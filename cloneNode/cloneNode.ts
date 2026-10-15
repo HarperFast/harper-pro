@@ -1195,12 +1195,11 @@ async function cloneApplications(): Promise<void> {
 		chooseTransfer: async () => {
 			// The replication socket carries an operation's answer as one buffered message, so only HTTP streams.
 			if (usingCertAuth) return { withNodeModules: false, reason: 'certificate authentication cannot stream it' };
+			// Unknown is not older: rebuilding with npm could certify a clone missing a node_modules-only package.
 			const version = await leaderVersion();
+			if (version === undefined) throw new Error('the leader did not report its version');
 			if (packagesNodeModulesWithoutInstall(version)) return { withNodeModules: true };
-			return {
-				withNodeModules: false,
-				reason: version ? `leader ${version} would include its own install` : "the leader's version is unknown",
-			};
+			return { withNodeModules: false, reason: `leader ${version} would include its own install` };
 		},
 		requestPackage: requestApplicationPackage,
 		prepareApplication: async (name, payload) => {
@@ -1339,8 +1338,8 @@ let probedLeaderVersion: string | undefined;
 
 /**
  * The leader's Harper version from `registration_info`, which every leader version answers (see
- * core/bin/cliOperations.ts), or undefined when three attempts fail. Only an answer is kept, so a later
- * caller retries a probe that failed.
+ * core/bin/cliOperations.ts), or undefined when three attempts get none. Only a version is kept, so a
+ * later caller retries a probe that failed.
  */
 async function leaderVersion(): Promise<string | undefined> {
 	if (probedLeaderVersion !== undefined) return probedLeaderVersion;
@@ -1352,15 +1351,17 @@ async function leaderVersion(): Promise<string | undefined> {
 	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
 			const registration: any = await leaderRequest({ operation: 'registration_info' });
-			if (registration?.version == null) return undefined;
-			probedLeaderVersion = String(registration.version);
-			return probedLeaderVersion;
+			if (registration?.version != null) {
+				probedLeaderVersion = String(registration.version);
+				return probedLeaderVersion;
+			}
+			log(`Leader version probe got no version (attempt ${attempt}/3)`);
 		} catch (err) {
 			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
-			if (attempt < 3) {
-				const delay = backoff.nextDelay();
-				if (delay !== undefined) await sleep(delay);
-			}
+		}
+		if (attempt < 3) {
+			const delay = backoff.nextDelay();
+			if (delay !== undefined) await sleep(delay);
 		}
 	}
 	return undefined;

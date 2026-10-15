@@ -13,7 +13,7 @@ export type LeaderHTTPTarget = {
  * Socket inactivity, not total duration. A leader that predates streamed `package_component` sends
  * nothing until it has built the whole archive, so this has to outlast that.
  */
-export const LEADER_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+const LEADER_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 
 export function postToLeader(
 	target: LeaderHTTPTarget,
