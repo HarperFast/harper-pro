@@ -95,8 +95,8 @@ export async function setNode(req: any) {
 	let cert_auth;
 	if (url?.startsWith('wss:')) {
 		rep = await getReplicationCert();
-		const caRecord = await getReplicationCertAuth();
 		if (!rep) throw new Error('Unable to find a certificate to use for replication');
+		const caRecord = await getReplicationCertAuth();
 		if (rep.options.is_self_signed || req.force_signing) {
 			// Create the certificate signing request that will be sent to the other node
 			const csrResult = await createCsr();
@@ -298,7 +298,11 @@ export async function addNodeBack(req) {
 	if (req.authorization) nodeRecord.authorization = req.authorization;
 	if (req.shard !== undefined) nodeRecord.shard = req.shard;
 
-	const repCa = await getReplicationCertAuth();
+	let repCa;
+	if (req.csr || req.url?.startsWith('wss:')) {
+		if (!(await getReplicationCert())) throw new Error('Unable to find a certificate to use for replication');
+		repCa = await getReplicationCertAuth();
+	}
 	if (nodeRecord.replicates) {
 		const thisNode: any = {
 			url: getThisNodeUrl(),
