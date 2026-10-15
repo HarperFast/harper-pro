@@ -1,18 +1,3 @@
-/**
- * Regression coverage for security/certificate.ts delegating getReplicationCert and
- * getReplicationCertAuth to core/security/keys.ts (liveReload = false), and for
- * createCsr / setNode / addNodeBack guarding the empty-certificate return value.
- *
- * Previously, security/certificate.ts held a duplicate copy of getReplicationCert()
- * that called createTLSSelector('replication') with the default liveReload = true.
- * Every call registered an unawaited databases.system.hdb_certificate.subscribe()
- * inside the caller's ambient contextStorage store. When ambientContext.user was
- * stale (!isCurrentUser(user)), registerLiveSubscriptionForContext took the async
- * handle.verify() path and left an OPEN DatabaseTransaction on the ambient store
- * across await getReplicationCert(), causing subsequent reads in getReplicationCertAuth()
- * and addNodeBack() to join that subscription transaction and race its async commit/abort
- * ("Operation aborted: Database closed during transaction get operation").
- */
 import assert from 'node:assert/strict';
 import { X509Certificate } from 'node:crypto';
 import mkcert from 'mkcert';
@@ -110,18 +95,24 @@ describe('getReplicationCert and getReplicationCertAuth (Pro security/certificat
 		sandbox.restore();
 		coreKeys.getPrivateKeys().delete(keyName);
 		coreKeys.getPrivateKeys().delete(otherKeyName);
-		await certTable.clear();
+		await certTable?.clear();
 	});
 
 	after(async () => {
 		sandbox.restore();
 		coreKeys.getPrivateKeys().delete(keyName);
 		coreKeys.getPrivateKeys().delete(otherKeyName);
-		setProperty(CONFIG_PARAMS.REPLICATION_URL, previousReplicationUrl);
-		setHdbBasePath(previousBasePath);
-		await certTable.clear();
-		for (const cert of savedCerts) {
-			await certTable.put(cert);
+		if (previousReplicationUrl !== undefined) {
+			setProperty(CONFIG_PARAMS.REPLICATION_URL, previousReplicationUrl);
+		}
+		if (previousBasePath !== undefined) {
+			setHdbBasePath(previousBasePath);
+		}
+		if (certTable) {
+			await certTable.clear();
+			for (const cert of savedCerts) {
+				await certTable.put(cert);
+			}
 		}
 	});
 
@@ -150,10 +141,7 @@ describe('getReplicationCert and getReplicationCertAuth (Pro security/certificat
 
 		const subscribeSpy = sandbox.spy(databases.system.hdb_certificate, 'subscribe');
 
-		// Construct a user with record provenance whose stamp does not match system.hdb_user,
-		// so isCurrentUser(staleUser) is false — the exact condition that caused the old
-		// unawaited hdb_certificate.subscribe() to take the async handle.verify() path and
-		// leave an OPEN DatabaseTransaction on the caller's ambient contextStorage store.
+		// Stale provenance forces registerLiveSubscriptionForContext's verify() branch.
 		const staleUser = { username: 'stale-replication-admin', active: true };
 		trackUserRecords(staleUser, {
 			username: 'stale-replication-admin',
@@ -164,26 +152,43 @@ describe('getReplicationCert and getReplicationCertAuth (Pro security/certificat
 		assert.equal(hasRecordProvenance(staleUser), true);
 		assert.equal(isCurrentUser(staleUser), false);
 
+		const nodeTable = getHDBNodeTable();
 		const ambientStore = { user: staleUser };
-		await contextStorage.run(ambientStore, async () => {
-			const cert = await proCertificate.getReplicationCert();
-			assert.equal(
-				isJoinableScope(ambientStore.transaction),
-				false,
-				'getReplicationCert must not leave an open joinable transaction on the ambient context'
-			);
-			assert.ok(cert, 'expected getReplicationCert to return the node replication certificate');
-			assert.equal(cert.name, nodeName);
+		try {
+			await contextStorage.run(ambientStore, async () => {
+				const cert = await proCertificate.getReplicationCert();
+				assert.equal(
+					isJoinableScope(ambientStore.transaction),
+					false,
+					'getReplicationCert must not leave an open joinable transaction on the ambient context'
+				);
+				assert.ok(cert, 'expected getReplicationCert to return the node replication certificate');
+				assert.equal(cert.name, nodeName);
 
-			const caRecord = await proCertificate.getReplicationCertAuth();
-			assert.equal(
-				isJoinableScope(ambientStore.transaction),
-				false,
-				'getReplicationCertAuth must not leave an open joinable transaction on the ambient context'
-			);
-			assert.ok(caRecord, 'expected getReplicationCertAuth to return the issuing CA record');
-			assert.equal(caRecord.name, caName);
-		});
+				const caRecord = await proCertificate.getReplicationCertAuth();
+				assert.equal(
+					isJoinableScope(ambientStore.transaction),
+					false,
+					'getReplicationCertAuth must not leave an open joinable transaction on the ambient context'
+				);
+				assert.ok(caRecord, 'expected getReplicationCertAuth to return the issuing CA record');
+				assert.equal(caRecord.name, caName);
+
+				const res = await addNodeBack({
+					hostname: 'peer-wss-node',
+					url: 'wss://127.0.0.1:9997',
+				});
+				assert.equal(
+					isJoinableScope(ambientStore.transaction),
+					false,
+					'addNodeBack must not leave an open joinable transaction on the ambient context'
+				);
+				assert.equal(res.usingCA, ca.cert);
+			});
+		} finally {
+			await nodeTable.delete('peer-wss-node');
+			await nodeTable.delete(nodeName);
+		}
 
 		assert.equal(subscribeSpy.callCount, 0, 'one-shot replication cert lookup must not subscribe to hdb_certificate');
 	});
@@ -247,6 +252,42 @@ describe('getReplicationCert and getReplicationCertAuth (Pro security/certificat
 			assert.equal(res.usingCA, undefined);
 		} finally {
 			await nodeTable.delete('peer-ws-node');
+			await nodeTable.delete(nodeName);
+		}
+	});
+
+	it('preserves usingCA and this node ca in hdb_nodes on a ws:// addNodeBack when a replication cert exists', async () => {
+		coreKeys.getPrivateKeys().set(keyName, nodeCert.key);
+		await coreKeys.setCertTable({
+			name: nodeName,
+			uses: ['replication'],
+			certificate: nodeCert.cert,
+			private_key_name: keyName,
+			is_authority: false,
+			is_self_signed: false,
+		});
+		await coreKeys.setCertTable({
+			name: caName,
+			uses: [],
+			certificate: ca.cert,
+			is_authority: true,
+			is_self_signed: true,
+		});
+
+		const nodeTable = getHDBNodeTable();
+		try {
+			const res = await withTimeout(
+				addNodeBack({ hostname: 'peer-ws-node', url: 'ws://127.0.0.1:9998' }),
+				2000,
+				'addNodeBack ws:// with cert'
+			);
+			assert.equal(res.nodeName, nodeName);
+			assert.equal(res.usingCA, ca.cert);
+			const selfRow = await nodeTable.get(nodeName);
+			assert.equal(selfRow?.ca, ca.cert);
+		} finally {
+			await nodeTable.delete('peer-ws-node');
+			await nodeTable.delete(nodeName);
 		}
 	});
 });

@@ -298,11 +298,11 @@ export async function addNodeBack(req) {
 	if (req.authorization) nodeRecord.authorization = req.authorization;
 	if (req.shard !== undefined) nodeRecord.shard = req.shard;
 
-	let repCa;
-	if (req.csr || req.url?.startsWith('wss:')) {
-		if (!(await getReplicationCert())) throw new Error('Unable to find a certificate to use for replication');
-		repCa = await getReplicationCertAuth();
+	const rep = await getReplicationCert();
+	if (!rep && (req.csr || req.url?.startsWith('wss:'))) {
+		throw new Error('Unable to find a certificate to use for replication');
 	}
+	const repCa = rep ? await getReplicationCertAuth() : undefined;
 	if (nodeRecord.replicates) {
 		const thisNode: any = {
 			url: getThisNodeUrl(),
