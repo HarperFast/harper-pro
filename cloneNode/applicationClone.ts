@@ -1,5 +1,6 @@
 import { basename } from 'node:path';
 import { Readable } from 'node:stream';
+import { PROJECT_NAME_PATTERN } from '../core/utility/componentNames.ts';
 
 export class ApplicationCloneError extends Error {
 	name = 'ApplicationCloneError';
@@ -55,6 +56,12 @@ export async function cloneFilesystemOnlyApplications({
 		let payload: string | Readable | undefined;
 		try {
 			if (!isComponentName(name)) throw new Error('the leader listed it under a name that is not a directory name');
+			// package_component cuts `app.v2` down to `app`, so the request would return a different application.
+			if (!PROJECT_NAME_PATTERN.test(name)) {
+				throw new Error(
+					`package_component cannot fetch it by that name; rename it on the leader to letters, digits, '-' and '_' only`
+				);
+			}
 			payload = await requestPackage(name);
 			await prepareApplication(name, payload);
 			log(`Successfully cloned application: ${name}`);
