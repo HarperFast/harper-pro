@@ -11,6 +11,7 @@ function harness({
 	failPrepare = [],
 	streamed = false,
 	transfer = { withNodeModules: true },
+	failTransfer,
 } = {}) {
 	const requested = [];
 	const transfers = [];
@@ -34,6 +35,7 @@ function harness({
 				},
 				chooseTransfer: async () => {
 					transferChoices++;
+					if (failTransfer) throw new Error(failTransfer);
 					return transfer;
 				},
 				requestPackage: async (name, withNodeModules) => {
@@ -212,13 +214,28 @@ describe('cloneFilesystemOnlyApplications', () => {
 		assert.equal(clone.transferChoices(), 0);
 	});
 
+	it('stops before copying anything when it cannot choose the transfer', async () => {
+		const clone = harness({
+			listing: { entries: [filesystemOnly('app')] },
+			failTransfer: 'the leader did not report its version',
+		});
+		await assert.rejects(clone.run(), {
+			name: 'ApplicationCloneError',
+			message: "Unable to choose how to copy the leader's applications: the leader did not report its version",
+		});
+		assert.deepEqual(clone.requested, []);
+	});
 });
 
 describe('packagesNodeModulesWithoutInstall', () => {
 	for (const [version, expected] of [
 		['4.7.41', false],
 		['5.2.15', false],
+		['5.3.0-alpha.1', false],
+		['5.3.0-beta.2', false],
 		['5.3.0', true],
+		['5.3.1-beta.1', true],
+		['5.4.0-alpha.1', true],
 		['5.3.2', true],
 		['v5.3.1', true],
 		['5.10.0', true],

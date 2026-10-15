@@ -15,7 +15,8 @@ the clone requests each application with its `node_modules` and streams it. Rebu
 loses whatever npm cannot reproduce: a `file:` dependency into `node_modules`, a bundler's private
 workspace packages, and a payload deploy's request-scoped install options and registry credentials
 (harper-pro#1047). Anywhere else the clone asks for the application without `node_modules` and npm
-rebuilds it, logging that packages existing only there will be missing. Earlier leaders follow the
+rebuilds it, logging that packages existing only there will be missing. A leader whose version the clone
+cannot read stops the clone (retryable) rather than risk that rebuild. Earlier leaders follow the
 loader's link to their own install (`node_modules/harper`, or `node_modules/harperdb` on v4), so every
 application would carry the whole install — measured at 80 MB of base64 for a two-file app on a v4.7
 leader. Cert auth gets one buffered message over the replication socket, which cannot stream.

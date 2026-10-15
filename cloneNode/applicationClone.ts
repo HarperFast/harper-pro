@@ -9,12 +9,15 @@ export class ApplicationCloneError extends Error {
 /**
  * Whether a leader can package an application's node_modules without its own Harper install. From 5.3.0
  * the packer leaves out the loader's `node_modules/harper` link; earlier leaders follow it (v4 follows
- * `node_modules/harperdb`), so every application would carry the whole install.
+ * `node_modules/harperdb`), so every application would carry the whole install. A 5.3.0 prerelease is
+ * earlier than 5.3.0, and the alphas lack the exclusion.
  */
 export function packagesNodeModulesWithoutInstall(leaderVersion: string | undefined): boolean {
-	const [, major, minor] = /(\d+)\.(\d+)/.exec(leaderVersion ?? '') ?? [];
+	const [, major, minor, patch, prerelease] = /(\d+)\.(\d+)(?:\.(\d+)(-\S+)?)?/.exec(leaderVersion ?? '') ?? [];
 	if (major === undefined) return false;
-	return Number(major) > 5 || (Number(major) === 5 && Number(minor) >= 3);
+	if (Number(major) !== 5) return Number(major) > 5;
+	if (Number(minor) !== 3) return Number(minor) > 3;
+	return Number(patch ?? 0) > 0 || prerelease === undefined;
 }
 
 /**
@@ -63,7 +66,16 @@ export async function cloneFilesystemOnlyApplications({
 		return;
 	}
 	log(`Cloning ${applications.length} application(s) not referenced in harper-config`);
-	const { withNodeModules, reason } = await chooseTransfer();
+	let transfer: { withNodeModules: boolean; reason?: string };
+	try {
+		transfer = await chooseTransfer();
+	} catch (error) {
+		throw new ApplicationCloneError(
+			`Unable to choose how to copy the leader's applications: ${(error as Error)?.message ?? error}`,
+			{ cause: error }
+		);
+	}
+	const { withNodeModules, reason } = transfer;
 	if (!withNodeModules) {
 		log(
 			`Reinstalling each application's dependencies with npm instead of copying node_modules (${reason}); a package that exists only in an application's node_modules will be missing`
