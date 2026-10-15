@@ -108,6 +108,7 @@ import {
 	subscriptionSetupCapabilityFrom,
 	type ResolvedPeerCapabilities,
 } from './protocolCapabilities.ts';
+import { INVALIDATED } from '../core/resources/Table.ts';
 import {
 	HAS_STRUCTURE_UPDATE,
 	isMissingStructureError,
@@ -5925,28 +5926,33 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								} else {
 									entry.version = getLastVersion();
 								}
-								if (lastMetadata && lastMetadata[METADATA] & HAS_BLOBS) {
-									// if there are blobs, we need to find them and send their contents
-									// but first, the decoding process can destroy our buffer above, so we need to copy it
-									valueBuffer = Buffer.from(valueBuffer);
-									decodeWithBlobCallback(
-										() => table.primaryStore.decoder.decode(binaryEntry),
-										(blob) => sendBlobs(blob, recordId),
-										table.primaryStore.rootStore
-									);
+								if (lastMetadata && lastMetadata[METADATA] & INVALIDATED) {
+									// an index-only stub, not the record: the requester would store it as complete
+									responseData = encode([GET_RECORD_RESPONSE, requestId]);
+								} else {
+									if (lastMetadata && lastMetadata[METADATA] & HAS_BLOBS) {
+										// if there are blobs, we need to find them and send their contents
+										// but first, the decoding process can destroy our buffer above, so we need to copy it
+										valueBuffer = Buffer.from(valueBuffer);
+										decodeWithBlobCallback(
+											() => table.primaryStore.decoder.decode(binaryEntry),
+											(blob) => sendBlobs(blob, recordId),
+											table.primaryStore.rootStore
+										);
+									}
+									responseData = encode([
+										GET_RECORD_RESPONSE,
+										requestId,
+										{
+											value: valueBuffer,
+											expiresAt: entry.expiresAt,
+											version: entry.version,
+											residencyId: entry.residencyId,
+											nodeId: entry.nodeId,
+											user: entry.user,
+										},
+									]);
 								}
-								responseData = encode([
-									GET_RECORD_RESPONSE,
-									requestId,
-									{
-										value: valueBuffer,
-										expiresAt: entry.expiresAt,
-										version: entry.version,
-										residencyId: entry.residencyId,
-										nodeId: entry.nodeId,
-										user: entry.user,
-									},
-								]);
 							} else {
 								responseData = encode([GET_RECORD_RESPONSE, requestId]);
 							}
@@ -7019,6 +7025,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// the outer catch and close the channel, turning a metadata hiccup into a reconnect loop.
 												let withheldOriginNodeId: number | undefined;
 												let withheldRecordCount = 0;
+												let withheldStubCount = 0;
 												try {
 													const peerNodeRow = !legacyCopy && getHDBNodeTable().primaryStore.getSync(remoteNodeName);
 													if (
@@ -7093,6 +7100,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// already-available record metadata integer from the range entry — a pure bitmask
 														// test, no record value decode added to this send path.
 														if (entry.metadataFlags & LOCAL_ONLY) continue;
+														// A copy row goes out as a complete `put`, which sendAuditRecord turns into an
+														// `invalidate` only for a peer the residency excludes; a stub may go to that peer alone.
+														if (entry.metadataFlags & INVALIDATED) {
+															const stubResidency = getResidence(entry.residencyId, table);
+															if (!stubResidency || stubResidency.includes(remoteNodeName)) {
+																withheldStubCount++;
+																continue;
+															}
+														}
 														// same origin normalization as recordNodeId below: undefined means we authored it
 														if (
 															withheldOriginNodeId !== undefined &&
@@ -7185,6 +7201,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												if (withheldOriginNodeId !== undefined)
 													logger.warn?.(
 														`Copied ${databaseName} to ${remoteNodeName} without ${withheldRecordCount} record(s) that peer originated (harper-pro#737)`
+													);
+												if (withheldStubCount > 0)
+													logger.info?.(
+														`Copied ${databaseName} to ${remoteNodeName} without ${withheldStubCount} INVALIDATED stub(s) that peer would have stored as complete records (harper#2257)`
 													);
 												currentSequenceId = copyStartTime;
 												if (!currentTransaction.txnLogKey) {
