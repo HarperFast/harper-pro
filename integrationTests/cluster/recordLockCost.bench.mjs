@@ -71,7 +71,7 @@ const results = {
 		node: process.version,
 	},
 	threads: THREADS,
-	replicationThreads: THREADS >= 2 ? Math.floor(THREADS / 2) : 0,
+	replicationThreads: undefined,
 	ranAt: new Date().toISOString(),
 };
 
@@ -107,6 +107,10 @@ async function startNode(suiteName, replicationOverrides) {
 	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
 	const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
 	await startHarper(ctx, optionsFor(hostname, replicationFor(hostname, replicationOverrides)));
+	if (results.replicationThreads === undefined) {
+		const sysInfo = await sendOperation(ctx.harper, { operation: 'system_information', attributes: ['threads'] });
+		results.replicationThreads = (sysInfo.threads ?? []).filter((t) => t.name === 'replication').length;
+	}
 	return ctx;
 }
 
