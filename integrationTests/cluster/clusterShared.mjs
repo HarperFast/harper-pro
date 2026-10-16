@@ -158,11 +158,12 @@ export async function restartNode(node, opts) {
 }
 
 /**
- * Env that keeps one node's replication off the pool on the pool-on CI legs, which set `replication.threads` for
- * every node through HARPER_CONFIG. For a node whose fault injection is application code: pool workers load
- * none, so an injector armed over HTTP never runs on the thread that owns the replication socket.
+ * Env that keeps one node's replication off the pool whether the pool comes from `HARPER_CONFIG` or the
+ * `threads.count`-derived default (`Math.floor(threads.count / 2)` for `threads.count >= 2`). For a node whose
+ * fault injection is application code: pool workers load none, so an injector armed over HTTP never runs on the
+ * thread that owns the replication socket.
  *
- * @returns {Object} env entries to pass to startHarper/setupHarperWithFixture (empty when the pool is off)
+ * @returns {Object} env entries to pass to startHarper/setupHarperWithFixture (empty only when HARPER_CONFIG already sets `replication.threads: 0`)
  */
 export function replicationPoolOffEnv() {
 	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;

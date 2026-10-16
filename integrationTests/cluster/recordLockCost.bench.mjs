@@ -71,6 +71,7 @@ const results = {
 		node: process.version,
 	},
 	threads: THREADS,
+	replicationThreads: THREADS >= 2 ? Math.floor(THREADS / 2) : 0,
 	ranAt: new Date().toISOString(),
 };
 
