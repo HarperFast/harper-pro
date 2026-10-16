@@ -107,10 +107,6 @@ async function startNode(suiteName, replicationOverrides) {
 	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
 	const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
 	await startHarper(ctx, optionsFor(hostname, replicationFor(hostname, replicationOverrides)));
-	if (results.replicationThreads === undefined) {
-		const sysInfo = await sendOperation(ctx.harper, { operation: 'system_information', attributes: ['threads'] });
-		results.replicationThreads = (sysInfo.threads ?? []).filter((t) => t.name === 'replication').length;
-	}
 	return ctx;
 }
 
@@ -127,6 +123,15 @@ async function startAll(suiteName, overridesPerNode) {
 	if (failed) {
 		for (const c of contexts) await stopNode(c);
 		throw failed.reason;
+	}
+	if (results.replicationThreads === undefined && contexts.length > 0) {
+		try {
+			const sysInfo = await sendOperation(contexts[0].harper, {
+				operation: 'system_information',
+				attributes: ['threads'],
+			});
+			results.replicationThreads = (sysInfo.threads ?? []).filter((t) => t.name === 'replication').length;
+		} catch {}
 	}
 	return contexts;
 }
