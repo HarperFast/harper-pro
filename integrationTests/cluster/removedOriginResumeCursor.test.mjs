@@ -23,9 +23,11 @@
  *   5. N joins A, then B, by base copy: neither copy's tail may carry OLD, and a restart of N must not either.
  *   6. A restarts: no OLD is resent, and R's log on A and B does not grow from step 4 on.
  *
- * The oracle is the SENDER's debug line `wrote record <id> length: <n> remoteNode <peer>` (the level is pinned to
+ * The replay oracle is the SENDER's debug line `wrote record <id> length: <n> remoteNode <peer>` (the level is pinned to
  * debug), read from a log mark onward; for a copy, only after its `Finished copy table <table> <peer>` line, since
  * the copy itself carries every row.
+ * Audit reads establish visibility around removal; post-restart reads prove persistence, since a mapped log
+ * can remain readable after its file is unlinked. These checks keep the no-replay oracle from passing on lost history.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, deepEqual } from 'node:assert/strict';
@@ -237,12 +239,20 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		);
 
 		const bRetainedLogs = await postToFixture(B, 'RecordLogs', { ids: [...rOld, ...rMid] });
-		deepEqual(bRetainedLogs, Object.fromEntries([...rOld, ...rMid].map((id) => [id, R.hostname])));
+		deepEqual(
+			bRetainedLogs,
+			Object.fromEntries([...rOld, ...rMid].map((id) => [id, R.hostname])),
+			'B holds OLD and MID audit entries under R before removal'
+		);
 		await killHarper({ harper: B });
 		await upsert(R, rLate);
 		await waitForIds(A, rLate, 'LATE reaches A while B is down');
 		const aRetainedLogs = await postToFixture(A, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] });
-		deepEqual(aRetainedLogs, Object.fromEntries([...rOld, ...rMid, ...rLate].map((id) => [id, R.hostname])));
+		deepEqual(
+			aRetainedLogs,
+			Object.fromEntries([...rOld, ...rMid, ...rLate].map((id) => [id, R.hostname])),
+			'A holds OLD, MID and LATE audit entries under R before removal'
+		);
 
 		// A's removal also disables R itself (remove_node_back), so R stops replicating to anyone.
 		await sendOperation(A, { operation: 'remove_node', hostname: R.hostname });
