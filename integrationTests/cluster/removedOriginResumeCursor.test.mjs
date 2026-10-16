@@ -49,6 +49,7 @@ const CONVERGE_TIMEOUT_MS = 90_000;
 const SETTLE_MS = 3_000;
 
 const ids = (prefix, count) => Array.from({ length: count }, (_, i) => `${prefix}-${i}`);
+const filedUnder = (recordIds, log) => Object.fromEntries(recordIds.map((id) => [id, log]));
 const rOld = ids('r-old', 20);
 const qOld = ids('q-old', 10);
 const rMid = ids('r-mid', 5);
@@ -75,8 +76,12 @@ async function startNode(node) {
 }
 
 async function restartNode(node) {
+	const previousProcess = node.process;
 	await killHarper({ harper: node });
-	return startNode(node);
+	ok(previousProcess.exitCode !== null || previousProcess.signalCode !== null, 'the previous process exited');
+	const restarted = await startNode(node);
+	ok(restarted.process.pid !== previousProcess.pid, 'restart starts a new process');
+	return restarted;
 }
 
 async function startNewNode(suiteName) {
@@ -241,7 +246,7 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		const bRetainedLogs = await postToFixture(B, 'RecordLogs', { ids: [...rOld, ...rMid] });
 		deepEqual(
 			bRetainedLogs,
-			Object.fromEntries([...rOld, ...rMid].map((id) => [id, R.hostname])),
+			filedUnder([...rOld, ...rMid], R.hostname),
 			'B holds OLD and MID audit entries under R before removal'
 		);
 		await killHarper({ harper: B });
@@ -250,12 +255,21 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		const aRetainedLogs = await postToFixture(A, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] });
 		deepEqual(
 			aRetainedLogs,
-			Object.fromEntries([...rOld, ...rMid, ...rLate].map((id) => [id, R.hostname])),
+			filedUnder([...rOld, ...rMid, ...rLate], R.hostname),
 			'A holds OLD, MID and LATE audit entries under R before removal'
 		);
+		const rMembership = {
+			operation: 'search_by_hash',
+			database: 'system',
+			table: 'hdb_nodes',
+			hash_values: [R.hostname],
+			get_attributes: ['name'],
+		};
+		deepEqual(await sendOperation(R, rMembership), [{ name: R.hostname }], 'R is a member before removal');
 
 		// A's removal also disables R itself (remove_node_back), so R stops replicating to anyone.
 		await sendOperation(A, { operation: 'remove_node', hostname: R.hostname });
+		deepEqual(await sendOperation(R, rMembership), [], 'R confirms its reciprocal membership removal');
 		deepEqual(
 			await postToFixture(A, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] }),
 			aRetainedLogs,
@@ -263,7 +277,7 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		);
 		deepEqual(
 			await postToFixture(R, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] }),
-			Object.fromEntries([...rOld, ...rMid, ...rLate].map((id) => [id, 'local'])),
+			filedUnder([...rOld, ...rMid, ...rLate], 'local'),
 			"reciprocal removal must preserve R's own audit entries"
 		);
 		await killHarper({ harper: R });
@@ -295,17 +309,19 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 
 		deepEqual(await oldIdsSent(A, B, markA), [], 'A must not resend OLD rows to B on its restart');
 		deepEqual(await oldIdsSent(B, A, markB), [], 'B must not resend OLD rows to A when it returns');
-		deepEqual(
-			await postToFixture(B, 'RecordLogs', { ids: rOld }),
-			Object.fromEntries(rOld.map((id) => [id, R.hostname])),
-			'B must retain OLD audit entries through removal and restart'
-		);
+		for (const node of [A, B]) {
+			deepEqual(
+				await postToFixture(node, 'RecordLogs', { ids: rOld }),
+				filedUnder(rOld, R.hostname),
+				`${node.hostname} must retain OLD audit entries through removal and B's restart`
+			);
+		}
 		ctx.rLogCounts = {
 			A: (await postToFixture(A, 'LogEntryCount', { log: R.hostname })).count,
 			B: (await postToFixture(B, 'LogEntryCount', { log: R.hostname })).count,
 		};
-		for (const count of Object.values(ctx.rLogCounts)) {
-			ok(count >= rOld.length + rMid.length + rLate.length, `R's retained log lost entries: ${count}`);
+		for (const [name, count] of Object.entries(ctx.rLogCounts)) {
+			ok(count >= rOld.length + rMid.length + rLate.length, `R's retained log on ${name} lost entries: ${count}`);
 		}
 	});
 
@@ -360,7 +376,7 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		for (const node of [A, B]) {
 			deepEqual(
 				await postToFixture(node, 'RecordLogs', { ids: rOld }),
-				Object.fromEntries(rOld.map((id) => [id, R.hostname])),
+				filedUnder(rOld, R.hostname),
 				'survivors must retain OLD audit entries through restarts and a new node joining'
 			);
 		}
