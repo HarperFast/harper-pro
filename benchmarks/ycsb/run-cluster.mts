@@ -168,8 +168,11 @@ async function main(): Promise<void> {
 		await connectCluster(nodes);
 
 		const baseUrls = nodes.map((n) => n.httpURL);
-		const sysInfo = await sendOperation(nodes[0], { operation: 'system_information', attributes: ['threads'] });
-		const replicationThreads = (sysInfo.threads ?? []).filter((t: any) => t.name === 'replication').length;
+		let replicationThreads: number | undefined;
+		try {
+			const sysInfo = await sendOperation(nodes[0], { operation: 'system_information', attributes: ['threads'] });
+			replicationThreads = (sysInfo.threads ?? []).filter((t: any) => t.name === 'replication').length;
+		} catch {}
 		console.log(`Driving load round-robin across ${baseUrls.length} nodes.`);
 		const results = await runBenchmark(baseUrls, options, {
 			topology: 'round-robin',

@@ -130,7 +130,13 @@ function nodeConfig(hostname, { legacyPeer = false, replicationThreads } = {}) {
 		},
 		// A pre-#1212 peer: no NODE_NAME capability bag (the hook protocolCapabilityRegistry.test.mjs uses), so no
 		// stamps on the wire, and none in its catalog.
-		env: legacyPeer ? { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1', HARPER_TEST_OMIT_TABLE_LIFECYCLE: '1' } : {},
+		env: {
+			...(replicationThreads && { HARPER_CONFIG: '' }),
+			...(legacyPeer && {
+				HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1',
+				HARPER_TEST_OMIT_TABLE_LIFECYCLE: '1',
+			}),
+		},
 	};
 }
 

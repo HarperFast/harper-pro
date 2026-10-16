@@ -222,11 +222,9 @@ async function startResidencyCluster(suiteName, replicationConfig) {
 	const started = await Promise.allSettled(
 		Array.from({ length: NODE_COUNT }, async () => {
 			const hostname = await getNextAvailableLoopbackAddress();
-			const nodeCtx = {
-				name: suiteName,
-				harper: { hostname, dataRootDir: await mkdtemp(join(tmpdir(), 'harper-integration-test-')) },
-			};
+			const nodeCtx = { name: suiteName, harper: { hostname } };
 			try {
+				nodeCtx.harper = { hostname, dataRootDir: await mkdtemp(join(tmpdir(), 'harper-integration-test-')) };
 				const compDir = join(nodeCtx.harper.dataRootDir, 'components', 'residency-app');
 				await mkdir(compDir, { recursive: true });
 				await writeFile(
