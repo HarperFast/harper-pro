@@ -222,12 +222,12 @@ async function startResidencyCluster(suiteName, replicationConfig) {
 	const started = await Promise.allSettled(
 		Array.from({ length: NODE_COUNT }, async () => {
 			const hostname = await getNextAvailableLoopbackAddress();
-			let dataRootDir;
-			const nodeCtx = { name: suiteName, harper: { hostname } };
+			const nodeCtx = {
+				name: suiteName,
+				harper: { hostname, dataRootDir: await mkdtemp(join(tmpdir(), 'harper-integration-test-')) },
+			};
 			try {
-				dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
-				nodeCtx.harper.dataRootDir = dataRootDir;
-				const compDir = join(dataRootDir, 'components', 'residency-app');
+				const compDir = join(nodeCtx.harper.dataRootDir, 'components', 'residency-app');
 				await mkdir(compDir, { recursive: true });
 				await writeFile(
 					join(compDir, 'config.yaml'),
@@ -254,7 +254,7 @@ async function startResidencyCluster(suiteName, replicationConfig) {
 				await teardownHarper(nodeCtx).catch(() => {});
 				throw error;
 			}
-			return { ...nodeCtx.harper, dataRootDir };
+			return nodeCtx.harper;
 		})
 	);
 	const nodes = started.filter((result) => result.status === 'fulfilled').map((result) => result.value);
