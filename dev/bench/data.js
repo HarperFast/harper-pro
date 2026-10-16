@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792137744584,
+  "lastUpdate": 1792137747647,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -14571,6 +14571,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E scan p99 — short ranges",
             "value": 128.73,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "e7439cc7c06b122608cc59084e9f32ac2df3cffc",
+          "message": "Confirm relayed record lock recalls instead of answering them as errors (#1040)\n\n* Confirm relayed record lock recalls with the replication pool on\n\nThe replication session's OPERATION_REQUEST responder stamped requestId\ndirectly onto the operation's result. A record_lock_recall relayed from a\nnon-coordinating pool worker answers with a frozen constant, so the stamp\nthrew and the home received the confirmed recall as an error. A planned\nrecord_lock_apply_homes transition then could not prove quiescence and\nfell back to the ~6 minute drain, which is the recurring\nrecordLockApplyRetry shrink failure on the pool Cluster shard.\n\nmaterializeOperationResponse now returns a shallow copy of a plain-object\nresult (keeping a null prototype), so the responder only writes into an\nobject the transport owns. Other result shapes are unchanged.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01HJEUNqDAjjChTCaUaeWs9F\nDispatch-Task: harper-pro-record-lock-apply-retry-ci-20261013\n\n* Copy a plain operation result by property descriptor\n\nSpread and Object.assign read every enumerable field, including symbol\ngetters the encoder never touches, and drop a non-enumerable toJSON hook\nthat msgpackr honors on a null-prototype object. Copying the descriptors\nonto a new object with the same prototype reads nothing, so the encoder\nserializes the copy exactly as it would the original.\n\nNarrow the DESIGN.md note to plain-object results, and drop the bug\nhistory from the helper's docblock and the test comment.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01HJEUNqDAjjChTCaUaeWs9F\nDispatch-Task: harper-pro-record-lock-apply-retry-ci-20261013\n\n* Leave requestId to the caller and copy plain objects from any realm\n\nThe descriptor copy carried a result's own requestId descriptor, so a\nfrozen or non-enumerable requestId still blocked or hid the caller's\nstamp. The copy now omits it. A plain object built in another realm, such\nas an application loaded into its own VM context, has a different\nObject.prototype; recognizing any root prototype copies those too.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01HJEUNqDAjjChTCaUaeWs9F\nDispatch-Task: harper-pro-record-lock-apply-retry-ci-20261013\n\n* Copy only this realm's plain objects, with a fresh requestId slot\n\nA prototype whose own prototype is null is not necessarily a realm's\nObject.prototype: a class can be re-rooted on null, and copying its\ninstance drops the private-field brand its toJSON needs. Go back to this\nrealm's Object.prototype or a null prototype, and name objects from\nanother realm as returned unchanged.\n\nDeleting the copied requestId descriptor could expose an inherited\nread-only property or setter to the caller's stamp. Define a fresh\nwritable, enumerable own slot instead.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01HJEUNqDAjjChTCaUaeWs9F\nDispatch-Task: harper-pro-record-lock-apply-retry-ci-20261013\n\n* Spread ordinary results; copy only null-prototype ones by descriptor\n\nmsgpackr encodes an ordinary object from its own enumerable string keys\nand never consults toJSON there, so a spread is an exact copy and costs\nnothing measurable: 0.31 vs 0.34 us per answer including the encode,\nagainst 1.9-4.3 us for the descriptor copy. Only a null-prototype object\nhas its toJSON honored, so only that branch keeps the descriptor copy\nwith its fresh requestId slot.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01HJEUNqDAjjChTCaUaeWs9F\nDispatch-Task: harper-pro-record-lock-apply-retry-ci-20261013\n\n* Copy an operation result only when the stamp cannot extend it\n\nEvery copy shape tried so far encoded some valid answer differently: a\nspread drops a non-enumerable constructor/toJSON pair the encoder honors\nand reads symbol getters it skips; a descriptor copy rebinds getters to\nthe copy. Copy only a plain answer that cannot take a new property (the\nfrozen record_lock_recall constant), by descriptor with a fresh requestId\nslot. Every answer the responder can already stamp is returned as is and\nencodes exactly as before. Shared mutable answers such as NOT_HOME are\nstill stamped in place, which is harmless because the stamp and the\nencode are synchronous.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01HJEUNqDAjjChTCaUaeWs9F\nDispatch-Task: harper-pro-record-lock-apply-retry-ci-20261013\n\n* Drop a test comment the fixtures already state\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01HJEUNqDAjjChTCaUaeWs9F\nDispatch-Task: harper-pro-record-lock-apply-retry-ci-20261013\n\n* Copy only when the stamp would throw\n\nA sealed answer that already owns a writable requestId takes the stamp\non base, so leave it in place too: now no answer that encoded before is\ncopied. Pin the ordinary-object symbol-getter case, which is returned as\nis and never read.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01HJEUNqDAjjChTCaUaeWs9F\nDispatch-Task: harper-pro-record-lock-apply-retry-ci-20261013\n\n* Copy exactly when the requestId assignment would throw\n\nAn own requestId setter takes the stamp on base, so a sealed answer with\none is no longer copied. An own read-only requestId throws even on an\nextensible answer, so that answer is now copied too, which fixes a case\nthat failed on base.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01HJEUNqDAjjChTCaUaeWs9F\nDispatch-Task: harper-pro-record-lock-apply-retry-ci-20261013\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T02:25:22Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/e7439cc7c06b122608cc59084e9f32ac2df3cffc"
+        },
+        "date": 1792137747575,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 9.72,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 15.03,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 19.18,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 25.01,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 25.64,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 24.12,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 47.22,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 130.32,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 46.2,
             "unit": "ms"
           }
         ]
