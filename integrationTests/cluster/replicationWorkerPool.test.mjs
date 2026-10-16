@@ -1,10 +1,14 @@
 /**
- * With `replication.threads`, every replication socket (the replication port's inbound listener and
- * every outbound subscription) is owned by a `replication` pool worker, never an HTTP worker.
+ * With `replication.threads` (explicitly set or defaulted to `Math.floor(threads.count / 2)` for
+ * `threads.count >= 2`), every replication socket (the replication port's inbound listener and every
+ * outbound subscription) is owned by a `replication` pool worker, never an HTTP worker. Also covers
+ * the port-fallback to 0 pool workers and `setResidencyById` migration behavior vs explicit `0`.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, strictEqual } from 'node:assert';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sendOperation, readLog, waitForCondition } from './clusterShared.mjs';
 
@@ -60,13 +64,12 @@ async function inboundSocketThreadTypes(node) {
 		.map((line) => line.match(/ \[([a-z]+)\/\d+\]/)?.[1]);
 }
 
-for (const { label, nodeConfig, nodeEnv } of [
+for (const { label, nodeConfig } of [
 	{
 		label: 'explicit replication.threads: 2',
 		nodeConfig: (hostname) => ({
 			replication: { securePort: hostname + ':9933', threads: POOL_SIZE },
 		}),
-		nodeEnv: {},
 	},
 	{
 		label: 'omitted replication.threads at threads.count: 4',
@@ -74,7 +77,6 @@ for (const { label, nodeConfig, nodeEnv } of [
 			threads: { count: 4 },
 			replication: { securePort: hostname + ':9933' },
 		}),
-		nodeEnv: { HARPER_CONFIG: '' },
 	},
 ]) {
 	suite(`replication runs on the dedicated worker pool (${label})`, (ctx) => {
@@ -89,7 +91,7 @@ for (const { label, nodeConfig, nodeEnv } of [
 								logging: { colors: false, stdStreams: false, console: true, level: 'debug' },
 								...nodeConfig(nodeCtx.harper.hostname),
 							},
-							env: { HARPER_NO_FLUSH_ON_EXIT: true, ...nodeEnv },
+							env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_CONFIG: '' },
 						});
 					} catch (error) {
 						// not yet in ctx.nodes, so release the reserved address (and any data root) here
@@ -207,29 +209,38 @@ for (const { label, nodeConfig, nodeEnv } of [
 	});
 }
 
+async function teardownResidencyCluster(nodes) {
+	await Promise.all(
+		nodes.map(async (node) => {
+			await teardownHarper({ harper: node }).catch(() => {});
+			if (node?.dataRootDir) {
+				await rm(node.dataRootDir, { recursive: true, force: true }).catch(() => {});
+			}
+		})
+	);
+}
+
 async function startResidencyCluster(suiteName, replicationConfig) {
-	const { mkdir, mkdtemp, writeFile } = await import('node:fs/promises');
-	const { tmpdir } = await import('node:os');
 	const started = await Promise.allSettled(
 		Array.from({ length: NODE_COUNT }, async () => {
 			const hostname = await getNextAvailableLoopbackAddress();
 			const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
-			const compDir = join(dataRootDir, 'components', 'residency-app');
-			await mkdir(compDir, { recursive: true });
-			await writeFile(
-				join(compDir, 'config.yaml'),
-				"rest: true\ngraphqlSchema:\n  files: '*.graphql'\njsResource:\n  files: resources.js\n"
-			);
-			await writeFile(
-				join(compDir, 'schema.graphql'),
-				'type Sharded @table @export {\n\tid: ID @primaryKey\n\ttag: String @indexed\n\tbody: String\n}\n'
-			);
-			await writeFile(
-				join(compDir, 'resources.js'),
-				"tables.Sharded.setResidencyById((id) => (String(id).startsWith('only-on-') ? [String(id).slice('only-on-'.length)] : undefined));\n"
-			);
 			const nodeCtx = { name: suiteName, harper: { hostname, dataRootDir } };
 			try {
+				const compDir = join(dataRootDir, 'components', 'residency-app');
+				await mkdir(compDir, { recursive: true });
+				await writeFile(
+					join(compDir, 'config.yaml'),
+					"rest: true\ngraphqlSchema:\n  files: '*.graphql'\njsResource:\n  files: resources.js\n"
+				);
+				await writeFile(
+					join(compDir, 'schema.graphql'),
+					'type Sharded @table @export {\n\tid: ID @primaryKey\n\ttag: String @indexed\n\tbody: String\n}\n'
+				);
+				await writeFile(
+					join(compDir, 'resources.js'),
+					"tables.Sharded.setResidencyById((id) => (String(id).startsWith('only-on-') ? [String(id).slice('only-on-'.length)] : undefined));\n"
+				);
 				await startHarper(nodeCtx, {
 					config: {
 						analytics: { aggregatePeriod: -1 },
@@ -241,6 +252,7 @@ async function startResidencyCluster(suiteName, replicationConfig) {
 				});
 			} catch (error) {
 				await teardownHarper(nodeCtx).catch(() => {});
+				await rm(dataRootDir, { recursive: true, force: true }).catch(() => {});
 				throw error;
 			}
 			return nodeCtx.harper;
@@ -249,20 +261,25 @@ async function startResidencyCluster(suiteName, replicationConfig) {
 	const nodes = started.filter((result) => result.status === 'fulfilled').map((result) => result.value);
 	const failed = started.find((result) => result.status === 'rejected');
 	if (failed) {
-		await Promise.all(nodes.map((node) => teardownHarper({ harper: node }).catch(() => {})));
+		await teardownResidencyCluster(nodes);
 		throw failed.reason;
 	}
-	const { operation_token: token } = await sendOperation(nodes[0], {
-		operation: 'create_authentication_tokens',
-		authorization: nodes[0].admin,
-	});
-	await sendOperation(nodes[1], {
-		operation: 'add_node',
-		rejectUnauthorized: false,
-		hostname: nodes[0].hostname,
-		authorization: 'Bearer ' + token,
-	});
-	await waitForCondition((signal) => allConnected(nodes, signal), { description: 'the cluster to connect' });
+	try {
+		const { operation_token: token } = await sendOperation(nodes[0], {
+			operation: 'create_authentication_tokens',
+			authorization: nodes[0].admin,
+		});
+		await sendOperation(nodes[1], {
+			operation: 'add_node',
+			rejectUnauthorized: false,
+			hostname: nodes[0].hostname,
+			authorization: 'Bearer ' + token,
+		});
+		await waitForCondition((signal) => allConnected(nodes, signal), { description: 'the cluster to connect' });
+	} catch (error) {
+		await teardownResidencyCluster(nodes);
+		throw error;
+	}
 	return nodes;
 }
 
@@ -279,64 +296,63 @@ async function putSharded(node, record) {
 }
 
 suite('setResidencyById migration when replication.threads is defaulted vs explicitly 0', (ctx) => {
-	before(async () => {
-		ctx.nodes = await startResidencyCluster(ctx.name, {});
-	});
-
-	after(async () => {
-		if (ctx.nodes) await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node })));
-	});
-
 	test('logs a setResidencyById error and stores residency partials on non-resident peers when the pool is active', async () => {
-		const [writer, peer] = ctx.nodes;
-		const { node_name: writerName } = await sendOperation(writer, { operation: 'cluster_status' });
-		await waitForCondition(
-			async () => {
-				const log = await readLog(writer);
-				return (
-					log.includes("Table 'Sharded' registered setResidencyById while the replication worker pool is active") &&
-					log.includes('Set replication.threads: 0')
-				);
-			},
-			{ timeoutMs: 30000, description: 'setResidencyById pool error in writer log' }
-		);
+		let nodes;
+		try {
+			nodes = await startResidencyCluster(`${ctx.name}-defaulted`, {});
+			const [writer, peer] = nodes;
+			const { node_name: writerName } = await sendOperation(writer, { operation: 'cluster_status' });
+			await waitForCondition(
+				async () => {
+					const log = await readLog(writer);
+					return (
+						log.includes("Table 'Sharded' registered setResidencyById while the replication worker pool is active") &&
+						log.includes('Set replication.threads: 0')
+					);
+				},
+				{ timeoutMs: 30000, description: 'setResidencyById pool error in writer log' }
+			);
 
-		const localOnlyId = `only-on-${writerName}`;
-		await putSharded(writer, { id: localOnlyId, tag: 'pooled-partial', body: 'resident-only' });
-		await putSharded(writer, { id: 'shared-after-partial', tag: 'shared', body: 'everywhere' });
+			const localOnlyId = `only-on-${writerName}`;
+			await putSharded(writer, { id: localOnlyId, tag: 'pooled-partial', body: 'resident-only' });
+			await putSharded(writer, { id: 'shared-after-partial', tag: 'shared', body: 'everywhere' });
 
-		await waitForCondition(
-			async (signal) => {
-				const [record] = await sendOperation(
-					peer,
-					{
-						operation: 'search_by_id',
-						table: 'Sharded',
-						ids: ['shared-after-partial'],
-						get_attributes: ['id', 'body'],
-					},
-					{ signal }
-				);
-				return record?.body === 'everywhere';
-			},
-			{ timeoutMs: 30000, description: 'subsequent shared write to replicate to peer' }
-		);
+			await waitForCondition(
+				async (signal) => {
+					const [record] = await sendOperation(
+						peer,
+						{
+							operation: 'search_by_id',
+							table: 'Sharded',
+							ids: ['shared-after-partial'],
+							get_attributes: ['id', 'body'],
+						},
+						{ signal }
+					);
+					return record?.body === 'everywhere';
+				},
+				{ timeoutMs: 30000, description: 'subsequent shared write to replicate to peer' }
+			);
 
-		const partials = await sendOperation(peer, {
-			operation: 'search_by_value',
-			table: 'Sharded',
-			search_attribute: 'id',
-			search_value: localOnlyId,
-			get_attributes: ['tag', 'body'],
-		});
-		strictEqual(partials.length, 1);
-		strictEqual(partials[0].tag, 'pooled-partial');
-		strictEqual(partials[0].body, null);
+			const partials = await sendOperation(peer, {
+				operation: 'search_by_value',
+				table: 'Sharded',
+				search_attribute: 'id',
+				search_value: localOnlyId,
+				get_attributes: ['tag', 'body'],
+			});
+			strictEqual(partials.length, 1);
+			strictEqual(partials[0].tag, 'pooled-partial');
+			strictEqual(partials[0].body, null);
+		} finally {
+			if (nodes) await teardownResidencyCluster(nodes);
+		}
 	});
 
 	test('explicit replication.threads: 0 at threads.count: 4 runs on HTTP workers and omits non-resident setResidencyById records', async () => {
-		const nodes = await startResidencyCluster(`${ctx.name}-opt-out`, { threads: 0 });
+		let nodes;
 		try {
+			nodes = await startResidencyCluster(`${ctx.name}-opt-out`, { threads: 0 });
 			const [writer, peer] = nodes;
 			for (const node of nodes) {
 				strictEqual((await threadIds(node, 'http')).length, 4);
@@ -379,7 +395,27 @@ suite('setResidencyById migration when replication.threads is defaulted vs expli
 			});
 			strictEqual(partials.length, 0, 'non-resident peer stores no partial when replication.threads: 0');
 		} finally {
-			await Promise.all(nodes.map((node) => teardownHarper({ harper: node }).catch(() => {})));
+			if (nodes) await teardownResidencyCluster(nodes);
+		}
+	});
+
+	test('defaulted replication.threads falls back to 0 pool workers when no dedicated replication port is configured', async () => {
+		const hostname = await getNextAvailableLoopbackAddress();
+		const nodeCtx = { name: `${ctx.name}-port-fallback`, harper: { hostname } };
+		try {
+			await startHarper(nodeCtx, {
+				config: {
+					analytics: { aggregatePeriod: -1 },
+					logging: { colors: false, stdStreams: false, console: true, level: 'warn' },
+					threads: { count: 4 },
+					replication: { port: null, securePort: null },
+				},
+				env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_CONFIG: '' },
+			});
+			strictEqual((await threadIds(nodeCtx.harper, 'http')).length, 4);
+			strictEqual((await threadIds(nodeCtx.harper, 'replication')).length, 0);
+		} finally {
+			await teardownHarper(nodeCtx).catch(() => {});
 		}
 	});
 });
