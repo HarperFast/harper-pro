@@ -3026,6 +3026,40 @@ export function anchorsWithoutFailedLogs(
 }
 
 /**
+ * Merges relayed copy anchors into `originFloors` (as `anchor - ORIGIN_CURSOR_OVERLAP_MS` via `resolveOriginFloors`)
+ * and builds `originFloorById` for logs not resumed in append order by `announcedAnchors`.
+ *
+ * Every relayed anchor stays in `originFloors` so `liveStartByLog` has a floor for all relayed logs if the boundary
+ * range drains or falls back mid-tail, while `originFloorById` omits `announcedAnchors` while the append-order
+ * boundary is active so entries appended after the anchor with older keys are not dropped by a key floor.
+ */
+export function applyRelayedAnchorFloors(
+	originFloors: Map<string, number> | undefined,
+	relayedAnchors: ReadonlyMap<string, number> | undefined,
+	announcedAnchors: ReadonlyMap<string, number> | undefined,
+	nameToId: Record<string, number> | undefined
+): { originFloors: Map<string, number> | undefined; originFloorById: number[] | undefined } {
+	if (!originFloors?.size && !relayedAnchors?.size) {
+		return { originFloors: undefined, originFloorById: undefined };
+	}
+	const floors = new Map(originFloors);
+	if (relayedAnchors?.size) {
+		for (const [logName, floor] of resolveOriginFloors(Object.fromEntries(relayedAnchors), nameToId)) {
+			if (floor > (floors.get(logName) ?? 0)) floors.set(logName, floor);
+		}
+	}
+	let originFloorById: number[] | undefined;
+	if (nameToId) {
+		for (const [logName, floor] of floors) {
+			if (announcedAnchors?.has(logName) || !Object.hasOwn(nameToId, logName)) continue;
+			const id = nameToId[logName];
+			if (typeof id === 'number') (originFloorById ??= [])[id] = floor;
+		}
+	}
+	return { originFloors: floors.size > 0 ? floors : undefined, originFloorById };
+}
+
+/**
  * Receive-side silence watchdog. Arm with `reset()` whenever incoming activity is observed
  * (peer ping, pong, message). If `intervalMs` elapses with the underlying socket's `bytesRead`
  * unchanged, `onSilence` is invoked exactly once.
@@ -6966,10 +7000,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														anchoredInLogOrder = true;
 													}
 												}
-												if (announcedAnchors && originFloorById) {
-													// resumed past their exact anchors: a key floor would drop entries appended later with older keys
-													const nameToId = exportIdMapping(auditStore);
-													for (const logName of announcedAnchors.keys()) delete originFloorById[nameToId[logName]];
+												if (originFloors?.size || relayedAnchors?.size) {
+													// Resumed logs carry no key floor while the append-order boundary is active; degraded logs fall back to anchor - overlap.
+													({ originFloors, originFloorById } = applyRelayedAnchorFloors(
+														originFloors,
+														relayedAnchors,
+														announcedAnchors,
+														exportIdMapping(auditStore)
+													));
+												}
+												if (relayedAnchors?.size && announcedAnchors?.size !== relayedAnchors.size) {
+													const degradedLogs = [...relayedAnchors.keys()].filter(
+														(name) => !announcedAnchors?.has(name)
+													);
+													logger.warn?.(
+														`Base copy of ${databaseName} to ${remoteNodeName} could not resume relayed log(s) ${degradedLogs.join(', ')} in append order; falling back to ${ORIGIN_CURSOR_OVERLAP_MS}ms overlap floor`
+													);
 												}
 												if (!anchoredInLogOrder && (copyResume || orderedTableNames.length > 0)) {
 													// A degraded anchor is otherwise indistinguishable from a log-order one in the logs.
@@ -6997,10 +7043,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// a resume cursor a later leader can validate before trusting the skip or the anchor.
 												ws.send(
 													encode(
-														announcedAnchors?.size &&
+														relayedAnchors?.size &&
 															peerCapabilitiesLearned &&
 															peerSupportsOriginCursors(peerCapabilities)
-															? [COPY_START, copyStartTime, COPY_ORDER_VERSION, Object.fromEntries(announcedAnchors)]
+															? [COPY_START, copyStartTime, COPY_ORDER_VERSION, Object.fromEntries(relayedAnchors)]
 															: [COPY_START, copyStartTime, COPY_ORDER_VERSION]
 													)
 												);
@@ -7280,6 +7326,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											);
 											boundaryLogName = undefined;
 											auditLogIterable = undefined;
+											if (originFloors?.size) {
+												({ originFloors, originFloorById } = applyRelayedAnchorFloors(
+													originFloors,
+													undefined,
+													undefined,
+													exportIdMapping(auditStore)
+												));
+											}
 											// Retry now, not on the next commit: whatever this boundary failed to deliver needs an
 											// ordinary range rebuilt from currentSequenceId, not a wait for unrelated future activity
 											// that may never come on an otherwise-idle database.
