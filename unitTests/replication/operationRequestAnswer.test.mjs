@@ -130,4 +130,88 @@ describe('answering an OPERATION_REQUEST', function () {
 			expect(received[0].data).to.not.have.property('replicatedFrom');
 		});
 	});
+
+	describe('a result the operation still owns', () => {
+		let realOperation;
+
+		beforeEach(() => {
+			realOperation = server.operation;
+		});
+
+		afterEach(() => {
+			server.operation = realOperation;
+		});
+
+		async function answerTo(requestId) {
+			const before = socket.sent.length;
+			socket.emit('message', encode([OPERATION_REQUEST, { operation: 'record_lock_recall', requestId }]));
+			for (let turn = 0; turn < 50 && socket.sent.length === before; turn++) {
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+			expect(socket.sent).to.have.length(before + 1);
+			const [command, answer] = socket.sent[before];
+			expect(command).to.equal(OPERATION_RESPONSE);
+			return answer;
+		}
+
+		it('answers a frozen result, ordinary or null-prototype, as a success carrying the requestId', async () => {
+			server.operation = () => Promise.resolve(Object.freeze({ recalled: true }));
+			expect(await answerTo(7)).to.deep.equal({ recalled: true, requestId: 7 });
+			server.operation = () => Promise.resolve(Object.freeze(Object.assign(Object.create(null), { recalled: true })));
+			expect(await answerTo(8)).to.deep.equal({ recalled: true, requestId: 8 });
+			expect(socket.closes).to.deep.equal([]);
+		});
+
+		it("answers a shared result with each request's own requestId", async () => {
+			const shared = { granted: false, reason: 'not-home', requestId: 'stale' };
+			server.operation = () => Promise.resolve(shared);
+			expect(await answerTo(9)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 9 });
+			expect(await answerTo(10)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 10 });
+			server.operation = () => Promise.resolve(Object.freeze({ recalled: true, requestId: 'stale' }));
+			expect(await answerTo(15)).to.deep.equal({ recalled: true, requestId: 15 });
+		});
+
+		it('encodes a copy as it would the original: a toJSON hook applies, a symbol getter is never read', async () => {
+			const hooked = Object.assign(Object.create(null), { internal: 'not for the wire', message: 'ok' });
+			Object.defineProperty(hooked, 'toJSON', {
+				value() {
+					return { message: this.message, requestId: this.requestId };
+				},
+			});
+			server.operation = () => Promise.resolve(Object.freeze(hooked));
+			expect(await answerTo(13)).to.deep.equal({ message: 'ok', requestId: 13 });
+			const symbolGetter = Object.defineProperty(Object.create(null), Symbol('unencoded'), {
+				enumerable: true,
+				get() {
+					throw new Error('the encoder never reads symbol keys');
+				},
+			});
+			symbolGetter.recalled = true;
+			server.operation = () => Promise.resolve(Object.freeze(symbolGetter));
+			expect(await answerTo(14)).to.deep.equal({ recalled: true, requestId: 14 });
+			server.operation = () =>
+				Promise.resolve({
+					recalled: true,
+					get [Symbol('unencoded')]() {
+						throw new Error('the encoder never reads symbol keys');
+					},
+				});
+			expect(await answerTo(17)).to.deep.equal({ recalled: true, requestId: 17 });
+		});
+
+		it('answers a result whose field throws on read with one correlated error, and keeps the connection', async () => {
+			server.operation = () =>
+				Promise.resolve({
+					get recalled() {
+						throw new Error('unreadable result');
+					},
+				});
+			const answer = await answerTo(11);
+			expect(answer.requestId).to.equal(11);
+			expect(answer.error).to.match(/unreadable result/);
+			server.operation = () => Promise.resolve({ recalled: true });
+			expect(await answerTo(12)).to.deep.equal({ recalled: true, requestId: 12 });
+			expect(socket.closes).to.deep.equal([]);
+		});
+	});
 });
