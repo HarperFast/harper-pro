@@ -80,9 +80,8 @@ export async function readLeaderResponse(response: IncomingMessage): Promise<any
 }
 
 /**
- * A `package_component` answer as an extractable payload: the archive itself when the leader streamed it,
- * else the base64 payload of the `{ project, payload }` envelope. Leaders that predate `stream` answer with
- * the envelope rather than refusing it, because operation validation has always allowed unknown keys.
+ * Leaders that predate `stream` answer with the `{ project, payload }` envelope rather than refusing the
+ * flag, because operation validation has always allowed unknown keys.
  */
 export async function readPackageResponse(response: IncomingMessage): Promise<string | Readable> {
 	const statusCode = response.statusCode ?? 0;
