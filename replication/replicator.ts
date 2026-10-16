@@ -354,7 +354,7 @@ function warnOfUnresolvedComputedIndexes() {
 			const unresolved = databases[databaseName][tableName]?.unresolvedComputedIndexes?.();
 			if (unresolved?.length)
 				logger.error(
-					`${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code; replication.threads workers will refuse to replicate any table of ${databaseName}, use replication.threads: 0`
+					`${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code while the replication worker pool is active (replication.threads > 0, or defaulted for threads.count >= 2); replication pool workers will refuse to replicate any table of ${databaseName}, set replication.threads: 0 to run replication on HTTP workers`
 				);
 		}
 	}
