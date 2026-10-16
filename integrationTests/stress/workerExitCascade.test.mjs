@@ -88,7 +88,8 @@ if (!stressEnabled()) {
 			const cfg = (host) => ({
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false, console: true, level: 'debug' },
-				replication: { securePort: host + ':9933' },
+				// SuicideWorker exits an HTTP worker, so keep subscriptions on the shared HTTP workers.
+				replication: { securePort: host + ':9933', threads: 0 },
 				threads: { count: THREADS_PER_NODE },
 			});
 			await startHarper(nodeA, { config: cfg(nodeA.harper.hostname), env: { HARPER_NO_FLUSH_ON_EXIT: true } });

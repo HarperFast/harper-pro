@@ -75,13 +75,11 @@ const results = {
 };
 
 function replicationFor(hostname, overrides) {
-	const envReplication = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG)?.replication : undefined;
 	return {
 		securePort: hostname + ':9933',
 		databases: [DB, 'system'],
 		pingInterval: 1000,
 		pingTimeout: 3000,
-		...envReplication,
 		...overrides,
 	};
 }

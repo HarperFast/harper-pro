@@ -166,8 +166,8 @@ export async function restartNode(node, opts) {
  */
 export function replicationPoolOffEnv() {
 	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
-	if (!(shared?.replication?.threads > 0)) return {};
-	return { HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared.replication, threads: 0 } }) };
+	if (shared?.replication?.threads === 0) return {};
+	return { HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared?.replication, threads: 0 } }) };
 }
 
 /**
