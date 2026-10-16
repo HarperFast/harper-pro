@@ -7,17 +7,16 @@ export class ApplicationCloneError extends Error {
 }
 
 /**
- * Whether a leader can package an application's node_modules without its own Harper install. From 5.3.0
- * the packer leaves out the loader's `node_modules/harper` link; earlier leaders follow it (v4 follows
- * `node_modules/harperdb`), so every application would carry the whole install. A 5.3.0 prerelease is
- * earlier than 5.3.0, and the alphas lack the exclusion.
+ * Whether a leader streams `package_component`, which it has since 5.2.3. A leader that cannot builds the
+ * whole archive in memory, and before 5.3.0 that archive also carries the leader's own install through the
+ * loader's link in node_modules (v4: 80 MB of base64 for a two-file app), so node_modules is copied only
+ * from a leader that streams.
  */
-export function packagesNodeModulesWithoutInstall(leaderVersion: string | undefined): boolean {
+export function streamsPackages(leaderVersion: string | undefined): boolean {
 	const [, major, minor, patch, prerelease] = /(\d+)\.(\d+)(?:\.(\d+)(-\S+)?)?/.exec(leaderVersion ?? '') ?? [];
 	if (major === undefined) return false;
-	if (Number(major) !== 5) return Number(major) > 5;
-	if (Number(minor) !== 3) return Number(minor) > 3;
-	return Number(patch ?? 0) > 0 || prerelease === undefined;
+	const order = [Number(major) - 5, Number(minor) - 2, Number(patch ?? 0) - 3].find((difference) => difference !== 0);
+	return order === undefined ? prerelease === undefined : order > 0;
 }
 
 /**

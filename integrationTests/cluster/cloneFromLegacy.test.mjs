@@ -164,9 +164,7 @@ suite('Clone from legacy v4 leader', { timeout: 240000 }, (ctx) => {
 		await waitForAvailableStatus(cloneCtx.harper);
 
 		ok(
-			/instead of copying node_modules \(leader 4\.[\d.]+ would include its own install\)/.test(
-				await readLog(cloneCtx.harper)
-			),
+			/instead of copying node_modules \(leader 4\.[\d.]+ cannot stream it\)/.test(await readLog(cloneCtx.harper)),
 			'A clone of a v4 leader must not ask it for node_modules, which would carry the whole v4 install'
 		);
 		const cloneComponents = await sendOperation(cloneCtx.harper, { operation: 'get_components' });
