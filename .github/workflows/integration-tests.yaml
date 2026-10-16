@@ -556,8 +556,8 @@ jobs:
           # run heavy clusters, and the default (availableParallelism/2+1) let too
           # many run at once on CI runners, starving each other into shard timeouts.
           HARPER_INTEGRATION_TEST_CONCURRENCY: '2'
-          # Every node a suite starts inherits this; empty (pool off) is the same as unset.
-          HARPER_CONFIG: ${{ matrix.replication-threads != 0 && format('{{"replication":{{"threads":{0}}}}}', matrix.replication-threads) || '' }}
+          # Every node a suite starts inherits this unless the suite overrides replication.threads explicitly.
+          HARPER_CONFIG: ${{ format('{{"replication":{{"threads":{0}}}}}', matrix.replication-threads) }}
         run: |
           npm run test:integration:cluster -- --shard=${{ matrix.shard }}/6
 
