@@ -7,10 +7,10 @@
 import { suite, test, before, after } from 'node:test';
 import { ok, strictEqual } from 'node:assert';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { sendOperation, readLog, waitForCondition } from './clusterShared.mjs';
+import { sendOperation, readLog, restartNode, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -212,10 +212,8 @@ for (const { label, nodeConfig } of [
 async function teardownResidencyCluster(nodes) {
 	await Promise.all(
 		nodes.map(async (node) => {
+			await stopNodeProcess(node).catch(() => {});
 			await teardownHarper({ harper: node }).catch(() => {});
-			if (node?.dataRootDir) {
-				await rm(node.dataRootDir, { recursive: true, force: true }).catch(() => {});
-			}
 		})
 	);
 }
@@ -224,9 +222,10 @@ async function startResidencyCluster(suiteName, replicationConfig) {
 	const started = await Promise.allSettled(
 		Array.from({ length: NODE_COUNT }, async () => {
 			const hostname = await getNextAvailableLoopbackAddress();
-			const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
-			const nodeCtx = { name: suiteName, harper: { hostname, dataRootDir } };
+			const nodeCtx = { name: suiteName, harper: { hostname } };
 			try {
+				const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
+				nodeCtx.harper.dataRootDir = dataRootDir;
 				const compDir = join(dataRootDir, 'components', 'residency-app');
 				await mkdir(compDir, { recursive: true });
 				await writeFile(
@@ -252,7 +251,6 @@ async function startResidencyCluster(suiteName, replicationConfig) {
 				});
 			} catch (error) {
 				await teardownHarper(nodeCtx).catch(() => {});
-				await rm(dataRootDir, { recursive: true, force: true }).catch(() => {});
 				throw error;
 			}
 			return nodeCtx.harper;
@@ -398,10 +396,12 @@ suite('setResidencyById migration when replication.threads is defaulted vs expli
 			if (nodes) await teardownResidencyCluster(nodes);
 		}
 	});
+});
 
-	test('defaulted replication.threads falls back to 0 pool workers when no dedicated replication port is configured', async () => {
+suite('defaulted replication.threads port fallback', (ctx) => {
+	test('falls back to 0 pool workers across restart when no replication port is configured', async () => {
 		const hostname = await getNextAvailableLoopbackAddress();
-		const nodeCtx = { name: `${ctx.name}-port-fallback`, harper: { hostname } };
+		const nodeCtx = { name: `${ctx.name}-no-port`, harper: { hostname } };
 		try {
 			await startHarper(nodeCtx, {
 				config: {
@@ -414,8 +414,115 @@ suite('setResidencyById migration when replication.threads is defaulted vs expli
 			});
 			strictEqual((await threadIds(nodeCtx.harper, 'http')).length, 4);
 			strictEqual((await threadIds(nodeCtx.harper, 'replication')).length, 0);
+
+			// Restart to prove validateConfig did not persist the defaulted replication.threads
+			// into harperdb-config.yaml and cause a second-boot throw.
+			await restartNode(nodeCtx.harper);
+			await waitForCondition(
+				async (signal) => {
+					try {
+						const http = await threadIds(nodeCtx.harper, 'http', signal);
+						const repl = await threadIds(nodeCtx.harper, 'replication', signal);
+						return http.length === 4 && repl.length === 0;
+					} catch {
+						return false;
+					}
+				},
+				{ timeoutMs: 30000, description: 'restarted node to come back with 4 HTTP and 0 replication workers' }
+			);
+		} finally {
+			if (nodeCtx.harper?.dataRootDir) await stopNodeProcess(nodeCtx.harper).catch(() => {});
+			await teardownHarper(nodeCtx).catch(() => {});
+		}
+	});
+
+	test('falls back to 0 pool workers when replication.port shares the operations API port', async () => {
+		const hostname = await getNextAvailableLoopbackAddress();
+		const nodeCtx = { name: `${ctx.name}-shared-ops-port`, harper: { hostname } };
+		try {
+			await startHarper(nodeCtx, {
+				config: {
+					analytics: { aggregatePeriod: -1 },
+					logging: { colors: false, stdStreams: false, console: true, level: 'warn' },
+					threads: { count: 4 },
+					replication: { port: hostname + ':9925', securePort: null },
+				},
+				env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_CONFIG: '' },
+			});
+			strictEqual((await threadIds(nodeCtx.harper, 'http')).length, 4);
+			strictEqual((await threadIds(nodeCtx.harper, 'replication')).length, 0);
 		} finally {
 			await teardownHarper(nodeCtx).catch(() => {});
+		}
+	});
+
+	test('falls back to 0 pool workers and replicates on HTTP workers when replication.port shares http.port', async () => {
+		let nodes = [];
+		try {
+			const started = await Promise.allSettled(
+				Array.from({ length: NODE_COUNT }, async () => {
+					const hostname = await getNextAvailableLoopbackAddress();
+					const nodeCtx = { name: `${ctx.name}-shared-http-port`, harper: { hostname } };
+					try {
+						await startHarper(nodeCtx, {
+							config: {
+								analytics: { aggregatePeriod: -1 },
+								logging: { colors: false, stdStreams: false, console: true, level: 'warn' },
+								threads: { count: 4 },
+								replication: { port: hostname + ':9926', securePort: null },
+							},
+							env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_CONFIG: '' },
+						});
+					} catch (error) {
+						await teardownHarper(nodeCtx).catch(() => {});
+						throw error;
+					}
+					return nodeCtx.harper;
+				})
+			);
+			nodes = started.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+			const failed = started.find((result) => result.status === 'rejected');
+			if (failed) throw failed.reason;
+
+			for (const node of nodes) {
+				strictEqual((await threadIds(node, 'http')).length, 4);
+				strictEqual((await threadIds(node, 'replication')).length, 0);
+			}
+
+			for (const node of nodes) {
+				await sendOperation(node, {
+					operation: 'create_table',
+					table: 'fallback_shared',
+					primary_key: 'id',
+					attributes: [
+						{ name: 'id', type: 'ID' },
+						{ name: 'name', type: 'String' },
+					],
+				});
+			}
+			await sendOperation(nodes[1], {
+				operation: 'add_node',
+				rejectUnauthorized: false,
+				hostname: nodes[0].hostname,
+				retain_authorization: true,
+				authorization: nodes[0].admin,
+			});
+			await waitForCondition((signal) => allConnected(nodes, signal), {
+				description: 'the fallback cluster to connect over the shared HTTP port',
+			});
+
+			await sendOperation(nodes[0], {
+				operation: 'upsert',
+				table: 'fallback_shared',
+				records: [{ id: '1', name: 'over-shared-http-port' }],
+			});
+			const record = await waitForCondition((signal) => readReplicated(nodes[1], 'fallback_shared', '1', signal), {
+				timeoutMs: 30000,
+				description: 'write to replicate over the shared HTTP port on HTTP workers',
+			});
+			strictEqual(record.name, 'over-shared-http-port');
+		} finally {
+			await teardownResidencyCluster(nodes);
 		}
 	});
 });
