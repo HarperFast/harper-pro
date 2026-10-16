@@ -3,13 +3,11 @@ import { Readable } from 'node:stream';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { gte, valid } from 'semver';
 import { PROJECT_NAME_PATTERN } from '../core/utility/componentNames.ts';
+import { LEADER_REQUEST_ATTEMPTS, LEADER_RETRY_DELAY_MS } from './sshKeyClone.ts';
 
 export class ApplicationCloneError extends Error {
 	name = 'ApplicationCloneError';
 }
-
-const LEADER_REQUEST_ATTEMPTS = 3;
-const LEADER_RETRY_DELAY_MS = 1000;
 
 type Transfer = { withNodeModules: true } | { withNodeModules: false; reason: string };
 
@@ -23,9 +21,8 @@ export function streamsPackages(leaderVersion: string | undefined): boolean | un
 }
 
 /**
- * Copies the leader's filesystem-only applications (see cloneNode/DESIGN.md). Every application is
- * attempted, then any failure throws, so clone setup stops before this node can be marked cloned or
- * Available without an application the leader serves.
+ * Copies the leader's filesystem-only applications (see cloneNode/DESIGN.md). A failure throws only after
+ * every application was attempted, so the log names all of them.
  */
 export async function cloneFilesystemOnlyApplications({
 	listComponents,
@@ -128,7 +125,7 @@ export async function cloneFilesystemOnlyApplications({
 }
 
 // The loader never loads a dot-prefixed directory (`.git`, editor state, Harper's own staging), and
-// package_component refuses the name. A malformed name such as `../escape` is not hidden: it is refused.
+// package_component refuses the name.
 function isHiddenDirectory(name: unknown): boolean {
 	return isComponentName(name) && name.startsWith('.');
 }
