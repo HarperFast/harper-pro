@@ -119,6 +119,15 @@ async function startCluster(suiteName, recordLocks) {
 		for (const c of contexts) await stopNode(c);
 		throw failed.reason;
 	}
+	if (results.replicationThreads === undefined && contexts.length > 0) {
+		try {
+			const sysInfo = await sendOperation(contexts[0].harper, {
+				operation: 'system_information',
+				attributes: ['threads'],
+			});
+			results.replicationThreads = (sysInfo.threads ?? []).filter((t) => t.name === 'replication').length;
+		} catch {}
+	}
 	return contexts;
 }
 
