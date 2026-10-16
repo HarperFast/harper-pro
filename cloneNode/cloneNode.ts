@@ -1161,8 +1161,9 @@ async function cloneApplications(): Promise<void> {
 			if (usingCertAuth) return { withNodeModules: false, reason: 'certificate authentication cannot stream it' };
 			// Unknown is not older: rebuilding with npm could certify a clone missing a node_modules-only package.
 			const version = await leaderVersion();
-			if (version === undefined) throw new Error('the leader did not report its version');
-			if (streamsPackages(version)) return { withNodeModules: true };
+			const streams = streamsPackages(version);
+			if (streams === undefined) throw new Error(`the leader did not report a usable version (${version ?? 'none'})`);
+			if (streams) return { withNodeModules: true };
 			return { withNodeModules: false, reason: `leader ${version} cannot stream it` };
 		},
 		requestPackage: requestApplicationPackage,
