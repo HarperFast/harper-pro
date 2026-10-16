@@ -3026,9 +3026,8 @@ export function anchorsWithoutFailedLogs(
 }
 
 /**
- * Records an `anchor - ORIGIN_CURSOR_OVERLAP_MS` floor in `originFloors` for every relayed anchor so
- * `liveStartByLog` covers all of them if the boundary range falls back, while `originFloorById` omits
- * `exactAnchors` for the life of the boundary range so append-order delivery is not filtered by key.
+ * Merges `anchor - ORIGIN_CURSOR_OVERLAP_MS` for each relayed anchor into `originFloors`, keeping the higher
+ * floor, and builds `originFloorById` from the result, omitting `exactAnchors`.
  */
 export function applyRelayedAnchorFloors(
 	originFloors: Map<string, number> | undefined,
@@ -7281,7 +7280,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 										for (const auditRecord of auditLogIterable) {
 											const key: number = auditRecord.txnLogKey;
-											if (closed) return;
+											if (closed || wsClosed) return;
 											logger.debug?.('sending audit record', key, auditRecord.recordId);
 											if (tables?.test)
 												logger.debug?.(
