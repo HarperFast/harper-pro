@@ -12,7 +12,14 @@ function harness({
 	streamed = false,
 	transfer = { withNodeModules: true },
 	failTransfer,
+	transientFailures = {},
 } = {}) {
+	const remaining = { ...transientFailures };
+	const transient = (key) => {
+		if (!(remaining[key] > 0)) return false;
+		remaining[key]--;
+		return true;
+	};
 	const requested = [];
 	const transfers = [];
 	const prepared = [];
@@ -30,7 +37,9 @@ function harness({
 		run: () =>
 			cloneFilesystemOnlyApplications({
 				listComponents: async () => {
-					if (failListing) throw new Error('Leader request failed: 503 Service Unavailable');
+					if (failListing || transient('get_components')) {
+						throw new Error('Leader request failed: 503 Service Unavailable');
+					}
 					return listing;
 				},
 				chooseTransfer: async () => {
@@ -42,6 +51,7 @@ function harness({
 					requested.push(name);
 					transfers.push(withNodeModules);
 					if (failPackage.includes(name)) throw new Error(`Unable to locate project '${name}'`);
+					if (transient(name)) throw new Error('read ECONNRESET');
 					if (!streamed) return `payload:${name}`;
 					const archive = Readable.from([Buffer.from(name)]);
 					archives.push(archive);
@@ -52,6 +62,7 @@ function harness({
 					prepared.push({ name, payload: payload instanceof Readable ? 'archive' : payload });
 				},
 				log: (message, level) => logged.push({ message, level }),
+				retryDelayMs: 0,
 			}),
 	};
 }
@@ -111,7 +122,7 @@ describe('cloneFilesystemOnlyApplications', () => {
 			message: 'Failed to clone 2 of 3 filesystem-only application(s) from the leader: first, third',
 		});
 
-		assert.deepEqual(clone.requested, ['first', 'second', 'third']);
+		assert.deepEqual(clone.requested, ['first', 'first', 'first', 'second', 'third', 'third', 'third']);
 		assert.deepEqual(
 			clone.prepared.map(({ name }) => name),
 			['second']
@@ -178,7 +189,7 @@ describe('cloneFilesystemOnlyApplications', () => {
 		});
 		await assert.rejects(clone.run());
 
-		assert.equal(clone.archives.length, 2);
+		assert.equal(clone.archives.length, 4);
 		assert.ok(
 			clone.archives.every((archive) => archive.destroyed),
 			'an archive preparation never read must not stay open'
@@ -214,6 +225,28 @@ describe('cloneFilesystemOnlyApplications', () => {
 		assert.equal(clone.transferChoices(), 0);
 	});
 
+	it('retries an application after a transient leader error', async () => {
+		const clone = harness({ listing: { entries: [filesystemOnly('app')] }, transientFailures: { app: 2 } });
+		await clone.run();
+
+		assert.deepEqual(clone.requested, ['app', 'app', 'app']);
+		assert.deepEqual(
+			clone.prepared.map(({ name }) => name),
+			['app']
+		);
+		assert.deepEqual(clone.errors(), []);
+	});
+
+	it('retries the listing after a transient leader error', async () => {
+		const clone = harness({
+			listing: { entries: [filesystemOnly('app')] },
+			transientFailures: { get_components: 2 },
+		});
+		await clone.run();
+
+		assert.deepEqual(clone.requested, ['app']);
+	});
+
 	it('stops before copying anything when it cannot choose the transfer', async () => {
 		const clone = harness({
 			listing: { entries: [filesystemOnly('app')] },
@@ -240,10 +273,12 @@ describe('streamsPackages', () => {
 		['5.3.0', true],
 		['5.10.0', true],
 		['6.0.0', true],
-		[undefined, false],
-		['unknown', false],
+		[undefined, undefined],
+		['', undefined],
+		['unknown', undefined],
+		['4.3', undefined],
 	]) {
-		it(`${expected ? 'streams' : 'does not stream'} from a leader reporting ${version}`, () => {
+		it(`reads ${JSON.stringify(version)} as ${expected}`, () => {
 			assert.equal(streamsPackages(version), expected);
 		});
 	}

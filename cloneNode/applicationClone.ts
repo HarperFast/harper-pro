@@ -1,33 +1,31 @@
 import { basename } from 'node:path';
 import { Readable } from 'node:stream';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { gte, valid } from 'semver';
 import { PROJECT_NAME_PATTERN } from '../core/utility/componentNames.ts';
 
 export class ApplicationCloneError extends Error {
 	name = 'ApplicationCloneError';
 }
 
+const LEADER_REQUEST_ATTEMPTS = 3;
+const LEADER_RETRY_DELAY_MS = 1000;
+
+type Transfer = { withNodeModules: true } | { withNodeModules: false; reason: string };
+
 /**
- * Whether a leader streams `package_component`, which it has since 5.2.3. A leader that cannot builds the
- * whole archive in memory, and before 5.3.0 that archive also carries the leader's own install through the
- * loader's link in node_modules (v4: 80 MB of base64 for a two-file app), so node_modules is copied only
- * from a leader that streams.
+ * `package_component` streams from 5.2.3 (see cloneNode/DESIGN.md for why that decides the transfer);
+ * undefined when the version is not semver.
  */
-export function streamsPackages(leaderVersion: string | undefined): boolean {
-	const [, major, minor, patch, prerelease] = /(\d+)\.(\d+)(?:\.(\d+)(-\S+)?)?/.exec(leaderVersion ?? '') ?? [];
-	if (major === undefined) return false;
-	const order = [Number(major) - 5, Number(minor) - 2, Number(patch ?? 0) - 3].find((difference) => difference !== 0);
-	return order === undefined ? prerelease === undefined : order > 0;
+export function streamsPackages(leaderVersion: string | undefined): boolean | undefined {
+	const parsed = valid(leaderVersion ?? '');
+	return parsed === null ? undefined : gte(parsed, '5.2.3');
 }
 
 /**
- * Copies the leader's filesystem-only applications — those without a `package` in its config, which
- * nothing reinstalls on this node — as the leader packages them, node_modules included whenever
- * `chooseTransfer` allows: npm cannot rebuild a package whose only copy is in node_modules (a `file:`
- * dependency into it, a bundler's private workspace package), nor a deploy's request-scoped install
- * options or registry credentials.
- *
- * Every application is attempted, then any failure throws, so clone setup stops before this node can be
- * marked cloned or Available without an application the leader serves.
+ * Copies the leader's filesystem-only applications (see cloneNode/DESIGN.md). Every application is
+ * attempted, then any failure throws, so clone setup stops before this node can be marked cloned or
+ * Available without an application the leader serves.
  */
 export async function cloneFilesystemOnlyApplications({
 	listComponents,
@@ -35,16 +33,31 @@ export async function cloneFilesystemOnlyApplications({
 	requestPackage,
 	prepareApplication,
 	log,
+	attempts = LEADER_REQUEST_ATTEMPTS,
+	retryDelayMs = LEADER_RETRY_DELAY_MS,
 }: {
 	listComponents: () => Promise<any>;
-	chooseTransfer: () => Promise<{ withNodeModules: boolean; reason?: string }>;
+	chooseTransfer: () => Promise<Transfer>;
 	requestPackage: (name: string, withNodeModules: boolean) => Promise<string | Readable>;
 	prepareApplication: (name: string, payload: string | Readable) => Promise<unknown>;
 	log: (message: string, level?: 'notify' | 'error') => void;
+	attempts?: number;
+	retryDelayMs?: number;
 }): Promise<void> {
+	const retried = async <T>(what: string, operation: () => Promise<T>): Promise<T> => {
+		for (let attempt = 1; ; attempt++) {
+			try {
+				return await operation();
+			} catch (error) {
+				if (attempt >= attempts) throw error;
+				log(`${what} failed (attempt ${attempt}/${attempts}), retrying: ${error}`);
+				await sleep(retryDelayMs);
+			}
+		}
+	};
 	let listing: any;
 	try {
-		listing = await listComponents();
+		listing = await retried("Listing the leader's applications", listComponents);
 	} catch (error) {
 		throw new ApplicationCloneError(`Unable to list the leader's applications: ${(error as Error)?.message ?? error}`, {
 			cause: error,
@@ -65,7 +78,7 @@ export async function cloneFilesystemOnlyApplications({
 		return;
 	}
 	log(`Cloning ${applications.length} application(s) not referenced in harper-config`);
-	let transfer: { withNodeModules: boolean; reason?: string };
+	let transfer: Transfer;
 	try {
 		transfer = await chooseTransfer();
 	} catch (error) {
@@ -74,17 +87,16 @@ export async function cloneFilesystemOnlyApplications({
 			{ cause: error }
 		);
 	}
-	const { withNodeModules, reason } = transfer;
-	if (!withNodeModules) {
+	const { withNodeModules } = transfer;
+	if ('reason' in transfer) {
 		log(
-			`Reinstalling each application's dependencies with npm instead of copying node_modules (${reason}); a package that exists only in an application's node_modules will be missing`
+			`Reinstalling each application's dependencies with npm instead of copying node_modules (${transfer.reason}); a package that exists only in an application's node_modules will be missing`
 		);
 	}
 
 	const failed: string[] = [];
 	for (const { name } of applications) {
 		log(`Cloning application: ${name}`);
-		let payload: string | Readable | undefined;
 		try {
 			if (!isComponentName(name)) throw new Error('the leader listed it under a name that is not a directory name');
 			// package_component cuts `app.v2` down to `app`, so the request would return a different application.
@@ -93,15 +105,19 @@ export async function cloneFilesystemOnlyApplications({
 					`package_component cannot fetch it by that name; rename it on the leader to letters, digits, '-' and '_' only`
 				);
 			}
-			payload = await requestPackage(name, withNodeModules);
-			await prepareApplication(name, payload);
+			await retried(`Cloning application '${name}'`, async () => {
+				const payload = await requestPackage(name, withNodeModules);
+				try {
+					await prepareApplication(name, payload);
+				} finally {
+					// An archive that preparation never read would otherwise hold the leader's response open.
+					if (payload instanceof Readable) payload.destroy();
+				}
+			});
 			log(`Successfully cloned application: ${name}`);
 		} catch (error) {
 			log(`Failed to clone application '${name}': ${error}`, 'error');
 			failed.push(name);
-		} finally {
-			// An archive that preparation never read would otherwise hold the leader's response open.
-			if (payload instanceof Readable) payload.destroy();
 		}
 	}
 	if (failed.length > 0) {

@@ -32,5 +32,7 @@ archive. Tests: `unitTests/cloneNode/applicationClone.test.mjs`, `integrationTes
 **Limits.** The copy is core's package of the leader's tree: links dereferenced, core's exclusions
 applied. Until HarperFast/harper#3207 ships, the leader still packs its install through the loader link
 inside every npm sub-component; the clone's loader replaces each copy with its own link. Copying assumes
-leader and clone share a platform, as any payload deploy that carries `node_modules` already does. Success
-means the application was prepared, not that its workers loaded it.
+leader and clone share a platform, as any payload deploy that carries `node_modules` already does. Over a
+buffered transfer, an application whose own files compress past about 384 MiB exceeds V8's string limit on
+the leader and stops the clone. Success means the application was prepared, not that its workers loaded
+it.
