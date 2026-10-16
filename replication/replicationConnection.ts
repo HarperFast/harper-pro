@@ -3026,17 +3026,14 @@ export function anchorsWithoutFailedLogs(
 }
 
 /**
- * Merges relayed copy anchors into `originFloors` (as `anchor - ORIGIN_CURSOR_OVERLAP_MS` via `resolveOriginFloors`)
- * and builds `originFloorById` for logs not resumed in append order by `announcedAnchors`.
- *
- * Every relayed anchor stays in `originFloors` so `liveStartByLog` has a floor for all relayed logs if the boundary
- * range drains or falls back mid-tail, while `originFloorById` omits `announcedAnchors` while the append-order
- * boundary is active so entries appended after the anchor with older keys are not dropped by a key floor.
+ * Records an `anchor - ORIGIN_CURSOR_OVERLAP_MS` floor in `originFloors` for every relayed anchor so
+ * `liveStartByLog` covers all of them if the boundary range falls back, while `originFloorById` omits
+ * `exactAnchors` for the life of the boundary range so append-order delivery is not filtered by key.
  */
 export function applyRelayedAnchorFloors(
 	originFloors: Map<string, number> | undefined,
 	relayedAnchors: ReadonlyMap<string, number> | undefined,
-	announcedAnchors: ReadonlyMap<string, number> | undefined,
+	exactAnchors: ReadonlyMap<string, number> | undefined,
 	nameToId: Record<string, number> | undefined
 ): { originFloors: Map<string, number> | undefined; originFloorById: number[] | undefined } {
 	if (!originFloors?.size && !relayedAnchors?.size) {
@@ -3051,7 +3048,7 @@ export function applyRelayedAnchorFloors(
 	let originFloorById: number[] | undefined;
 	if (nameToId) {
 		for (const [logName, floor] of floors) {
-			if (announcedAnchors?.has(logName) || !Object.hasOwn(nameToId, logName)) continue;
+			if (exactAnchors?.has(logName) || !Object.hasOwn(nameToId, logName)) continue;
 			const id = nameToId[logName];
 			if (typeof id === 'number') (originFloorById ??= [])[id] = floor;
 		}
@@ -6926,8 +6923,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															)
 														: undefined;
 												const boundaryFailure = (rangeOptions: any) => rangeBoundaryFailure(auditStore, rangeOptions);
-												// only anchors the tail resumes past are the receiver's to keep
-												let announcedAnchors: Map<string, number> | undefined;
+												// Relayed logs whose boundary probe succeeded and therefore resume in append order.
+												let exactAnchors: Map<string, number> | undefined;
 												// A resumed copy resumes in append order only if its anchor still NAMES an entry of the log;
 												// anything else — a pre-#876 wall-clock anchor, a purged entry, a log that cannot be read — keeps
 												// the timestamp resume every build before this one used for every cursor. `resumeAnchorKind`
@@ -6958,7 +6955,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													if (anchors?.size) {
 														auditLogIterable = auditStore.getRange(relayedRange);
 														boundaryLogName = logName;
-														announcedAnchors = anchors;
+														exactAnchors = anchors;
 													} else auditLogIterable = auditStore.getRange(emptyLogRange);
 													anchoredInLogOrder = true;
 												} else if (
@@ -6986,7 +6983,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														boundaryRange.startByLog = new Map([[logName, copyStartTime], ...(anchors ?? [])]);
 														unusable = boundaryFailure(boundaryRange);
 													}
-													if (!unusable) announcedAnchors = anchors;
+													if (!unusable) exactAnchors = anchors;
 													if (unusable) {
 														// Degrade rather than refuse, for the same reason. The anchor stays the entry's key, which
 														// under the timestamp range still replays everything keyed after it.
@@ -7001,17 +6998,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													}
 												}
 												if (originFloors?.size || relayedAnchors?.size) {
-													// Resumed logs carry no key floor while the append-order boundary is active; degraded logs fall back to anchor - overlap.
 													({ originFloors, originFloorById } = applyRelayedAnchorFloors(
 														originFloors,
 														relayedAnchors,
-														announcedAnchors,
+														exactAnchors,
 														exportIdMapping(auditStore)
 													));
 												}
-												if (relayedAnchors?.size && announcedAnchors?.size !== relayedAnchors.size) {
+												if (relayedAnchors?.size && exactAnchors?.size !== relayedAnchors.size) {
 													const degradedLogs = [...relayedAnchors.keys()].filter(
-														(name) => !announcedAnchors?.has(name)
+														(name) => !exactAnchors?.has(name)
 													);
 													logger.warn?.(
 														`Base copy of ${databaseName} to ${remoteNodeName} could not resume relayed log(s) ${degradedLogs.join(', ')} in append order; falling back to ${ORIGIN_CURSOR_OVERLAP_MS}ms overlap floor`
@@ -7306,6 +7302,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											await sendAuditRecord(auditRecord, key);
 											if (key > auditSubscription.startTime) auditSubscription.startTime = key; // don't double send
 										}
+										if (closed) return;
 										// Backstop for the pre-COPY_START probe, which pulled a different iterable. Every failure signal
 										// counts, not just the boundary one: a local iterator that dies mid-pass leaves the reusable
 										// iterable exhausted while the follower's cursor keeps advancing. Drop the append-order range and

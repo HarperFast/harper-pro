@@ -268,7 +268,7 @@ describe('applyRelayedAnchorFloors', () => {
 		});
 	});
 
-	it('populates originFloorById only for degraded logs not in announcedAnchors, and preserves higher existing floors', () => {
+	it('populates originFloorById only for logs not in exactAnchors, and preserves higher existing floors', () => {
 		const originFloors = new Map([
 			['relayed', T - 5],
 			['prior', T - 30],
@@ -277,13 +277,11 @@ describe('applyRelayedAnchorFloors', () => {
 			['relayed', T - 10],
 			['removed', T - 20],
 		]);
-		const announcedAnchors = new Map([
-			['relayed', T - 10],
-			['prior', T - 30],
-		]);
+		const exactAnchors = new Map([['relayed', T - 10]]);
 		const expectedFloorById = [];
 		expectedFloorById[3] = T - 20 - ORIGIN_CURSOR_OVERLAP_MS;
-		assert.deepStrictEqual(applyRelayedAnchorFloors(originFloors, relayedAnchors, announcedAnchors, nameToId), {
+		expectedFloorById[4] = T - 30;
+		assert.deepStrictEqual(applyRelayedAnchorFloors(originFloors, relayedAnchors, exactAnchors, nameToId), {
 			originFloors: new Map([
 				['relayed', T - 5],
 				['prior', T - 30],

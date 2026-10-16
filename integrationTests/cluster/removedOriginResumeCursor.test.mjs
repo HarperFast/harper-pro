@@ -159,16 +159,17 @@ async function logSince(node, mark) {
 }
 
 const SENT = /wrote record (\S+) length: \S+ remoteNode (\S+)/g;
-const oldIdsSentIn = (log, receiver) => [
-	...new Set([...log.matchAll(SENT)].filter(([, id, to]) => to === receiver.hostname && isOld(id)).map(([, id]) => id)),
+const idsSentIn = (log, receiver) => [
+	...new Set([...log.matchAll(SENT)].filter(([, , to]) => to === receiver.hostname).map(([, id]) => id)),
 ];
+const oldIdsSentIn = (log, receiver) => idsSentIn(log, receiver).filter(isOld);
 
 async function oldIdsSent(sender, receiver, mark) {
 	return oldIdsSentIn(await logSince(sender, mark), receiver);
 }
 
 /** Only the copy's tail counts: the copy itself carries every row. */
-async function oldIdsSentAfterCopy(sender, receiver, mark) {
+async function idsSentAfterCopy(sender, receiver, mark) {
 	const copied = `Finished copy table ${TABLE} ${receiver.hostname}`;
 	let log;
 	await waitForCondition(async () => (log = await logSince(sender, mark)).includes(copied), {
@@ -177,7 +178,11 @@ async function oldIdsSentAfterCopy(sender, receiver, mark) {
 	});
 	await delay(SETTLE_MS);
 	log = await logSince(sender, mark);
-	return oldIdsSentIn(log.slice(log.indexOf(copied)), receiver);
+	return idsSentIn(log.slice(log.indexOf(copied)), receiver);
+}
+
+async function oldIdsSentAfterCopy(sender, receiver, mark) {
+	return (await idsSentAfterCopy(sender, receiver, mark)).filter(isOld);
 }
 
 suite('Removed and relayed origins resume from per-origin cursors (harper-pro#989)', { timeout: 600_000 }, (ctx) => {
@@ -281,9 +286,8 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		let markA = await logMark(A);
 		await addNode(N, A);
 		deepEqual(await oldIdsSentAfterCopy(A, N, markA), [], "A's copy tail to N must not carry OLD rows");
-		// Force a duplicate log key at B's anchor for Q (as happens under multi-threaded relay when two peers
-		// deliver the same relayed batch concurrently) so B's exact append-order resume for Q degrades to the
-		// overlap floor instead of replaying Q from 0.
+		// Two batches at Q's anchor key (as under concurrent multi-path relay) trip exactStartFailures 'duplicate',
+		// degrading Q from append-order resume to the overlap floor.
 		const qDup = ['q-dup-0', 'q-dup-1'];
 		await postToFixture(B, 'OriginLogWrite', {
 			ghost: Q.hostname,
@@ -292,7 +296,12 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		});
 		const markB = await logMark(B);
 		await addNode(N, B);
-		deepEqual(await oldIdsSentAfterCopy(B, N, markB), [], "B's copy tail to N must not carry OLD rows");
+		const bTailIds = await idsSentAfterCopy(B, N, markB);
+		deepEqual(bTailIds.filter(isOld), [], "B's copy tail to N must not carry OLD rows");
+		ok(
+			qMid.every((id) => bTailIds.includes(id)),
+			`B's degraded copy tail to N must replay Q's overlap window below its anchor, got ${JSON.stringify(bTailIds)}`
+		);
 		ok(
 			(await logSince(B, markB)).includes(`could not resume relayed log(s) ${Q.hostname} in append order`),
 			"B must warn when Q's relayed log degrades from exact append-order resume to the overlap floor"
