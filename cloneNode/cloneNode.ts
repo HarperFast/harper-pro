@@ -36,11 +36,7 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
-import {
-	ApplicationCloneError,
-	cloneFilesystemOnlyApplications,
-	packagesNodeModulesWithoutInstall,
-} from './applicationClone.ts';
+import { ApplicationCloneError, cloneFilesystemOnlyApplications, streamsPackages } from './applicationClone.ts';
 import { postToLeader, readLeaderResponse, readPackageResponse, type LeaderHTTPTarget } from './leaderHTTP.ts';
 import { cloneSSHKeysFromLeader } from './sshKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
@@ -1166,8 +1162,8 @@ async function cloneApplications(): Promise<void> {
 			// Unknown is not older: rebuilding with npm could certify a clone missing a node_modules-only package.
 			const version = await leaderVersion();
 			if (version === undefined) throw new Error('the leader did not report its version');
-			if (packagesNodeModulesWithoutInstall(version)) return { withNodeModules: true };
-			return { withNodeModules: false, reason: `leader ${version} would include its own install` };
+			if (streamsPackages(version)) return { withNodeModules: true };
+			return { withNodeModules: false, reason: `leader ${version} cannot stream it` };
 		},
 		requestPackage: requestApplicationPackage,
 		prepareApplication: async (name, payload) => {

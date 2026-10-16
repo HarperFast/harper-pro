@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
-import { cloneFilesystemOnlyApplications, packagesNodeModulesWithoutInstall } from '#src/cloneNode/applicationClone';
+import { cloneFilesystemOnlyApplications, streamsPackages } from '#src/cloneNode/applicationClone';
 
 const filesystemOnly = (name) => ({ name, entries: [] });
 
@@ -197,14 +197,14 @@ describe('cloneFilesystemOnlyApplications', () => {
 	it('says once why it reinstalls dependencies when the leader cannot send node_modules', async () => {
 		const clone = harness({
 			listing: { entries: [filesystemOnly('first'), filesystemOnly('second')] },
-			transfer: { withNodeModules: false, reason: 'leader 4.7.41 would include its own install' },
+			transfer: { withNodeModules: false, reason: 'leader 4.7.41 cannot stream it' },
 		});
 		await clone.run();
 
 		assert.deepEqual(clone.transfers, [false, false]);
 		const explained = clone.logged.filter(({ message }) => message.includes('instead of copying node_modules'));
 		assert.equal(explained.length, 1);
-		assert.match(explained[0].message, /leader 4\.7\.41 would include its own install/);
+		assert.match(explained[0].message, /leader 4\.7\.41 cannot stream it/);
 	});
 
 	it('does not probe the leader when it has no filesystem-only application', async () => {
@@ -227,24 +227,24 @@ describe('cloneFilesystemOnlyApplications', () => {
 	});
 });
 
-describe('packagesNodeModulesWithoutInstall', () => {
+describe('streamsPackages', () => {
 	for (const [version, expected] of [
 		['4.7.41', false],
-		['5.2.15', false],
-		['5.3.0-alpha.1', false],
-		['5.3.0-beta.2', false],
+		['5.1.22', false],
+		['5.2.2', false],
+		['5.2.3-beta.1', false],
+		['5.2.3', true],
+		['v5.2.3', true],
+		['5.2.15', true],
+		['5.3.0-alpha.1', true],
 		['5.3.0', true],
-		['5.3.1-beta.1', true],
-		['5.4.0-alpha.1', true],
-		['5.3.2', true],
-		['v5.3.1', true],
 		['5.10.0', true],
 		['6.0.0', true],
 		[undefined, false],
 		['unknown', false],
 	]) {
-		it(`${expected ? 'trusts' : 'does not trust'} a leader reporting ${version}`, () => {
-			assert.equal(packagesNodeModulesWithoutInstall(version), expected);
+		it(`${expected ? 'streams' : 'does not stream'} from a leader reporting ${version}`, () => {
+			assert.equal(streamsPackages(version), expected);
 		});
 	}
 });
