@@ -7006,9 +7006,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													));
 												}
 												if (relayedAnchors?.size && exactAnchors?.size !== relayedAnchors.size) {
-													const degradedLogs = [...relayedAnchors.keys()].filter(
-														(name) => !exactAnchors?.has(name)
-													);
+													const degradedLogs = [...relayedAnchors.keys()].filter((name) => !exactAnchors?.has(name));
 													logger.warn?.(
 														`Base copy of ${databaseName} to ${remoteNodeName} could not resume relayed log(s) ${degradedLogs.join(', ')} in append order; falling back to ${ORIGIN_CURSOR_OVERLAP_MS}ms overlap floor`
 													);
@@ -7302,7 +7300,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											await sendAuditRecord(auditRecord, key);
 											if (key > auditSubscription.startTime) auditSubscription.startTime = key; // don't double send
 										}
-										if (closed) return;
+										if (closed || wsClosed) return;
 										// Backstop for the pre-COPY_START probe, which pulled a different iterable. Every failure signal
 										// counts, not just the boundary one: a local iterator that dies mid-pass leaves the reusable
 										// iterable exhausted while the follower's cursor keeps advancing. Drop the append-order range and
