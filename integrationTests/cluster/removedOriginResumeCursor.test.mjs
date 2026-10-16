@@ -236,17 +236,36 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 			}
 		);
 
+		const bRetainedLogs = await postToFixture(B, 'RecordLogs', { ids: [...rOld, ...rMid] });
+		deepEqual(bRetainedLogs, Object.fromEntries([...rOld, ...rMid].map((id) => [id, R.hostname])));
 		await killHarper({ harper: B });
 		await upsert(R, rLate);
 		await waitForIds(A, rLate, 'LATE reaches A while B is down');
+		const aRetainedLogs = await postToFixture(A, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] });
+		deepEqual(aRetainedLogs, Object.fromEntries([...rOld, ...rMid, ...rLate].map((id) => [id, R.hostname])));
 
 		// A's removal also disables R itself (remove_node_back), so R stops replicating to anyone.
 		await sendOperation(A, { operation: 'remove_node', hostname: R.hostname });
+		deepEqual(
+			await postToFixture(A, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] }),
+			aRetainedLogs,
+			'removing R must preserve its retained audit entries on A'
+		);
+		deepEqual(
+			await postToFixture(R, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] }),
+			Object.fromEntries([...rOld, ...rMid, ...rLate].map((id) => [id, 'local'])),
+			"reciprocal removal must preserve R's own audit entries"
+		);
 		await killHarper({ harper: R });
 		await startNode(B);
 		// Removing R lifts its exclusion on B's subscription to A, which re-admits A's log for R live.
 		const markIncludeA = await logMark(A);
 		await sendOperation(B, { operation: 'remove_node', hostname: R.hostname });
+		deepEqual(
+			await postToFixture(B, 'RecordLogs', { ids: [...rOld, ...rMid] }),
+			bRetainedLogs,
+			'removing R must preserve its retained audit entries on B'
+		);
 		await waitForIds(B, rLate, 'LATE reaches B through A once B removes R, without a restart');
 		await delay(SETTLE_MS);
 		deepEqual(await oldIdsSent(A, B, markIncludeA), [], 'A must not send OLD rows when it re-admits R for B');
@@ -266,10 +285,18 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 
 		deepEqual(await oldIdsSent(A, B, markA), [], 'A must not resend OLD rows to B on its restart');
 		deepEqual(await oldIdsSent(B, A, markB), [], 'B must not resend OLD rows to A when it returns');
+		deepEqual(
+			await postToFixture(B, 'RecordLogs', { ids: rOld }),
+			Object.fromEntries(rOld.map((id) => [id, R.hostname])),
+			'B must retain OLD audit entries through removal and restart'
+		);
 		ctx.rLogCounts = {
 			A: (await postToFixture(A, 'LogEntryCount', { log: R.hostname })).count,
 			B: (await postToFixture(B, 'LogEntryCount', { log: R.hostname })).count,
 		};
+		for (const count of Object.values(ctx.rLogCounts)) {
+			ok(count >= rOld.length + rMid.length + rLate.length, `R's retained log lost entries: ${count}`);
+		}
 	});
 
 	test('a node added after the removal pulls none of the old rows in its copy tails, nor on restart', async () => {
@@ -320,6 +347,13 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 
 		deepEqual(await oldIdsSent(B, A, markB), [], 'B must not resend OLD rows to A on its restart');
 		deepEqual(await oldIdsSent(A, B, markA), [], 'A must not resend OLD rows to B when it returns');
+		for (const node of [A, B]) {
+			deepEqual(
+				await postToFixture(node, 'RecordLogs', { ids: rOld }),
+				Object.fromEntries(rOld.map((id) => [id, R.hostname])),
+				'survivors must retain OLD audit entries through restarts and a new node joining'
+			);
+		}
 		deepEqual(
 			{
 				A: (await postToFixture(A, 'LogEntryCount', { log: R.hostname })).count,
