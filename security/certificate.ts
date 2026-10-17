@@ -11,17 +11,17 @@ import {
 	getPrivateKeys,
 	getCertAuthority,
 	generateSerialNumber,
-	createTLSSelector,
 	certExtensions,
 	CERT_ATTRIBUTES,
 	getCommonName,
 	getPrimaryHostName,
 	setCertTable,
+	getReplicationCert,
+	getReplicationCertAuth,
 } from '../core/security/keys.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { LICENSE_KEY_DIR_NAME } from '../core/utility/hdbTerms.ts';
 import harperLogger from '../core/utility/logging/harper_logger.js';
-import { getThisNodeName } from '../core/server/nodeName.ts';
 import { server } from '../core/server/Server.ts';
 import { replicateOperation } from '../replication/replicator.ts';
 
@@ -140,6 +140,7 @@ export async function createCsr() {
 	if (!opsCert || !opsPrivateKey) {
 		// Fall back to the replication cert (original behavior)
 		const rep = await getReplicationCert();
+		if (!rep) throw new Error('Unable to find a certificate to use for replication');
 		opsCert = pki.certificateFromPem(rep.options.cert);
 		opsPrivateKey = pki.privateKeyFromPem(rep.options.key);
 		certName = rep.name;
@@ -178,29 +179,7 @@ export async function createCsr() {
 	return { pem: forge.pki.certificationRequestToPem(csr), privateKeyName };
 }
 
-export async function getReplicationCert() {
-	const SNICallback = createTLSSelector('replication');
-	const secureTarget = {
-		secureContexts: null,
-		setSecureContext: () => {},
-	};
-	await SNICallback.initialize(secureTarget);
-	const cert = secureTarget.secureContexts.get(getThisNodeName());
-	if (!cert) return;
-	const certParsed = new X509Certificate(cert.options.cert);
-	cert.cert_parsed = certParsed;
-	cert.issuer = certParsed.issuer;
-
-	return cert;
-}
-
-export async function getReplicationCertAuth() {
-	getCertTable();
-	const certPem = (await getReplicationCert()).options.cert;
-	const repCert = new X509Certificate(certPem);
-	const caName = repCert.issuer.match(/CN=(.*)/)?.[1];
-	return getCertTable().get(caName);
-}
+export { getReplicationCert, getReplicationCertAuth };
 
 interface AddCertificateRequest {
 	name?: string;
