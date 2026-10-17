@@ -17,6 +17,7 @@ import {
 	DELEGATION_DRAIN_MS,
 	MIN_DRAIN_BACKSTOP_MS,
 	digestOf,
+	currentRow,
 	planActivate,
 	planStage,
 	setHomesDrainReader,
@@ -281,6 +282,45 @@ describe('planSurvey: what refuses before anything is staged', () => {
 	});
 });
 
+describe('planSurvey with fenced nodes (harper-pro#973)', () => {
+	const active = state(1, ['a', 'b', 'c']);
+	const survivors = () =>
+		replies({
+			a: reply('a', { active, highestActedOn: 1, supportsFenced: true }),
+			b: reply('b', { active, highestActedOn: 1, supportsFenced: true }),
+		});
+
+	it('a fenced node is not asked, and still counts as named for the ring its peers serve', () => {
+		const plan = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, survivors(), undefined, ['c']);
+		assert.strictEqual(plan.action, 'proceed', plan.reason);
+		assert.strictEqual(plan.generation, 2);
+	});
+
+	it('an unreachable node that is not fenced still refuses, and dropping the dead node from quiesce still refuses', () => {
+		const unfenced = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, survivors());
+		assert.strictEqual(unfenced.action, 'refuse');
+		assert.strictEqual(unfenced.status, 503);
+		assert.match(unfenced.reason, /c \(no answer\)/);
+		const omitted = planSurvey('db', ['a', 'b'], ['a', 'b'], undefined, survivors());
+		assert.strictEqual(omitted.status, 409);
+		assert.match(omitted.reason, /c \(in a's ring\)/);
+	});
+
+	it('a surveyed node that cannot record the fence refuses before anything is staged', () => {
+		const legacy = replies({
+			a: reply('a', { active, highestActedOn: 1, supportsFenced: true }),
+			b: reply('b', { active, highestActedOn: 1 }),
+		});
+		const plan = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, legacy, undefined, ['c']);
+		assert.strictEqual(plan.action, 'refuse');
+		assert.strictEqual(plan.status, 409);
+		assert.match(plan.reason, /^b cannot record a fenced transition/);
+		legacy.set('c', reply('c', { active, highestActedOn: 1 }));
+		const unfenced = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, legacy);
+		assert.strictEqual(unfenced.action, 'proceed', 'an unfenced call does not ask for the field');
+	});
+});
+
 describe('planActivation: only a proof on every freshly staged node skips the interval', () => {
 	const nodes = (entries) =>
 		Object.fromEntries(Object.entries(entries).map(([node, fields]) => [node, { role: 'home', ...fields }]));
@@ -341,12 +381,14 @@ describe('planActivation: only a proof on every freshly staged node skips the in
  * Peers as the orchestrator sees them: each holds a row driven by the same pure planners the real
  * per-node operations use, answers with an injectable drain result, and can be made to fail a hop.
  */
-function fakeCluster(rowsByNode, { quiesced = {}, fail = {}, hang = [], self } = {}) {
+function fakeCluster(rowsByNode, { quiesced = {}, fail = {}, hang = [], self, legacy = [] } = {}) {
 	const rows = new Map(Object.entries(rowsByNode));
 	const calls = [];
+	const stages = [];
 	return {
 		rows,
 		calls,
+		stages,
 		peers: {
 			self: () => self,
 			async send(node, operation) {
@@ -357,10 +399,12 @@ function fakeCluster(rowsByNode, { quiesced = {}, fail = {}, hang = [], self } =
 				const row = rows.get(node);
 				if (operation.action === 'survey') {
 					if (!rows.has(node) && node !== self) throw new Error('no route to ' + node);
-					return { node, active: row?.active, staged: row?.staged, highestActedOn: row?.highestActedOn ?? 0 };
+					const answer = { node, active: row?.active, staged: row?.staged, highestActedOn: row?.highestActedOn ?? 0 };
+					return legacy.includes(node) ? answer : { ...answer, supportsFenced: true };
 				}
 				const { generation, homes, quiesce, digest } = operation;
 				if (operation.action === 'stage') {
+					stages.push({ node, fenced: operation.fenced, operator: operation.operator });
 					const plan = planStage(row, operation.database, generation, homes, digest, T, quiesce);
 					if (plan.action === 'reject') throw new Error(plan.reason);
 					if (plan.action === 'write') rows.set(node, plan.row);
@@ -555,6 +599,104 @@ describe('applyHomes over fake peers', function () {
 	});
 });
 
+describe('applyHomes with fenced nodes (harper-pro#973)', function () {
+	this.timeout(30_000);
+	const operator = { name: 'ops-admin' };
+	// c is gone: it has no row here, so any hop to it fails as unreachable.
+	const withoutC = () => {
+		const rows = activeCluster(['a', 'b', 'c']);
+		delete rows.c;
+		return rows;
+	};
+	const recallToC = {
+		complete: false,
+		surrendered: 0,
+		recalled: 0,
+		outstanding: [{ table: 'T', key: 'k', delegate: 'c', reason: 'recall failed: c is unreachable' }],
+	};
+	const fencedShrink = (fields = {}) => ({
+		database: 'db',
+		homes: ['a', 'b'],
+		quiesce: ['a', 'b', 'c'],
+		fenced: ['c'],
+		hdb_user: operator,
+		...fields,
+	});
+
+	it('activates in one call when every survivor proves, never contacting the fenced node', async () => {
+		const cluster = fakeCluster(withoutC(), { quiesced: { a: recallToC, b: PROVEN } });
+		const report = await applyHomes(fencedShrink(), cluster.peers);
+		assert.strictEqual(report.outcome, 'activated', report.reason);
+		assert.strictEqual(report.generation, 2);
+		assert.deepStrictEqual(report.fenced, ['c']);
+		assert.deepStrictEqual(report.nodes.c, { role: 'fenced' });
+		assert.strictEqual(report.nodes.a.stage.proven, true, "a's only outstanding entry is its recall to c");
+		assert.ok(!cluster.calls.some((call) => call.endsWith(':c')), cluster.calls.join(', '));
+		assert.deepStrictEqual(cluster.stages, [
+			{ node: 'a', fenced: ['c'], operator: 'ops-admin' },
+			{ node: 'b', fenced: ['c'], operator: 'ops-admin' },
+		]);
+		for (const node of ['a', 'b']) assert.deepStrictEqual(cluster.rows.get(node).active.homes, ['a', 'b']);
+	});
+
+	it('a survivor that cannot prove for another reason waits for the attested call, which needs the same fence', async () => {
+		const cluster = fakeCluster(withoutC(), { quiesced: { a: recallToC, b: UNPROVEN } });
+		const first = await applyHomes(fencedShrink(), cluster.peers);
+		assert.strictEqual(first.outcome, 'staged');
+		assert.match(first.reason, /^b could not prove quiescence/);
+		assert.strictEqual(first.retryAfterMs, DELEGATION_DRAIN_MS);
+		assert.ok(!cluster.calls.some((call) => call.startsWith('activate:')));
+		const unfenced = await refused(
+			applyHomes(fencedShrink({ fenced: undefined, generation: 2, drained: true }), cluster.peers)
+		);
+		assert.strictEqual(unfenced.statusCode, 503, 'without the fence c is an unreachable participant');
+		const dropped = await refused(
+			applyHomes(fencedShrink({ fenced: undefined, quiesce: undefined, generation: 2, drained: true }), cluster.peers)
+		);
+		assert.strictEqual(dropped.statusCode, 409, "the survivors' staged quiesce still names c");
+		const second = await applyHomes(fencedShrink({ generation: 2, drained: true }), cluster.peers);
+		assert.strictEqual(second.outcome, 'activated', second.reason);
+		assert.strictEqual(cluster.rows.get('b').active.generation, 2);
+	});
+
+	it('an outstanding recall to a node that is not fenced still withholds activation', async () => {
+		const toB = { ...recallToC, outstanding: [{ ...recallToC.outstanding[0], delegate: 'b' }] };
+		const cluster = fakeCluster(withoutC(), { quiesced: { a: toB, b: PROVEN } });
+		const report = await applyHomes(fencedShrink(), cluster.peers);
+		assert.strictEqual(report.outcome, 'staged');
+		assert.strictEqual(report.nodes.a.stage.proven, false);
+	});
+
+	it('refuses before staging when a survivor would silently drop the fence', async () => {
+		const cluster = fakeCluster(withoutC(), { legacy: ['b'] });
+		const error = await refused(applyHomes(fencedShrink(), cluster.peers));
+		assert.strictEqual(error.statusCode, 409);
+		assert.match(error.http_resp_msg.error, /b cannot record a fenced transition/);
+		assert.deepStrictEqual(cluster.stages, []);
+	});
+
+	it('validates the fence before asking anyone, and treats an empty one as absent', async () => {
+		const cluster = fakeCluster(withoutC(), { self: 'a' });
+		const cases = [
+			[{ quiesce: undefined }, /fenced must be a subset of quiesce; missing c/],
+			[{ fenced: ['b', 'c'] }, /fenced must not include a node in homes; b/],
+			[{ homes: ['b'], quiesce: ['a', 'b', 'c'], fenced: ['a', 'c'] }, /a is taking this call, so it cannot be fenced/],
+			[{ fenced: [''] }, /non-empty, bounded node name/],
+			[{ fenced: 'c' }, /must be an array/],
+			[{ hdb_user: undefined }, /require an authenticated user/],
+		];
+		for (const [fields, expected] of cases)
+			await assert.rejects(applyHomes(fencedShrink(fields), cluster.peers), (error) => {
+				assert.match(error.message, expected);
+				assert.ok(error.statusCode >= 400 && error.statusCode < 500, `${error.statusCode} for ${error.message}`);
+				return true;
+			});
+		assert.deepStrictEqual(cluster.calls, []);
+		const empty = await refused(applyHomes(fencedShrink({ fenced: [] }), cluster.peers));
+		assert.strictEqual(empty.statusCode, 503, 'fenced: [] is an unfenced call, so c is unreachable');
+	});
+});
+
 describe('record_lock_transition: the peer-callable hop', () => {
 	const peer = { name: 'peer-node', url: 'wss://peer-node:9933' };
 	const from = { name: 'peer-node' };
@@ -701,5 +843,35 @@ describe('record_lock_transition: the peer-callable hop', () => {
 			(await executeTransitionLocally({ database: 'hop3', action: 'survey' })).active.digest,
 			digestOf(1, canonical)
 		);
+	});
+
+	it('records a relayed fence attributed to the relaying node, and re-validates it first', async () => {
+		const homes = [self];
+		const stage = (fields) =>
+			executeTransition({
+				database: 'hop5',
+				action: 'stage',
+				generation: 1,
+				homes,
+				quiesce: [self, 'gone'],
+				digest: digestOf(1, homes),
+				fenced: ['gone'],
+				operator: 'ops-admin',
+				hdb_user: from,
+				...fields,
+			});
+		await assert.rejects(stage({ fenced: [self] }), /fenced must not include a node in homes/);
+		await assert.rejects(stage({ fenced: ['elsewhere'] }), /fenced must be a subset of quiesce/);
+		await assert.rejects(stage({ operator: undefined }), /must name the operator/);
+		assert.strictEqual((await executeTransitionLocally({ database: 'hop5', action: 'survey' })).staged, undefined);
+		await stage();
+		await stage();
+		const row = await currentRow('hop5');
+		assert.deepStrictEqual(
+			row.fenced.map(({ node, operator, generation }) => ({ node, operator, generation })),
+			[{ node: 'gone', operator: 'ops-admin via peer-node', generation: 1 }]
+		);
+		const survey = await executeTransitionLocally({ database: 'hop5', action: 'survey' });
+		assert.strictEqual(survey.supportsFenced, true);
 	});
 });

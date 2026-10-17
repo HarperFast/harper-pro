@@ -19,12 +19,14 @@ import {
 	canonicalizeHomes,
 	currentRow,
 	digestOf,
+	operatorPrincipal,
 	planStage,
 	provesQuiescence,
 	stageGeneration,
 	validateGenerationInput,
 	type RecordLockGenerationState,
 	type RecordLockHomesRow,
+	type StageFence,
 } from './recordLockHomes.ts';
 import { principalNodeName, sendRecordLockOperation } from './recordLockRpc.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
@@ -52,6 +54,9 @@ export interface TransitionOperation {
 	homes?: string[];
 	quiesce?: string[];
 	digest?: string;
+	/** Stage only: nodes in `quiesce` the operator attests are stopped, and who attested it. */
+	fenced?: string[];
+	operator?: string;
 }
 
 export interface SurveyReply {
@@ -59,6 +64,8 @@ export interface SurveyReply {
 	active?: RecordLockGenerationState;
 	staged?: RecordLockGenerationState;
 	highestActedOn: number;
+	/** This node records a stage's `fenced` list. An older node would accept the field and drop it. */
+	supportsFenced?: boolean;
 }
 export interface StageReply {
 	staged: RecordLockGenerationState;
@@ -76,7 +83,8 @@ export interface NodeSurvey {
 }
 
 export interface NodeReport {
-	role: 'home' | 'departing';
+	/** `fenced`: attested stopped, so never contacted; it has no survey, stage or activate entry. */
+	role: 'home' | 'departing' | 'fenced';
 	survey?: NodeSurvey;
 	stage?: {
 		action: 'already-active' | 'noop' | 'staged' | 'failed';
@@ -91,6 +99,7 @@ export interface ApplyReport {
 	database: string;
 	homes: string[];
 	quiesce: string[];
+	fenced?: string[];
 	generation?: number;
 	digest?: string;
 	/** `staged`: every node is staged and refusing locks; wait `retryAfterMs`, then re-run with `generation` and `drained: true`. */
@@ -149,10 +158,12 @@ export function planSurvey(
 	quiesce: string[],
 	requestedGeneration: number | undefined,
 	replies: Map<string, SurveyReply | { error: string }>,
-	observer?: { node: string; reply: SurveyReply | { error: string } }
+	observer?: { node: string; reply: SurveyReply | { error: string } },
+	fenced: string[] = []
 ): SurveyPlan {
 	const unreachable: string[] = [];
 	const misnamed: string[] = [];
+	const unfenceable: string[] = [];
 	const unlisted: string[] = [];
 	const unrecorded: string[] = [];
 	const activeStates = new Map<string, string[]>();
@@ -168,6 +179,7 @@ export function planSurvey(
 			if (!quiesce.includes(member)) unlisted.push(`${member} (in ${observer.node}'s ring, the node taking this call)`);
 	}
 	for (const node of quiesce) {
+		if (fenced.includes(node)) continue;
 		const reply = replies.get(node);
 		if (!reply || 'error' in reply) {
 			unreachable.push(`${node} (${reply && 'error' in reply ? reply.error : 'no answer'})`);
@@ -178,6 +190,7 @@ export function planSurvey(
 			continue;
 		}
 		rows.set(node, reply);
+		if (fenced.length > 0 && reply.supportsFenced !== true) unfenceable.push(node);
 		if (reply.staged && !reply.staged.quiesce) unrecorded.push(node);
 		for (const member of ringMembers(reply))
 			if (!quiesce.includes(member)) unlisted.push(`${member} (in ${node}'s ring)`);
@@ -191,6 +204,12 @@ export function planSurvey(
 			action: 'refuse',
 			status: 409,
 			reason: `a named node answered under another name: ${misnamed.join(', ')}`,
+		};
+	if (unfenceable.length > 0)
+		return {
+			action: 'refuse',
+			status: 409,
+			reason: `${unfenceable.join(', ')} cannot record a fenced transition; upgrade them, or apply without fenced`,
 		};
 	if (unrecorded.length > 0)
 		return {
@@ -287,6 +306,7 @@ const applySchema = Joi.object({
 	quiesce: Joi.array().optional(),
 	generation: Joi.number().optional(),
 	drained: Joi.boolean().optional(),
+	fenced: Joi.array().optional(),
 });
 
 function hopError(error: unknown): string {
@@ -337,8 +357,13 @@ export async function applyHomes(
 		if (missing.length > 0)
 			throw new ClientError(`quiesce must include every node in homes; missing ${missing.join(', ')}`, 400);
 	}
+	let fence: StageFence | undefined;
+	if (request.fenced?.length > 0) {
+		const nodes = validateFenced(request.fenced, homes, quiesce, peers.self());
+		fence = { nodes, operator: operatorPrincipal(request) };
+	}
 	const prior = applyQueues.get(database) ?? Promise.resolve();
-	const run = prior.then(() => runApply(request, database, homes, quiesce, peers, timeouts));
+	const run = prior.then(() => runApply(request, database, homes, quiesce, fence, peers, timeouts));
 	const queued = run
 		.catch(() => {})
 		.finally(() => {
@@ -348,16 +373,38 @@ export async function applyHomes(
 	return run;
 }
 
+/**
+ * `fenced` names nodes of the transition the operator attests are stopped outside Harper, so it must
+ * be part of `quiesce` and can be neither a new home nor the node taking the call.
+ */
+function validateFenced(fenced: unknown, homes: string[], quiesce: string[], self: string | undefined): string[] {
+	validateGenerationInput(1, fenced);
+	const nodes = canonicalizeHomes(fenced);
+	const homing = nodes.filter((node) => homes.includes(node));
+	if (homing.length > 0) throw new ClientError(`fenced must not include a node in homes; ${homing.join(', ')}`, 400);
+	const unlisted = nodes.filter((node) => !quiesce.includes(node));
+	if (unlisted.length > 0)
+		throw new ClientError(`fenced must be a subset of quiesce; missing ${unlisted.join(', ')}`, 400);
+	if (self !== undefined && nodes.includes(self))
+		throw new ClientError(`${self} is taking this call, so it cannot be fenced`, 400);
+	return nodes;
+}
+
 async function runApply(
 	request: any,
 	database: string,
 	homes: string[],
 	quiesce: string[],
+	fence: StageFence | undefined,
 	peers: TransitionPeers,
 	timeouts: HopTimeouts
 ): Promise<ApplyReport> {
+	const fenced = fence?.nodes ?? [];
+	const live = quiesce.filter((node) => !fenced.includes(node));
 	const report: ApplyReport = { database, homes, quiesce, outcome: 'refused', nodes: {} };
-	for (const node of quiesce) report.nodes[node] = { role: homes.includes(node) ? 'home' : 'departing' };
+	if (fence) report.fenced = fenced;
+	for (const node of quiesce)
+		report.nodes[node] = { role: fenced.includes(node) ? 'fenced' : homes.includes(node) ? 'home' : 'departing' };
 	const hop = (node: string, operation: TransitionOperation, ms: number) =>
 		withHopDeadline(peers.send(node, operation, ms), ms, `${node} ${operation.action}`);
 	const survey = async (node: string): Promise<SurveyReply | { error: string }> => {
@@ -373,7 +420,7 @@ async function runApply(
 			: { active: reply.active, staged: reply.staged, highestActedOn: reply.highestActedOn };
 
 	const replies = new Map<string, SurveyReply | { error: string }>();
-	await forEachNode(quiesce, async (node) => {
+	await forEachNode(live, async (node) => {
 		const reply = await survey(node);
 		replies.set(node, reply);
 		report.nodes[node].survey = surveyed(reply);
@@ -384,7 +431,7 @@ async function runApply(
 		observer = { node: self, reply: await survey(self) };
 		report.initiator = { node: self, survey: surveyed(observer.reply) };
 	}
-	const plan = planSurvey(database, homes, quiesce, request.generation, replies, observer);
+	const plan = planSurvey(database, homes, quiesce, request.generation, replies, observer, fenced);
 	if (plan.action === 'refuse') {
 		report.reason = plan.reason;
 		throw new ApplyRefusedError(report, plan.status);
@@ -394,22 +441,28 @@ async function runApply(
 	report.digest = digest;
 
 	let failed = false;
-	await forEachNode(quiesce, async (node) => {
+	const stage: TransitionOperation = {
+		operation: TRANSITION_OPERATION,
+		database,
+		action: 'stage',
+		generation,
+		homes,
+		quiesce,
+		digest,
+	};
+	if (fence) Object.assign(stage, { fenced, operator: fence.operator });
+	await forEachNode(live, async (node) => {
 		const entry = report.nodes[node];
 		if (plan.alreadyActive.has(node)) {
 			entry.stage = { action: 'already-active' };
 			return;
 		}
 		try {
-			const reply: StageReply = await hop(
-				node,
-				{ operation: TRANSITION_OPERATION, database, action: 'stage', generation, homes, quiesce, digest },
-				timeouts.stageMs
-			);
+			const reply: StageReply = await hop(node, stage, timeouts.stageMs);
 			entry.stage = {
 				action: plan.alreadyStaged.has(node) ? 'noop' : 'staged',
 				quiesced: reply.quiesced,
-				proven: provesQuiescence(reply.quiesced),
+				proven: provesQuiescence(reply.quiesced, fenced),
 			};
 			entry.survey = { ...entry.survey, staged: reply.staged };
 		} catch (error) {
@@ -440,7 +493,7 @@ async function runApply(
 		);
 	// `planActivate` refuses an activate within MIN_DRAIN_BACKSTOP_MS of that node's own stage.
 	if (Object.values(report.nodes).some((entry) => entry.stage?.action === 'staged')) await delay(MIN_DRAIN_BACKSTOP_MS);
-	await forEachNode(quiesce, async (node) => {
+	await forEachNode(live, async (node) => {
 		const entry = report.nodes[node];
 		if (entry.role === 'departing') {
 			entry.activate = { action: 'skipped' };
@@ -464,7 +517,9 @@ async function runApply(
 		throw new ApplyRefusedError(report, 503);
 	}
 	report.outcome = 'activated';
-	logger.info?.(`Record lock home map for ${database}: applied generation ${generation} on ${homes.join(', ')}`);
+	logger.info?.(
+		`Record lock home map for ${database}: applied generation ${generation} on ${homes.join(', ')}${fence ? `, ${fenced.join(', ')} fenced by ${fence.operator}` : ''}`
+	);
 	return report;
 }
 
@@ -475,6 +530,8 @@ const transitionSchema = Joi.object({
 	homes: Joi.array().optional(),
 	quiesce: Joi.array().optional(),
 	digest: Joi.string().optional(),
+	fenced: Joi.array().optional(),
+	operator: Joi.string().optional(),
 });
 
 /**
@@ -482,7 +539,10 @@ const transitionSchema = Joi.object({
  * digest is recomputed, this node must be named in `quiesce` to stage and in `homes` to activate, and
  * the per-node planners decide against its own row.
  */
-export async function executeTransitionLocally(request: any): Promise<SurveyReply | StageReply | ActivateReply> {
+export async function executeTransitionLocally(
+	request: any,
+	relayedBy?: string
+): Promise<SurveyReply | StageReply | ActivateReply> {
 	const validation = validateBySchema(request, transitionSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
@@ -491,7 +551,13 @@ export async function executeTransitionLocally(request: any): Promise<SurveyRepl
 	if (!self) throw new ClientError('this node has no resolved node name', 503);
 	if (action === 'survey') {
 		const row = await currentRow(database);
-		return { node: self, active: row?.active, staged: row?.staged, highestActedOn: row?.highestActedOn ?? 0 };
+		return {
+			node: self,
+			active: row?.active,
+			staged: row?.staged,
+			highestActedOn: row?.highestActedOn ?? 0,
+			supportsFenced: true,
+		};
 	}
 	validateGenerationInput(request.generation, request.homes);
 	const homes = canonicalizeHomes(request.homes);
@@ -505,16 +571,24 @@ export async function executeTransitionLocally(request: any): Promise<SurveyRepl
 		validateGenerationInput(request.generation, request.quiesce);
 		const quiesce = canonicalizeHomes([...request.quiesce, ...homes]);
 		if (!quiesce.includes(self)) throw new ClientError(`${self} is not named in this transition's quiesce set`, 409);
-		return stageGeneration({ database, generation: request.generation, homes, quiesce });
+		let fence: StageFence | undefined;
+		if (request.fenced?.length > 0) {
+			const nodes = validateFenced(request.fenced, homes, quiesce, self);
+			if (!request.operator) throw new ClientError('a fenced stage must name the operator who attested it', 400);
+			// The relaying node is authenticated; the operator name is its statement, so record both.
+			const operator = relayedBy && relayedBy !== self ? `${request.operator} via ${relayedBy}` : request.operator;
+			fence = { nodes, operator };
+		}
+		return stageGeneration({ database, generation: request.generation, homes, quiesce }, fence);
 	}
 	if (!homes.includes(self)) throw new ClientError(`${self} is not a member of generation ${request.generation}`, 409);
 	return activateGeneration({ database, generation: request.generation, homes });
 }
 
 export async function executeTransition(request: any) {
-	if (!principalNodeName(request))
-		throw new ClientError('record lock transitions are accepted from cluster nodes only', 403);
-	return executeTransitionLocally(request);
+	const principal = principalNodeName(request);
+	if (!principal) throw new ClientError('record lock transitions are accepted from cluster nodes only', 403);
+	return executeTransitionLocally(request, principal);
 }
 
 const productionPeers: TransitionPeers = {

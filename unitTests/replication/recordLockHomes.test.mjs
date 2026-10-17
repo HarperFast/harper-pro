@@ -11,6 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
 	STAGE_DRAIN_BUDGET_MS,
 	canonicalizeHomes,
+	currentRow,
 	getRecordLockHomesTable,
 	provesQuiescence,
 	setHomesDrainReader,
@@ -20,6 +21,7 @@ import {
 	planStage,
 	stageGeneration,
 	validateGenerationInput,
+	withFences,
 } from '#src/replication/recordLockHomes';
 
 describe('canonicalizeHomes', () => {
@@ -467,6 +469,36 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 		assert.strictEqual(provesQuiescence({ complete: 'yes', outstanding: [] }), false);
 	});
 
+	it('a recall to a fenced delegate is the only outstanding entry a fence discounts (harper-pro#973)', () => {
+		const toC = { table: 'T', key: 'k', delegate: 'c', reason: 'the delegate did not confirm it stopped admitting' };
+		const unprovenOwner = { table: 'T', key: undefined, reason: 'this thread has not coordinated T long enough' };
+		const result = (outstanding, complete = outstanding.length === 0) => ({
+			complete,
+			surrendered: 0,
+			recalled: 0,
+			outstanding,
+		});
+		assert.strictEqual(provesQuiescence(result([toC])), false, 'no fence: an unconfirmed recall is not a proof');
+		assert.strictEqual(provesQuiescence(result([toC]), ['c']), true);
+		assert.strictEqual(provesQuiescence(result([toC, { ...toC, key: 'k2' }]), ['c']), true);
+		assert.strictEqual(provesQuiescence(result([toC]), ['b']), false, 'a fence on another node covers nothing');
+		assert.strictEqual(provesQuiescence(result([toC, unprovenOwner]), ['c']), false, 'an entry with no delegate');
+		assert.strictEqual(
+			provesQuiescence(result([toC, { table: 'T', key: 'k', reason: 'this node still holds a delegation' }]), ['c']),
+			false,
+			'a delegation this node holds and could not surrender'
+		);
+		// Core reports `complete: false` for any outstanding entry; the exception never makes an empty or
+		// self-contradicting report a proof.
+		assert.strictEqual(provesQuiescence(result([], false), ['c']), false);
+		assert.strictEqual(provesQuiescence(result([toC], true), ['c']), false);
+		assert.strictEqual(provesQuiescence({ outstanding: [toC] }, ['c']), false, 'complete missing');
+		assert.strictEqual(provesQuiescence(result([null]), ['c']), false);
+		assert.strictEqual(provesQuiescence(result([{ ...toC, delegate: 3 }]), [3]), false);
+		for (const malformed of [null, 'complete', 7, { error: 'x', outstanding: [] }])
+			assert.strictEqual(provesQuiescence(malformed, ['c']), false, JSON.stringify(malformed));
+	});
+
 	it('has a reporting budget far below the interval it replaces', () => {
 		// The budget bounds how long `stage` spends DRAINING before it reports what is left; it is not a
 		// safety interval. It must be well under DELEGATION_DRAIN_MS, or reporting would cost as much as
@@ -518,5 +550,49 @@ describe('withRow serializes on the row lock, not only on its per-isolate queue 
 		}
 		const { staged } = await stage;
 		assert.strictEqual(staged.generation, 1, 'and it completes once the holder releases');
+	});
+});
+
+describe('a fenced stage records the fence with the stage (harper-pro#973)', () => {
+	it('withFences adds one entry per node and generation, and nothing on a retry', () => {
+		const fence = { nodes: ['c', 'd'], operator: 'op' };
+		const first = withFences([], fence, 2, 10);
+		assert.deepStrictEqual(first, [
+			{ node: 'c', operator: 'op', at: 10, generation: 2 },
+			{ node: 'd', operator: 'op', at: 10, generation: 2 },
+		]);
+		assert.strictEqual(withFences(first, fence, 2, 11), undefined, 'a retried stage records nothing new');
+		assert.strictEqual(withFences(first, undefined, 2, 11), undefined);
+		// A per-node record_lock_fence_external entry has no generation and does not stand in for this one.
+		const manual = [{ node: 'c', operator: 'op', at: 5 }];
+		assert.deepStrictEqual(withFences(manual, { nodes: ['c'], operator: 'op2' }, 2, 12), [
+			...manual,
+			{ node: 'c', operator: 'op2', at: 12, generation: 2 },
+		]);
+	});
+
+	it('writes the fence in the stage, and a noop re-stage that brings a new fence still records it', async () => {
+		const request = { database: 'fence1', generation: 1, homes: ['a'], quiesce: ['a', 'c'], hdb_user: { name: 'op' } };
+		const staged = await stageGeneration(request, { nodes: ['c'], operator: 'op' });
+		assert.strictEqual(staged.staged.generation, 1);
+		let row = await currentRow('fence1');
+		assert.deepStrictEqual(
+			row.fenced.map(({ node, operator, generation }) => ({ node, operator, generation })),
+			[{ node: 'c', operator: 'op', generation: 1 }]
+		);
+		await stageGeneration(request, { nodes: ['c'], operator: 'op' });
+		row = await currentRow('fence1');
+		assert.strictEqual(row.fenced.length, 1, 'a retry adds no second entry');
+		// A row staged with no fence (an earlier unfenced call, or a per-node stage) gains one on the noop.
+		const unfenced = { ...request, database: 'fence2' };
+		await stageGeneration(unfenced);
+		assert.deepStrictEqual((await currentRow('fence2')).fenced, []);
+		await stageGeneration(unfenced, { nodes: ['c'], operator: 'op' });
+		row = await currentRow('fence2');
+		assert.deepStrictEqual(
+			row.fenced.map((entry) => entry.node),
+			['c']
+		);
+		assert.strictEqual(row.staged.generation, 1, 'the noop left the staged state as it was');
 	});
 });
