@@ -26,17 +26,16 @@ import { ok } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { existsSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import {
-	startHarper,
-	teardownHarper,
-	getNextAvailableLoopbackAddress,
-	targz,
-} from '@harperfast/integration-testing';
+import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
-	'..', '..', 'dist', 'bin', 'harper.js'
+	'..',
+	'..',
+	'dist',
+	'bin',
+	'harper.js'
 );
 
 const STRESS = process.env.HARPER_RUN_STRESS_TESTS === '1';
@@ -127,7 +126,10 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429 regression)', { skip
 		// Orphan ORPHAN_COUNT blob files by deleting them directly from disk —
 		// simulates the TTL-eviction-race / partial-transfer orphan scenario.
 		const blobFiles = walkBlobFiles(ctx.nodeA.dataRootDir, 'data');
-		ok(blobFiles.length >= ORPHAN_COUNT, `Need at least ${ORPHAN_COUNT} blob files to orphan, found ${blobFiles.length}`);
+		ok(
+			blobFiles.length >= ORPHAN_COUNT,
+			`Need at least ${ORPHAN_COUNT} blob files to orphan, found ${blobFiles.length}`
+		);
 		ctx.orphanedPaths = blobFiles.slice(0, ORPHAN_COUNT);
 		for (const p of ctx.orphanedPaths) {
 			rmSync(p, { force: true });

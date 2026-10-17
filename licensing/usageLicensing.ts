@@ -203,11 +203,10 @@ async function recordUsage(analytics: any) {
 		}
 	} else {
 		// assign license nag header
-		universalHeaders.splice(
-			0,
-			universalHeaders.length,
-			['X-License-Info', 'Unlicensed Harper Pro, this should only be used for educational and development purposes']
-		);
+		universalHeaders.splice(0, universalHeaders.length, [
+			'X-License-Info',
+			'Unlicensed Harper Pro, this should only be used for educational and development purposes',
+		]);
 		if (!process.env.DEV_MODE) {
 			const msg =
 				'This server does not have valid usage licenses, this should only be used for educational and development purposes.';
