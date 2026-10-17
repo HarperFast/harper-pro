@@ -341,18 +341,18 @@ describe('createRecordLockTransport().homeMap', () => {
 });
 
 describe('readOwnIncarnation', () => {
-	// The production reader must go to the hdb_nodes table, not server.nodes: that mirror excludes the
-	// local node on every path, so a mirror read is 0 forever and the home map is withheld for the life
-	// of the process — which is exactly how the first cluster run of this transport failed.
+	// The production reader must go to this node's own LOCAL_ONLY row, not server.nodes: that mirror
+	// excludes the local node on every path, so a mirror read is 0 forever and the home map is withheld
+	// for the life of the process — which is exactly how the first cluster run of this transport failed.
 	const tableWith = (row) => ({ primaryStore: { getSync: (key) => (key === 'self' ? row : undefined) } });
 	it('reads the persisted counter from this node’s own row', () => {
-		assert.strictEqual(readOwnIncarnation(tableWith({ name: 'self', recordLockIncarnation: 4 }), 'self'), 4);
+		assert.strictEqual(readOwnIncarnation(tableWith({ name: 'self', incarnation: 4 }), 'self'), 4);
 	});
 	it('reads 0 for a missing row, a missing field, or a value that is not a positive number', () => {
 		assert.strictEqual(readOwnIncarnation(tableWith(undefined), 'self'), 0);
 		assert.strictEqual(readOwnIncarnation(tableWith({ name: 'self' }), 'self'), 0);
 		for (const bad of [0, -1, '3', NaN, null])
-			assert.strictEqual(readOwnIncarnation(tableWith({ recordLockIncarnation: bad }), 'self'), 0);
+			assert.strictEqual(readOwnIncarnation(tableWith({ incarnation: bad }), 'self'), 0);
 	});
 });
 

@@ -17,7 +17,8 @@
  *   a paced retry while the row cannot be read.
  * - `homeIncarnation`: a durable, monotonic counter bumped once per **coordination incarnation** —
  *   a process start, or a coordinating-worker handoff (`recordLockOwnerFor`, below) — persisted on
- *   this node's own `hdb_nodes` row (`recordLockIncarnation`). Core orders fencing tokens on it.
+ *   this node's own `LOCAL_ONLY` row of `hdb_record_lock_node` (harper#3254 moved it off the `hdb_nodes`
+ *   self row, which a peer's write replaces). Core orders fencing tokens on it.
  * - `requestDelegation` / `recallDelegation`: unicast operations over the existing replication
  *   connections (`recordLockRpc.ts`).
  * - `ownsCoordination()`: whether this worker thread is the one the main thread assigned to the
@@ -55,7 +56,8 @@ import {
 	type LockHomeMap,
 	type LockRound,
 } from '../core/resources/recordLockCoordinator.ts';
-import { getDatabases } from '../core/resources/databases.ts';
+import { getDatabases, table } from '../core/resources/databases.ts';
+import { transaction } from '../core/resources/transaction.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, getReplicationSharedStatus, shouldReplicateFromNode } from './knownNodes.ts';
@@ -94,6 +96,8 @@ import {
 	type OutboundOperationStats,
 } from './recordLockRpc.ts';
 import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
+import { createRestartRecall, type RestartRecallStatus } from './recordLockRestart.ts';
+import { recallDelegationsFromHome } from '../core/resources/recordLockCoordinator.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
 import { ANY_TABLE, everRecloned, forgetPoisonState, isPoisoned, poison, poisonedPairs } from './recordLockPoison.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
@@ -102,7 +106,6 @@ import {
 	unregisterReplicatedApplyFailureListener,
 	type ReplicatedApplyFailureListener,
 } from '../core/resources/replicatedApplyFailure.ts';
-import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 import './recordLockApply.ts';
 
@@ -273,11 +276,11 @@ export interface RecordLockTransportDeps {
 	/** Any table's auditStore for the database, which is what keys the shared status buffers. */
 	auditStore(database: string): any;
 	ownsDatabase(database: string): boolean;
-	/** This node's persisted `recordLockIncarnation`, or 0 while unknown. */
+	/** This node's persisted coordination incarnation, or 0 while unknown. */
 	homeIncarnation(): number;
 	send(nodeName: string, database: string, operation: any): Promise<any>;
 	/**
-	 * Whether this node's `recordLockIncarnation` was 0 (never persisted) the instant BEFORE this
+	 * Whether this node's persisted incarnation was 0 (never persisted) the instant BEFORE this
 	 * process's own bump — i.e. no previous incarnation of this process could have issued anything, so
 	 * core's construction-anchored restart quarantine (`grantableAfterMono`) can be waived. A read of
 	 * the pre-bump durable value, not a flag that toggles: this is what makes it correct even when the
@@ -293,6 +296,8 @@ export interface RecordLockTransportDeps {
 	acquireOnOwner(database: string, table: string, key: unknown, leaseMs: number, waitMs: number): Promise<LockRound>;
 	/** harper-pro#852: release a relayed admission on the owner worker. */
 	releaseOnOwner(database: string, table: string, key: unknown, admissionId: number): void;
+	/** harper#3254: the incarnation every ring member has recalled below, or undefined (`recordLockRestart.ts`). */
+	quiescedIncarnation?(database: string): number | undefined;
 }
 
 /**
@@ -330,6 +335,9 @@ export function createRecordLockTransport(
 		coordinationIncarnation() {
 			const incarnation = deps.homeIncarnation();
 			return Number.isSafeInteger(incarnation) && incarnation > 0 ? incarnation : undefined;
+		},
+		quiescedIncarnation() {
+			return deps.quiescedIncarnation?.(database);
 		},
 		establishLockFreshness(db: string, table: string, _key: unknown, dependencies, deadlineMs: number) {
 			freshness ??= deps.freshness(db, () => transport.homeMap(db));
@@ -505,7 +513,11 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 	}
 	const after = activeCache.get(database);
 	// A generation change retires outstanding freshness waits.
-	if (before?.generation !== after?.generation) recreateRecordLockTransport(database);
+	if (before?.generation !== after?.generation) {
+		recreateRecordLockTransport(database);
+		// Answers to a restart recall are bound to the generation they were asked under.
+		if (CLUSTER_RECORD_LOCKS_ENABLED && ownedDatabases.has(database)) restartRecall.schedule(database);
+	}
 }
 
 /** Leaf bound: main waiting on ONE worker (or a worker waiting on main's own local refresh alone). */
@@ -735,8 +747,13 @@ export function setRecordLockOwnership(database: string, owned: boolean): void {
 	// true. Rebuilding the transport object the instant ownership newly arrives is what gives core a
 	// fresh coordinator to build, this time with `ownsCoordination()` already true from its first
 	// instant — matching the one case that keeps the waiver.
-	if (owned && !wasOwned) recreateRecordLockTransport(database);
-	else if (!owned && wasOwned) onRecordLockOwnershipLost(database);
+	if (owned && !wasOwned) {
+		recreateRecordLockTransport(database);
+		if (CLUSTER_RECORD_LOCKS_ENABLED) restartRecall.schedule(database);
+	} else if (!owned && wasOwned) {
+		onRecordLockOwnershipLost(database);
+		restartRecall.cancel(database);
+	}
 }
 
 function auditStoreFor(database: string): any {
@@ -752,15 +769,39 @@ function auditStoreFor(database: string): any {
 /** Kept for `replicator.ts`, which installs it; the delegation transport no longer reads liveness. */
 export function setConnectionDownSinceReader(_reader: (status: Float64Array) => number | undefined): void {}
 
+let recordLockNodeTable: any;
 /**
- * This node's persisted home incarnation, read from its OWN `hdb_nodes` row. Not from `server.nodes`:
- * that mirror deliberately excludes the local node (`knownNodes.ts` filters `getThisNodeName()` out
- * on every path), so a read there is 0 forever and `homeMap()` would be withheld for the life of the
- * process. A point read per call until the bump has landed, then cached — the value changes only
- * across a coordination incarnation.
+ * `LOCAL_ONLY`, one row for this node: its coordination incarnation. Its own table and not a field on
+ * the `hdb_nodes` self row, where it lived before harper#3254: that row is the mesh's shared copy of
+ * this node, and a peer's write of it (`add_node` on a joining node writes our row and replicates it
+ * back) replaces ours wholesale, so the counter was lost on the first restart of every fresh cluster
+ * — the quarantine was then waived as a first incarnation and the token order of §5.1 restarted at 1.
+ */
+export function getRecordLockNodeTable() {
+	return (
+		recordLockNodeTable ||
+		(recordLockNodeTable = table({
+			table: 'hdb_record_lock_node',
+			database: 'system',
+			attributes: [{ name: 'node', isPrimaryKey: true }, { attribute: 'incarnation' }],
+		}) as any)
+	);
+}
+
+/**
+ * This node's persisted home incarnation, read from its own row of `hdb_record_lock_node`. Not from
+ * `server.nodes`: that mirror deliberately excludes the local node (`knownNodes.ts` filters
+ * `getThisNodeName()` out on every path), so a read there is 0 forever and `homeMap()` would be
+ * withheld for the life of the process.
  */
 export function readOwnIncarnation(table: { primaryStore: { getSync(key: string): any } }, self: string): number {
-	const value = table.primaryStore.getSync(self)?.recordLockIncarnation;
+	const value = table.primaryStore.getSync(self)?.incarnation;
+	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** The counter a build before harper#3254 kept on the `hdb_nodes` self row, so an upgrade continues from it. */
+function legacyIncarnation(self: string): number {
+	const value = getHDBNodeTable().primaryStore.getSync(self)?.recordLockIncarnation;
 	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
 }
 /**
@@ -804,7 +845,32 @@ export function setHomeIncarnation(value: unknown, first?: boolean): void {
 		firstIncarnation = first;
 		for (const database of transports.keys()) recreateRecordLockTransport(database);
 	}
+	// The counter is node-wide: a handoff on one database re-arms every owned database's quarantine
+	// (core re-arms on the incarnation change), so each one needs a round for the new incarnation.
+	if (CLUSTER_RECORD_LOCKS_ENABLED) for (const database of ownedDatabases) restartRecall.schedule(database);
 }
+
+/**
+ * The restart recall (harper#3254) for every database this thread coordinates. Scheduled when
+ * ownership arrives, on every incarnation change, and on a generation change; cancelled when
+ * ownership leaves or the database is released.
+ */
+const restartRecall = createRestartRecall({
+	thisNodeName: getThisNodeName,
+	homeIncarnation: currentHomeIncarnation,
+	isFirstIncarnation,
+	ownsDatabase: ownsRecordLockCoordination,
+	homeMap(database) {
+		try {
+			return transports.get(database)?.homeMap(database);
+		} catch {
+			return undefined;
+		}
+	},
+	send: sendRecordLockOperation,
+	recallLocally: recallDelegationsFromHome,
+	warn: (message, detail) => logger.warn?.(message, detail),
+});
 
 const productionDeps: RecordLockTransportDeps = {
 	thisNodeName: getThisNodeName,
@@ -816,6 +882,7 @@ const productionDeps: RecordLockTransportDeps = {
 	monotonicNow: () => performance.now(),
 	acquireOnOwner: acquireOnOwnerRelay,
 	releaseOnOwner: releaseOnOwnerRelay,
+	quiescedIncarnation: (database) => restartRecall.quiescedIncarnation(database),
 	freshness(database, homeMap) {
 		const barrier = createFreshnessBarrier(database, {
 			thisNodeName: getThisNodeName,
@@ -855,17 +922,16 @@ export async function bumpHomeIncarnation(): Promise<number> {
 	if (bumpInFlight) return bumpInFlight;
 	const run = (async () => {
 		const self = getThisNodeName();
-		const table = getHDBNodeTable();
-		// A node that has never joined a mesh has no row of its own (add_node and the config routes are
-		// what write it). A url-less row that replicated would be one peers try to dial, so the counter
-		// goes on a LOCAL_ONLY self row instead: invisible to peers, and merged into the real row when
-		// add_node later patches it. Without this a lone node with the feature on would fail every
-		// cluster lock closed for the life of the process.
-		const existing = table.primaryStore.getSync(self);
-		const previous = readOwnIncarnation(table, self);
+		const nodeTable = getRecordLockNodeTable();
+		const previous = Math.max(readOwnIncarnation(nodeTable, self), legacyIncarnation(self));
 		const next = previous + 1;
 		const first = previous === 0;
-		await ensureNode(self, { recordLockIncarnation: next }, existing ? undefined : { localOnly: true });
+		await transaction({}, async (txn) => {
+			const context = (txn as any).getContext();
+			const resource: any = await nodeTable.getResource(self, context, { async: true });
+			await resource._writeUpdate(self, { node: self, incarnation: next }, true, { localOnly: true });
+			await resource.save?.();
+		});
 		setHomeIncarnation(next, first);
 		for (const worker of recordLockParticipantWorkers()) confer(worker, 'record-lock-incarnation', next, first);
 		logger.info?.(`Record lock home incarnation for ${self} is now ${next}`);
@@ -927,6 +993,7 @@ export function releaseRecordLockTransport(database: string): void {
 	stopListeningForApplyFailures(database);
 	forgetPoisonState(database);
 	ownedDatabases.delete(database);
+	restartRecall.cancel(database);
 	relayedControlEntries.delete(database);
 	controlEntryRelayDrops.delete(database);
 	controlEntryRelayRefusals.delete(database);
@@ -962,6 +1029,8 @@ export interface RecordLockDatabaseStats {
 	 * `unprovenOwnershipMs`), 0 once it can; absent while the database has no coordinator to attest from.
 	 */
 	unprovenMs?: number;
+	/** The restart recall round for this incarnation (harper#3254), from the coordinating thread only. */
+	restartRecall?: RestartRecallStatus;
 }
 
 /** Summed `LockCoordinator.stats` over the database's tables on this thread. */
@@ -997,6 +1066,7 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 	}
 	total.relayedControlEntries = relayedControlEntries.get(database) ?? 0;
 	total.outbound = outboundOperationStats(database);
+	if (ownedDatabases.has(database)) total.restartRecall = restartRecall.status(database);
 	try {
 		total.members = transports.get(database)?.homeMap(database)?.homes;
 		total.freshness = freshnessBarriers.get(database)?.stats();
@@ -1449,6 +1519,7 @@ export async function collectRecordLockStatus(
 				entry.freshness = stats.freshness;
 				entry.poisoned = stats.poisoned;
 				entry.unprovenMs = stats.unprovenMs;
+				entry.restartRecall = stats.restartRecall;
 				entry.relayedControlEntries = stats.relayedControlEntries;
 				entry.outbound = stats.outbound;
 			}
