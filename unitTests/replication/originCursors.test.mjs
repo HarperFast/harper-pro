@@ -6,6 +6,7 @@ import assert from 'node:assert';
 import {
 	ORIGIN_CURSOR_OVERLAP_MS,
 	anchorsWithoutFailedLogs,
+	applyRelayedAnchorFloors,
 	buildOriginCursorVector,
 	collectRelayedLogAnchors,
 	collectSeqRows,
@@ -236,5 +237,71 @@ describe('anchorsWithoutFailedLogs', () => {
 		assert.strictEqual(anchorsWithoutFailedLogs(anchors, new Set(['relayed', 'removed'])), undefined);
 		assert.strictEqual(anchorsWithoutFailedLogs(anchors, true), undefined);
 		assert.strictEqual(anchorsWithoutFailedLogs(anchors, new Error('closed')), undefined);
+	});
+});
+
+describe('applyRelayedAnchorFloors', () => {
+	const nameToId = { relayed: 2, removed: 3, prior: 4 };
+
+	it('returns undefined maps when neither originFloors nor relayedAnchors has entries', () => {
+		assert.deepStrictEqual(applyRelayedAnchorFloors(undefined, undefined, undefined, nameToId), {
+			originFloors: undefined,
+			originFloorById: undefined,
+		});
+		assert.deepStrictEqual(applyRelayedAnchorFloors(new Map(), new Map(), new Map(), nameToId), {
+			originFloors: undefined,
+			originFloorById: undefined,
+		});
+	});
+
+	it('records overlap floors in originFloors for all relayed anchors while omitting resumed logs from originFloorById', () => {
+		const relayedAnchors = new Map([
+			['relayed', T - 10],
+			['removed', T - 20],
+		]);
+		assert.deepStrictEqual(applyRelayedAnchorFloors(undefined, relayedAnchors, relayedAnchors, nameToId), {
+			originFloors: new Map([
+				['relayed', T - 10 - ORIGIN_CURSOR_OVERLAP_MS],
+				['removed', T - 20 - ORIGIN_CURSOR_OVERLAP_MS],
+			]),
+			originFloorById: undefined,
+		});
+	});
+
+	it('populates originFloorById only for logs not in exactAnchors, and preserves higher existing floors', () => {
+		const originFloors = new Map([
+			['relayed', T - 5],
+			['prior', T - 30],
+		]);
+		const relayedAnchors = new Map([
+			['relayed', T - 10],
+			['removed', T - 20],
+		]);
+		const exactAnchors = new Map([['relayed', T - 10]]);
+		const expectedFloorById = [];
+		expectedFloorById[3] = T - 20 - ORIGIN_CURSOR_OVERLAP_MS;
+		expectedFloorById[4] = T - 30;
+		assert.deepStrictEqual(applyRelayedAnchorFloors(originFloors, relayedAnchors, exactAnchors, nameToId), {
+			originFloors: new Map([
+				['relayed', T - 5],
+				['prior', T - 30],
+				['removed', T - 20 - ORIGIN_CURSOR_OVERLAP_MS],
+			]),
+			originFloorById: expectedFloorById,
+		});
+	});
+
+	it('restores originFloorById for every floor in originFloors when the boundary range falls back mid-tail', () => {
+		const originFloors = new Map([
+			['relayed', T - 10 - ORIGIN_CURSOR_OVERLAP_MS],
+			['removed', T - 20 - ORIGIN_CURSOR_OVERLAP_MS],
+		]);
+		const expectedFloorById = [];
+		expectedFloorById[2] = T - 10 - ORIGIN_CURSOR_OVERLAP_MS;
+		expectedFloorById[3] = T - 20 - ORIGIN_CURSOR_OVERLAP_MS;
+		assert.deepStrictEqual(applyRelayedAnchorFloors(originFloors, undefined, undefined, nameToId), {
+			originFloors,
+			originFloorById: expectedFloorById,
+		});
 	});
 });

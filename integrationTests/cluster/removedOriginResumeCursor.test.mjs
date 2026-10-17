@@ -159,16 +159,17 @@ async function logSince(node, mark) {
 }
 
 const SENT = /wrote record (\S+) length: \S+ remoteNode (\S+)/g;
-const oldIdsSentIn = (log, receiver) => [
-	...new Set([...log.matchAll(SENT)].filter(([, id, to]) => to === receiver.hostname && isOld(id)).map(([, id]) => id)),
+const idsSentIn = (log, receiver) => [
+	...new Set([...log.matchAll(SENT)].filter(([, , to]) => to === receiver.hostname).map(([, id]) => id)),
 ];
+const oldIdsSentIn = (log, receiver) => idsSentIn(log, receiver).filter(isOld);
 
 async function oldIdsSent(sender, receiver, mark) {
 	return oldIdsSentIn(await logSince(sender, mark), receiver);
 }
 
 /** Only the copy's tail counts: the copy itself carries every row. */
-async function oldIdsSentAfterCopy(sender, receiver, mark) {
+async function idsSentAfterCopy(sender, receiver, mark) {
 	const copied = `Finished copy table ${TABLE} ${receiver.hostname}`;
 	let log;
 	await waitForCondition(async () => (log = await logSince(sender, mark)).includes(copied), {
@@ -177,7 +178,11 @@ async function oldIdsSentAfterCopy(sender, receiver, mark) {
 	});
 	await delay(SETTLE_MS);
 	log = await logSince(sender, mark);
-	return oldIdsSentIn(log.slice(log.indexOf(copied)), receiver);
+	return idsSentIn(log.slice(log.indexOf(copied)), receiver);
+}
+
+async function oldIdsSentAfterCopy(sender, receiver, mark) {
+	return (await idsSentAfterCopy(sender, receiver, mark)).filter(isOld);
 }
 
 suite('Removed and relayed origins resume from per-origin cursors (harper-pro#989)', { timeout: 600_000 }, (ctx) => {
@@ -226,6 +231,7 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 
 		// B holds Q only through A, so its cursor for Q is one B recorded on its A connection.
 		const qMidVersion = Math.max(...Object.values(await postToFixture(B, 'RecordVersions', { ids: qMid })));
+		ctx.qMidVersion = qMidVersion;
 		let bCursorsFromA;
 		await waitForCondition(
 			async () =>
@@ -273,17 +279,34 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 	});
 
 	test('a node added after the removal pulls none of the old rows in its copy tails, nor on restart', async () => {
-		const { A, B, R } = ctx;
+		const { A, B, R, Q } = ctx;
 		ctx.N = await startNewNode(ctx.name);
 		const { N } = ctx;
 		// One copy at a time, so each copy's tail is everything its sender sent after the copy.
 		let markA = await logMark(A);
 		await addNode(N, A);
 		deepEqual(await oldIdsSentAfterCopy(A, N, markA), [], "A's copy tail to N must not carry OLD rows");
+		// Two batches at Q's anchor key (as under concurrent multi-path relay) trip exactStartFailures 'duplicate',
+		// degrading Q from append-order resume to the overlap floor.
+		const qDup = ['q-dup-0', 'q-dup-1'];
+		await postToFixture(B, 'OriginLogWrite', {
+			ghost: Q.hostname,
+			version: ctx.qMidVersion + 1,
+			records: qDup.map((id) => ({ id, fromGhost: true })),
+		});
 		const markB = await logMark(B);
 		await addNode(N, B);
-		deepEqual(await oldIdsSentAfterCopy(B, N, markB), [], "B's copy tail to N must not carry OLD rows");
-		await waitForIds(N, ALL_IDS, 'N holds every row, LATE included');
+		const bTailIds = await idsSentAfterCopy(B, N, markB);
+		deepEqual(bTailIds.filter(isOld), [], "B's copy tail to N must not carry OLD rows");
+		ok(
+			qMid.every((id) => bTailIds.includes(id)),
+			`B's degraded copy tail to N must replay Q's overlap window below its anchor, got ${JSON.stringify(bTailIds)}`
+		);
+		ok(
+			(await logSince(B, markB)).includes(`could not resume relayed log(s) ${Q.hostname} in append order`),
+			"B must warn when Q's relayed log degrades from exact append-order resume to the overlap floor"
+		);
+		await waitForIds(N, [...ALL_IDS, ...qDup], 'N holds every row, LATE included');
 		await delay(SETTLE_MS);
 		// A copy writes a log entry for a row keyed at or after its anchor, so this is a baseline, not zero.
 		const nRLogCount = (await postToFixture(N, 'LogEntryCount', { log: R.hostname })).count;
