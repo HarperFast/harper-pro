@@ -23,9 +23,11 @@
  *   5. N joins A, then B, by base copy: neither copy's tail may carry OLD, and a restart of N must not either.
  *   6. A restarts: no OLD is resent, and R's log on A and B does not grow from step 4 on.
  *
- * The oracle is the SENDER's debug line `wrote record <id> length: <n> remoteNode <peer>` (the level is pinned to
+ * The replay oracle is the SENDER's debug line `wrote record <id> length: <n> remoteNode <peer>` (the level is pinned to
  * debug), read from a log mark onward; for a copy, only after its `Finished copy table <table> <peer>` line, since
  * the copy itself carries every row.
+ * Audit reads establish visibility around removal; post-restart reads prove persistence, since a mapped log
+ * can remain readable after its file is unlinked. These checks keep the no-replay oracle from passing on lost history.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, deepEqual } from 'node:assert/strict';
@@ -47,6 +49,7 @@ const CONVERGE_TIMEOUT_MS = 90_000;
 const SETTLE_MS = 3_000;
 
 const ids = (prefix, count) => Array.from({ length: count }, (_, i) => `${prefix}-${i}`);
+const filedUnder = (recordIds, log) => Object.fromEntries(recordIds.map((id) => [id, log]));
 const rOld = ids('r-old', 20);
 const qOld = ids('q-old', 10);
 const rMid = ids('r-mid', 5);
@@ -73,8 +76,12 @@ async function startNode(node) {
 }
 
 async function restartNode(node) {
+	const previousProcess = node.process;
 	await killHarper({ harper: node });
-	return startNode(node);
+	ok(previousProcess.exitCode !== null || previousProcess.signalCode !== null, 'the previous process exited');
+	const restarted = await startNode(node);
+	ok(restarted.process.pid !== previousProcess.pid, 'restart starts a new process');
+	return restarted;
 }
 
 async function startNewNode(suiteName) {
@@ -236,17 +243,53 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 			}
 		);
 
+		const bRetainedLogs = await postToFixture(B, 'RecordLogs', { ids: [...rOld, ...rMid] });
+		deepEqual(
+			bRetainedLogs,
+			filedUnder([...rOld, ...rMid], R.hostname),
+			'B holds OLD and MID audit entries under R before removal'
+		);
 		await killHarper({ harper: B });
 		await upsert(R, rLate);
 		await waitForIds(A, rLate, 'LATE reaches A while B is down');
+		const aRetainedLogs = await postToFixture(A, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] });
+		deepEqual(
+			aRetainedLogs,
+			filedUnder([...rOld, ...rMid, ...rLate], R.hostname),
+			'A holds OLD, MID and LATE audit entries under R before removal'
+		);
+		const rMembership = {
+			operation: 'search_by_hash',
+			database: 'system',
+			table: 'hdb_nodes',
+			hash_values: [R.hostname],
+			get_attributes: ['name'],
+		};
+		deepEqual(await sendOperation(R, rMembership), [{ name: R.hostname }], 'R is a member before removal');
 
 		// A's removal also disables R itself (remove_node_back), so R stops replicating to anyone.
 		await sendOperation(A, { operation: 'remove_node', hostname: R.hostname });
+		deepEqual(await sendOperation(R, rMembership), [], 'R confirms its reciprocal membership removal');
+		deepEqual(
+			await postToFixture(A, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] }),
+			aRetainedLogs,
+			'removing R must preserve its retained audit entries on A'
+		);
+		deepEqual(
+			await postToFixture(R, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] }),
+			filedUnder([...rOld, ...rMid, ...rLate], 'local'),
+			"reciprocal removal must preserve R's own audit entries"
+		);
 		await killHarper({ harper: R });
 		await startNode(B);
 		// Removing R lifts its exclusion on B's subscription to A, which re-admits A's log for R live.
 		const markIncludeA = await logMark(A);
 		await sendOperation(B, { operation: 'remove_node', hostname: R.hostname });
+		deepEqual(
+			await postToFixture(B, 'RecordLogs', { ids: [...rOld, ...rMid] }),
+			bRetainedLogs,
+			'removing R must preserve its retained audit entries on B'
+		);
 		await waitForIds(B, rLate, 'LATE reaches B through A once B removes R, without a restart');
 		await delay(SETTLE_MS);
 		deepEqual(await oldIdsSent(A, B, markIncludeA), [], 'A must not send OLD rows when it re-admits R for B');
@@ -266,10 +309,20 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 
 		deepEqual(await oldIdsSent(A, B, markA), [], 'A must not resend OLD rows to B on its restart');
 		deepEqual(await oldIdsSent(B, A, markB), [], 'B must not resend OLD rows to A when it returns');
+		for (const node of [A, B]) {
+			deepEqual(
+				await postToFixture(node, 'RecordLogs', { ids: rOld }),
+				filedUnder(rOld, R.hostname),
+				`${node.hostname} must retain OLD audit entries through removal and B's restart`
+			);
+		}
 		ctx.rLogCounts = {
 			A: (await postToFixture(A, 'LogEntryCount', { log: R.hostname })).count,
 			B: (await postToFixture(B, 'LogEntryCount', { log: R.hostname })).count,
 		};
+		for (const [name, count] of Object.entries(ctx.rLogCounts)) {
+			ok(count >= rOld.length + rMid.length + rLate.length, `R's retained log on ${name} lost entries: ${count}`);
+		}
 	});
 
 	test('a node added after the removal pulls none of the old rows in its copy tails, nor on restart', async () => {
@@ -320,6 +373,13 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 
 		deepEqual(await oldIdsSent(B, A, markB), [], 'B must not resend OLD rows to A on its restart');
 		deepEqual(await oldIdsSent(A, B, markA), [], 'A must not resend OLD rows to B when it returns');
+		for (const node of [A, B]) {
+			deepEqual(
+				await postToFixture(node, 'RecordLogs', { ids: rOld }),
+				filedUnder(rOld, R.hostname),
+				'survivors must retain OLD audit entries through restarts and a new node joining'
+			);
+		}
 		deepEqual(
 			{
 				A: (await postToFixture(A, 'LogEntryCount', { log: R.hostname })).count,
