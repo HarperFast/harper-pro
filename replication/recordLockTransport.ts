@@ -815,8 +815,8 @@ function hasKnownPeers(self: string): boolean {
 /**
  * Where a node with no recoverable history starts. Above any counter a node can have reached (one per
  * process start or worker handoff), below the wall clock in milliseconds on any sane clock, so a node
- * that loses its history twice still moves forward, and a clock set far back still orders above the
- * lost history.
+ * that loses its history twice moves forward whenever the clock did, and a clock set far back still
+ * orders above the lost history.
  */
 export const UNKNOWN_HISTORY_INCARNATION_FLOOR = 2 ** 40;
 
