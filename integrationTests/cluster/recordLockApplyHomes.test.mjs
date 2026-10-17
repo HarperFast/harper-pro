@@ -1,9 +1,10 @@
 /**
  * `record_lock_apply_homes` (harper-pro#862) on real nodes: a one-call bootstrap and the refusals that
- * happen before anything is staged. Core lets a coordinator prove a drain only after it has owned for
- * a full delegation lease (~6 minutes, `unprovenOwnershipMs`), so the suite waits that out once in
- * `before`. The retry contract and the topology change live in `recordLockApplyRetry.test.mjs` so the
- * two lease waits shard separately. Same fixture as `recordLockCluster.test.mjs`.
+ * happen before anything is staged. A coordinator proves a drain once the restart recall has attested its
+ * incarnation (seconds on a fresh cluster, harper#3254) or after a full delegation lease (~6 minutes,
+ * `unprovenOwnershipMs`); the suite waits for that once in `before`. The retry contract and the
+ * topology change live in `recordLockApplyRetry.test.mjs`, which keeps the recall off so its drains
+ * stay unprovable. Same fixture as `recordLockCluster.test.mjs`.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';

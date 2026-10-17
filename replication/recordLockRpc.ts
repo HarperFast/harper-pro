@@ -30,6 +30,7 @@ import {
 	deliverDelegationRecall,
 	deliverDelegationRequest,
 	quiesceDelegations,
+	recallDelegationsFromHome,
 	releaseForRelay,
 	revokeRelayedAdmission,
 	writeLockBarrier,
@@ -43,6 +44,11 @@ import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
 import { MAX_LOCK_TIMEOUT_MS } from '../core/resources/recordLock.ts';
 import { MAX_OUTSTANDING_BARRIERS } from './recordLockFreshness.ts';
 import type { TransitionOperation } from './recordLockApply.ts';
+import {
+	INCARNATION_RECALL_BUDGET_MS,
+	RECALL_INCARNATION_OPERATION,
+	type RecallIncarnationOperation,
+} from './recordLockRestart.ts';
 
 export const DELEGATE_OPERATION = 'record_lock_delegate';
 export const RECALL_OPERATION = 'record_lock_recall';
@@ -64,7 +70,7 @@ const RELAY_TIMEOUT_MS = 5_000;
 const RELAY_SLACK_MS = 2_000;
 const MAX_RELAY_TIMEOUT_MS = 120_000;
 export function relayTimeoutFor(kind: RelayKind, payload: any, hop: 'caller' | 'forward' = 'forward'): number {
-	if (kind !== 'quiesce') return RELAY_TIMEOUT_MS;
+	if (kind !== 'quiesce' && kind !== 'recall-incarnation') return RELAY_TIMEOUT_MS;
 	const deadlineMs = Number(payload?.deadlineMs);
 	if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) return RELAY_TIMEOUT_MS;
 	const slack = hop === 'caller' ? RELAY_SLACK_MS * 2 : RELAY_SLACK_MS;
@@ -96,6 +102,8 @@ interface OwnershipReaders {
 	mainOwns(database: string): boolean;
 	/** The thread id of the worker that coordinates `database`, or undefined when not yet known here. */
 	ownerThreadId?(database: string): number | undefined;
+	/** The generation of this node's agreed home map for the database, or undefined while withheld. */
+	activeGeneration?(database: string): number | undefined;
 	/** Whether `node` is in the database's current agreed home map, at this node's own level. */
 	isMember?(database: string, node: string): boolean;
 	/** The peer's exact advertised `recordLocks` level, 0 while unknown. */
@@ -107,8 +115,10 @@ let ownership: OwnershipReaders = {
 	ownerFor: () => undefined,
 	mainOwns: () => false,
 };
-export function setRecordLockOwnershipReaders(readers: OwnershipReaders): void {
+export function setRecordLockOwnershipReaders(readers: OwnershipReaders): OwnershipReaders {
+	const previous = ownership;
 	ownership = readers;
+	return previous;
 }
 
 // ---- send side ---------------------------------------------------------------------------------
@@ -137,7 +147,8 @@ export interface BarrierOperation {
 	nonce: number;
 }
 
-type LockOperation = DelegateOperation | RecallOperation | BarrierOperation | TransitionOperation;
+type LockOperation =
+	DelegateOperation | RecallOperation | BarrierOperation | TransitionOperation | RecallIncarnationOperation;
 
 export interface OutboundOperationStats {
 	/** Sent over this thread's own live subscription session to the peer. */
@@ -419,6 +430,69 @@ async function executeRecall(request: any): Promise<{ recalled: true }> {
 	return RECALLED;
 }
 
+/**
+ * One sweep per (database, home, generation, incarnation) at a time: a repeat of the same request joins
+ * it, while a request for a newer incarnation or generation starts its own, since the answer echoes
+ * exactly what was asked and the home attests on that echo.
+ */
+const incarnationRecallsInFlight = new Map<string, Promise<void>>();
+
+/**
+ * A restarted home's recall by incarnation: drain and release every delegation this node holds from
+ * the calling node below the incarnation it names, on the coordinating thread, and answer only once
+ * nothing here can admit under any of them. The home counts the answer only if it echoes exactly what
+ * was asked, so every refusal below keeps the home's timer rather than ending it. The recalled home is
+ * the authenticated principal, never a payload field: a node can only ever recall what it issued
+ * itself. A `probe` passes the same checks and answers without draining, so the home can tell whether
+ * every member could serve the recall before it makes any of them give up a delegation.
+ */
+export async function executeRecallIncarnation(
+	request: any
+): Promise<{ recalled?: true; probed?: true; incarnation: number; generation: number }> {
+	const home = principalNodeName(request);
+	if (!home) throw new ClientError('record lock recalls are accepted from cluster nodes only', 403);
+	if (typeof request.database !== 'string') throw new ClientError('database is required', 400);
+	const { database, generation, incarnation } = request;
+	if (!Number.isSafeInteger(generation) || generation <= 0 || !Number.isSafeInteger(incarnation) || incarnation <= 0)
+		throw new ClientError('generation and incarnation must be positive integers', 400);
+	if (!ownership.isMember?.(database, home))
+		throw new ClientError(`${home} is not a member of the record lock home map for ${database}`, 403);
+	if (ownership.peerLevel?.(database, home) !== RECORD_LOCKS_CAPABILITY)
+		throw new ClientError(`${home} does not advertise record lock capability level ${RECORD_LOCKS_CAPABILITY}`, 403);
+	if (request.probe === true) {
+		if (!ownership.ownsDatabase(database) && !ownership.ownerThreadId?.(database))
+			throw new ClientError(`no thread coordinates record locks for ${database} here yet`, 503);
+		const active = ownership.activeGeneration?.(database);
+		if (active !== generation)
+			throw new ClientError(
+				`This node holds record lock home map generation ${active ?? 'unknown'} for ${database}, not ${generation}`,
+				409
+			);
+		return { probed: true, incarnation, generation };
+	}
+	const deadlineMs =
+		typeof request.deadlineMs === 'number' && request.deadlineMs > 0
+			? Math.min(request.deadlineMs, INCARNATION_RECALL_BUDGET_MS)
+			: INCARNATION_RECALL_BUDGET_MS;
+	const key = `${database}\u0000${home}\u0000${generation}\u0000${incarnation}`;
+	let sweep = incarnationRecallsInFlight.get(key);
+	if (!sweep) {
+		sweep = (async () => {
+			if (ownership.ownsDatabase(database)) return recallDelegationsFromHome(database, home, generation, incarnation);
+			const answer = await relay('recall-incarnation', database, '', { home, generation, incarnation, deadlineMs });
+			if (answer?.recalled !== true)
+				throw new ClientError('record lock recall did not reach the coordinating worker in time', 503);
+		})();
+		incarnationRecallsInFlight.set(key, sweep);
+		sweep.then(
+			() => incarnationRecallsInFlight.delete(key),
+			() => incarnationRecallsInFlight.delete(key)
+		);
+	}
+	await sweep;
+	return { recalled: true, incarnation, generation };
+}
+
 // ---- the recovery / freshness fence: a lockBarrier written on request -------------------------
 
 const barrierBuckets = new Map<string, { tokens: number; refilledAt: number }>();
@@ -464,7 +538,7 @@ async function executeBarrier(request: any): Promise<{ position: number }> {
 
 // ---- relay through the main thread to the owner worker -----------------------------------------
 
-type RelayKind = 'delegate' | 'recall' | 'quiesce';
+type RelayKind = 'delegate' | 'recall' | 'quiesce' | 'recall-incarnation';
 let nextRelayId = 1;
 const pendingRelays = new Map<number, (reply: any) => void>();
 
@@ -498,6 +572,10 @@ async function relay(kind: RelayKind, database: string, table: string, payload: 
 async function executeLocally(kind: RelayKind, database: string, table: string, payload: any): Promise<any> {
 	if (kind === 'delegate') return deliverDelegationRequest(database, table, payload);
 	if (kind === 'quiesce') return quiesceDelegations(database, payload?.deadlineMs);
+	if (kind === 'recall-incarnation') {
+		await recallDelegationsFromHome(database, payload.home, payload.generation, payload.incarnation);
+		return RECALLED;
+	}
 	await deliverDelegationRecall(database, table, payload);
 	return RECALLED;
 }
@@ -1036,3 +1114,10 @@ export function onRecordLockOwnershipLost(database: string): void {
 server.registerOperation?.({ name: DELEGATE_OPERATION, execute: executeDelegate, httpMethod: 'POST' });
 server.registerOperation?.({ name: RECALL_OPERATION, execute: executeRecall, httpMethod: 'POST' });
 server.registerOperation?.({ name: BARRIER_OPERATION, execute: executeBarrier, httpMethod: 'POST' });
+// Under the test switch the operation stays unregistered, as on a build that predates it.
+if (process.env.HARPER_TEST_RECORD_LOCK_OMIT_INCARNATION_RECALL !== '1')
+	server.registerOperation?.({
+		name: RECALL_INCARNATION_OPERATION,
+		execute: executeRecallIncarnation,
+		httpMethod: 'POST',
+	});

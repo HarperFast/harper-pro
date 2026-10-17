@@ -254,7 +254,7 @@ export async function nodeNames(nodes) {
 	return names;
 }
 
-/** Every node's coordinating thread can prove a drain: core's `unprovenOwnershipMs` has run down. */
+/** Every node's coordinating thread can prove a drain: attested by the restart recall, or core's `unprovenOwnershipMs` has run down. */
 export function waitForProvableDrain(nodes) {
 	return waitForCondition(
 		async (signal) => {
