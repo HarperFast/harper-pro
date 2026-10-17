@@ -2,9 +2,10 @@
  * This module is responsible for profiling threads so we can determine how much CPU usage can be attributed
  * to user code, harper code, and individual "hot" functions
  */
-import { recordAction } from '../core/resources/analytics/write.ts';
+import { addAnalyticsListener, recordAction } from '../core/resources/analytics/write.ts';
 import { getHdbBasePath } from '../core/utility/environment/environmentManager.js';
 import { PACKAGE_ROOT } from '../core/utility/packageUtils.js';
+import { MAX_SET_TIMEOUT_MS } from '../core/utility/hdbTerms.ts';
 import { existsSync, realpathSync, readFileSync, readdirSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -26,6 +27,9 @@ if (process.env.RUN_HDB_APP) userCodeFolders.push(realpathSync(process.env.RUN_H
 
 let profilerTimer: NodeJS.Timeout | undefined;
 let profilerStarted = false;
+export const PROFILER_SAMPLING_METRIC = 'profiler-sampling';
+let samplingSince: number | undefined;
+let unreportedSamplingMs = 0;
 // @datadog/pprof prebuilds link the raw V8 ABI and segfault under V8 pointer compression. The
 // pointer-compression Docker image swaps in a binary rebuilt for that ABI and marks the package
 // with .pointer-compression-build; without the marker, skip profiling instead of crashing.
@@ -68,24 +72,55 @@ export function startAutomaticProfiling(options: Scope['options']): boolean {
 				: undefined;
 	if (disabledReason) {
 		log.info?.(disabledReason);
+		cancelScheduledCapture();
 		if (profilerStarted) captureProfile(-1);
 		return false;
 	}
 	if (profilerUnavailable()) return false;
-	if (!profilerStarted && !startProfiler()) return false;
-	scheduleCapture(capturePeriod, capturePeriod);
-	return true;
+	return scheduleCapture(capturePeriod, capturePeriod);
+}
+
+function samplingWindow(): number {
+	return capturePeriod > 0 ? capturePeriod : Infinity;
+}
+
+function cancelScheduledCapture() {
+	clearTimeout(profilerTimer);
+	captureGeneration++;
 }
 
 // A capture's successor runs after the delay that capture was asked for, and is itself asked for
 // `delayAfterThat`. Automatic profiling asks the first capture for one period and every later one
 // for the shipped default, so captures land at one and two periods and then a thousand periods out.
-function scheduleCapture(delay: number, delayAfterThat = shippedRescheduleDelay()) {
-	clearTimeout(profilerTimer);
-	captureGeneration++;
-	profilerTimer = setTimeout(() => {
-		captureProfile(delayAfterThat);
-	}, delay).unref();
+function scheduleCapture(delay: number, delayAfterThat = shippedRescheduleDelay()): boolean {
+	cancelScheduledCapture();
+	const windowDelay = Math.max(0, delay - samplingWindow());
+	// A sampler that is already running, which a failed stop can leave behind, is captured one
+	// window out rather than left sampling until the next window opens.
+	if (windowDelay === 0 || profilerStarted) {
+		if (!profilerStarted && !startProfiler()) return false;
+		armCapture(Math.min(delay, samplingWindow()), delayAfterThat);
+		return true;
+	}
+	setProfilerTimer(() => {
+		if (profilerStarted || startProfiler()) armCapture(delay - windowDelay, delayAfterThat);
+		// The next window must still open, or the worker never profiles again until it restarts.
+		else scheduleCapture(delay - windowDelay + delayAfterThat, delayAfterThat);
+	}, windowDelay);
+	return true;
+}
+
+function armCapture(delay: number, delayAfterThat: number) {
+	setProfilerTimer(() => captureProfile(delayAfterThat), delay);
+}
+
+// Node fires a timer longer than 2^31-1 ms after 1 ms, so a longer delay waits in hops; capping it
+// would shorten the thousand-period interval until a long period's window filled it.
+function setProfilerTimer(callback: () => void, delay: number) {
+	profilerTimer =
+		delay > MAX_SET_TIMEOUT_MS
+			? setTimeout(() => setProfilerTimer(callback, delay - MAX_SET_TIMEOUT_MS), MAX_SET_TIMEOUT_MS).unref()
+			: setTimeout(callback, delay).unref();
 }
 
 // Entry and completion markers place a wedge inside the native call (harper-pro#788); the entry
@@ -101,6 +136,7 @@ function startProfiler(): boolean {
 	} finally {
 		profilerStarted = timeProfiler.isStarted();
 	}
+	samplingSince = performance.now();
 	log.debug?.(`Profiler started in ${(performance.now() - startedAt).toFixed(1)}ms`);
 	return true;
 }
@@ -112,9 +148,26 @@ function stopProfiler(restart: boolean): Profile {
 		return timeProfiler.stop(restart);
 	} finally {
 		profilerStarted = timeProfiler.isStarted();
+		if (!profilerStarted && samplingSince !== undefined) {
+			unreportedSamplingMs += performance.now() - samplingSince;
+			samplingSince = undefined;
+		}
 		log.debug?.(`Profiler stop returned after ${(performance.now() - startedAt).toFixed(1)}ms (restart=${restart})`);
 	}
 }
+
+export function markProfilerSampling(metrics: { metric: string; total?: number; count?: number }[]) {
+	let sampledMs = unreportedSamplingMs;
+	unreportedSamplingMs = 0;
+	if (samplingSince !== undefined) {
+		const now = performance.now();
+		sampledMs += now - samplingSince;
+		samplingSince = now;
+	}
+	if (sampledMs > 0) metrics.push({ metric: PROFILER_SAMPLING_METRIC, total: Math.ceil(sampledMs), count: 1 });
+}
+addAnalyticsListener(markProfilerSampling);
+
 let lastChildCpuTime = 0;
 let gpuAvailable = true;
 // Bumped by every capture and lifecycle change, so a capture still awaiting GPU measurement when a
@@ -126,20 +179,17 @@ let captureGeneration = 0;
 // purpose — a capture every period (a synchronous V8 profiler stop/start on every thread) at a short
 // period loses db-write analytics in integrationTests/cluster/replicatedAnalyticsUnion.test.mjs;
 // restoring per-period captures needs that interaction understood first.
-// Capped at Node's largest timeout: past 2^31-1 ms a timer fires after 1 ms, which for
-// aggregatePeriod >= 2148 s meant a profiler stop/start every millisecond on every thread.
-const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 function shippedRescheduleDelay(): number {
-	return Math.min((capturePeriod ?? 60) * 1000, MAX_TIMEOUT_MS);
+	return (capturePeriod ?? 60) * 1000;
 }
 
 export async function captureProfile(delayToNextCapture = shippedRescheduleDelay()): Promise<void> {
-	clearTimeout(profilerTimer);
+	cancelScheduledCapture();
 	if (profilerUnavailable()) return;
 	const continuous = delayToNextCapture > 0;
-	const generation = ++captureGeneration;
+	const generation = captureGeneration;
 	if (!profilerStarted) {
-		if (continuous && startProfiler()) scheduleCapture(delayToNextCapture);
+		if (continuous && startProfiler()) armCapture(delayToNextCapture, shippedRescheduleDelay());
 		return;
 	}
 	const hitCountThreshold = 100;
@@ -153,7 +203,12 @@ export async function captureProfile(delayToNextCapture = shippedRescheduleDelay
 	// Start GPU measurement early so it runs in parallel with CPU profiling work
 	const gpuPromise = getWorkerIndex() === 0 && gpuAvailable ? getGpuUtilization() : null;
 	try {
-		const profile = stopProfiler(continuous);
+		const profile = stopProfiler(continuous && delayToNextCapture <= samplingWindow());
+		// Non-zero only after a restarting stop in which pprof found V8's profiler event processor
+		// wedged and replaced it; a window-ending stop replaces the processor regardless.
+		const stuck = timeProfiler.v8ProfilerStuckEventLoopDetected();
+		if (stuck > 0)
+			log.warn?.(`@datadog/pprof found the V8 profiler event processor stuck (level ${stuck}) and restarted it`);
 		const strings = profile.stringTable.strings;
 		for (let func of profile.function) {
 			fileNameById.set(func.id as number, strings[func.filename as number]);

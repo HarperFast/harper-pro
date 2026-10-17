@@ -68,6 +68,8 @@ The `cluster:*` scripts in `package.json` reference `utility/dev/docker-compose.
 
 `test:unit` runs `unitTests/**/*.test.mjs` via mocha (requires a built `dist/` — run `npm run build` first). `test:integration` is slow — run only when the change plausibly affects integration behavior.
 
+From a VS Code-hosted agent, unset `ELECTRON_RUN_AS_NODE` (`env -u ELECTRON_RUN_AS_NODE npm run test:unit`) for builds, tests, and local instances: the extension host exports it, node-gyp-build then looks for an _electron_ prebuild of `@datadog/pprof`, finds none, and the `analytics` component fails to load (`No native build was found for platform=darwin ... runtime=electron`).
+
 ---
 
 ## Where should this change go? (Pro vs. core)
