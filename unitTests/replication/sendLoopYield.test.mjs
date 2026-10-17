@@ -10,7 +10,7 @@ import * as replication from '#src/replication/replicationConnection';
 const source = readFileSync(new URL('../../dist/replication/replicationConnection.js', import.meta.url), 'utf8');
 const skipStart = source.indexOf('function skipAuditRecord() {');
 const skipEnd = source.indexOf('if (!sentNodeIds.has(', skipStart);
-const waitStart = source.indexOf('// wait if there is back-pressure', skipEnd);
+const waitStart = source.indexOf('if (ws._socket.writableNeedDrain)', skipEnd);
 const waitEnd = source.indexOf('const sendQueuedData =', waitStart);
 assert(skipStart >= 0 && skipEnd > skipStart && waitStart > skipEnd && waitEnd > waitStart);
 const skip = source.slice(skipStart, skipEnd);
