@@ -157,12 +157,10 @@ suite('record locks: a restarted home ends its quarantine by recall (harper#3254
 		assert.notEqual(contended.status, 200, `a second holder was admitted: ${JSON.stringify(contended.body)}`);
 		const during = await lockStats(home);
 		assert.notEqual(during.restartRecall?.state, 'attested', JSON.stringify(during.restartRecall));
-		const releasedAt = Date.now();
 		await call(holder, 'LockRelease/', { token: held.body.token });
 		await waitForAttested(home);
 		const after = await call(contender, 'LockHold/', { id, lease: 5_000, timeout: 20_000 });
 		assert.equal(after.status, 200, `after the release the contender acquires: ${JSON.stringify(after.body)}`);
-		assert.ok(Date.now() >= releasedAt, 'the second hold started after the first ended');
 		await call(contender, 'LockRelease/', { token: after.body.token });
 	});
 });
@@ -221,14 +219,24 @@ suite(
 
 		test('a peer at the old level rejects the operation, and the home keeps the timer', async () => {
 			const [home, requester] = nodes;
-			// Probed from the home itself: a probe from `requester` would leave it a retained delegation that
-			// serves its later locks locally, never consulting the restarted home at all.
+			// Found from the home itself: a key found from `requester` would leave it a retained delegation
+			// that serves its later locks locally, never consulting the restarted home at all.
 			const id = await keyHomedOn(nodes, home, home, 'old-level');
+			// And one `requester` does hold a delegation for: while the round cannot complete, nobody is
+			// drained, so it keeps serving that key from its delegation exactly as before this feature.
+			const cached = await keyHomedOn(nodes, home, requester, 'cached');
 			await restartHome(home, nodes);
 			await waitForRing(nodes, nodes.length);
 			await assertQuarantineHolds(home, requester, id, oldPeerName);
 			const status = await lockStats(home);
 			assert.match(status.restartRecall?.lastError ?? '', /\S/, 'the refusal is reported');
+			const kept = await call(requester, 'LockHold/', { id: cached, lease: 2_000, timeout: 2_000 });
+			assert.equal(
+				kept.status,
+				200,
+				`the retained delegation was drained for a round that cannot complete: ${JSON.stringify(kept.body)}`
+			);
+			await call(requester, 'LockRelease/', { token: kept.body.token });
 		});
 
 		test('an unreachable member keeps the timer', async () => {

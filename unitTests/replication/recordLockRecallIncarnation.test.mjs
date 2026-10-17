@@ -113,4 +113,23 @@ describe('record_lock_recall_incarnation (harper#3254)', () => {
 		await executeRecallIncarnation(request());
 		assert.strictEqual(mapReads, 2, 'a request after the sweep settled starts a new one');
 	});
+
+	it('answers a probe after every check, without sweeping', async () => {
+		const answer = await executeRecallIncarnation(request({ probe: true }));
+		assert.deepStrictEqual(answer, { probed: true, incarnation: 2, generation: 1 });
+		assert.strictEqual(mapReads, 0, 'a probe drains nothing');
+		await refuses({ probe: true, hdb_user: { name: 'departed' } }, 403, 'a probe passes the same checks');
+	});
+
+	it('does not let a request for a newer incarnation or generation join an older sweep', async () => {
+		const answers = await Promise.all([
+			executeRecallIncarnation(request({ incarnation: 2 })),
+			executeRecallIncarnation(request({ incarnation: 3 })),
+		]);
+		assert.deepStrictEqual(
+			answers.map((answer) => answer.incarnation),
+			[2, 3]
+		);
+		assert.strictEqual(mapReads, 2, 'each question gets its own sweep');
+	});
 });

@@ -107,6 +107,7 @@ import {
 	type ReplicatedApplyFailureListener,
 } from '../core/resources/replicatedApplyFailure.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
+import { ensureNode } from './subscriptionManager.ts';
 import './recordLockApply.ts';
 
 export { RECORD_LOCKS_CAPABILITY_POSITION, RECORD_LOCK_HOMES_AGREEMENT_POSITION, RECORD_LOCK_LEVEL_POSITION };
@@ -296,7 +297,7 @@ export interface RecordLockTransportDeps {
 	acquireOnOwner(database: string, table: string, key: unknown, leaseMs: number, waitMs: number): Promise<LockRound>;
 	/** harper-pro#852: release a relayed admission on the owner worker. */
 	releaseOnOwner(database: string, table: string, key: unknown, admissionId: number): void;
-	/** harper#3254: the incarnation every ring member has recalled below, or undefined (`recordLockRestart.ts`). */
+	/** The incarnation every ring member has recalled below, or undefined (`recordLockRestart.ts`). */
 	quiescedIncarnation?(database: string): number | undefined;
 }
 
@@ -515,7 +516,8 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 	// A generation change retires outstanding freshness waits.
 	if (before?.generation !== after?.generation) {
 		recreateRecordLockTransport(database);
-		// Answers to a restart recall are bound to the generation they were asked under.
+		// A round in flight asked under the old generation and must ask again; an attested incarnation
+		// stays attested, since earlier incarnations never issued under a generation they never activated.
 		if (CLUSTER_RECORD_LOCKS_ENABLED && ownedDatabases.has(database)) restartRecall.schedule(database);
 	}
 }
@@ -777,7 +779,7 @@ let recordLockNodeTable: any;
  * back) replaces ours wholesale, so the counter was lost on the first restart of every fresh cluster
  * — the quarantine was then waived as a first incarnation and the token order of §5.1 restarted at 1.
  */
-export function getRecordLockNodeTable() {
+function getRecordLockNodeTable() {
 	return (
 		recordLockNodeTable ||
 		(recordLockNodeTable = table({
@@ -803,6 +805,11 @@ export function readOwnIncarnation(table: { primaryStore: { getSync(key: string)
 function legacyIncarnation(self: string): number {
 	const value = getHDBNodeTable().primaryStore.getSync(self)?.recordLockIncarnation;
 	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function hasKnownPeers(self: string): boolean {
+	for (const node of getHDBNodeTable().search([])) if (node?.name && node.name !== self) return true;
+	return false;
 }
 /**
  * The incarnation this thread issues tokens under. On the main thread it is what `bumpHomeIncarnation`
@@ -851,9 +858,9 @@ export function setHomeIncarnation(value: unknown, first?: boolean): void {
 }
 
 /**
- * The restart recall (harper#3254) for every database this thread coordinates. Scheduled when
- * ownership arrives, on every incarnation change, and on a generation change; cancelled when
- * ownership leaves or the database is released.
+ * The restart recall for every database this thread coordinates. Scheduled when ownership arrives,
+ * on every incarnation change, and on a generation change; cancelled when ownership leaves or the
+ * database is released.
  */
 const restartRecall = createRestartRecall({
 	thisNodeName: getThisNodeName,
@@ -925,13 +932,24 @@ export async function bumpHomeIncarnation(): Promise<number> {
 		const nodeTable = getRecordLockNodeTable();
 		const previous = Math.max(readOwnIncarnation(nodeTable, self), legacyIncarnation(self));
 		const next = previous + 1;
-		const first = previous === 0;
+		// A counter of 0 proves nothing on a node that already has peers: a build before harper#3254 lost
+		// the legacy field to a peer's rewrite of the self row, so an upgraded member reads 0 while its
+		// earlier incarnations may still have delegations out. Only a node that never joined a mesh is
+		// provably on its first incarnation.
+		const first = previous === 0 && !hasKnownPeers(self);
 		await transaction({}, async (txn) => {
 			const context = (txn as any).getContext();
 			const resource: any = await nodeTable.getResource(self, context, { async: true });
 			await resource._writeUpdate(self, { node: self, incarnation: next }, true, { localOnly: true });
 			await resource.save?.();
 		});
+		// Mirrored onto the legacy field while a self row exists, so a rollback to a build that reads only
+		// that field continues the count rather than restarting it. Best effort: the row is the mesh's
+		// shared copy and a peer's rewrite can still erase it, which is why it is no longer authoritative.
+		if (getHDBNodeTable().primaryStore.getSync(self))
+			await ensureNode(self, { recordLockIncarnation: next }).catch((error) =>
+				logger.debug?.('Could not mirror the record lock incarnation onto the hdb_nodes self row', error)
+			);
 		setHomeIncarnation(next, first);
 		for (const worker of recordLockParticipantWorkers()) confer(worker, 'record-lock-incarnation', next, first);
 		logger.info?.(`Record lock home incarnation for ${self} is now ${next}`);
@@ -1029,7 +1047,7 @@ export interface RecordLockDatabaseStats {
 	 * `unprovenOwnershipMs`), 0 once it can; absent while the database has no coordinator to attest from.
 	 */
 	unprovenMs?: number;
-	/** The restart recall round for this incarnation (harper#3254), from the coordinating thread only. */
+	/** The restart recall round for this incarnation, from the coordinating thread only. */
 	restartRecall?: RestartRecallStatus;
 }
 

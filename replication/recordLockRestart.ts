@@ -1,26 +1,37 @@
 /**
- * A restarted record-lock home's way out of its §4.3 quarantine (harper#3254): instead of waiting
- * out `DELEGATION_LEASE_MS + skew` for the delegations its previous incarnations issued, the home
- * asks every member of the agreed ring to recall every delegation it holds from this node below the
- * current incarnation (`record_lock_recall_incarnation`, `recordLockRpc.ts`; core's
- * `recallDelegationsFromHome` on the member) and attests the incarnation to core's coordinators
+ * A restarted record-lock home's way out of its §4.3 quarantine: instead of waiting out
+ * `DELEGATION_LEASE_MS + skew` for the delegations its previous incarnations issued, the home asks
+ * every member of the agreed ring to recall every delegation it holds from this node below the
+ * current incarnation and attests the incarnation to core's coordinators
  * (`ClusterLockTransport.quiescedIncarnation`) once every member has answered.
  *
  * Completeness is over `homes[]` of the map the round started under, never over who answered. An
  * answer counts only if it echoes the incarnation and generation it was asked for, so an older peer
  * that rejects the operation, a silent peer, or a reply about another incarnation leaves the round
- * incomplete and core's timer in force. A round that fails is retried on a paced backoff for as long
- * as this thread coordinates the database and the incarnation is unattested; a later-built table
- * coordinator still benefits from the attestation, which is why the retries do not stop at the timer.
+ * incomplete and core's timer in force.
  *
- * Runs on the coordinating thread only. Pure over its dependencies so the round logic is unit-testable
- * without a cluster.
+ * Every attempt probes first and recalls second. A member that is recalled gives up delegations it
+ * could otherwise have kept serving from until their lease ran out, so while a round cannot complete
+ * — a member down, or one on a build without the operation — nobody should be drained for nothing:
+ * the recall is sent only once every member has answered the probe, which drains nothing.
+ *
+ * A round that fails is retried for as long as this thread coordinates the database and the
+ * incarnation is unattested: a table coordinator built later still benefits from the attestation,
+ * which is why the retries do not stop at the timer.
+ *
+ * Runs on the coordinating thread only. Pure over its dependencies.
  */
 import type { LockHomeMap } from '../core/resources/recordLockCoordinator.ts';
+import { createBackoff, type Backoff } from './backoff.ts';
 
 export const RECALL_INCARNATION_OPERATION = 'record_lock_recall_incarnation';
-/** One attempt's bound per member. A member draining a held lock answers within the holder's lease. */
+/**
+ * One attempt's bound per member. Far below a delegation lease: a member draining a lock that is still
+ * held answers only once the holder unlocks, and a retry joins that same drain, so a short bound costs
+ * a retry rather than a lost answer.
+ */
 export const INCARNATION_RECALL_BUDGET_MS = 20_000;
+const PROBE_BUDGET_MS = 5_000;
 const RETRY_INITIAL_MS = 1_000;
 const RETRY_MAX_MS = 30_000;
 
@@ -32,13 +43,14 @@ export interface RestartRecallDeps {
 	isFirstIncarnation(): boolean;
 	ownsDatabase(database: string): boolean;
 	homeMap(database: string): LockHomeMap | undefined;
-	/** Send the recall to one member; the reply is checked here, errors fail the round. */
 	send(node: string, database: string, operation: RecallIncarnationOperation, timeoutMs: number): Promise<any>;
-	/** This node's own sweep (core's `recallDelegationsFromHome`); the home is a ring member too. */
+	/** This node's own sweep; the home is a ring member too. */
 	recallLocally(database: string, home: string, generation: number, belowIncarnation: number): Promise<void>;
 	setTimer?(callback: () => void, ms: number): unknown;
 	clearTimer?(handle: unknown): void;
+	random?(): number;
 	warn?(message: string, detail?: unknown): void;
+	debug?(message: string, detail?: unknown): void;
 }
 
 export interface RecallIncarnationOperation {
@@ -48,10 +60,11 @@ export interface RecallIncarnationOperation {
 	/** The caller's current incarnation; the member recalls everything the caller issued below it. */
 	incarnation: number;
 	deadlineMs: number;
+	/** Answer whether the recall could be served, without serving it. */
+	probe?: true;
 }
 
 export interface RestartRecallStatus {
-	/** The incarnation the round is for, or has attested. */
 	incarnation: number;
 	state: 'pending' | 'attested';
 	attempts: number;
@@ -61,7 +74,7 @@ export interface RestartRecallStatus {
 }
 
 export interface RestartRecall {
-	/** Start, or restart, the round for a database this thread coordinates. Idempotent while one runs. */
+	/** Start, or restart, the round for a database this thread coordinates. */
 	schedule(database: string): void;
 	/** Ownership lost or the database released: stop retrying and forget the attestation. */
 	cancel(database: string): void;
@@ -73,11 +86,12 @@ export interface RestartRecall {
 interface DatabaseRound {
 	attested?: number;
 	attempts: number;
-	running: boolean;
-	/** A `schedule` that landed while an attempt was running: run again as soon as it settles. */
+	/** The question the running attempt is asking, while one runs. */
+	running?: { incarnation: number; generation: number };
+	/** A `schedule` for a different question landed while an attempt was running: ask again when it settles. */
 	rerun: boolean;
 	retryTimer?: unknown;
-	retryMs: number;
+	backoff: Backoff;
 	unanswered: string[];
 	lastError?: string;
 	/** The incarnation the current or last attempt asked for. */
@@ -85,11 +99,16 @@ interface DatabaseRound {
 }
 
 /** The shape every answer must have; anything else is "did not answer" and keeps the timer. */
-export function isCompleteAnswer(reply: unknown, incarnation: number, generation: number): boolean {
+export function isCompleteAnswer(
+	reply: unknown,
+	incarnation: number,
+	generation: number,
+	confirmation: 'recalled' | 'probed' = 'recalled'
+): boolean {
 	return (
 		typeof reply === 'object' &&
 		reply !== null &&
-		(reply as any).recalled === true &&
+		(reply as any)[confirmation] === true &&
 		(reply as any).incarnation === incarnation &&
 		(reply as any).generation === generation
 	);
@@ -107,9 +126,8 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 				database,
 				(round = {
 					attempts: 0,
-					running: false,
 					rerun: false,
-					retryMs: RETRY_INITIAL_MS,
+					backoff: createBackoff({ initialMs: RETRY_INITIAL_MS, maxMs: RETRY_MAX_MS, random: deps.random }),
 					unanswered: [],
 					incarnation: 0,
 				})
@@ -126,15 +144,33 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 		stopRetry(round);
 		round.retryTimer = setTimer(() => {
 			round.retryTimer = undefined;
-			attempt(database);
-		}, round.retryMs);
-		round.retryMs = Math.min(RETRY_MAX_MS, round.retryMs * 2);
+			attempt(database).catch((error) => deps.warn?.(`Record lock restart recall for ${database} failed`, error));
+		}, round.backoff.nextDelay() ?? RETRY_MAX_MS);
+	}
+
+	/** One phase of an attempt over every member; a rejection names the member it came from. */
+	async function askEveryMember(
+		database: string,
+		members: string[],
+		ask: (member: string) => Promise<void>
+	): Promise<{ unanswered: string[]; lastError?: string }> {
+		const outcomes = await Promise.allSettled(members.map(ask));
+		const unanswered: string[] = [];
+		let lastError: string | undefined;
+		outcomes.forEach((outcome, index) => {
+			if (outcome.status === 'fulfilled') return;
+			unanswered.push(members[index]);
+			lastError = `${members[index]}: ${(outcome.reason as Error)?.message ?? outcome.reason}`;
+		});
+		return { unanswered, lastError };
 	}
 
 	async function attempt(database: string): Promise<void> {
 		const round = roundFor(database);
 		if (round.running) {
-			round.rerun = true;
+			const incarnation = deps.homeIncarnation();
+			const generation = deps.homeMap(database)?.generation;
+			if (round.running.incarnation !== incarnation || round.running.generation !== generation) round.rerun = true;
 			return;
 		}
 		stopRetry(round);
@@ -144,8 +180,7 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 		round.incarnation = incarnation;
 		if (round.attested === incarnation) return;
 		if (deps.isFirstIncarnation()) {
-			// Nothing was ever issued below the first incarnation; the attestation is vacuously true and
-			// core already waives the timer through `grantableAfterMono`.
+			// Nothing was ever issued below the first incarnation, and core already waives the timer.
 			round.attested = incarnation;
 			round.unanswered = [];
 			return;
@@ -158,46 +193,51 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 		const self = deps.thisNodeName();
 		const { generation } = homeMap;
 		const members = [...homeMap.homes];
-		const operation: RecallIncarnationOperation = {
+		const peers = members.filter((member) => member !== self);
+		const operation = (probe: boolean): RecallIncarnationOperation => ({
 			operation: RECALL_INCARNATION_OPERATION,
 			database,
 			generation,
 			incarnation,
 			deadlineMs: INCARNATION_RECALL_BUDGET_MS,
-		};
-		round.running = true;
+			...(probe ? { probe: true as const } : {}),
+		});
+		round.running = { incarnation, generation };
 		round.rerun = false;
 		round.attempts++;
-		const outcomes = await Promise.allSettled(
-			members.map(async (member) => {
+		let outcome = await askEveryMember(database, peers, async (member) => {
+			const reply = await deps.send(member, database, operation(true), PROBE_BUDGET_MS);
+			if (!isCompleteAnswer(reply, incarnation, generation, 'probed'))
+				throw new Error(`${member} cannot serve a recall for incarnation ${incarnation}`);
+		});
+		if (outcome.unanswered.length === 0)
+			outcome = await askEveryMember(database, members, async (member) => {
 				if (member === self) return deps.recallLocally(database, self, generation, incarnation);
-				const reply = await deps.send(member, database, operation, INCARNATION_RECALL_BUDGET_MS);
+				const reply = await deps.send(member, database, operation(false), INCARNATION_RECALL_BUDGET_MS);
 				if (!isCompleteAnswer(reply, incarnation, generation))
 					throw new Error(`${member} did not confirm the recall for incarnation ${incarnation}`);
-			})
-		);
-		round.running = false;
-		const unanswered: string[] = [];
-		let lastError: string | undefined;
-		outcomes.forEach((outcome, index) => {
-			if (outcome.status === 'fulfilled') return;
-			unanswered.push(members[index]);
-			lastError = `${members[index]}: ${(outcome.reason as Error)?.message ?? outcome.reason}`;
-		});
-		round.unanswered = unanswered;
-		round.lastError = lastError;
+			});
+		round.running = undefined;
+		// Cancelled, or replaced by a later round, while the answers were in flight: they belong to nobody.
+		if (rounds.get(database) !== round) return;
+		const changed = outcome.lastError !== round.lastError;
+		round.unanswered = outcome.unanswered;
+		round.lastError = outcome.lastError;
 		// What the answers were about must still be what this thread coordinates under: an incarnation
 		// bump or a generation change during the round makes them answers to another question.
 		const current =
 			deps.ownsDatabase(database) &&
 			deps.homeIncarnation() === incarnation &&
 			deps.homeMap(database)?.generation === generation;
-		if (unanswered.length === 0 && current && !round.rerun) {
+		if (outcome.unanswered.length === 0 && current && !round.rerun) {
 			round.attested = incarnation;
-			round.retryMs = RETRY_INITIAL_MS;
+			round.backoff.reset();
 			return;
 		}
-		if (lastError) deps.warn?.(`Record lock restart recall for ${database} is incomplete; retrying`, lastError);
+		if (outcome.lastError) {
+			const log = changed ? deps.warn : deps.debug;
+			log?.(`Record lock restart recall for ${database} is incomplete; retrying`, outcome.lastError);
+		}
 		if (!deps.ownsDatabase(database)) return;
 		if (round.rerun) return attempt(database);
 		retryLater(database, round);
@@ -206,10 +246,7 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 	return {
 		schedule(database) {
 			if (!deps.ownsDatabase(database)) return;
-			const round = roundFor(database);
-			// Any earlier attestation is for an incarnation `quiescedIncarnation` no longer reports; the
-			// field itself is left for the comparison there, so a schedule for the same incarnation is free.
-			round.retryMs = RETRY_INITIAL_MS;
+			roundFor(database).backoff.reset();
 			attempt(database).catch((error) => deps.warn?.(`Record lock restart recall for ${database} failed`, error));
 		},
 		cancel(database) {

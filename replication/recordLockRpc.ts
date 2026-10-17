@@ -429,20 +429,25 @@ async function executeRecall(request: any): Promise<{ recalled: true }> {
 	return RECALLED;
 }
 
-/** One sweep per (database, home) at a time; a duplicate request from the same home joins it. */
+/**
+ * One sweep per (database, home, generation, incarnation) at a time: a repeat of the same request joins
+ * it, while a request for a newer incarnation or generation starts its own, since the answer echoes
+ * exactly what was asked and the home attests on that echo.
+ */
 const incarnationRecallsInFlight = new Map<string, Promise<void>>();
 
 /**
- * A restarted home's recall by incarnation (harper#3254): drain and release every delegation this
- * node holds from the calling node below the incarnation it names, on the coordinating thread, and
- * answer only once nothing here can admit under any of them. The home counts the answer only if it
- * echoes exactly what was asked, so every refusal below keeps the home's timer rather than ending it.
- * The recalled home is the authenticated principal, never a payload field: a node can only ever
- * recall what it issued itself.
+ * A restarted home's recall by incarnation: drain and release every delegation this node holds from
+ * the calling node below the incarnation it names, on the coordinating thread, and answer only once
+ * nothing here can admit under any of them. The home counts the answer only if it echoes exactly what
+ * was asked, so every refusal below keeps the home's timer rather than ending it. The recalled home is
+ * the authenticated principal, never a payload field: a node can only ever recall what it issued
+ * itself. A `probe` passes the same checks and answers without draining, so the home can tell whether
+ * every member could serve the recall before it makes any of them give up a delegation.
  */
 export async function executeRecallIncarnation(
 	request: any
-): Promise<{ recalled: true; incarnation: number; generation: number }> {
+): Promise<{ recalled?: true; probed?: true; incarnation: number; generation: number }> {
 	const home = principalNodeName(request);
 	if (!home) throw new ClientError('record lock recalls are accepted from cluster nodes only', 403);
 	if (typeof request.database !== 'string') throw new ClientError('database is required', 400);
@@ -453,11 +458,16 @@ export async function executeRecallIncarnation(
 		throw new ClientError(`${home} is not a member of the record lock home map for ${database}`, 403);
 	if (ownership.peerLevel?.(database, home) !== RECORD_LOCKS_CAPABILITY)
 		throw new ClientError(`${home} does not advertise record lock capability level ${RECORD_LOCKS_CAPABILITY}`, 403);
+	if (request.probe === true) {
+		if (!ownership.ownsDatabase(database) && !ownership.ownerThreadId?.(database))
+			throw new ClientError(`no thread coordinates record locks for ${database} here yet`, 503);
+		return { probed: true, incarnation, generation };
+	}
 	const deadlineMs =
 		typeof request.deadlineMs === 'number' && request.deadlineMs > 0
 			? Math.min(request.deadlineMs, INCARNATION_RECALL_BUDGET_MS)
 			: INCARNATION_RECALL_BUDGET_MS;
-	const key = `${database}\u0000${home}`;
+	const key = `${database}\u0000${home}\u0000${generation}\u0000${incarnation}`;
 	let sweep = incarnationRecallsInFlight.get(key);
 	if (!sweep) {
 		sweep = (async () => {
@@ -1097,8 +1107,7 @@ export function onRecordLockOwnershipLost(database: string): void {
 server.registerOperation?.({ name: DELEGATE_OPERATION, execute: executeDelegate, httpMethod: 'POST' });
 server.registerOperation?.({ name: RECALL_OPERATION, execute: executeRecall, httpMethod: 'POST' });
 server.registerOperation?.({ name: BARRIER_OPERATION, execute: executeBarrier, httpMethod: 'POST' });
-// Left unregistered under the test switch so a node stands in for a build that predates the recall by
-// incarnation: the home's send then fails as an unknown operation and its timer must stay in force.
+// Under the test switch the operation stays unregistered, as on a build that predates it.
 if (process.env.HARPER_TEST_RECORD_LOCK_OMIT_INCARNATION_RECALL !== '1')
 	server.registerOperation?.({
 		name: RECALL_INCARNATION_OPERATION,
