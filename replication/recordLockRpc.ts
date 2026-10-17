@@ -115,7 +115,6 @@ let ownership: OwnershipReaders = {
 	ownerFor: () => undefined,
 	mainOwns: () => false,
 };
-/** Returns the previous readers so a test can restore them. */
 export function setRecordLockOwnershipReaders(readers: OwnershipReaders): OwnershipReaders {
 	const previous = ownership;
 	ownership = readers;

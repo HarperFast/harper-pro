@@ -802,14 +802,37 @@ export function readOwnIncarnation(table: { primaryStore: { getSync(key: string)
 }
 
 /** The counter a build before harper#3254 kept on the `hdb_nodes` self row, so an upgrade continues from it. */
-function legacyIncarnation(self: string): number {
-	const value = getHDBNodeTable().primaryStore.getSync(self)?.recordLockIncarnation;
+export function readLegacyIncarnation(table: { primaryStore: { getSync(key: string): any } }, self: string): number {
+	const value = table.primaryStore.getSync(self)?.recordLockIncarnation;
 	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 function hasKnownPeers(self: string): boolean {
 	for (const node of getHDBNodeTable().search([])) if (node?.name && node.name !== self) return true;
 	return false;
+}
+
+/**
+ * Where a node with no recoverable history starts. Above any counter a node can have reached (one per
+ * process start or worker handoff), below the wall clock in milliseconds on any sane clock, so a node
+ * that loses its history twice still moves forward, and a clock set far back still orders above the
+ * lost history.
+ */
+export const UNKNOWN_HISTORY_INCARNATION_FLOOR = 2 ** 40;
+
+/**
+ * The incarnation this start coordinates under, and whether it is provably the node's first. A
+ * counter of 0 proves nothing on a node that already has peers: a build before harper#3254 lost the
+ * legacy field to a peer's rewrite of the self row, so an upgraded member reads 0 while its earlier
+ * incarnations may still have delegations out, under a counter nobody here can recover. Only a node
+ * that never joined a mesh is provably on its first incarnation. The other case needs an incarnation
+ * that orders above whatever the lost history issued and that the restart recall (which recalls
+ * everything below it) reaches.
+ */
+export function nextIncarnation(previous: number, hasPeers: boolean, now: number): { next: number; first: boolean } {
+	if (previous > 0) return { next: previous + 1, first: false };
+	if (!hasPeers) return { next: 1, first: true };
+	return { next: Math.max(Math.floor(now), UNKNOWN_HISTORY_INCARNATION_FLOOR), first: false };
 }
 /**
  * The incarnation this thread issues tokens under. On the main thread it is what `bumpHomeIncarnation`
@@ -931,16 +954,8 @@ export async function bumpHomeIncarnation(): Promise<number> {
 	const run = (async () => {
 		const self = getThisNodeName();
 		const nodeTable = getRecordLockNodeTable();
-		const previous = Math.max(readOwnIncarnation(nodeTable, self), legacyIncarnation(self));
-		// A counter of 0 proves nothing on a node that already has peers: a build before harper#3254 lost
-		// the legacy field to a peer's rewrite of the self row, so an upgraded member reads 0 while its
-		// earlier incarnations may still have delegations out, under a counter nobody here can recover.
-		// Only a node that never joined a mesh is provably on its first incarnation. The other case needs
-		// an incarnation that orders above whatever the lost history issued, and that the restart recall
-		// (which recalls everything below it) reaches: the wall clock in milliseconds is above any counter
-		// a node can have reached, and every later bump continues from it.
-		const first = previous === 0 && !hasKnownPeers(self);
-		const next = previous === 0 && !first ? Math.max(1, Date.now()) : previous + 1;
+		const previous = Math.max(readOwnIncarnation(nodeTable, self), readLegacyIncarnation(getHDBNodeTable(), self));
+		const { next, first } = nextIncarnation(previous, hasKnownPeers(self), Date.now());
 		await transaction({}, async (txn) => {
 			const context = (txn as any).getContext();
 			const resource: any = await nodeTable.getResource(self, context, { async: true });

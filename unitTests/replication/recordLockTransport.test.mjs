@@ -26,6 +26,9 @@ import {
 	createRecordLockTransport,
 	handleOwnerThreadAck,
 	readOwnIncarnation,
+	readLegacyIncarnation,
+	nextIncarnation,
+	UNKNOWN_HISTORY_INCARNATION_FLOOR,
 	setHomeIncarnation,
 	isFirstIncarnation,
 	currentHomeIncarnation,
@@ -353,6 +356,31 @@ describe('readOwnIncarnation', () => {
 		assert.strictEqual(readOwnIncarnation(tableWith({ name: 'self' }), 'self'), 0);
 		for (const bad of [0, -1, '3', NaN, null])
 			assert.strictEqual(readOwnIncarnation(tableWith({ incarnation: bad }), 'self'), 0);
+	});
+});
+
+describe('the incarnation a start coordinates under', () => {
+	const tableWith = (row) => ({ primaryStore: { getSync: (key) => (key === 'self' ? row : undefined) } });
+	it('reads the legacy hdb_nodes field for an upgrade, and 0 when it is missing or malformed', () => {
+		assert.strictEqual(readLegacyIncarnation(tableWith({ name: 'self', recordLockIncarnation: 4 }), 'self'), 4);
+		assert.strictEqual(readLegacyIncarnation(tableWith({ name: 'self' }), 'self'), 0);
+		for (const bad of [0, -1, '3', NaN, null])
+			assert.strictEqual(readLegacyIncarnation(tableWith({ recordLockIncarnation: bad }), 'self'), 0);
+	});
+	it('continues a known count, starts a lone node at its first incarnation, and starts a node with lost history above it', () => {
+		assert.deepStrictEqual(nextIncarnation(7, true, 1_760_000_000_000), { next: 8, first: false });
+		assert.deepStrictEqual(nextIncarnation(0, false, 1_760_000_000_000), { next: 1, first: true });
+		const lost = nextIncarnation(0, true, 1_760_000_000_000);
+		assert.strictEqual(lost.first, false, 'a node with peers and no counter is not provably first');
+		assert.strictEqual(lost.next, 1_760_000_000_000);
+		assert.ok(lost.next > 2 ** 32, 'far above any counter a node reaches one bump at a time');
+		const brokenClock = nextIncarnation(0, true, 7);
+		assert.strictEqual(
+			brokenClock.next,
+			UNKNOWN_HISTORY_INCARNATION_FLOOR,
+			'a clock set back still orders above the lost history'
+		);
+		assert.deepStrictEqual(nextIncarnation(lost.next, true, 0), { next: lost.next + 1, first: false });
 	});
 });
 
