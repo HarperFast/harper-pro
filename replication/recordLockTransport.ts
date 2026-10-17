@@ -518,7 +518,8 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		recreateRecordLockTransport(database);
 		// A round in flight asked under the old generation and must ask again; an attested incarnation
 		// stays attested, since earlier incarnations never issued under a generation they never activated.
-		if (CLUSTER_RECORD_LOCKS_ENABLED && ownedDatabases.has(database)) restartRecall.schedule(database);
+		if (CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF && ownedDatabases.has(database))
+			restartRecall.schedule(database);
 	}
 }
 
@@ -751,7 +752,7 @@ export function setRecordLockOwnership(database: string, owned: boolean): void {
 	// instant — matching the one case that keeps the waiver.
 	if (owned && !wasOwned) {
 		recreateRecordLockTransport(database);
-		if (CLUSTER_RECORD_LOCKS_ENABLED) restartRecall.schedule(database);
+		if (CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF) restartRecall.schedule(database);
 	} else if (!owned && wasOwned) {
 		onRecordLockOwnershipLost(database);
 		restartRecall.cancel(database);
@@ -877,7 +878,8 @@ export function setHomeIncarnation(value: unknown, first?: boolean): void {
 	}
 	// The counter is node-wide: a handoff on one database re-arms every owned database's quarantine
 	// (core re-arms on the incarnation change), so each one needs a round for the new incarnation.
-	if (CLUSTER_RECORD_LOCKS_ENABLED) for (const database of ownedDatabases) restartRecall.schedule(database);
+	if (CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF)
+		for (const database of ownedDatabases) restartRecall.schedule(database);
 }
 
 /**
@@ -885,6 +887,14 @@ export function setHomeIncarnation(value: unknown, first?: boolean): void {
  * on every incarnation change, and on a generation change; cancelled when ownership leaves or the
  * database is released.
  */
+/**
+ * Keeps the restart recall off, so a node never attests an incarnation (a fresh node's vacuous
+ * attestation included) and a drain stays unprovable for its full interval: what the apply-homes
+ * retry-contract suite needs a cluster to look like, which a live one only does with an unreachable
+ * or older member.
+ */
+const RESTART_RECALL_OFF = process.env.HARPER_TEST_RECORD_LOCK_OMIT_RESTART_RECALL === '1';
+
 const restartRecall = createRestartRecall({
 	thisNodeName: getThisNodeName,
 	homeIncarnation: currentHomeIncarnation,
