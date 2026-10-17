@@ -193,6 +193,12 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 		const self = deps.thisNodeName();
 		const { generation } = homeMap;
 		const members = [...homeMap.homes];
+		if (!members.includes(self)) {
+			// Not a home for any key, so no incarnation of this node ever issued a delegation to recall.
+			round.attested = incarnation;
+			round.unanswered = [];
+			return;
+		}
 		const peers = members.filter((member) => member !== self);
 		const operation = (probe: boolean): RecallIncarnationOperation => ({
 			operation: RECALL_INCARNATION_OPERATION,
@@ -210,7 +216,15 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 			if (!isCompleteAnswer(reply, incarnation, generation, 'probed'))
 				throw new Error(`${member} cannot serve a recall for incarnation ${incarnation}`);
 		});
-		if (outcome.unanswered.length === 0)
+		// The question must still be live between the two phases: a round cancelled, replaced or moved on
+		// during the probes must not drain anybody for answers it is about to throw away.
+		const stillAsked = () =>
+			rounds.get(database) === round &&
+			!round.rerun &&
+			deps.ownsDatabase(database) &&
+			deps.homeIncarnation() === incarnation &&
+			deps.homeMap(database)?.generation === generation;
+		if (outcome.unanswered.length === 0 && stillAsked())
 			outcome = await askEveryMember(database, members, async (member) => {
 				if (member === self) return deps.recallLocally(database, self, generation, incarnation);
 				const reply = await deps.send(member, database, operation(false), INCARNATION_RECALL_BUDGET_MS);
@@ -225,11 +239,7 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 		round.lastError = outcome.lastError;
 		// What the answers were about must still be what this thread coordinates under: an incarnation
 		// bump or a generation change during the round makes them answers to another question.
-		const current =
-			deps.ownsDatabase(database) &&
-			deps.homeIncarnation() === incarnation &&
-			deps.homeMap(database)?.generation === generation;
-		if (outcome.unanswered.length === 0 && current && !round.rerun) {
+		if (outcome.unanswered.length === 0 && stillAsked()) {
 			round.attested = incarnation;
 			round.backoff.reset();
 			return;

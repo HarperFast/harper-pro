@@ -877,6 +877,7 @@ const restartRecall = createRestartRecall({
 	send: sendRecordLockOperation,
 	recallLocally: recallDelegationsFromHome,
 	warn: (message, detail) => logger.warn?.(message, detail),
+	debug: (message, detail) => logger.debug?.(message, detail),
 });
 
 const productionDeps: RecordLockTransportDeps = {
@@ -931,25 +932,29 @@ export async function bumpHomeIncarnation(): Promise<number> {
 		const self = getThisNodeName();
 		const nodeTable = getRecordLockNodeTable();
 		const previous = Math.max(readOwnIncarnation(nodeTable, self), legacyIncarnation(self));
-		const next = previous + 1;
 		// A counter of 0 proves nothing on a node that already has peers: a build before harper#3254 lost
 		// the legacy field to a peer's rewrite of the self row, so an upgraded member reads 0 while its
-		// earlier incarnations may still have delegations out. Only a node that never joined a mesh is
-		// provably on its first incarnation.
+		// earlier incarnations may still have delegations out, under a counter nobody here can recover.
+		// Only a node that never joined a mesh is provably on its first incarnation. The other case needs
+		// an incarnation that orders above whatever the lost history issued, and that the restart recall
+		// (which recalls everything below it) reaches: the wall clock in milliseconds is above any counter
+		// a node can have reached, and every later bump continues from it.
 		const first = previous === 0 && !hasKnownPeers(self);
+		const next = previous === 0 && !first ? Math.max(1, Date.now()) : previous + 1;
 		await transaction({}, async (txn) => {
 			const context = (txn as any).getContext();
 			const resource: any = await nodeTable.getResource(self, context, { async: true });
 			await resource._writeUpdate(self, { node: self, incarnation: next }, true, { localOnly: true });
 			await resource.save?.();
 		});
-		// Mirrored onto the legacy field while a self row exists, so a rollback to a build that reads only
-		// that field continues the count rather than restarting it. Best effort: the row is the mesh's
-		// shared copy and a peer's rewrite can still erase it, which is why it is no longer authoritative.
-		if (getHDBNodeTable().primaryStore.getSync(self))
-			await ensureNode(self, { recordLockIncarnation: next }).catch((error) =>
-				logger.debug?.('Could not mirror the record lock incarnation onto the hdb_nodes self row', error)
-			);
+		// Mirrored onto the legacy field, so a rollback to a build that reads only that field continues
+		// the count rather than restarting it. Best effort: the row is the mesh's shared copy and a peer's
+		// rewrite can still erase it, which is why it is no longer authoritative. A node with no row yet
+		// gets a LOCAL_ONLY one, as the older build wrote (a url-less row must not replicate).
+		const existingRow = getHDBNodeTable().primaryStore.getSync(self);
+		await ensureNode(self, { recordLockIncarnation: next }, existingRow ? undefined : { localOnly: true }).catch(
+			(error) => logger.debug?.('Could not mirror the record lock incarnation onto the hdb_nodes self row', error)
+		);
 		setHomeIncarnation(next, first);
 		for (const worker of recordLockParticipantWorkers()) confer(worker, 'record-lock-incarnation', next, first);
 		logger.info?.(`Record lock home incarnation for ${self} is now ${next}`);
@@ -1600,6 +1605,13 @@ setRecordLockOwnershipReaders({
 	},
 	mainOwns: (database) => recordLockOwners.get(database) === MAIN_OWNER,
 	ownerThreadId: (database) => ownerThreadByDatabase.get(database),
+	activeGeneration: (database) => {
+		try {
+			return transports.get(database)?.homeMap(database)?.generation;
+		} catch {
+			return undefined;
+		}
+	},
 	isMember: (database, node) => transports.get(database)?.homeMap(database)?.homes.includes(node) === true,
 	peerLevel: (database, node) => {
 		const auditStore = auditStoreFor(database);

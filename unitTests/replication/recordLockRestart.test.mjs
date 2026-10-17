@@ -262,6 +262,38 @@ describe('the restart recall round', () => {
 		assert.strictEqual(recall.quiescedIncarnation('data'), 4, 'the changed question was not asked again');
 	});
 
+	it('drains nobody when the round is cancelled or moved on between the probes and the recall', async () => {
+		for (const move of ['cancel', 'incarnation', 'generation']) {
+			const { recall, state, settle, recalls, local } = harness();
+			const pending = [];
+			state.answer = (node, operation) =>
+				operation.probe
+					? new Promise((resolve) => pending.push(() => resolve(confirm(operation))))
+					: confirm(operation);
+			recall.schedule('data');
+			await settle();
+			assert.strictEqual(pending.length, 2, 'both probes are in flight');
+			if (move === 'cancel') recall.cancel('data');
+			else if (move === 'incarnation') state.incarnation = 3;
+			else state.homeMap = { ...state.homeMap, generation: 2 };
+			for (const release of pending) release();
+			await settle();
+			assert.strictEqual(recalls().length, 0, `a recall went out after ${move}`);
+			assert.strictEqual(local.length, 0);
+			assert.strictEqual(recall.quiescedIncarnation('data'), undefined);
+		}
+	});
+
+	it('a node the ring does not name has nothing to recall and attests at once', async () => {
+		const { recall, state, sent, local, settle } = harness();
+		state.homeMap = { generation: 1, homes: ['a', 'b'], homeIncarnation: 2 };
+		recall.schedule('data');
+		await settle();
+		assert.strictEqual(sent.length, 0);
+		assert.strictEqual(local.length, 0);
+		assert.strictEqual(recall.quiescedIncarnation('data'), 2);
+	});
+
 	it('answers nothing for a database this thread does not coordinate, and cancel forgets the round', async () => {
 		const { recall, state, settle } = harness();
 		recall.schedule('data');

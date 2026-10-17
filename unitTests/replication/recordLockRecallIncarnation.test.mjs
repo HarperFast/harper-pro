@@ -41,6 +41,7 @@ describe('record_lock_recall_incarnation (harper#3254)', () => {
 			mainOwns: () => false,
 			isMember: (database, node) => database === DB && node === 'home',
 			peerLevel: (database, node) => (node === 'home' ? RECORD_LOCKS_CAPABILITY : 3),
+			activeGeneration: (database) => (database === DB ? 1 : undefined),
 		});
 		previousReaders ??= installed;
 		registerClusterLockTransport(DB, {
@@ -119,6 +120,7 @@ describe('record_lock_recall_incarnation (harper#3254)', () => {
 		assert.deepStrictEqual(answer, { probed: true, incarnation: 2, generation: 1 });
 		assert.strictEqual(mapReads, 0, 'a probe drains nothing');
 		await refuses({ probe: true, hdb_user: { name: 'departed' } }, 403, 'a probe passes the same checks');
+		await refuses({ probe: true, generation: 2 }, 409, 'a probe is refused for a generation this node does not hold');
 	});
 
 	it('does not let a request for a newer incarnation or generation join an older sweep', async () => {

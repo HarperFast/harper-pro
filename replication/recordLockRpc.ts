@@ -102,6 +102,8 @@ interface OwnershipReaders {
 	mainOwns(database: string): boolean;
 	/** The thread id of the worker that coordinates `database`, or undefined when not yet known here. */
 	ownerThreadId?(database: string): number | undefined;
+	/** The generation of this node's agreed home map for the database, or undefined while withheld. */
+	activeGeneration?(database: string): number | undefined;
 	/** Whether `node` is in the database's current agreed home map, at this node's own level. */
 	isMember?(database: string, node: string): boolean;
 	/** The peer's exact advertised `recordLocks` level, 0 while unknown. */
@@ -461,6 +463,12 @@ export async function executeRecallIncarnation(
 	if (request.probe === true) {
 		if (!ownership.ownsDatabase(database) && !ownership.ownerThreadId?.(database))
 			throw new ClientError(`no thread coordinates record locks for ${database} here yet`, 503);
+		const active = ownership.activeGeneration?.(database);
+		if (active !== generation)
+			throw new ClientError(
+				`This node holds record lock home map generation ${active ?? 'unknown'} for ${database}, not ${generation}`,
+				409
+			);
 		return { probed: true, incarnation, generation };
 	}
 	const deadlineMs =
