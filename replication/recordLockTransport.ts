@@ -882,19 +882,14 @@ export function setHomeIncarnation(value: unknown, first?: boolean): void {
 		for (const database of ownedDatabases) restartRecall.schedule(database);
 }
 
+/** With the recall off, no incarnation is ever attested and every drain stays unprovable for its full interval. */
+const RESTART_RECALL_OFF = process.env.HARPER_TEST_RECORD_LOCK_OMIT_RESTART_RECALL === '1';
+
 /**
  * The restart recall for every database this thread coordinates. Scheduled when ownership arrives,
  * on every incarnation change, and on a generation change; cancelled when ownership leaves or the
  * database is released.
  */
-/**
- * Keeps the restart recall off, so a node never attests an incarnation (a fresh node's vacuous
- * attestation included) and a drain stays unprovable for its full interval: what the apply-homes
- * retry-contract suite needs a cluster to look like, which a live one only does with an unreachable
- * or older member.
- */
-const RESTART_RECALL_OFF = process.env.HARPER_TEST_RECORD_LOCK_OMIT_RESTART_RECALL === '1';
-
 const restartRecall = createRestartRecall({
 	thisNodeName: getThisNodeName,
 	homeIncarnation: currentHomeIncarnation,
