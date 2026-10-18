@@ -54,7 +54,6 @@ export interface TransitionOperation {
 	homes?: string[];
 	quiesce?: string[];
 	digest?: string;
-	/** Stage only: nodes in `quiesce` the operator attests are stopped, and who attested it. */
 	fenced?: string[];
 	operator?: string;
 }
@@ -83,7 +82,6 @@ export interface NodeSurvey {
 }
 
 export interface NodeReport {
-	/** `fenced`: attested stopped, so never contacted; it has no survey, stage or activate entry. */
 	role: 'home' | 'departing' | 'fenced';
 	survey?: NodeSurvey;
 	stage?: {
@@ -373,10 +371,6 @@ export async function applyHomes(
 	return run;
 }
 
-/**
- * `fenced` names nodes of the transition the operator attests are stopped outside Harper, so it must
- * be part of `quiesce` and can be neither a new home nor the node taking the call.
- */
 function validateFenced(fenced: unknown, homes: string[], quiesce: string[], self: string | undefined): string[] {
 	validateGenerationInput(1, fenced);
 	const nodes = canonicalizeHomes(fenced);

@@ -572,7 +572,13 @@ describe('a fenced stage records the fence with the stage (harper-pro#973)', () 
 	});
 
 	it('writes the fence in the stage, and a noop re-stage that brings a new fence still records it', async () => {
-		const request = { database: 'fence1', generation: 1, homes: ['a'], quiesce: ['a', 'c'], hdb_user: { username: 'op' } };
+		const request = {
+			database: 'fence1',
+			generation: 1,
+			homes: ['a'],
+			quiesce: ['a', 'c'],
+			hdb_user: { username: 'op' },
+		};
 		const staged = await stageGeneration(request, { nodes: ['c'], operator: 'op' });
 		assert.strictEqual(staged.staged.generation, 1);
 		let row = await currentRow('fence1');

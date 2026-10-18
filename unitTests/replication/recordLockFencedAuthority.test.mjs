@@ -28,6 +28,7 @@ function cluster(names) {
 	const nodes = new Map();
 	const harness = {
 		database,
+		table,
 		nodes,
 		requests: [],
 		/** Runs while the requester is still awaiting a reply: the window a delayed grant lands in. */
@@ -119,12 +120,28 @@ describe('fenced apply: authority a fenced node exercised under generation g', (
 		const released = b.written.filter((entry) => entry.type === 'lockRelease');
 		assert.strictEqual(released.length, 1, 'the stale grant was handed back');
 		assert.strictEqual(released[0].token[0], 1);
-		// Activated at g+1 the token is still from a ring that no longer exists.
-		harness.beforeReply = undefined;
-		harness.stage('a', 2, ['a', 'b']);
-		harness.activate('a', 2, ['a', 'b']);
-		harness.activate('b', 2, ['a', 'b']);
-		assert.strictEqual(b.coordinator.stats.delegations, 0);
+	});
+
+	it('a grant from the fenced node that reaches a survivor after it activated g+1 is handed back', async () => {
+		const harness = cluster(['a', 'b', 'c']);
+		const { nodes } = harness;
+		// Homed on a under g+1, which stays at g and so refuses b's retry: nothing re-admits the key.
+		const key = Array.from({ length: 10_000 }, (_, i) => `key-${i}`).find(
+			(candidate) =>
+				homeFor(ringKeyFor(harness.database, harness.table, candidate), ['a', 'b', 'c']) === 'c' &&
+				homeFor(ringKeyFor(harness.database, harness.table, candidate), ['a', 'b']) === 'a'
+		);
+		const b = nodes.get('b');
+		harness.beforeReply = () => {
+			nodes.get('c').alive = false;
+			harness.stage('b', 2, ['a', 'b']);
+			harness.activate('b', 2, ['a', 'b']);
+		};
+		await assert.rejects(b.coordinator.acquire(key, LEASE, WAIT));
+		assert.strictEqual(b.coordinator.stats.delegations, 0, "b installed the fenced node's generation-1 grant");
+		const released = b.written.filter((entry) => entry.type === 'lockRelease');
+		assert.strictEqual(released.length, 1, 'the stale grant was handed back');
+		assert.strictEqual(released[0].token[0], 1);
 	});
 
 	it('a delegation request from the fenced node is refused once the survivor home staged, and after it activated', async () => {

@@ -65,7 +65,6 @@ export interface RecordLockHomesRow {
 	fenced: FenceEntry[];
 }
 
-/** `generation` is set when a fenced `record_lock_apply_homes` stage recorded it (harper-pro#973). */
 export interface FenceEntry {
 	node: string;
 	operator: string;
@@ -73,7 +72,6 @@ export interface FenceEntry {
 	generation?: number;
 }
 
-/** Nodes an operator attests are stopped outside Harper, recorded on this node's stage of a generation. */
 export interface StageFence {
 	nodes: string[];
 	operator: string;
@@ -363,7 +361,7 @@ export async function stageGeneration(
 	return { ...staged, quiesced: await drainForStage(request.database) };
 }
 
-/** Appends one entry per fenced node not already recorded for this generation, so a retried stage adds none. */
+/** Deduplicated on (node, generation), so a retried stage adds nothing. */
 export function withFences(
 	fenced: FenceEntry[],
 	fence: StageFence | undefined,
@@ -396,12 +394,8 @@ async function stageRow(request: any, fence?: StageFence): Promise<{ staged: Rec
 			generation,
 			Date.now()
 		);
-		if (plan.action === 'noop' && fenced) {
-			await write({ ...existing!, fenced });
-			await notifyChanged(database);
-			return { staged: plan.staged };
-		}
 		if (plan.action === 'noop') {
+			if (fenced) await write({ ...existing!, fenced });
 			// Idempotent retry, not a genuine transition — but the PRIOR call may have durably written
 			// this exact state and then failed to confirm every thread applied it (a relay timeout, a
 			// dead worker). Re-notifying is harmless when nothing changed and is the only way a retry
