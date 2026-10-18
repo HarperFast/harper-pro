@@ -361,7 +361,6 @@ export async function stageGeneration(
 	return { ...staged, quiesced: await drainForStage(request.database) };
 }
 
-/** Deduplicated on (node, generation), so a retried stage adds nothing. */
 export function withFences(
 	fenced: FenceEntry[],
 	fence: StageFence | undefined,

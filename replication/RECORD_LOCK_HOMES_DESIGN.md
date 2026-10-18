@@ -304,7 +304,8 @@ never derived, and this operation orchestrates without ever authorizing policy.
 **No node stages or activates a generation this call did not verify against every node the operator
 named, and no node activates `g+1` while any node in `homes(g) ∪ homes(g+1)` is unreachable, has not
 staged it, or has neither proven quiescence nor been covered by an operator-attested drain wait that
-began after that node was staged.** The failure direction of every partial outcome is refusal: a
+began after that node was staged — except a node the operator names in `fenced` as stopped outside
+Harper ("Fenced nodes").** The failure direction of every partial outcome is refusal: a
 half-applied call leaves some nodes quiesced (their cluster locks 503) and none double-granting.
 
 ### Why the explicit list is what makes orchestration safe
@@ -413,11 +414,11 @@ reports `incomplete` and re-runs.
 Without `fenced`, a permanently stopped member of the current ring blocks every transition: listing it
 in `quiesce` is 503 unreachable, omitting it is 409 because survivors' rows still name it. `fenced` is
 the operator's statement "this node is stopped outside Harper", carried on the one call. Harper does
-not verify it; the trust model is the same as `record_lock_fence_external`, which this extends. Isolating a node is not stopping it: a handle it admitted before the isolation can still commit, so an operator who can only isolate waits out the drain interval (`DELEGATION_DRAIN_MS`) after isolating it before naming it in `fenced`.
+not verify it; the trust model is the same as `record_lock_fence_external`, which this extends. Isolating a node never qualifies, however long ago: a partitioned node that is still running keeps its digest agreement and keeps homing its own keys under `g` (below). Stop the Harper process first.
 
 - **Survey and stage skip fenced nodes**, which still count as named for the unlisted-member check.
   The report gives them `role: 'fenced'` and no `survey`/`stage`/`activate`.
-- **Each survivor records the fence with its stage.** The stage hop carries `fenced` and `operator`
+- **Each survivor that this call stages records the fence with its stage.** The stage hop carries `fenced` and `operator`
   (the authenticated caller on the initiating node). `stageGeneration` appends one
   `{node, operator, at, generation}` entry per fenced node to the row's audit-only `fenced[]` inside
   the same `withRow` write as `staged`, deduplicated on `(node, generation)` so retries do not grow
@@ -458,7 +459,7 @@ generation") until that node is re-staged with the per-node operation.
 `sendOperationToNode` and the live subscription session both connect with mTLS, so a peer authenticates
 the caller as a **node principal**, not as `super_user`. The operator's credentials are never forwarded.
 Instead a peer-callable operation, `record_lock_transition { database, action: survey | stage |
-activate, generation, homes, quiesce, digest }`, is accepted only from a node principal — the same
+activate, generation, homes, quiesce, digest, fenced?, operator? }`, is accepted only from a node principal — the same
 `principalNodeName` gate `record_lock_delegate` / `record_lock_recall` / `record_lock_barrier` use — and
 its handler **re-validates locally before writing**: the generation and sets through the shared
 validator, the digest by recomputing it and refusing a mismatch, its own place in the transition (it

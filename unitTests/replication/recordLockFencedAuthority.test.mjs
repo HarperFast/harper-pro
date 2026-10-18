@@ -158,7 +158,6 @@ describe('fenced apply: authority a fenced node exercised under generation g', (
 			reason: 'generation',
 			generation: 2,
 		});
-		// Even naming the new generation, c is not a member of it.
 		assert.deepStrictEqual(await a.onDelegationRequest({ ...late, generation: 2 }), {
 			granted: false,
 			reason: 'unknown-node',
