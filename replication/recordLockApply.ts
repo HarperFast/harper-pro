@@ -209,6 +209,18 @@ export function planSurvey(
 			status: 409,
 			reason: `${unfenceable.join(', ')} cannot record a fenced transition; upgrade them, or apply without fenced`,
 		};
+	// A fenced node is never surveyed, so its generation is known only through a survivor whose ring
+	// names it. Without one, the new generation can land at or below the fenced node's own, and if it
+	// comes back no peer in its ring is left to disagree with the map it still serves.
+	const named = new Set([...rows.values()].flatMap(ringMembers));
+	if (observer && !('error' in observer.reply)) for (const member of ringMembers(observer.reply)) named.add(member);
+	const unanchored = fenced.filter((node) => !named.has(node));
+	if (unanchored.length > 0)
+		return {
+			action: 'refuse',
+			status: 409,
+			reason: `no surviving node's ring names ${unanchored.join(', ')}, so its generation cannot be read from them; apply without fenced once it is reachable, or stage it with the per-node operations`,
+		};
 	if (unrecorded.length > 0)
 		return {
 			action: 'refuse',

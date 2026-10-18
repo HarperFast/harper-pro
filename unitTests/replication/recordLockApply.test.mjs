@@ -319,6 +319,23 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 		const unfenced = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, legacy);
 		assert.strictEqual(unfenced.action, 'proceed', 'an unfenced call does not ask for the field');
 	});
+
+	it("refuses a fenced node no survivor's ring names, since its generation cannot be read", () => {
+		// c alone served {c} at generation 1; a has no row. Activating generation 1 on {a} would leave a
+		// restarted c serving its own map with no peer in its ring to disagree.
+		const plan = planSurvey(
+			'db',
+			['a'],
+			['a', 'c'],
+			undefined,
+			replies({ a: reply('a', { supportsFenced: true }) }),
+			undefined,
+			['c']
+		);
+		assert.strictEqual(plan.action, 'refuse');
+		assert.strictEqual(plan.status, 409);
+		assert.match(plan.reason, /no surviving node's ring names c/);
+	});
 });
 
 describe('planActivation: only a proof on every freshly staged node skips the interval', () => {
