@@ -159,7 +159,9 @@ suite('record_lock_apply_homes with a fenced node on a three-node cluster', { ti
 		// Its peers announce generation 2's digest, so it agrees with none of them and withholds the
 		// whole map: `members` is `homeMap()?.homes`.
 		const status = await clusterStatusOf(restarted);
-		assert.equal(status.recordLocks?.[DB]?.members, undefined, JSON.stringify(status.recordLocks));
+		const locks = status.recordLocks[DB];
+		assert.ok(locks, `the restarted node reports ${DB} at all: ${JSON.stringify(status.recordLocks)}`);
+		assert.equal(locks.members, undefined, JSON.stringify(locks));
 		for (const id of ids.slice(0, 5)) assert.equal(await lockStatus(restarted, id), 503, id);
 		for (const node of nodes.slice(0, 2)) {
 			const survivorStatus = await clusterStatusOf(node);
