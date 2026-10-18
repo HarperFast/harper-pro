@@ -150,7 +150,7 @@ suite('record_lock_apply_homes with a fenced node on a three-node cluster', { ti
 	});
 
 	test('the fenced node restarted with its old row has no home map, and the survivors keep theirs', async () => {
-		const restarted = await restartStoppedNode(contexts[2]);
+		const restarted = (await restartStoppedNode(contexts[2])).harper;
 		nodes[2] = restarted;
 		await waitForMesh(nodes);
 		const row = await currentRow(restarted);

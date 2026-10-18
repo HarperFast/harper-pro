@@ -69,7 +69,7 @@ export async function restartStoppedNode(ctx, env, threadsCount = 1) {
 	const restarted = { name: ctx.name, harper: { hostname, dataRootDir } };
 	await startHarper(restarted, optionsFor(hostname, env, threadsCount));
 	ctx.harper = restarted.harper;
-	return ctx.harper;
+	return ctx;
 }
 
 export async function stopNode(ctx) {
