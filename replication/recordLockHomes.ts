@@ -70,6 +70,8 @@ export interface FenceEntry {
 	operator: string;
 	at: number;
 	generation?: number;
+	/** Every node the recording call fenced: an entry vouches only for a call fencing a subset of these. */
+	fencedWith?: string[];
 }
 
 export interface StageFence {
@@ -366,9 +368,14 @@ export function withFences(
 	generation: number,
 	now: number
 ): FenceEntry[] | undefined {
-	const added = (fence?.nodes ?? [])
-		.filter((node) => !fenced.some((entry) => entry.node === node && entry.generation === generation))
-		.map((node) => ({ node, operator: fence!.operator, at: now, generation }));
+	const nodes = fence?.nodes ?? [];
+	const sameCall = (entry: FenceEntry) =>
+		entry.generation === generation &&
+		entry.fencedWith?.length === nodes.length &&
+		nodes.every((node) => entry.fencedWith!.includes(node));
+	const added = nodes
+		.filter((node) => !fenced.some((entry) => entry.node === node && sameCall(entry)))
+		.map((node) => ({ node, operator: fence!.operator, at: now, generation, fencedWith: nodes }));
 	return added.length > 0 ? [...fenced, ...added] : undefined;
 }
 

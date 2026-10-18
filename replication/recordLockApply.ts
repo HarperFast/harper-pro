@@ -261,7 +261,12 @@ export function planSurvey(
 		const recorded = [...rows.values()].some(
 			(reply) =>
 				[reply.active, reply.staged].some((state) => state?.generation === generation && state.digest === digest) &&
-				reply.fenced?.some((entry) => entry.node === node && entry.generation === generation)
+				reply.fenced?.some(
+					(entry) =>
+						entry.node === node &&
+						entry.generation === generation &&
+						fenced.every((other) => entry.fencedWith?.includes(other))
+				)
 		);
 		return !anchored && !recorded;
 	});

@@ -383,7 +383,7 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 	});
 
 	it('accepts a retry of the same fenced transition from the fence its earlier call recorded', () => {
-		const fence = [{ node: 'c', operator: 'op', at: 1, generation: 2 }];
+		const fence = [{ node: 'c', operator: 'op', at: 1, generation: 2, fencedWith: ['c'] }];
 		const staged = state(2, ['a', 'b'], { quiesce: ['a', 'b', 'c'] });
 		const partial = replies({
 			a: reply('a', { staged, highestActedOn: 2, supportsFenced: true, fenced: fence }),
@@ -398,14 +398,29 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 		});
 		const again = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, activated, undefined, ['c']);
 		assert.strictEqual(again.action, 'proceed', again.reason);
+		const later = state(3, ['a', 'b']);
 		const stale = replies({
-			a: reply('a', { active: state(3, ['a', 'b']), highestActedOn: 3, supportsFenced: true, fenced: fence }),
+			a: reply('a', { active: later, highestActedOn: 3, supportsFenced: true, fenced: fence }),
+			b: reply('b', { active: later, highestActedOn: 3, supportsFenced: true }),
 		});
-		assert.strictEqual(
-			planSurvey('db', ['a'], ['a', 'c'], undefined, stale, undefined, ['c']).status,
-			409,
-			'a fence from an earlier transition does not anchor a later one'
-		);
+		const refusedStale = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, stale, undefined, ['c']);
+		assert.strictEqual(refusedStale.status, 409, 'a fence from an earlier transition does not anchor a later one');
+		assert.match(refusedStale.reason, /active ring places c beside/);
+		// Two calls that each fenced one node do not add up to a witness for a call fencing both.
+		const target = state(2, ['a'], { quiesce: ['a', 'b', 'c'] });
+		const pieced = replies({
+			a: reply('a', {
+				staged: target,
+				highestActedOn: 2,
+				supportsFenced: true,
+				fenced: [
+					{ node: 'c', operator: 'op', at: 1, generation: 2, fencedWith: ['c'] },
+					{ node: 'b', operator: 'op', at: 2, generation: 2, fencedWith: ['b'] },
+				],
+			}),
+		});
+		const both = planSurvey('db', ['a'], ['a', 'b', 'c'], 2, pieced, undefined, ['b', 'c']);
+		assert.strictEqual(both.status, 409, both.reason);
 	});
 });
 

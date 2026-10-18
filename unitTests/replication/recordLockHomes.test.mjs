@@ -554,20 +554,25 @@ describe('withRow serializes on the row lock, not only on its per-isolate queue 
 });
 
 describe('a fenced stage records the fence with the stage (harper-pro#973)', () => {
-	it('withFences adds one entry per node and generation, and nothing on a retry', () => {
+	it('withFences adds one entry per node, generation and fenced set, and nothing on a retry', () => {
 		const fence = { nodes: ['c', 'd'], operator: 'op' };
 		const first = withFences([], fence, 2, 10);
 		assert.deepStrictEqual(first, [
-			{ node: 'c', operator: 'op', at: 10, generation: 2 },
-			{ node: 'd', operator: 'op', at: 10, generation: 2 },
+			{ node: 'c', operator: 'op', at: 10, generation: 2, fencedWith: ['c', 'd'] },
+			{ node: 'd', operator: 'op', at: 10, generation: 2, fencedWith: ['c', 'd'] },
 		]);
 		assert.strictEqual(withFences(first, fence, 2, 11), undefined, 'a retried stage records nothing new');
 		assert.strictEqual(withFences(first, undefined, 2, 11), undefined);
+		assert.strictEqual(
+			withFences(first, { nodes: ['c'], operator: 'op' }, 2, 12).length,
+			3,
+			'a call that fenced a different set records its own entry'
+		);
 		// A per-node record_lock_fence_external entry has no generation and does not stand in for this one.
 		const manual = [{ node: 'c', operator: 'op', at: 5 }];
 		assert.deepStrictEqual(withFences(manual, { nodes: ['c'], operator: 'op2' }, 2, 12), [
 			...manual,
-			{ node: 'c', operator: 'op2', at: 12, generation: 2 },
+			{ node: 'c', operator: 'op2', at: 12, generation: 2, fencedWith: ['c'] },
 		]);
 	});
 
