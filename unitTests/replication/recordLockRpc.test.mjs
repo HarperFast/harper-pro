@@ -411,8 +411,12 @@ describe('the owner side will only take an admission from the worker it belongs 
 describe('bounding a relay through the main thread', () => {
 	it('gives a quiesce hop longer than its own drain budget, and every other kind the flat bound', () => {
 		const flat = relayTimeoutFor('delegate', undefined);
-		assert.strictEqual(relayTimeoutFor('recall', { deadlineMs: 10_000 }), flat, 'only quiesce carries a budget');
+		assert.strictEqual(relayTimeoutFor('recall', { deadlineMs: 10_000 }), flat, 'only a sweep carries a budget');
 		assert.ok(relayTimeoutFor('quiesce', { deadlineMs: 10_000 }) > 10_000, 'the relay outlives the sweep it carries');
+		assert.ok(
+			relayTimeoutFor('recall-incarnation', { deadlineMs: 10_000 }) > 10_000,
+			'a restart recall drains like a quiesce and is bounded like one (harper#3254)'
+		);
 	});
 
 	it('falls back to the flat bound when a quiesce hop names no usable budget', () => {

@@ -26,6 +26,9 @@ import {
 	createRecordLockTransport,
 	handleOwnerThreadAck,
 	readOwnIncarnation,
+	readLegacyIncarnation,
+	nextIncarnation,
+	UNKNOWN_HISTORY_INCARNATION_FLOOR,
 	setHomeIncarnation,
 	isFirstIncarnation,
 	currentHomeIncarnation,
@@ -341,18 +344,43 @@ describe('createRecordLockTransport().homeMap', () => {
 });
 
 describe('readOwnIncarnation', () => {
-	// The production reader must go to the hdb_nodes table, not server.nodes: that mirror excludes the
-	// local node on every path, so a mirror read is 0 forever and the home map is withheld for the life
-	// of the process — which is exactly how the first cluster run of this transport failed.
+	// The production reader must go to this node's own LOCAL_ONLY row, not server.nodes: that mirror
+	// excludes the local node on every path, so a mirror read is 0 forever and the home map is withheld
+	// for the life of the process — which is exactly how the first cluster run of this transport failed.
 	const tableWith = (row) => ({ primaryStore: { getSync: (key) => (key === 'self' ? row : undefined) } });
 	it('reads the persisted counter from this node’s own row', () => {
-		assert.strictEqual(readOwnIncarnation(tableWith({ name: 'self', recordLockIncarnation: 4 }), 'self'), 4);
+		assert.strictEqual(readOwnIncarnation(tableWith({ name: 'self', incarnation: 4 }), 'self'), 4);
 	});
 	it('reads 0 for a missing row, a missing field, or a value that is not a positive number', () => {
 		assert.strictEqual(readOwnIncarnation(tableWith(undefined), 'self'), 0);
 		assert.strictEqual(readOwnIncarnation(tableWith({ name: 'self' }), 'self'), 0);
 		for (const bad of [0, -1, '3', NaN, null])
-			assert.strictEqual(readOwnIncarnation(tableWith({ recordLockIncarnation: bad }), 'self'), 0);
+			assert.strictEqual(readOwnIncarnation(tableWith({ incarnation: bad }), 'self'), 0);
+	});
+});
+
+describe('the incarnation a start coordinates under', () => {
+	const tableWith = (row) => ({ primaryStore: { getSync: (key) => (key === 'self' ? row : undefined) } });
+	it('reads the legacy hdb_nodes field for an upgrade, and 0 when it is missing or malformed', () => {
+		assert.strictEqual(readLegacyIncarnation(tableWith({ name: 'self', recordLockIncarnation: 4 }), 'self'), 4);
+		assert.strictEqual(readLegacyIncarnation(tableWith({ name: 'self' }), 'self'), 0);
+		for (const bad of [0, -1, '3', NaN, null])
+			assert.strictEqual(readLegacyIncarnation(tableWith({ recordLockIncarnation: bad }), 'self'), 0);
+	});
+	it('continues a known count, starts a lone node at its first incarnation, and starts a node with lost history above it', () => {
+		assert.deepStrictEqual(nextIncarnation(7, true, 1_760_000_000_000), { next: 8, first: false });
+		assert.deepStrictEqual(nextIncarnation(0, false, 1_760_000_000_000), { next: 1, first: true });
+		const lost = nextIncarnation(0, true, 1_760_000_000_000);
+		assert.strictEqual(lost.first, false, 'a node with peers and no counter is not provably first');
+		assert.strictEqual(lost.next, 1_760_000_000_000);
+		assert.ok(lost.next > 2 ** 32, 'far above any counter a node reaches one bump at a time');
+		const brokenClock = nextIncarnation(0, true, 7);
+		assert.strictEqual(
+			brokenClock.next,
+			UNKNOWN_HISTORY_INCARNATION_FLOOR,
+			'a clock set back still orders above the lost history'
+		);
+		assert.deepStrictEqual(nextIncarnation(lost.next, true, 0), { next: lost.next + 1, first: false });
 	});
 });
 
