@@ -222,7 +222,7 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS || !ROCKSDB, t
 		await waitForCondition((signal) => hasRow(subscriber, 'after-recovery', signal), {
 			timeoutMs: RECOVERY_TIMEOUT_MS,
 			pollMs: POLL_MS,
-			description: 'a live write after recovery to replicate over the reconnected leg',
+			description: 'a live write after recovery to replicate over the repaired leg',
 		});
 	});
 
