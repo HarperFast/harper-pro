@@ -242,8 +242,9 @@ function withRow<T>(
 
 export function operatorPrincipal(request: any): string {
 	// `hdb_user` is the authenticated principal the operation dispatcher attached; never a request
-	// body field, which a caller could set to forge attribution on the audit-only `fenced[]` list.
-	const name = request?.hdb_user?.name;
+	// body field, which a caller could set to forge attribution on the audit-only `fenced[]` list. A
+	// user carries `username`; a node principal (`principalNodeName`) carries `name`.
+	const name = request?.hdb_user?.username ?? request?.hdb_user?.name;
 	if (typeof name !== 'string' || name.length === 0)
 		throw new ClientError('record lock home map operations require an authenticated user', 401);
 	return name;
@@ -670,7 +671,7 @@ export async function proposeHomes(request: any): Promise<
 	HomesProposal & {
 		database: string;
 		source: 'hdb_nodes';
-		current: { active?: RecordLockGenerationState; staged?: RecordLockGenerationState };
+		current: { active?: RecordLockGenerationState; staged?: RecordLockGenerationState; fenced?: FenceEntry[] };
 	}
 > {
 	const validation = validateBySchema(request, proposeSchema);
@@ -685,7 +686,7 @@ export async function proposeHomes(request: any): Promise<
 		database,
 		...planProposal(self, peers, existing, database),
 		source: 'hdb_nodes',
-		current: { active: existing?.active, staged: existing?.staged },
+		current: { active: existing?.active, staged: existing?.staged, fenced: existing?.fenced },
 	};
 }
 

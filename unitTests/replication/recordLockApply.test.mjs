@@ -601,7 +601,7 @@ describe('applyHomes over fake peers', function () {
 
 describe('applyHomes with fenced nodes (harper-pro#973)', function () {
 	this.timeout(30_000);
-	const operator = { name: 'ops-admin' };
+	const operator = { username: 'ops-admin' };
 	// c is gone: it has no row here, so any hop to it fails as unreachable.
 	const withoutC = () => {
 		const rows = activeCluster(['a', 'b', 'c']);

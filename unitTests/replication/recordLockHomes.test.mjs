@@ -419,7 +419,7 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 			generation: 1,
 			homes: ['a'],
 			quiesce: ['a'],
-			hdb_user: { name: 'op' },
+			hdb_user: { username: 'op' },
 		});
 		assert.deepStrictEqual(quiesced, drained);
 		assert.deepStrictEqual(asked, { database: 'drain1', deadlineMs: STAGE_DRAIN_BUDGET_MS });
@@ -434,7 +434,7 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 			generation: 1,
 			homes: ['a'],
 			quiesce: ['a'],
-			hdb_user: { name: 'op' },
+			hdb_user: { username: 'op' },
 		});
 		assert.strictEqual(result.staged.generation, 1, 'the stage itself still succeeded');
 		assert.match(result.quiesced.error, /did not reach the coordinating worker/);
@@ -446,7 +446,7 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 			generation: 1,
 			homes: ['a'],
 			quiesce: ['a'],
-			hdb_user: { name: 'op' },
+			hdb_user: { username: 'op' },
 		});
 		assert.ok(quiesced.error, 'an unwired drain must not read as an empty outstanding list');
 		assert.strictEqual(quiesced.outstanding, undefined);
@@ -535,7 +535,7 @@ describe('withRow serializes on the row lock, not only on its per-isolate queue 
 			generation: 1,
 			homes: ['a'],
 			quiesce: ['a'],
-			hdb_user: { name: 'op' },
+			hdb_user: { username: 'op' },
 		}).then(
 			(value) => ((settled = 'fulfilled'), value),
 			(error) => ((settled = 'rejected'), Promise.reject(error))
@@ -572,7 +572,7 @@ describe('a fenced stage records the fence with the stage (harper-pro#973)', () 
 	});
 
 	it('writes the fence in the stage, and a noop re-stage that brings a new fence still records it', async () => {
-		const request = { database: 'fence1', generation: 1, homes: ['a'], quiesce: ['a', 'c'], hdb_user: { name: 'op' } };
+		const request = { database: 'fence1', generation: 1, homes: ['a'], quiesce: ['a', 'c'], hdb_user: { username: 'op' } };
 		const staged = await stageGeneration(request, { nodes: ['c'], operator: 'op' });
 		assert.strictEqual(staged.staged.generation, 1);
 		let row = await currentRow('fence1');

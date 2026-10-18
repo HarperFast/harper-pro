@@ -64,6 +64,15 @@ export async function startNode(suiteName, env, threadsCount = 1) {
 	return ctx;
 }
 
+/** Start a node `stopNodeProcess` stopped, on its own data root and address, and point `ctx` at it. */
+export async function restartStoppedNode(ctx, env, threadsCount = 1) {
+	const { hostname, dataRootDir } = ctx.harper;
+	const restarted = { name: ctx.name, harper: { hostname, dataRootDir } };
+	await startHarper(restarted, optionsFor(hostname, env, threadsCount));
+	ctx.harper = restarted.harper;
+	return ctx.harper;
+}
+
 export async function stopNode(ctx) {
 	if (!ctx?.harper) return;
 	await stopNodeProcess(ctx.harper).catch(() => {});

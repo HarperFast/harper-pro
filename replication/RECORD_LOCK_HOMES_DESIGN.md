@@ -239,7 +239,7 @@ node's `LOCAL_ONLY` row reproduces the same false proof on a node that _had_ act
 `record_lock_propose_homes { database }`, `requiresSuperUser`, **read-only**. It returns the home
 set this node's `hdb_nodes` view suggests (this node plus every row `shouldReplicateFromNode(row,
 database)` accepts, canonicalized), the generation one past whatever this node has acted on, the
-digest that pair would produce, the current `active`/`staged`, `quiesce`, and warnings. It writes
+digest that pair would produce, the current `active`/`staged` and the row's `fenced` audit list, `quiesce`, and warnings. It writes
 nothing and notifies nothing.
 
 `quiesce` is §4.3's `homes(g) ∪ homes(g+1)` — the union of the proposal with this node's current
@@ -314,7 +314,7 @@ peer. That is the whole difference between this operation and the rejected one.
 
 ### The operation
 
-`record_lock_apply_homes { database, homes[], quiesce?[], generation?, drained? }`, `requiresSuperUser`,
+`record_lock_apply_homes { database, homes[], quiesce?[], generation?, drained?, fenced?[] }`, `requiresSuperUser`,
 `replication/recordLockApply.ts`. One apply runs at a time per database on the worker that takes the
 call (a second worker or node racing it is kept safe by the row-level planners, and the loser's retry
 succeeds by naming a higher generation); hops fan out at most 16 at a time, each under a deadline
@@ -335,6 +335,9 @@ socket per apply.
   generation is resumed, so a retry of an interrupted call continues the same transition rather than
   opening a new one. (The list is never derived; only the number is.) It is **required** with `drained`.
 - `drained` is the operator's attestation that the drain interval has elapsed (see "Activation").
+- `fenced` names nodes of `quiesce` the operator attests are stopped outside Harper (harper-pro#973).
+  It must be a subset of `quiesce`, disjoint from `homes`, and must not name the node taking the call;
+  each violation is a 400 before any hop. `fenced: []` is the same as omitting it. See "Fenced nodes".
 
 **Phase 1 — survey (reads only).** Ask every node in `quiesce` for its row (`active`, `staged`,
 `highestActedOn`) and its own name; the initiating node answers itself locally, and when it is not
@@ -344,7 +347,8 @@ written, if:
 
 | Condition                                                                                                                               | Why it refuses                                                                                                                                                                                                                                                                                                                                                    |
 | --------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| any named node does not answer, or answers under a different name                                                                       | completeness is the point of the list; a misrouted `hdb_nodes` URL is an unanswered node. A peer too old to have `record_lock_transition` fails here, before any stage                                                                                                                                                                                            |
+| any named node that is not fenced does not answer, or answers under a different name                                                    | completeness is the point of the list; a misrouted `hdb_nodes` URL is an unanswered node. A peer too old to have `record_lock_transition` fails here, before any stage                                                                                                                                                                                            |
+| `fenced` is non-empty and a surveyed node does not report `supportsFenced`                                                              | an older node accepts the stage hop's `fenced`/`operator` fields unread (`validateBySchema` allows unknown keys), so it would stage without recording the fence, and its home would keep the stopped node's grants for a full lease. Upgrade it, or apply without `fenced`                                                                                        |
 | any node reports a ring member not in `quiesce` — in `active.homes`, `staged.homes`, or the `quiesce` its `staged` row was written with | "you forgot a node that is still granting". Staging retracts `active`, so a staged node's row no longer names the old ring; the `quiesce` persisted on stage is what still does, which is what makes a retry with a shorter list refusable                                                                                                                        |
 | a surveyed `staged` row has no recorded `quiesce`                                                                                       | it was staged by a stage that did not name its participants (a row from before this change), so the ring it stopped serving cannot be checked against the list; the operator re-stages the same generation and set with `quiesce` on that node, which backfills it                                                                                                |
 | nodes disagree about `active` (two distinct `(generation, digest)`)                                                                     | two rings are being served; §4's whole-map-fails-closed rule already withholds locks on such nodes. A disagreement about `staged` is not refused here: it is judged by the next row, so an explicit higher generation supersedes two sets that two racing operators staged (otherwise the cluster would stay quiesced until someone used the per-node operations) |
@@ -364,8 +368,8 @@ activating anything.
 
 **Phase 3 — activation.** Only when every node in `quiesce` has staged the target (or was already
 active at it). `provesQuiescence()` — the drain reached the coordinating thread, was complete, and found
-nothing outstanding — is the only predicate that licenses skipping the interval, and it is checked per
-node. If it holds for every freshly staged node, the call waits out `MIN_DRAIN_BACKSTOP_MS` from the last
+nothing outstanding, or only recalls to fenced nodes ("Fenced nodes") — is the only predicate that
+licenses skipping the interval, and it is checked per node. If it holds for every freshly staged node, the call waits out `MIN_DRAIN_BACKSTOP_MS` from the last
 stage response (the per-node backstop would otherwise refuse an activate that lands within 2 s of that
 node's own stage) and activates `homes`. Otherwise it does **not** activate: it returns
 `outcome: 'staged'`, the per-node drain results, and `retryAfterMs` — the drain interval, to be measured
@@ -386,13 +390,14 @@ request never holds for the interval.
 **Retry contract.** The same call, unchanged (plus `generation` and `drained: true` after a wait), is
 safe to repeat from any state this operation can leave behind, and completes the transition:
 
-| State after an interrupted call        | What the retry does                                                                                                                            |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| nothing staged (refused at survey)     | nothing was written; fix the list and call again                                                                                               |
-| some nodes staged, some not            | survey allows it (staged rows all equal the target); stages the rest; noops re-drain the first; an attestation does not cover the newly staged |
-| all staged, none active                | noops everywhere, then activates if proven or attested                                                                                         |
-| some active at the target, some staged | already-active nodes skip the stage and noop the activate; the rest complete                                                                   |
-| all active                             | every phase noops; `outcome: 'activated'`                                                                                                      |
+| State after an interrupted call        | What the retry does                                                                                                                                                                          |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| nothing staged (refused at survey)     | nothing was written; fix the list and call again                                                                                                                                             |
+| some nodes staged, some not            | survey allows it (staged rows all equal the target); stages the rest; noops re-drain the first; an attestation does not cover the newly staged                                               |
+| all staged, none active                | noops everywhere, then activates if proven or attested                                                                                                                                       |
+| some active at the target, some staged | already-active nodes skip the stage and noop the activate; the rest complete                                                                                                                 |
+| all active                             | every phase noops; `outcome: 'activated'`                                                                                                                                                    |
+| fenced transition, retried             | must carry the same `fenced`: dropping it with the node still in `quiesce` is 503 unreachable, dropping the node from `quiesce` is 409, since the survivors' staged `quiesce` still names it |
 
 Every response and every error body carries `nodes`, one entry per node in `quiesce`, with what each
 phase found or did on it (`survey`, `stage`, `activate`, each with its own `error` when the hop failed) —
@@ -400,6 +405,51 @@ never a bare boolean. Refusals are 409 (policy) or 503 (unreachable, or a hop fa
 the error body is the same report. Two operators applying concurrently from different nodes cannot
 double-grant: each node's `planStage` refuses a second set at the same generation, so one of them
 reports `incomplete` and re-runs.
+
+### Fenced nodes (harper-pro#973)
+
+Without `fenced`, a permanently stopped member of the current ring blocks every transition: listing it
+in `quiesce` is 503 unreachable, omitting it is 409 because survivors' rows still name it. `fenced` is
+the operator's statement "this node is stopped outside Harper", carried on the one call. Harper does
+not verify it; the trust model is the same as `record_lock_fence_external`, which this extends.
+
+- **Survey and stage skip fenced nodes**, which still count as named for the unlisted-member check.
+  The report gives them `role: 'fenced'` and no `survey`/`stage`/`activate`.
+- **Each survivor records the fence with its stage.** The stage hop carries `fenced` and `operator`
+  (the authenticated caller on the initiating node). `stageGeneration` appends one
+  `{node, operator, at, generation}` entry per fenced node to the row's audit-only `fenced[]` inside
+  the same `withRow` write as `staged`, deduplicated on `(node, generation)` so retries do not grow
+  it. A noop re-stage that adds a fence still writes. A relayed hop records the operator as
+  `"<operator> via <relaying node>"`: the node principal can already run any operation on a peer
+  ("What that admits", below), so the relay is named rather than trusted silently. The receiving node
+  re-validates the same three rules.
+- **Activation.** `provesQuiescence(quiesced, fenced)` treats one more drain result as proof: a
+  `complete: false` drain whose `outstanding` entries are all home-side recalls (`delegate` set) naming
+  a fenced node. A survivor that granted the stopped node a delegation can never get that recall
+  confirmed, so without this the immediate path would almost never fire. Every other incompleteness
+  (no `delegate`, an empty list, a malformed entry, an error) still withholds. When every survivor
+  proves, the call activates at once; otherwise it is the ordinary `staged` + `retryAfterMs` path,
+  and the attested retry must carry the same `fenced`.
+
+Why each kind of authority the fenced node `C` held under `g` cannot admit after the survivors
+activate `g+1`:
+
+| `C`'s authority under `g`                         | Why it cannot admit                                                                                                                                                                                                                                    |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| delegations `C` holds, granted by a survivor home | `C` is stopped: the operator's attestation, and the only fact the recall discount relies on. Core's home expires these grants on the first grant under `g+1` (`#prepareFreshnessGeneration`), so the key is served at once rather than after the lease |
+| delegations `C` granted to survivors              | the survivor's own drain surrenders them, which is part of its proof                                                                                                                                                                                   |
+| a grant reply from `C` still in flight            | a staged survivor has no home map, so core's post-reply check (`reply.token[0] !== homeMap()?.generation`) hands it back; after activation the token's generation is `g`                                                                               |
+| a delegation request from `C` still in flight     | refused for no map while staged, and for generation or `unknown-node` after activation                                                                                                                                                                 |
+| `C` restarts with its old `active` row            | the per-peer digest agreement (slot 30) is process memory, so a restarted `C` starts with no agreement and §4 withholds its whole map; it cannot lock until a later generation that includes it is applied                                             |
+
+A `C` that is actually alive and partitioned keeps its retained digest agreement and self-homes its own
+keys under `g` whether or not the call waits, so the attestation was already load-bearing on the wait
+path; the immediate path adds reliance only for the delegations `C` held. Writes `C` committed and never
+replicated are lost or arrive late on either path.
+
+A fenced node that comes back is not re-admitted by this call: its `active` disagrees with the
+survivors', so a later apply that lists it refuses at survey ("nodes disagree about the active
+generation") until that node is re-staged with the per-node operation.
 
 ### Auth for the hop
 
@@ -504,3 +554,10 @@ freshness barrier and the poison rules are untouched; nothing here runs on a loc
   `staged` again; the peer hop refuses an operator caller; a topology change activates in seconds once
   every node proves, with the departing node staged and never activated; a list that omits the node
   taking the call, or the ring a staged node was drained for, is refused.
+- Fenced transitions (harper-pro#973). Unit: `recordLockApply.test.mjs` (validation, survey skip,
+  the `supportsFenced` gate, one-call activation, recall to an unfenced node withholding, the retry
+  contract, relayed attribution); `recordLockHomes.test.mjs` (the `provesQuiescence` matrix, the fence
+  recorded with the stage and deduplicated); `recordLockFencedAuthority.test.mjs` drives core's real
+  coordinator through each row of the authority table above. Cluster:
+  `recordLockApplyFenced.test.mjs` stops a node holding delegations from both survivors, applies
+  with it fenced, re-locks the exact keys it held, then restarts it and checks it has no home map.
