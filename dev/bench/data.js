@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792310442555,
+  "lastUpdate": 1792310445466,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -14809,6 +14809,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E scan p99 — short ranges",
             "value": 136.01,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "harperfastaibot[bot]",
+            "username": "harperfastaibot[bot]",
+            "email": "280766738+harperfastaibot[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "bc74c7ec85ccbff8bf026f755fa855efbb7fd3b4",
+          "message": "feat: Sync Core (#1062)\n\nCo-authored-by: kriszyp <34054+kriszyp@users.noreply.github.com>",
+          "timestamp": "2026-10-18T07:24:12Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/bc74c7ec85ccbff8bf026f755fa855efbb7fd3b4"
+        },
+        "date": 1792310445398,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 9.73,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 19.76,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 21.06,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 24.02,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 31,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 24.08,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 58.69,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 44.08,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 170.02,
             "unit": "ms"
           }
         ]
