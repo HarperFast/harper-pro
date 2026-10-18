@@ -694,6 +694,7 @@ function reconcileAllPeerHomesAgreement(database: string): void {
 
 const ownedDatabases = new Set<string>();
 const transports = new Map<string, ClusterLockTransport>();
+const transportBuilders = new Map<string, () => ClusterLockTransport>();
 /**
  * The thread that coordinates each database, as this thread last learned it from main (harper-pro#852).
  * Read by `recordLockRpc.ts` (through the ownership readers) to send a relayed acquire straight to the
@@ -753,14 +754,8 @@ export function setRecordLockOwnership(database: string, owned: boolean): void {
 	if (owned) ownedDatabases.add(database);
 	else ownedDatabases.delete(database);
 	logger.debug?.(`Record lock coordination for ${database} is ${owned ? 'owned' : 'not owned'} by this thread`);
-	// Rebuilding the transport when ownership arrives makes core construct a replacement coordinator and
-	// hand off from any predecessor built while unowned (`predecessor.#ownedSinceMono === undefined`).
-	// Across `handOffTo`, `#grantableAfterMono` always follows the predecessor (`recordLockCoordinator.ts`),
-	// while a successor whose predecessor never coordinated reads `ownsCoordination()` and
-	// `coordinationIncarnation()` fresh — immediately when `homeIncarnation` is already known, or on the
-	// subsequent `setHomeIncarnation` rebuild if `homeIncarnation` is still 0. When no predecessor was
-	// built before ownership and `firstIncarnation` resolved, the first-built coordinator also reads
-	// this transport's `grantableAfterMono` directly.
+	// Replace the transport so core constructs a successor coordinator that picks up the new ownership
+	// state (see `recreateRecordLockTransport`).
 	if (owned && !wasOwned) {
 		recreateRecordLockTransport(database);
 		if (CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF) restartRecall.schedule(database);
@@ -876,9 +871,8 @@ export function isFirstIncarnation(): boolean {
  * (`first=false`, `bumpHomeIncarnation`): a handoff means this node has already been an owner and has
  * live relayed handles out, so a new owner's coordinator built with the waiver would grant a key straight
  * away while a departed worker's handle can still commit (harper-pro#852). Re-registers every built
- * transport when `homeIncarnation` first resolves from 0 (so any coordinator built while
- * `ownsCoordination()` was withheld is replaced by a successor that reads `ownsCoordination()` and
- * `coordinationIncarnation()` fresh across `handOffTo`) or when `firstIncarnation` changes.
+ * transport when `homeIncarnation` first resolves from 0 or when `firstIncarnation` changes (see
+ * `recreateRecordLockTransport`).
  */
 export function setHomeIncarnation(value: unknown, first?: boolean): void {
 	if (!(typeof value === 'number' && Number.isFinite(value) && value > homeIncarnation)) return;
@@ -1005,15 +999,39 @@ export async function bumpHomeIncarnation(): Promise<number> {
 }
 
 /**
+ * Main thread: retry the startup `bumpHomeIncarnation` with backoff if its durable write fails, so
+ * a transient storage error at startup cannot leave `homeIncarnation === 0` (and `ownsCoordination()`
+ * withheld) for the life of the process.
+ */
+export function ensureStartupHomeIncarnation(
+	bump: () => Promise<number> = bumpHomeIncarnation,
+	backoff: Backoff = createBackoff({ initialMs: REFRESH_RETRY_INITIAL_MS, maxMs: REFRESH_RETRY_MAX_MS })
+): void {
+	const attempt = (): void => {
+		bump()
+			.then(() => backoff.reset())
+			.catch((error) => {
+				logger.error?.('Could not bump the record lock home incarnation; will retry', error);
+				setTimeout(attempt, backoff.nextDelay() ?? REFRESH_RETRY_MAX_MS).unref();
+			});
+	};
+	attempt();
+}
+
+/**
  * Register this thread's transport for a replicated database (idempotent; core recreates the
  * coordinator whenever the transport object changes, so the instance must be stable) and, when
  * enabled, ask the main thread which worker coordinates it.
  */
-export function ensureRecordLockTransport(database: string): void {
+export function ensureRecordLockTransport(database: string, buildTransport?: () => ClusterLockTransport): void {
 	if (transports.has(database)) return;
-	const transport = CLUSTER_RECORD_LOCKS_ENABLED
-		? createRecordLockTransport(database, productionDeps, () => cacheForDatabase(database))
-		: createDisabledRecordLockTransport();
+	const builder =
+		buildTransport ??
+		(CLUSTER_RECORD_LOCKS_ENABLED
+			? () => createRecordLockTransport(database, productionDeps, () => cacheForDatabase(database))
+			: undefined);
+	if (builder) transportBuilders.set(database, builder);
+	const transport = builder ? builder() : createDisabledRecordLockTransport();
 	transports.set(database, transport);
 	registerClusterLockTransport(database, transport);
 	if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
@@ -1030,17 +1048,17 @@ export function ensureRecordLockTransport(database: string): void {
 }
 
 /** Rebuilds an already-registered database's transport so core constructs a replacement coordinator on
- * the next `lockCoordinator` access and hands off from any existing one. Across `handOffTo`,
- * `#grantableAfterMono` always follows the predecessor (`recordLockCoordinator.ts`), while a successor
- * whose predecessor never coordinated reads `ownsCoordination()` and `coordinationIncarnation()` fresh;
- * if no coordinator was built yet, the first construction also reads the new transport's
- * `grantableAfterMono` directly. Ownership/cache wiring is unaffected: only the transport OBJECT is
- * replaced, not this thread's owned/cache state. */
+ * the next `lockCoordinator` access and hands off from any existing one. Under core's adoption
+ * contract (`recordLockCoordinator.ts`), a successor whose predecessor never coordinated reads
+ * `ownsCoordination()` and `coordinationIncarnation()` fresh, and if no coordinator was built yet the
+ * first construction also reads the new transport's `grantableAfterMono` directly. Ownership/cache
+ * wiring is unaffected: only the transport OBJECT is replaced, not this thread's owned/cache state. */
 function recreateRecordLockTransport(database: string): void {
-	if (!CLUSTER_RECORD_LOCKS_ENABLED || !transports.has(database)) return;
+	const builder = transportBuilders.get(database);
+	if (!builder || !transports.has(database)) return;
 	// The old transport's waits belong to a coordinator core is about to rebuild; settle them now.
 	closeFreshnessBarrier(database);
-	const transport = createRecordLockTransport(database, productionDeps, () => cacheForDatabase(database));
+	const transport = builder();
 	transports.set(database, transport);
 	registerClusterLockTransport(database, transport);
 }
@@ -1048,6 +1066,7 @@ function recreateRecordLockTransport(database: string): void {
 /** The database is no longer replicated here. Cluster scope keeps failing closed (core's rule). */
 export function releaseRecordLockTransport(database: string): void {
 	forgetRecordLockHomesCache(database);
+	transportBuilders.delete(database);
 	if (!transports.delete(database)) return;
 	unregisterClusterLockTransport(database);
 	closeFreshnessBarrier(database);
@@ -1664,10 +1683,7 @@ function tableReplicates(database: string, table: string): boolean {
 }
 
 if (!parentPort) {
-	if (CLUSTER_RECORD_LOCKS_ENABLED)
-		whenThreadsStarted.then(() =>
-			bumpHomeIncarnation().catch((error) => logger.error?.('Could not bump the record lock home incarnation', error))
-		);
+	if (CLUSTER_RECORD_LOCKS_ENABLED) whenThreadsStarted.then(() => ensureStartupHomeIncarnation());
 	onMessageByType('record-lock-incarnation-request', (_message, worker) => {
 		if (worker && homeIncarnation > 0) confer(worker, 'record-lock-incarnation', homeIncarnation, isFirstIncarnation());
 	});

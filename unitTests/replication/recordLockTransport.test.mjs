@@ -48,12 +48,15 @@ import {
 	setRecordLockHomesRowReader,
 	relayLockControlEntry,
 	relayedControlEntryCount,
+	ensureRecordLockTransport,
+	ensureStartupHomeIncarnation,
+	releaseRecordLockTransport,
 } from '#src/replication/recordLockTransport';
 import { DELEGATE_OPERATION, RECALL_OPERATION } from '#src/replication/recordLockRpc';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
 import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
 import { setActiveWorkerPools } from '#src/core/server/threads/workerPools';
-import { LockCoordinator } from '#src/core/resources/recordLockCoordinator';
+import { getClusterLockTransport, LockCoordinator } from '#src/core/resources/recordLockCoordinator';
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
@@ -334,7 +337,7 @@ describe('createRecordLockTransport().homeMap', () => {
 		);
 		assert.strictEqual(transport.ownsCoordination(), false);
 		await assert.rejects(
-			() => transport.acquireOnOwner('pre-incarnation-owner', 'Counter', 'k1', 1000, 1000, () => {}),
+			() => transport.acquireOnOwner('pre-incarnation-owner', 'Counter', 'k1', 1000, 1000),
 			(error) =>
 				error.statusCode === 503 && /No agreed record lock home map for pre-incarnation-owner/.test(error.message)
 		);
@@ -353,9 +356,8 @@ describe('createRecordLockTransport().homeMap', () => {
 		);
 	});
 
-	it('keeps the successor’s coordinating incarnation when handing off from a coordinator built before the incarnation resolved', async () => {
+	it('rebuilds the registered transport on setHomeIncarnation so a successor coordinator adopts the resolved incarnation', async () => {
 		const database = 'handoff-restarted';
-		let incarnation = 0;
 		let quiesced;
 		const auditStore = fakeAuditStore();
 		const makeTransport = () =>
@@ -365,7 +367,7 @@ describe('createRecordLockTransport().homeMap', () => {
 					thisNodeName: () => 'self',
 					auditStore: () => auditStore,
 					ownsDatabase: () => true,
-					homeIncarnation: () => incarnation,
+					homeIncarnation: () => currentHomeIncarnation(),
 					send: async () => ({}),
 					isFirstIncarnation: () => false,
 					monotonicNow: () => 1000,
@@ -373,36 +375,49 @@ describe('createRecordLockTransport().homeMap', () => {
 				},
 				() => ({ generation: 1, homes: ['self'] })
 			);
-		const earlyTransport = makeTransport();
-		const predecessor = new LockCoordinator({
-			database,
-			table: 'Counter',
-			nodeId: 'self',
-			transport: earlyTransport,
-			writeControl: () => {},
-			keyIdOf: (key) => key,
-			nextTimestamp: () => 1,
-			monotonic: () => 1000,
-			grantableAfterMono: earlyTransport.grantableAfterMono,
-			autoTick: false,
-		});
-		incarnation = 2;
-		const lateTransport = makeTransport();
-		const successor = new LockCoordinator({
-			database,
-			table: 'Counter',
-			nodeId: 'self',
-			transport: lateTransport,
-			writeControl: () => {},
-			keyIdOf: (key) => key,
-			nextTimestamp: () => 1,
-			monotonic: () => 1000,
-			grantableAfterMono: lateTransport.grantableAfterMono,
-			adopt: predecessor,
-			autoTick: false,
-		});
-		predecessor.close();
+		assert.strictEqual(currentHomeIncarnation(), 0);
+		ensureRecordLockTransport(database, makeTransport);
+		let predecessor;
+		let successor;
 		try {
+			const earlyTransport = getClusterLockTransport(database);
+			assert.strictEqual(earlyTransport.ownsCoordination(), false);
+			predecessor = new LockCoordinator({
+				database,
+				table: 'Counter',
+				nodeId: 'self',
+				transport: earlyTransport,
+				writeControl: () => {},
+				keyIdOf: (key) => key,
+				nextTimestamp: () => 1,
+				monotonic: () => 1000,
+				grantableAfterMono: earlyTransport.grantableAfterMono,
+				autoTick: false,
+			});
+			setHomeIncarnation(2);
+			const lateTransport = getClusterLockTransport(database);
+			assert.notStrictEqual(
+				lateTransport,
+				earlyTransport,
+				'resolving homeIncarnation from 0 re-registers a fresh transport instance'
+			);
+			assert.strictEqual(lateTransport.ownsCoordination(), true);
+			assert.strictEqual(lateTransport.coordinationIncarnation(), 2);
+			successor = new LockCoordinator({
+				database,
+				table: 'Counter',
+				nodeId: 'self',
+				transport: lateTransport,
+				writeControl: () => {},
+				keyIdOf: (key) => key,
+				nextTimestamp: () => 1,
+				monotonic: () => 1000,
+				grantableAfterMono: lateTransport.grantableAfterMono,
+				adopt: predecessor,
+				autoTick: false,
+			});
+			predecessor.close();
+			predecessor = undefined;
 			assert.ok(successor.unprovenOwnershipMs() > 0, 'still quarantined before recall attests');
 			quiesced = 2;
 			assert.strictEqual(successor.unprovenOwnershipMs(), 0);
@@ -415,7 +430,9 @@ describe('createRecordLockTransport().homeMap', () => {
 			assert.strictEqual(reply.granted, true);
 			assert.deepStrictEqual(reply.token, [1, 2, 1]);
 		} finally {
-			successor.close();
+			predecessor?.close();
+			successor?.close();
+			releaseRecordLockTransport(database);
 		}
 	});
 
@@ -513,17 +530,78 @@ describe('setHomeIncarnation (worker side)', () => {
 		assert.strictEqual(currentHomeIncarnation(), 6);
 	});
 
-	it('clears the first-incarnation quarantine waiver on the first handoff bump', () => {
+	it('clears the first-incarnation quarantine waiver on the first handoff bump and rebuilds registered transports', () => {
 		// The waiver lets a fresh node's successor coordinator grant immediately. But once ownership
 		// has changed hands at least once (main bumps the incarnation with first=false), a departed
 		// worker's relayed handle could still be in flight, so the waiver MUST drop or we get a
 		// two-writer window. The true->false transition is one-way: it never re-waives afterward.
-		setHomeIncarnation(10, true);
-		assert.strictEqual(isFirstIncarnation(), true);
-		setHomeIncarnation(11, false);
-		assert.strictEqual(isFirstIncarnation(), false);
-		setHomeIncarnation(12, true);
-		assert.strictEqual(isFirstIncarnation(), false);
+		const database = 'waiver-handoff';
+		const auditStore = fakeAuditStore();
+		ensureRecordLockTransport(database, () =>
+			createRecordLockTransport(
+				database,
+				{
+					thisNodeName: () => 'self',
+					auditStore: () => auditStore,
+					ownsDatabase: () => true,
+					homeIncarnation: () => currentHomeIncarnation(),
+					send: async () => ({}),
+					isFirstIncarnation,
+					monotonicNow: () => 500,
+				},
+				() => ({ generation: 1, homes: ['self'] })
+			)
+		);
+		try {
+			const beforeFirst = getClusterLockTransport(database);
+			setHomeIncarnation(10, true);
+			assert.strictEqual(isFirstIncarnation(), true);
+			const afterFirst = getClusterLockTransport(database);
+			assert.notStrictEqual(afterFirst, beforeFirst, 'undefined -> true rebuilds the transport');
+			assert.strictEqual(afterFirst.grantableAfterMono, 500);
+			setHomeIncarnation(11, false);
+			assert.strictEqual(isFirstIncarnation(), false);
+			const afterHandoff = getClusterLockTransport(database);
+			assert.notStrictEqual(afterHandoff, afterFirst, 'true -> false rebuilds the transport without the waiver');
+			assert.strictEqual(afterHandoff.grantableAfterMono, undefined);
+			setHomeIncarnation(12, true);
+			assert.strictEqual(isFirstIncarnation(), false);
+			assert.strictEqual(
+				getClusterLockTransport(database),
+				afterHandoff,
+				'once false, firstIncarnation never changes again and does not rebuild the transport'
+			);
+		} finally {
+			releaseRecordLockTransport(database);
+		}
+	});
+
+	it('retries a failed startup bumpHomeIncarnation via backoff until it succeeds', async () => {
+		let attempts = 0;
+		let resets = 0;
+		let resolved;
+		const done = new Promise((resolve) => {
+			resolved = resolve;
+		});
+		ensureStartupHomeIncarnation(
+			async () => {
+				attempts++;
+				if (attempts < 3) throw new Error(`transient storage failure #${attempts}`);
+				resolved();
+				return 13;
+			},
+			{
+				attempts: 0,
+				nextDelay: () => 1,
+				reset() {
+					resets++;
+				},
+			}
+		);
+		await done;
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(attempts, 3);
+		assert.strictEqual(resets, 1);
 	});
 });
 
