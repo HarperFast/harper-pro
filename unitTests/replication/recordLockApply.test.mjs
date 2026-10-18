@@ -683,6 +683,7 @@ describe('applyHomes with fenced nodes (harper-pro#973)', function () {
 			[{ fenced: [''] }, /non-empty, bounded node name/],
 			[{ fenced: 'c' }, /must be an array/],
 			[{ hdb_user: undefined }, /require an authenticated user/],
+			[{ hdb_user: { username: 'o'.repeat(513) } }, /operator name of at most 512 characters/],
 		];
 		for (const [fields, expected] of cases)
 			await assert.rejects(applyHomes(fencedShrink(fields), cluster.peers), (error) => {

@@ -330,6 +330,7 @@ async function forEachNode(nodes: string[], task: (node: string) => Promise<void
 const applyQueues = new Map<string, Promise<unknown>>();
 
 const FAIL_BEFORE_ACTIVATE = process.env.HARPER_TEST_RECORD_LOCK_APPLY_FAIL_BEFORE_ACTIVATE === '1';
+const MAX_OPERATOR_LENGTH = 512;
 
 export async function applyHomes(
 	request: any,
@@ -359,6 +360,8 @@ export async function applyHomes(
 	if (request.fenced?.length > 0) {
 		const nodes = validateFenced(request.fenced, homes, quiesce, peers.self());
 		fence = { nodes, operator: operatorPrincipal(request) };
+		if (fence.operator.length > MAX_OPERATOR_LENGTH)
+			throw new ClientError(`a fenced call needs an operator name of at most ${MAX_OPERATOR_LENGTH} characters`, 400);
 	}
 	const prior = applyQueues.get(database) ?? Promise.resolve();
 	const run = prior.then(() => runApply(request, database, homes, quiesce, fence, peers, timeouts));
@@ -525,7 +528,7 @@ const transitionSchema = Joi.object({
 	quiesce: Joi.array().optional(),
 	digest: Joi.string().optional(),
 	fenced: Joi.array().optional(),
-	operator: Joi.string().max(512).optional(),
+	operator: Joi.string().max(MAX_OPERATOR_LENGTH).optional(),
 });
 
 /**
