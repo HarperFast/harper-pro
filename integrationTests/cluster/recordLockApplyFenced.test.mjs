@@ -50,7 +50,6 @@ suite('record_lock_apply_homes with a fenced node on a three-node cluster', { ti
 	let nodes;
 	let names;
 	let ids;
-	/** Keys each survivor had delegated to the stopped node, as its drain reported them. */
 	const heldFrom = {};
 
 	before(async () => {

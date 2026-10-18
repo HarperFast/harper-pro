@@ -589,7 +589,6 @@ describe('a fenced stage records the fence with the stage (harper-pro#973)', () 
 		await stageGeneration(request, { nodes: ['c'], operator: 'op' });
 		row = await currentRow('fence1');
 		assert.strictEqual(row.fenced.length, 1, 'a retry adds no second entry');
-		// A row staged with no fence (an earlier unfenced call, or a per-node stage) gains one on the noop.
 		const unfenced = { ...request, database: 'fence2' };
 		await stageGeneration(unfenced);
 		assert.deepStrictEqual((await currentRow('fence2')).fenced, []);

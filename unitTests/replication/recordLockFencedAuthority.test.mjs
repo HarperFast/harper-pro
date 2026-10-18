@@ -20,7 +20,6 @@ function activeRow(database, generation, homes) {
 	return planActivate(staged, database, generation, digest, 0, 0).row;
 }
 
-/** Nodes in one process, one coordinator each, every one active at generation 1 over all of them. */
 function cluster(names) {
 	const database = `fenced${++sequence}`;
 	const table = `FencedAuthority${sequence}`;
@@ -197,6 +196,7 @@ describe('fenced apply: authority a fenced node exercised under generation g', (
 		await c.release(key, round.admissionId);
 		nodes.get('c').alive = false;
 		for (const name of ['a', 'b']) harness.stage(name, 2, ['a', 'b']);
+		await a.quiesce({ complete: true, surrendered: 0, recalled: 0, outstanding: [] }, () => 1_000);
 		for (const name of ['a', 'b']) harness.activate(name, 2, ['a', 'b']);
 		const successor = await b.acquire(key, LEASE, WAIT);
 		assert.ok(successor.admissionId, 'b holds the key c was delegated under generation 1');
