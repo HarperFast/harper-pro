@@ -63,7 +63,7 @@ import {
 } from '#src/replication/recordLockRpc';
 import { RECORD_LOCKS_CAPABILITY } from '#src/replication/protocolCapabilities';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
-import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
+import { FIRE_MECHANISMS, fireCounterPositions } from '#src/replication/replicationConnection';
 import { setActiveWorkerPools } from '#src/core/server/threads/workerPools';
 import { getClusterLockTransport, LockCoordinator } from '#src/core/resources/recordLockCoordinator';
 import { server } from '#src/core/server/Server';
@@ -157,9 +157,20 @@ describe('peer lock capability in the shared status buffer', () => {
 	});
 
 	it('uses a slot outside the ones connection truth, blob signals, and the fire counters occupy', () => {
-		const fireCountersEnd = FIRE_COUNTER_BASE_POSITION + FIRE_MECHANISMS.length * 2; // exclusive
-		assert.ok(RECORD_LOCKS_CAPABILITY_POSITION >= fireCountersEnd);
-		assert.ok(RECORD_LOCKS_CAPABILITY_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
+		const fireCounterSlots = new Set(
+			FIRE_MECHANISMS.flatMap((mechanism) => {
+				const positions = fireCounterPositions(mechanism);
+				return positions ? [positions.redundant, positions.loadBearing] : [];
+			})
+		);
+		for (const position of [
+			RECORD_LOCKS_CAPABILITY_POSITION,
+			RECORD_LOCK_HOMES_AGREEMENT_POSITION,
+			RECORD_LOCK_LEVEL_POSITION,
+		]) {
+			assert.ok(!fireCounterSlots.has(position));
+			assert.ok(position < REPLICATION_SHARED_STATUS_SLOTS);
+		}
 	});
 });
 

@@ -134,7 +134,7 @@ staged?.generation ?? 0, highestActedOn)`, and refuses a `quiesce` that omits a 
 Per thread, cache this node's active generation per database, updated **only** when this node's
 own `active` row changes locally (on `stage` clearing it, or `activate` setting it) — never read
 from storage, hashed or sorted inside `homeMap()` itself. Each call checks every peer named in
-`homes` against shared-status slots 29 (capability) and 30 (digest agreement), failing closed when
+`homes` against shared-status slots 31 (capability) and 32 (digest agreement), failing closed when
 either is unknown, and returns a new object. With `replication.recordLocks` off, no table watcher
 or cache exists at all.
 
@@ -163,7 +163,7 @@ Reusing `NODE_NAME` as a live refresh is unproven — its handler has side effec
 (b) standalone, on every live outbound connection for a database whose local `active` digest just
 changed (on `activate`) — with no other handshake side effect triggered. Receipt writes only a
 tri-state match/mismatch/unknown result into the per-(database, peer) shared status buffer
-(slot 30, beside slot 29's capability support flag) — the full digest itself travels on the wire,
+(slot 32, beside slot 31's capability support flag) — the full digest itself travels on the wire,
 compared byte-exact on the socket thread, never truncated into shared memory.
 
 ### 7. `homeIncarnation` per coordination incarnation, gated centrally

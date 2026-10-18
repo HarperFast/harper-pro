@@ -38,6 +38,7 @@ export const FIRE_MECHANISMS = [
 	'subscription-setup',
 	'wedge-reconcile',
 	'receive-stall-net',
+	'send-log-break',
 ] as const;
 export const FIRE_COUNTER_BASE_POSITION = allocate(FIRE_MECHANISMS.length * 2);
 
