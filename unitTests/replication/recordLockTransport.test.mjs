@@ -53,6 +53,7 @@ import { DELEGATE_OPERATION, RECALL_OPERATION } from '#src/replication/recordLoc
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
 import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
 import { setActiveWorkerPools } from '#src/core/server/threads/workerPools';
+import { LockCoordinator } from '#src/core/resources/recordLockCoordinator';
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
@@ -283,8 +284,9 @@ describe('createRecordLockTransport().homeMap', () => {
 		assert.deepStrictEqual(transport.homeMap('data'), { generation: 1, homes: ['self'], homeIncarnation: 3 });
 	});
 
-	it('answers ownsCoordination from the injected ownership view', () => {
+	it('answers ownsCoordination only once both thread ownership and the home incarnation are established', () => {
 		let owned = false;
+		let incarnation = 0;
 		const auditStore = fakeAuditStore();
 		const transport = createRecordLockTransport(
 			'data',
@@ -292,7 +294,7 @@ describe('createRecordLockTransport().homeMap', () => {
 				thisNodeName: () => 'self',
 				auditStore: () => auditStore,
 				ownsDatabase: () => owned,
-				homeIncarnation: () => 1,
+				homeIncarnation: () => incarnation,
 				send: async () => ({}),
 				isFirstIncarnation: () => false,
 				monotonicNow: () => 0,
@@ -301,7 +303,145 @@ describe('createRecordLockTransport().homeMap', () => {
 		);
 		assert.strictEqual(transport.ownsCoordination(), false);
 		owned = true;
+		assert.strictEqual(
+			transport.ownsCoordination(),
+			false,
+			'withheld while the home incarnation is still 0 so a coordinator built during the bump does not latch an undefined incarnation'
+		);
+		incarnation = 1;
 		assert.strictEqual(transport.ownsCoordination(), true);
+	});
+
+	it('fails closed on owner-thread acquireOnOwner and drops nothing in relayControlEntry before the incarnation resolves', async () => {
+		let relayedAcquires = 0;
+		const auditStore = fakeAuditStore();
+		const transport = createRecordLockTransport(
+			'pre-incarnation-owner',
+			{
+				thisNodeName: () => 'self',
+				auditStore: () => auditStore,
+				ownsDatabase: () => true,
+				homeIncarnation: () => 0,
+				send: async () => ({}),
+				isFirstIncarnation: () => false,
+				monotonicNow: () => 0,
+				acquireOnOwner: async () => {
+					relayedAcquires++;
+					return { tsR: 1, mintedMono: 0, admissionId: 1 };
+				},
+			},
+			() => undefined
+		);
+		assert.strictEqual(transport.ownsCoordination(), false);
+		await assert.rejects(
+			() => transport.acquireOnOwner('pre-incarnation-owner', 'Counter', 'k1', 1000, 1000, () => {}),
+			(error) =>
+				error.statusCode === 503 && /No agreed record lock home map for pre-incarnation-owner/.test(error.message)
+		);
+		assert.strictEqual(relayedAcquires, 0, 'the owner thread never relays an acquire to itself');
+		transport.relayControlEntry(
+			'pre-incarnation-owner',
+			'Counter',
+			{ type: 'lockRelease', key: 'k1', requester: 'self', token: [1, 1, 1], dependencies: null },
+			'self',
+			1
+		);
+		assert.strictEqual(
+			controlEntryRelayDropCount('pre-incarnation-owner'),
+			0,
+			'an entry applied on the owner before the incarnation resolves is neither self-relayed nor counted as a drop'
+		);
+	});
+
+	it('lets a coordinator built on the owner before the incarnation resolves adopt the successor’s incarnation and waiver', async () => {
+		// Regression for harper-pro#1059 CI failures: `cluster_status` polling during `bumpHomeIncarnation`
+		// instantiates `table.lockCoordinator` while `ownsDatabase` is already true and `homeIncarnation` is
+		// still 0. If `ownsCoordination()` returned true there, the predecessor latched `#ownedSinceMono`
+		// with `#coordinatingIncarnation = undefined`, and `handOffTo` overwrote the recreated successor's
+		// `#coordinatingIncarnation` back to `undefined` — leaving `unprovenOwnershipMs()` stuck at 365 s
+		// even after the restart recall round attested.
+		for (const { database, targetIncarnation, first } of [
+			{ database: 'handoff-restarted', targetIncarnation: 2, first: false },
+			{ database: 'handoff-fresh', targetIncarnation: 1, first: true },
+		]) {
+			let incarnation = 0;
+			let firstIncarnation = false;
+			let quiesced;
+			const auditStore = fakeAuditStore();
+			recordPeerLockCapability(getReplicationSharedStatus(auditStore, database, 'peer-a'), true);
+			recordPeerHomesAgreement(getReplicationSharedStatus(auditStore, database, 'peer-a'), true);
+			const makeTransport = () =>
+				createRecordLockTransport(
+					database,
+					{
+						thisNodeName: () => 'self',
+						auditStore: () => auditStore,
+						ownsDatabase: () => true,
+						homeIncarnation: () => incarnation,
+						send: async () => ({}),
+						isFirstIncarnation: () => firstIncarnation,
+						monotonicNow: () => 1000,
+						quiescedIncarnation: () => quiesced,
+					},
+					() => ({ generation: 1, homes: ['self'] })
+				);
+			const earlyTransport = makeTransport();
+			const predecessor = new LockCoordinator({
+				database,
+				table: 'Counter',
+				nodeId: 'self',
+				transport: earlyTransport,
+				writeControl: () => {},
+				keyIdOf: (key) => key,
+				nextTimestamp: () => 1,
+				monotonic: () => 1000,
+				grantableAfterMono: earlyTransport.grantableAfterMono,
+				autoTick: false,
+			});
+			incarnation = targetIncarnation;
+			firstIncarnation = first;
+			if (first) quiesced = targetIncarnation;
+			const lateTransport = makeTransport();
+			const successor = new LockCoordinator({
+				database,
+				table: 'Counter',
+				nodeId: 'self',
+				transport: lateTransport,
+				writeControl: () => {},
+				keyIdOf: (key) => key,
+				nextTimestamp: () => 1,
+				monotonic: () => 1000,
+				grantableAfterMono: lateTransport.grantableAfterMono,
+				adopt: predecessor,
+				autoTick: false,
+			});
+			predecessor.close();
+			try {
+				if (!first) {
+					assert.ok(successor.unprovenOwnershipMs() > 0, 'still quarantined before recall attests');
+					const beforeAttest = await successor.onDelegationRequest({
+						key: 'k1',
+						requester: 'self',
+						generation: 1,
+						leaseMs: 5000,
+					});
+					assert.strictEqual(beforeAttest.granted, false);
+					assert.strictEqual(beforeAttest.reason, 'quarantine');
+					quiesced = targetIncarnation;
+				}
+				assert.strictEqual(successor.unprovenOwnershipMs(), 0);
+				const reply = await successor.onDelegationRequest({
+					key: 'k1',
+					requester: 'self',
+					generation: 1,
+					leaseMs: 5000,
+				});
+				assert.strictEqual(reply.granted, true);
+				assert.deepStrictEqual(reply.token, [1, targetIncarnation, 1]);
+			} finally {
+				successor.close();
+			}
+		}
 	});
 
 	it('sends a delegation request as the delegate operation and returns the home’s reply verbatim', async () => {
