@@ -51,12 +51,22 @@ import {
 	ensureRecordLockTransport,
 	ensureStartupHomeIncarnation,
 	releaseRecordLockTransport,
+	setRecordLockOwnership,
 } from '#src/replication/recordLockTransport';
-import { DELEGATE_OPERATION, RECALL_OPERATION } from '#src/replication/recordLockRpc';
+import {
+	DELEGATE_OPERATION,
+	RECALL_OPERATION,
+	executeDelegate,
+	executeRecall,
+	executeRecallIncarnation,
+	setRecordLockOwnershipReaders,
+} from '#src/replication/recordLockRpc';
+import { RECORD_LOCKS_CAPABILITY } from '#src/replication/protocolCapabilities';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
 import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
 import { setActiveWorkerPools } from '#src/core/server/threads/workerPools';
 import { getClusterLockTransport, LockCoordinator } from '#src/core/resources/recordLockCoordinator';
+import { server } from '#src/core/server/Server';
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
@@ -315,7 +325,7 @@ describe('createRecordLockTransport().homeMap', () => {
 		assert.strictEqual(transport.ownsCoordination(), true);
 	});
 
-	it('fails closed on owner-thread acquireOnOwner and ignores relayControlEntry before the incarnation resolves', async () => {
+	it('fails closed on owner-thread acquireOnOwner and inbound RPCs and ignores relayControlEntry before the incarnation resolves', async () => {
 		let relayedAcquires = 0;
 		const auditStore = fakeAuditStore();
 		const transport = createRecordLockTransport(
@@ -339,7 +349,10 @@ describe('createRecordLockTransport().homeMap', () => {
 		await assert.rejects(
 			() => transport.acquireOnOwner('pre-incarnation-owner', 'Counter', 'k1', 1000, 1000),
 			(error) =>
-				error.statusCode === 503 && /No agreed record lock home map for pre-incarnation-owner/.test(error.message)
+				error.statusCode === 503 &&
+				/Record lock coordination incarnation for pre-incarnation-owner is not yet initialized on self/.test(
+					error.message
+				)
 		);
 		assert.strictEqual(relayedAcquires, 0, 'the owner thread never relays an acquire to itself');
 		transport.relayControlEntry(
@@ -354,6 +367,98 @@ describe('createRecordLockTransport().homeMap', () => {
 			0,
 			'an entry applied on the owner before the incarnation resolves is ignored without incrementing controlEntryRelayDrops'
 		);
+
+		assert.strictEqual(currentHomeIncarnation(), 0);
+		const previousNodes = server.nodes;
+		let previousReaders;
+		server.nodes = [{ name: 'peer-supported' }];
+		setRecordLockOwnership('pre-incarnation-owner', true);
+		try {
+			previousReaders = setRecordLockOwnershipReaders({
+				ownsDatabase: ownsRecordLockCoordination,
+				homeIncarnation: currentHomeIncarnation,
+				isMember: (database, node) => database === 'pre-incarnation-owner' && node === 'peer-supported',
+				peerLevel: () => RECORD_LOCKS_CAPABILITY,
+				activeGeneration: () => 1,
+			});
+			assert.deepStrictEqual(
+				await executeDelegate({
+					database: 'pre-incarnation-owner',
+					table: 'Counter',
+					key: 'k1',
+					generation: 1,
+					leaseMs: 5000,
+					hdb_user: { name: 'peer-supported' },
+				}),
+				{ granted: false, reason: 'generation' }
+			);
+			assert.deepStrictEqual(
+				await executeRecall({
+					database: 'pre-incarnation-owner',
+					table: 'Counter',
+					key: 'k1',
+					token: [1, 1, 1],
+					hdb_user: { name: 'peer-supported' },
+				}),
+				{ recalled: true }
+			);
+			for (const probe of [true, false]) {
+				await assert.rejects(
+					() =>
+						executeRecallIncarnation({
+							database: 'pre-incarnation-owner',
+							generation: 1,
+							incarnation: 2,
+							...(probe ? { probe: true } : {}),
+							hdb_user: { name: 'peer-supported' },
+						}),
+					(error) => error.statusCode === 503
+				);
+			}
+		} finally {
+			if (previousReaders) setRecordLockOwnershipReaders(previousReaders);
+			setRecordLockOwnership('pre-incarnation-owner', false);
+			server.nodes = previousNodes;
+		}
+	});
+
+	it('retries a failed startup bumpHomeIncarnation via backoff while homeIncarnation is 0, and stops once resolved', async () => {
+		assert.strictEqual(currentHomeIncarnation(), 0);
+		let attempts = 0;
+		let resets = 0;
+		let resolved;
+		const done = new Promise((resolve) => {
+			resolved = resolve;
+		});
+		ensureStartupHomeIncarnation(
+			async () => {
+				attempts++;
+				if (attempts < 3) throw new Error(`transient storage failure #${attempts}`);
+				resolved();
+				return 13;
+			},
+			{
+				attempts: 0,
+				nextDelay: () => 1,
+				reset() {
+					resets++;
+				},
+			}
+		);
+		let timeout;
+		try {
+			await Promise.race([
+				done,
+				new Promise((_, reject) => {
+					timeout = setTimeout(() => reject(new Error('timed out waiting for ensureStartupHomeIncarnation')), 2000);
+				}),
+			]);
+		} finally {
+			clearTimeout(timeout);
+		}
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(attempts, 3);
+		assert.strictEqual(resets, 1);
 	});
 
 	it('rebuilds the registered transport on setHomeIncarnation so a successor coordinator adopts the resolved incarnation', async () => {
@@ -394,7 +499,30 @@ describe('createRecordLockTransport().homeMap', () => {
 				grantableAfterMono: earlyTransport.grantableAfterMono,
 				autoTick: false,
 			});
+			let rejectStartupBump;
+			let retryDelays = 0;
+			ensureStartupHomeIncarnation(
+				() =>
+					new Promise((_, reject) => {
+						rejectStartupBump = reject;
+					}),
+				{
+					attempts: 0,
+					nextDelay: () => {
+						retryDelays++;
+						return 1;
+					},
+					reset() {},
+				}
+			);
 			setHomeIncarnation(2);
+			rejectStartupBump(new Error('late startup failure after handoff resolved incarnation'));
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.strictEqual(
+				retryDelays,
+				0,
+				'an in-flight startup bump that fails after homeIncarnation > 0 schedules no further retries'
+			);
 			const lateTransport = getClusterLockTransport(database);
 			assert.notStrictEqual(
 				lateTransport,
@@ -576,32 +704,27 @@ describe('setHomeIncarnation (worker side)', () => {
 		}
 	});
 
-	it('retries a failed startup bumpHomeIncarnation via backoff until it succeeds', async () => {
+	it('does not start a startup bump once homeIncarnation is already resolved', async () => {
+		assert.ok(currentHomeIncarnation() > 0);
 		let attempts = 0;
-		let resets = 0;
-		let resolved;
-		const done = new Promise((resolve) => {
-			resolved = resolve;
-		});
+		let delays = 0;
 		ensureStartupHomeIncarnation(
 			async () => {
 				attempts++;
-				if (attempts < 3) throw new Error(`transient storage failure #${attempts}`);
-				resolved();
 				return 13;
 			},
 			{
 				attempts: 0,
-				nextDelay: () => 1,
-				reset() {
-					resets++;
+				nextDelay: () => {
+					delays++;
+					return 1;
 				},
+				reset() {},
 			}
 		);
-		await done;
 		await new Promise((resolve) => setImmediate(resolve));
-		assert.strictEqual(attempts, 3);
-		assert.strictEqual(resets, 1);
+		assert.strictEqual(attempts, 0);
+		assert.strictEqual(delays, 0);
 	});
 });
 

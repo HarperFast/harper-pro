@@ -368,7 +368,6 @@ export function createRecordLockTransport(
 			return { generation: active.generation, homes: active.homes, homeIncarnation };
 		},
 		ownsCoordination(): boolean {
-			// Ownership without a known incarnation is not coordination.
 			return deps.ownsDatabase(database) && transport.coordinationIncarnation() !== undefined;
 		},
 		requestDelegation(node: string, db: string, table: string, request: DelegationRequest): Promise<DelegationReply> {
@@ -394,12 +393,11 @@ export function createRecordLockTransport(
 		// worker over the port mesh. Core installs the returned round as a remote admission and drives
 		// the release/revoke through these.
 		acquireOnOwner(db: string, table: string, key: unknown, leaseMs: number, waitMs: number): Promise<LockRound> {
-			// Never relay an acquire from the owning thread to itself (e.g. while homeIncarnation is 0
-			// and ownsCoordination() is false, or from a superseded coordinator after a rebuild).
+			// Never relay an acquire from the owning thread to itself while homeIncarnation is 0.
 			if (deps.ownsDatabase(database))
 				return Promise.reject(
 					new LockUnavailableError(
-						`No agreed record lock home map for ${db}; cluster record locks are unavailable until one is established`
+						`Record lock coordination incarnation for ${database} is not yet initialized on ${deps.thisNodeName()}; retry once startup completes`
 					)
 				);
 			return deps.acquireOnOwner(db, table, key, leaseMs, waitMs);
@@ -754,8 +752,6 @@ export function setRecordLockOwnership(database: string, owned: boolean): void {
 	if (owned) ownedDatabases.add(database);
 	else ownedDatabases.delete(database);
 	logger.debug?.(`Record lock coordination for ${database} is ${owned ? 'owned' : 'not owned'} by this thread`);
-	// Replace the transport so core constructs a successor coordinator that picks up the new ownership
-	// state (see `recreateRecordLockTransport`).
 	if (owned && !wasOwned) {
 		recreateRecordLockTransport(database);
 		if (CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF) restartRecall.schedule(database);
@@ -1001,17 +997,20 @@ export async function bumpHomeIncarnation(): Promise<number> {
 /**
  * Main thread: retry the startup `bumpHomeIncarnation` with backoff if its durable write fails, so
  * a transient storage error at startup cannot leave `homeIncarnation === 0` (and `ownsCoordination()`
- * withheld) for the life of the process.
+ * withheld) for the life of the process. Stops as soon as an incarnation is set (either by the retry
+ * itself or by a concurrent handoff bump).
  */
 export function ensureStartupHomeIncarnation(
 	bump: () => Promise<number> = bumpHomeIncarnation,
 	backoff: Backoff = createBackoff({ initialMs: REFRESH_RETRY_INITIAL_MS, maxMs: REFRESH_RETRY_MAX_MS })
 ): void {
 	const attempt = (): void => {
+		if (homeIncarnation > 0) return;
 		bump()
 			.then(() => backoff.reset())
 			.catch((error) => {
 				logger.error?.('Could not bump the record lock home incarnation; will retry', error);
+				if (homeIncarnation > 0) return;
 				setTimeout(attempt, backoff.nextDelay() ?? REFRESH_RETRY_MAX_MS).unref();
 			});
 	};
@@ -1022,6 +1021,9 @@ export function ensureStartupHomeIncarnation(
  * Register this thread's transport for a replicated database (idempotent; core recreates the
  * coordinator whenever the transport object changes, so the instance must be stable) and, when
  * enabled, ask the main thread which worker coordinates it.
+ *
+ * @param buildTransport Test-only seam to supply a transport factory when cluster record locks are
+ *   not enabled in the unit-test environment.
  */
 export function ensureRecordLockTransport(database: string, buildTransport?: () => ClusterLockTransport): void {
 	if (transports.has(database)) return;
@@ -1656,6 +1658,7 @@ setHomesMembershipReaders({
 
 setRecordLockOwnershipReaders({
 	ownsDatabase: ownsRecordLockCoordination,
+	homeIncarnation: currentHomeIncarnation,
 	ownerFor: (database) => {
 		const owner = recordLockOwners.get(database);
 		return owner === MAIN_OWNER || owner === PENDING_BUMP ? undefined : owner;

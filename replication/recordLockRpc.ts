@@ -77,6 +77,7 @@ export function relayTimeoutFor(kind: RelayKind, payload: any, hop: 'caller' | '
 	return Math.min(deadlineMs, MAX_RELAY_TIMEOUT_MS) + slack;
 }
 const NOT_HOME: DelegationReply = { granted: false, reason: 'not-home' };
+const GENERATION_MISMATCH: DelegationReply = Object.freeze({ granted: false as const, reason: 'generation' as const });
 const RECALLED = Object.freeze({ recalled: true as const });
 /**
  * A barrier is a replicated write a peer can make this node perform, so each caller gets a token
@@ -96,6 +97,8 @@ export const BARRIER_BURST = MAX_OUTSTANDING_BARRIERS;
 
 interface OwnershipReaders {
 	ownsDatabase(database: string): boolean;
+	/** This thread's resolved home incarnation, or 0 before main's startup bump / broadcast lands. */
+	homeIncarnation?(): number;
 	/** Main thread only: the owner worker for a database, `undefined` when the main thread is the owner. */
 	ownerFor(database: string): any;
 	/** Main thread only: whether the main thread itself owns the database. */
@@ -119,6 +122,10 @@ export function setRecordLockOwnershipReaders(readers: OwnershipReaders): Owners
 	const previous = ownership;
 	ownership = readers;
 	return previous;
+}
+
+function ownerIncarnationReady(): boolean {
+	return ownership.homeIncarnation ? ownership.homeIncarnation() > 0 : true;
 }
 
 // ---- send side ---------------------------------------------------------------------------------
@@ -392,7 +399,7 @@ export function principalNodeName(request: any): string | undefined {
 	return (server.nodes ?? []).some((node: any) => node?.name === name) ? name : undefined;
 }
 
-async function executeDelegate(request: any): Promise<DelegationReply> {
+export async function executeDelegate(request: any): Promise<DelegationReply> {
 	const requester = principalNodeName(request);
 	if (!requester) throw new ClientError('record lock delegation requests are accepted from cluster nodes only', 403);
 	if (typeof request.database !== 'string' || typeof request.table !== 'string')
@@ -403,12 +410,17 @@ async function executeDelegate(request: any): Promise<DelegationReply> {
 		generation: request.generation,
 		leaseMs: request.leaseMs,
 	};
-	if (ownership.ownsDatabase(request.database))
+	if (ownership.ownsDatabase(request.database)) {
+		// While homeIncarnation is 0, ownsCoordination() is false and no table coordinator can issue a
+		// token yet; answer 'generation' so the caller fails fast with 503 rather than polling 'not-home'
+		// every 25ms for its full lock timeout.
+		if (!ownerIncarnationReady()) return GENERATION_MISMATCH;
 		return deliverDelegationRequest(request.database, request.table, delegation);
+	}
 	return relay('delegate', request.database, request.table, delegation);
 }
 
-async function executeRecall(request: any): Promise<{ recalled: true }> {
+export async function executeRecall(request: any): Promise<{ recalled: true }> {
 	const from = principalNodeName(request);
 	if (!from) throw new ClientError('record lock recalls are accepted from cluster nodes only', 403);
 	if (typeof request.database !== 'string' || typeof request.table !== 'string')
@@ -416,6 +428,8 @@ async function executeRecall(request: any): Promise<{ recalled: true }> {
 	if (!Array.isArray(request.token) || request.token.length !== 3) throw new ClientError('token is required', 400);
 	const recall: DelegationRecall = { key: request.key, token: request.token };
 	if (ownership.ownsDatabase(request.database)) {
+		// Delegations do not survive a process restart and none can be acquired while homeIncarnation is 0.
+		if (!ownerIncarnationReady()) return RECALLED;
 		await deliverDelegationRecall(request.database, request.table, recall);
 		return { recalled: true };
 	}
@@ -460,7 +474,7 @@ export async function executeRecallIncarnation(
 	if (ownership.peerLevel?.(database, home) !== RECORD_LOCKS_CAPABILITY)
 		throw new ClientError(`${home} does not advertise record lock capability level ${RECORD_LOCKS_CAPABILITY}`, 403);
 	if (request.probe === true) {
-		if (!ownership.ownsDatabase(database) && !ownership.ownerThreadId?.(database))
+		if ((!ownership.ownsDatabase(database) && !ownership.ownerThreadId?.(database)) || !ownerIncarnationReady())
 			throw new ClientError(`no thread coordinates record locks for ${database} here yet`, 503);
 		const active = ownership.activeGeneration?.(database);
 		if (active !== generation)
@@ -478,7 +492,14 @@ export async function executeRecallIncarnation(
 	let sweep = incarnationRecallsInFlight.get(key);
 	if (!sweep) {
 		sweep = (async () => {
-			if (ownership.ownsDatabase(database)) return recallDelegationsFromHome(database, home, generation, incarnation);
+			if (ownership.ownsDatabase(database)) {
+				if (!ownerIncarnationReady())
+					throw new ClientError(
+						`record lock coordination incarnation for ${database} is not yet initialized here`,
+						503
+					);
+				return recallDelegationsFromHome(database, home, generation, incarnation);
+			}
 			const answer = await relay('recall-incarnation', database, '', { home, generation, incarnation, deadlineMs });
 			if (answer?.recalled !== true)
 				throw new ClientError('record lock recall did not reach the coordinating worker in time', 503);
@@ -570,12 +591,17 @@ async function relay(kind: RelayKind, database: string, table: string, payload: 
 }
 
 async function executeLocally(kind: RelayKind, database: string, table: string, payload: any): Promise<any> {
-	if (kind === 'delegate') return deliverDelegationRequest(database, table, payload);
+	if (kind === 'delegate') {
+		if (!ownerIncarnationReady()) return GENERATION_MISMATCH;
+		return deliverDelegationRequest(database, table, payload);
+	}
 	if (kind === 'quiesce') return quiesceDelegations(database, payload?.deadlineMs);
 	if (kind === 'recall-incarnation') {
+		if (!ownerIncarnationReady()) return undefined;
 		await recallDelegationsFromHome(database, payload.home, payload.generation, payload.incarnation);
 		return RECALLED;
 	}
+	if (!ownerIncarnationReady()) return RECALLED;
 	await deliverDelegationRecall(database, table, payload);
 	return RECALLED;
 }
