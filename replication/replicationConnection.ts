@@ -169,6 +169,7 @@ import { FrameWriter } from './frameWriter.ts';
 import { tableReplicates } from './replicatedDatabases.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
 import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
+export { normalizeWebSocketCloseReason } from './webSocketClose.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
 // blob-send backpressure both need it, so the private field is declared here rather than at each read.
@@ -244,6 +245,101 @@ export const CONNECTION_STATE_CONNECTED = 2;
 // Deliberately outside the 16-bit WebSocket close-code space so it can never collide with a real one, and
 // so an operator reading `lastConnectionError` can tell "the owning worker died" from "the peer closed us".
 export const WORKER_EXIT_ERROR_CODE = 100_001;
+// Floor between rebuilds of a send range that stopped at a torn tail. Until something is written past the
+// tear the fresh iterator stops at the same frame, and without this that would be a `getRange` per commit.
+export const SEND_LOG_REPAIR_INTERVAL_MS = 30_000;
+// Mid-log breaks get a far longer floor, not `never`. Refreshing cannot cross the break, so it must not
+// spin — but never refreshing means the cache stays latched for the life of the session even after an
+// operator repairs the log.
+export const SEND_LOG_QUARANTINE_RECHECK_MS = 30 * 60_000;
+// Whether the send range may be rebuilt now. A torn tail is walked as soon as the floor since the LAST
+// rebuild allows, because recovering it is the point. A quarantined one additionally waits out the recheck
+// window from when the break FIRST appeared, so it never rebuilds on first sight — that is the spin
+// harper#2087's fail-stop policy exists to avoid — while still looking again in case the log was repaired.
+export function rebuildRetryDelayMs(
+	midLogBreak: boolean,
+	breakSince: number,
+	lastRebuildAt: number,
+	now: number,
+	repairMs: number = SEND_LOG_REPAIR_INTERVAL_MS,
+	quarantineMs: number = SEND_LOG_QUARANTINE_RECHECK_MS
+): number {
+	const since = midLogBreak ? Math.max(breakSince, lastRebuildAt) : lastRebuildAt;
+	if (since <= 0) return 0;
+	return Math.max(0, (midLogBreak ? quarantineMs : repairMs) - (now - since));
+}
+export function mayRebuildSendRange(
+	midLogBreak: boolean,
+	breakSince: number,
+	lastRebuildAt: number,
+	now: number,
+	repairMs: number = SEND_LOG_REPAIR_INTERVAL_MS,
+	quarantineMs: number = SEND_LOG_QUARANTINE_RECHECK_MS
+): boolean {
+	const since = midLogBreak ? Math.max(breakSince, lastRebuildAt) : lastRebuildAt;
+	return !(since > 0 && now - since < (midLogBreak ? quarantineMs : repairMs));
+}
+export function sendLogBreakRepairDecision(
+	midLogBreak: boolean,
+	breakSince: number,
+	lastRebuildAt: number,
+	now: number
+): { breakSince: number; rebuild: boolean; retryInMs: number } {
+	const establishedBreakSince = breakSince || now;
+	const rebuild = mayRebuildSendRange(midLogBreak, establishedBreakSince, lastRebuildAt, now);
+	return {
+		breakSince: establishedBreakSince,
+		rebuild,
+		retryInMs: rebuild ? 0 : rebuildRetryDelayMs(midLogBreak, establishedBreakSince, lastRebuildAt, now),
+	};
+}
+// Tracks, for the CURRENT torn-tail break episode, whether a commit has landed since the first
+// denied rebuild — the signal a denied torn-tail wait uses to decide whether to arm the remaining
+// floor timer (once a commit is seen) or stay timerless (nothing walkable yet, see
+// waitForSessionEndOrTransactionOrRetry). `pending` identity-compares the transaction-generation
+// promise each deny observes; equality, not value, is what matters, so this works with any object
+// used as a stand-in for "the current pending generation" in a test. Sticky once observed: a later
+// deny must not re-derive "has anything changed" only against the immediately PRECEDING deny — an
+// intervening non-commit wake (re-admission, supersession) that cancels an armed wait would then
+// make the next deny's comparison come up empty and forget a commit already proved the log
+// readable, reverting to a timerless wait that may never see another one (round-5/6 regression).
+export function sendLogBreakCommitTransition(
+	firstPendingAtDeny: unknown | undefined,
+	commitObserved: boolean,
+	pending: unknown
+): { firstPendingAtDeny: unknown; commitObserved: boolean } {
+	if (firstPendingAtDeny === undefined) return { firstPendingAtDeny: pending, commitObserved };
+	if (!commitObserved && firstPendingAtDeny !== pending) return { firstPendingAtDeny, commitObserved: true };
+	return { firstPendingAtDeny, commitObserved };
+}
+// `currentSequenceId` is a maximum over every origin a merged range drains, so it can overstate
+// the one named origin's own safe position when a different relayed origin advanced it first. An
+// ORDINARY rebuild (a fresh connection, or every pass on a non-reusable LMDB range) seeds from it
+// anyway — `needsSafeSeed` is false there — so a healthy leg never pays for the failure path below.
+//
+// A rebuild caused by that origin's own reusable range having stopped (torn tail or mid-log break)
+// must never seed from that scalar: a different relayed origin in the same merged range can have
+// pushed it past this origin's own undelivered entries. `preservedSeed` is the bound the FAILED
+// range itself started from instead (`liveStartByLog`'s existing entry for this log) — not a live
+// max-observed-key tracker, which an earlier version of this fix used and which review caught as
+// unsafe: a transaction's key is assigned when created, not when it commits, so a lower-keyed one
+// can still append after a higher-keyed one this session already drained (harper-pro#876), and a
+// plain `exclusiveStart` past a live high-water mark could permanently exclude it. Reusing the
+// failed range's own start bound instead resends whatever it already delivered since its own last
+// rebuild (wasteful, but safe) and never advances past anything this session hasn't already proven
+// safe to skip.
+//
+// A range built from core's append-order-validated `exactStart`/`resumeAfterExactStart` boundary
+// (a base copy's tail) does NOT go through this function on a generic corruption — see
+// `boundaryRangeOptions`, declared with the per-subscription state above the send loop, which
+// replays that same already-covered boundary instead of downgrading it to a bare scalar.
+export function resolveSendRangeSeed(
+	needsSafeSeed: boolean,
+	preservedSeed: number | undefined,
+	currentSequenceId: number
+): number {
+	return needsSafeSeed ? (preservedSeed ?? 0) : currentSequenceId || 1;
+}
 // LIVENESS_STALE_MS is defined below, after PING_TIMEOUT, so it can be derived from the configured
 // keepalive window rather than a fixed default.
 export type ConnectionTruth = {
@@ -978,38 +1074,13 @@ export function keepaliveArmsOnOpen(readyState: number): boolean {
 	return readyState === WebSocket.CONNECTING;
 }
 
-/**
- * Handle an error that escaped `onWSMessage` (the inbound handler in `replicateOverWS`).
- *
- * Historically this was logged and swallowed. That silently dropped the rest of the failed frame
- * while later frames kept applying and confirming ever-higher sequence ids — a permanent,
- * undetected `[error, head]` gap on the receiver (epic harper-pro#430 Theme B; workstream
- * harper-pro#440). Recovery instead rides the established transient-close path:
- *
- *   1. `markInboundClosed` FIRST — frames already queued behind this one on the
- *      `messageProcessing` chain must not apply (they would commit past the hole), and after
- *      `ws.close()` the peer can still deliver frames until the close handshake completes.
- *   2. `close(1011)` (internal error — distinct from the 1008 policy closes) WITHOUT the
- *      `intentional` flag, so `NodeReplicationConnection`'s normal retry path reconnects with
- *      backoff and resumes from the last durable cursor, re-streaming everything past it.
- *      Records applied before the error redeliver idempotently (version dedup).
- *
- * A deterministic error (e.g. a genuinely undecodable frame) becomes a visible, backed-off
- * reconnect loop instead of silent loss; bounding that with an escalation budget is W2
- * (harper-pro#432) territory.
- *
- * Coverage: FRAME-level errors (header/command decode, audit-entry structure, unexpected rejections
- * from awaited handler work) reach the outer catch directly. A per-record VALUE decode failure is
- * caught first by the inner catch around `decodeBlobsWithWrites` — which logs the decoder's structures
- * and the offending bytes for diagnosis, then RE-THROWS (only when the table decoder resolved) so it
- * rides this same close path instead of skip-and-logging while the resume cursor advances past the
- * hole. That closes the #1163/#1453 structure-fork silent-gap class: the reconnect rebuilds the table
- * decoder from the peer's re-sent structures, healing the fork on resume. An unknown tableId (decoder
- * unresolved — a transient schema-propagation case, not a fork) stays skip-and-log.
- *
- * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
- * catch in `onWSMessage`.
- */
+export function runRecoveryDiagnostic(diagnostic: () => void): void {
+	try {
+		diagnostic();
+	} catch {}
+}
+
+/** Close after an error escapes an inbound frame so later queued frames cannot advance past it. */
 export function closeOnInboundMessageError(
 	error: unknown,
 	deps: {
@@ -1020,29 +1091,14 @@ export function closeOnInboundMessageError(
 	}
 ): void {
 	deps.markInboundClosed();
-	// The log must never prevent the close — this handler is the last line of defense, so the
-	// logger access is fully guarded rather than trusted.
-	deps.logger?.error?.(
-		deps.connectionId,
-		'Error handling incoming replication message; closing so replication resumes from the last durable cursor',
-		error
+	runRecoveryDiagnostic(() =>
+		deps.logger?.error?.(
+			deps.connectionId,
+			'Error handling incoming replication message; closing so replication resumes from the last durable cursor',
+			error
+		)
 	);
 	deps.close(1011, 'Error handling incoming replication message');
-}
-
-/**
- * The close-vs-skip decision for a per-record value-decode failure inside `onWSMessage`'s inner
- * catch (around `decodeBlobsWithWrites`): a resolved `tableDecoder` means the offending bytes are a
- * real record whose structures forked from the sender's (#1163/#1453), so the caller latches the
- * error to re-throw onto `closeOnInboundMessageError`'s close-and-reconnect path instead of skipping
- * past it — see the inline comment at the call site for the full reasoning. An unresolved decoder
- * (unknown tableId) is transient schema propagation, not a fork, and still skips.
- *
- * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
- * inner value-decode catch in `onWSMessage`.
- */
-export function shouldCloseOnRecordDecodeFailure(tableDecoder: unknown): boolean {
-	return !!tableDecoder;
 }
 
 /**
@@ -1564,6 +1620,28 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 	copyStallForTestArmed = true;
 	logger.warn?.(`[test] stalling outbound base copy mid-flight for db "${databaseName}" (harper-pro#453)`);
 	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
+}
+
+// Test-only: the first outbound subscription for this database gets a drained audit iterable carrying a
+// corrupt-frame stop — which is exactly what `endIteratorOnCorruptFrame` leaves behind, and what the send
+// loop then reuses for the rest of the session. `HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB=<db>` reports a
+// torn tail (recoverable by replacing the cached range); adding `:midlog` reports a mid-log break
+// (quarantined by harper#2087). One-shot, so the replacement range converges rather than looping.
+let deadAuditIterableForTestArmed = false;
+const DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST = process.env.HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB;
+export function maybeDeadAuditIterableForTest<T>(databaseName: string | undefined): T | undefined {
+	if (!DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST) return undefined;
+	const [specDb, shape] = DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST.split(':');
+	if (deadAuditIterableForTestArmed || specDb !== databaseName) return undefined;
+	deadAuditIterableForTestArmed = true;
+	const midLogBreak = shape === 'midlog';
+	logger.warn?.(
+		`[test] serving a drained audit iterable stopped at a ${midLogBreak ? 'mid-log' : 'torn-tail'} corrupt frame for db "${databaseName}" (harper-pro#810)`
+	);
+	return {
+		[Symbol.iterator]: () => ({ next: () => ({ done: true, value: undefined }) }),
+		corruptFrameStop: { breaks: 1, truncatedVersions: new Set(), midLogBreak },
+	} as T;
 }
 
 // Test-only fault injection for the copy-progress false-fire repro: when HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB
@@ -3834,6 +3912,40 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// healthy case for a plain resume. Only a log we actually asked to resume past can fail closed.
 	let boundaryLogName: string | undefined;
 	let replicationSharedStatus: Float64Array;
+	// Corrupt-frame stops already seen on the CURRENT send iterable, so a new one is distinguishable
+	// from the running total (`corruptFrameStop` accumulates on a reused object). Reset whenever the
+	// iterable is replaced.
+	let sendLogBreaksSeen = 0;
+	let lastSendLogRepairAt = 0;
+	// When the CURRENT break was first seen, which is what a quarantined break waits from: it must not
+	// rebuild on first sight (that is the spin the policy avoids), only re-check long after.
+	let sendLogBreakSince = 0;
+	// The transaction generation pending the FIRST time the current torn-tail break was denied, and
+	// a sticky flag for whether a LATER pass has seen a different (i.e. resolved-and-replaced)
+	// generation since. A seen generation change means a commit landed during this break episode —
+	// the one thing a timerless wait exists to catch — so once observed it stays observed even if an
+	// intervening non-commit wake (re-admission, supersession) cancels the armed timer before it
+	// fires: re-deriving "did a commit happen" fresh each pass by comparing only against the LAST
+	// deny would forget that fact the moment such a wake interrupts the wait, going back to a
+	// timerless wait that may never see another commit and parking the now-readable record.
+	let sendLogBreakFirstPendingAtDeny: unknown;
+	let sendLogBreakCommitObserved = false;
+	// The remaining floor after a denied rebuild. Torn tails wait for a new commit before starting this
+	// timer; a quiet broken tail therefore keeps one wait rather than repeatedly rebuilding itself.
+	let sendLogRebuildRetryInMs = 0;
+	// Sticky for the connection's whole life once set: a scan failure means no later drain — even a clean
+	// one on a replaced range — can prove the gap was delivered, so origin floors stay uncertified until a
+	// fresh reconnect. Sampled once per pass, immediately after the drain, before any exit (boundary
+	// fallback, repair, or certification) can act on it.
+	let sendLogBreakUnresolved = false;
+	// Set only by the exact pass whose failure cleared `auditLogIterable`, and consumed by the single
+	// shared rebuild below: a rebuild caused by a stopped reusable range must resume this origin from its
+	// own best-known bound (or zero), never from the cross-origin `currentSequenceId` scalar, which a
+	// different origin in a merged range can have pushed past an undelivered entry of this one. An ordinary
+	// rebuild (a fresh connection, or every pass on a non-reusable LMDB range) is unaffected — it keeps
+	// seeding from `currentSequenceId` exactly as before, so a healthy LMDB leg never pays a retained-
+	// history rescan for a failure mode that is specific to reusable RocksDB ranges.
+	let sendLogRangeNeedsSafeSeed = false;
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
@@ -4013,7 +4125,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyStartTime: copyModeStartTime,
 					});
 				} catch (error) {
-					logger.warn?.(connectionId, 'failed to persist clone copy completion', databaseName, error);
+					runRecoveryDiagnostic(() =>
+						logger.error?.(connectionId, 'Failed to persist clone copy completion for', databaseName, error)
+					);
 					close(1011, 'Failed to persist clone copy completion');
 					return;
 				}
@@ -4776,19 +4890,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (instanceRetired || !ownsPeerCertifiesFloorsSlot()) return;
 		status[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
 	}
-	// A record this node will not apply is a hole in that origin's stream for that table. It is
-	// recorded durably BEFORE the drop completes, so no later barrier can certify past it; a store
-	// that cannot take the row holds the frame instead of advancing the cursor over an unrecorded hole.
-	// One closure per connection, not per frame: an ordinary frame never touches it.
+	// A record this node will not apply is a hole in that origin's stream for that table. The caller records
+	// it before completing the cursor commit.
 	async function recordReplicationHole(originId: number | undefined, tableName: string, reason: string) {
 		const origin = getNodeNameForId(auditStore, originId, true);
 		try {
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
 			return true;
 		} catch (error) {
-			logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error);
 			wsClosed = true;
 			close(1011, 'could not record a replication hole; reconnecting');
+			runRecoveryDiagnostic(() =>
+				logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error)
+			);
 			return false;
 		}
 	}
@@ -4803,6 +4917,62 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			recordPeerLockLevel(status, peerCapabilities.recordLocks);
 			publishPeerCertifiesFloors(status);
 		}
+	}
+	// A torn tail latches this reusable iterable but a fresh range can read beyond it; a mid-log break is
+	// quarantined and must remain visible without reconnect churn.
+	function repairSendLogBreak(
+		breaks: number,
+		midLogBreak: boolean,
+		isNewBreak: boolean,
+		subscriptionClosed: boolean,
+		resumeFrom: number
+	): boolean {
+		sendLogRebuildRetryInMs = 0;
+		// A superseded subscription whose drain ends after its own `closed` was set must not mutate the
+		// connection-shared iterable or seed flag that the replacement loop is using.
+		if (wsClosed || subscriptionClosed) return false;
+		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+		const reportMidLogBreak = () => {
+			if (midLogBreak && isNewBreak)
+				runRecoveryDiagnostic(() =>
+					logger.error?.(
+						connectionId,
+						`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind the break are quarantined and no fresh iterator can cross it, so this leg will not send past it. Repair the transaction log or re-clone this node.`
+					)
+				);
+		};
+		// Nothing is cached to drop where the loop already rebuilds every wake.
+		if (!auditStore?.reusableIterable) {
+			reportMidLogBreak();
+			return false;
+		}
+		// A torn tail is not always walkable yet, and rebuilding on every wake would be a `getRange` per
+		// commit. A quarantined break cannot be walked at all until someone repairs the log, so it waits far
+		// longer — but it does wait, rather than never looking again. `performance.now()`, not `Date.now()`:
+		// these floors are purely session-local durations, and a wall-clock step backward (NTP correction,
+		// VM resume) would otherwise deny a repair for the length of the step plus the floor itself.
+		const now = performance.now();
+		const repairDecision = sendLogBreakRepairDecision(midLogBreak, sendLogBreakSince, lastSendLogRepairAt, now);
+		sendLogBreakSince = repairDecision.breakSince;
+		sendLogRebuildRetryInMs = repairDecision.retryInMs;
+		reportMidLogBreak();
+		if (!repairDecision.rebuild) {
+			return false;
+		}
+		lastSendLogRepairAt = now;
+		auditLogIterable = undefined;
+		sendLogRangeNeedsSafeSeed = true;
+		runRecoveryDiagnostic(() => {
+			// Assigned before the log call: `logger.warn?.` is undefined under `logging.level: error`, so an
+			// inlined call would stop counting (harper-pro#431).
+			const fireDetail = recordFireForLog('send-log-break');
+			logger.warn?.(
+				connectionId,
+				`Replication send to ${remoteNodeName}${dbContext} stopped at a ${midLogBreak ? 'quarantined mid-log' : 'torn'} transaction-log frame (${breaks} break(s) on the cached iterable); it is latched done, so this session would send nothing further. Rebuilding the send range from ${resumeFrom}. ` +
+					fireDetail
+			);
+		});
+		return true;
 	}
 	if (databaseName) {
 		setDatabase(databaseName);
@@ -4892,6 +5062,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let originFloors: Map<string, number> | undefined;
 	let originFloorById: number[] | undefined;
 	let liveStartByLog: Map<string, number> | undefined;
+	// Sticky for the life of the subscription once an append-order copy-tail is attempted: a
+	// peer-supplied origin cursor's numeric floor is incompatible with that boundary (it can exclude
+	// a lower-keyed, later-committed entry the boundary would otherwise deliver), so a later
+	// SUBSCRIPTION_UPDATE re-admitting an excluded node must not reinstate one either.
+	let originFloorsSuppressedForCopy = false;
 	let wakeSender: (() => void) | undefined;
 	// Serialize message handling so that async backpressure inside onWSMessage doesn't allow
 	// the WS library to start processing the next frame before the current one is fully decoded.
@@ -4899,6 +5074,47 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
 	let wsClosed = false;
+	let wakeSendLoop: (() => void) | undefined;
+	// Dedup for the `.then()` below: `whenNextTransaction` returns the SAME pending promise across
+	// repeated denied-rebuild cycles until something resolves it, so without this a mid-log leg that
+	// never sees a commit (DESIGN.md's "permanently one-way leg") would accumulate one reaction per
+	// floor-timer wake for the rest of the connection's life. Safe to skip re-attaching because the
+	// reaction below reads `wakeSendLoop` itself at fire time rather than closing over one call's
+	// `resolve`, so it always wakes whichever wait is current, not whichever one happened to attach.
+	let attachedRetryTransaction: Promise<unknown> | undefined;
+	// A denied send-log-break rebuild must not block a merged range's OTHER, healthy origins for a
+	// mid-log quarantine's whole 30-minute floor: core isolates failures per log (DESIGN.md item
+	// 10d), so a healthy origin's commit should wake this loop to drain it even while one log stays
+	// broken. `ms` races a transaction against that floor timer on the SAME `wakeSendLoop` slot the
+	// other two waits use. A torn tail gets no timer (`ms` omitted): DESIGN.md's "Bounded" note is
+	// that a quiet tail waits for an actual commit rather than periodically rebuilding itself, since
+	// retrying with nothing new written past the tear only reproduces the same break.
+	async function waitForSessionEndOrTransactionOrRetry(nextTransaction: Promise<unknown>, ms?: number) {
+		let retryTimer: NodeJS.Timeout | undefined;
+		try {
+			await new Promise<void>((resolve) => {
+				const wake = () => {
+					if (wakeSendLoop === wake) wakeSendLoop = undefined;
+					resolve();
+				};
+				wakeSendLoop = wake;
+				if (attachedRetryTransaction !== nextTransaction) {
+					attachedRetryTransaction = nextTransaction;
+					void nextTransaction.then(
+						() => wakeSendLoop?.(),
+						() => wakeSendLoop?.()
+					);
+				}
+				if (ms !== undefined) {
+					retryTimer = setTimeout(wake, ms);
+					retryTimer.unref?.();
+				}
+				if (instanceRetired) wake();
+			});
+		} finally {
+			if (retryTimer) clearTimeout(retryTimer);
+		}
+	}
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
@@ -6065,6 +6281,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 
 						// Remove nodes from exclusion list (add their logs to the iterator)
 						const includeFloors =
+							!originFloorsSuppressedForCopy &&
 							auditStore?.reusableIterable === true &&
 							peerCapabilitiesLearned &&
 							peerSupportsOriginCursors(peerCapabilities)
@@ -6093,6 +6310,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// Add this log back to the iterator
 								auditLogIterable?.addLog(nodeName);
 								wakeSender?.();
+								wakeSendLoop?.();
 								logger.debug?.(connectionId, 'added log to iterator:', nodeName);
 							}
 						}
@@ -6107,9 +6325,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities)
 								? Object.fromEntries(parseOriginKeyMap(message[4]))
 								: undefined;
-						originFloors = undefined;
-						originFloorById = undefined;
-						liveStartByLog = undefined;
 						// permission check to make sure that this node is allowed to subscribe to this database, that is that
 						// we have publish permission for this node/database
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
@@ -6130,6 +6345,28 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							);
 							return;
 						}
+						// Reset only once this request is confirmed to actually proceed: a rejected request (the
+						// wrong-database check above) returns without superseding anything, so resetting before
+						// it would zero a still-running predecessor's state out from under it — restarting a
+						// mid-log quarantine's 30-minute clock, or forcing a torn-tail repair to rescan from 0.
+						originFloors = undefined;
+						originFloorById = undefined;
+						liveStartByLog = undefined;
+						originFloorsSuppressedForCopy = false;
+						// Send-log-break bookkeeping is connection-scoped (so `repairSendLogBreak`, defined once
+						// per connection, can see it) but must not survive onto a REPLACEMENT subscription: a
+						// different named origin inheriting a torn-tail clock could deny a repair that should
+						// run. `sendLogBreakUnresolved` is deliberately NOT reset here: it is the session-sticky
+						// certification veto (DESIGN.md item 10d), scoped to the whole CONNECTION on purpose —
+						// a replacement subscription on the same socket is not a reconnect, so it cannot prove
+						// the earlier gap was delivered either.
+						sendLogBreaksSeen = 0;
+						lastSendLogRepairAt = 0;
+						sendLogBreakSince = 0;
+						sendLogBreakFirstPendingAtDeny = undefined;
+						sendLogBreakCommitObserved = false;
+						sendLogRebuildRetryInMs = 0;
+						sendLogRangeNeedsSafeSeed = false;
 						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
 						if (tableSubscriptionToReplicator.then)
 							logger.debug?.('Waiting for subscription to database ' + databaseName);
@@ -6600,7 +6837,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						auditSubscription.once('close', () => {
 							closed = true;
 							subscriptionToHdbNodes?.end();
+							// A replacement subscription must build its own range from its own startTime, not
+							// resume whatever this one left cached: that cached object was built for this
+							// subscription's own nodes/exclusions and may hold an unflushed buffered record this
+							// loop never reached its own end_txn for.
+							auditLogIterable = undefined;
 							wakeSender?.(); // an idle sender settles now rather than at the next transaction
+							wakeSendLoop?.(); // a send-log-break retry wait must not park on a superseded subscription
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
@@ -6718,7 +6961,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										dbRemovalListener?.remove();
 									});
 								}
-
 								let lastFloorCaptureAt = 0;
 								let floorTimer: ReturnType<typeof setTimeout> | undefined;
 								let capturedFloors: Map<string, number> | undefined;
@@ -6786,6 +7028,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									logger.debug?.(connectionId, 'certified origin floors to', remoteNodeName, rising);
 								};
 								let isFirst = true;
+								// Fixed for the life of this subscription (only a new SUBSCRIPTION_REQUEST replaces this
+								// whole closure).
+								const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+								// The exact-start options a copy boundary was built with, saved so a LATER
+								// failure-triggered rebuild can replay the same already-covered boundary instead of
+								// sampling a fresh "last committed" key: a transaction committed only after the
+								// failure (never delivered by the copy's table walk or anything else) would otherwise
+								// become the anchor and be skipped by `resumeAfterExactStart`, which assumes — and
+								// only the copy's own walk ever establishes — that its anchor is already delivered.
+								let boundaryRangeOptions: any;
 								// A `return` from inside the loop (close, rejection) still runs this finally, so a timer
 								// armed in the exiting pass can never outlive it to wake a later, superseding loop that
 								// reused the connection-wide `wakeSender`.
@@ -6851,8 +7103,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// that aggregate applies `exactStart` only to the logs named in `startByLog`. Gated on the store
 												// itself, not STORAGE_IS_ROCKSDB: that is a config snapshot that can misreport the engine in a
 												// worker, and an LMDB audit store would read these range options as a scan from its start.
-												const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 												const canResumePastAnchor = auditStore.reusableIterable === true && logName === 'local';
+												if (canResumePastAnchor) {
+													originFloors = undefined;
+													originFloorById = undefined;
+													originFloorsSuppressedForCopy = true;
+												}
 												// If resuming, the follower already committed every table before currentTable (records commit
 												// in stable iteration order), so skip to currentTable and continue after its last committed key.
 												let reachedResumeTable = !copyResume;
@@ -6954,8 +7210,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													if (anchors?.size) {
 														auditLogIterable = auditStore.getRange(relayedRange);
 														boundaryLogName = logName;
+														boundaryRangeOptions = relayedRange;
 														exactAnchors = anchors;
-													} else auditLogIterable = auditStore.getRange(emptyLogRange);
+													} else {
+														// No relayed anchors to protect, but this log's own boundary is still
+														// `start: 0` — not a numeric cutoff that could exclude a later-appended
+														// lower key, since nothing can key below 0. Saved anyway so a later
+														// generic corruption replays this exact range instead of falling through
+														// to `liveStartByLog`'s `copyStartTime` (a real, higher, exclusionary
+														// bound for an empty local log).
+														auditLogIterable = auditStore.getRange(emptyLogRange);
+														boundaryRangeOptions = emptyLogRange;
+													}
 													anchoredInLogOrder = true;
 												} else if (
 													canResumePastAnchor &&
@@ -6993,6 +7259,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													} else {
 														auditLogIterable = auditStore.getRange(boundaryRange);
 														boundaryLogName = logName;
+														boundaryRangeOptions = boundaryRange;
 														anchoredInLogOrder = true;
 													}
 												}
@@ -7226,6 +7493,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														`Copied ${databaseName} to ${remoteNodeName} without ${withheldRecordCount} record(s) that peer originated (harper-pro#737)`
 													);
 												currentSequenceId = copyStartTime;
+												// Fallback bound for the NON-boundary case only (no `boundaryRangeOptions`,
+												// e.g. a relay or non-reusable copy): without it, a failure-triggered rebuild
+												// would reseed from 0 and resend everything the copy just finished delivering.
+												// A boundary-anchored log ignores this entry while its boundary is live, and
+												// explicitly clears it on permanent abandonment (resuming from 0, not here) —
+												// this is never the seed for that case. Guarded on closure: a superseded copy
+												// loop finishing here must not clobber a replacement subscription's own
+												// (freshly reset) bound with this closure's stale one.
+												if (!closed && !wsClosed) (liveStartByLog ??= new Map()).set(logName, copyStartTime);
 												if (!currentTransaction.txnLogKey) {
 													// no records pending (none sent, or the last batch landed on a checkpoint flush):
 													// force a txn so the end_txn below still carries the sequence update
@@ -7251,7 +7527,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												currentSequenceId = copyStartTime;
 											}
 										}
-										const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 										// Capture the current generation before scanning. A commit after this live scan
 										// drains must wake this iteration; subscribing afterward can miss that commit.
 										const nextTransaction = whenNextTransaction(auditStore);
@@ -7260,23 +7535,52 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											lastFloorCaptureAt = Date.now();
 											capturedFloors = captureOriginFloors();
 										}
-										if (!(auditStore.reusableIterable && auditLogIterable)) {
+										// Test-only fault-injection seam; a no-op outside the integration suite.
+										const deadAuditIterableForTest =
+											maybeDeadAuditIterableForTest<typeof auditLogIterable>(databaseName);
+										if (deadAuditIterableForTest) {
+											boundaryLogName = undefined;
+											auditLogIterable = deadAuditIterableForTest;
+										} else if (sendLogRangeNeedsSafeSeed && boundaryRangeOptions) {
+											// A generic corruption (not an invalid anchor — that path below abandons
+											// `boundaryRangeOptions` instead of reaching here) on a boundary-anchored range.
+											// Replay the SAME already-covered boundary rather than sampling a fresh "last
+											// committed" key: a transaction that committed only after THIS failure was never
+											// delivered by the copy's table walk or anything else, so treating it as an
+											// already-delivered anchor (what `resumeAfterExactStart` assumes) would skip it.
+											sendLogRangeNeedsSafeSeed = false;
+											auditLogIterable = auditStore.getRange(boundaryRangeOptions) as typeof auditLogIterable;
+										} else if (!(auditStore.reusableIterable && auditLogIterable)) {
 											// No append-order resume here — only the copy's own pre-positioned range above does that. A
 											// reconnect resumes with the subscription's startTime at the anchor key, and
 											// `matchesSubscription` below requires that startTime to be BELOW an entry's key, so an
 											// older-keyed entry this range would correctly yield is dropped by the subscription predicate
 											// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
 											boundaryLogName = undefined;
-											liveStartByLog = new Map([[logName, currentSequenceId || 1], ...(originFloors ?? [])]);
+											// The failure-path seed is the bound the FAILED range itself started from (read from
+											// `liveStartByLog`'s entry for this log BEFORE this rebuild overwrites it — the only
+											// places that entry is ever written are here, at copy completion, and the boundary
+											// construction above), not how far it had read: a live max-observed-key bound is not
+											// an append-order boundary (harper-pro#876, see the comment above), so seeding past
+											// it could permanently exclude a lower-keyed entry that commits later. This resends
+											// whatever the failed range delivered since its own last rebuild — wasteful, but
+											// safe.
+											const logNameSeed = resolveSendRangeSeed(
+												sendLogRangeNeedsSafeSeed,
+												liveStartByLog?.get(logName),
+												currentSequenceId
+											);
+											sendLogRangeNeedsSafeSeed = false;
+											liveStartByLog = new Map([[logName, logNameSeed], ...(originFloors ?? [])]);
 											auditLogIterable = auditStore.getRange({
-												start: currentSequenceId || 1,
+												start: logNameSeed,
 												exclusiveStart: true,
 												exactStart: false,
 												log: excludedNodes ? undefined : logName,
 												startByLog: liveStartByLog,
 												excludeLogs: excludedNodes,
 												snapshot: false, // don't want to use a snapshot, and we want to see new entries
-											});
+											}) as typeof auditLogIterable;
 										}
 										for (const auditRecord of auditLogIterable) {
 											const key: number = auditRecord.txnLogKey;
@@ -7299,26 +7603,66 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											await sendAuditRecord(auditRecord, key);
 											if (key > auditSubscription.startTime) auditSubscription.startTime = key; // don't double send
 										}
+										// Observe the drained range's failure ONCE here, before any exit below can replace or discard
+										// it: a session-sticky certification veto (harper-pro#815) must see the range that actually
+										// failed, never a replacement that looks clean. Sticky for the connection's life once set —
+										// a later clean drain on a replaced range cannot prove the earlier gap was delivered.
+										const scannedRange: any = auditLogIterable;
+										if (
+											scannedRange?.failedLogs?.size > 0 ||
+											scannedRange?.corruptFrameStop?.breaks > 0 ||
+											(boundaryLogName && scannedRange?.exactStartFailures?.size > 0)
+										) {
+											sendLogBreakUnresolved = true;
+										}
+										// Backstop for the pre-COPY_START probe, which pulled a different iterable. Guarded on
+										// `closed`/`wsClosed` first: a superseded subscription's drain finishing here must not
+										// null the replacement's shared `auditLogIterable` or force it onto a safe-seed rebuild
+										// it never asked for.
 										if (closed || wsClosed) return;
-										// Backstop for the pre-COPY_START probe, which pulled a different iterable. Every failure signal
-										// counts, not just the boundary one: a local iterator that dies mid-pass leaves the reusable
-										// iterable exhausted while the follower's cursor keeps advancing. Drop the append-order range and
-										// let the next pass rebuild an ordinary one — closing instead would reconnect straight back into
-										// the same failing boundary.
-										const range: any = auditLogIterable;
 										if (
 											boundaryLogName &&
-											(range?.exactStartFailures?.size > 0 ||
-												range?.failedLogs?.size > 0 ||
-												range?.corruptFrameStop?.breaks > 0)
+											(scannedRange?.exactStartFailures?.size > 0 || scannedRange?.failedLogs?.size > 0)
 										) {
-											logger.error?.(
-												connectionId,
-												'the resume boundary failed while tailing; falling back to a timestamp resume',
-												databaseName,
-												boundaryLogName
+											const failedLogNames = new Set<string>([
+												...(scannedRange?.exactStartFailures?.keys?.() ?? []),
+												...(scannedRange?.failedLogs ?? []),
+											]);
+											const before = boundaryRangeOptions?.startByLog;
+											// Computed directly rather than via `anchorsWithoutFailedLogs` (whose `undefined`
+											// return conflates "nothing changed" with "everything failed" — both need the
+											// SAME outcome here, permanent abandonment below, but for different reasons: the
+											// first means retrying buys nothing (the failing name isn't even in the map), the
+											// second means nothing is left to validate).
+											const after =
+												before && !failedLogNames.has(boundaryLogName)
+													? new Map([...before].filter(([log]) => !failedLogNames.has(log)))
+													: undefined;
+											if (after && after.size > 0 && after.size < before.size) {
+												// A RELAYED origin's anchor failed; this log's own anchor (never trimmed —
+												// gated above) survives. Keep tailing everyone else through the boundary; the
+												// trimmed-away log falls back to core's own zero default, same as an
+												// unlisted log always has.
+												boundaryRangeOptions = { ...boundaryRangeOptions, startByLog: after };
+												auditLogIterable = undefined;
+												sendLogRangeNeedsSafeSeed = true;
+												continue;
+											}
+											// No further progress is possible by trimming — permanently abandon the boundary
+											// for the rest of the session. Falls back to a plain `start: 0`, not
+											// `liveStartByLog`'s `copyStartTime` entry, which carries the same append-order
+											// exposure this mechanism exists to avoid (DESIGN.md item 10).
+											runRecoveryDiagnostic(() =>
+												logger.error?.(
+													connectionId,
+													'the resume boundary failed while tailing; falling back to a full rescan',
+													databaseName,
+													boundaryLogName
+												)
 											);
 											boundaryLogName = undefined;
+											boundaryRangeOptions = undefined;
+											liveStartByLog?.delete(logName);
 											auditLogIterable = undefined;
 											if (originFloors?.size) {
 												({ originFloors, originFloorById } = applyRelayedAnchorFloors(
@@ -7328,10 +7672,65 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													exportIdMapping(auditStore)
 												));
 											}
+											sendLogRangeNeedsSafeSeed = true;
 											// Retry now, not on the next commit: whatever this boundary failed to deliver needs an
-											// ordinary range rebuilt from currentSequenceId, not a wait for unrelated future activity
-											// that may never come on an otherwise-idle database.
+											// ordinary range rebuilt from a safe bound, not a wait for unrelated future activity that
+											// may never come on an otherwise-idle database.
 											continue;
+										}
+										// A store without `corruptFrameStop` reads 0 here, which is correct: the wedge is
+										// structurally Rocks-only (see DESIGN.md item 10d). harper#2087's fail-stop policy
+										// delivers everything drained before a corrupt frame and stops there, so a healthy
+										// drain (breaks === 0) just clears this session's own break bookkeeping below.
+										let repairedSendRange = false;
+										let rebuildRetryInMs = 0;
+										let deniedRebuildIsMidLog = false;
+										let deniedRebuildHadCommit = false;
+										try {
+											const corruptFrameStop = (auditLogIterable as any)?.corruptFrameStop;
+											const breaks = corruptFrameStop?.breaks ?? 0;
+											if (breaks > 0) {
+												// Asked on every drain once stopped, not only on a new break: a repair the interval
+												// floor declined must be retried rather than latched off.
+												const isNewBreak = breaks > sendLogBreaksSeen;
+												const isMidLog = corruptFrameStop.midLogBreak === true;
+												sendLogBreaksSeen = breaks;
+												// The boundary replay (when active) ignores `liveStartByLog` and reuses
+												// `boundaryRangeOptions.start` directly (0 for an empty-log boundary, even
+												// though `liveStartByLog` can still hold a stale `copyStartTime` from
+												// construction) — report whichever one this repair will actually use.
+												const resumeFrom = boundaryRangeOptions?.start ?? liveStartByLog?.get(logName) ?? 0;
+												if (repairSendLogBreak(breaks, isMidLog, isNewBreak, closed, resumeFrom)) {
+													sendLogBreaksSeen = 0;
+													// A granted repair swaps in a fresh object; its own break history (if the new
+													// range immediately hits another corrupt frame) must not inherit a stale
+													// generation from before the swap.
+													sendLogBreakFirstPendingAtDeny = undefined;
+													sendLogBreakCommitObserved = false;
+													repairedSendRange = true;
+												} else {
+													rebuildRetryInMs = sendLogRebuildRetryInMs;
+													deniedRebuildIsMidLog = isMidLog;
+													({
+														firstPendingAtDeny: sendLogBreakFirstPendingAtDeny,
+														commitObserved: sendLogBreakCommitObserved,
+													} = sendLogBreakCommitTransition(
+														sendLogBreakFirstPendingAtDeny,
+														sendLogBreakCommitObserved,
+														nextTransaction
+													));
+													deniedRebuildHadCommit = sendLogBreakCommitObserved;
+												}
+											} else {
+												sendLogBreaksSeen = 0;
+												sendLogBreakSince = 0;
+												sendLogBreakFirstPendingAtDeny = undefined;
+												sendLogBreakCommitObserved = false;
+											}
+										} catch (error) {
+											runRecoveryDiagnostic(() =>
+												logger.trace?.(connectionId, 'could not read the send iterable corrupt-frame state', error)
+											);
 										}
 										if (frame.position - frame.encodingStart > 8) {
 											sendAuditRecord(
@@ -7347,13 +7746,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// reports `missing` whenever the first polled entry isn't exactly the cursor, which is
 											// the ordinary, healthy case for a plain (non-boundary) resume (see boundaryLogName's
 											// comment above). failedLogs and corruptFrameStop are genuine scan failures on ANY
-											// range and must still withhold certification even when there is no boundary.
+											// range and must still withhold certification even when there is no boundary. The sticky
+											// veto above additionally withholds past a replacement, which this per-object check alone
+											// cannot: once `auditLogIterable` is replaced, a clean drain of the NEW object must not
+											// retroactively certify through a gap an earlier, now-discarded object left undelivered.
 											if (
+												sendLogBreakUnresolved ||
 												(boundaryLogName && liveRange?.exactStartFailures?.size > 0) ||
 												liveRange?.failedLogs?.size > 0 ||
 												liveRange?.corruptFrameStop?.breaks > 0
 											) {
-												// a scan that may have skipped an entry can certify nothing more on this range
 												if (floorEmissionLatchedRange !== liveRange)
 													logger.warn?.(
 														connectionId,
@@ -7364,13 +7766,44 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											capturedFloors = undefined;
 										}
 										getSharedStatus()[SENDING_TIME_POSITION] = 0;
-										if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
+										if (repairedSendRange) continue;
+										// A quarantined/denied-rebuild pass made no progress: a caught-up report here would be false.
+										if (rebuildRetryInMs === 0) {
+											if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
+										}
 										// a timed wake can land after the socket was marked closed, before the close event
 										if (closed || wsClosed) return;
+										// A denied rebuild also wakes on a commit regardless of break class: a merged range's
+										// OTHER, healthy origins keep committing while one is torn/quarantined (core isolates
+										// failures per log, DESIGN.md item 10d), and this loop drains all of them together, so
+										// waking only on the mid-log floor would starve those healthy origins for the whole
+										// 30-minute quarantine window. Waking re-drains cheaply — the broken log's cached
+										// iterable is already latched done, so revisiting it costs one no-I/O poll, not a
+										// rescan — and the repair's own floor (`sendLogBreakRepairDecision`) still denies a
+										// too-soon retry independently of this wake. A torn tail gets no timer UNTIL a commit
+										// has actually landed since the last deny: nothing is walkable yet, so racing the floor
+										// would rebuild into the same break on a quiet tail instead of waiting for the one thing
+										// that can fix it. Once a commit has landed, the floor is the only thing left to wait
+										// out — staying timerless there would park the now-readable record until some unrelated
+										// later commit happened to arrive.
+										if (rebuildRetryInMs > 0) {
+											// `nextTransaction` may have already resolved during this very drain: its attached
+											// reaction (below) fires once, at resolution, and does nothing if no wait is
+											// currently parked on it — so a wait entered here on an already-settled promise
+											// would get neither a live reaction nor (for a torn tail) a timer, parking the
+											// loop until some unrelated future wake rescues it. Re-drain instead of waiting on
+											// a generation that is already stale, mirroring the ordinary wait's own guard below.
+											if (whenNextTransaction(auditStore) !== nextTransaction) continue;
+											await waitForSessionEndOrTransactionOrRetry(
+												nextTransaction,
+												deniedRebuildIsMidLog || deniedRebuildHadCommit ? rebuildRetryInMs : undefined
+											);
+											if (closed || wsClosed) return;
+											continue;
+										}
 										// A commit that landed during the scan rotated the promise captured before it: rescan
 										// immediately, without paying for timer setup, a Promise/executor allocation or a waker.
 										if (whenNextTransaction(auditStore) !== nextTransaction) continue;
-										// an `includeNodes` update re-admits a log whose entries are already committed
 										let wake: () => void;
 										// one timer per loop; an exit that skips the clear leaks nothing but one unreferenced timer
 										if (certifiesOriginFloors()) {
@@ -7403,14 +7836,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 							})
 							.catch((error) => {
-								logger.error?.(connectionId, 'Error handling subscription to node', error);
+								runRecoveryDiagnostic(() => logger.error?.(connectionId, 'Error handling subscription to node', error));
 								if (!supersededOrClosed()) options.connection?.onSendFailed?.();
 								// An authorization-watch rejection before it resolves reaches this chain too (the setup
 								// gate awaits the same promise), and that chain has already closed with a more accurate
 								// code — so a second close here would only overwrite the reason.
 								if (closed || wsClosed) return;
 								closed = true;
-								close(1008, 'Error handling subscription to node ' + error);
+								// Fixed reason: the detail is already in the contained log above. Concatenating
+								// `error` into the reason string coerces it via `toString()`, which can itself
+								// throw (a thrown non-Error, or an Error subclass with a throwing `toString`) and
+								// escape this catch as an unhandled rejection with no further handler.
+								close(1008, 'Error handling subscription to node');
 							});
 						break;
 					}
@@ -8076,8 +8513,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// claim durability beyond what we'd actually resume from after a crash. (Copy frames
 							// already awaited their blobs above, so the watermark covers them too.)
 							const confirmed = Math.min(lastSequenceIdCommitted, lastDurableSequenceId);
-							ws.send(encode([COMMITTED_UPDATE, confirmed]));
-							logger.trace?.(connectionId, 'sent confirmation of a commit at', confirmed);
+							// Checked inside the timer: the frame's own resync close may have run since it was armed.
+							// The confirmation is lost either way once closed (the sender resends unconfirmed data on
+							// reconnect) — this guard only avoids a pointless send on a socket that can't deliver it.
+							if (!wsClosed) {
+								ws.send(encode([COMMITTED_UPDATE, confirmed]));
+								logger.trace?.(connectionId, 'sent confirmation of a commit at', confirmed);
+							}
 							lastSequenceIdCommitted = null;
 						}, COMMITTED_UPDATE_DELAY);
 					}
@@ -8210,6 +8652,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (instanceRetired) return;
 		instanceRetired = true;
 		wsClosed = true;
+		wakeSendLoop?.();
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
 		if (options.connection?.peerCapabilities === peerCapabilities) {
 			options.connection.peerCapabilities = undefined;
@@ -8243,7 +8686,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const aborted = abortInFlightBlobsOnClose(blobsInFlight, remoteNodeName, (_blobId, stream) =>
 				unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore)
 			);
-			logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`);
+			runRecoveryDiagnostic(() =>
+				logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`)
+			);
 		}
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
@@ -8256,27 +8701,36 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
-		if (Object.keys(repairDeclines).length > 0)
-			logger.warn?.(connectionId, 'blob repair declines for this connection', repairDeclines);
-		logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
+		runRecoveryDiagnostic(() => {
+			if (Object.keys(repairDeclines).length > 0)
+				logger.warn?.(connectionId, 'blob repair declines for this connection', repairDeclines);
+			logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
+		});
 	}
 	ws.on('close', retireInstance);
 
 	function close(code?, reason?, intentional?: boolean) {
+		// Only the deliberate "we are done with this connection" call sites pass intentional=true
+		// (currently just the empty-subscription delayed close below). Everything else — auth
+		// failures after open, peer-initiated DISCONNECT, schema/sequence errors — is a
+		// transient protocol close that should reconnect, so we let the WS close event fall
+		// through to NodeReplicationConnection's normal retry path instead of marking the
+		// connection as finished or emitting 'finished' (which would remove it from the
+		// worker's connections map).
+		if (intentional && options.connection) options.connection.intentionallyUnsubscribed = true;
+		// A throwing debug log must not skip the close itself: contained separately, before the action.
+		runRecoveryDiagnostic(() => logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, code, reason));
 		try {
-			// Only the deliberate "we are done with this connection" call sites pass intentional=true
-			// (currently just the empty-subscription delayed close below). Everything else — auth
-			// failures after open, peer-initiated DISCONNECT, schema/sequence errors — is a
-			// transient protocol close that should reconnect, so we let the WS close event fall
-			// through to NodeReplicationConnection's normal retry path instead of marking the
-			// connection as finished or emitting 'finished' (which would remove it from the
-			// worker's connections map).
-			if (intentional && options.connection) options.connection.intentionallyUnsubscribed = true;
-			logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, code, reason);
 			ws.close(code, truncateCloseReason(reason));
-			if (intentional) options.connection?.emit('finished'); // synchronously indicate that the connection is finished, so it is not accidentally reused
 		} catch (error) {
-			logger.error?.(connectionId, 'Error closing connection', error);
+			runRecoveryDiagnostic(() => logger.error?.(connectionId, 'Error closing connection', error));
+		}
+		if (intentional) {
+			try {
+				options.connection?.emit('finished'); // synchronously indicate that the connection is finished, so it is not accidentally reused
+			} catch (error) {
+				runRecoveryDiagnostic(() => logger.error?.(connectionId, 'Error finishing closed connection', error));
+			}
 		}
 	}
 	// The requester stops waiting at its own deadline or when it restarts, and this node's work goes on,
