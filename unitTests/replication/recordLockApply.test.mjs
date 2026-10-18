@@ -335,7 +335,7 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 		);
 		assert.strictEqual(plan.action, 'refuse');
 		assert.strictEqual(plan.status, 409);
-		assert.match(plan.reason, /no surviving node's ring places c beside a node that is not fenced/);
+		assert.match(plan.reason, /no surviving node's active ring places c beside a node that is not fenced/);
 	});
 
 	it('refuses a fenced node whose latest known ring holds only fenced nodes', () => {
@@ -366,6 +366,20 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 			['c', 'd']
 		);
 		assert.strictEqual(pair.status, 409, 'two fenced nodes that only home with each other');
+		// c served {c} at 1; an expansion staged {a,c} at 2 on a, and c died before its own stage.
+		const expanding = replies({
+			a: reply('a', { staged: state(2, ['a', 'c'], { quiesce: ['a', 'c'] }), highestActedOn: 2, supportsFenced: true }),
+		});
+		assert.strictEqual(
+			planSurvey('db', ['a'], ['a', 'c'], undefined, expanding, undefined, ['c']).status,
+			409,
+			'a staged ring does not show what the fenced node still serves'
+		);
+		// A manual record_lock_fence_external entry carries no generation and anchors nothing.
+		const manual = replies({
+			a: reply('a', { supportsFenced: true, fenced: [{ node: 'c', operator: 'op', at: 1 }] }),
+		});
+		assert.strictEqual(planSurvey('db', ['a'], ['a', 'c'], undefined, manual, undefined, ['c']).status, 409);
 	});
 
 	it('accepts a retry of the same fenced transition from the fence its earlier call recorded', () => {

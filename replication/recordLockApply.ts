@@ -211,33 +211,6 @@ export function planSurvey(
 			status: 409,
 			reason: `${unfenceable.join(', ')} cannot record a fenced transition; upgrade them, or apply without fenced`,
 		};
-	// A fenced node is never surveyed, and if it comes back serving its old map, only a peer in that
-	// map's ring can disagree with it. So its ring has to be known from the survivors and hold a node
-	// that is not fenced, or a fence for it has to be recorded already, by an earlier call of this
-	// transition that checked the same.
-	const surveyed = [...rows.values()];
-	if (observer && !('error' in observer.reply)) surveyed.push(observer.reply);
-	const actedOn = Math.max(0, ...surveyed.map(floorOf));
-	const unanchored: string[] = [];
-	for (const node of fenced) {
-		const rings = surveyed.flatMap((reply) =>
-			[reply.active, reply.staged].filter((ring) => ring?.homes.includes(node)).map((ring) => ring!.homes)
-		);
-		if (rings.some((ring) => ring.every((home) => fenced.includes(home)))) unanchored.push(node);
-		else if (
-			!rings.some((ring) => ring.some((home) => !fenced.includes(home))) &&
-			!surveyed.some((reply) =>
-				reply.fenced?.some((entry) => entry.node === node && (entry.generation ?? 0) >= actedOn)
-			)
-		)
-			unanchored.push(node);
-	}
-	if (unanchored.length > 0)
-		return {
-			action: 'refuse',
-			status: 409,
-			reason: `no surviving node's ring places ${unanchored.join(', ')} beside a node that is not fenced, so nothing would refuse its old map if it came back; apply without fenced once it is reachable, or stage it with the per-node operations`,
-		};
 	if (unrecorded.length > 0)
 		return {
 			action: 'refuse',
@@ -269,6 +242,35 @@ export function planSurvey(
 		generation = resumable ? floor : floor + 1;
 	}
 	const digest = digestOf(generation, homes);
+	// A fenced node is never surveyed, and if it comes back serving its old map only a peer in that
+	// map's ring can disagree with it. A surveyed `active` ring that places it beside a node that is
+	// not fenced is such a peer: activating that ring needed every member staged, the fenced node
+	// included, so its row moved on with it. A staged ring is not, since the fenced node may never
+	// have staged it. Failing that, a fence an earlier call of this transition recorded on a survivor
+	// already at its target.
+	const surveyed = [...rows.values()];
+	if (observer && !('error' in observer.reply)) surveyed.push(observer.reply);
+	const unanchored = fenced.filter((node) => {
+		const rings = surveyed
+			.flatMap((reply) => [reply.active, reply.staged])
+			.filter((ring) => ring?.homes.includes(node));
+		if (rings.some((ring) => ring!.homes.every((home) => fenced.includes(home)))) return true;
+		const anchored = surveyed.some(
+			(reply) => reply.active?.homes.includes(node) && reply.active.homes.some((home) => !fenced.includes(home))
+		);
+		const recorded = [...rows.values()].some(
+			(reply) =>
+				[reply.active, reply.staged].some((state) => state?.generation === generation && state.digest === digest) &&
+				reply.fenced?.some((entry) => entry.node === node && entry.generation === generation)
+		);
+		return !anchored && !recorded;
+	});
+	if (unanchored.length > 0)
+		return {
+			action: 'refuse',
+			status: 409,
+			reason: `no surviving node's active ring places ${unanchored.join(', ')} beside a node that is not fenced, so nothing would refuse its old map if it came back; apply without fenced once it is reachable, or stage it with the per-node operations`,
+		};
 	const alreadyActive = new Set<string>();
 	const alreadyStaged = new Set<string>();
 	for (const [node, reply] of rows) {
