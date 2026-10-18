@@ -421,9 +421,9 @@ not verify it; the trust model is the same as `record_lock_fence_external`, whic
   The report gives them `role: 'fenced'` and no `survey`/`stage`/`activate`.
 - **Each survivor that this call stages records the fence with its stage.** The stage hop carries `fenced` and `operator`
   (the authenticated caller on the initiating node). `stageGeneration` appends one
-  `{node, operator, at, generation}` entry per fenced node to the row's audit-only `fenced[]` inside
-  the same `withRow` write as `staged`, deduplicated on `(node, generation)` so retries do not grow
-  it. A noop re-stage that adds a fence still writes. A relayed hop records the operator as
+  `{node, operator, at, generation, fencedWith}` entry per fenced node to the row's audit-only
+  `fenced[]` inside the same `withRow` write as `staged`, deduplicated on `(node, generation,
+fencedWith)` so retries of the same call do not grow it. A noop re-stage that adds a fence still writes. A relayed hop records the operator as
   `"<operator> via <relaying node>"`: the node principal can already run any operation on a peer
   ("What that admits", below), so the relay is named rather than trusted silently. The receiving node
   re-validates the same three rules.
