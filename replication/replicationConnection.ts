@@ -4890,8 +4890,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (instanceRetired || !ownsPeerCertifiesFloorsSlot()) return;
 		status[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
 	}
-	// A record this node will not apply is a hole in that origin's stream for that table. The caller records
-	// it before completing the cursor commit.
+	// A record this node will not apply is a hole in that origin's stream for that table. It is
+	// recorded durably BEFORE the drop completes, so no later barrier can certify past it; a store
+	// that cannot take the row holds the frame instead of advancing the cursor over an unrecorded hole.
+	// One closure per connection, not per frame: an ordinary frame never touches it.
 	async function recordReplicationHole(originId: number | undefined, tableName: string, reason: string) {
 		const origin = getNodeNameForId(auditStore, originId, true);
 		try {
