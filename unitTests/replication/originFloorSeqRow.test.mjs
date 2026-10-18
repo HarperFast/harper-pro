@@ -1,9 +1,11 @@
 /**
  * The seam between this receiver and core: `seqUpdateEndTxn` (replicationConnection.ts) attaches
  * certified floors to its `end_txn` from `onCommit`, and core's apply loop (`updateRecordedSequenceId`
- * in core `resources/Table.ts`) stores them in the `[seq, peer]` row that resume reads. The halves land
- * through the `core` pointer, so a core that ignores `originFloors` must fail here, not after 90 s per
- * case in integrationTests/cluster/idleOriginFloorResume.test.mjs.
+ * in core `resources/Table.ts`) stores them in the `[seq, peer]` row that resume reads — including
+ * merging 4-field (`relayable: true`) and 3-field (`relayable` omitted) `[seq, peer]` structures across
+ * RocksDB `__dbis__` handles. The halves land through the `core` pointer, so a core regression on
+ * `originFloors` or `__dbis__` structure saves must fail here, not after 90 s per case in
+ * integrationTests/cluster/idleOriginFloorResume.test.mjs.
  */
 import assert from 'node:assert';
 import fs from 'node:fs';
@@ -99,8 +101,6 @@ describe('a certified origin floor reaches the seq row through core', () => {
 		);
 	});
 
-	// RocksDB-specific: tests PrimaryRocksDatabase.open() wiring rocksStore onto RecordEncoder
-	// for non-initStore internal handles (__dbis__).
 	it('merges concurrent 4-field and 3-field [seq, peer] structure saves across RocksDB worker __dbis__ handles', () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-seq-row-'));
 		const openWorkerDbis = () => {
@@ -112,10 +112,12 @@ describe('a certified origin floor reaches the seq row through core', () => {
 			return db;
 		};
 
-		let db1 = openWorkerDbis();
-		let db2 = openWorkerDbis();
+		let db1;
+		let db2;
 		let readerDb;
 		try {
+			db1 = openWorkerDbis();
+			db2 = openWorkerDbis();
 			const rowWithRelayable = {
 				seqId: 1000,
 				nodes: [{ id: ORIGIN, originLogKey: 900, closedFloor: 850, relayable: true }],
@@ -163,9 +165,13 @@ describe('a certified origin floor reaches the seq row through core', () => {
 			assert.deepEqual(readerDb.getSync([SEQ, PEER + 1]), rowWithRelayable);
 			assert.deepEqual(readerDb.getSync([SEQ, PEER + 2]), rowWithoutRelayable);
 		} finally {
-			readerDb?.close();
-			db2?.close();
-			db1?.close();
+			for (const handle of [readerDb, db2, db1]) {
+				try {
+					handle?.close();
+				} catch {
+					// Ensure remaining handles and tempDir are still cleaned up.
+				}
+			}
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
