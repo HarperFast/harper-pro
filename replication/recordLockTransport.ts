@@ -368,9 +368,7 @@ export function createRecordLockTransport(
 			return { generation: active.generation, homes: active.homes, homeIncarnation };
 		},
 		ownsCoordination(): boolean {
-			// Ownership without a known incarnation is not coordination: core snapshots
-			// `coordinationIncarnation()` the instant `ownsCoordination()` is true at construction and
-			// carries that snapshot across `handOffTo`.
+			// Ownership without a known incarnation is not coordination.
 			return deps.ownsDatabase(database) && transport.coordinationIncarnation() !== undefined;
 		},
 		requestDelegation(node: string, db: string, table: string, request: DelegationRequest): Promise<DelegationReply> {
@@ -394,10 +392,10 @@ export function createRecordLockTransport(
 		},
 		// harper-pro#852: a `lock()` served on a non-owner worker gets its admission from the owner
 		// worker over the port mesh. Core installs the returned round as a remote admission and drives
-		// the release/revoke through these. While `ownsDatabase` is true and `homeIncarnation` is still 0,
-		// `ownsCoordination()` is false, so core's off-owner path lands here on the owner thread itself:
-		// refuse with the missing-map 503 rather than relaying to self.
+		// the release/revoke through these.
 		acquireOnOwner(db: string, table: string, key: unknown, leaseMs: number, waitMs: number): Promise<LockRound> {
+			// Never relay an acquire from the owning thread to itself (e.g. while homeIncarnation is 0
+			// and ownsCoordination() is false, or from a superseded coordinator after a rebuild).
 			if (deps.ownsDatabase(database))
 				return Promise.reject(
 					new LockUnavailableError(
@@ -410,7 +408,9 @@ export function createRecordLockTransport(
 			deps.releaseOnOwner(db, table, key, admissionId);
 		},
 		relayControlEntry(db: string, table: string, entry: LockControlEntry, author: string, position?: number): void {
-			if (deps.ownsDatabase(database)) return;
+			// While homeIncarnation is 0, homeMap() is withheld so no grant can exist on the owner for a
+			// lockRelease to clear; ignore without self-relaying or counting a relay drop.
+			if (deps.ownsDatabase(database) && transport.coordinationIncarnation() === undefined) return;
 			relayLockControlEntry(db, table, entry, author, position);
 		},
 	};
@@ -753,13 +753,17 @@ export function setRecordLockOwnership(database: string, owned: boolean): void {
 	if (owned) ownedDatabases.add(database);
 	else ownedDatabases.delete(database);
 	logger.debug?.(`Record lock coordination for ${database} is ${owned ? 'owned' : 'not owned'} by this thread`);
-	// Core's coordinator anchors its restart-quarantine waiver (`grantableAfterMono`) and its
-	// `#coordinatingIncarnation` baseline at CONSTRUCTION, and only keeps them across `handOffTo` if this
-	// thread already owned coordination at that instant (`recordLockCoordinator.ts#ownershipHorizon`).
-	// Ownership and `homeIncarnation` arrive independently (`record-lock-owner` vs `record-lock-incarnation`,
-	// or synchronous `recordLockOwnerFor` vs async `bumpHomeIncarnation`), so rebuilding the transport on
-	// both transitions guarantees a fresh coordinator is built once both `ownsDatabase` and
-	// `homeIncarnation > 0` hold.
+	// Core's coordinator anchors its restart-quarantine waiver (`grantableAfterMono`) at CONSTRUCTION,
+	// and only keeps it if this thread already owned coordination at that instant — "a coordinator
+	// that has coordinated since it was built never reaches [the reset]; every other way of arriving
+	// at ownership" loses the waiver (`recordLockCoordinator.ts#ownershipHorizon`). Ownership is
+	// conferred over an async message round trip (`record-lock-owner-request`/`-owner`), strictly
+	// after `ensureRecordLockTransport` first registers the transport, so the FIRST-built coordinator
+	// (however it gets built — including lazily, off a `cluster_status` poll's `lockCoordinator`
+	// getter, which can easily race ahead of that round trip) almost never sees ownership already
+	// true. Rebuilding the transport object the instant ownership newly arrives is what gives core a
+	// fresh coordinator to build, this time with `ownsCoordination()` already true from its first
+	// instant — matching the one case that keeps the waiver.
 	if (owned && !wasOwned) {
 		recreateRecordLockTransport(database);
 		if (CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF) restartRecall.schedule(database);
@@ -874,20 +878,16 @@ export function isFirstIncarnation(): boolean {
  * `true` only on a genuinely fresh node's incarnation 1 and MUST clear on the first handoff bump
  * (`first=false`, `bumpHomeIncarnation`): a handoff means this node has already been an owner and has
  * live relayed handles out, so a successor coordinator built with the waiver would grant a key straight
- * away while a departed worker's handle can still commit (harper-pro#852). Re-registers every built
- * transport when the incarnation first resolves from 0 or when `firstIncarnation` changes, because core
- * snapshots `ownsCoordination()`, `coordinationIncarnation()`, and `grantableAfterMono` at coordinator
- * construction.
+ * away while a departed worker's handle can still commit (harper-pro#852). Any change re-registers every
+ * built transport, because `grantableAfterMono` is read once at coordinator construction, not per call.
  */
 export function setHomeIncarnation(value: unknown, first?: boolean): void {
 	if (!(typeof value === 'number' && Number.isFinite(value) && value > homeIncarnation)) return;
-	const wasUnset = homeIncarnation === 0;
 	homeIncarnation = value;
 	// Transition undefined→true (fresh node) or true→false (a handoff bump revokes the waiver). Never
 	// false→true: once cleared, a later bump cannot make this incarnation first-ever again.
-	const firstChanged = typeof first === 'boolean' && firstIncarnation !== false && firstIncarnation !== first;
-	if (firstChanged) firstIncarnation = first;
-	if (wasUnset || firstChanged) {
+	if (typeof first === 'boolean' && firstIncarnation !== false && firstIncarnation !== first) {
+		firstIncarnation = first;
 		for (const database of transports.keys()) recreateRecordLockTransport(database);
 	}
 	// The counter is node-wide: a handoff on one database re-arms every owned database's quarantine
@@ -1028,9 +1028,10 @@ export function ensureRecordLockTransport(database: string): void {
 }
 
 /** Rebuilds an already-registered database's transport so core rebuilds its coordinator and re-reads
- * `ownsCoordination()`, `coordinationIncarnation()`, and `grantableAfterMono` — all three are
- * snapshotted once at coordinator construction and carried across `handOffTo`. Ownership/cache wiring
- * is unaffected: only the transport OBJECT is replaced, not this thread's owned/cache state. */
+ * `grantableAfterMono` — needed because that field is read once at construction, and this thread's
+ * `isFirstIncarnation()` answer can resolve after the transport was first built (`setHomeIncarnation`
+ * calls this once, the moment it learns the answer). Ownership/cache wiring is unaffected: only the
+ * transport OBJECT is replaced, not this thread's owned/cache state. */
 function recreateRecordLockTransport(database: string): void {
 	if (!CLUSTER_RECORD_LOCKS_ENABLED || !transports.has(database)) return;
 	// The old transport's waits belong to a coordinator core is about to rebuild; settle them now.

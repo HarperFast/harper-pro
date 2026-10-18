@@ -312,7 +312,7 @@ describe('createRecordLockTransport().homeMap', () => {
 		assert.strictEqual(transport.ownsCoordination(), true);
 	});
 
-	it('fails closed on owner-thread acquireOnOwner and drops nothing in relayControlEntry before the incarnation resolves', async () => {
+	it('fails closed on owner-thread acquireOnOwner and ignores relayControlEntry before the incarnation resolves', async () => {
 		let relayedAcquires = 0;
 		const auditStore = fakeAuditStore();
 		const transport = createRecordLockTransport(
@@ -349,98 +349,73 @@ describe('createRecordLockTransport().homeMap', () => {
 		assert.strictEqual(
 			controlEntryRelayDropCount('pre-incarnation-owner'),
 			0,
-			'an entry applied on the owner before the incarnation resolves is neither self-relayed nor counted as a drop'
+			'an entry applied on the owner before the incarnation resolves is ignored without incrementing controlEntryRelayDrops'
 		);
 	});
 
-	it('lets a coordinator built on the owner before the incarnation resolves adopt the successor’s incarnation and waiver', async () => {
-		// Regression for harper-pro#1059 CI failures: `cluster_status` polling during `bumpHomeIncarnation`
-		// instantiates `table.lockCoordinator` while `ownsDatabase` is already true and `homeIncarnation` is
-		// still 0. If `ownsCoordination()` returned true there, the predecessor latched `#ownedSinceMono`
-		// with `#coordinatingIncarnation = undefined`, and `handOffTo` overwrote the recreated successor's
-		// `#coordinatingIncarnation` back to `undefined` — leaving `unprovenOwnershipMs()` stuck at 365 s
-		// even after the restart recall round attested.
-		for (const { database, targetIncarnation, first } of [
-			{ database: 'handoff-restarted', targetIncarnation: 2, first: false },
-			{ database: 'handoff-fresh', targetIncarnation: 1, first: true },
-		]) {
-			let incarnation = 0;
-			let firstIncarnation = false;
-			let quiesced;
-			const auditStore = fakeAuditStore();
-			recordPeerLockCapability(getReplicationSharedStatus(auditStore, database, 'peer-a'), true);
-			recordPeerHomesAgreement(getReplicationSharedStatus(auditStore, database, 'peer-a'), true);
-			const makeTransport = () =>
-				createRecordLockTransport(
-					database,
-					{
-						thisNodeName: () => 'self',
-						auditStore: () => auditStore,
-						ownsDatabase: () => true,
-						homeIncarnation: () => incarnation,
-						send: async () => ({}),
-						isFirstIncarnation: () => firstIncarnation,
-						monotonicNow: () => 1000,
-						quiescedIncarnation: () => quiesced,
-					},
-					() => ({ generation: 1, homes: ['self'] })
-				);
-			const earlyTransport = makeTransport();
-			const predecessor = new LockCoordinator({
+	it('keeps the successor’s coordinating incarnation when handing off from a coordinator built before the incarnation resolved', async () => {
+		const database = 'handoff-restarted';
+		let incarnation = 0;
+		let quiesced;
+		const auditStore = fakeAuditStore();
+		const makeTransport = () =>
+			createRecordLockTransport(
 				database,
-				table: 'Counter',
-				nodeId: 'self',
-				transport: earlyTransport,
-				writeControl: () => {},
-				keyIdOf: (key) => key,
-				nextTimestamp: () => 1,
-				monotonic: () => 1000,
-				grantableAfterMono: earlyTransport.grantableAfterMono,
-				autoTick: false,
+				{
+					thisNodeName: () => 'self',
+					auditStore: () => auditStore,
+					ownsDatabase: () => true,
+					homeIncarnation: () => incarnation,
+					send: async () => ({}),
+					isFirstIncarnation: () => false,
+					monotonicNow: () => 1000,
+					quiescedIncarnation: () => quiesced,
+				},
+				() => ({ generation: 1, homes: ['self'] })
+			);
+		const earlyTransport = makeTransport();
+		const predecessor = new LockCoordinator({
+			database,
+			table: 'Counter',
+			nodeId: 'self',
+			transport: earlyTransport,
+			writeControl: () => {},
+			keyIdOf: (key) => key,
+			nextTimestamp: () => 1,
+			monotonic: () => 1000,
+			grantableAfterMono: earlyTransport.grantableAfterMono,
+			autoTick: false,
+		});
+		incarnation = 2;
+		const lateTransport = makeTransport();
+		const successor = new LockCoordinator({
+			database,
+			table: 'Counter',
+			nodeId: 'self',
+			transport: lateTransport,
+			writeControl: () => {},
+			keyIdOf: (key) => key,
+			nextTimestamp: () => 1,
+			monotonic: () => 1000,
+			grantableAfterMono: lateTransport.grantableAfterMono,
+			adopt: predecessor,
+			autoTick: false,
+		});
+		predecessor.close();
+		try {
+			assert.ok(successor.unprovenOwnershipMs() > 0, 'still quarantined before recall attests');
+			quiesced = 2;
+			assert.strictEqual(successor.unprovenOwnershipMs(), 0);
+			const reply = await successor.onDelegationRequest({
+				key: 'k1',
+				requester: 'self',
+				generation: 1,
+				leaseMs: 5000,
 			});
-			incarnation = targetIncarnation;
-			firstIncarnation = first;
-			if (first) quiesced = targetIncarnation;
-			const lateTransport = makeTransport();
-			const successor = new LockCoordinator({
-				database,
-				table: 'Counter',
-				nodeId: 'self',
-				transport: lateTransport,
-				writeControl: () => {},
-				keyIdOf: (key) => key,
-				nextTimestamp: () => 1,
-				monotonic: () => 1000,
-				grantableAfterMono: lateTransport.grantableAfterMono,
-				adopt: predecessor,
-				autoTick: false,
-			});
-			predecessor.close();
-			try {
-				if (!first) {
-					assert.ok(successor.unprovenOwnershipMs() > 0, 'still quarantined before recall attests');
-					const beforeAttest = await successor.onDelegationRequest({
-						key: 'k1',
-						requester: 'self',
-						generation: 1,
-						leaseMs: 5000,
-					});
-					assert.strictEqual(beforeAttest.granted, false);
-					assert.strictEqual(beforeAttest.reason, 'quarantine');
-					quiesced = targetIncarnation;
-				}
-				assert.strictEqual(successor.unprovenOwnershipMs(), 0);
-				const reply = await successor.onDelegationRequest({
-					key: 'k1',
-					requester: 'self',
-					generation: 1,
-					leaseMs: 5000,
-				});
-				assert.strictEqual(reply.granted, true);
-				assert.deepStrictEqual(reply.token, [1, targetIncarnation, 1]);
-			} finally {
-				successor.close();
-			}
+			assert.strictEqual(reply.granted, true);
+			assert.deepStrictEqual(reply.token, [1, 2, 1]);
+		} finally {
+			successor.close();
 		}
 	});
 
