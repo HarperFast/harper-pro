@@ -21,6 +21,7 @@ import {
 	planActivate,
 	planStage,
 	setHomesDrainReader,
+	withFences,
 } from '#src/replication/recordLockHomes';
 
 const T = 1_700_000_000_000;
@@ -334,7 +335,63 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 		);
 		assert.strictEqual(plan.action, 'refuse');
 		assert.strictEqual(plan.status, 409);
-		assert.match(plan.reason, /no surviving node's ring names c/);
+		assert.match(plan.reason, /no surviving node's ring places c beside a node that is not fenced/);
+	});
+
+	it('refuses a fenced node whose latest known ring holds only fenced nodes', () => {
+		// {a,c} at 1, then an apply to homes [c] left a staged and departing: c alone serves 2.
+		const departed = replies({
+			a: reply('a', {
+				staged: state(2, ['c'], { quiesce: ['a', 'c'] }),
+				highestActedOn: 2,
+				supportsFenced: true,
+			}),
+		});
+		const plan = planSurvey('db', ['a'], ['a', 'c'], undefined, departed, undefined, ['c']);
+		assert.strictEqual(plan.status, 409);
+		assert.match(plan.reason, /places c beside a node that is not fenced/);
+		const pair = planSurvey(
+			'db',
+			['a'],
+			['a', 'c', 'd'],
+			undefined,
+			replies({
+				a: reply('a', {
+					staged: state(2, ['c', 'd'], { quiesce: ['a', 'c', 'd'] }),
+					highestActedOn: 2,
+					supportsFenced: true,
+				}),
+			}),
+			undefined,
+			['c', 'd']
+		);
+		assert.strictEqual(pair.status, 409, 'two fenced nodes that only home with each other');
+	});
+
+	it('accepts a retry of the same fenced transition from the fence its earlier call recorded', () => {
+		const fence = [{ node: 'c', operator: 'op', at: 1, generation: 2 }];
+		const staged = state(2, ['a', 'b'], { quiesce: ['a', 'b', 'c'] });
+		const partial = replies({
+			a: reply('a', { staged, highestActedOn: 2, supportsFenced: true, fenced: fence }),
+			b: reply('b', { staged, highestActedOn: 2, supportsFenced: true, fenced: fence }),
+		});
+		const plan = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, partial, undefined, ['c']);
+		assert.strictEqual(plan.action, 'proceed', plan.reason);
+		const done = state(2, ['a', 'b']);
+		const activated = replies({
+			a: reply('a', { active: done, highestActedOn: 2, supportsFenced: true, fenced: fence }),
+			b: reply('b', { active: done, highestActedOn: 2, supportsFenced: true, fenced: fence }),
+		});
+		const again = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, activated, undefined, ['c']);
+		assert.strictEqual(again.action, 'proceed', again.reason);
+		const stale = replies({
+			a: reply('a', { active: state(3, ['a', 'b']), highestActedOn: 3, supportsFenced: true, fenced: fence }),
+		});
+		assert.strictEqual(
+			planSurvey('db', ['a'], ['a', 'c'], undefined, stale, undefined, ['c']).status,
+			409,
+			'a fence from an earlier transition does not anchor a later one'
+		);
 	});
 });
 
@@ -417,7 +474,7 @@ function fakeCluster(rowsByNode, { quiesced = {}, fail = {}, hang = [], self, le
 				if (operation.action === 'survey') {
 					if (!rows.has(node) && node !== self) throw new Error('no route to ' + node);
 					const answer = { node, active: row?.active, staged: row?.staged, highestActedOn: row?.highestActedOn ?? 0 };
-					return legacy.includes(node) ? answer : { ...answer, supportsFenced: true };
+					return legacy.includes(node) ? answer : { ...answer, supportsFenced: true, fenced: row?.fenced };
 				}
 				const { generation, homes, quiesce, digest } = operation;
 				if (operation.action === 'stage') {
@@ -425,6 +482,9 @@ function fakeCluster(rowsByNode, { quiesced = {}, fail = {}, hang = [], self, le
 					const plan = planStage(row, operation.database, generation, homes, digest, T, quiesce);
 					if (plan.action === 'reject') throw new Error(plan.reason);
 					if (plan.action === 'write') rows.set(node, plan.row);
+					const fence = operation.fenced && { nodes: operation.fenced, operator: operation.operator };
+					const fenced = withFences(rows.get(node).fenced ?? [], fence, generation, T);
+					if (fenced) rows.set(node, { ...rows.get(node), fenced });
 					return { staged: rows.get(node).staged, quiesced: quiesced[node] ?? PROVEN };
 				}
 				const plan = planActivate(row, operation.database, generation, digest, T, 0);

@@ -24,6 +24,7 @@ import {
 	provesQuiescence,
 	stageGeneration,
 	validateGenerationInput,
+	type FenceEntry,
 	type RecordLockGenerationState,
 	type RecordLockHomesRow,
 	type StageFence,
@@ -65,6 +66,7 @@ export interface SurveyReply {
 	highestActedOn: number;
 	/** This node records a stage's `fenced` list. An older node would accept the field and drop it. */
 	supportsFenced?: boolean;
+	fenced?: FenceEntry[];
 }
 export interface StageReply {
 	staged: RecordLockGenerationState;
@@ -209,17 +211,32 @@ export function planSurvey(
 			status: 409,
 			reason: `${unfenceable.join(', ')} cannot record a fenced transition; upgrade them, or apply without fenced`,
 		};
-	// A fenced node is never surveyed, so its generation is known only through a survivor whose ring
-	// names it. Without one, the new generation can land at or below the fenced node's own, and if it
-	// comes back no peer in its ring is left to disagree with the map it still serves.
-	const named = new Set([...rows.values()].flatMap(ringMembers));
-	if (observer && !('error' in observer.reply)) for (const member of ringMembers(observer.reply)) named.add(member);
-	const unanchored = fenced.filter((node) => !named.has(node));
+	// A fenced node is never surveyed, and if it comes back serving its old map, only a peer in that
+	// map's ring can disagree with it. So its ring has to be known from the survivors and hold a node
+	// that is not fenced, or a fence for it has to be recorded already, by an earlier call of this
+	// transition that checked the same.
+	const surveyed = [...rows.values()];
+	if (observer && !('error' in observer.reply)) surveyed.push(observer.reply);
+	const actedOn = Math.max(0, ...surveyed.map(floorOf));
+	const unanchored: string[] = [];
+	for (const node of fenced) {
+		const rings = surveyed.flatMap((reply) =>
+			[reply.active, reply.staged].filter((ring) => ring?.homes.includes(node)).map((ring) => ring!.homes)
+		);
+		if (rings.some((ring) => ring.every((home) => fenced.includes(home)))) unanchored.push(node);
+		else if (
+			!rings.some((ring) => ring.some((home) => !fenced.includes(home))) &&
+			!surveyed.some((reply) =>
+				reply.fenced?.some((entry) => entry.node === node && (entry.generation ?? 0) >= actedOn)
+			)
+		)
+			unanchored.push(node);
+	}
 	if (unanchored.length > 0)
 		return {
 			action: 'refuse',
 			status: 409,
-			reason: `no surviving node's ring names ${unanchored.join(', ')}, so its generation cannot be read from them; apply without fenced once it is reachable, or stage it with the per-node operations`,
+			reason: `no surviving node's ring places ${unanchored.join(', ')} beside a node that is not fenced, so nothing would refuse its old map if it came back; apply without fenced once it is reachable, or stage it with the per-node operations`,
 		};
 	if (unrecorded.length > 0)
 		return {
@@ -566,6 +583,7 @@ export async function executeTransitionLocally(
 			staged: row?.staged,
 			highestActedOn: row?.highestActedOn ?? 0,
 			supportsFenced: true,
+			fenced: row?.fenced,
 		};
 	}
 	validateGenerationInput(request.generation, request.homes);
