@@ -525,7 +525,7 @@ const transitionSchema = Joi.object({
 	quiesce: Joi.array().optional(),
 	digest: Joi.string().optional(),
 	fenced: Joi.array().optional(),
-	operator: Joi.string().optional(),
+	operator: Joi.string().max(512).optional(),
 });
 
 /**

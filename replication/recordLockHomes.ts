@@ -240,8 +240,7 @@ function withRow<T>(
 
 export function operatorPrincipal(request: any): string {
 	// `hdb_user` is the authenticated principal the operation dispatcher attached; never a request
-	// body field, which a caller could set to forge attribution on the audit-only `fenced[]` list. A
-	// user carries `username`; a node principal (`principalNodeName`) carries `name`.
+	// body field, which a caller could set to forge attribution on the audit-only `fenced[]` list.
 	const name = request?.hdb_user?.username ?? request?.hdb_user?.name;
 	if (typeof name !== 'string' || name.length === 0)
 		throw new ClientError('record lock home map operations require an authenticated user', 401);
@@ -571,9 +570,9 @@ let drainReader: (database: string, budgetMs: number) => Promise<QuiesceResult |
 /**
  * An orchestrator may skip the drain interval for a node ONLY on this: a drain that both completed
  * and found nothing. `complete` is core's statement that the sweep could have seen everything —
- * coordinators are built lazily, so an empty `outstanding` alone is not a proof (harper-pro#856).
+ * coordinators are built lazily, so an empty `outstanding` alone is not a proof.
  *
- * The one exception is a recall this node, as home, sent to a node in `fenced` (harper-pro#973): it
+ * The one exception is a recall this node, as home, sent to a node in `fenced`: it
  * can never be confirmed, and the delegation it targets is held by a node the operator attests is
  * stopped, so it admits nothing. Core marks the sweep incomplete for it, so `complete: false` is
  * accepted only when every outstanding entry is such a recall.

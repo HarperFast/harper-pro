@@ -1,8 +1,7 @@
 /**
- * The safety claims `record_lock_apply_homes { fenced }` activates on without waiting out the drain
- * interval (harper-pro#973): authority a fenced node exercised under the old generation cannot admit on
- * a survivor that staged the next one. Core's real coordinator, with each node's `homeMap()` driven
- * from a home-map row the way `recordLockTransport.ts` drives it (no `active`, no map).
+ * Authority a fenced node exercised under the old generation cannot admit on a survivor that staged
+ * the next one, on core's real coordinator with `homeMap()` driven from a home-map row the way
+ * `recordLockTransport.ts` drives it (no `active`, no map).
  */
 import assert from 'node:assert';
 import { performance } from 'node:perf_hooks';

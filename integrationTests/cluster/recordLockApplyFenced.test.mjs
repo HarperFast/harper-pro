@@ -1,9 +1,7 @@
 /**
- * `record_lock_apply_homes { fenced }` (harper-pro#973) on real nodes: a ring member stops for good
- * while holding delegations from both survivors, and one call with it fenced completes the transition
- * without waiting out the delegation lease. Then the exact keys it held are served by their unchanged
- * homes, and the stopped node restarted with its old row has no home map. Waits out core's
- * `unprovenOwnershipMs` once in `before`, like `recordLockApplyHomes.test.mjs`.
+ * `record_lock_apply_homes { fenced }` on real nodes: a ring member is killed while holding
+ * delegations from both survivors, one call with it fenced completes the transition, its exact keys
+ * are served by their unchanged homes at once, and restarted with its old row it has no home map.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';

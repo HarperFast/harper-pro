@@ -862,6 +862,7 @@ describe('record_lock_transition: the peer-callable hop', () => {
 		await assert.rejects(stage({ fenced: [self] }), /fenced must not include a node in homes/);
 		await assert.rejects(stage({ fenced: ['elsewhere'] }), /fenced must be a subset of quiesce/);
 		await assert.rejects(stage({ operator: undefined }), /must name the operator/);
+		await assert.rejects(stage({ operator: 'o'.repeat(513) }), (error) => error.statusCode === 400);
 		assert.strictEqual((await executeTransitionLocally({ database: 'hop5', action: 'survey' })).staged, undefined);
 		await stage();
 		await stage();
