@@ -9,10 +9,11 @@
  * row). Both make a `replicated` get_analytics fan-out lose the peer's analytics. Draining
  * the result into a concrete, fully-resolved array before encoding fixes both.
  *
- * Arrays are wrapped as `{ results }` to match the existing replication response shape (so a
- * top-level `requestId` can be attached by the caller); any other value (e.g. a plain object)
- * is returned unchanged. `response` is intentionally `any` — operation results are arbitrarily
- * shaped.
+ * Arrays are wrapped as `{ results }` so the caller can attach a top-level `requestId`. A plain
+ * object that would throw on that assignment (`record_lock_recall` answers with a frozen constant)
+ * is copied for the same reason. The copy is by descriptor, so the encoder sees the same properties
+ * and hooks. Anything the assignment succeeds on is returned as is, so it encodes as it always has.
+ * `response` is intentionally `any`, because operation results can have any shape.
  *
  * Assumes operation results are bounded (they are for today's operations): the whole response
  * is buffered in memory here, so a future genuinely-large streaming op forwarded over
@@ -39,6 +40,16 @@ export async function materializeOperationResponse(response: any): Promise<any> 
 	}
 	if (Array.isArray(response)) {
 		return { results: await Promise.all(response) };
+	}
+	if (response !== null && typeof response === 'object') {
+		const slot = Object.getOwnPropertyDescriptor(response, 'requestId');
+		if (slot ? slot.writable || slot.set : Object.isExtensible(response)) return response;
+		const prototype = Object.getPrototypeOf(response);
+		if (prototype === Object.prototype || prototype === null) {
+			const descriptors = Object.getOwnPropertyDescriptors(response);
+			descriptors.requestId = { value: undefined, writable: true, enumerable: true, configurable: true };
+			return Object.create(prototype, descriptors);
+		}
 	}
 	return response;
 }

@@ -33,9 +33,14 @@ suite(
 		let names;
 
 		before(async () => {
+			// With the restart recall on, a fresh cluster proves its drain at once (harper#3254: nothing was
+			// ever issued below a first incarnation) and the first call activates. This suite is about the
+			// retry contract under "cannot prove", which a live cluster shows with an unreachable or older
+			// member; the switch keeps every node unprovable for its full interval instead.
+			const unprovable = { HARPER_TEST_RECORD_LOCK_OMIT_RESTART_RECALL: '1' };
 			const started = await Promise.allSettled([
-				startNode(ctx.name),
-				startNode(ctx.name, { HARPER_TEST_RECORD_LOCK_APPLY_FAIL_BEFORE_ACTIVATE: '1' }),
+				startNode(ctx.name, unprovable),
+				startNode(ctx.name, { ...unprovable, HARPER_TEST_RECORD_LOCK_APPLY_FAIL_BEFORE_ACTIVATE: '1' }),
 			]);
 			for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
 			const failed = started.find((result) => result.status === 'rejected');

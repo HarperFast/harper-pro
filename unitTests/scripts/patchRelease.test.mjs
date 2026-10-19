@@ -9,7 +9,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { closeSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -300,6 +300,45 @@ describe('patch-release.js non-interactive contract', function () {
 			const written = readFileSync(filePath, 'utf8');
 			assert.equal(written, 'RESULT: ' + JSON.stringify({ ok: true, pushed: true }) + '\n');
 			assert.deepEqual(JSON.parse(written.replace(/^RESULT: /, '')), { ok: true, pushed: true });
+		});
+	});
+
+	describe('runtime dependency preflight', function () {
+		let fixture;
+
+		beforeEach(function () {
+			fixture = mkdtempSync(join(tmpdir(), 'patch-release-preflight-'));
+			// Hides semver from the child on any host, including ancestor or global node_modules.
+			writeFileSync(
+				join(fixture, 'hide-semver.cjs'),
+				`const Module = require('node:module');
+const resolveFilename = Module._resolveFilename;
+Module._resolveFilename = function (request, ...rest) {
+	if (request === 'semver') throw Object.assign(new Error("Cannot find module 'semver'"), { code: 'MODULE_NOT_FOUND' });
+	return resolveFilename.call(this, request, ...rest);
+};
+`
+			);
+		});
+
+		afterEach(function () {
+			if (fixture) rmSync(fixture, { recursive: true, force: true });
+		});
+
+		it('exits nonzero with an npm ci message and a parsable RESULT line when semver is missing', function () {
+			const r = spawnSync(process.execPath, ['-r', join(fixture, 'hide-semver.cjs'), scriptPath], {
+				encoding: 'utf8',
+				timeout: 5000,
+				env: { ...process.env, PATH: '' },
+			});
+			assert.equal(r.status, 1);
+			assert.ok(r.stderr.includes(`Run \`npm ci\` in ${root} first.`), r.stderr);
+			assert.doesNotMatch(r.stderr, /MODULE_NOT_FOUND/);
+			const resultLine = r.stdout.split('\n').find((line) => line.startsWith('RESULT: '));
+			assert.ok(resultLine, 'RESULT line missing from stdout');
+			const result = JSON.parse(resultLine.slice('RESULT: '.length));
+			assert.equal(result.ok, false);
+			assert.match(result.error, /npm ci/);
 		});
 	});
 });

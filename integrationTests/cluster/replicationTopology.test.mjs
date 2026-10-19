@@ -13,7 +13,7 @@ import {
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
 import { assertLegacyAuditHasNoEcho } from './legacyAuditHelpers.mjs';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -57,7 +57,7 @@ function nodeStartOptions(node) {
 		},*/
 	};
 }
-suite('Replication Topology', { timeout: 120000 }, (ctx) => {
+suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 	before(async () => {
 		// start up the nodes
 		ctx.nodes = await Promise.all(
@@ -246,58 +246,92 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 			table: 'test',
 			records: [{ id: '2', name: 'test while disconnected' }],
 		});
-		let response;
 		// Reapply the original config on restart — without it, HARPER_SET_CONFIG=`{}`
 		// would delete `replication.databases: ['data']` and the restarted node would
 		// try to open `db: system` replication to its peers (which they reject).
 		ctx.nodes[0] = (await startHarper({ name: ctx.name, harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
-		// A killed node must restart, re-subscribe, and replay the audit log to catch
-		// up — on a loaded CI runner that can take several seconds, so poll generously
-		// (25 * 200ms = 5s) rather than the old ~2.2s, which a slow-but-healthy catchup
-		// could overrun.
-		const MAX_CATCHUP_RETRIES = 25;
-		let retries = 0;
-		// ensure the data gets to the central node
-		do {
-			await delay(200);
-			response = await sendOperation(ctx.nodes[0], {
-				operation: 'search_by_id',
-				table: 'test',
-				get_attributes: ['id', 'name'],
-				ids: ['2'],
-			});
-			if (retries++ > MAX_CATCHUP_RETRIES) {
-				break;
+		// A leaf resumes receiving from the restarted hub only when its own outbound socket's next
+		// backoff retry fires (ceiling capped at 30 s), so the whole recovery shares one budget of
+		// that cap plus delivery — replication/DESIGN.md, "A restarted node's own sockets do not
+		// resume its peers' inbound streams".
+		const RECOVERY_BUDGET_MS = 35_000;
+		const recoveryDeadline = Date.now() + RECOVERY_BUDGET_MS;
+		const remainingBudget = () => Math.max(1, recoveryDeadline - Date.now());
+		const hubSocketsSeenBy = (status) =>
+			status.connections.find((connection) => connection.name === ctx.nodes[0].hostname)?.database_sockets ?? [];
+		const describeHubSockets = async (node) => {
+			try {
+				const status = await sendOperation(
+					node,
+					{ operation: 'cluster_status' },
+					{ signal: AbortSignal.timeout(5000) }
+				);
+				return JSON.stringify(
+					hubSocketsSeenBy(status).map(
+						({ database, connected, lastConnectionError, lastLiveness, lastReceivedRemoteTime }) => ({
+							database,
+							connected,
+							lastConnectionError,
+							lastLiveness,
+							lastReceivedRemoteTime,
+						})
+					)
+				);
+			} catch (error) {
+				return `status unavailable (${error.message})`;
 			}
-		} while (response.length === 0);
-		if (response.length === 0) {
-			throw new Error('Node 1 did not replicate insert');
-		}
-		// and the data is passed on to the other node
+		};
+		const failWithHubSockets = async (i, what, error) =>
+			new Error(
+				`Node ${i} ${ctx.nodes[i].hostname} ${what} within ${RECOVERY_BUDGET_MS}ms of node 0's restart; node ${i}'s sockets to node 0: ${await describeHubSockets(ctx.nodes[i])}`,
+				{ cause: error }
+			);
+		const waitForRecord = async (i) => {
+			try {
+				return await waitForCondition(
+					async (signal) => {
+						const response = await sendOperation(
+							ctx.nodes[i],
+							{ operation: 'search_by_id', table: 'test', get_attributes: ['id', 'name'], ids: ['2'] },
+							{ signal }
+						);
+						return response.length > 0 && response;
+					},
+					{ timeoutMs: remainingBudget(), pollMs: 200, description: `node ${i} to hold record 2` }
+				);
+			} catch (error) {
+				throw await failWithHubSockets(i, 'did not receive the record written while node 0 was down', error);
+			}
+		};
+		let response = await waitForRecord(0);
 		equal(response.length, 1);
 		equal(response[0].name, 'test while disconnected');
-		// Reset the retry budget: this loop polls a *different* node (transitive
-		// catchup to node 2), so it must get its own full poll window. Sharing the
-		// counter with the node-0 loop above let a slow-but-successful node-0
-		// catchup (e.g. a loaded CI runner) exhaust the budget, leaving node 2 a
-		// single ~200ms poll before this assertion fired — a false `0 == 1` even
-		// though the record arrived moments later (node 0/2 catchup is not lost,
-		// just slower under load; passes on faster runners).
-		retries = 0;
-		do {
-			await delay(200);
-			response = await sendOperation(ctx.nodes[2], {
-				operation: 'search_by_id',
-				table: 'test',
-				get_attributes: ['id', 'name'],
-				ids: ['2'],
-			});
-			if (retries++ > MAX_CATCHUP_RETRIES) {
-				break;
+		for (let i = 2; i < NODE_COUNT; i++) {
+			response = await waitForRecord(i);
+			equal(response.length, 1, `Node ${i} did not receive the transitively-replicated record from node 0`);
+			equal(response[0].name, 'test while disconnected');
+		}
+		// Writer node 1 holds its own row, so only its socket shows its inbound stream is back — the
+		// next test's `replicatedConfirmation: NODE_COUNT - 1` write needs that from every leaf.
+		for (let i = 1; i < NODE_COUNT; i++) {
+			try {
+				await waitForCondition(
+					async (signal) => {
+						const sockets = hubSocketsSeenBy(
+							await sendOperation(ctx.nodes[i], { operation: 'cluster_status' }, { signal })
+						);
+						return sockets.length > 0 && sockets.every((socket) => socket.connected);
+					},
+					{
+						timeoutMs: remainingBudget(),
+						pollMs: 200,
+						description: `node ${i} to reconnect its replication socket to node 0`,
+					}
+				);
+			} catch (error) {
+				throw await failWithHubSockets(i, 'did not reconnect its replication socket to node 0', error);
 			}
-		} while (response.length === 0);
-		equal(response.length, 1, 'Node 2 did not receive the transitively-replicated record from node 0');
-		equal(response[0].name, 'test while disconnected');
+		}
 	});
 	test('replicate per-record expiration so records evict on receivers', async () => {
 		// Create a TTL table — schema replication propagates the table-level
