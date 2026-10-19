@@ -7636,7 +7636,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// SAME outcome here, permanent abandonment below, but for different reasons: the
 											// first means retrying buys nothing (the failing name isn't even in the map), the
 											// second means nothing is left to validate).
-											const after =
+											const after: Map<string, number> | undefined =
 												before && !failedLogNames.has(boundaryLogName)
 													? new Map([...before].filter(([log]) => !failedLogNames.has(log)))
 													: undefined;
@@ -7646,6 +7646,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// trimmed-away log falls back to core's own zero default, same as an
 												// unlisted log always has.
 												boundaryRangeOptions = { ...boundaryRangeOptions, startByLog: after };
+												// A trimmed origin is no longer resumed in append order, so its overlap floor applies again.
+												if (originFloors?.size) {
+													const stillExact = new Map(after);
+													stillExact.delete(boundaryLogName);
+													({ originFloors, originFloorById } = applyRelayedAnchorFloors(
+														originFloors,
+														undefined,
+														stillExact,
+														exportIdMapping(auditStore)
+													));
+												}
 												auditLogIterable = undefined;
 												sendLogRangeNeedsSafeSeed = true;
 												continue;
