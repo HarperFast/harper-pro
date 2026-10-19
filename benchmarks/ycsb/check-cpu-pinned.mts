@@ -24,8 +24,9 @@ const cpuRoot = join(process.env.SYSFS_ROOT ?? '/sys', 'devices/system/cpu');
 
 async function readNumber(path: string): Promise<number | null> {
 	try {
-		const value = Number((await readFile(path, 'utf8')).trim());
-		return Number.isFinite(value) ? value : null;
+		const text = (await readFile(path, 'utf8')).trim();
+		const value = Number(text);
+		return text && Number.isFinite(value) ? value : null;
 	} catch {
 		return null;
 	}

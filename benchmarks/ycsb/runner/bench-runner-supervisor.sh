@@ -41,6 +41,8 @@ RUNNER_CGROUP_PARENT="${RUNNER_CGROUP_PARENT:-}"
 command -v docker >/dev/null || { echo "docker not found"; exit 1; }
 command -v gh >/dev/null || { echo "gh not found"; exit 1; }
 command -v jq >/dev/null || { echo "jq not found"; exit 1; }
+command -v flock >/dev/null || { echo "flock not found"; exit 1; }
+command -v md5sum >/dev/null || { echo "md5sum not found"; exit 1; }
 
 log() { echo "[bench-supervisor] $*"; }
 
@@ -55,12 +57,15 @@ gh_get_cached() {
 	etag="$(cat "${key}.etag" 2>/dev/null || true)"
 	# gh exits non-zero on 304, so read the status line instead of the exit code.
 	raw="$(gh api -i ${etag:+-H "If-None-Match: ${etag}"} "${path}" 2>/dev/null | tr -d '\r' || true)"
-	status="$(printf '%s\n' "${raw}" | head -1 | awk '{print $2}')"
+	status="$(awk 'NR==1{print $2}' <<<"${raw}")"
 	case "${status}" in
-		304) cat "${key}.body" ;;
+		304)
+			# A 304 without its cached body would hide the job until the list changes: refetch.
+			cat "${key}.body" 2>/dev/null || { rm -f "${key}.etag"; gh_get_cached "${path}"; } ;;
 		200)
-			printf '%s\n' "${raw}" | awk 'body{print;next} /^$/{body=1}' > "${key}.body"
-			printf '%s\n' "${raw}" | awk -F': ' 'tolower($1)=="etag"{print $2; exit}' > "${key}.etag"
+			rm -f "${key}.etag"
+			awk 'body{print;next} /^$/{body=1}' <<<"${raw}" > "${key}.body" || return 1
+			awk -F': ' '/^$/{exit} tolower($1)=="etag"{print $2}' <<<"${raw}" > "${key}.etag"
 			cat "${key}.body" ;;
 		*) return 1 ;;
 	esac
@@ -119,6 +124,21 @@ restore_stale_turbo() {
 	exec {lock_fd}>&-
 }
 
+# The container runs under dockerd, so it outlives a hard-killed supervisor while the lock is
+# released. Its measurement is already lost then, so a restarted supervisor removes it before
+# treating the host as idle.
+DRAIN_CONTAINER_LABEL=bench-supervisor.drain
+holding_lock=0
+
+remove_orphan_drains() {
+	local orphans
+	orphans="$(docker ps -q --filter "label=${DRAIN_CONTAINER_LABEL}" 2>/dev/null || true)"
+	[ -n "${orphans}" ] || return 0
+	log "removing drain container(s) left by a previous supervisor: ${orphans//$'\n'/ }"
+	# shellcheck disable=SC2086 # one container id per word
+	docker rm -f ${orphans} >/dev/null || log "WARNING: could not remove orphaned drain container(s)"
+}
+
 # Register a throwaway repo-scoped ephemeral runner that drains exactly one job.
 drain_one() {
 	local repo="$1" lock_fd
@@ -128,10 +148,12 @@ drain_one() {
 		flock "${lock_fd}"
 	fi
 	printf 'name: ci-drain %s\npid: %s\nstarted: %s\n' "${repo}" "$$" "$(date -Is)" > "${BENCH_LOCK_DIR}/holder"
+	holding_lock=1
 	turbo_off
 	drain_locked "${repo}" {lock_fd}>&-
 	turbo_on
 	rm -f "${BENCH_LOCK_DIR}/holder"
+	holding_lock=0
 	exec {lock_fd}>&-
 }
 
@@ -148,14 +170,20 @@ drain_locked() {
 		-e RUNNER_REPO_URL="https://github.com/${repo}" \
 		-e RUNNER_TOKEN="${token}" \
 		-e RUNNER_LABELS="${LABEL}" \
+		--label "${DRAIN_CONTAINER_LABEL}" \
 		"${IMAGE}" \
 		|| log "container for ${repo} exited non-zero / timed out (continuing)"
 	log "drain for ${repo} complete"
 }
 
 log "repos=[${REPOS[*]}] label=${LABEL} image=${IMAGE} poll=${POLL}s cpus=${RUNNER_CPUS} memory=${RUNNER_MEMORY}"
-trap '[ "${turbo_off_by_us}" = 1 ] && turbo_on' EXIT
+on_exit() {
+	if [ "${turbo_off_by_us}" = 1 ]; then turbo_on; fi
+	if [ "${holding_lock}" = 1 ]; then rm -f "${BENCH_LOCK_DIR}/holder"; fi
+}
+trap on_exit EXIT
 trap 'log "stopping"; exit 0' INT TERM
+remove_orphan_drains
 
 while true; do
 	restore_stale_turbo
