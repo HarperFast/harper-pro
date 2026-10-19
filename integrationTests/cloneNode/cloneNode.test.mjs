@@ -1,9 +1,25 @@
 import { suite, test, before, after } from 'node:test';
-import { equal, ok } from 'node:assert';
-import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { deepEqual, equal, ok } from 'node:assert';
+import {
+	startHarper,
+	teardownHarper,
+	killHarper,
+	getNextAvailableLoopbackAddress,
+	targz,
+} from '@harperfast/integration-testing';
 import { generateKeyPairSync } from 'node:crypto';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+	appendFileSync,
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readLog } from '../cluster/clusterShared.mjs';
 
@@ -41,6 +57,96 @@ async function waitForAvailableStatus(node, timeoutMs = 120000, checkInterval = 
 	}
 
 	throw new Error(`Node status did not become Available within ${timeoutMs}ms`);
+}
+
+// Applications whose dependencies exist only in node_modules, in the two shapes harper-pro#1047 hit:
+// a `file:` dependency into node_modules, and a monorepo workspace package a Next.js standalone build
+// copies into node_modules without listing it. npm can reinstall neither. Built at run time because the
+// repository ignores node_modules. The `file:` package is imported rather than loaded as a component: a
+// nested component's loader link to the Harper install would make the leader package the whole install.
+const NODE_MODULES_ONLY_APPLICATIONS = {
+	'vendored-loader-app': {
+		endpoint: 'VendoredLoader',
+		expected: { loadedFrom: 'vendored-loader' },
+		files: {
+			'package.json': JSON.stringify({
+				name: 'vendored-loader-app',
+				version: '1.0.0',
+				type: 'module',
+				dependencies: { 'vendored-loader': 'file:./node_modules/vendored-loader' },
+			}),
+			'config.yaml': 'rest: true\njsResource:\n  files: resources.js\n',
+			'resources.js':
+				"import { loadedFrom } from 'vendored-loader';\n\nexport class VendoredLoader extends Resource {\n\tget() {\n\t\treturn { loadedFrom };\n\t}\n}\n",
+			'node_modules/vendored-loader/package.json': JSON.stringify({
+				name: 'vendored-loader',
+				version: '1.0.0',
+				type: 'module',
+				exports: './index.js',
+			}),
+			'node_modules/vendored-loader/index.js': "export const loadedFrom = 'vendored-loader';\n",
+		},
+	},
+	'standalone-build-app': {
+		endpoint: 'StandaloneBuild',
+		expected: { label: 'workspace-package' },
+		files: {
+			'package.json': JSON.stringify({ name: 'standalone-build-app', version: '1.0.0', type: 'module' }),
+			'config.yaml': 'rest: true\njsResource:\n  files: resources.js\n',
+			'resources.js':
+				"import { label } from '@repo/logger';\n\nexport class StandaloneBuild extends Resource {\n\tget() {\n\t\treturn { label };\n\t}\n}\n",
+			'node_modules/@repo/logger/package.json': JSON.stringify({
+				name: '@repo/logger',
+				version: '0.0.0',
+				private: true,
+				type: 'module',
+				exports: './index.js',
+			}),
+			'node_modules/@repo/logger/index.js': "export const label = 'workspace-package';\n",
+		},
+	},
+};
+
+async function deployNodeModulesOnlyApplications(node) {
+	const scratch = mkdtempSync(join(tmpdir(), 'clone-node-modules-only-'));
+	try {
+		for (const [project, { files }] of Object.entries(NODE_MODULES_ONLY_APPLICATIONS)) {
+			const appDir = join(scratch, project);
+			for (const [file, content] of Object.entries(files)) {
+				mkdirSync(dirname(join(appDir, file)), { recursive: true });
+				writeFileSync(join(appDir, file), content);
+			}
+			await sendOperation(node, {
+				operation: 'deploy_component',
+				project,
+				payload: await targz(appDir),
+				restart: true,
+			});
+		}
+	} finally {
+		rmSync(scratch, { recursive: true, force: true });
+	}
+}
+
+async function assertNodeModulesOnlyApplicationsServe(node, timeoutMs = 60000) {
+	for (const [project, { endpoint, expected }] of Object.entries(NODE_MODULES_ONLY_APPLICATIONS)) {
+		const deadline = Date.now() + timeoutMs;
+		let status;
+		let body;
+		while (Date.now() < deadline) {
+			try {
+				const response = await fetch(`${node.httpURL}/${endpoint}`, { headers: { Accept: 'application/json' } });
+				status = response.status;
+				body = await response.text();
+				if (status === 200) break;
+			} catch (error) {
+				body = String(error);
+			}
+			await sleep(1000);
+		}
+		equal(status, 200, `${project} must serve /${endpoint} on ${node.hostname}: ${body}`);
+		deepEqual(JSON.parse(body), expected, `${project} must answer from its node_modules-only package`);
+	}
 }
 
 suite('Clone Node', (ctx) => {
@@ -138,6 +244,9 @@ suite('Clone Node', (ctx) => {
 			project: 'config-app',
 			package: 'HarperFast/application-template',
 		});
+
+		await deployNodeModulesOnlyApplications(nodeCtx.harper);
+		await assertNodeModulesOnlyApplicationsServe(nodeCtx.harper);
 	});
 
 	after(async () => {
@@ -288,6 +397,8 @@ suite('Clone Node', (ctx) => {
 		ok(configApp, 'config-referenced application should be cloned to the clone node');
 		ok(!filesystemApp?.package, 'filesystem-only application should not have a config package reference on the clone');
 		ok(configApp?.package, 'config-referenced application should retain its package reference on the clone');
+
+		await assertNodeModulesOnlyApplicationsServe(ctx.nodes[1]);
 	});
 
 	test('should clone three more nodes successfully', async () => {
@@ -600,3 +711,100 @@ suite('Clone Node - SSH key clone failure leaves node Unavailable and uncloned',
 		);
 	});
 });
+
+// A real transfer fault: a file the leader cannot read makes its packer fail partway through the archive,
+// so the clone's extraction fails as it would on a dropped transfer.
+suite(
+	'Clone Node - application clone failure leaves node Unavailable and uncloned, and a restart retries it',
+	{
+		skip:
+			(process.platform === 'win32' && 'Windows cannot make a file unreadable with chmod') ||
+			(process.getuid?.() === 0 && 'root can read a mode-000 file'),
+	},
+	(ctx) => {
+		const unreadableFile = () => join(ctx.leader.dataRootDir, 'components', 'unreadable-app', 'data.bin');
+
+		before(async () => {
+			const leaderCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+			await startHarper(leaderCtx, {
+				config: {
+					analytics: { aggregatePeriod: -1 },
+					logging: { colors: false },
+					replication: { port: leaderCtx.harper.hostname + ':9933', securePort: null },
+				},
+				env: { HARPER_NO_FLUSH_ON_EXIT: true },
+			});
+			ctx.leaderCtx = leaderCtx;
+			ctx.leader = leaderCtx.harper;
+			for (const [file, payload] of [
+				['config.yaml', 'rest: true\n'],
+				['data.bin', 'leader-only bytes'],
+			]) {
+				await sendOperation(ctx.leader, { operation: 'set_component_file', project: 'unreadable-app', file, payload });
+			}
+			chmodSync(unreadableFile(), 0);
+		});
+
+		after(async () => {
+			await Promise.all([ctx.leaderCtx, ctx.cloneCtx].filter((c) => c?.harper?.process).map((c) => teardownHarper(c)));
+		});
+
+		test('reports Unavailable and is not marked cloned, then clones the application once it can', async () => {
+			const { operation_token } = await sendOperation(ctx.leader, {
+				operation: 'create_authentication_tokens',
+				authorization: ctx.leader.admin,
+			});
+			const cloneCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+			ctx.cloneCtx = cloneCtx;
+			const cloneOptions = {
+				config: {
+					analytics: { aggregatePeriod: -1 },
+					logging: { colors: false },
+					replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
+				},
+				env: {
+					HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
+					HDB_LEADER_TOKEN: operation_token,
+					ALLOW_SELF_SIGNED: true,
+					HARPER_NO_FLUSH_ON_EXIT: true,
+				},
+			};
+			await startHarper(cloneCtx, cloneOptions);
+
+			// until setup has given up: before that, a clone still in progress is Unavailable and uncloned too
+			let log = '';
+			const deadline = Date.now() + 60000;
+			while (Date.now() < deadline && !log.includes('failed during setup')) {
+				await sleep(1000);
+				log = await readLog(cloneCtx.harper);
+			}
+			ok(log.includes("Failed to clone application 'unreadable-app'"), 'the failed application must be named');
+			ok(
+				log.includes('Failed to clone 1 of 1 filesystem-only application(s) from the leader: unreadable-app'),
+				'a failed application clone must stop clone setup'
+			);
+
+			const availability = await sendOperation(cloneCtx.harper, { operation: 'get_status', id: 'availability' });
+			equal(availability?.status, 'Unavailable', 'a clone missing an application must report availability Unavailable');
+			const config = await sendOperation(cloneCtx.harper, { operation: 'get_configuration' });
+			ok(config.cloned !== true, 'a clone missing an application must not be marked cloned');
+			ok(
+				!existsSync(join(cloneCtx.harper.dataRootDir, '.cloneAttempt.json')),
+				'a clone stopped by an application must retire its attempt (harper-pro#737)'
+			);
+
+			chmodSync(unreadableFile(), 0o644);
+			await killHarper(cloneCtx);
+			await startHarper(cloneCtx, cloneOptions);
+			await waitForAvailableStatus(cloneCtx.harper);
+
+			const retried = await sendOperation(cloneCtx.harper, { operation: 'get_configuration' });
+			equal(retried.cloned, true, 'the retried clone must be marked cloned');
+			equal(
+				readFileSync(join(cloneCtx.harper.dataRootDir, 'components', 'unreadable-app', 'data.bin'), 'utf8'),
+				'leader-only bytes',
+				'the retried clone must hold the application'
+			);
+		});
+	}
+);
