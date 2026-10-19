@@ -91,8 +91,17 @@ jobs:
           WORKLOADS: ${{ github.event.inputs.workloads || 'C,B,A,F,E' }}
         run: node benchmarks/ycsb/validate-benchmark-json.mts core/benchmarks/ycsb/bench-out/throughput.json "$WORKLOADS"
 
+      # The bench runner turns turbo off for each job so every night measures the same clock.
+      # A run that did not see that state (sudo missing, a leftover frequency cap) would put a
+      # step in the trend that is not a code change, so it is kept off the trend. The state goes
+      # into the results artifact either way. Sets the `pinned` output to gate the steps below.
+      - name: Check host CPU is pinned
+        id: cpu
+        if: always()
+        run: node benchmarks/ycsb/check-cpu-pinned.mts core/benchmarks/ycsb/results/cpu-state.json
+
       - name: Track cluster throughput trend
-        if: success() && steps.validate.outputs.publish == 'true'
+        if: success() && steps.validate.outputs.publish == 'true' && steps.cpu.outputs.pinned == 'true'
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           name: YCSB Cluster Throughput
@@ -106,7 +115,7 @@ jobs:
           alert-comment-cc-users: '@kriszyp'
 
       - name: Track cluster latency (p99) trend
-        if: success() && steps.validate.outputs.publish == 'true'
+        if: success() && steps.validate.outputs.publish == 'true' && steps.cpu.outputs.pinned == 'true'
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           name: YCSB Cluster Latency p99

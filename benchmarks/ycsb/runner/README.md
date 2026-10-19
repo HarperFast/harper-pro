@@ -21,8 +21,35 @@ a repo-scoped runner binds the same job in ~15s).
 So `bench-runner-supervisor.sh` polls each repo for a queued job targeting the
 `harper-bench` label and, when it finds one, registers a throwaway repo-scoped
 `--ephemeral` runner that drains exactly that job and exits. Because draining blocks, **at
-most one job runs at a time across all repos** — strictly serial by construction, so the
-numbers stay comparable and there's no lock to manage.
+most one job runs at a time across all repos** — strictly serial by construction. Each drain
+also takes a machine-wide `flock` (`$BENCH_LOCK_DIR/lock`, default `~/dev/tmp/bench-lock`)
+shared with the host's local `bench-run` tool, so a CI job never overlaps a local benchmark.
+
+## CPU turbo state
+
+The supervisor owns the host's turbo setting. Every benchmark runs with **turbo off** (cores at
+base clock: 2.3 GHz P-cores, 1.7 GHz E-cores on the current host), and the host runs with
+**turbo on** whenever no benchmark is running:
+
+- After taking the lock, `drain_one` runs `sudo -n cpupower set --turbo-boost 0` and checks that
+  `/sys/devices/system/cpu/intel_pstate/no_turbo` reads `1`. If that fails it logs a warning
+  and runs the job anyway.
+- When the container exits (success, failure or the `MAX_JOB_SECONDS` timeout) it turns turbo
+  back on, and so does its exit trap when the supervisor is stopped mid-job.
+- Each poll pass turns turbo back on if `no_turbo` reads `1` while nobody holds the lock, so a
+  supervisor or `bench-run` that was killed leaves turbo off for at most one poll interval.
+
+This applies to every workflow that targets `harper-bench`, in both repos.
+[`ycsb-cluster-nightly`](../../../.github/workflows/ycsb-cluster-nightly.yml) checks the state
+from inside the job (`benchmarks/ycsb/check-cpu-pinned.mts`): it publishes a trend point only
+when `no_turbo` is `1` and every online CPU's `scaling_max_freq` equals its `base_frequency`.
+Otherwise it warns and skips the publish steps. The state goes into the job summary and the
+results artifact (`cpu-state.json`) either way.
+
+**Nothing else on the host may cap the CPU frequency.** A `cpupower frequency-set -u` cap
+survives until it is undone or the host reboots, and it is how the trend lost ~40% from
+2026-09-17: a local wrapper capped the CPU at 2 GHz and never removed the cap, and CI measured
+whatever state the host was in. The publish guard refuses a cap below base.
 
 ## Nightly fire order
 
@@ -69,7 +96,14 @@ entirely.
 ## Prerequisites
 
 - Docker, and `gh` authenticated as a **repo admin on every served repo** (to mint
-  registration tokens), plus `jq`.
+  registration tokens), plus `jq` and `flock`.
+- An `intel_pstate` CPU and passwordless sudo for `cpupower`, so the supervisor can switch
+  turbo (see [CPU turbo state](#cpu-turbo-state)):
+
+  ```sh
+  echo "$USER ALL=(root) NOPASSWD: /usr/bin/cpupower" | sudo tee /etc/sudoers.d/bench-runner
+  sudo visudo -cf /etc/sudoers.d/bench-runner
+  ```
 
 ## Setup
 
