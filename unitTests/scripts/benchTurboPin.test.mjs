@@ -266,6 +266,27 @@ exit 0`
 		]);
 	});
 
+	it('removes a container left by the holder it waited on before starting a drain', async function () {
+		writeFileSync(join(dir, 'orphans'), 'old1\n');
+		mkdirSync(lockDir, { recursive: true });
+		const lockPath = join(lockDir, 'lock');
+		const holder = spawn('flock', [lockPath, realSleep, '1'], { stdio: 'ignore' });
+		const holderExited = new Promise((resolve) => holder.once('exit', resolve));
+		while (spawnSync('flock', ['-n', lockPath, 'true']).status === 0) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		const { code, stdout, calls } = await runSupervisor();
+		await holderExited;
+		assert.equal(code, 0, stdout);
+		assert.match(stdout, /waiting for benchmark lock/);
+		assert.deepEqual(calls, [
+			'docker rm -f old1',
+			'sudo -n cpupower set --turbo-boost 0',
+			'docker no_turbo=1 labelled locked',
+			'sudo -n cpupower set --turbo-boost 1',
+		]);
+	});
+
 	it('answers a repeated poll from the ETag cache', async function () {
 		const { code, stdout, calls } = await runSupervisor({ FAKE_PASSES: '2' });
 		assert.equal(code, 0, stdout);

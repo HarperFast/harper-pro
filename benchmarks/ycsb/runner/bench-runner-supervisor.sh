@@ -150,6 +150,8 @@ drain_one() {
 	fi
 	holding_lock=1
 	printf 'name: ci-drain %s\npid: %s\nstarted: %s\n' "${repo}" "$$" "$(date -Is)" > "${BENCH_LOCK_DIR}/holder"
+	# A previous holder killed while this process waited for the lock can have left one behind.
+	remove_drain_containers
 	turbo_off
 	drain_locked "${repo}" {lock_fd}>&-
 	remove_drain_containers
