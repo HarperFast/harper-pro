@@ -12,6 +12,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import { materializeOperationResponse } from '#src/replication/materializeOperationResponse';
 
 describe('materializeOperationResponse', () => {
@@ -72,9 +73,69 @@ describe('materializeOperationResponse', () => {
 		await assert.rejects(materializeOperationResponse(boom()), /mid-stream failure/);
 	});
 
-	it('returns a plain object response unchanged (by reference)', async () => {
+	it('returns a plain object the caller can stamp unchanged (by reference)', async () => {
 		const response = { message: 'ok' };
 		assert.equal(await materializeOperationResponse(response), response);
+		const sealed = Object.seal({ message: 'ok', requestId: undefined });
+		assert.equal(await materializeOperationResponse(sealed), sealed, 'its own writable requestId takes the stamp');
+		const withSetter = Object.seal({
+			id: 0,
+			get requestId() {
+				return this.id;
+			},
+			set requestId(value) {
+				this.id = value;
+			},
+		});
+		assert.equal(await materializeOperationResponse(withSetter), withSetter, 'its own setter takes the stamp');
+	});
+
+	it('copies a plain object whose own requestId is read-only, even when it is extensible', async () => {
+		const response = Object.defineProperty({ message: 'ok' }, 'requestId', { value: 'stale', enumerable: true });
+		const copy = await materializeOperationResponse(response);
+		assert.notEqual(copy, response);
+		copy.requestId = 1;
+		assert.deepEqual(copy, { message: 'ok', requestId: 1 });
+	});
+
+	it('copies a frozen plain object shallowly so the caller can stamp it, leaving the original alone', async () => {
+		const nested = { token: [1, 2, 3] };
+		const response = Object.freeze({ message: 'ok', nested, requestId: 'stale' });
+		const copy = await materializeOperationResponse(response);
+		assert.notEqual(copy, response);
+		assert.equal(copy.nested, nested, 'shallow: nested values are shared, not cloned');
+		copy.requestId = 1;
+		assert.deepEqual(copy, { message: 'ok', nested, requestId: 1 });
+		assert.equal(response.requestId, 'stale');
+	});
+
+	it('copies a frozen null-prototype object by descriptor, with a fresh writable requestId slot', async () => {
+		const response = Object.freeze(Object.assign(Object.create(null), { message: 'ok', requestId: 'stale' }));
+		const copy = await materializeOperationResponse(response);
+		assert.notEqual(copy, response);
+		assert.equal(Object.getPrototypeOf(copy), null);
+		assert.equal(copy.message, 'ok');
+		assert.deepEqual(Object.getOwnPropertyDescriptor(copy, 'requestId'), {
+			value: undefined,
+			writable: true,
+			enumerable: true,
+			configurable: true,
+		});
+	});
+
+	it('returns a class instance or an object from another realm unchanged (by reference)', async () => {
+		class Answer {
+			message = 'ok';
+		}
+		class Rootless {
+			#message = 'ok';
+			toJSON() {
+				return { message: this.#message };
+			}
+		}
+		Object.setPrototypeOf(Rootless.prototype, null);
+		for (const response of [new Answer(), new Rootless(), runInNewContext('({ message: "ok" })')])
+			assert.equal(await materializeOperationResponse(response), response);
 	});
 
 	it('does not drain a string into characters', async () => {
