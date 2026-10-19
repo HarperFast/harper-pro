@@ -61,7 +61,7 @@ gh_get_cached() {
 	case "${status}" in
 		304)
 			# A 304 without its cached body would hide the job until the list changes: refetch.
-			cat "${key}.body" 2>/dev/null || { rm -f "${key}.etag"; gh_get_cached "${path}"; } ;;
+			cat "${key}.body" 2>/dev/null || { rm -f "${key}.etag" && gh_get_cached "${path}"; } ;;
 		200)
 			rm -f "${key}.etag"
 			awk 'body{print;next} /^$/{body=1}' <<<"${raw}" > "${key}.body" || return 1
@@ -111,32 +111,33 @@ turbo_on() {
 	turbo_off_by_us=0
 }
 
-# Turbo left off by a killed supervisor or bench-run: restore it, under the lock so a
-# benchmark cannot start between the check and the write.
-restore_stale_turbo() {
-	local lock_fd
-	turbo_is_off || return 0
-	exec {lock_fd}>"${BENCH_LOCK_DIR}/lock"
-	if flock -n "${lock_fd}"; then
-		log "turbo is off with no benchmark holding the lock; turning it back on"
-		turbo_on
-	fi
-	exec {lock_fd}>&-
-}
-
-# The container runs under dockerd, so it outlives a hard-killed supervisor while the lock is
-# released. Its measurement is already lost then, so a restarted supervisor removes it before
-# treating the host as idle.
+# A drain container runs under dockerd, so it can outlive its docker client or a hard-killed
+# supervisor. Once its drain has ended it is a leftover whose measurement is lost.
 DRAIN_CONTAINER_LABEL=bench-supervisor.drain
 holding_lock=0
 
-remove_orphan_drains() {
-	local orphans
-	orphans="$(docker ps -q --filter "label=${DRAIN_CONTAINER_LABEL}" 2>/dev/null || true)"
-	[ -n "${orphans}" ] || return 0
-	log "removing drain container(s) left by a previous supervisor: ${orphans//$'\n'/ }"
+remove_drain_containers() {
+	local ids
+	ids="$(docker ps -q --filter "label=${DRAIN_CONTAINER_LABEL}" 2>/dev/null || true)"
+	[ -n "${ids}" ] || return 0
+	log "removing leftover drain container(s): ${ids//$'\n'/ }"
 	# shellcheck disable=SC2086 # one container id per word
-	docker rm -f ${orphans} >/dev/null || log "WARNING: could not remove orphaned drain container(s)"
+	docker rm -f ${ids} >/dev/null || log "WARNING: could not remove drain container(s)"
+}
+
+# Clear what a killed supervisor or bench-run left behind (drain containers, turbo off), only
+# while no benchmark holds the lock and under it, so none can start in between.
+recover_idle_host() {
+	local lock_fd
+	exec {lock_fd}>"${BENCH_LOCK_DIR}/lock"
+	if flock -n "${lock_fd}"; then
+		remove_drain_containers
+		if turbo_is_off; then
+			log "turbo is off with no benchmark holding the lock; turning it back on"
+			turbo_on
+		fi
+	fi
+	exec {lock_fd}>&-
 }
 
 # Register a throwaway repo-scoped ephemeral runner that drains exactly one job.
@@ -147,10 +148,11 @@ drain_one() {
 		log "waiting for benchmark lock: $(tr '\n' ' ' < "${BENCH_LOCK_DIR}/holder" 2>/dev/null)"
 		flock "${lock_fd}"
 	fi
-	printf 'name: ci-drain %s\npid: %s\nstarted: %s\n' "${repo}" "$$" "$(date -Is)" > "${BENCH_LOCK_DIR}/holder"
 	holding_lock=1
+	printf 'name: ci-drain %s\npid: %s\nstarted: %s\n' "${repo}" "$$" "$(date -Is)" > "${BENCH_LOCK_DIR}/holder"
 	turbo_off
 	drain_locked "${repo}" {lock_fd}>&-
+	remove_drain_containers
 	turbo_on
 	rm -f "${BENCH_LOCK_DIR}/holder"
 	holding_lock=0
@@ -183,10 +185,9 @@ on_exit() {
 }
 trap on_exit EXIT
 trap 'log "stopping"; exit 0' INT TERM
-remove_orphan_drains
 
 while true; do
-	restore_stale_turbo
+	recover_idle_host
 	for repo in "${REPOS[@]}"; do
 		if has_queued_bench_job "${repo}"; then
 			drain_one "${repo}"

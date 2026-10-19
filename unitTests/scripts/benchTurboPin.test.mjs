@@ -143,14 +143,16 @@ esac`
 			'docker',
 			`case "$1" in
 	ps) cat "${join(dir, 'orphans')}" 2>/dev/null; exit 0 ;;
-	rm) echo "docker $*" >> "${callLog}"; exit 0 ;;
+	rm) echo "docker $*" >> "${callLog}"; rm -f "${join(dir, 'orphans')}"; exit 0 ;;
 esac
 touch "${join(dir, 'drained')}"
 [[ " $* " == *" --label bench-supervisor.drain "* ]] && labelled=labelled
-echo "docker no_turbo=$(cat "${noTurboPath}") $labelled" >> "${callLog}"
+flock -n "${lockDir}/lock" true || locked=locked
+echo "docker no_turbo=$(cat "${noTurboPath}") $labelled $locked" >> "${callLog}"
 case "$FAKE_JOB" in
 	fail) exit 1 ;;
 	hang) exec "${realSleep}" 30 ;;
+	leave) echo live1 > "${join(dir, 'orphans')}"; exit 1 ;;
 	stop) kill -TERM "$(ps -o ppid= -p "$PPID" | tr -d ' ')" ;;
 esac`
 		);
@@ -196,7 +198,7 @@ exit 0`
 			assert.equal(code, 0, stdout);
 			assert.deepEqual(calls, [
 				'sudo -n cpupower set --turbo-boost 0',
-				'docker no_turbo=1 labelled',
+				'docker no_turbo=1 labelled locked',
 				'sudo -n cpupower set --turbo-boost 1',
 			]);
 			assert.equal(readFileSync(noTurboPath, 'utf8').trim(), '0');
@@ -209,7 +211,7 @@ exit 0`
 		assert.match(stdout, /stopping/);
 		assert.deepEqual(calls, [
 			'sudo -n cpupower set --turbo-boost 0',
-			'docker no_turbo=1 labelled',
+			'docker no_turbo=1 labelled locked',
 			'sudo -n cpupower set --turbo-boost 1',
 		]);
 	});
@@ -223,10 +225,11 @@ exit 0`
 		assert.equal(readFileSync(noTurboPath, 'utf8').trim(), '0');
 	});
 
-	it('leaves turbo off while another benchmark holds the lock', async function () {
+	it('leaves turbo and drain containers alone while another benchmark holds the lock', async function () {
 		writeFileSync(noTurboPath, '1\n');
 		writeFileSync(join(dir, 'drained'), '');
 		mkdirSync(lockDir, { recursive: true });
+		writeFileSync(join(dir, 'orphans'), 'busy1\n');
 		const lockPath = join(lockDir, 'lock');
 		const holder = spawn('flock', [lockPath, realSleep, '30'], { stdio: 'ignore', detached: true });
 		try {
@@ -236,6 +239,7 @@ exit 0`
 			const { code, stdout, calls } = await runSupervisor();
 			assert.equal(code, 0, stdout);
 			assert.deepEqual(calls, ['']);
+			assert.equal(readFileSync(join(dir, 'orphans'), 'utf8'), 'busy1\n');
 			assert.equal(readFileSync(noTurboPath, 'utf8').trim(), '1');
 		} finally {
 			process.kill(-holder.pid);
@@ -251,12 +255,23 @@ exit 0`
 		assert.deepEqual(calls, ['docker rm -f abc123', 'sudo -n cpupower set --turbo-boost 1']);
 	});
 
+	it('removes the drain container when the docker client exits without it', async function () {
+		const { code, stdout, calls } = await runSupervisor({ FAKE_JOB: 'leave' });
+		assert.equal(code, 0, stdout);
+		assert.deepEqual(calls, [
+			'sudo -n cpupower set --turbo-boost 0',
+			'docker no_turbo=1 labelled locked',
+			'docker rm -f live1',
+			'sudo -n cpupower set --turbo-boost 1',
+		]);
+	});
+
 	it('answers a repeated poll from the ETag cache', async function () {
 		const { code, stdout, calls } = await runSupervisor({ FAKE_PASSES: '2' });
 		assert.equal(code, 0, stdout);
 		const drain = [
 			'sudo -n cpupower set --turbo-boost 0',
-			'docker no_turbo=1 labelled',
+			'docker no_turbo=1 labelled locked',
 			'sudo -n cpupower set --turbo-boost 1',
 		];
 		assert.deepEqual(calls, [...drain, ...drain]);
@@ -273,6 +288,6 @@ exit 0`
 		writeFileSync(join(dir, 'etags', `${key}.etag`), '"v1"\n');
 		const { code, stdout, calls } = await runSupervisor();
 		assert.equal(code, 0, stdout);
-		assert.equal(calls[1], 'docker no_turbo=1 labelled');
+		assert.equal(calls[1], 'docker no_turbo=1 labelled locked');
 	});
 });
