@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -132,6 +132,7 @@ echo "gh $*" >> "${join(dir, 'gh-calls')}"
 if [ "$2" = -i ]; then
 	if [ "$3" = -H ]; then printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 1; fi
 	printf 'HTTP/2.0 200 OK\\r\\nETag: "v1"\\r\\n\\r\\n'
+	trap 'exit \${FAKE_GH_EXIT:-0}' EXIT
 fi
 case "$*" in
 	*registration-token*) echo token ;;
@@ -142,16 +143,18 @@ esac`
 		stub(
 			'docker',
 			`case "$1" in
-	ps) cat "${join(dir, 'orphans')}" 2>/dev/null; exit 0 ;;
+	ps) [ "$FAKE_DOCKER_PS" = fail ] && exit 1; cat "${join(dir, 'orphans')}" 2>/dev/null; exit 0 ;;
 	rm) echo "docker $*" >> "${callLog}"; rm -f "${join(dir, 'orphans')}"; exit 0 ;;
 esac
 touch "${join(dir, 'drained')}"
+[[ " $* " == *" --init "* ]] && init=init
 [[ " $* " == *" --label bench-supervisor.drain "* ]] && labelled=labelled
 flock -n "${lockDir}/lock" true || locked=locked
-echo "docker no_turbo=$(cat "${noTurboPath}") $labelled $locked" >> "${callLog}"
+echo "docker no_turbo=$(cat "${noTurboPath}") $init $labelled $locked" >> "${callLog}"
 case "$FAKE_JOB" in
 	fail) exit 1 ;;
 	hang) exec "${realSleep}" 30 ;;
+	stubborn) echo stuck1 > "${join(dir, 'orphans')}"; trap '' TERM; exec "${realSleep}" 30 ;;
 	leave) echo live1 > "${join(dir, 'orphans')}"; exit 1 ;;
 	stop) kill -TERM "$(ps -o ppid= -p "$PPID" | tr -d ' ')" ;;
 esac`
@@ -198,7 +201,7 @@ exit 0`
 			assert.equal(code, 0, stdout);
 			assert.deepEqual(calls, [
 				'sudo -n cpupower set --turbo-boost 0',
-				'docker no_turbo=1 labelled locked',
+				'docker no_turbo=1 init labelled locked',
 				'sudo -n cpupower set --turbo-boost 1',
 			]);
 			assert.equal(readFileSync(noTurboPath, 'utf8').trim(), '0');
@@ -211,7 +214,7 @@ exit 0`
 		assert.match(stdout, /stopping/);
 		assert.deepEqual(calls, [
 			'sudo -n cpupower set --turbo-boost 0',
-			'docker no_turbo=1 labelled locked',
+			'docker no_turbo=1 init labelled locked',
 			'sudo -n cpupower set --turbo-boost 1',
 		]);
 	});
@@ -260,7 +263,7 @@ exit 0`
 		assert.equal(code, 0, stdout);
 		assert.deepEqual(calls, [
 			'sudo -n cpupower set --turbo-boost 0',
-			'docker no_turbo=1 labelled locked',
+			'docker no_turbo=1 init labelled locked',
 			'docker rm -f live1',
 			'sudo -n cpupower set --turbo-boost 1',
 		]);
@@ -282,9 +285,34 @@ exit 0`
 		assert.deepEqual(calls, [
 			'docker rm -f old1',
 			'sudo -n cpupower set --turbo-boost 0',
-			'docker no_turbo=1 labelled locked',
+			'docker no_turbo=1 init labelled locked',
 			'sudo -n cpupower set --turbo-boost 1',
 		]);
+	});
+
+	it('kills a job that ignores the timeout and removes its container', async function () {
+		const { code, stdout, calls } = await runSupervisor({ FAKE_JOB: 'stubborn', JOB_KILL_AFTER: '1' });
+		assert.equal(code, 0, stdout);
+		assert.deepEqual(calls, [
+			'sudo -n cpupower set --turbo-boost 0',
+			'docker no_turbo=1 init labelled locked',
+			'docker rm -f stuck1',
+			'sudo -n cpupower set --turbo-boost 1',
+		]);
+	});
+
+	it('skips the drain when drain containers cannot be listed', async function () {
+		const { code, stdout, calls } = await runSupervisor({ FAKE_DOCKER_PS: 'fail' });
+		assert.equal(code, 0, stdout);
+		assert.match(stdout, /skipping the drain/);
+		assert.deepEqual(calls, ['']);
+	});
+
+	it('does not cache a truncated response', async function () {
+		const { code, stdout, calls } = await runSupervisor({ FAKE_GH_EXIT: '1' });
+		assert.equal(code, 0, stdout);
+		assert.deepEqual(calls, ['']);
+		assert.deepEqual(readdirSync(join(dir, 'etags')), []);
 	});
 
 	it('answers a repeated poll from the ETag cache', async function () {
@@ -292,7 +320,7 @@ exit 0`
 		assert.equal(code, 0, stdout);
 		const drain = [
 			'sudo -n cpupower set --turbo-boost 0',
-			'docker no_turbo=1 labelled locked',
+			'docker no_turbo=1 init labelled locked',
 			'sudo -n cpupower set --turbo-boost 1',
 		];
 		assert.deepEqual(calls, [...drain, ...drain]);
@@ -309,6 +337,6 @@ exit 0`
 		writeFileSync(join(dir, 'etags', `${key}.etag`), '"v1"\n');
 		const { code, stdout, calls } = await runSupervisor();
 		assert.equal(code, 0, stdout);
-		assert.equal(calls[1], 'docker no_turbo=1 labelled locked');
+		assert.equal(calls[1], 'docker no_turbo=1 init labelled locked');
 	});
 });

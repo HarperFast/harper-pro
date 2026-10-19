@@ -32,6 +32,7 @@ POLL="${POLL:-20}"               # seconds between queue scans
 # it would otherwise wait for work forever and wedge the supervisor. Cap a single
 # drain above the longest workflow timeout-minutes (stress-large-data = 180m).
 MAX_JOB_SECONDS="${MAX_JOB_SECONDS:-12000}" # 200 min
+JOB_KILL_AFTER="${JOB_KILL_AFTER:-60}"      # seconds after the timeout's TERM before KILL
 
 RUNNER_CPUS="${RUNNER_CPUS:-16}"            # leave cores for the host desktop
 RUNNER_MEMORY="${RUNNER_MEMORY:-16g}"
@@ -52,17 +53,19 @@ mkdir -p "${ETAG_DIR}"
 # GET a REST path, printing its body. Conditional on the last ETag: a 304 does not count
 # against the core rate limit, and this loop re-asks the same questions every POLL seconds.
 gh_get_cached() {
-	local path="$1" key raw status etag
+	local path="$1" key raw status etag rc=0
 	key="${ETAG_DIR}/$(printf %s "${path}" | md5sum | cut -c1-32)"
 	etag="$(cat "${key}.etag" 2>/dev/null || true)"
-	# gh exits non-zero on 304, so read the status line instead of the exit code.
-	raw="$(gh api -i ${etag:+-H "If-None-Match: ${etag}"} "${path}" 2>/dev/null | tr -d '\r' || true)"
+	# gh exits non-zero on 304, so read the status line; a 200 with a non-zero exit is truncated.
+	raw="$(gh api -i ${etag:+-H "If-None-Match: ${etag}"} "${path}" 2>/dev/null)" || rc=$?
+	raw="${raw//$'\r'/}"
 	status="$(awk 'NR==1{print $2}' <<<"${raw}")"
 	case "${status}" in
 		304)
 			# A 304 without its cached body would hide the job until the list changes: refetch.
 			cat "${key}.body" 2>/dev/null || { rm -f "${key}.etag" && gh_get_cached "${path}"; } ;;
 		200)
+			[ "${rc}" = 0 ] || return 1
 			rm -f "${key}.etag"
 			awk 'body{print;next} /^$/{body=1}' <<<"${raw}" > "${key}.body" || return 1
 			awk -F': ' '/^$/{exit} tolower($1)=="etag"{print $2}' <<<"${raw}" > "${key}.etag"
@@ -118,11 +121,12 @@ holding_lock=0
 
 remove_drain_containers() {
 	local ids
-	ids="$(docker ps -q --filter "label=${DRAIN_CONTAINER_LABEL}" 2>/dev/null || true)"
+	ids="$(docker ps -q --filter "label=${DRAIN_CONTAINER_LABEL}" 2>/dev/null)" \
+		|| { log "WARNING: could not list drain containers"; return 1; }
 	[ -n "${ids}" ] || return 0
 	log "removing leftover drain container(s): ${ids//$'\n'/ }"
 	# shellcheck disable=SC2086 # one container id per word
-	docker rm -f ${ids} >/dev/null || log "WARNING: could not remove drain container(s)"
+	docker rm -f ${ids} >/dev/null || { log "WARNING: could not remove drain container(s)"; return 1; }
 }
 
 # Clear what a killed supervisor or bench-run left behind (drain containers, turbo off), only
@@ -131,7 +135,7 @@ recover_idle_host() {
 	local lock_fd
 	exec {lock_fd}>"${BENCH_LOCK_DIR}/lock"
 	if flock -n "${lock_fd}"; then
-		remove_drain_containers
+		remove_drain_containers || true
 		if turbo_is_off; then
 			log "turbo is off with no benchmark holding the lock; turning it back on"
 			turbo_on
@@ -145,17 +149,20 @@ drain_one() {
 	local repo="$1" lock_fd
 	exec {lock_fd}>"${BENCH_LOCK_DIR}/lock"
 	if ! flock -n "${lock_fd}"; then
-		log "waiting for benchmark lock: $(tr '\n' ' ' < "${BENCH_LOCK_DIR}/holder" 2>/dev/null)"
+		log "waiting for benchmark lock: $(tr '\n' ' ' 2>/dev/null < "${BENCH_LOCK_DIR}/holder")"
 		flock "${lock_fd}"
 	fi
 	holding_lock=1
 	printf 'name: ci-drain %s\npid: %s\nstarted: %s\n' "${repo}" "$$" "$(date -Is)" > "${BENCH_LOCK_DIR}/holder"
 	# A previous holder killed while this process waited for the lock can have left one behind.
-	remove_drain_containers
-	turbo_off
-	drain_locked "${repo}" {lock_fd}>&-
-	remove_drain_containers
-	turbo_on
+	if remove_drain_containers; then
+		turbo_off
+		drain_locked "${repo}" {lock_fd}>&-
+		remove_drain_containers || true
+		turbo_on
+	else
+		log "skipping the drain: a leftover drain container may still be running"
+	fi
 	rm -f "${BENCH_LOCK_DIR}/holder"
 	holding_lock=0
 	exec {lock_fd}>&-
@@ -166,7 +173,10 @@ drain_locked() {
 	token="$(gh api -X POST "repos/${repo}/actions/runners/registration-token" --jq .token 2>/dev/null)" \
 		|| { log "token mint failed for ${repo} (skipping)"; return; }
 	log "draining one ${LABEL} job for ${repo}..."
-	timeout "${MAX_JOB_SECONDS}" docker run --rm \
+	# --init: the runner's run.sh is otherwise PID 1 and ignores the TERM that timeout and
+	# systemctl stop forward. -k bounds a client that still does not exit; the container is then
+	# removed after the drain.
+	timeout -k "${JOB_KILL_AFTER}" "${MAX_JOB_SECONDS}" docker run --rm --init \
 		--cpus "${RUNNER_CPUS}" \
 		--memory "${RUNNER_MEMORY}" \
 		--memory-reservation "${RUNNER_MEMORY_RESERVATION}" \
@@ -182,8 +192,11 @@ drain_locked() {
 
 log "repos=[${REPOS[*]}] label=${LABEL} image=${IMAGE} poll=${POLL}s cpus=${RUNNER_CPUS} memory=${RUNNER_MEMORY}"
 on_exit() {
+	if [ "${holding_lock}" = 1 ]; then
+		remove_drain_containers || true
+		rm -f "${BENCH_LOCK_DIR}/holder"
+	fi
 	if [ "${turbo_off_by_us}" = 1 ]; then turbo_on; fi
-	if [ "${holding_lock}" = 1 ]; then rm -f "${BENCH_LOCK_DIR}/holder"; fi
 }
 trap on_exit EXIT
 trap 'log "stopping"; exit 0' INT TERM

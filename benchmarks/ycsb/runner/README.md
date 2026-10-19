@@ -144,6 +144,9 @@ gh workflow run ycsb-cluster-nightly.yml --repo HarperFast/harper-pro -f scale=q
   host keeps headroom (defaults 16 / 16g / 8g).
 - `MAX_JOB_SECONDS` — backstop kill for a single drain if a queued job vanishes before the
   runner binds it (default 12000 = 200 min, above the longest workflow `timeout-minutes`).
+- `JOB_KILL_AFTER` — seconds between the backstop's TERM and a KILL of the docker client
+  (default 60). The container runs with `--init` so it stops on TERM; any container still
+  running after the drain is removed.
 
 ## Sandboxing & safety notes
 
