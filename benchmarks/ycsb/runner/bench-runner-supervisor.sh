@@ -12,10 +12,12 @@
 # this supervisor polls each repo for a queued job that targets the bench label
 # and, when it finds one, registers a throwaway repo-scoped --ephemeral runner
 # that drains exactly that job and exits. Draining is blocking, so at most one
-# job ever runs at a time across all repos — strictly serial, no lock required.
+# job ever runs at a time across all repos; a machine-wide flock also keeps a
+# drain from overlapping a local benchmark.
 #
 # Run under systemd --user (see bench-runner-supervisor.service). Requires:
-# docker, gh (authenticated; repo-admin on each REPO), and the image built:
+# docker, gh (authenticated; repo-admin on each REPO), jq, flock, passwordless
+# `sudo cpupower` (it owns the turbo state, see README), and the image built:
 #   docker build -t harper-bench-runner benchmarks/ycsb/runner
 set -euo pipefail
 
@@ -30,6 +32,7 @@ POLL="${POLL:-20}"               # seconds between queue scans
 # it would otherwise wait for work forever and wedge the supervisor. Cap a single
 # drain above the longest workflow timeout-minutes (stress-large-data = 180m).
 MAX_JOB_SECONDS="${MAX_JOB_SECONDS:-12000}" # 200 min
+JOB_KILL_AFTER="${JOB_KILL_AFTER:-60}"      # seconds after the timeout's TERM before KILL
 
 RUNNER_CPUS="${RUNNER_CPUS:-16}"            # leave cores for the host desktop
 RUNNER_MEMORY="${RUNNER_MEMORY:-16g}"
@@ -39,16 +42,45 @@ RUNNER_CGROUP_PARENT="${RUNNER_CGROUP_PARENT:-}"
 command -v docker >/dev/null || { echo "docker not found"; exit 1; }
 command -v gh >/dev/null || { echo "gh not found"; exit 1; }
 command -v jq >/dev/null || { echo "jq not found"; exit 1; }
+command -v flock >/dev/null || { echo "flock not found"; exit 1; }
+command -v md5sum >/dev/null || { echo "md5sum not found"; exit 1; }
 
 log() { echo "[bench-supervisor] $*"; }
+
+ETAG_DIR="${ETAG_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/bench-supervisor-etags}"
+mkdir -p "${ETAG_DIR}"
+
+# GET a REST path, printing its body. Conditional on the last ETag: a 304 does not count
+# against the core rate limit, and this loop re-asks the same questions every POLL seconds.
+gh_get_cached() {
+	local path="$1" key raw status etag rc=0
+	key="${ETAG_DIR}/$(printf %s "${path}" | md5sum | cut -c1-32)"
+	etag="$(cat "${key}.etag" 2>/dev/null || true)"
+	# gh exits non-zero on 304, so read the status line; a 200 with a non-zero exit is truncated.
+	raw="$(gh api -i ${etag:+-H "If-None-Match: ${etag}"} "${path}" 2>/dev/null)" || rc=$?
+	raw="${raw//$'\r'/}"
+	status="$(awk 'NR==1{print $2}' <<<"${raw}")"
+	case "${status}" in
+		304)
+			# A 304 without its cached body would hide the job until the list changes: refetch.
+			cat "${key}.body" 2>/dev/null || { rm -f "${key}.etag" && gh_get_cached "${path}"; } ;;
+		200)
+			[ "${rc}" = 0 ] || return 1
+			rm -f "${key}.etag"
+			awk 'body{print;next} /^$/{body=1}' <<<"${raw}" > "${key}.body" || return 1
+			awk -F': ' '/^$/{exit} tolower($1)=="etag"{print $2}' <<<"${raw}" > "${key}.etag"
+			cat "${key}.body" ;;
+		*) return 1 ;;
+	esac
+}
 
 # True if $repo has a queued job whose labels include $LABEL.
 has_queued_bench_job() {
 	local repo="$1" ids id
-	ids="$(gh api "repos/${repo}/actions/runs?status=queued&per_page=30" --jq '.workflow_runs[].id' 2>/dev/null)" || return 1
+	ids="$(gh_get_cached "repos/${repo}/actions/runs?status=queued&per_page=30" | jq -r '.workflow_runs[].id')" || return 1
 	for id in ${ids}; do
-		if gh api "repos/${repo}/actions/runs/${id}/jobs" \
-			--jq ".jobs[] | select(.status==\"queued\") | .labels[]" 2>/dev/null \
+		if gh_get_cached "repos/${repo}/actions/runs/${id}/jobs" \
+			| jq -r ".jobs[] | select(.status==\"queued\") | .labels[]" 2>/dev/null \
 			| grep -qx "${LABEL}"; then
 			return 0
 		fi
@@ -56,13 +88,95 @@ has_queued_bench_job() {
 	return 1
 }
 
+# Machine-wide benchmark lock shared with ~/dev/scripts/bench-run, so a CI drain never
+# overlaps a local benchmark. Taken before minting the token (tokens expire after 1h).
+BENCH_LOCK_DIR="${BENCH_LOCK_DIR:-$HOME/dev/tmp/bench-lock}"
+mkdir -p "${BENCH_LOCK_DIR}"
+
+# Benchmarks run with turbo off (cores at base clock) so trend points are comparable; the host
+# runs with turbo on whenever no benchmark holds the lock. The nightly workflow refuses to
+# publish a run that did not see this state, so a failure here only costs that night's point.
+NO_TURBO="${SYSFS_ROOT:-/sys}/devices/system/cpu/intel_pstate/no_turbo"
+turbo_off_by_us=0
+
+set_turbo_boost() { sudo -n cpupower set --turbo-boost "$1" >/dev/null 2>&1; }
+turbo_is_off() { [ "$(cat "${NO_TURBO}" 2>/dev/null)" = 1 ]; }
+
+turbo_off() {
+	turbo_off_by_us=1
+	if ! { set_turbo_boost 0 && turbo_is_off; }; then
+		log "WARNING: could not turn turbo off; this job runs unpinned and stays off the trend"
+	fi
+}
+
+turbo_on() {
+	set_turbo_boost 1 || log "WARNING: could not turn turbo back on"
+	turbo_off_by_us=0
+}
+
+# A drain container runs under dockerd, so it can outlive its docker client or a hard-killed
+# supervisor. Once its drain has ended it is a leftover whose measurement is lost.
+DRAIN_CONTAINER_LABEL=bench-supervisor.drain
+holding_lock=0
+
+remove_drain_containers() {
+	local ids
+	ids="$(docker ps -q --filter "label=${DRAIN_CONTAINER_LABEL}" 2>/dev/null)" \
+		|| { log "WARNING: could not list drain containers"; return 1; }
+	[ -n "${ids}" ] || return 0
+	log "removing leftover drain container(s): ${ids//$'\n'/ }"
+	# shellcheck disable=SC2086 # one container id per word
+	docker rm -f ${ids} >/dev/null || { log "WARNING: could not remove drain container(s)"; return 1; }
+}
+
+# Clear what a killed supervisor or bench-run left behind (drain containers, turbo off), only
+# while no benchmark holds the lock and under it, so none can start in between.
+recover_idle_host() {
+	local lock_fd
+	exec {lock_fd}>"${BENCH_LOCK_DIR}/lock"
+	if flock -n "${lock_fd}"; then
+		remove_drain_containers || true
+		if turbo_is_off; then
+			log "turbo is off with no benchmark holding the lock; turning it back on"
+			turbo_on
+		fi
+	fi
+	exec {lock_fd}>&-
+}
+
 # Register a throwaway repo-scoped ephemeral runner that drains exactly one job.
 drain_one() {
+	local repo="$1" lock_fd
+	exec {lock_fd}>"${BENCH_LOCK_DIR}/lock"
+	if ! flock -n "${lock_fd}"; then
+		log "waiting for benchmark lock: $(tr '\n' ' ' 2>/dev/null < "${BENCH_LOCK_DIR}/holder")"
+		flock "${lock_fd}"
+	fi
+	holding_lock=1
+	printf 'name: ci-drain %s\npid: %s\nstarted: %s\n' "${repo}" "$$" "$(date -Is)" > "${BENCH_LOCK_DIR}/holder"
+	# A previous holder killed while this process waited for the lock can have left one behind.
+	if remove_drain_containers; then
+		turbo_off
+		drain_locked "${repo}" {lock_fd}>&-
+		remove_drain_containers || true
+		turbo_on
+	else
+		log "skipping the drain: a leftover drain container may still be running"
+	fi
+	rm -f "${BENCH_LOCK_DIR}/holder"
+	holding_lock=0
+	exec {lock_fd}>&-
+}
+
+drain_locked() {
 	local repo="$1" token
 	token="$(gh api -X POST "repos/${repo}/actions/runners/registration-token" --jq .token 2>/dev/null)" \
 		|| { log "token mint failed for ${repo} (skipping)"; return; }
 	log "draining one ${LABEL} job for ${repo}..."
-	timeout "${MAX_JOB_SECONDS}" docker run --rm \
+	# --init: the runner's run.sh is otherwise PID 1 and ignores the TERM that timeout and
+	# systemctl stop forward. -k bounds a client that still does not exit; the container is then
+	# removed after the drain.
+	timeout -k "${JOB_KILL_AFTER}" "${MAX_JOB_SECONDS}" docker run --rm --init \
 		--cpus "${RUNNER_CPUS}" \
 		--memory "${RUNNER_MEMORY}" \
 		--memory-reservation "${RUNNER_MEMORY_RESERVATION}" \
@@ -70,15 +184,36 @@ drain_one() {
 		-e RUNNER_REPO_URL="https://github.com/${repo}" \
 		-e RUNNER_TOKEN="${token}" \
 		-e RUNNER_LABELS="${LABEL}" \
-		"${IMAGE}" \
-		|| log "container for ${repo} exited non-zero / timed out (continuing)"
+		--label "${DRAIN_CONTAINER_LABEL}" \
+		"${IMAGE}" &
+	# timeout runs in its own process group, so a Ctrl-C or a kill of this pid alone never reaches
+	# it; waiting in the background lets the INT/TERM trap run at once and stop it in on_exit.
+	wait "$!" || log "container for ${repo} exited non-zero / timed out (continuing)"
 	log "drain for ${repo} complete"
 }
 
 log "repos=[${REPOS[*]}] label=${LABEL} image=${IMAGE} poll=${POLL}s cpus=${RUNNER_CPUS} memory=${RUNNER_MEMORY}"
+on_exit() {
+	local drain_pids
+	trap '' INT TERM
+	drain_pids="$(jobs -p)"
+	if [ -n "${drain_pids}" ]; then
+		# timeout forwards the TERM and applies its -k deadline, so this wait is bounded.
+		# shellcheck disable=SC2086 # one pid per word
+		kill -TERM ${drain_pids} 2>/dev/null || true
+		wait 2>/dev/null || true
+	fi
+	if [ "${holding_lock}" = 1 ]; then
+		remove_drain_containers || true
+		rm -f "${BENCH_LOCK_DIR}/holder"
+	fi
+	if [ "${turbo_off_by_us}" = 1 ]; then turbo_on; fi
+}
+trap on_exit EXIT
 trap 'log "stopping"; exit 0' INT TERM
 
 while true; do
+	recover_idle_host
 	for repo in "${REPOS[@]}"; do
 		if has_queued_bench_job "${repo}"; then
 			drain_one "${repo}"
