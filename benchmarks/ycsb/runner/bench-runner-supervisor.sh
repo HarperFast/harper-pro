@@ -118,7 +118,6 @@ turbo_on() {
 # supervisor. Once its drain has ended it is a leftover whose measurement is lost.
 DRAIN_CONTAINER_LABEL=bench-supervisor.drain
 holding_lock=0
-drain_pid=
 
 remove_drain_containers() {
 	local ids
@@ -189,18 +188,20 @@ drain_locked() {
 		"${IMAGE}" &
 	# timeout runs in its own process group, so a Ctrl-C or a kill of this pid alone never reaches
 	# it; waiting in the background lets the INT/TERM trap run at once and stop it in on_exit.
-	drain_pid=$!
-	wait "${drain_pid}" || log "container for ${repo} exited non-zero / timed out (continuing)"
-	drain_pid=
+	wait "$!" || log "container for ${repo} exited non-zero / timed out (continuing)"
 	log "drain for ${repo} complete"
 }
 
 log "repos=[${REPOS[*]}] label=${LABEL} image=${IMAGE} poll=${POLL}s cpus=${RUNNER_CPUS} memory=${RUNNER_MEMORY}"
 on_exit() {
-	if [ -n "${drain_pid}" ]; then
+	local drain_pids
+	trap '' INT TERM
+	drain_pids="$(jobs -p)"
+	if [ -n "${drain_pids}" ]; then
 		# timeout forwards the TERM and applies its -k deadline, so this wait is bounded.
-		kill -TERM "${drain_pid}" 2>/dev/null || true
-		wait "${drain_pid}" 2>/dev/null || true
+		# shellcheck disable=SC2086 # one pid per word
+		kill -TERM ${drain_pids} 2>/dev/null || true
+		wait 2>/dev/null || true
 	fi
 	if [ "${holding_lock}" = 1 ]; then
 		remove_drain_containers || true
