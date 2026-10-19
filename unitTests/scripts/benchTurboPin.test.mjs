@@ -155,7 +155,7 @@ case "$FAKE_JOB" in
 	fail) exit 1 ;;
 	hang) exec "${realSleep}" 30 ;;
 	stubborn) echo stuck1 > "${join(dir, 'orphans')}"; trap '' TERM; exec "${realSleep}" 30 ;;
-	hold) echo held1 > "${join(dir, 'orphans')}"; exec "${realSleep}" 30 ;;
+	hold) echo held1 > "${join(dir, 'orphans')}"; echo $$ > "${join(dir, 'docker.pid')}"; exec "${realSleep}" 30 ;;
 	leave) echo live1 > "${join(dir, 'orphans')}"; exit 1 ;;
 	stop) kill -TERM "$(ps -o ppid= -p "$PPID" | tr -d ' ')" ;;
 esac`
@@ -329,6 +329,8 @@ exit 0`
 		});
 		assert.equal(code, 0, stdout);
 		assert.ok(Date.now() - started < 10000, 'the supervisor waited out the job');
+		const dockerPid = Number(readFileSync(join(dir, 'docker.pid'), 'utf8'));
+		assert.throws(() => process.kill(dockerPid, 0), { code: 'ESRCH' }, 'the docker client outlived the supervisor');
 		assert.deepEqual(calls, [
 			'sudo -n cpupower set --turbo-boost 0',
 			'docker no_turbo=1 init labelled locked',
