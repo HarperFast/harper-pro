@@ -38,6 +38,9 @@ base clock: 2.3 GHz P-cores, 1.7 GHz E-cores on the current host), and the host 
   back on, and so does its exit trap when the supervisor is stopped mid-job.
 - Each poll pass turns turbo back on if `no_turbo` reads `1` while nobody holds the lock, so a
   supervisor or `bench-run` that was killed leaves turbo off for at most one poll interval.
+- A hard-killed supervisor releases the lock while its container keeps running under dockerd.
+  On startup the supervisor removes any container labelled `bench-supervisor.drain` before it
+  treats the host as idle; that job's measurement was already lost.
 
 This applies to every workflow that targets `harper-bench`, in both repos.
 [`ycsb-cluster-nightly`](../../../.github/workflows/ycsb-cluster-nightly.yml) checks the state
