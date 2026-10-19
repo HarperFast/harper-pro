@@ -155,6 +155,7 @@ case "$FAKE_JOB" in
 	fail) exit 1 ;;
 	hang) exec "${realSleep}" 30 ;;
 	stubborn) echo stuck1 > "${join(dir, 'orphans')}"; trap '' TERM; exec "${realSleep}" 30 ;;
+	hold) echo held1 > "${join(dir, 'orphans')}"; exec "${realSleep}" 30 ;;
 	leave) echo live1 > "${join(dir, 'orphans')}"; exit 1 ;;
 	stop) kill -TERM "$(ps -o ppid= -p "$PPID" | tr -d ' ')" ;;
 esac`
@@ -172,7 +173,7 @@ exit 0`
 		rmSync(dir, { recursive: true, force: true });
 	});
 
-	function runSupervisor(env = {}) {
+	function runSupervisor(env = {}, onSpawn = () => {}) {
 		return new Promise((resolve, reject) => {
 			const child = spawn('bash', [supervisorPath], {
 				env: {
@@ -187,6 +188,7 @@ exit 0`
 				},
 				stdio: ['ignore', 'pipe', 'pipe'],
 			});
+			onSpawn(child);
 			let stdout = '';
 			child.stdout.on('data', (data) => (stdout += data));
 			child.stderr.on('data', (data) => (stdout += data));
@@ -313,6 +315,26 @@ exit 0`
 		assert.equal(code, 0, stdout);
 		assert.deepEqual(calls, ['']);
 		assert.deepEqual(readdirSync(join(dir, 'etags')), []);
+	});
+
+	it('stops at once on a TERM to the supervisor alone mid-job', async function () {
+		const started = Date.now();
+		const { code, stdout, calls } = await runSupervisor({ FAKE_JOB: 'hold', MAX_JOB_SECONDS: '60' }, (child) => {
+			const poll = setInterval(() => {
+				if (readFileSync(callLog, 'utf8').includes('docker no_turbo')) {
+					clearInterval(poll);
+					child.kill('SIGTERM');
+				}
+			}, 20);
+		});
+		assert.equal(code, 0, stdout);
+		assert.ok(Date.now() - started < 10000, 'the supervisor waited out the job');
+		assert.deepEqual(calls, [
+			'sudo -n cpupower set --turbo-boost 0',
+			'docker no_turbo=1 init labelled locked',
+			'docker rm -f held1',
+			'sudo -n cpupower set --turbo-boost 1',
+		]);
 	});
 
 	it('answers a repeated poll from the ETag cache', async function () {

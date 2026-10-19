@@ -185,8 +185,10 @@ drain_locked() {
 		-e RUNNER_TOKEN="${token}" \
 		-e RUNNER_LABELS="${LABEL}" \
 		--label "${DRAIN_CONTAINER_LABEL}" \
-		"${IMAGE}" \
-		|| log "container for ${repo} exited non-zero / timed out (continuing)"
+		"${IMAGE}" &
+	# timeout runs in its own process group, so a Ctrl-C or a kill of this pid alone never reaches
+	# it; waiting in the background lets the INT/TERM trap run at once.
+	wait "$!" || log "container for ${repo} exited non-zero / timed out (continuing)"
 	log "drain for ${repo} complete"
 }
 
