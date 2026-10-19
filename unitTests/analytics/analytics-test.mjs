@@ -1,8 +1,8 @@
 import { assert } from 'chai';
 import axios from 'axios';
 import { setupTestApp } from '../setupTestApp.mjs';
-import { captureProfile, userCodeFolders } from '#src/analytics/profile';
-import analytics from '#src/core/resources/analytics/write';
+import { captureProfile, PROFILER_SAMPLING_METRIC, userCodeFolders } from '#src/analytics/profile';
+import analytics, { recordAction } from '#src/core/resources/analytics/write';
 import { spawn } from 'node:child_process';
 
 describe('Analytics profiling user code', () => {
@@ -32,6 +32,35 @@ describe('Analytics profiling user code', () => {
 		}
 		assert(userUsageRecorded, 'user cpu-usage was recorded in analytics');
 		assert(harperUsageRecorded, 'harper cpu-usage was recorded in analytics');
+	});
+
+	it('stores the profiler-sampling marker in the raw row of the report that overlapped the sampler', async () => {
+		await captureProfile(-1);
+		await captureProfile(10000);
+		const start = Date.now();
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		recordAction(1, 'marker-probe');
+		let probe, marker;
+		const deadline = Date.now() + 5000;
+		while (!probe && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			// the raw table exists once core has stored its first report
+			const rawAnalytics = databases.system.hdb_raw_analytics;
+			if (!rawAnalytics) continue;
+			const rows = await rawAnalytics.search({
+				conditions: [{ attribute: 'id', comparator: 'greater_than_equal', value: start }],
+			});
+			for await (const { metrics } of rows) {
+				const probeHere = metrics.find(({ metric }) => metric === 'marker-probe');
+				if (!probeHere) continue;
+				probe = probeHere;
+				marker = metrics.find(({ metric }) => metric === PROFILER_SAMPLING_METRIC);
+			}
+		}
+		assert(probe, 'the report carrying the probe action was stored');
+		assert(marker, 'profiler-sampling is in the same raw row as the probe');
+		assert.isAtLeast(marker.total, 50, `sampled ${marker?.total}ms since the previous report`);
+		await captureProfile(-1);
 	});
 
 	it('can track child process CPU time', async () => {
