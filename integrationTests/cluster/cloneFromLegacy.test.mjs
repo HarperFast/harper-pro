@@ -16,6 +16,7 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
+import { mkdir, symlink } from 'node:fs/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
 import { sendOperation, readLog } from './clusterShared.mjs';
@@ -30,6 +31,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 const RECORDS_PER_TABLE = 50;
+const FILESYSTEM_ONLY_APP = 'legacy-fs-app';
 const CLONE_AVAILABLE_TIMEOUT_MS = 120000;
 
 async function waitForAvailableStatus(node, timeoutMs = CLONE_AVAILABLE_TIMEOUT_MS, checkInterval = 2000) {
@@ -93,6 +95,27 @@ suite('Clone from legacy v4 leader', { timeout: 240000 }, (ctx) => {
 			}
 			await sendOperation(legacyCtx.harper, { operation: 'upsert', table, records });
 		}
+
+		// A filesystem-only application with the link v4's loader gives every application it loads:
+		// node_modules/harperdb pointing at the v4 install, which a package with node_modules would carry
+		// whole (harper-pro#1050). Linked here rather than by restarting the shared leader.
+		for (const [file, payload] of [
+			['config.yaml', 'rest: true\njsResource:\n  files: resources.js\n'],
+			[
+				'resources.js',
+				'export class LegacyFilesystemApp extends Resource {\n\tget() {\n\t\treturn { ok: true };\n\t}\n}\n',
+			],
+		]) {
+			await sendOperation(legacyCtx.harper, {
+				operation: 'set_component_file',
+				project: FILESYSTEM_ONLY_APP,
+				file,
+				payload,
+			});
+		}
+		const appNodeModules = join(legacyCtx.harper.dataRootDir, 'components', FILESYSTEM_ONLY_APP, 'node_modules');
+		await mkdir(appNodeModules, { recursive: true });
+		await symlink(legacyPath, join(appNodeModules, 'harperdb'), 'dir');
 	});
 
 	after(async () => {
@@ -139,6 +162,16 @@ suite('Clone from legacy v4 leader', { timeout: 240000 }, (ctx) => {
 		ctx.nodes.push(cloneCtx.harper);
 
 		await waitForAvailableStatus(cloneCtx.harper);
+
+		ok(
+			/instead of copying node_modules \(leader v?4\.[\d.]+ cannot stream it\)/.test(await readLog(cloneCtx.harper)),
+			'A clone of a v4 leader must not ask it for node_modules, which would carry the whole v4 install'
+		);
+		const cloneComponents = await sendOperation(cloneCtx.harper, { operation: 'get_components' });
+		ok(
+			cloneComponents.entries?.some((entry) => entry.name === FILESYSTEM_ONLY_APP),
+			'The v4 filesystem-only application must still be cloned'
+		);
 
 		// Both pre-existing tables must be present with their full record
 		// counts on the v5 clone. If the audit-log-only path had been taken,
