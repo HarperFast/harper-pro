@@ -232,11 +232,11 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			],
 		]);
 		const reported = [];
-		const vector = buildOriginCursorVector(rows, 1, nameForId, isMember, true, (id, start) =>
-			reported.push([id, start])
+		const vector = buildOriginCursorVector(rows, 1, nameForId, isMember, true, (id, start, generation) =>
+			reported.push([id, start, generation])
 		);
 		assert.deepStrictEqual(vector, { peer: cursorBelowFloor(T - 10), relayed: T, other: T });
-		assert.deepStrictEqual(reported, [[1, cursorBelowFloor(T - 10)]]);
+		assert.deepStrictEqual(reported, [[1, cursorBelowFloor(T - 10), 'g']]);
 		// without the level-2 route the position still wins where it is newer
 		assert.deepStrictEqual(buildOriginCursorVector(rows, 1, nameForId, isMember, true), {
 			peer: T,
@@ -252,33 +252,36 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.deepStrictEqual(pending.take(false), [[7, T, true, 'gen', true]]);
 	});
 
-	it('PendingRouteState attaches the lowest certified-from mark, holes, partial history and revocations on every update', () => {
+	it('PendingRouteState attaches generation-scoped marks and revocations, settled when their update commits', async () => {
 		const pending = new PendingRouteState();
-		pending.certifiedFrom(1, T);
-		pending.certifiedFrom(1, T - 5);
-		pending.certifiedFrom(1, T + 5);
+		pending.certifiedFrom(1, T, 'g1');
+		pending.certifiedFrom(1, T - 5, 'g1');
+		pending.certifiedFrom(1, T + 5, 'g1');
 		pending.hole(2);
-		pending.partialHistory(3, true);
-		pending.revoke(4);
+		pending.partialHistory(3, true, 'g3');
+		pending.revoke(4, 'g4');
 		assert.strictEqual(pending.size, 4);
-		const event = {};
+		const event = { onCommit: async () => (event.committed = true) };
 		pending.attachTo(event);
-		assert.deepStrictEqual(event, {
-			originRouteStates: [
-				[1, T - 5, undefined, undefined],
-				[2, undefined, undefined, true],
-				[3, undefined, true, undefined],
-			],
-			originFloorRevocations: [4],
-		});
-		// never settled: a held, failed or lost update costs nothing, the next one carries them again
-		pending.partialHistory(3, false);
-		const again = {};
-		pending.attachTo(again);
-		assert.deepStrictEqual(again.originRouteStates[2], [3, undefined, false, undefined]);
+		assert.deepStrictEqual(event.originRouteStates, [
+			[1, T - 5, undefined, undefined, 'g1'],
+			[2, undefined, undefined, true, undefined],
+			[3, undefined, true, undefined, 'g3'],
+		]);
+		assert.deepStrictEqual(event.originFloorRevocations, [[4, 'g4']]);
+		// a held or failed update keeps them for the next one
 		assert.strictEqual(pending.size, 4);
+		// a mark changed after it was attached survives the commit
+		pending.partialHistory(3, false, 'g3');
+		await event.onCommit();
+		assert.strictEqual(event.committed, true);
+		assert.strictEqual(pending.size, 1);
+		const rest = {};
+		pending.takeInto(rest);
+		assert.deepStrictEqual(rest, { originRouteStates: [[3, undefined, false, undefined, 'g3']] });
+		assert.strictEqual(pending.size, 0);
 		const empty = {};
-		new PendingRouteState().attachTo(empty);
+		pending.attachTo(empty);
 		assert.deepStrictEqual(empty, {});
 	});
 
