@@ -343,7 +343,9 @@ stubs with an empty response and supplies current decoder structures for full ro
 tries the remaining residents after an empty stored-stub response; absence requires every non-self
 resident to answer, while an unreachable resident leaves a read error. Id-derived reads retain their
 first-answer semantics. Blob repair shares a subscription socket, so its request and response decoder
-use the peer's table id; a missing usable decoder fails locally. A subscribed sender refuses mismatched
+use the peer's table id; a missing usable decoder fails locally. After a reconnect, an idle table may
+have no decoder until its next replicated write, so blob repair can fail for that table in the meantime.
+A subscribed sender refuses mismatched
 table ids before announcing structures, including after an asynchronous read. Tests: `residencyWire.test.mjs` and the four-node `residencyReads.test.mjs`.
 Receivers need core's equal-version resident guard before an upgraded sender copies stubs as
 invalidations; older receivers can demote a full resident on that tie.
