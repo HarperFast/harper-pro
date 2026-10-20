@@ -462,7 +462,9 @@ never staged it (which §4.3's runbook already forbids) can still anchor wrongly
 
 **A fenced call after an unfenced one is refused too.** If an unfenced call staged the survivors and
 the node then died, their `active` ring is gone and no fence was recorded at that target, so a fenced
-retry is 409. Recover with `record_lock_activate_generation` on each survivor after the drain interval.
+retry is 409. Recover with the per-node operations: stage the target on any survivor that has not
+(`record_lock_stage_generation` with the same `quiesce`), wait the drain interval, then
+`record_lock_activate_generation` on each survivor in the target's `homes`. If the dead node is itself in those `homes`, do not activate a ring it never staged: stage a later generation without it the same way.
 
 A fenced node that comes back is not re-admitted by this call: its `active` disagrees with the
 survivors', so a later apply that lists it refuses at survey ("nodes disagree about the active
