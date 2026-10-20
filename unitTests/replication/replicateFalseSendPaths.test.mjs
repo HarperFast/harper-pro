@@ -238,6 +238,42 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 		assert.match(refused?.[2].error, /is not available for replication/);
 	});
 
+	for (const randomAccessFields of [false, true]) {
+		it(`refreshes growing dictionaries and suppresses redundant announcements (typed: ${randomAccessFields})`, async () => {
+			const name = `GetRecordGrowing${randomAccessFields}`;
+			await loadGQLSchema(`type ${name} @table(randomAccessFields: ${randomAccessFields}) { id: ID @primaryKey }`);
+			const table = tables[name];
+			const StructonPackr = createStructon(Packr);
+			let decoder;
+			for (const [i, value] of [
+				{ id: 'first', payload: 'simple' },
+				{ id: 'second', payload: 'larger', extra: { nested: ['value', 42, false] } },
+			].entries()) {
+				await table.put(value);
+				const start = socket.sent.length;
+				socket.emit('message', encode([GET_RECORD, 50 + i, table.tableId, value.id, table.tableName]));
+				await settle(socket, start + 2);
+				const frames = socket.sent.slice(start);
+				const structure = frames.find((frame) => frame[0] === TABLE_FIXED_STRUCTURE);
+				assert.ok(structure, `no updated decoder for ${value.id}`);
+				decoder = new StructonPackr(structure[1]);
+				assert.deepEqual(decoder.decode(frames.find((frame) => frame[0] === GET_RECORD_RESPONSE)[2].value), value);
+			}
+			for (const [i, id] of ['second', 'missing'].entries()) {
+				const start = socket.sent.length;
+				socket.emit('message', encode([GET_RECORD, 52 + i, table.tableId, id, table.tableName]));
+				await settle(socket, start + 1);
+				const frames = socket.sent.slice(start);
+				assert.deepEqual(
+					frames.map((frame) => frame[0]),
+					[GET_RECORD_RESPONSE]
+				);
+				if (id === 'missing') assert.equal(frames[0][2], undefined);
+				else assert.equal(decoder.decode(frames[0][2].value).extra.nested[1], 42);
+			}
+		});
+	}
+
 	it('refuses blob repair before receiving a usable subscription decoder', async () => {
 		const table = tables.ReplicateFalseShared;
 		const unknown = session.getRecord({ table, id: 'shared', entry: {}, blobRepairOnly: true });

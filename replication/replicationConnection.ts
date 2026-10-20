@@ -5930,15 +5930,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								: table.primaryStore.getBinary(recordId);
 							// A subsequent dictionary read also changes LMDB's thread-local last version.
 							const recordVersion = encoder.isRocksDB ? undefined : getLastVersion();
-							// Dictionaries live at different keys on RocksDB and LMDB; the encoder owns that lookup.
-							encoder._mergeStructures(encoder.getStructures());
-							const typedLength = encoder.typedStructs?.length ?? 0;
-							const structureLength = encoder.structures?.length ?? 0;
+							// Local encoder arrays can lag another worker's writes. Check durable counts,
+							// but avoid rebuilding unchanged dictionaries or loading them for a repeat miss.
+							const counts = binaryEntry && previous?.table === table ? encoder.getStructureCounts() : undefined;
 							if (
 								previous?.table !== table ||
-								previous.typedLength !== typedLength ||
-								previous.structureLength !== structureLength
+								(counts && (previous.typedLength !== counts.typed || previous.structureLength !== counts.classic))
 							) {
+								encoder._mergeStructures(encoder.getStructures());
+								const typedLength = encoder.typedStructs?.length ?? 0;
+								const structureLength = encoder.structures?.length ?? 0;
 								ws.send(
 									encode([
 										TABLE_FIXED_STRUCTURE,
@@ -5956,13 +5957,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (binaryEntry) {
 								let valueBuffer = table.primaryStore.decoder.decode(binaryEntry, { valueAsBuffer: true });
 								const entry: any = lastMetadata || {};
-								// getLastVersion() reads lmdb-native thread-local state that doesn't exist for a
-								// RocksDB store — calling it there throws, silently failing every on-demand record
-								// fetch (GET_RECORD) on RocksDB. Only call it on LMDB. On RocksDB the version is carried
-								// inline on the decoded metadata: when the record has a metadata prefix the decoder
-								// returns that metadata object (=== lastMetadata, value bytes under `.value`, version
-								// already on `entry`); when it doesn't, `valueBuffer` is the plain value buffer and the
-								// version isn't available here (left undefined) — never fall through to getLastVersion().
+								// RocksDB carries the version inline; unwrap its metadata's value bytes.
 								if (table.primaryStore.decoder.isRocksDB) {
 									if (valueBuffer === lastMetadata && lastMetadata != null) {
 										valueBuffer = lastMetadata.value;

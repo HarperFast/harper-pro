@@ -59,6 +59,20 @@ async function get(node, path, options) {
 	return response.data;
 }
 
+async function waitForRecord(node, id) {
+	let record;
+	await waitForCondition(
+		async (signal) => {
+			const response = await request(node, `Sharded/${id}`, { signal });
+			if (response.status !== 200) return false;
+			record = response.data;
+			return true;
+		},
+		{ description: `retrieval connection to serve ${id} after owner restart` }
+	);
+	assert.deepEqual(record, recordFor(id));
+}
+
 function recordFor(id, tag = id) {
 	return { id, tag, body: id, sequence: 42, details: { label: 'nested', values: [1, false, null, 'value'] } };
 }
@@ -352,7 +366,7 @@ suite(`Static sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 60
 		await waitForRows(peer, ['0:failover', '0:other-owner']);
 		await killHarper(contexts[0]);
 		try {
-			assert.deepEqual(await get(reader, 'Sharded/0:failover'), recordFor('0:failover'));
+			await waitForRecord(reader, '0:failover');
 			await put(peer, '0:during-downtime');
 		} finally {
 			await startHarper(contexts[0], optionsFor(owner, 0));
@@ -361,7 +375,7 @@ suite(`Static sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 60
 		await waitForRows(contexts[0].harper, ['0:during-downtime']);
 		await killHarper(contexts[1]);
 		try {
-			assert.deepEqual(await get(reader, 'Sharded/0:other-owner'), recordFor('0:other-owner'));
+			await waitForRecord(reader, '0:other-owner');
 		} finally {
 			await startHarper(contexts[1], optionsFor(peer, 0));
 		}
@@ -370,7 +384,7 @@ suite(`Static sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 60
 		await put(contexts[1].harper, '0:during-restart');
 		await mesh();
 		await waitForRows(contexts[0].harper, ['0:during-downtime', '0:during-restart']);
-		assert.equal((await get(reader, 'Sharded/0:during-restart')).body, '0:during-restart');
+		await waitForRecord(reader, '0:during-restart');
 		await barriers();
 		await checkNonowners(['0:during-downtime', '0:during-restart'], nodes().slice(2));
 		assert.equal(await readNodePid(contexts[0].harper), newPid);
