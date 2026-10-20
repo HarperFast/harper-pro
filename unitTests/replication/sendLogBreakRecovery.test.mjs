@@ -164,11 +164,7 @@ describe('sendLogBreakCommitTransition — whether a denied torn-tail rebuild ha
 		const priorEpisodeEndedWithCommitObserved = sendLogBreakCommitTransition(P1, false, P2);
 		expect(priorEpisodeEndedWithCommitObserved.commitObserved).to.equal(true);
 		const reset = { firstPendingAtDeny: undefined, commitObserved: false };
-		const freshEpisodeFirstDeny = sendLogBreakCommitTransition(
-			reset.firstPendingAtDeny,
-			reset.commitObserved,
-			P1
-		);
+		const freshEpisodeFirstDeny = sendLogBreakCommitTransition(reset.firstPendingAtDeny, reset.commitObserved, P1);
 		expect(freshEpisodeFirstDeny).to.deep.equal({ firstPendingAtDeny: P1, commitObserved: false });
 	});
 });
