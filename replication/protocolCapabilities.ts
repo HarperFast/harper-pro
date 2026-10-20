@@ -40,18 +40,14 @@ export const RECORD_LOCKS_CAPABILITY = 4;
 export const ORIGIN_CURSORS_CAPABILITY = 1;
 
 /**
- * Level at which a peer sends and applies origin-closed floor certificates (harper-pro#922 item 2): the optional
- * per-origin floor vector on `SEQUENCE_ID_UPDATE[2]`, stored as `nodes[].closedFloor`, and a resume request that
- * starts at a stored floor. Advertised only by a build whose transaction logs are per origin (RocksDB), since only
- * core's RocksDB store certifies a floor.
- */
-/**
- * Level 1: floor certificates `{ origin: floor }`. Level 2 (harper-pro#922 items 3–4): checkpoint-grade certificates
- * `{ origin: [floor, generation, fullCoverage] | 0 }` behind a power-loss durable advertisement, floor-only resume
- * and sticky revocation; advertised only by a RocksDB build whose engine can sync the floor record (`syncWal`).
+ * Level at which a peer sends and applies origin-closed floor certificates on `SEQUENCE_ID_UPDATE[2]`, stored as
+ * `nodes[].closedFloor`, and resumes at a stored floor. Level 1: `{ origin: floor }`. Level 2: checkpoint-grade
+ * certificates `{ origin: [floor, generation, fullCoverage] | 0 }` behind a power-loss durable advertisement,
+ * floor-only resume and sticky revocation. Advertised only by a build whose transaction logs are per origin
+ * (RocksDB), at level 2 only when its engine can sync the floor record (`syncWal`).
  */
 export const ORIGIN_FLOORS_CAPABILITY = 2;
-export const CHECKPOINT_FLOORS_LEVEL = 2;
+const CHECKPOINT_FLOORS_LEVEL = 2;
 
 /**
  * Table lifecycle stamps: a peer at this level reads `createdTime` on definitions and structure frames and
@@ -113,8 +109,10 @@ function resolveBudget(value: unknown): number | undefined {
 	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
-/** Keys this build does not know are dropped, so nothing downstream can consult one by accident. */
-/** `localOriginFloors`: the level this build advertises (`buildLocalCapabilities`), the ceiling of the resolved one. */
+/**
+ * Keys this build does not know are dropped, so nothing downstream can consult one by accident.
+ * `localOriginFloors`: the level this build advertises (`buildLocalCapabilities`), the ceiling of the resolved one.
+ */
 export function resolvePeerCapabilities(
 	bag: any,
 	localOriginFloors: number = ORIGIN_FLOORS_CAPABILITY
