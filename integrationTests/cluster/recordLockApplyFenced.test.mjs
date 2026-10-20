@@ -1,7 +1,8 @@
 /**
  * `record_lock_apply_homes { fenced }` on real nodes: a ring member is killed while holding
  * delegations from both survivors, one call with it fenced completes the transition, its exact keys
- * are served by their unchanged homes at once, and restarted with its old row it has no home map.
+ * are served by their unchanged homes at once, and restarted with its old row it has no home map. A
+ * lone survivor of the resulting two-node ring cannot fence the other: no majority of it answers.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -168,5 +169,24 @@ suite('record_lock_apply_homes with a fenced node on a three-node cluster', { ti
 			assert.deepEqual([...(survivorStatus.recordLocks?.[DB]?.members ?? [])].sort(), names.slice(0, 2).sort());
 			assert.equal(await lockStatus(node, ids[0]), 200);
 		}
+	});
+
+	test('a lone survivor of the two-node ring cannot fence the other, and its row is unchanged', async () => {
+		const survivors = names.slice(0, 2);
+		await stopNodeProcess(nodes[1]);
+		const before = await currentRow(nodes[0]);
+		assert.equal(before.active?.generation, 2);
+		const refused = await operation(nodes[0], {
+			operation: 'record_lock_apply_homes',
+			database: DB,
+			homes: [survivors[0]],
+			quiesce: survivors,
+			fenced: [survivors[1]],
+		});
+		assert.equal(refused.status, 409, JSON.stringify(refused.body));
+		assert.match(refused.body.error, /reported by a majority of its members/);
+		const after = await currentRow(nodes[0]);
+		assert.deepEqual(after.active, before.active);
+		assert.equal(after.staged, undefined);
 	});
 });

@@ -438,6 +438,21 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 		});
 		const plan = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, partial, undefined, ['c']);
 		assert.strictEqual(plan.action, 'proceed', plan.reason);
+		// A crash between stages: a staged and recorded the fence, b still serves generation 1. The old
+		// ring has no majority reporting it any more, so only a's recorded fence lets the retry resume.
+		const halfway = replies({
+			a: reply('a', { staged, highestActedOn: 2, supportsFenced: true, fenced: fence }),
+			b: reply('b', { active, highestActedOn: 1, supportsFenced: true }),
+		});
+		const resumed = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, halfway, undefined, ['c']);
+		assert.strictEqual(resumed.action, 'proceed', resumed.reason);
+		assert.strictEqual(resumed.generation, 2);
+		halfway.set('a', reply('a', { staged, highestActedOn: 2, supportsFenced: true }));
+		assert.strictEqual(
+			planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, halfway, undefined, ['c']).status,
+			409,
+			'without the recorded fence, one of three still serving the old ring is no majority'
+		);
 		const done = state(2, ['a', 'b']);
 		const activated = replies({
 			a: reply('a', { active: done, highestActedOn: 2, supportsFenced: true, fenced: fence }),
