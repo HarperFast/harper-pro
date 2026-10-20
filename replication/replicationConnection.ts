@@ -4583,6 +4583,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// a resumed copy restarts at its cursor's table, so it does not make a widened route whole
 					if (copyCompleteReceived && !copyWasResumed) {
 						for (const id of partialMarked) pendingRouteState.partialHistory(id, false);
+						partialMarked.clear();
 						pendingRouteState.takeInto(event);
 					}
 				},
@@ -8637,7 +8638,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				tableSubscriptionToReplicator.send(
 					seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId), undefined, true)
 				);
-			} else if (routeStateDeferred) {
+			}
+			if (routeStateDeferred) {
 				routeStateDeferred = false;
 				tableSubscriptionToReplicator.send(seqUpdateEndTxn(clampedPosition()));
 			}
@@ -9558,6 +9560,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
 		receivingDataFromNodeIds = [];
 		requestIsCopy = false;
+		copyWasResumed = false;
 		const nodeSubscriptions = options.connection?.nodeSubscriptions?.map((node: any) => {
 			const tableSubs = [];
 			let { replicateByDefault } = node;
@@ -9679,7 +9682,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 				}
 			}
-			copyWasResumed = Boolean(copyCursor);
+			if (copyCursor) copyWasResumed = true;
 			for (const state of level2Rows) if (state.partialHistory === true) partialMarked.add(state.id);
 			// For a proxied/indirect subscription: the relayed per-source resume cursor, used ONLY to arm the
 			// leading-duplicate fast-skip (it does not move `startTime` — see the indirect block for why).
