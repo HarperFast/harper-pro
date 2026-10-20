@@ -55,12 +55,12 @@ suite('partial replication reads and placement', { timeout: 600_000 }, (ctx) => 
 			Array.from({ length: 4 }, async () => {
 				const hostname = await getNextAvailableLoopbackAddress();
 				const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
+				const context = { name: ctx.name, harper: { hostname, dataRootDir } };
+				contexts.push(context);
 				await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), {
 					recursive: true,
 					dereference: true,
 				});
-				const context = { name: ctx.name, harper: { hostname, dataRootDir } };
-				contexts.push(context);
 				await startHarper(context, {
 					config: {
 						analytics: { aggregatePeriod: -1 },

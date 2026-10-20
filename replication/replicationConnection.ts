@@ -6008,6 +6008,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								responseData = encode([GET_RECORD_RESPONSE, requestId]);
 							}
 						} catch (error) {
+							if (supersededOrClosed()) break;
 							responseData = encode([
 								GET_RECORD_RESPONSE,
 								requestId,

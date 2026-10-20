@@ -342,6 +342,11 @@ stubs with an empty response and supplies current decoder structures for full ro
 tries the remaining residents after an empty stored-stub response; absence requires every non-self
 resident to answer, while an unreachable resident leaves a read error. Id-derived reads retain their
 first-answer semantics. Tests: `residencyWire.test.mjs` and the four-node `residencyReads.test.mjs`.
+Receivers need core's equal-version resident guard before an upgraded sender copies stubs as
+invalidations; older receivers can demote a full resident on that tie.
+These transport guards do not repair relocate-on-read (#436/#980): query materialization uses the
+existing path, whose missing default residency can mark other peers' partial rows complete. The
+RocksDB relocation audit append can also fail after returning a successful read.
 
 ## Non-obvious behaviors
 

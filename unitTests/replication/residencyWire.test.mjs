@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
+import sinon from 'sinon';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
 import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
@@ -8,8 +9,14 @@ import { transaction } from '#src/core/resources/transaction';
 import { Decoder, readAuditEntry } from '#src/core/resources/auditStore';
 import { INVALIDATED } from '#src/core/resources/Table';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
-import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
+import {
+	databaseSubscriptions,
+	NodeReplicationConnection,
+	replicateOverWS,
+} from '#src/replication/replicationConnection';
 import { setReplicator } from '#src/replication/replicator';
+import { getHDBNodeTable, getReplicationSharedStatus } from '#src/replication/knownNodes';
+import { LATENCY_POSITION } from '#src/replication/sharedStatusSlots';
 
 const SUBSCRIPTION_REQUEST = 129;
 const GET_RECORD = 133;
@@ -50,7 +57,7 @@ async function until(predicate) {
 
 describe('residency stubs on the replication wire', function () {
 	this.timeout(30_000);
-	let Records, socket, session, residencyId;
+	let Records, ReplicationSource, socket, session, residencyId;
 
 	before(async () => {
 		setHdbBasePath(process.env.STORAGE_PATH);
@@ -71,7 +78,13 @@ describe('residency stubs on the replication wire', function () {
 		});
 		assert.ok(Records.primaryStore.getEntry('stub').metadataFlags & INVALIDATED);
 		assert.ok(Records.getResidencyRecord(residencyId).includes(PEER));
-		setReplicator(DATABASE, Records, {});
+		const sourcedFrom = sinon.spy(Records, 'sourcedFrom');
+		try {
+			setReplicator(DATABASE, Records, {});
+			ReplicationSource = sourcedFrom.firstCall.args[0];
+		} finally {
+			sourcedFrom.restore();
+		}
 		await until(() => databaseSubscriptions.get(DATABASE)?.auditStore);
 	});
 
@@ -83,6 +96,47 @@ describe('residency stubs on the replication wire', function () {
 	});
 
 	afterEach(() => socket?.close());
+
+	for (const mode of ['retry', 'absent', 'unreachable', 'id-derived']) {
+		it(`handles ${mode} after the first resident answers not held`, async () => {
+			const peers = [`residency-${mode}-first`, `residency-${mode}-second`];
+			const contacted = [];
+			const connections = [];
+			const sandbox = sinon.createSandbox();
+			const complete = { key: mode, value: { id: mode, body: 'complete' } };
+			try {
+				sandbox.stub(getHDBNodeTable().primaryStore, 'getSync').callsFake((name) => ({
+					name,
+					url: `wss://${name}:9933`,
+				}));
+				sandbox.stub(NodeReplicationConnection.prototype, 'connect').callsFake(function () {
+					connections.push(this);
+					this.isConnected = !(mode === 'unreachable' && this.nodeName === peers[1]);
+				});
+				sandbox.stub(NodeReplicationConnection.prototype, 'getRecord').callsFake(async function () {
+					contacted.push(this.nodeName);
+					return this.nodeName === peers[1] && mode === 'retry' ? complete : undefined;
+				});
+				for (const [index, name] of peers.entries())
+					getReplicationSharedStatus(Records.auditStore, DATABASE, name)[LATENCY_POSITION] = index;
+				Records.dbisDB.putSync([Symbol.for('residency_by_id'), 789], peers);
+				const pending = ReplicationSource.load({
+					key: mode,
+					residencyId: 789,
+					...(mode === 'id-derived' ? { residency: peers } : {}),
+				});
+				if (mode === 'unreachable') await assert.rejects(pending, (error) => error.statusCode === 502);
+				else assert.equal(await pending, mode === 'retry' ? complete : undefined);
+				assert.deepEqual(contacted, mode === 'unreachable' || mode === 'id-derived' ? peers.slice(0, 1) : peers);
+			} finally {
+				for (const connection of connections) {
+					connection.isFinished = true;
+					connection.emit('finished');
+				}
+				sandbox.restore();
+			}
+		});
+	}
 
 	it('names the table on repeated requests so each can resolve the live table', async () => {
 		for (let index = 0; index < 2; index++) {
