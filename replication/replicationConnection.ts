@@ -3026,7 +3026,7 @@ export function collectRelayableCertificates(
 }
 
 /** A row whose floor resumes floor-only: certified with its generation over a whole route, and not revoked. */
-export function checkpointGradeRow(node: any): boolean {
+function checkpointGradeRow(node: any): boolean {
 	return (
 		typeof node?.originGeneration === 'string' &&
 		node.fullCoverage === true &&
@@ -3066,40 +3066,14 @@ export class PendingRouteState {
 		}
 		return mark;
 	}
-	private snapshot(event: any): [Map<number, OriginRouteState> | undefined, Set<number> | undefined] | undefined {
-		if (!this.marks?.size && !this.revocations?.size) return;
-		const marks = this.marks?.size
-			? new Map([...this.marks].map(([id, mark]) => [id, [...mark] as OriginRouteState]))
-			: undefined;
-		const revocations = this.revocations?.size ? new Set(this.revocations) : undefined;
-		if (marks) event.originRouteStates = [...marks.values()];
-		if (revocations) event.originFloorRevocations = [...revocations];
-		return [marks, revocations];
-	}
-	private settle(marks: Map<number, OriginRouteState> | undefined, revocations: Set<number> | undefined): void {
-		for (const [id, sent] of marks ?? []) {
-			const current = this.marks?.get(id);
-			if (current && current.every((value, i) => value === sent[i])) this.marks!.delete(id);
-		}
-		for (const id of revocations ?? []) this.revocations?.delete(id);
-	}
 	/**
-	 * Attaches what is pending; it is settled only when the event commits (an `onCommit` chained after any the
-	 * event has), so a held or failed update keeps the marks for the next one, and a mark changed meanwhile stays.
+	 * Attaches what this socket has recorded. Marks are never settled: core's merge is idempotent and writes the
+	 * row only on a change, so a held, failed or lost update costs nothing and the next one carries them again.
 	 */
 	attachTo(event: any): void {
-		const sent = this.snapshot(event);
-		if (!sent) return;
-		const onCommit = event.onCommit;
-		event.onCommit = async (...args: unknown[]) => {
-			if (onCommit) await onCommit(...args);
-			this.settle(sent[0], sent[1]);
-		};
-	}
-	/** For a commit callback already running: attaches and settles at once. */
-	takeInto(event: any): void {
-		const sent = this.snapshot(event);
-		if (sent) this.settle(sent[0], sent[1]);
+		if (this.marks?.size)
+			event.originRouteStates = [...this.marks.values()].map((mark) => [...mark] as OriginRouteState);
+		if (this.revocations?.size) event.originFloorRevocations = [...this.revocations];
 	}
 	get size(): number {
 		return (this.marks?.size ?? 0) + (this.revocations?.size ?? 0);
@@ -4574,9 +4548,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					await flushCopyRowsDurable();
 					// a base copy holds every table from its start: the route's history is whole again, so the
 					// mark rides this update, after the copied rows are durable
-					if (copyCompleteReceived) {
-						for (const id of receivingDataFromNodeIds ?? []) pendingRouteState.partialHistory(id, false);
-						pendingRouteState.takeInto(event);
+					// a resumed copy restarts at its cursor's table, so it does not make a widened route whole
+					if (copyCompleteReceived && !copyWasResumed) {
+						for (const id of partialMarked) pendingRouteState.partialHistory(id, false);
+						pendingRouteState.attachTo(event);
 					}
 				},
 			};
@@ -4618,6 +4593,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * the subscription has resolved. Never waits on it: the handshake must not block on the placeholder (item 13),
 	 * so an unresolved subscription is retried from a timer, and the next frame carries the marks anyway.
 	 */
+	const clampedPosition = () =>
+		cursorBlockedByBlob() ? lastDurableSequenceId : (lastSequenceIdReceived ?? lastDurableSequenceId ?? 0);
+	let routeStateDeferred = false;
 	function flushRouteState(attempt = 0) {
 		if (pendingRouteState.size === 0 || wsClosed) return;
 		try {
@@ -4631,16 +4609,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (attempt < 60) setTimeout(() => flushRouteState(attempt + 1), 1000).unref();
 				return;
 			}
-			// an open frame's own end_txn carries the marks; a bare update inside it would close its transaction
+			// a bare update inside an open frame would close the frame's transaction: sent once the frame closes
 			if (frameOpen) {
-				drainEndTxnDeferred = true;
+				routeStateDeferred = true;
 				return;
 			}
-			tableSubscriptionToReplicator.send(
-				seqUpdateEndTxn(
-					cursorBlockedByBlob() ? lastDurableSequenceId : (lastSequenceIdReceived ?? lastDurableSequenceId ?? 0)
-				)
-			);
+			tableSubscriptionToReplicator.send(seqUpdateEndTxn(clampedPosition()));
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not send the route marks for', databaseName, error);
 		}
@@ -5299,6 +5273,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		STORAGE_IS_ROCKSDB && peerCapabilitiesLearned && peerCertifiesCheckpointFloors(peerCapabilities);
 	const pendingOriginFloors = new PendingOriginFloors();
 	const pendingRouteState = new PendingRouteState();
+	/** Origins marked partial on this socket, cleared only by a copy begun after the mark. */
+	const partialMarked = new Set<number>();
+	let copyWasResumed = false;
+	let requestIsCopy = false;
 	/**
 	 * A received floor vector as `[localOriginId, floor, relayable]` entries. Names resolve through the durable id
 	 * mapping and never mint an id; this node's own floor is not a certificate for it; a copy's updates carry none.
@@ -8627,6 +8605,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				tableSubscriptionToReplicator.send(
 					seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId), undefined, true)
 				);
+			} else if (routeStateDeferred) {
+				routeStateDeferred = false;
+				tableSubscriptionToReplicator.send(seqUpdateEndTxn(clampedPosition()));
 			}
 		} catch (error) {
 			closeOnInboundMessageError(error, {
@@ -9470,7 +9451,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// a removed node leaves a tombstone, which reads as a clean null; an undecodable row stays a member
 				(name) => probeNodeRow(getHDBNodeTable().primaryStore, name).outcome !== 'deleted',
 				certifiesOriginFloors(),
-				certifiesCheckpointFloors() ? (originId, start) => pendingRouteState.certifiedFrom(originId, start) : undefined
+				// a copy's rows carry no audit entries, so its request proves no prefix for anyone
+				certifiesCheckpointFloors() && !requestIsCopy
+					? (originId, start) => pendingRouteState.certifiedFrom(originId, start)
+					: undefined
 			);
 		} catch (error) {
 			// Without cursors every unlisted origin starts at 0, as it would without the capability.
@@ -9541,6 +9525,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
 		receivingDataFromNodeIds = [];
+		requestIsCopy = false;
 		const nodeSubscriptions = options.connection?.nodeSubscriptions?.map((node: any) => {
 			const tableSubs = [];
 			let { replicateByDefault } = node;
@@ -9621,6 +9606,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// (set in the indirect block below).
 			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
 			let floorOnlyStart: number | undefined;
+			if (copyCursor) requestIsCopy = true;
 			// A floor the peer certified is a proven start, used only while the peer still certifies: a
 			// downgraded peer may write below a floor it saved.
 			if (hasPersistedResumeCursor && connectedNode === node && certifiesOriginFloors()) {
@@ -9644,14 +9630,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const fullCoverage = (options.connection.exclusionOrigins ?? []).includes(node.name);
 				const previous = options.connection.routeFullCoverage;
 				options.connection.routeFullCoverage = fullCoverage;
-				const persistedPartial = level2Rows.some((state) => state.fullCoverage === false);
-				// a route widened to full coverage without a base copy holds no history of the newly included
-				// tables below its position, so nothing it certified before covers them, relayed origins included
-				if (fullCoverage && (previous === false || persistedPartial) && !copyCursor) {
-					for (const state of level2Rows) pendingRouteState.partialHistory(state.id, true);
-					if (!level2Rows.some((state) => state.id === nodeId)) pendingRouteState.partialHistory(nodeId, true);
+				const persistedPartial = level2Rows.some((state) => state.id === nodeId && state.fullCoverage === false);
+				// a route widened to full coverage holds no history of the newly included tables below its
+				// position (a resumed copy restarts at its cursor's table), so nothing it certified before covers
+				// them, relayed origins included; only a copy begun afterwards clears the mark
+				if (fullCoverage && (previous === false || persistedPartial)) {
+					for (const id of new Set([nodeId, ...level2Rows.map((state) => state.id)])) {
+						pendingRouteState.partialHistory(id, true);
+						partialMarked.add(id);
+					}
 				}
 			}
+			if (copyCursor) copyWasResumed = true;
 			// For a proxied/indirect subscription: the relayed per-source resume cursor, used ONLY to arm the
 			// leading-duplicate fast-skip (it does not move `startTime` — see the indirect block for why).
 			let proxiedSkipCursor: number | undefined;

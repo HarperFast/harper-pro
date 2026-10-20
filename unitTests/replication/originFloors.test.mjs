@@ -252,7 +252,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.deepStrictEqual(pending.take(false), [[7, T, true, 'gen', true]]);
 	});
 
-	it('PendingRouteState attaches the lowest certified-from mark, holes, partial history and revocations, settled on commit', async () => {
+	it('PendingRouteState attaches the lowest certified-from mark, holes, partial history and revocations on every update', () => {
 		const pending = new PendingRouteState();
 		pending.certifiedFrom(1, T);
 		pending.certifiedFrom(1, T - 5);
@@ -261,30 +261,24 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		pending.partialHistory(3, true);
 		pending.revoke(4);
 		assert.strictEqual(pending.size, 4);
-		const event = { onCommit: async () => (event.committed = true) };
+		const event = {};
 		pending.attachTo(event);
-		assert.deepStrictEqual(event.originRouteStates, [
-			[1, T - 5, undefined, undefined],
-			[2, undefined, undefined, true],
-			[3, undefined, true, undefined],
-		]);
-		assert.deepStrictEqual(event.originFloorRevocations, [4]);
-		// a held or failed update keeps them for the next one
-		assert.strictEqual(pending.size, 4);
+		assert.deepStrictEqual(event, {
+			originRouteStates: [
+				[1, T - 5, undefined, undefined],
+				[2, undefined, undefined, true],
+				[3, undefined, true, undefined],
+			],
+			originFloorRevocations: [4],
+		});
+		// never settled: a held, failed or lost update costs nothing, the next one carries them again
+		pending.partialHistory(3, false);
 		const again = {};
 		pending.attachTo(again);
-		assert.strictEqual(again.originRouteStates.length, 3);
-		// a mark changed after it was attached survives the commit
-		pending.partialHistory(3, false);
-		await event.onCommit();
-		assert.strictEqual(event.committed, true);
-		assert.strictEqual(pending.size, 1);
-		const rest = {};
-		pending.takeInto(rest);
-		assert.deepStrictEqual(rest, { originRouteStates: [[3, undefined, false, undefined]] });
-		assert.strictEqual(pending.size, 0);
+		assert.deepStrictEqual(again.originRouteStates[2], [3, undefined, false, undefined]);
+		assert.strictEqual(pending.size, 4);
 		const empty = {};
-		pending.attachTo(empty);
+		new PendingRouteState().attachTo(empty);
 		assert.deepStrictEqual(empty, {});
 	});
 
