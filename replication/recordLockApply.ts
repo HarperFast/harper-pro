@@ -243,11 +243,12 @@ export function planSurvey(
 	}
 	const digest = digestOf(generation, homes);
 	// A fenced node is never surveyed, and if it comes back serving its old map only a peer in that
-	// map's ring can disagree with it. A surveyed `active` ring that places it beside a node that is
-	// not fenced is such a peer: activating that ring needed every member staged, the fenced node
-	// included, so its row moved on with it. A staged ring is not, since the fenced node may never
-	// have staged it. Failing that, a fence an earlier call of this transition recorded on a survivor
-	// already at its target.
+	// map's ring can disagree with it. The anchor is an `active` ring holding it that a strict majority
+	// of that ring's members report active. A single survivor's row can be stale: the fenced node may
+	// itself have fenced that survivor out in an earlier transition, and only a majority is sure to
+	// include a node that saw it. A staged ring is no anchor, since the fenced node may never have
+	// staged it. Failing that, a fence an earlier call of this transition recorded on a survivor
+	// already at its target; that call passed this same check.
 	const surveyed = [...rows.values()];
 	if (observer && !('error' in observer.reply)) surveyed.push(observer.reply);
 	const unanchored = fenced.filter((node) => {
@@ -255,9 +256,15 @@ export function planSurvey(
 			.flatMap((reply) => [reply.active, reply.staged])
 			.filter((ring) => ring?.homes.includes(node));
 		if (rings.some((ring) => ring!.homes.every((home) => fenced.includes(home)))) return true;
-		const anchored = surveyed.some(
-			(reply) => reply.active?.homes.includes(node) && reply.active.homes.some((home) => !fenced.includes(home))
-		);
+		const anchored = surveyed.some((reply) => {
+			const ring = reply.active;
+			if (!ring?.homes.includes(node)) return false;
+			const answering = ring.homes.filter((home) => {
+				const active = rows.get(home)?.active;
+				return active?.generation === ring.generation && active.digest === ring.digest;
+			});
+			return answering.length * 2 > ring.homes.length;
+		});
 		const recorded = [...rows.values()].some(
 			(reply) =>
 				[reply.active, reply.staged].some((state) => state?.generation === generation && state.digest === digest) &&
@@ -274,7 +281,7 @@ export function planSurvey(
 		return {
 			action: 'refuse',
 			status: 409,
-			reason: `no surviving node's active ring places ${unanchored.join(', ')} beside a node that is not fenced, so nothing would refuse its old map if it came back; apply without fenced once it is reachable, or stage it with the per-node operations`,
+			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; apply without fenced once it is reachable, or use the per-node operations and keep it stopped until it is re-staged`,
 		};
 	const alreadyActive = new Set<string>();
 	const alreadyStaged = new Set<string>();

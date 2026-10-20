@@ -335,7 +335,7 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 		);
 		assert.strictEqual(plan.action, 'refuse');
 		assert.strictEqual(plan.status, 409);
-		assert.match(plan.reason, /no surviving node's active ring places c beside a node that is not fenced/);
+		assert.match(plan.reason, /no active ring holding c is reported by a majority of its members/);
 	});
 
 	it('refuses a fenced node whose latest known ring holds only fenced nodes', () => {
@@ -349,7 +349,7 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 		});
 		const plan = planSurvey('db', ['a'], ['a', 'c'], undefined, departed, undefined, ['c']);
 		assert.strictEqual(plan.status, 409);
-		assert.match(plan.reason, /places c beside a node that is not fenced/);
+		assert.match(plan.reason, /no active ring holding c is reported by a majority/);
 		const pair = planSurvey(
 			'db',
 			['a'],
@@ -382,6 +382,53 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 		assert.strictEqual(planSurvey('db', ['a'], ['a', 'c'], undefined, manual, undefined, ['c']).status, 409);
 	});
 
+	it('needs a strict majority of the anchoring ring to report it active', () => {
+		const five = state(1, ['a', 'b', 'c', 'd', 'e']);
+		const answering = (nodes) =>
+			replies(
+				Object.fromEntries(
+					nodes.map((node) => [node, reply(node, { active: five, highestActedOn: 1, supportsFenced: true })])
+				)
+			);
+		const all = ['a', 'b', 'c', 'd', 'e'];
+		const three = planSurvey('db', ['a', 'b', 'c'], all, undefined, answering(['a', 'b', 'c']), undefined, ['d', 'e']);
+		assert.strictEqual(three.action, 'proceed', three.reason);
+		const two = planSurvey('db', ['a', 'b'], all, undefined, answering(['a', 'b']), undefined, ['c', 'd', 'e']);
+		assert.strictEqual(two.status, 409, 'two of five');
+		const pair = state(1, ['a', 'b']);
+		const half = planSurvey(
+			'db',
+			['a'],
+			['a', 'b'],
+			undefined,
+			replies({ a: reply('a', { active: pair, highestActedOn: 1, supportsFenced: true }) }),
+			undefined,
+			['b']
+		);
+		assert.strictEqual(half.status, 409, 'one of two');
+		assert.match(half.reason, /no active ring holding b is reported by a majority/);
+	});
+
+	it('refuses each side of a cohort flip-flop, which would leave two rings granting', () => {
+		// Two nodes: with b down a fences b and activates {a}; later, with a down, b restarts on its
+		// generation-1 row and fences a. Both would serve a ring of one, with no peer to disagree.
+		const pair = state(1, ['a', 'b']);
+		const solo = (node) => replies({ [node]: reply(node, { active: pair, highestActedOn: 1, supportsFenced: true }) });
+		assert.strictEqual(planSurvey('db', ['a'], ['a', 'b'], undefined, solo('a'), undefined, ['b']).status, 409);
+		assert.strictEqual(planSurvey('db', ['b'], ['a', 'b'], undefined, solo('b'), undefined, ['a']).status, 409);
+		// Three nodes: c alone fences a and b; later a and b, restarted on generation 1, fence c.
+		const first = planSurvey(
+			'db',
+			['c'],
+			['a', 'b', 'c'],
+			undefined,
+			replies({ c: reply('c', { active, highestActedOn: 1, supportsFenced: true }) }),
+			undefined,
+			['a', 'b']
+		);
+		assert.strictEqual(first.status, 409, 'the minority side is refused, so the later majority row is not stale');
+	});
+
 	it('accepts a retry of the same fenced transition from the fence its earlier call recorded', () => {
 		const fence = [{ node: 'c', operator: 'op', at: 1, generation: 2, fencedWith: ['c'] }];
 		const staged = state(2, ['a', 'b'], { quiesce: ['a', 'b', 'c'] });
@@ -405,7 +452,7 @@ describe('planSurvey with fenced nodes (harper-pro#973)', () => {
 		});
 		const refusedStale = planSurvey('db', ['a', 'b'], ['a', 'b', 'c'], undefined, stale, undefined, ['c']);
 		assert.strictEqual(refusedStale.status, 409, 'a fence from an earlier transition does not anchor a later one');
-		assert.match(refusedStale.reason, /active ring places c beside/);
+		assert.match(refusedStale.reason, /no active ring holding c is reported by a majority/);
 		// Two calls that each fenced one node do not add up to a witness for a call fencing both.
 		const target = state(2, ['a'], { quiesce: ['a', 'b', 'c'] });
 		const pieced = replies({
