@@ -22,6 +22,14 @@ import mqtt from 'mqtt';
 import { killHarper, startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
 
+// Level 2 is advertised only by an engine that syncs the floor record (`syncWal`, rocksdb-js#949); on 2.12.0 no
+// node certifies at level 2 and every case below would wait out its deadline.
+const engine = await import('@harperfast/rocksdb-js');
+const ENGINE_SKIP =
+	typeof engine.RocksDatabase?.prototype?.syncWal === 'function'
+		? false
+		: 'the installed @harperfast/rocksdb-js has no syncWal(), so no level-2 floor certificate is advertised';
+
 const TEST_DIR = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -164,7 +172,8 @@ const subscribeMqtt = (client, topic) =>
 const endMqtt = (client) => new Promise((resolve) => client.end(true, {}, () => resolve()));
 const topicIds = (received) => received.map(({ topic }) => topic.split('/').pop());
 
-suite('Subscription checkpoints resume across nodes (harper-pro#922 items 3–4)', { timeout: 900_000 }, (ctx) => {
+const SUITE = 'Subscription checkpoints resume across nodes (harper-pro#922 items 3–4)';
+suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
 	before(async () => {
 		[ctx.A, ctx.B, ctx.C, ctx.E] = await Promise.all([
 			startNewNode(ctx.name),
