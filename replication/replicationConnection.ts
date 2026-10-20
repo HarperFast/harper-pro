@@ -4821,7 +4821,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const MAX_OUTSTANDING_COMMITS = env.get(CONFIG_PARAMS.REPLICATION_RECORDCONCURRENCY) ?? 150; // maximum before requesting that other nodes pause
 	const MAX_OUTSTANDING_BLOBS_BEING_SENT = env.get(CONFIG_PARAMS.REPLICATION_BLOBCONCURRENCY) ?? 5;
 	let outstandingCommits = 0;
-	let lastStructureLength = 0;
+	const recordRequestTables = new Map<
+		number,
+		{ name: string; table: any; typedLength: number; structureLength: number }
+	>();
 	let commitBacklogPaused = false;
 	// Wall-clock at which the current back-pressure pause began (0 when not paused). Used to discount the
 	// paused interval from the blob-stream timeout: while paused no chunks are processed so every in-flight
@@ -5894,15 +5897,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let responseData: Buffer;
 						try {
 							const recordId = message[3];
+							const previous = recordRequestTables.get(tableId);
+							const tableName = message[4] ?? previous?.name;
 							// Resolved per request, not cached: a cached class outlives a drop.
-							const table = tables?.[message[4]];
-							if (!table || !tableReplicates(table)) {
+							const table = tables && Object.hasOwn(tables, tableName) ? tables[tableName] : undefined;
+							// A subscription uses this sender's ids. An older repair client may send
+							// its own id; announcing under it could replace another streamed table's decoder.
+							if (!table || !tableReplicates(table) || (nodeSubscriptions && tableId !== table.tableId)) {
 								// One wording for every case, so a guessing peer cannot tell them apart.
 								logger.warn?.(
 									connectionId,
 									'Refusing record request for',
 									databaseName,
-									message[4],
+									tableName,
 									'from',
 									remoteNodeName
 								);
@@ -5910,34 +5917,42 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									encode([
 										GET_RECORD_RESPONSE,
 										requestId,
-										{ error: `Table ${databaseName}.${message[4]} is not available for replication` },
+										{ error: `Table ${databaseName}.${tableName} is not available for replication` },
 									])
 								);
 								break;
 							}
-							// we are sending raw binary data back, so we have to send the typed structure information so the
-							// receiving side can properly decode it. We only need to send this once until it changes again, so we can check if the structure
-							// has changed. It will only grow, so we can just check the length.
-							const structuresBinary = table.primaryStore.getBinaryFast(Symbol.for('structures'));
-							const structureLength = structuresBinary?.length ?? 0;
-							if (structureLength > 0 && structureLength !== lastStructureLength) {
-								lastStructureLength = structureLength;
-								const structure = decode(structuresBinary);
+							const encoder = table.primaryStore.encoder;
+							// Read an exact-sized, stable value before its dictionaries: another worker may
+							// commit a record with a new structure between these reads.
+							const binaryEntry = encoder.isRocksDB
+								? table.primaryStore.getBinarySync(recordId)
+								: table.primaryStore.getBinary(recordId);
+							// A subsequent dictionary read also changes LMDB's thread-local last version.
+							const recordVersion = encoder.isRocksDB ? undefined : getLastVersion();
+							// Dictionaries live at different keys on RocksDB and LMDB; the encoder owns that lookup.
+							encoder._mergeStructures(encoder.getStructures());
+							const typedLength = encoder.typedStructs?.length ?? 0;
+							const structureLength = encoder.structures?.length ?? 0;
+							if (
+								previous?.table !== table ||
+								previous.typedLength !== typedLength ||
+								previous.structureLength !== structureLength
+							) {
 								ws.send(
 									encode([
 										TABLE_FIXED_STRUCTURE,
 										{
-											typedStructs: structure.typed,
-											structures: structure.named,
+											typedStructs: encoder.typedStructs,
+											structures: encoder.structures,
 											createdTime: advertisedCreatedTime(table),
 										},
 										tableId,
 										table.tableName,
 									])
 								);
+								recordRequestTables.set(tableId, { name: tableName, table, typedLength, structureLength });
 							}
-							// we might want to prefetch here
-							const binaryEntry = table.primaryStore.getBinaryFast(recordId);
 							if (binaryEntry) {
 								let valueBuffer = table.primaryStore.decoder.decode(binaryEntry, { valueAsBuffer: true });
 								const entry: any = lastMetadata || {};
@@ -5953,7 +5968,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										valueBuffer = lastMetadata.value;
 									}
 								} else {
-									entry.version = getLastVersion();
+									entry.version = recordVersion;
 								}
 								if (lastMetadata && lastMetadata[METADATA] & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
@@ -9616,7 +9631,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 		});
 	}
-	const sentTableNames = [];
 	return {
 		end() {
 			// cleanup
@@ -9632,15 +9646,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// send a request for a specific record
 			const requestId = nextId++;
 			return new Promise((resolve, reject) => {
-				const message = [GET_RECORD, requestId, request.table.tableId, request.id];
-				if (!sentTableNames[request.table.tableId]) {
-					message.push(request.table.tableName);
-					sentTableNames[request.table.tableId] = true;
+				let tableId = request.table.tableId;
+				if (request.blobRepairOnly) {
+					// Repair shares the subscription stream's decoder namespace: use the peer's id, not ours.
+					const peerTableId = Object.keys(tableDecoders).find(
+						(id) => tableDecoders[id]?.name === request.table.tableName && !peerGenerationRefused(tableDecoders[id])
+					);
+					if (peerTableId === undefined) {
+						reject(new Error(`No subscription decoder for blob repair of ${request.table.tableName}`));
+						return;
+					}
+					tableId = Number(peerTableId);
 				}
+				const message = [GET_RECORD, requestId, tableId, request.id, request.table.tableName];
 				ws.send(encode(message));
 				lastMessageTime = performance.now();
 				awaitingResponse.set(requestId, {
-					tableId: request.table.tableId,
+					tableId,
 					key: request.id,
 					resolve(entry) {
 						const { table, entry: existingEntry, blobRepairOnly } = request;

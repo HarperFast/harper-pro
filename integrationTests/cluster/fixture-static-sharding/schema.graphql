@@ -1,0 +1,20 @@
+type Sharded @table @export {
+	id: ID @primaryKey
+	tag: String @indexed
+	body: String
+	sequence: Int
+	details: Any
+}
+type OtherSharded @table @export {
+	id: ID @primaryKey
+	body: String
+}
+type Placed @table @export {
+	id: ID @primaryKey
+	homes: [String]
+	tag: String @indexed
+	body: String
+}
+type Barrier @table @export {
+	id: ID @primaryKey
+}
