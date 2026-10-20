@@ -333,6 +333,16 @@ discipline paces _retries_, and jittering a durability deadline would be activel
 
 ---
 
+## Send-side residency
+
+A stub is never sent, served, or stored as a complete record. `sendAuditRecord` sends every write to
+every non-resident peer as an invalidation unless residency is by id. The copy walk uses `invalidate`
+for `INVALIDATED` rows and translates the stored residency flag to the audit flag. GET_RECORD refuses
+stubs with an empty response and supplies current decoder structures for full rows. `Replicator.load`
+tries the remaining residents after an empty stored-stub response; absence requires every non-self
+resident to answer, while an unreachable resident leaves a read error. Id-derived reads retain their
+first-answer semantics. Tests: `residencyWire.test.mjs` and the four-node `residencyReads.test.mjs`.
+
 ## Non-obvious behaviors
 
 1. **Auth failures don't send DISCONNECT.** When the `authorization` promise rejects in `replicateOverWS`, the connection closes with "Unauthorized" but no DISCONNECT frame is sent — the client is expected to retry.
