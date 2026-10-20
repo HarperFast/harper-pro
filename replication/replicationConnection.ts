@@ -37,8 +37,10 @@ import {
 	COPIED_RECORD,
 	isLockControlType,
 	readOriginClosedFloor,
+	getDatabaseGeneration,
 } from '../core/resources/auditStore.ts';
-import { isValidFloor } from '../core/resources/originClosedFloor.ts';
+import { isValidFloor, originFloorsDurable } from '../core/resources/originClosedFloor.ts';
+import { RocksDatabase } from '@harperfast/rocksdb-js';
 import {
 	exportIdMapping,
 	getIdOfRemoteNode,
@@ -104,6 +106,7 @@ import {
 	noteUnknownCommand,
 	peerSupportsOriginCursors,
 	peerSupportsOriginFloors,
+	peerCertifiesCheckpointFloors,
 	peerSupportsRecordLocks,
 	peerSupportsResidencyNotResident,
 	peerSupportsResidencyStubCopy,
@@ -813,7 +816,9 @@ const SEND_SUBSCRIPTION_SETUP_BUDGET_MS = SEND_SUBSCRIPTION_RESOLVE_TIMEOUT * 2 
 const LOCAL_CAPABILITIES = buildLocalCapabilities(
 	SEND_SUBSCRIPTION_SETUP_BUDGET_MS,
 	CLUSTER_RECORD_LOCKS_ENABLED,
-	STORAGE_IS_ROCKSDB
+	STORAGE_IS_ROCKSDB,
+	// level 2 needs the floor record on disk before it is advertised, which only an engine with syncWal gives
+	originFloorsDurable(RocksDatabase.prototype)
 );
 // Shared by every socket in this worker thread, so one peer cannot emit a warn line per socket per
 // window by sending a single unrecognized frame on each. Per-socket counts stay on each connection.
@@ -2939,9 +2944,45 @@ export function resumeStartWithFloor(position: number, closedFloor: unknown): nu
 
 export function parseOriginFloors(value: unknown): Map<string, number> {
 	const floors = new Map<string, number>();
-	if (!value || typeof value !== 'object' || Array.isArray(value)) return floors;
-	for (const [name, floor] of Object.entries(value)) if (isValidFloor(floor)) floors.set(name, floor);
+	for (const [name, certificate] of parseOriginCertificates(value)) {
+		if (certificate.floor !== undefined) floors.set(name, certificate.floor);
+	}
 	return floors;
+}
+
+/** A level-2 certificate: `floor` alone from a level-1 peer; `generation` and `fullCoverage` from level 2; `revoked` for `0`. */
+export interface OriginCertificate {
+	floor?: number;
+	generation?: string;
+	fullCoverage?: boolean;
+	revoked?: boolean;
+}
+
+/**
+ * `{ origin: floor | [floor, generation, fullCoverage] | 0 }`: a malformed entry is dropped, so that origin keeps
+ * what it had; `0` is a revocation.
+ */
+export function parseOriginCertificates(value: unknown): Map<string, OriginCertificate> {
+	const certificates = new Map<string, OriginCertificate>();
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return certificates;
+	for (const [name, entry] of Object.entries(value)) {
+		if (entry === 0) certificates.set(name, { revoked: true });
+		else if (isValidFloor(entry)) certificates.set(name, { floor: entry });
+		else if (Array.isArray(entry) && isValidFloor(entry[0]) && typeof entry[1] === 'string' && entry[1].length > 0) {
+			certificates.set(name, { floor: entry[0], generation: entry[1], fullCoverage: entry[2] === true });
+		}
+	}
+	return certificates;
+}
+
+/** The wire form of a certificate for a peer at `level`; undefined when the peer cannot take it. */
+export function encodeOriginCertificate(certificate: OriginCertificate, level: number): unknown {
+	if (certificate.revoked) return level >= 2 ? 0 : undefined;
+	if (certificate.floor === undefined) return undefined;
+	if (level >= 2 && typeof certificate.generation === 'string') {
+		return [certificate.floor, certificate.generation, certificate.fullCoverage === true];
+	}
+	return certificate.floor;
 }
 
 /** `certifies`: an origin whose current socket no longer certifies may be an older binary writing below its floor. */
@@ -2952,29 +2993,111 @@ export function collectRelayableFloors(
 	certifies: (name: string) => boolean
 ): Map<string, number> {
 	const floors = new Map<string, number>();
-	if (!nameToId) return floors;
-	for (const name of originNames) {
-		if (!Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number' || !certifies(name)) continue;
-		const id = nameToId[name];
-		const nodes = seqRows.get(id)?.nodes;
-		const state = Array.isArray(nodes) ? nodes.find((node) => node?.id === id) : undefined;
-		if (state?.relayable === true && isValidFloor(state.closedFloor)) floors.set(name, state.closedFloor);
+	for (const [name, certificate] of collectRelayableCertificates(seqRows, originNames, nameToId, certifies)) {
+		if (certificate.floor !== undefined) floors.set(name, certificate.floor);
 	}
 	return floors;
 }
 
+/**
+ * The certificates this node may relay for its direct origins: a revoked row relays `0`; the level-2 fields are
+ * forwarded only from a row whose own socket certifies at level 2 now (`certifies(name)` returns the level), so a
+ * downgraded origin's checkpoint-grade qualifiers stop at this hop.
+ */
+export function collectRelayableCertificates(
+	seqRows: Map<number, DbisCursor>,
+	originNames: Iterable<string>,
+	nameToId: Record<string, number> | undefined,
+	certifies: (name: string) => boolean | number
+): Map<string, OriginCertificate> {
+	const certificates = new Map<string, OriginCertificate>();
+	if (!nameToId) return certificates;
+	for (const name of originNames) {
+		if (!Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number') continue;
+		const id = nameToId[name];
+		const nodes = seqRows.get(id)?.nodes;
+		const state = Array.isArray(nodes) ? nodes.find((node) => node?.id === id) : undefined;
+		if (!state) continue;
+		if (state.floorRevoked === true) {
+			certificates.set(name, { revoked: true });
+			continue;
+		}
+		const level = certifies(name);
+		if (!level) continue;
+		if (state.relayable !== true || !isValidFloor(state.closedFloor)) continue;
+		const certificate: OriginCertificate = { floor: state.closedFloor };
+		if (level === 2 && typeof state.originGeneration === 'string' && state.fullCoverage === true) {
+			certificate.generation = state.originGeneration;
+			certificate.fullCoverage = true;
+		}
+		certificates.set(name, certificate);
+	}
+	return certificates;
+}
+
+/** Route state core merges into the seq row (`originRouteStates`): `[id, certifiedFrom, partialHistory, hole]`. */
+export type OriginRouteState = [number, number | undefined, boolean | undefined, boolean | undefined];
+/** Keeps this connection's route marks and revocations until a sequence update carries them. */
+export class PendingRouteState {
+	private marks: Map<number, OriginRouteState> | undefined;
+	private revocations: Set<number> | undefined;
+	certifiedFrom(originId: number, start: number): void {
+		const mark = this.mark(originId);
+		if (!(mark[1] <= start)) mark[1] = start;
+	}
+	partialHistory(originId: number, partial: boolean): void {
+		this.mark(originId)[2] = partial;
+	}
+	hole(originId: number): void {
+		this.mark(originId)[3] = true;
+	}
+	revoke(originId: number): void {
+		(this.revocations ??= new Set()).add(originId);
+	}
+	private mark(originId: number): OriginRouteState {
+		let mark = (this.marks ??= new Map()).get(originId);
+		if (!mark) {
+			mark = [originId, undefined, undefined, undefined] as OriginRouteState;
+			this.marks.set(originId, mark);
+		}
+		return mark;
+	}
+	/** Attaches and clears what is pending; nothing is attached when nothing is pending. */
+	attachTo(event: any): void {
+		if (this.marks?.size) {
+			event.originRouteStates = [...this.marks.values()];
+			this.marks = undefined;
+		}
+		if (this.revocations?.size) {
+			event.originFloorRevocations = [...this.revocations];
+			this.revocations = undefined;
+		}
+	}
+	get size(): number {
+		return (this.marks?.size ?? 0) + (this.revocations?.size ?? 0);
+	}
+}
+
 /** Keeps the floors a sequence update carried until the blob rule lets them be persisted. */
+export type ReceivedOriginFloor = [number, number, boolean, string?, boolean?];
 export class PendingOriginFloors {
-	private pending: Map<number, [number, number, boolean]> | undefined;
-	note(floors: Iterable<[number, number, boolean]> | undefined): void {
+	private pending: Map<number, ReceivedOriginFloor> | undefined;
+	note(floors: Iterable<ReceivedOriginFloor> | undefined): void {
 		if (!floors) return;
 		for (const floor of floors) {
 			const existing = (this.pending ??= new Map()).get(floor[0]);
 			if (!existing || existing[1] < floor[1]) this.pending.set(floor[0], floor);
-			else if (existing[1] === floor[1] && floor[2] && !existing[2]) existing[2] = true;
+			else if (existing[1] === floor[1]) {
+				if (floor[2] && !existing[2]) existing[2] = true;
+				// a level-2 certificate for the same floor carries what a level-1 one lacks
+				if (floor[3] !== undefined && existing[3] === undefined) {
+					existing[3] = floor[3];
+					existing[4] = floor[4];
+				} else if (floor[4] && !existing[4] && floor[3] === existing[3]) existing[4] = true;
+			}
 		}
 	}
-	take(blocked: boolean): [number, number, boolean][] | undefined {
+	take(blocked: boolean): ReceivedOriginFloor[] | undefined {
 		if (!this.pending?.size || blocked) return undefined;
 		const floors = [...this.pending.values()];
 		this.pending.clear();
@@ -3011,11 +3134,20 @@ export function buildOriginCursorVector(
 	peerId: number,
 	nameForId: (id: number) => string | undefined,
 	isMember: (name: string) => boolean,
-	useFloors = false
+	useFloors = false,
+	/** Called with each origin resumed floor-only (a level-2 row on a level-2 route) and its start. */
+	floorOnly?: (originId: number, start: number) => void
 ): Record<string, number> {
 	const cursorOf = (node: any): number | undefined => {
 		const position = isValidFrameTxnLogKey(node?.originLogKey) ? node.originLogKey : undefined;
 		if (!useFloors || !isValidFloor(node?.closedFloor)) return position;
+		// item 4: a checkpoint-grade row resumes exactly below its floor, so a transaction reserved below the
+		// position and committed after it is re-sent rather than filtered by the sender's position
+		if (floorOnly && typeof node.originGeneration === 'string' && node.floorRevoked !== true) {
+			const start = cursorBelowFloor(node.closedFloor);
+			floorOnly(node.id, start);
+			return start;
+		}
 		return position === undefined
 			? cursorBelowFloor(node.closedFloor)
 			: resumeStartWithFloor(position, node.closedFloor);
@@ -3548,6 +3680,8 @@ export class NodeReplicationConnection extends EventEmitter {
 	// computeExclusionOrigins), carried on subscribe-to-node and refreshed by
 	// update-exclusion-origins; the session reads it when building SUBSCRIPTION_REQUEST.
 	exclusionOrigins?: string[];
+	/** Whether the last subscription request on this route carried every table (harper-pro#922 item 4). */
+	routeFullCoverage?: boolean;
 	latency = 0;
 	replicateTablesByDefault: boolean;
 	session: any; // this is a promise that resolves to the session object, which is the object that handles the replication
@@ -4392,8 +4526,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
 	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn with no flush gate. (harper-pro#480)
-	function seqUpdateEndTxn(seqId: number, originFloors?: [number, number, boolean][], releasePending = false): any {
+	function seqUpdateEndTxn(seqId: number, originFloors?: ReceivedOriginFloor[], releasePending = false): any {
 		const originCursors = takeDurableOriginCursors();
+		const withRouteState = (event: any) => {
+			pendingRouteState.attachTo(event);
+			return event;
+		};
 		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && seqId >= copyModeStartTime) {
 			return {
 				type: 'end_txn',
@@ -4409,14 +4547,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		// only an update that carries floors, or a blob drain releasing held ones, pays for a commit callback
 		if (!originFloors && !(releasePending && pendingOriginFloors.size > 0)) {
-			return {
+			return withRouteState({
 				type: 'end_txn',
 				localTime: seqId,
 				remoteNodeIds: receivingDataFromNodeIds,
 				txnStream,
 				onFailure: onFrameFailure,
 				originCursors,
-			};
+			});
 		}
 		// eligible only in this update's own onCommit: an earlier frame's late commit must not persist a floor
 		// past records still queued below it
@@ -4432,7 +4570,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				event.originFloors = pendingOriginFloors.take(cursorBlockedByBlob());
 			},
 		};
-		return event;
+		return withRouteState(event);
 	}
 	// Returns true to hold: core then records no cursor for this connection's later frames either.
 	function onFrameFailure(error: unknown, position: number): boolean {
@@ -4874,7 +5012,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		peerCapabilitiesLearned && options.connection?.nodeSubscriptions?.[0]?.name === remoteNodeName;
 	function publishPeerCertifiesFloors(status: Float64Array) {
 		if (instanceRetired || !ownsPeerCertifiesFloorsSlot()) return;
-		status[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
+		status[PEER_CERTIFIES_FLOORS_POSITION] = peerCertifiesCheckpointFloors(peerCapabilities)
+			? 2
+			: peerSupportsOriginFloors(peerCapabilities)
+				? 1
+				: 0;
 	}
 	// A record this node will not apply is a hole in that origin's stream for that table. It is
 	// recorded durably BEFORE the drop completes, so no later barrier can certify past it; a store
@@ -4884,6 +5026,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const origin = getNodeNameForId(auditStore, originId, true);
 		try {
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
+			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
+			if (originId !== undefined) pendingRouteState.hole(originId);
 			// The connection can close during the write; the caller must not keep applying frames then.
 			return !wsClosed;
 		} catch (error) {
@@ -5078,26 +5222,44 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	const certifiesOriginFloors = () =>
 		STORAGE_IS_ROCKSDB && peerCapabilitiesLearned && peerSupportsOriginFloors(peerCapabilities);
+	const certifiesCheckpointFloors = () =>
+		STORAGE_IS_ROCKSDB && peerCapabilitiesLearned && peerCertifiesCheckpointFloors(peerCapabilities);
 	const pendingOriginFloors = new PendingOriginFloors();
+	const pendingRouteState = new PendingRouteState();
 	/**
 	 * A received floor vector as `[localOriginId, floor, relayable]` entries. Names resolve through the durable id
 	 * mapping and never mint an id; this node's own floor is not a certificate for it; a copy's updates carry none.
 	 * `relayable` records whether this node receives the origin directly with full table coverage (the main thread's
 	 * exclusion-origin set), which is what lets a relay forward the floor to its own subscribers.
 	 */
-	function receivedOriginFloors(value: unknown): [number, number, boolean][] | undefined {
+	function receivedOriginFloors(value: unknown): ReceivedOriginFloor[] | undefined {
 		if (value == null || !certifiesOriginFloors() || (inCopyMode && !copyCompleteReceived)) return undefined;
-		const floors = parseOriginFloors(value);
-		if (floors.size === 0) return undefined;
-		let entries: [number, number, boolean][] | undefined;
+		const certificates = parseOriginCertificates(value);
+		if (certificates.size === 0) return undefined;
+		const checkpointGrade = certifiesCheckpointFloors();
+		let entries: ReceivedOriginFloor[] | undefined;
 		try {
 			const store = auditStore ?? getDatabaseStores().auditStore;
 			const nameToId = exportIdMapping(store);
 			const thisNodeName = getThisNodeName();
 			const directFullCoverage: string[] = options.connection?.exclusionOrigins ?? [];
-			for (const [name, floor] of floors) {
+			// this socket replicates every table of the database to this node
+			const routeFullCoverage = directFullCoverage.includes(remoteNodeName);
+			for (const [name, certificate] of certificates) {
 				if (name === thisNodeName || !Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number') continue;
-				(entries ??= []).push([nameToId[name], floor, directFullCoverage.includes(name)]);
+				const id = nameToId[name];
+				if (certificate.revoked) {
+					if (checkpointGrade) pendingRouteState.revoke(id);
+					continue;
+				}
+				const entry: ReceivedOriginFloor = [id, certificate.floor!, directFullCoverage.includes(name)];
+				if (checkpointGrade && typeof certificate.generation === 'string') {
+					entry[3] = certificate.generation;
+					// complete here only if the whole route is: this socket carries every table, and so did the
+					// sender's own route to a relayed origin
+					entry[4] = routeFullCoverage && (name === remoteNodeName || certificate.fullCoverage === true);
+				}
+				(entries ??= []).push(entry);
 			}
 		} catch (error) {
 			// Without the mapping no floor is recorded; the position update itself still applies.
@@ -5797,6 +5959,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
 						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
 						copyCompleteReceived = true;
+						// a base copy holds every table from its start: the route's history is whole again
+						for (const id of receivingDataFromNodeIds ?? []) pendingRouteState.partialHistory(id, false);
 						// No more copy frames will arrive, so stop watching for copy-progress stalls now rather
 						// than leaving the timer to wake the event loop until the commit drain finishes (#453).
 						copyProgressWatchdog?.stop();
@@ -6863,20 +7027,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 
 								let lastFloorCaptureAt = 0;
 								let floorTimer: ReturnType<typeof setTimeout> | undefined;
-								let capturedFloors: Map<string, number> | undefined;
+								let capturedFloors: Map<string, OriginCertificate> | undefined;
 								const certifiedFloors = new Map<string, number>();
+								const revokedSent = new Set<string>();
 								let floorEmissionLatchedRange: unknown;
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
-								const originCertifies = (name: string) =>
-									getReplicationSharedStatus(auditStore, databaseName, name)[PEER_CERTIFIES_FLOORS_POSITION] === 1;
-								const captureOriginFloors = (): Map<string, number> | undefined => {
-									let floors: Map<string, number> | undefined;
+								// the level the origin's own socket to this node certifies at now: 0, 1 or 2
+								const originCertifies = (name: string): number => {
+									const level = getReplicationSharedStatus(auditStore, databaseName, name)[
+										PEER_CERTIFIES_FLOORS_POSITION
+									];
+									return level >= 1 ? level : 0;
+								};
+								const captureOriginFloors = (): Map<string, OriginCertificate> | undefined => {
+									let floors: Map<string, OriginCertificate> | undefined;
 									try {
 										const thisNodeName = getThisNodeName();
 										const own = readOriginClosedFloor(auditStore);
-										if (isValidFloor(own) && !excludedNodes?.includes(thisNodeName))
-											(floors ??= new Map()).set(thisNodeName, own);
+										if (isValidFloor(own) && !excludedNodes?.includes(thisNodeName)) {
+											// own origin: the local log covers every table, and its generation is this database's
+											const generation = getDatabaseGeneration(auditStore)?.id;
+											(floors ??= new Map()).set(
+												thisNodeName,
+												typeof generation === 'string' ? { floor: own, generation, fullCoverage: true } : { floor: own }
+											);
+										}
 										// only a multi-log range sends unlisted origins, and only per-origin logs have names
 										if (excludedNodes && auditStore.reusableIterable === true) {
 											const listed = new Set(nodeSubscriptions.map(({ name }) => name));
@@ -6891,13 +7067,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const seqRows = collectSeqRows(
 													dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([0xff])] })
 												);
-												for (const [name, floor] of collectRelayableFloors(
+												for (const [name, certificate] of collectRelayableCertificates(
 													seqRows,
 													names,
 													exportIdMapping(auditStore),
 													originCertifies
 												))
-													(floors ??= new Map()).set(name, floor);
+													(floors ??= new Map()).set(name, certificate);
 											}
 										}
 									} catch (error) {
@@ -6912,19 +7088,34 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 									return floors;
 								};
-								const certifyOriginFloors = (floors: Map<string, number>) => {
-									let rising: Map<string, number> | undefined;
+								const certifyOriginFloors = (floors: Map<string, OriginCertificate>) => {
+									let rising: Map<string, unknown> | undefined;
 									const thisNodeName = getThisNodeName();
-									for (const [name, floor] of floors) {
+									const peerLevel = certifiesCheckpointFloors() ? 2 : 1;
+									for (const [name, certificate] of floors) {
+										if (excludedNodes?.includes(name)) continue;
+										if (certificate.revoked) {
+											// once per connection: the receiver's revocation is sticky
+											if (peerLevel < 2 || revokedSent.has(name)) continue;
+											(rising ??= new Map()).set(name, 0);
+											revokedSent.add(name);
+											continue;
+										}
+										const floor = certificate.floor!;
 										// an origin a SUBSCRIPTION_UPDATE excluded during the pass had its scan cut short, and
 										// one whose socket stopped certifying during it may be an older binary now
-										if (excludedNodes?.includes(name) || certifiedFloors.get(name) >= floor) continue;
+										if (certifiedFloors.get(name) >= floor) continue;
 										if (name !== thisNodeName && !originCertifies(name)) continue;
-										(rising ??= new Map()).set(name, floor);
+										const encoded = encodeOriginCertificate(certificate, peerLevel);
+										if (encoded === undefined) continue;
+										(rising ??= new Map()).set(name, encoded);
 									}
 									if (!rising || closed || wsClosed) return;
 									ws.send(encode([SEQUENCE_ID_UPDATE, currentSequenceId, Object.fromEntries(rising)]));
-									for (const [name, floor] of rising) certifiedFloors.set(name, floor);
+									for (const [name, encoded] of rising) {
+										if (encoded !== 0)
+											certifiedFloors.set(name, Array.isArray(encoded) ? encoded[0] : (encoded as number));
+									}
 									logger.debug?.(connectionId, 'certified origin floors to', remoteNodeName, rising);
 								};
 								let isFirst = true;
@@ -9191,7 +9382,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				(id) => getNodeNameForId(store, id, true),
 				// a removed node leaves a tombstone, which reads as a clean null; an undecodable row stays a member
 				(name) => probeNodeRow(getHDBNodeTable().primaryStore, name).outcome !== 'deleted',
-				certifiesOriginFloors()
+				certifiesOriginFloors(),
+				certifiesCheckpointFloors() ? (originId, start) => pendingRouteState.certifiedFrom(originId, start) : undefined
 			);
 		} catch (error) {
 			// Without cursors every unlisted origin starts at 0, as it would without the capability.
@@ -9345,7 +9537,37 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// downgraded peer may write below a floor it saved.
 			if (hasPersistedResumeCursor && connectedNode === node && certifiesOriginFloors()) {
 				const ownState = sequenceEntry?.nodes?.find?.((state: any) => state?.id === nodeId);
-				startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
+				if (
+					nodeId !== undefined &&
+					certifiesCheckpointFloors() &&
+					typeof ownState?.originGeneration === 'string' &&
+					ownState.floorRevoked !== true &&
+					isValidFloor(ownState.closedFloor)
+				) {
+					// item 4: exactly below the floor, never the higher position — a transaction reserved below the
+					// position and committed during the disconnect is re-sent instead of filtered by the sender
+					startTime = cursorBelowFloor(ownState.closedFloor);
+					pendingRouteState.certifiedFrom(nodeId, startTime);
+				} else startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
+			}
+			if (
+				nodeId !== undefined &&
+				connectedNode === node &&
+				peerCapabilitiesLearned &&
+				!certifiesCheckpointFloors() &&
+				typeof sequenceEntry?.nodes?.find?.((state: any) => state?.id === nodeId)?.originGeneration === 'string'
+			) {
+				// the peer stopped certifying at level 2 (a rollback, or a downgrade to none): it may write below
+				// the floor it certified, so the stored checkpoint-grade floor is revoked for good
+				pendingRouteState.revoke(nodeId);
+			}
+			if (nodeId !== undefined && connectedNode === node && options.connection) {
+				const fullCoverage = (options.connection.exclusionOrigins ?? []).includes(node.name);
+				const previous = options.connection.routeFullCoverage;
+				options.connection.routeFullCoverage = fullCoverage;
+				// a route widened to full coverage without a base copy holds no history of the newly included
+				// tables below its position, so nothing it certified before covers them
+				if (fullCoverage && previous === false && !copyCursor) pendingRouteState.partialHistory(nodeId, true);
 			}
 			// For a proxied/indirect subscription: the relayed per-source resume cursor, used ONLY to arm the
 			// leading-duplicate fast-skip (it does not move `startTime` — see the indirect block for why).

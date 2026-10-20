@@ -45,7 +45,14 @@ export const ORIGIN_CURSORS_CAPABILITY = 1;
  * starts at a stored floor. Advertised only by a build whose transaction logs are per origin (RocksDB), since only
  * core's RocksDB store certifies a floor.
  */
-export const ORIGIN_FLOORS_CAPABILITY = 1;
+/**
+ * Level 1: floor certificates `{ origin: floor }`. Level 2 (harper-pro#922 items 3–4): checkpoint-grade certificates
+ * `{ origin: [floor, generation, fullCoverage] | 0 }` behind a power-loss durable advertisement, floor-only resume
+ * and sticky revocation; advertised only by a RocksDB build whose engine can sync the floor record (`syncWal`).
+ */
+export const ORIGIN_FLOORS_CAPABILITY = 2;
+export const CHECKPOINT_FLOORS_LEVEL = 2;
+let advertisedOriginFloorsLevel = ORIGIN_FLOORS_CAPABILITY;
 
 /**
  * Table lifecycle stamps: a peer at this level reads `createdTime` on definitions and structure frames and
@@ -116,7 +123,7 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
 		recordLocks: resolveExactLevel(bag?.recordLocks, 0),
 		originCursors: resolveLevel(bag?.originCursors, ORIGIN_CURSORS_CAPABILITY, 0),
-		originFloors: resolveLevel(bag?.originFloors, ORIGIN_FLOORS_CAPABILITY, 0),
+		originFloors: resolveLevel(bag?.originFloors, advertisedOriginFloorsLevel, 0),
 		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
 		residencyStubCopy: resolveLevel(bag?.residencyStubCopy, RESIDENCY_STUB_COPY_CAPABILITY, 0),
 		residencyNotResident: resolveLevel(bag?.residencyNotResident, RESIDENCY_NOT_RESIDENT_CAPABILITY, 0),
@@ -145,7 +152,12 @@ export function peerSupportsOriginCursors(resolved: ResolvedPeerCapabilities): b
 }
 
 export function peerSupportsOriginFloors(resolved: ResolvedPeerCapabilities): boolean {
-	return resolved.originFloors >= ORIGIN_FLOORS_CAPABILITY;
+	return resolved.originFloors >= 1;
+}
+
+/** Both sides certify at level 2: durable floors, floor-only resume, revocation. */
+export function peerCertifiesCheckpointFloors(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.originFloors >= CHECKPOINT_FLOORS_LEVEL;
 }
 
 /** A peer that advertised nothing — the pre-registry baseline. */
@@ -171,8 +183,10 @@ export function advertisedRecordLocksLevel(recordLocksEnabled: boolean, bagOmitt
 export function buildLocalCapabilities(
 	subscriptionSetupBudgetMs: number,
 	recordLocksEnabled: boolean,
-	perOriginLogs: boolean
+	perOriginLogs: boolean,
+	durableFloors = true
 ): Readonly<Record<string, number>> {
+	advertisedOriginFloorsLevel = perOriginLogs ? (durableFloors ? ORIGIN_FLOORS_CAPABILITY : 1) : 0;
 	return Object.freeze({
 		safeCopyAudit: 1,
 		protocolVersion: LOCAL_PROTOCOL_VERSION,
@@ -182,7 +196,7 @@ export function buildLocalCapabilities(
 		recordLocks: advertisedRecordLocksLevel(recordLocksEnabled, false),
 		// LMDB keys one shared audit log by local time, so it has no origin cursor to send or apply.
 		originCursors: perOriginLogs ? ORIGIN_CURSORS_CAPABILITY : 0,
-		originFloors: perOriginLogs ? ORIGIN_FLOORS_CAPABILITY : 0,
+		originFloors: advertisedOriginFloorsLevel,
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 		residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 		residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
