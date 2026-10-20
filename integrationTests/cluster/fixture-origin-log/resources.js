@@ -99,6 +99,11 @@ export class ClosedFloors extends Resource {
 				originLogKey: node.originLogKey ?? null,
 				closedFloor: node.closedFloor ?? null,
 				relayable: node.relayable ?? null,
+				originGeneration: node.originGeneration ?? null,
+				fullCoverage: node.fullCoverage ?? null,
+				certifiedFrom: node.certifiedFrom ?? null,
+				floorRevoked: node.floorRevoked ?? null,
+				hole: node.hole ?? null,
 			};
 		}
 		return { seqId: row?.seqId ?? null, nodes };
@@ -136,5 +141,70 @@ export class ReleaseTransaction extends Resource {
 		releaseHeldTransaction?.();
 		releaseHeldTransaction = undefined;
 		return { released };
+	}
+}
+
+// Progress-reporting subscriptions by name, for issuing a checkpoint on one node and resuming it on another
+// (harper-pro#922 items 3–4). `events` are the record ids delivered so far.
+const checkpointSubscriptions = new Map();
+export class CheckpointSubscription extends Resource {
+	static loadAsInstance = false;
+	async post(target, data) {
+		const Table = databases.data[data.table];
+		const name = data.name ?? 'default';
+		if (data.action === 'open' || data.action === 'resume') {
+			checkpointSubscriptions.get(name)?.subscription.end();
+			const events = [];
+			const errors = [];
+			const request = {
+				omitCurrent: true,
+				reportProgress: true,
+				listener: (event) => {
+					if (event.type === 'put' || event.type === 'delete') events.push(event.id);
+				},
+			};
+			if (data.action === 'resume') request.resume = data.checkpoint;
+			let subscription;
+			try {
+				subscription = await Table.subscribe(request);
+			} catch (error) {
+				return { refused: { statusCode: error.statusCode ?? null, code: error.code ?? null, message: error.message } };
+			}
+			subscription.on('close', () => {
+				if (subscription.closedWith instanceof Error) errors.push(subscription.closedWith.message);
+			});
+			const state = { subscription, events, errors, verified: null };
+			subscription.resumeVerified?.then((verified) => (state.verified = verified));
+			checkpointSubscriptions.set(name, state);
+			return { opened: name };
+		}
+		const state = checkpointSubscriptions.get(name);
+		if (!state) throw new Error(`No subscription named ${name}`);
+		if (data.action === 'close') {
+			state.subscription.end();
+			checkpointSubscriptions.delete(name);
+			return { closed: name };
+		}
+		return {
+			checkpoint: state.subscription.checkpoint?.() ?? null,
+			events: state.events,
+			errors: state.errors,
+			verified: state.verified,
+			closed: state.subscription.closed,
+		};
+	}
+}
+
+// Reads, or writes (`record`), a durable MQTT session row: the test copies a row between nodes whose system
+// database does not replicate, standing in for the replication the row gets in a cluster.
+export class DurableSessionRecord extends Resource {
+	static loadAsInstance = false;
+	async post(target, data) {
+		if (data.record) {
+			await databases.system.hdb_durable_session.put(data.record);
+			return { written: data.record.id };
+		}
+		const record = await databases.system.hdb_durable_session.get(data.id);
+		return { record: record ? JSON.parse(JSON.stringify(record)) : null };
 	}
 }

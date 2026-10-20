@@ -2,9 +2,13 @@ import assert from 'node:assert';
 import {
 	ORIGIN_CURSOR_OVERLAP_MS,
 	PendingOriginFloors,
+	PendingRouteState,
 	buildOriginCursorVector,
+	collectRelayableCertificates,
 	collectRelayableFloors,
 	cursorBelowFloor,
+	encodeOriginCertificate,
+	parseOriginCertificates,
 	parseOriginFloors,
 	resolveOriginFloors,
 	resumeStartWithFloor,
@@ -140,5 +144,133 @@ describe('PendingOriginFloors', () => {
 		assert.strictEqual(pending.take(false), undefined);
 		pending.note(undefined);
 		assert.strictEqual(pending.size, 0);
+	});
+});
+
+describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
+	const row = (id, state) => [id, { seqId: T, nodes: [state] }];
+
+	it('parses a floor, a checkpoint-grade tuple and a revocation, dropping malformed entries', () => {
+		const parsed = parseOriginCertificates({
+			peer: T,
+			relayed: [T - 5, 'gen-r', true],
+			other: 0,
+			partial: [T - 6, 'gen-p'],
+			bad: [T, ''],
+			worse: ['x', 'gen'],
+		});
+		assert.deepStrictEqual(
+			[...parsed],
+			[
+				['peer', { floor: T }],
+				['relayed', { floor: T - 5, generation: 'gen-r', fullCoverage: true }],
+				['other', { revoked: true }],
+				['partial', { floor: T - 6, generation: 'gen-p', fullCoverage: false }],
+			]
+		);
+		assert.deepStrictEqual(
+			[...parseOriginFloors({ peer: T, other: 0, relayed: [T - 5, 'g', true] })],
+			[
+				['peer', T],
+				['relayed', T - 5],
+			]
+		);
+	});
+
+	it('encodes for the peer level: a level-1 peer gets floors only and no revocation', () => {
+		const certificate = { floor: T, generation: 'g', fullCoverage: true };
+		assert.deepStrictEqual(encodeOriginCertificate(certificate, 2), [T, 'g', true]);
+		assert.strictEqual(encodeOriginCertificate(certificate, 1), T);
+		assert.strictEqual(encodeOriginCertificate({ floor: T }, 2), T);
+		assert.strictEqual(encodeOriginCertificate({ revoked: true }, 2), 0);
+		assert.strictEqual(encodeOriginCertificate({ revoked: true }, 1), undefined);
+	});
+
+	it('relays checkpoint-grade qualifiers only from a row whose socket certifies at level 2, and a revocation always', () => {
+		const rows = new Map([
+			row(1, { id: 1, closedFloor: T - 5, relayable: true, originGeneration: 'gen-p', fullCoverage: true }),
+			row(2, { id: 2, closedFloor: T - 6, relayable: true, originGeneration: 'gen-r', fullCoverage: false }),
+			row(3, { id: 3, closedFloor: T - 7, relayable: true, floorRevoked: true }),
+		]);
+		const names = ['peer', 'relayed', 'other'];
+		assert.deepStrictEqual(
+			[...collectRelayableCertificates(rows, names, nameToId, () => 2)],
+			[
+				['peer', { floor: T - 5, generation: 'gen-p', fullCoverage: true }],
+				['relayed', { floor: T - 6 }],
+				['other', { revoked: true }],
+			]
+		);
+		assert.deepStrictEqual(
+			[...collectRelayableCertificates(rows, names, nameToId, () => 1)],
+			[
+				['peer', { floor: T - 5 }],
+				['relayed', { floor: T - 6 }],
+				['other', { revoked: true }],
+			]
+		);
+		assert.deepStrictEqual(
+			[...collectRelayableCertificates(rows, names, nameToId, () => 0)],
+			[['other', { revoked: true }]]
+		);
+	});
+
+	it('resumes a checkpoint-grade row exactly below its floor, ignoring a higher position, and reports it', () => {
+		const rows = new Map([
+			[
+				1,
+				{
+					seqId: T,
+					nodes: [
+						{ id: 1, originLogKey: T, closedFloor: T - 10, originGeneration: 'g' },
+						{ id: 2, originLogKey: T, closedFloor: T - 20 },
+						{ id: 3, originLogKey: T, closedFloor: T - 30, originGeneration: 'g', floorRevoked: true },
+					],
+				},
+			],
+		]);
+		const reported = [];
+		const vector = buildOriginCursorVector(rows, 1, nameForId, isMember, true, (id, start) =>
+			reported.push([id, start])
+		);
+		assert.deepStrictEqual(vector, { peer: cursorBelowFloor(T - 10), relayed: T, other: T });
+		assert.deepStrictEqual(reported, [[1, cursorBelowFloor(T - 10)]]);
+		// without the level-2 route the position still wins where it is newer
+		assert.deepStrictEqual(buildOriginCursorVector(rows, 1, nameForId, isMember, true), {
+			peer: T,
+			relayed: T,
+			other: T,
+		});
+	});
+
+	it('PendingOriginFloors keeps the level-2 fields a same-floor certificate carries', () => {
+		const pending = new PendingOriginFloors();
+		pending.note([[7, T, false]]);
+		pending.note([[7, T, true, 'gen', true]]);
+		assert.deepStrictEqual(pending.take(false), [[7, T, true, 'gen', true]]);
+	});
+
+	it('PendingRouteState attaches the lowest certified-from mark, holes, partial history and revocations once', () => {
+		const pending = new PendingRouteState();
+		pending.certifiedFrom(1, T);
+		pending.certifiedFrom(1, T - 5);
+		pending.certifiedFrom(1, T + 5);
+		pending.hole(2);
+		pending.partialHistory(3, true);
+		pending.revoke(4);
+		assert.strictEqual(pending.size, 4);
+		const event = {};
+		pending.attachTo(event);
+		assert.deepStrictEqual(event, {
+			originRouteStates: [
+				[1, T - 5, undefined, undefined],
+				[2, undefined, undefined, true],
+				[3, undefined, true, undefined],
+			],
+			originFloorRevocations: [4],
+		});
+		const empty = {};
+		pending.attachTo(empty);
+		assert.deepStrictEqual(empty, {});
 	});
 });
