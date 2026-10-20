@@ -52,7 +52,6 @@ export const ORIGIN_CURSORS_CAPABILITY = 1;
  */
 export const ORIGIN_FLOORS_CAPABILITY = 2;
 export const CHECKPOINT_FLOORS_LEVEL = 2;
-let advertisedOriginFloorsLevel = ORIGIN_FLOORS_CAPABILITY;
 
 /**
  * Table lifecycle stamps: a peer at this level reads `createdTime` on definitions and structure frames and
@@ -104,7 +103,11 @@ function resolveBudget(value: unknown): number | undefined {
 }
 
 /** Keys this build does not know are dropped, so nothing downstream can consult one by accident. */
-export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
+/** `localOriginFloors`: the level this build advertises (`buildLocalCapabilities`), the ceiling of the resolved one. */
+export function resolvePeerCapabilities(
+	bag: any,
+	localOriginFloors: number = ORIGIN_FLOORS_CAPABILITY
+): ResolvedPeerCapabilities {
 	return Object.freeze({
 		safeCopyAudit: bag?.safeCopyAudit === 1 ? 1 : 0,
 		protocolVersion: resolveLevel(bag?.protocolVersion, LOCAL_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION),
@@ -112,7 +115,7 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
 		recordLocks: resolveExactLevel(bag?.recordLocks, 0),
 		originCursors: resolveLevel(bag?.originCursors, ORIGIN_CURSORS_CAPABILITY, 0),
-		originFloors: resolveLevel(bag?.originFloors, advertisedOriginFloorsLevel, 0),
+		originFloors: resolveLevel(bag?.originFloors, localOriginFloors, 0),
 		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
 	});
 }
@@ -165,7 +168,6 @@ export function buildLocalCapabilities(
 	perOriginLogs: boolean,
 	durableFloors = true
 ): Readonly<Record<string, number>> {
-	advertisedOriginFloorsLevel = perOriginLogs ? (durableFloors ? ORIGIN_FLOORS_CAPABILITY : 1) : 0;
 	return Object.freeze({
 		safeCopyAudit: 1,
 		protocolVersion: LOCAL_PROTOCOL_VERSION,
@@ -175,7 +177,7 @@ export function buildLocalCapabilities(
 		recordLocks: advertisedRecordLocksLevel(recordLocksEnabled, false),
 		// LMDB keys one shared audit log by local time, so it has no origin cursor to send or apply.
 		originCursors: perOriginLogs ? ORIGIN_CURSORS_CAPABILITY : 0,
-		originFloors: advertisedOriginFloorsLevel,
+		originFloors: perOriginLogs ? (durableFloors ? ORIGIN_FLOORS_CAPABILITY : 1) : 0,
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 	});
 }

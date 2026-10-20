@@ -215,16 +215,23 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		);
 	});
 
-	it('resumes a checkpoint-grade row exactly below its floor, ignoring a higher position, and reports it', () => {
+	it('resumes a whole-route checkpoint-grade row exactly below its floor, ignoring a higher position, and reports it', () => {
 		const rows = new Map([
 			[
 				1,
 				{
 					seqId: T,
 					nodes: [
-						{ id: 1, originLogKey: T, closedFloor: T - 10, originGeneration: 'g' },
-						{ id: 2, originLogKey: T, closedFloor: T - 20 },
-						{ id: 3, originLogKey: T, closedFloor: T - 30, originGeneration: 'g', floorRevoked: true },
+						{ id: 1, originLogKey: T, closedFloor: T - 10, originGeneration: 'g', fullCoverage: true },
+						{ id: 2, originLogKey: T, closedFloor: T - 20, originGeneration: 'g' },
+						{
+							id: 3,
+							originLogKey: T,
+							closedFloor: T - 30,
+							originGeneration: 'g',
+							fullCoverage: true,
+							floorRevoked: true,
+						},
 					],
 				},
 			],

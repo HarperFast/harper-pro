@@ -144,8 +144,7 @@ export class ReleaseTransaction extends Resource {
 	}
 }
 
-// Progress-reporting subscriptions by name, for issuing a checkpoint on one node and resuming it on another
-// (harper-pro#922 items 3–4). `events` are the record ids delivered so far.
+// Progress-reporting subscriptions by name, for issuing a checkpoint on one node and resuming it on another.
 const checkpointSubscriptions = new Map();
 export class CheckpointSubscription extends Resource {
 	static loadAsInstance = false;

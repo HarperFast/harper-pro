@@ -14,6 +14,7 @@ import {
 	createUnknownCommandState,
 	noteUnknownCommand,
 	peerSupportsOriginCursors,
+	peerCertifiesCheckpointFloors,
 	peerSupportsOriginFloors,
 	peerSupportsRecordLocks,
 	resolvePeerCapabilities,
@@ -370,6 +371,19 @@ describe('samePeerCapabilities', () => {
 		const withoutFloors = resolvePeerCapabilities({ ...buildLocalCapabilities(90_000, true, true), originFloors: 0 });
 		assert.strictEqual(peerSupportsOriginCursors(withoutFloors), true);
 		assert.strictEqual(samePeerCapabilities(full, withoutFloors), false);
+	});
+});
+
+describe('originFloors level 2 (harper-pro#922 items 3–4)', () => {
+	it('advertises level 2 only with durable floors, and resolves to the lower side', () => {
+		assert.strictEqual(buildLocalCapabilities(90_000, true, true).originFloors, 2);
+		assert.strictEqual(buildLocalCapabilities(90_000, true, true, false).originFloors, 1);
+		assert.strictEqual(buildLocalCapabilities(90_000, true, false).originFloors, 0);
+		assert.strictEqual(peerCertifiesCheckpointFloors(resolvePeerCapabilities({ originFloors: 2 })), true);
+		assert.strictEqual(peerCertifiesCheckpointFloors(resolvePeerCapabilities({ originFloors: 2 }, 1)), false);
+		assert.strictEqual(peerSupportsOriginFloors(resolvePeerCapabilities({ originFloors: 2 }, 1)), true);
+		assert.strictEqual(peerCertifiesCheckpointFloors(resolvePeerCapabilities({ originFloors: 1 })), false);
+		assert.strictEqual(resolvePeerCapabilities({ originFloors: 7 }, 1).originFloors, 1);
 	});
 });
 
