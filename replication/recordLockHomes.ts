@@ -62,7 +62,21 @@ export interface RecordLockHomesRow {
 	active?: RecordLockGenerationState;
 	staged?: RecordLockGenerationState;
 	highestActedOn: number;
-	fenced: { node: string; operator: string; at: number }[];
+	fenced: FenceEntry[];
+}
+
+export interface FenceEntry {
+	node: string;
+	operator: string;
+	at: number;
+	generation?: number;
+	/** Every node the recording call fenced: an entry vouches only for a call fencing a subset of these. */
+	fencedWith?: string[];
+}
+
+export interface StageFence {
+	nodes: string[];
+	operator: string;
 }
 
 // ---- change notification: fires only on THIS thread's own write; recordLockTransport.ts is what
@@ -226,10 +240,10 @@ function withRow<T>(
 	return run;
 }
 
-function operatorPrincipal(request: any): string {
+export function operatorPrincipal(request: any): string {
 	// `hdb_user` is the authenticated principal the operation dispatcher attached; never a request
-	// body field, which a caller could set to forge attribution on the audit-only `fenced[]` list.
-	const name = request?.hdb_user?.name;
+	// body field, which a caller could set to forge attribution on the `fenced[]` list.
+	const name = request?.hdb_user?.username || request?.hdb_user?.name;
 	if (typeof name !== 'string' || name.length === 0)
 		throw new ClientError('record lock home map operations require an authenticated user', 401);
 	return name;
@@ -337,9 +351,10 @@ async function drainForStage(database: string): Promise<QuiesceResult | { error:
 }
 
 export async function stageGeneration(
-	request: any
+	request: any,
+	fence?: StageFence
 ): Promise<{ staged: RecordLockGenerationState; quiesced: QuiesceResult | { error: string } }> {
-	const staged = await stageRow(request);
+	const staged = await stageRow(request, fence);
 	// Deliberately OUTSIDE `withRow`: the drain waits on live critical sections, and holding the
 	// database's transition queue for that would block every other stage, fence and activate on this
 	// node behind it. The row write already retracted `active`, so nothing new can be granted while
@@ -347,7 +362,24 @@ export async function stageGeneration(
 	return { ...staged, quiesced: await drainForStage(request.database) };
 }
 
-async function stageRow(request: any): Promise<{ staged: RecordLockGenerationState }> {
+export function withFences(
+	fenced: FenceEntry[],
+	fence: StageFence | undefined,
+	generation: number,
+	now: number
+): FenceEntry[] | undefined {
+	const nodes = fence?.nodes ?? [];
+	const sameCall = (entry: FenceEntry) =>
+		entry.generation === generation &&
+		entry.fencedWith?.length === nodes.length &&
+		nodes.every((node) => entry.fencedWith!.includes(node));
+	const added = nodes
+		.filter((node) => !fenced.some((entry) => entry.node === node && sameCall(entry)))
+		.map((node) => ({ node, operator: fence!.operator, at: now, generation, fencedWith: nodes }));
+	return added.length > 0 ? [...fenced, ...added] : undefined;
+}
+
+async function stageRow(request: any, fence?: StageFence): Promise<{ staged: RecordLockGenerationState }> {
 	const validation = validateBySchema(request, stageSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
@@ -361,7 +393,14 @@ async function stageRow(request: any): Promise<{ staged: RecordLockGenerationSta
 	return withRow(database, async (existing, write) => {
 		const plan = planStage(existing, database, generation, homes, digest, Date.now(), quiesce);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
+		const fenced = withFences(
+			plan.action === 'write' ? plan.row.fenced : (existing?.fenced ?? []),
+			fence,
+			generation,
+			Date.now()
+		);
 		if (plan.action === 'noop') {
+			if (fenced) await write({ ...existing!, fenced });
 			// Idempotent retry, not a genuine transition — but the PRIOR call may have durably written
 			// this exact state and then failed to confirm every thread applied it (a relay timeout, a
 			// dead worker). Re-notifying is harmless when nothing changed and is the only way a retry
@@ -370,7 +409,7 @@ async function stageRow(request: any): Promise<{ staged: RecordLockGenerationSta
 			await notifyChanged(database);
 			return { staged: plan.staged };
 		}
-		await write(plan.row);
+		await write(fenced ? { ...plan.row, fenced } : plan.row);
 		logger.info?.(`Record lock home map for ${database}: staged generation ${generation}, retracted active`);
 		await notifyChanged(database);
 		return { staged: plan.row.staged! };
@@ -538,17 +577,26 @@ let drainReader: (database: string, budgetMs: number) => Promise<QuiesceResult |
 /**
  * An orchestrator may skip the drain interval for a node ONLY on this: a drain that both completed
  * and found nothing. `complete` is core's statement that the sweep could have seen everything —
- * coordinators are built lazily, so an empty `outstanding` alone is not a proof (harper-pro#856).
+ * coordinators are built lazily, so an empty `outstanding` alone is not a proof.
+ *
+ * The one exception is a recall this node, as home, sent to a node in `fenced`: it
+ * can never be confirmed, and the delegation it targets is held by a node the operator attests is
+ * stopped, so it admits nothing. Core marks the sweep incomplete for it, so `complete: false` is
+ * accepted only when every outstanding entry is such a recall.
  */
-export function provesQuiescence(quiesced: QuiesceResult | { error: string } | undefined): boolean {
+export function provesQuiescence(
+	quiesced: QuiesceResult | { error: string } | undefined,
+	fenced: readonly string[] = []
+): boolean {
 	// Every field is checked positively: this value crosses a worker boundary, so a malformed reply must
 	// read as "not proven" rather than slipping through on a missing `length`.
+	if (!quiesced || typeof quiesced !== 'object' || 'error' in quiesced || !Array.isArray(quiesced.outstanding))
+		return false;
+	if (quiesced.complete === true) return quiesced.outstanding.length === 0;
 	return (
-		!!quiesced &&
-		!('error' in quiesced) &&
-		quiesced.complete === true &&
-		Array.isArray(quiesced.outstanding) &&
-		quiesced.outstanding.length === 0
+		quiesced.complete === false &&
+		quiesced.outstanding.length > 0 &&
+		quiesced.outstanding.every((entry) => typeof entry?.delegate === 'string' && fenced.includes(entry.delegate))
 	);
 }
 export function setHomesDrainReader(reader: typeof drainReader): void {
@@ -622,7 +670,7 @@ export async function proposeHomes(request: any): Promise<
 	HomesProposal & {
 		database: string;
 		source: 'hdb_nodes';
-		current: { active?: RecordLockGenerationState; staged?: RecordLockGenerationState };
+		current: { active?: RecordLockGenerationState; staged?: RecordLockGenerationState; fenced?: FenceEntry[] };
 	}
 > {
 	const validation = validateBySchema(request, proposeSchema);
@@ -637,7 +685,7 @@ export async function proposeHomes(request: any): Promise<
 		database,
 		...planProposal(self, peers, existing, database),
 		source: 'hdb_nodes',
-		current: { active: existing?.active, staged: existing?.staged },
+		current: { active: existing?.active, staged: existing?.staged, fenced: existing?.fenced },
 	};
 }
 
@@ -664,7 +712,7 @@ server.registerOperation?.({
 });
 server.registerOperation?.({
 	name: 'record_lock_stage_generation',
-	execute: stageGeneration,
+	execute: (request: any) => stageGeneration(request),
 	httpMethod: 'POST',
 	requiresSuperUser: true,
 });
