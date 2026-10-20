@@ -318,4 +318,27 @@ suite('Subscription checkpoints resume across nodes (harper-pro#922 items 3–4)
 			await endMqtt(onB.client);
 		}
 	});
+	test('a peer that stops certifying at level 2 is revoked on its direct receiver and one hop beyond', async () => {
+		const { A, B, C } = ctx;
+		// A comes back without a capability bag: an older binary that may write below the floor it certified
+		A.testEnv = { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' };
+		await restartNode(A);
+		await waitForState(B, A, A, (state) => state?.floorRevoked === true, "A revoked on B after A's downgrade");
+		await waitForState(C, B, A, (state) => state?.floorRevoked === true, 'the revocation relayed to C');
+		equal((await stateFor(B, A, A)).closedFloor, null, 'a revoked origin keeps no floor');
+		await subscription(C, { action: 'open', name: 'after-downgrade' });
+		await upsert(A, 'post-downgrade');
+		await waitForEvents(C, 'after-downgrade', ['post-downgrade']);
+		await new Promise((resolve) => setTimeout(resolve, 3 * FLOOR_INTERVAL_MS));
+		const status = await subscription(C, { action: 'status', name: 'after-downgrade' });
+		equal(status.checkpoint, null, 'strict availability: no checkpoint while a known origin is revoked');
+		await subscription(C, { action: 'close', name: 'after-downgrade' });
+		// back on level 2, A's next certificate names the same generation and stays revoked
+		A.testEnv = undefined;
+		await restartNode(A);
+		await upsert(A, 'post-upgrade');
+		await waitForRecord(C, 'post-upgrade');
+		await new Promise((resolve) => setTimeout(resolve, 3 * FLOOR_INTERVAL_MS));
+		equal((await stateFor(B, A, A)).floorRevoked, true, 'a revocation is sticky within the generation');
+	});
 });

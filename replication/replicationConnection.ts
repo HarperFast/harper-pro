@@ -3097,6 +3097,10 @@ export class PendingOriginFloors {
 			}
 		}
 	}
+	/** A revoked origin's held certificate must not land after the revocation. */
+	drop(originId: number): void {
+		this.pending?.delete(originId);
+	}
 	take(blocked: boolean): ReceivedOriginFloor[] | undefined {
 		if (!this.pending?.size || blocked) return undefined;
 		const floors = [...this.pending.values()];
@@ -3141,9 +3145,14 @@ export function buildOriginCursorVector(
 	const cursorOf = (node: any): number | undefined => {
 		const position = isValidFrameTxnLogKey(node?.originLogKey) ? node.originLogKey : undefined;
 		if (!useFloors || !isValidFloor(node?.closedFloor)) return position;
-		// item 4: a checkpoint-grade row resumes exactly below its floor, so a transaction reserved below the
+		// a checkpoint-grade row resumes exactly below its floor, so a transaction reserved below the
 		// position and committed after it is re-sent rather than filtered by the sender's position
-		if (floorOnly && typeof node.originGeneration === 'string' && node.floorRevoked !== true) {
+		if (
+			floorOnly &&
+			typeof node.originGeneration === 'string' &&
+			node.fullCoverage === true &&
+			node.floorRevoked !== true
+		) {
 			const start = cursorBelowFloor(node.closedFloor);
 			floorOnly(node.id, start);
 			return start;
@@ -3680,7 +3689,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	// computeExclusionOrigins), carried on subscribe-to-node and refreshed by
 	// update-exclusion-origins; the session reads it when building SUBSCRIPTION_REQUEST.
 	exclusionOrigins?: string[];
-	/** Whether the last subscription request on this route carried every table (harper-pro#922 item 4). */
+	/** Whether the last subscription request on this route carried every table. */
 	routeFullCoverage?: boolean;
 	latency = 0;
 	replicateTablesByDefault: boolean;
@@ -4528,12 +4537,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn with no flush gate. (harper-pro#480)
 	function seqUpdateEndTxn(seqId: number, originFloors?: ReceivedOriginFloor[], releasePending = false): any {
 		const originCursors = takeDurableOriginCursors();
-		const withRouteState = (event: any) => {
-			pendingRouteState.attachTo(event);
-			return event;
-		};
 		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && seqId >= copyModeStartTime) {
-			return {
+			const event: any = {
 				type: 'end_txn',
 				localTime: seqId,
 				remoteNodeIds: receivingDataFromNodeIds,
@@ -4544,17 +4549,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					await flushCopyRowsDurable();
 				},
 			};
+			pendingRouteState.attachTo(event);
+			return event;
 		}
 		// only an update that carries floors, or a blob drain releasing held ones, pays for a commit callback
 		if (!originFloors && !(releasePending && pendingOriginFloors.size > 0)) {
-			return withRouteState({
+			const event: any = {
 				type: 'end_txn',
 				localTime: seqId,
 				remoteNodeIds: receivingDataFromNodeIds,
 				txnStream,
 				onFailure: onFrameFailure,
 				originCursors,
-			});
+			};
+			pendingRouteState.attachTo(event);
+			return event;
 		}
 		// eligible only in this update's own onCommit: an earlier frame's late commit must not persist a floor
 		// past records still queued below it
@@ -4570,7 +4579,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				event.originFloors = pendingOriginFloors.take(cursorBlockedByBlob());
 			},
 		};
-		return withRouteState(event);
+		pendingRouteState.attachTo(event);
+		return event;
+	}
+	/** Route marks queued outside a frame (a resume start, a downgrade) ride a sequence update of their own. */
+	async function flushRouteState() {
+		if (pendingRouteState.size === 0 || wsClosed) return;
+		if (!(await whenSubscriptionResolved())) return;
+		if (pendingRouteState.size === 0 || wsClosed) return;
+		tableSubscriptionToReplicator.send(
+			seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId ?? 0))
+		);
 	}
 	// Returns true to hold: core then records no cursor for this connection's later frames either.
 	function onFrameFailure(error: unknown, position: number): boolean {
@@ -5233,10 +5252,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * exclusion-origin set), which is what lets a relay forward the floor to its own subscribers.
 	 */
 	function receivedOriginFloors(value: unknown): ReceivedOriginFloor[] | undefined {
-		if (value == null || !certifiesOriginFloors() || (inCopyMode && !copyCompleteReceived)) return undefined;
+		if (value == null || !certifiesOriginFloors()) return undefined;
 		const certificates = parseOriginCertificates(value);
 		if (certificates.size === 0) return undefined;
 		const checkpointGrade = certifiesCheckpointFloors();
+		// a copy's updates certify nothing, but a revocation is sent once and must not be lost to one
+		const floorsAccepted = !(inCopyMode && !copyCompleteReceived);
 		let entries: ReceivedOriginFloor[] | undefined;
 		try {
 			const store = auditStore ?? getDatabaseStores().auditStore;
@@ -5249,9 +5270,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (name === thisNodeName || !Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number') continue;
 				const id = nameToId[name];
 				if (certificate.revoked) {
-					if (checkpointGrade) pendingRouteState.revoke(id);
+					if (checkpointGrade) {
+						pendingRouteState.revoke(id);
+						pendingOriginFloors.drop(id);
+					}
 					continue;
 				}
+				if (!floorsAccepted) continue;
 				const entry: ReceivedOriginFloor = [id, certificate.floor!, directFullCoverage.includes(name)];
 				if (checkpointGrade && typeof certificate.generation === 'string') {
 					entry[3] = certificate.generation;
@@ -5535,7 +5560,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				switch (command) {
 					case NODE_NAME: {
 						if (data) {
-							peerCapabilities = resolvePeerCapabilities(message[4]);
+							peerCapabilities = resolvePeerCapabilities(message[4], LOCAL_CAPABILITIES.originFloors);
 							const setupCapability = subscriptionSetupCapabilityFrom(
 								peerCapabilities,
 								SUBSCRIPTION_SETUP_TIMEOUT_MS,
@@ -9541,10 +9566,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					nodeId !== undefined &&
 					certifiesCheckpointFloors() &&
 					typeof ownState?.originGeneration === 'string' &&
+					ownState.fullCoverage === true &&
 					ownState.floorRevoked !== true &&
 					isValidFloor(ownState.closedFloor)
 				) {
-					// item 4: exactly below the floor, never the higher position — a transaction reserved below the
+					// exactly below the floor, never the higher position — a transaction reserved below the
 					// position and committed during the disconnect is re-sent instead of filtered by the sender
 					startTime = cursorBelowFloor(ownState.closedFloor);
 					pendingRouteState.certifiedFrom(nodeId, startTime);
@@ -9565,9 +9591,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const fullCoverage = (options.connection.exclusionOrigins ?? []).includes(node.name);
 				const previous = options.connection.routeFullCoverage;
 				options.connection.routeFullCoverage = fullCoverage;
+				const persistedPartial =
+					sequenceEntry?.nodes?.find?.((state: any) => state?.id === nodeId)?.fullCoverage === false;
 				// a route widened to full coverage without a base copy holds no history of the newly included
 				// tables below its position, so nothing it certified before covers them
-				if (fullCoverage && previous === false && !copyCursor) pendingRouteState.partialHistory(nodeId, true);
+				if (fullCoverage && (previous === false || persistedPartial) && !copyCursor) {
+					pendingRouteState.partialHistory(nodeId, true);
+				}
 			}
 			// For a proxied/indirect subscription: the relayed per-source resume cursor, used ONLY to arm the
 			// leading-duplicate fast-skip (it does not move `startTime` — see the indirect block for why).
@@ -9733,6 +9763,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const requestId = peerSupportsSubscriptionSetupAck ? ++nextSubscriptionSetupRequestId : undefined;
 				const originCursors = currentOriginCursorVector();
 				logger.debug?.(connectionId, 'per-origin resume cursors', originCursors);
+				// a downgraded peer sends no update to carry a revocation, so the marks ride one of this node's own
+				flushRouteState().catch((error) => logger.warn?.(connectionId, 'could not persist route marks', error));
 				ws.send(
 					encode(
 						originCursors
