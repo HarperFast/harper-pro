@@ -4582,11 +4582,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		pendingRouteState.attachTo(event);
 		return event;
 	}
-	/** Route marks queued outside a frame (a resume start, a downgrade) ride a sequence update of their own. */
-	async function flushRouteState() {
+	/**
+	 * Route marks queued outside a frame (a resume start, a downgrade) ride a sequence update of their own, once
+	 * the subscription has resolved. Never waits on it: the handshake must not block on the placeholder (item 13),
+	 * so an unresolved subscription is retried from a timer, and the next frame carries the marks anyway.
+	 */
+	function flushRouteState(attempt = 0) {
 		if (pendingRouteState.size === 0 || wsClosed) return;
-		if (!(await whenSubscriptionResolved())) return;
-		if (pendingRouteState.size === 0 || wsClosed) return;
+		if (tableSubscriptionToReplicator?.retired)
+			tableSubscriptionToReplicator = subscriptionForConnection(
+				tableSubscriptionToReplicator,
+				databaseName,
+				dbSubscriptions
+			);
+		if (!tableSubscriptionToReplicator?.send) {
+			if (attempt < 60) setTimeout(() => flushRouteState(attempt + 1), 1000).unref();
+			return;
+		}
 		tableSubscriptionToReplicator.send(
 			seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId ?? 0))
 		);
@@ -9764,7 +9776,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const originCursors = currentOriginCursorVector();
 				logger.debug?.(connectionId, 'per-origin resume cursors', originCursors);
 				// a downgraded peer sends no update to carry a revocation, so the marks ride one of this node's own
-				flushRouteState().catch((error) => logger.warn?.(connectionId, 'could not persist route marks', error));
+				flushRouteState();
 				ws.send(
 					encode(
 						originCursors
