@@ -2,8 +2,8 @@ name: Validate caller workflows
 
 # Thin caller of HarperFast/ai-review-prompts'
 # `_validate-caller-workflows.yml`. Validates
-# `.github/workflows/claude-*.yml` caller files for shadow jobs
-# and mutable refs.
+# `.github/workflows/claude-*.yml` and `gemini-*.yml` caller files
+# for shadow jobs and mutable refs.
 #
 # Runs on every PR and every push to `main` — no `paths:` filter.
 # A required status check that only fires on workflow-touching PRs

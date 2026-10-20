@@ -41,14 +41,15 @@ jobs:
     # level — that placement caps the reusable's per-job grants below
     # what they need and breaks the workflow at startup; see
     # ai-review-prompts#39/#40). Union of what the reusable's authorize
-    # (`contents: read`) and review (`contents: read` + `pull-requests:
-    # write` + `id-token: write`) jobs declare. Without this block the
-    # grants are inherited from the repo's default-workflow-permissions
-    # setting instead (GitHub intersects the reusable's requests with
-    # the caller's ceiling — un-grantable scopes are silently dropped,
-    # and `pull-requests: write` survives only while the repo default
-    # is "write"). Explicit grants keep the caller independent of that
-    # setting, and match gemini-review.yml in this repo.
+    # (`contents: read` + `pull-requests: read`) and review (`contents:
+    # read` + `pull-requests: write` + `id-token: write`) jobs declare.
+    # Without this block the grants are inherited from the repo's
+    # default-workflow-permissions setting instead (GitHub intersects
+    # the reusable's requests with the caller's ceiling — un-grantable
+    # scopes are silently dropped, and `pull-requests: write` survives
+    # only while the repo default is "write"). Explicit grants keep the
+    # caller independent of that setting, and match gemini-review.yml
+    # in this repo.
     permissions:
       contents: read
       pull-requests: write
@@ -83,9 +84,11 @@ jobs:
           surface, not re-explain core behavior.
         - **Storage.** Same substrate as Harper core — RocksDB
           primary, LMDB available via `HARPER_STORAGE_ENGINE=lmdb`.
-        - **Tests.** No unit-test split — `npm run test:integration`
-          is the test surface. Use it judiciously; integration
-          tests are slow.
+        - **Tests.** `npm run test:unit` (mocha over `unitTests/`;
+          needs a built `dist/` — run `npm run build` first) for fast
+          unit coverage; `npm run test:integration` for the
+          integration surface. The integration suite is slow — use
+          it judiciously.
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       AI_REVIEW_LOG_TOKEN: ${{ secrets.AI_REVIEW_LOG_TOKEN }}

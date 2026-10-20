@@ -35,16 +35,19 @@ jobs:
           invoke `eslint` directly.
         - Storage substrate matches Harper core: **RocksDB** primary,
           LMDB available via `HARPER_STORAGE_ENGINE=lmdb`.
-        - There is no `npm test` / `test:unit` script — only
-          `npm run test:integration`.
+        - `npm run test:unit` runs the mocha unit tests in
+          `unitTests/` (needs a built `dist/` — run `npm run build`
+          first). `npm run test:integration` is slow; run it only
+          when the change plausibly affects integration behavior.
       pre-commit-validation: |
         - `claude-fix:typo` / `claude-fix:docs` (doc-only changes
           to `*.md` or `package.json` keyword/description fields):
           run `npm run lint`. Skip `npm run build` /
-          `npm run test:integration` — they are not affected and
-          waste turns.
+          `npm run test:unit` / `npm run test:integration` — they
+          are not affected and waste turns.
         - `claude-fix:deps` / `claude-fix:bug` or any change that
-          touches code: run `npm run build && npm run lint`. Run
+          touches code: run
+          `npm run build && npm run lint && npm run test:unit`. Run
           `npm run test:integration` only if the change plausibly
           affects integration behavior.
 
