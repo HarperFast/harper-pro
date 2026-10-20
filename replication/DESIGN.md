@@ -335,18 +335,23 @@ discipline paces _retries_, and jittering a durability deadline would be activel
 
 ## Send-side residency
 
-A stub is never sent, served, or stored as a complete record. `sendAuditRecord` sends every write to
-every non-resident peer as an invalidation unless residency is by id. The copy walk uses `invalidate`
+Transport invariant: a stub is never sent, served, or stored as a complete record through these
+copy/retrieval paths. `sendAuditRecord` sends every write to every non-resident peer as an invalidation
+unless residency is by id. The copy walk uses `invalidate`
 for `INVALIDATED` rows and translates the stored residency flag to the audit flag. GET_RECORD refuses
 stubs with an empty response and supplies current decoder structures for full rows. `Replicator.load`
 tries the remaining residents after an empty stored-stub response; absence requires every non-self
 resident to answer, while an unreachable resident leaves a read error. Id-derived reads retain their
-first-answer semantics. Tests: `residencyWire.test.mjs` and the four-node `residencyReads.test.mjs`.
+first-answer semantics. Blob repair shares a subscription socket, so its request and response decoder
+use the peer's table id; a missing usable decoder fails locally. A subscribed sender refuses mismatched
+table ids before announcing structures, including after an asynchronous read. Tests: `residencyWire.test.mjs` and the four-node `residencyReads.test.mjs`.
 Receivers need core's equal-version resident guard before an upgraded sender copies stubs as
 invalidations; older receivers can demote a full resident on that tie.
 These transport guards do not repair relocate-on-read (#436/#980): query materialization uses the
 existing path, whose missing default residency can mark other peers' partial rows complete. The
 RocksDB relocation audit append can also fail after returning a successful read.
+
+---
 
 ## Non-obvious behaviors
 

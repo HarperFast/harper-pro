@@ -19,6 +19,7 @@ import { getHDBNodeTable, getReplicationSharedStatus } from '#src/replication/kn
 import { LATENCY_POSITION } from '#src/replication/sharedStatusSlots';
 
 const SUBSCRIPTION_REQUEST = 129;
+const TABLE_FIXED_STRUCTURE = 132;
 const GET_RECORD = 133;
 const GET_RECORD_RESPONSE = 134;
 const NODE_NAME = 140;
@@ -148,6 +149,48 @@ describe('residency stubs on the replication wire', function () {
 		}
 	});
 
+	it('uses the subscription peer table id for blob repair requests and response decoding', async () => {
+		socket.emit('message', encode([GET_RECORD, 93, Records.tableId, 'full', Records.tableName]));
+		await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 93));
+		const fullEntry = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 93)[2];
+		assert.equal(fullEntry.error, undefined);
+		const structure = socket.sent.find((frame) => frame[0] === TABLE_FIXED_STRUCTURE)[1];
+		const peerTableId = Records.tableId + 1000;
+		socket.emit('message', encode([TABLE_FIXED_STRUCTURE, structure, peerTableId, Records.tableName]));
+		await new Promise((resolve) => setImmediate(resolve));
+		const pending = session.getRecord({ table: Records, id: 'full', blobRepairOnly: true });
+		const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
+		socket.emit('message', encode([GET_RECORD_RESPONSE, request[1], fullEntry]));
+		assert.equal((await pending).value.body, 'complete');
+		assert.equal(request[2], peerTableId);
+	});
+
+	it('refuses blob repair before the subscription has a usable table decoder', async () => {
+		const pending = session.getRecord({ table: Records, id: 'missing', blobRepairOnly: true });
+		const request = socket.sent.find((frame) => frame[0] === GET_RECORD);
+		if (request) socket.emit('message', encode([GET_RECORD_RESPONSE, request[1]]));
+		await assert.rejects(pending, /No subscription decoder for blob repair/);
+		assert.equal(request, undefined);
+	});
+
+	it('rejects mismatched table ids on subscription sockets before announcing a decoder', async () => {
+		socket.emit(
+			'message',
+			encode([SUBSCRIPTION_REQUEST, [{ name: PEER, startTime: 0, tables: [], replicateByDefault: true }], []])
+		);
+		await until(() => socket.sent.some((frame) => frame[0] === COPY_COMPLETE));
+		const sentBeforeRequest = socket.sent.length;
+		socket.emit('message', encode([GET_RECORD, 91, Records.tableId + 1000, 'missing', Records.tableName]));
+		await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 91));
+		const frames = socket.sent.slice(sentBeforeRequest);
+		const response = frames.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 91);
+		assert.match(response[2]?.error ?? '', /not available for replication/);
+		assert.ok(!frames.some((frame) => frame[0] === TABLE_FIXED_STRUCTURE));
+		socket.emit('message', encode([GET_RECORD, 92, Records.tableId, 'missing', Records.tableName]));
+		await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 92));
+		assert.equal(socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 92)[2], undefined);
+	});
+
 	for (const id of ['stub', 'missing', 'full']) {
 		it(`answers GET_RECORD for ${id} without promoting partial data`, async () => {
 			socket.emit('message', encode([GET_RECORD, 7, Records.tableId, id, Records.tableName]));
@@ -155,7 +198,7 @@ describe('residency stubs on the replication wire', function () {
 			const response = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE);
 			if (id === 'full') {
 				assert.equal(response[2].error, undefined);
-				const [, structure] = socket.sent.find((frame) => frame[0] === 132);
+				const [, structure] = socket.sent.find((frame) => frame[0] === TABLE_FIXED_STRUCTURE);
 				const StructonPackr = createStructon(Packr);
 				const decoder = new StructonPackr({ typedStructs: structure.typedStructs, structures: structure.structures });
 				assert.equal(decoder.decode(response[2].value).body, 'complete');

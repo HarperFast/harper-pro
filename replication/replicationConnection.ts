@@ -9657,9 +9657,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				let tableId = request.table.tableId;
 				if (request.blobRepairOnly) {
 					// Repair shares the subscription stream's decoder namespace: use the peer's id, not ours.
-					const peerTableId = Object.keys(tableDecoders).find(
-						(id) => tableDecoders[id]?.name === request.table.tableName && !peerGenerationRefused(tableDecoders[id])
-					);
+					const peerTableId = Object.keys(tableDecoders).find((id) => {
+						const decoder = tableDecoders[id];
+						return decoder?.name === request.table.tableName && decoder.decoder && !peerGenerationRefused(decoder);
+					});
 					if (peerTableId === undefined) {
 						reject(new Error(`No subscription decoder for blob repair of ${request.table.tableName}`));
 						return;
