@@ -5,6 +5,6 @@ tables.Placed.setResidency((record) => record.homes);
 export class LocalRows extends Resource {
 	get(target) {
 		const table = tables[target.get('table')];
-		return Array.from(table.primaryStore.getRange({ start: null }), ({ key, value }) => ({ id: key, record: value }));
+		return Array.from(table.primaryStore.getRange({ start: true }), ({ key, value }) => ({ id: key, record: value }));
 	}
 }
