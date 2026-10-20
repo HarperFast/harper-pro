@@ -347,8 +347,9 @@ use the peer's table id; a missing usable decoder fails locally. After a reconne
 have no decoder until its next replicated write, so blob repair can fail for that table in the meantime.
 A subscribed sender refuses mismatched
 table ids before announcing structures, including after an asynchronous read. Tests: `residencyWire.test.mjs` and the four-node `residencyReads.test.mjs`.
-Receivers need core's equal-version resident guard before an upgraded sender copies stubs as
-invalidations; older receivers can demote a full resident on that tie.
+Safe mixed-version rollout needs a preparatory Pro release with core's equal-version resident guard
+and the old copy sender. Core ships inside Pro: rolling out this bundled change alone can demote
+a full record on an older receiver. There is no runtime switch that enables this sender separately.
 These transport guards do not repair relocate-on-read (#436/#980): query materialization uses the
 existing path, whose missing default residency can mark other peers' partial rows complete. The
 RocksDB relocation audit append can also fail after returning a successful read.
