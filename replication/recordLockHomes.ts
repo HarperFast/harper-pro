@@ -242,7 +242,7 @@ function withRow<T>(
 
 export function operatorPrincipal(request: any): string {
 	// `hdb_user` is the authenticated principal the operation dispatcher attached; never a request
-	// body field, which a caller could set to forge attribution on the audit-only `fenced[]` list.
+	// body field, which a caller could set to forge attribution on the `fenced[]` list.
 	const name = request?.hdb_user?.username || request?.hdb_user?.name;
 	if (typeof name !== 'string' || name.length === 0)
 		throw new ClientError('record lock home map operations require an authenticated user', 401);

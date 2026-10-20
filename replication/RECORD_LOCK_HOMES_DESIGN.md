@@ -66,7 +66,7 @@ interface RecordLockHomesRow {
 	active?: RecordLockGenerationState;
 	staged?: RecordLockGenerationState;
 	highestActedOn: number; // monotonic floor: max(active?.generation, staged?.generation, highestActedOn), updated with every write, so a delayed stale `stage` cannot clobber a newer `staged`
-	fenced: { node: string; operator: string; at: number; generation?: number; fencedWith?: string[] }[]; // audit only; no grant path reads it. `generation`/`fencedWith`: the stage and fenced set of the `record_lock_apply_homes` call that recorded it
+	fenced: { node: string; operator: string; at: number; generation?: number; fencedWith?: string[] }[]; // no grant path reads it. An entry with `generation`/`fencedWith` (the stage and fenced set of the `record_lock_apply_homes` call that recorded it) is also admission evidence for that call's retries ("Fenced nodes"); only that stage may write one
 }
 ```
 
@@ -421,7 +421,7 @@ not verify it; the trust model is the same as `record_lock_fence_external`, whic
   The report gives them `role: 'fenced'` and no `survey`/`stage`/`activate`.
 - **Each survivor that this call stages records the fence with its stage.** The stage hop carries `fenced` and `operator`
   (the authenticated caller on the initiating node). `stageGeneration` appends one
-  `{node, operator, at, generation, fencedWith}` entry per fenced node to the row's audit-only
+  `{node, operator, at, generation, fencedWith}` entry per fenced node to the row's
   `fenced[]` inside the same `withRow` write as `staged`, deduplicated on `(node, generation,
 fencedWith)` so retries of the same call do not grow it. A noop re-stage that adds a fence still writes. A relayed hop records the operator as
   `"<operator> via <relaying node>"`: the node principal can already run any operation on a peer
@@ -459,6 +459,10 @@ drain wait, and must keep every excluded node stopped until it is re-staged: a l
 a restarted node from serving a ring of one. The majority is counted only over rings that
 `record_lock_apply_homes` activated; a ring activated with the per-node operations on a node set that
 never staged it (which §4.3's runbook already forbids) can still anchor wrongly.
+
+**A fenced call after an unfenced one is refused too.** If an unfenced call staged the survivors and
+the node then died, their `active` ring is gone and no fence was recorded at that target, so a fenced
+retry is 409. Recover with `record_lock_activate_generation` on each survivor after the drain interval.
 
 A fenced node that comes back is not re-admitted by this call: its `active` disagrees with the
 survivors', so a later apply that lists it refuses at survey ("nodes disagree about the active

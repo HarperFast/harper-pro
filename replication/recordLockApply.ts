@@ -242,13 +242,9 @@ export function planSurvey(
 		generation = resumable ? floor : floor + 1;
 	}
 	const digest = digestOf(generation, homes);
-	// A fenced node is never surveyed, and if it comes back serving its old map only a peer in that
-	// map's ring can disagree with it. The anchor is an `active` ring holding it that a strict majority
-	// of that ring's members report active. A single survivor's row can be stale: the fenced node may
-	// itself have fenced that survivor out in an earlier transition, and only a majority is sure to
-	// include a node that saw it. A staged ring is no anchor, since the fenced node may never have
-	// staged it. Failing that, a fence an earlier call of this transition recorded on a survivor
-	// already at its target; that call passed this same check.
+	// Anchor: an `active` ring holding the fenced node that a strict majority of its members report, or a
+	// fence an earlier call of this transition recorded at its target. Why a majority, not one
+	// survivor: RECORD_LOCK_HOMES_DESIGN.md "Fenced nodes".
 	const surveyed = [...rows.values()];
 	if (observer && !('error' in observer.reply)) surveyed.push(observer.reply);
 	const unanchored = fenced.filter((node) => {
