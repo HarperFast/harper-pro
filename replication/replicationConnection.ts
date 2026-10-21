@@ -7184,8 +7184,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// origin (undefined/0 = us) — the same id space the wire uses.
 														const recordNodeId = entry.nodeId ?? nodeId;
 														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
-														// A receiver without the equal-version resident guard would demote its full row on
-														// a stub sent as `invalidate`, so it gets the stub exactly as an older sender sends it.
+														// Any other peer gets the stub exactly as a pre-gate sender sent it, never a skip.
 														const isStub = Boolean(entry.metadataFlags & INVALIDATED);
 														const stubAsInvalidation =
 															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);

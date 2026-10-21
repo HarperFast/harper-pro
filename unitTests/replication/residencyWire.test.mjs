@@ -236,7 +236,6 @@ describe('residency stubs on the replication wire', function () {
 		return records;
 	}
 
-	// What the copy sender sent for a stored row before stub rows were copied as invalidations.
 	function preGateCopyEncoding(key, nodeId) {
 		const stored = [...Records.primaryStore.getRange({ versions: true, snapshot: false })].find(
 			(entry) => entry.key === key
