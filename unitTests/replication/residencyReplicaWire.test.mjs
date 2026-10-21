@@ -76,14 +76,20 @@ function copiedRecords(socket, tableId) {
 
 describe('local replicas on the replication wire', function () {
 	this.timeout(30_000);
-	let Records, KeyOnly, socket, session, residencyId, stubVersion;
+	let Records, KeyOnly, Expiring, socket, session, residencyId, stubVersion;
 
 	before(async () => {
 		setHdbBasePath(process.env.STORAGE_PATH);
-		for (const indexed of [true, false]) {
+		for (const schema of [
+			{ name: 'Records', indexed: true },
+			{ name: 'KeyOnly', indexed: false },
+			{ name: 'Expiring', indexed: true, expiration: 3600 },
+		]) {
+			const { indexed } = schema;
 			const RecordTable = table({
 				database: DATABASE,
-				table: indexed ? 'Records' : 'KeyOnly',
+				table: schema.name,
+				expiration: schema.expiration,
 				attributes: [
 					{ name: 'id', isPrimaryKey: true },
 					{ name: 'name', indexed },
@@ -92,8 +98,9 @@ describe('local replicas on the replication wire', function () {
 				],
 				audit: true,
 			});
-			if (indexed) Records = RecordTable;
-			else KeyOnly = RecordTable;
+			if (schema.name === 'Records') Records = RecordTable;
+			else if (schema.name === 'KeyOnly') KeyOnly = RecordTable;
+			else Expiring = RecordTable;
 			RecordTable.setResidency(() => [PEER]);
 			await RecordTable.put('full', { id: 'full', name: 'indexed', body: 'complete' });
 			residencyId = RecordTable.primaryStore.getEntry('full').residencyId;
@@ -193,12 +200,15 @@ describe('local replicas on the replication wire', function () {
 		assert.equal(socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 12)[2], undefined);
 	});
 
-	for (const indexed of [true, false]) {
+	for (const shape of ['secondary-indexed', 'key-only', 'expiring']) {
+		const indexed = shape !== 'key-only';
 		for (const peer of ['capable', 'missing-key', 'unlearned']) {
-			it(`copies a ${indexed ? 'secondary-indexed' : 'key-only'} replica like its demoted stub to a ${peer} resident`, async () => {
-				const RecordTable = indexed ? Records : KeyOnly;
+			it(`copies a ${shape} replica like its demoted stub to a ${peer} resident`, async () => {
+				const RecordTable = shape === 'expiring' ? Expiring : indexed ? Records : KeyOnly;
 				const id = `copied-${peer}`;
 				const replica = await keptReplica(id, undefined, RecordTable);
+				assert.ok(replica.value.created != null, 'the fixture must supply a created time');
+				if (shape === 'expiring') assert.ok(replica.expiresAt > Date.now(), 'the fixture must supply a record expiry');
 				if (peer !== 'capable') {
 					socket.close();
 					socket = new Socket();
@@ -233,7 +243,7 @@ describe('local replicas on the replication wire', function () {
 				assert.equal(value.body, undefined);
 				assert.equal(value.created, replica.value.created);
 				assert.equal(value.name, indexed ? 'indexed' : undefined);
-				assert.equal(copied.expiresAt, undefined);
+				assert.equal(copied.expiresAt, undefined, 'stored stubs also use main’s copy frame without record expiry');
 				assert.equal(records.get('full').entry.type, 'put');
 				await RecordTable.evict(id, replica.value, replica.version);
 				await until(() => RecordTable.primaryStore.getEntry(id).metadataFlags & INVALIDATED, 'replica demotion');
