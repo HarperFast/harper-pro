@@ -8,6 +8,7 @@ import {
 	ORIGIN_CURSORS_CAPABILITY,
 	ORIGIN_FLOORS_CAPABILITY,
 	RECORD_LOCKS_CAPABILITY,
+	RESIDENCY_STUB_COPY_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
@@ -16,6 +17,7 @@ import {
 	peerSupportsOriginCursors,
 	peerSupportsOriginFloors,
 	peerSupportsRecordLocks,
+	peerSupportsResidencyStubCopy,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -37,6 +39,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				originCursors: 0,
 				originFloors: 0,
 				tableLifecycle: 0,
+				residencyStubCopy: 0,
 			}
 		);
 	});
@@ -60,6 +63,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 			'originFloors',
 			'protocolVersion',
 			'recordLocks',
+			'residencyStubCopy',
 			'safeCopyAudit',
 			'subscriptionSetupAck',
 			'subscriptionSetupBudgetMs',
@@ -237,6 +241,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originCursors: ORIGIN_CURSORS_CAPABILITY,
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
+				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -278,6 +283,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originCursors: ORIGIN_CURSORS_CAPABILITY,
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
+				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 			}
 		);
 	});
@@ -446,5 +452,29 @@ describe('safeCopyAudit', () => {
 			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ safeCopyAudit: 1 })),
 			false
 		);
+	});
+});
+
+describe('residencyStubCopy', () => {
+	it('is unsupported for an absent, empty or pre-key bag', () => {
+		for (const bag of [undefined, {}, { residencyStubCopy: 0 }, { residencyStubCopy: 'no' }, { tableLifecycle: 1 }])
+			assert.strictEqual(peerSupportsResidencyStubCopy(resolvePeerCapabilities(bag)), false, JSON.stringify(bag));
+	});
+
+	it('is supported from the advertised level and clamped to the one this build implements', () => {
+		assert.strictEqual(
+			peerSupportsResidencyStubCopy(resolvePeerCapabilities(buildLocalCapabilities(1, false, false))),
+			true
+		);
+		assert.strictEqual(
+			resolvePeerCapabilities({ residencyStubCopy: 5 }).residencyStubCopy,
+			RESIDENCY_STUB_COPY_CAPABILITY
+		);
+	});
+
+	it('reports a change in residencyStubCopy alone', () => {
+		const full = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
+		const without = resolvePeerCapabilities({ ...buildLocalCapabilities(90_000, true, true), residencyStubCopy: 0 });
+		assert.strictEqual(samePeerCapabilities(full, without), false);
 	});
 });

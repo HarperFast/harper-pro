@@ -6,11 +6,12 @@ import { createStructon } from 'structon';
 import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
 import { table } from '#src/core/resources/databases';
 import { transaction } from '#src/core/resources/transaction';
-import { Decoder, readAuditEntry } from '#src/core/resources/auditStore';
+import { ACTION_32_BIT, createAuditEntry, Decoder, readAuditEntry } from '#src/core/resources/auditStore';
 import { INVALIDATED } from '#src/core/resources/Table';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import {
 	databaseSubscriptions,
+	encodeCopyRecordValue,
 	NodeReplicationConnection,
 	replicateOverWS,
 } from '#src/replication/replicationConnection';
@@ -23,6 +24,8 @@ const TABLE_FIXED_STRUCTURE = 132;
 const GET_RECORD = 133;
 const GET_RECORD_RESPONSE = 134;
 const NODE_NAME = 140;
+const OPERATION_REQUEST = 136;
+const OPERATION_RESPONSE = 137;
 const COPY_START = 148;
 const COPY_COMPLETE = 149;
 const DATABASE = 'residencyWire';
@@ -206,17 +209,17 @@ describe('residency stubs on the replication wire', function () {
 		});
 	}
 
-	it('copies a resident-targeted stub as an invalidation with its residency id', async () => {
-		socket.emit(
+	async function copiedRecords(copySocket = socket) {
+		copySocket.emit(
 			'message',
 			encode([SUBSCRIPTION_REQUEST, [{ name: PEER, startTime: 0, tables: [], replicateByDefault: true }], []])
 		);
-		await until(() => socket.sent.some((frame) => frame[0] === COPY_COMPLETE));
-		const start = socket.sent.findIndex((frame) => frame[0] === COPY_START);
-		const end = socket.sent.findIndex((frame) => frame[0] === COPY_COMPLETE);
+		await until(() => copySocket.sent.some((frame) => frame[0] === COPY_COMPLETE));
+		const start = copySocket.sent.findIndex((frame) => frame[0] === COPY_START);
+		const end = copySocket.sent.findIndex((frame) => frame[0] === COPY_COMPLETE);
 		assert.ok(start >= 0 && end > start, 'must exercise the base-copy row walk');
 		const records = new Map();
-		for (const frame of socket.sent.slice(start + 1, end)) {
+		for (const frame of copySocket.sent.slice(start + 1, end)) {
 			if (!Buffer.isBuffer(frame)) continue;
 			const decoder = new Decoder(frame.buffer, frame.byteOffset, frame.byteLength);
 			decoder.position = 8;
@@ -226,14 +229,70 @@ describe('residency stubs on the replication wire', function () {
 				decoder.position += length;
 				if (length === 9 && frame[offset] === 11) continue;
 				const entry = readAuditEntry(frame, offset, offset + length);
-				if (entry.tableId === Records.tableId) records.set(entry.recordId, entry);
+				if (entry.tableId === Records.tableId)
+					records.set(entry.recordId, { entry, bytes: Buffer.from(frame.subarray(offset, offset + length)) });
 			}
 		}
-		assert.equal(records.get('stub')?.type, 'invalidate', 'base copy promoted a stub to put');
-		assert.equal(records.get('stub').residencyId, residencyId);
-		assert.equal(records.get('stub').getValue(Records.primaryStore).body, undefined);
-		assert.equal(records.get('full')?.type, 'put');
-		assert.equal(records.get('full').residencyId, residencyId);
-		assert.equal(records.get('full').getValue(Records.primaryStore).body, 'complete');
+		return records;
+	}
+
+	// What the copy sender sent for a stored row before stub rows were copied as invalidations.
+	function preGateCopyEncoding(key, nodeId) {
+		const stored = [...Records.primaryStore.getRange({ versions: true, snapshot: false })].find(
+			(entry) => entry.key === key
+		);
+		return Buffer.from(
+			createAuditEntry({
+				version: stored.version,
+				tableId: Records.tableId,
+				recordId: key,
+				previousVersion: null,
+				nodeId,
+				type: 'put',
+				encodedRecord: encodeCopyRecordValue(Records.primaryStore, stored.value, () => {}),
+				extendedType: stored.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24),
+				residencyId: stored.residencyId,
+				previousResidencyId: null,
+				expiresAt: stored.expiresAt,
+			})
+		);
+	}
+
+	it('copies a resident-targeted stub as an invalidation with its residency id to a guarded peer', async () => {
+		const records = await copiedRecords();
+		assert.equal(records.get('stub')?.entry.type, 'invalidate', 'base copy promoted a stub to put');
+		assert.equal(records.get('stub').entry.residencyId, residencyId);
+		assert.equal(records.get('stub').entry.getValue(Records.primaryStore).body, undefined);
+		assert.equal(records.get('full')?.entry.type, 'put');
+		assert.equal(records.get('full').entry.residencyId, residencyId);
+		assert.equal(records.get('full').entry.getValue(Records.primaryStore).body, 'complete');
 	});
+
+	for (const peer of ['a pre-key capability bag', 'unlearned capabilities']) {
+		it(`copies a stub exactly as before the gate to a peer with ${peer}`, async () => {
+			socket.close();
+			socket = new Socket();
+			// A peer's NODE_NAME names the database; with none, this side must already know it.
+			const unlearned = peer === 'unlearned capabilities';
+			replicateOverWS(socket, unlearned ? { database: DATABASE } : {}, { name: PEER, replicates: true });
+			if (!unlearned) {
+				const olderBag = { ...buildLocalCapabilities(90_000, false, true) };
+				delete olderBag.residencyStubCopy;
+				socket.emit('message', encode([NODE_NAME, PEER, DATABASE, [], olderBag]));
+				await until(() => socket.sent.some((frame) => frame[0] === NODE_NAME));
+			}
+			const copied = copiedRecords();
+			if (unlearned) {
+				// No safeCopyAudit either, so the copy first asks for the peer's version.
+				await until(() => socket.sent.some((frame) => frame[0] === OPERATION_REQUEST));
+				const { requestId } = socket.sent.find((frame) => frame[0] === OPERATION_REQUEST)[1];
+				socket.emit('message', encode([OPERATION_RESPONSE, { requestId, version: '5.3.0' }]));
+			}
+			const records = await copied;
+			const stub = records.get('stub');
+			assert.equal(stub?.entry.type, 'put');
+			assert.deepEqual(stub.bytes, preGateCopyEncoding('stub', stub.entry.nodeId));
+			assert.equal(records.get('full')?.entry.residencyId, residencyId);
+		});
+	}
 });

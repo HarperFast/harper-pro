@@ -102,6 +102,7 @@ import {
 	peerSupportsOriginCursors,
 	peerSupportsOriginFloors,
 	peerSupportsRecordLocks,
+	peerSupportsResidencyStubCopy,
 	peerSupportsTableLifecycle,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
@@ -7183,7 +7184,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// origin (undefined/0 = us) — the same id space the wire uses.
 														const recordNodeId = entry.nodeId ?? nodeId;
 														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
-														const copyType = entry.metadataFlags & INVALIDATED ? 'invalidate' : 'put';
+														// A receiver without the equal-version resident guard would demote its full row on
+														// a stub sent as `invalidate`, so it gets the stub exactly as an older sender sends it.
+														const isStub = Boolean(entry.metadataFlags & INVALIDATED);
+														const stubAsInvalidation =
+															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
+														const legacyStubCopy = isStub && !stubAsInvalidation;
+														const copyType = stubAsInvalidation ? 'invalidate' : 'put';
 														const encodeCopyRecord = () =>
 															createAuditEntry({
 																version: entry.version,
@@ -7197,7 +7204,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																),
 																extendedType:
 																	(entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24)) |
-																	(entry.residencyId ? HAS_CURRENT_RESIDENCY_ID : 0),
+																	(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0),
 																residencyId: entry.residencyId,
 																previousResidencyId: null,
 																expiresAt: entry.expiresAt,
