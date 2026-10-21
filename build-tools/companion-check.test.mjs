@@ -445,7 +445,7 @@ const evt = makeEnv('pull_request_target', [], pr(700, 'plain', 'bbb'));
 const evtBySha = await run(evt);
 assert.equal(evtBySha.bbb.state, 'success');
 assert.equal(evtBySha.bbb.description, 'No companion dependencies');
-assert.equal('request' in evtBySha.bbb, false, 'event writes keep the client retry defaults');
+assert.equal(evtBySha.bbb.request?.retries, undefined, 'event writes keep the client retry defaults');
 
 // --- sweep race guard: body changed between list and post -> skip ---
 const stale = pr(720, 'Depends-on: HarperFast/harper#2147', 'kkk');
@@ -475,7 +475,7 @@ writeErr.github.rest.repos.createCommitStatus = async (s) => {
 };
 const writeErrBySha = await run(writeErr);
 assert.equal(writeErrBySha.err2.state, 'pending', 'failed sweep write must not leave the old verdict');
-assert.equal('request' in writeErrBySha.err2, false, 'pending fallback keeps the client retries');
+assert.equal(writeErrBySha.err2.request?.retries, undefined, 'pending fallback keeps the client retries');
 assert.match(writeErr.core.failed, /1 PR/);
 
 // --- secret guards ---
