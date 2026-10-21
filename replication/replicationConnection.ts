@@ -6094,7 +6094,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												try {
 													retained = collectRetainedFileIds(requestedTable?.primaryStore.getEntry(key)?.value);
 												} catch {
-													return;
+													// the table is gone: no row of it can hold these files
 												}
 												for (const blob of blobsToDelete) if (!retained?.has(getFileId(blob))) deleteBlob(blob);
 											}, 60000).unref();
