@@ -112,7 +112,7 @@
 		"test:integration": "HARPER_INTEGRATION_TEST_INSTALL_SCRIPT=dist/bin/harper.js harper-integration-test-run",
 		"test:integration:all": "npm run test:integration -- integrationTests/**/*.test.*s",
 		"test:integration:cluster": "npm run test:integration -- 'integrationTests/cluster/**/*.test.*s'",
-		"test:integration:non-cluster": "npm run test:integration -- 'integrationTests/!(cluster)/**/*.test.*s'",
+		"test:integration:non-cluster": "npm run test:integration -- 'integrationTests/!(cluster)/**/*.test.*s' core/integrationTests/security/ocsp-verification.test.ts core/integrationTests/security/crl-verification.test.ts core/integrationTests/security/subscription-revocation.test.ts",
 		"test:smoke": "node smokeTests/run-smoke.mjs",
 		"test:stress:components": "node stressTests/run-stress.mjs",
 		"bench:record-locks": "npm run test:integration -- --concurrency=1 integrationTests/cluster/recordLockCost.bench.mjs",
