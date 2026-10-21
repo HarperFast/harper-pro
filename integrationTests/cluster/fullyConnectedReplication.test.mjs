@@ -193,7 +193,6 @@ function clusterReplication(ctx) {
 			records: [{ id: '1', name: 'test2' }],
 			replicatedConfirmation: NODE_COUNT - 1,
 		});
-		if (ctx.testLMDB) await delay(400); // confirmation isn't working for LMDB
 		for (let i = 0; i < NODE_COUNT; i++) {
 			let response = await sendOperation(ctx.nodes[i], {
 				operation: 'search_by_id',
@@ -212,21 +211,15 @@ function clusterReplication(ctx) {
 			ids: ['1'],
 			replicatedConfirmation: NODE_COUNT - 1,
 		});
-		if (ctx.testLMDB) await delay(400);
-		let response = await sendOperation(ctx.nodes[0], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 0);
-		response = await sendOperation(ctx.nodes[1], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 0);
+		for (let i = 0; i < NODE_COUNT; i++) {
+			const response = await sendOperation(ctx.nodes[i], {
+				operation: 'search_by_id',
+				table: 'test',
+				get_attributes: ['id', 'name'],
+				ids: ['1'],
+			});
+			equal(response.length, 0, `node ${i + 1} still has the deleted record`);
+		}
 	});
 	suite('Deploy app and test replication', { timeout: 60000 }, () => {
 		before(async () => {
