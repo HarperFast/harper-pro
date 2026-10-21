@@ -25,6 +25,7 @@ import {
 	createAuditEntry,
 	Decoder,
 	HAS_CURRENT_RESIDENCY_ID,
+	HAS_EXPIRATION_EXTENDED_TYPE,
 	HAS_PREVIOUS_RESIDENCY_ID,
 	REMOTE_SEQUENCE_UPDATE,
 	HAS_BLOBS,
@@ -118,7 +119,8 @@ import {
 	METADATA,
 	storedFieldsOnly,
 } from '../core/resources/RecordEncoder.ts';
-import { INVALIDATED } from '../core/resources/Table.ts';
+import { INVALIDATED, REPLICA } from '../core/resources/Table.ts';
+import { server } from '../core/server/Server.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
 import { WebSocket } from 'ws';
@@ -153,6 +155,7 @@ import {
 	decodeBlobsWithWrites,
 	decodeFromDatabase,
 	decodeWithBlobCallback,
+	collectRetainedFileIds,
 	deleteBlob,
 	saveBlob,
 	getFileId,
@@ -633,6 +636,21 @@ export function truncateCloseReason(reason: unknown): string | undefined {
  */
 export function isResolverOwnedIndexedName(table: any, name: string): boolean {
 	return table.primaryStore?.encoder?.resolvedAttributeNames?.has(name) === true;
+}
+
+function hasStoredIndexes(table: any): boolean {
+	for (const name in table.indices) if (!isResolverOwnedIndexedName(table, name)) return true;
+	return false;
+}
+
+/** What a non-resident keeps of a record: its stored indexed fields, so local searches still find it. */
+function residencyStubOf(table: any, record: any): Record<string, any> | null {
+	let stub: Record<string, any> | null = null;
+	for (const name in table.indices) {
+		if (isResolverOwnedIndexedName(table, name)) continue;
+		(stub ??= {})[name] = record[name];
+	}
+	return stub;
 }
 
 export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any, txnLogKey = auditRecord.txnLogKey) {
@@ -5980,7 +5998,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (binaryEntry) {
 								let valueBuffer = table.primaryStore.decoder.decode(binaryEntry, { valueAsBuffer: true });
 								const entry: any = lastMetadata || {};
-								if (entry[METADATA] & INVALIDATED) {
+								if (entry[METADATA] & (INVALIDATED | REPLICA)) {
 									ws.send(
 										encode(
 											peerCapabilitiesLearned && peerSupportsResidencyNotResident(peerCapabilities)
@@ -6017,6 +6035,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										version: entry.version,
 										residencyId: entry.residencyId,
 										nodeId: entry.nodeId,
+										// the writer by name: the reader's retrieval socket has no map for this node's ids, and an
+										// id this node cannot name is left unnamed rather than claimed
+										originNode: entry.nodeId ? getNodeNameForId(table.auditStore, entry.nodeId, true) : server.hostname,
 										user: entry.user,
 									},
 								]);
@@ -6038,7 +6059,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					case GET_RECORD_RESPONSE: {
 						// this is a response to a record request, we need to resolve the promise
-						const { resolve, reject, tableId, key } = awaitingResponse.get(message[1]);
+						const { resolve, reject, tableId, key, table: requestedTable } = awaitingResponse.get(message[1]);
 						const entry = message[2];
 						if (entry?.error) reject(new Error(entry.error));
 						else if (entry && (!tableDecoders[tableId]?.decoder || peerGenerationRefused(tableDecoders[tableId]))) {
@@ -6054,15 +6075,25 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									const record = tableDecoders[tableId].decoder.decode(entry.value);
 									entry.value = record;
 									entry.key = key;
-									if (!resolve(entry)) {
-										// if it was not moved locally, clean up any blobs that were written
-										if (blobsToDelete) {
+									// the row write must not hold up later frames on this socket
+									void resolve(entry).then((kept) => {
+										if (!kept && blobsToDelete) {
 											// The blobs are asynchronously used, and it is very difficult to actually know
 											// when they can be safely deleted (we might be able to use a WeakRef with CleanupRegistry).
-											// For now, this should give us plenty of time and provide adequate cleanup measures
-											setTimeout(() => blobsToDelete.forEach(deleteBlob), 60000).unref();
+											// For now, this should give us plenty of time and provide adequate cleanup measures.
+											// A concurrent fetch of the same record shares these files, so only the ones the
+											// row does not reference by then go.
+											setTimeout(() => {
+												let retained: Set<string> | undefined;
+												try {
+													retained = collectRetainedFileIds(requestedTable?.primaryStore.getEntry(key)?.value);
+												} catch {
+													return; // the table is gone; its files are nobody's to reclaim here
+												}
+												for (const blob of blobsToDelete) if (!retained?.has(getFileId(blob))) deleteBlob(blob);
+											}, 60000).unref();
 										}
-									}
+									});
 								},
 								auditStore?.rootStore,
 								(remoteBlob) => {
@@ -6438,17 +6469,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								let extendedType = 0;
 								if (residencyId) extendedType |= HAS_CURRENT_RESIDENCY_ID;
 								if (auditRecord.previousResidencyId) extendedType |= HAS_PREVIOUS_RESIDENCY_ID;
-								let fullRecord: any,
-									partialRecord = null;
-								for (const name in table.indices) {
-									if (isResolverOwnedIndexedName(table, name)) continue;
-									if (!partialRecord) {
-										fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore, txnLogKey);
-										if (!fullRecord) break; // if there is no record, as is the case with a relocate, we can't send it
-										partialRecord = {};
-									}
-									// if there are any indices, we need to preserve a partial invalidated record to ensure we can still do searches
-									partialRecord[name] = fullRecord[name];
+								let partialRecord = null;
+								if (hasStoredIndexes(table)) {
+									const fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore, txnLogKey);
+									if (fullRecord) partialRecord = residencyStubOf(table, fullRecord);
 								}
 								invalidationEntry = createAuditEntry({
 									...auditRecord,
@@ -7191,12 +7215,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// origin (undefined/0 = us) — the same id space the wire uses.
 														const recordNodeId = entry.nodeId ?? nodeId;
 														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
-														// Any other peer gets the stub exactly as a pre-gate sender sent it, never a skip.
-														const isStub = Boolean(entry.metadataFlags & INVALIDATED);
+														const isReplica = Boolean(entry.metadataFlags & REPLICA);
+														const isStub = Boolean(entry.metadataFlags & (INVALIDATED | REPLICA));
 														const stubAsInvalidation =
 															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
 														const legacyStubCopy = isStub && !stubAsInvalidation;
 														const copyType = stubAsInvalidation ? 'invalidate' : 'put';
+														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
+														let copyValue = entry.value;
+														if (isReplica) {
+															copyValue = residencyStubOf(table, entry.value) ?? {};
+															const createdTimeName = table.createdTimeProperty?.name;
+															if (createdTimeName && entry.value[createdTimeName] != null)
+																copyValue[createdTimeName] = entry.value[createdTimeName];
+															if (table.primaryKey) copyValue[table.primaryKey] = entry.key;
+														}
 														const encodeCopyRecord = () =>
 															createAuditEntry({
 																version: entry.version,
@@ -7205,18 +7238,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																previousVersion: null,
 																nodeId: recordNodeId,
 																type: copyType,
-																encodedRecord: encodeCopyRecordValue(table.primaryStore, entry.value, (blob) =>
+																encodedRecord: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
 																	sendBlobs(blob, entry.key)
 																),
 																extendedType:
-																	(entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24)) |
+																	(entry.metadataFlags &
+																		~0xff &
+																		~(ACTION_32_BIT << 24) &
+																		(isReplica ? ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS) : -1)) |
 																	(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0),
 																residencyId: entry.residencyId,
 																previousResidencyId: null,
-																expiresAt: entry.expiresAt,
+																expiresAt: isReplica ? undefined : entry.expiresAt,
 															} as any);
 														const encoded =
-															entry.metadataFlags & HAS_BLOBS
+															entry.metadataFlags & HAS_BLOBS && copyValue === entry.value
 																? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
 																: encodeCopyRecord();
 														await sendAuditRecord(
@@ -7226,7 +7262,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																tableId: table.tableId,
 																type: copyType,
 																getValue() {
-																	return entry.value;
+																	return copyValue;
 																},
 																encoded,
 																version: entry.version,
@@ -9693,17 +9729,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				awaitingResponse.set(requestId, {
 					tableId,
 					key: request.id,
+					table: request.table,
 					resolve(entry) {
 						const { table, entry: existingEntry, blobRepairOnly } = request;
 						// we can immediately resolve this because the data is available.
 						resolve(entry);
-						// However, if we are going to record this locally, we need to record it as a relocation event
-						// and determine new residency information. For blob-repair-only fetches we skip relocation
-						// (we only want the blob bytes written by BLOB_CHUNK, not to update the record's residency).
-						if (entry && !blobRepairOnly) return table._recordRelocate(existingEntry, entry);
-						// Return truthy for blob-repair-only so the GET_RECORD_RESPONSE handler does not schedule
-						// the freshly-received blobs for deferred deletion (they are exactly what we came for).
-						return !!blobRepairOnly;
+						if (blobRepairOnly || !entry) return Promise.resolve(Boolean(blobRepairOnly));
+						return new Promise<boolean>((kept) => kept(table._storeReplica(existingEntry, entry))).catch((error) => {
+							logger.warn?.(connectionId, 'Could not keep a replica of', request.id, 'from', remoteNodeName, error);
+							return false;
+						});
 					},
 					reject,
 				});

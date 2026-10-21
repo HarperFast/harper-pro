@@ -1,0 +1,10 @@
+type Open @table(replicaExpiration: 4) @export {
+	id: ID @primaryKey
+	name: String @indexed
+	body: String
+}
+type Kept @table(replicaExpiration: 3600) @export {
+	id: ID @primaryKey
+	name: String @indexed
+	body: String
+}
