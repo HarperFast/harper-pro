@@ -4824,7 +4824,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let outstandingCommits = 0;
 	const recordRequestTables = new Map<
 		number,
-		{ name: string; table: any; typedLength: number; structureLength: number; attributes: any; schemaDefined: boolean }
+		{
+			name: string;
+			table: any;
+			typedLength: number;
+			structureLength: number;
+			schemaVersion: number;
+			schemaDefined: boolean;
+		}
 	>();
 	let commitBacklogPaused = false;
 	// Wall-clock at which the current back-pressure pause began (0 when not paused). Used to discount the
@@ -5933,11 +5940,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const recordVersion = encoder.isRocksDB ? undefined : getLastVersion();
 							// Local encoder arrays can lag another worker's writes. Check durable counts,
 							// but avoid rebuilding unchanged dictionaries or loading them for a repeat miss.
-							// The receiver also takes the table's schema from this frame, so a schema change re-announces.
+							// The receiver also takes the table's schema from this frame. Schema reloads edit
+							// `attributes` in place, so compare the version they bump, not the array.
 							const counts = binaryEntry && previous?.table === table ? encoder.getStructureCounts() : undefined;
 							if (
 								previous?.table !== table ||
-								previous.attributes !== table.attributes ||
+								previous.schemaVersion !== table.schemaVersion ||
 								previous.schemaDefined !== table.schemaDefined ||
 								(counts && (previous.typedLength !== counts.typed || previous.structureLength !== counts.classic))
 							) {
@@ -5963,7 +5971,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									table,
 									typedLength,
 									structureLength,
-									attributes: table.attributes,
+									schemaVersion: table.schemaVersion,
 									schemaDefined: table.schemaDefined,
 								});
 							}
@@ -9657,10 +9665,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				let tableId = request.table.tableId;
 				if (request.blobRepairOnly) {
 					// Repair shares the subscription stream's decoder namespace: use the peer's id, not ours.
-					const peerTableId = Object.keys(tableDecoders).find((id) => {
-						const decoder = tableDecoders[id];
-						return decoder?.name === request.table.tableName && decoder.decoder && !peerGenerationRefused(decoder);
-					});
+					const peerTableId = Object.keys(tableDecoders).find(
+						(id) => tableDecoders[id]?.name === request.table.tableName && !peerGenerationRefused(tableDecoders[id])
+					);
 					if (peerTableId === undefined) {
 						reject(new Error(`No subscription decoder for blob repair of ${request.table.tableName}`));
 						return;

@@ -238,6 +238,30 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 		assert.match(refused?.[2].error, /is not available for replication/);
 	});
 
+	it('re-announces the schema after an in-place attribute change, and only then', async () => {
+		await loadGQLSchema('type GetRecordSchema @table { id: ID @primaryKey payload: String }');
+		const table = tables.GetRecordSchema;
+		const attributes = table.attributes;
+		await table.put({ id: 'row', payload: 'value' });
+		const request = async (requestId) => {
+			const start = socket.sent.length;
+			socket.emit('message', encode([GET_RECORD, requestId, table.tableId, 'row', table.tableName]));
+			for (let turn = 0; turn < 100 && !socket.sent.some((frame) => frame[1] === requestId); turn++)
+				await new Promise((resolve) => setImmediate(resolve));
+			const frames = socket.sent.slice(start);
+			assert.ok(frames.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === requestId));
+			return frames.find((frame) => frame[0] === TABLE_FIXED_STRUCTURE);
+		};
+		const names = (structure) => structure[1].attributes.map((attribute) => attribute.name);
+		assert.deepEqual(names(await request(60)), ['id', 'payload']);
+		assert.equal(await request(61), undefined);
+		await loadGQLSchema('type GetRecordSchema @table { id: ID @primaryKey payload: String added: String }');
+		assert.equal(tables.GetRecordSchema, table);
+		assert.equal(table.attributes, attributes);
+		assert.deepEqual(names(await request(62)), ['id', 'payload', 'added']);
+		assert.equal(await request(63), undefined);
+	});
+
 	for (const randomAccessFields of [false, true]) {
 		it(`refreshes growing dictionaries and suppresses redundant announcements (typed: ${randomAccessFields})`, async () => {
 			const name = `GetRecordGrowing${randomAccessFields}`;
