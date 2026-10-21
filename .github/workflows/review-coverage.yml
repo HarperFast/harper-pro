@@ -28,6 +28,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: HarperFast/harper/.github/actions/review-coverage@e856f7739593cd9278a07b7fe67dc8b359481130 # main
+      - uses: HarperFast/harper/.github/actions/review-coverage@ea43e5677be264f943260eaa337f4b2ab7a0290c # main
         with:
           mode: enforce
