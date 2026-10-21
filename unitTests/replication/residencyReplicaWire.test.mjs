@@ -12,10 +12,12 @@ import { setReplicator } from '#src/replication/replicator';
 import { server } from '#src/core/server/Server';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 
+const OPERATION_REQUEST = 136;
 const SUBSCRIPTION_REQUEST = 129;
 const TABLE_FIXED_STRUCTURE = 132;
 const GET_RECORD = 133;
 const GET_RECORD_RESPONSE = 134;
+const OPERATION_RESPONSE = 137;
 const NODE_NAME = 140;
 const COPY_START = 148;
 const COPY_COMPLETE = 149;
@@ -65,7 +67,8 @@ function copiedRecords(socket, tableId) {
 			decoder.position += length;
 			if (length === 9 && frame[offset] === 11) continue;
 			const entry = readAuditEntry(frame, offset, offset + length);
-			if (entry.tableId === tableId) records.set(entry.recordId, entry);
+			if (entry.tableId === tableId)
+				records.set(entry.recordId, { entry, bytes: Buffer.from(frame.subarray(offset, offset + length)) });
 		}
 	}
 	return records;
@@ -73,30 +76,39 @@ function copiedRecords(socket, tableId) {
 
 describe('local replicas on the replication wire', function () {
 	this.timeout(30_000);
-	let Records, socket, session, residencyId, stubVersion;
+	let Records, KeyOnly, socket, session, residencyId, stubVersion;
 
 	before(async () => {
 		setHdbBasePath(process.env.STORAGE_PATH);
-		Records = table({
-			database: DATABASE,
-			table: 'Records',
-			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'name', indexed: true }, { name: 'body' }],
-			audit: true,
-		});
-		Records.setResidency(() => [PEER]);
-		await Records.put('full', { id: 'full', name: 'indexed', body: 'complete' });
-		residencyId = Records.primaryStore.getEntry('full').residencyId;
-		setReplicator(DATABASE, Records, {});
+		for (const indexed of [true, false]) {
+			const RecordTable = table({
+				database: DATABASE,
+				table: indexed ? 'Records' : 'KeyOnly',
+				attributes: [
+					{ name: 'id', isPrimaryKey: true },
+					{ name: 'name', indexed },
+					{ name: 'body' },
+					{ name: 'created', assignCreatedTime: true },
+				],
+				audit: true,
+			});
+			if (indexed) Records = RecordTable;
+			else KeyOnly = RecordTable;
+			RecordTable.setResidency(() => [PEER]);
+			await RecordTable.put('full', { id: 'full', name: 'indexed', body: 'complete' });
+			residencyId = RecordTable.primaryStore.getEntry('full').residencyId;
+			setReplicator(DATABASE, RecordTable, {});
+		}
 		await until(() => databaseSubscriptions.get(DATABASE)?.auditStore, 'the database subscription');
 	});
 
-	async function stub(id) {
+	async function stub(id, RecordTable = Records) {
 		const context = {};
 		await transaction(context, async () => {
-			const resource = await Records.getResource(id, context, { ensureLoaded: false });
+			const resource = await RecordTable.getResource(id, context, { ensureLoaded: false });
 			resource._writeInvalidate(id, { id, name: 'indexed' }, { residencyId });
 		});
-		const entry = Records.primaryStore.getEntry(id);
+		const entry = RecordTable.primaryStore.getEntry(id);
 		assert.ok(entry.metadataFlags & INVALIDATED);
 		return entry;
 	}
@@ -110,8 +122,8 @@ describe('local replicas on the replication wire', function () {
 
 	afterEach(() => socket?.close());
 
-	async function fullRecordFrame() {
-		socket.emit('message', encode([GET_RECORD, 11, Records.tableId, 'full', Records.tableName]));
+	async function fullRecordFrame(RecordTable = Records) {
+		socket.emit('message', encode([GET_RECORD, 11, RecordTable.tableId, 'full', RecordTable.tableName]));
 		await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 11));
 		const response = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 11)[2];
 		assert.equal(response.error, undefined);
@@ -120,18 +132,18 @@ describe('local replicas on the replication wire', function () {
 		return { response, structure };
 	}
 
-	async function keptReplica(id, existing) {
-		existing ??= await stub(id);
+	async function keptReplica(id, existing, RecordTable = Records) {
+		existing ??= await stub(id, RecordTable);
 		stubVersion = existing.version;
-		const { response, structure } = await fullRecordFrame();
-		socket.emit('message', encode([TABLE_FIXED_STRUCTURE, structure[1], Records.tableId, Records.tableName]));
+		const { response, structure } = await fullRecordFrame(RecordTable);
+		socket.emit('message', encode([TABLE_FIXED_STRUCTURE, structure[1], RecordTable.tableId, RecordTable.tableName]));
 		await new Promise((resolve) => setImmediate(resolve));
-		const pending = session.getRecord({ table: Records, id, entry: existing });
+		const pending = session.getRecord({ table: RecordTable, id, entry: existing });
 		const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
 		socket.emit('message', encode([GET_RECORD_RESPONSE, request[1], { ...response, version: stubVersion }]));
 		assert.equal((await pending).value.body, 'complete');
-		return until(() => Records.primaryStore.getEntry(id).metadataFlags & REPLICA, 'the replica write').then(() =>
-			Records.primaryStore.getEntry(id)
+		return until(() => RecordTable.primaryStore.getEntry(id).metadataFlags & REPLICA, 'the replica write').then(() =>
+			RecordTable.primaryStore.getEntry(id)
 		);
 	}
 
@@ -181,22 +193,53 @@ describe('local replicas on the replication wire', function () {
 		assert.equal(socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 12)[2], undefined);
 	});
 
-	it('copies a replica as a bodyless invalidation with its residency id and no lifetime', async () => {
-		const replica = await keptReplica('copied');
-		assert.equal(replica.expiresAt, undefined, 'the row carries no replica deadline');
-		socket.emit(
-			'message',
-			encode([SUBSCRIPTION_REQUEST, [{ name: PEER, startTime: 0, tables: [], replicateByDefault: true }], []])
-		);
-		await until(() => socket.sent.some((frame) => frame[0] === COPY_COMPLETE));
-		const records = copiedRecords(socket, Records.tableId);
-		const copied = records.get('copied');
-		assert.equal(copied?.type, 'invalidate', 'base copy promoted a replica to put');
-		assert.equal(copied.residencyId, residencyId);
-		const value = copied.getValue(Records.primaryStore);
-		assert.equal(value.body, undefined);
-		assert.equal(value.name, 'indexed');
-		assert.equal(copied.expiresAt, undefined, 'a replica lifetime is never sent as the record expiry');
-		assert.equal(records.get('full')?.type, 'put');
-	});
+	for (const indexed of [true, false]) {
+		for (const peer of ['capable', 'missing-key', 'unlearned']) {
+			it(`copies a ${indexed ? 'secondary-indexed' : 'key-only'} replica like its demoted stub to a ${peer} resident`, async () => {
+				const RecordTable = indexed ? Records : KeyOnly;
+				const id = `copied-${peer}`;
+				const replica = await keptReplica(id, undefined, RecordTable);
+				if (peer !== 'capable') {
+					socket.close();
+					socket = new Socket();
+					replicateOverWS(socket, { database: DATABASE }, { name: PEER, replicates: true });
+					if (peer === 'missing-key') {
+						const bag = { ...buildLocalCapabilities(90_000, false, true) };
+						delete bag.residencyStubCopy;
+						socket.emit('message', encode([NODE_NAME, PEER, DATABASE, [], bag]));
+						await until(() => socket.sent.some((frame) => frame[0] === NODE_NAME));
+					}
+				}
+				const copy = async () => {
+					socket.sent.length = 0;
+					socket.emit(
+						'message',
+						encode([SUBSCRIPTION_REQUEST, [{ name: PEER, startTime: 0, tables: [], replicateByDefault: true }], []])
+					);
+					if (peer === 'unlearned') {
+						await until(() => socket.sent.some((frame) => frame[0] === OPERATION_REQUEST));
+						const { requestId } = socket.sent.find((frame) => frame[0] === OPERATION_REQUEST)[1];
+						socket.emit('message', encode([OPERATION_RESPONSE, { requestId, version: '5.3.0' }]));
+					}
+					await until(() => socket.sent.some((frame) => frame[0] === COPY_COMPLETE));
+					return copiedRecords(socket, RecordTable.tableId);
+				};
+				const records = await copy();
+				const copied = records.get(id).entry;
+				assert.equal(copied.type, peer === 'capable' ? 'invalidate' : 'put');
+				assert.equal(copied.residencyId, peer === 'capable' ? residencyId : undefined);
+				const value = copied.getValue(RecordTable.primaryStore);
+				assert.equal(value.id, id);
+				assert.equal(value.body, undefined);
+				assert.equal(value.created, replica.value.created);
+				assert.equal(value.name, indexed ? 'indexed' : undefined);
+				assert.equal(copied.expiresAt, undefined);
+				assert.equal(records.get('full').entry.type, 'put');
+				await RecordTable.evict(id, replica.value, replica.version);
+				await until(() => RecordTable.primaryStore.getEntry(id).metadataFlags & INVALIDATED, 'replica demotion');
+				const demoted = await copy();
+				assert.deepEqual(records.get(id).bytes, demoted.get(id).bytes, 'replica copy must match its demoted stub');
+			});
+		}
+	}
 });
