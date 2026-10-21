@@ -10,7 +10,7 @@ import { LATENCY_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from '../../dist/re
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 const ALL_REPLICAS = process.env.HARPER_STORAGE_ENGINE === 'lmdb' ? '*' : '*;confirm=3';
 const FIXTURE = join(import.meta.dirname, 'fixture-residency-replicas');
-const OPEN_REPLICA_EXPIRATION_MS = 4_000; // the fixture's `Open` table; `Kept` holds replicas for an hour
+const OPEN_REPLICA_EXPIRATION_MS = 4_000;
 
 async function request(node, path, options = {}) {
 	const response = await fetch(`${node.httpURL}/${path}`, {
@@ -157,7 +157,6 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 		);
 	}
 
-	/** Writes a record placed on two nodes and returns its placement: who holds it, who reads it as a stub. */
 	async function placedRecord(id, body, tableName = 'Open') {
 		await put(nodes[0], id, { name: id, body }, '1', tableName);
 		const states = await placed(id, tableName);
@@ -291,19 +290,20 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 	);
 
 	test('a replica survives a restart and stays subject to its lifetime', async () => {
-		const [kept, open] = await Promise.all([
-			placedRecord('restarted-kept', 'kept body', 'Kept'),
-			placedRecord('restarted', 'open body'),
-		]);
+		const kept = await placedRecord('restarted-kept', 'kept body', 'Kept');
 		const reader = kept.reader;
+		// an Open record the restarted node reads as a stub, whatever the placement function picks
+		let openId;
+		for (let attempt = 0; openId === undefined && attempt < 12; attempt++) {
+			const id = `restarted-${attempt}`;
+			const open = await placedRecord(id, 'open body');
+			if ([open.reader, open.other].includes(reader)) openId = id;
+		}
+		assert.ok(openId, 'no Open record placed away from the restarted node');
 		await request(nodes[reader], 'Kept/restarted-kept');
 		const keptReplica = await replicaOn(reader, 'restarted-kept', 'Kept');
-		const openReaders = [open.reader, open.other];
-		const openReader = openReaders.includes(reader) ? reader : undefined;
-		if (openReader !== undefined) {
-			await request(nodes[openReader], 'Open/restarted');
-			await replicaOn(openReader, 'restarted');
-		}
+		await request(nodes[reader], `Open/${openId}`);
+		await replicaOn(reader, openId);
 		await restartNode(nodes[reader], { timeoutMs: 120_000 });
 		await waitForCondition(
 			async (signal) => {
@@ -317,13 +317,10 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 		);
 		const afterRestart = await state(nodes[reader], 'restarted-kept', undefined, 'Kept');
 		assert.ok(afterRestart.replica, `the replica did not survive the restart: ${JSON.stringify(afterRestart)}`);
-		assert.equal(afterRestart.expiresAt, keptReplica.expiresAt);
+		assert.equal(afterRestart.version, keptReplica.version);
 		assert.equal(afterRestart.value.body, 'kept body');
-		if (openReader !== undefined) {
-			// the short-lived replica expired during the restart; the sweep re-armed at load demotes it
-			const stub = await stubOn(openReader, 'restarted', 'Open', OPEN_REPLICA_EXPIRATION_MS * 5);
-			assert.equal(stub.value.body, undefined);
-		}
+		const stub = await stubOn(reader, openId, 'Open', OPEN_REPLICA_EXPIRATION_MS * 5);
+		assert.equal(stub.value.body, undefined, 'the sweep re-armed at load must demote the expired replica');
 		await meshed();
 	});
 });

@@ -638,18 +638,24 @@ export function isResolverOwnedIndexedName(table: any, name: string): boolean {
 	return table.primaryStore?.encoder?.resolvedAttributeNames?.has(name) === true;
 }
 
-function hasStoredIndexes(table: any): boolean {
-	for (const name in table.indices) if (!isResolverOwnedIndexedName(table, name)) return true;
-	return false;
+// per table, rebuilt when its schema version moves: the stub projection runs once per write per non-resident peer
+const storedIndexNames = new WeakMap<any, { schemaVersion: any; names: string[] }>();
+function storedIndexNamesOf(table: any): string[] {
+	const cached = storedIndexNames.get(table);
+	if (cached && cached.schemaVersion === table.schemaVersion) return cached.names;
+	const names: string[] = [];
+	for (const name in table.indices) if (!isResolverOwnedIndexedName(table, name)) names.push(name);
+	storedIndexNames.set(table, { schemaVersion: table.schemaVersion, names });
+	return names;
 }
-
-/** What a non-resident keeps of a record: its stored indexed fields, so local searches still find it. */
+function hasStoredIndexes(table: any): boolean {
+	return storedIndexNamesOf(table).length > 0;
+}
 function residencyStubOf(table: any, record: any): Record<string, any> | null {
-	let stub: Record<string, any> | null = null;
-	for (const name in table.indices) {
-		if (isResolverOwnedIndexedName(table, name)) continue;
-		(stub ??= {})[name] = record[name];
-	}
+	const names = storedIndexNamesOf(table);
+	if (names.length === 0) return null;
+	const stub: Record<string, any> = {};
+	for (const name of names) stub[name] = record[name];
 	return stub;
 }
 
@@ -6088,7 +6094,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												try {
 													retained = collectRetainedFileIds(requestedTable?.primaryStore.getEntry(key)?.value);
 												} catch {
-													return; // the table is gone; its files are nobody's to reclaim here
+													return;
 												}
 												for (const blob of blobsToDelete) if (!retained?.has(getFileId(blob))) deleteBlob(blob);
 											}, 60000).unref();
@@ -6098,7 +6104,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								auditStore?.rootStore,
 								(remoteBlob) => {
 									const localBlob = receiveBlobs(remoteBlob, key, undefined, undefined, tableDecoders[tableId]?.name);
-									// track the blobs that were written in case we need to delete them if the record is not moved locally
+									// track the blobs that were written in case we need to delete them if the record is not kept as a replica
 									if (!blobsToDelete) blobsToDelete = [];
 									blobsToDelete.push(localBlob);
 									return localBlob;
@@ -7268,7 +7274,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																version: entry.version,
 																residencyId: entry.residencyId,
 																nodeId: recordNodeId,
-																extendedType: entry.metadataFlags,
+																extendedType: isReplica
+																	? entry.metadataFlags & ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS)
+																	: entry.metadataFlags,
 															},
 															copyTxnLogKey,
 															nodeId
