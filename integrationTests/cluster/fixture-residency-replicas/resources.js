@@ -46,15 +46,9 @@ export class ResidencyState extends Resource {
 		};
 	}
 
-	async post(target, { table: tableName = 'Open', removeLocal, prefer, holdReplicas, latencySlot, statusSlots }) {
+	async post(target, { table: tableName = 'Open', removeLocal, holdReplicas }) {
 		const table = tables[tableName];
 		if (removeLocal) await table.primaryStore.remove(removeLocal);
-		if (prefer) {
-			const status = new Float64Array(
-				table.auditStore.getUserSharedBuffer(['replicated', 'data', prefer], new ArrayBuffer(statusSlots * 8))
-			);
-			status[latencySlot] = -Infinity;
-		}
 		if (holdReplicas !== undefined) Atomics.store(hold, 0, holdReplicas ? 1 : 0);
 		return { ready: true };
 	}

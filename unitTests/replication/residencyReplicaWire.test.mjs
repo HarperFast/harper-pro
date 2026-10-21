@@ -120,7 +120,6 @@ describe('local replicas on the replication wire', function () {
 		return { response, structure };
 	}
 
-	/** Fetches `full` over the socket and keeps the answer as a replica of the stub `id`. */
 	async function keptReplica(id, existing) {
 		existing ??= await stub(id);
 		stubVersion = existing.version;
