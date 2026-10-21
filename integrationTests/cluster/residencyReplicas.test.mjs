@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { restartNode, sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
-import { LATENCY_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from '../../dist/replication/sharedStatusSlots.js';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 const ALL_REPLICAS = process.env.HARPER_STORAGE_ENGINE === 'lmdb' ? '*' : '*;confirm=3';
@@ -132,7 +131,7 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 	async function control(node, data) {
 		const response = await request(node, 'ResidencyState', {
 			method: 'POST',
-			body: JSON.stringify({ ...data, latencySlot: LATENCY_POSITION, statusSlots: REPLICATION_SHARED_STATUS_SLOTS }),
+			body: JSON.stringify(data),
 		});
 		assert.equal(response.status, 200, JSON.stringify(response));
 	}
