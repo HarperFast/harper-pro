@@ -408,6 +408,12 @@ jobs:
               exit 1
             fi
           done
+          for test_file in core/integrationTests/security/ocsp-verification.test.ts core/integrationTests/security/crl-verification.test.ts; do
+            if ! grep -Fq 'on a resumed TLS session' "$test_file"; then
+              echo "::error::'$test_file' lost its resumed-TLS-session cases — this job would run without the Node 26 revocation regression coverage."
+              exit 1
+            fi
+          done
 
       - name: Run revocation suites
         env:
