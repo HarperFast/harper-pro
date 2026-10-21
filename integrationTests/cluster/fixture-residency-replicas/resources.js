@@ -48,7 +48,6 @@ export class ResidencyState extends Resource {
 
 	async post(target, { table: tableName = 'Open', removeLocal, prefer, holdReplicas, latencySlot, statusSlots }) {
 		const table = tables[tableName];
-		// Deliberately leave peers' residency stubs unchanged, as with a stale residency list.
 		if (removeLocal) await table.primaryStore.remove(removeLocal);
 		if (prefer) {
 			const status = new Float64Array(

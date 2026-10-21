@@ -10,6 +10,7 @@ import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
 import { setReplicator } from '#src/replication/replicator';
 import { server } from '#src/core/server/Server';
+import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 
 const SUBSCRIPTION_REQUEST = 129;
 const TABLE_FIXED_STRUCTURE = 132;
@@ -119,21 +120,26 @@ describe('local replicas on the replication wire', function () {
 		return { response, structure };
 	}
 
-	it('keeps a GET_RECORD answer as a replica of the stub, without an audit entry, and keeps the socket open', async () => {
-		const existing = await stub('fetched');
+	/** Fetches `full` over the socket and keeps the answer as a replica of the stub `id`. */
+	async function keptReplica(id, existing) {
+		existing ??= await stub(id);
 		stubVersion = existing.version;
-		const history = (await Records.getHistoryOfRecord('fetched')).map((entry) => entry.type);
 		const { response, structure } = await fullRecordFrame();
 		socket.emit('message', encode([TABLE_FIXED_STRUCTURE, structure[1], Records.tableId, Records.tableName]));
 		await new Promise((resolve) => setImmediate(resolve));
-		const pending = session.getRecord({ table: Records, id: 'fetched', entry: existing });
+		const pending = session.getRecord({ table: Records, id, entry: existing });
 		const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
 		socket.emit('message', encode([GET_RECORD_RESPONSE, request[1], { ...response, version: stubVersion }]));
 		assert.equal((await pending).value.body, 'complete');
-		const replica = await until(
-			() => Records.primaryStore.getEntry('fetched').metadataFlags & REPLICA,
-			'the replica write'
-		).then(() => Records.primaryStore.getEntry('fetched'));
+		return until(() => Records.primaryStore.getEntry(id).metadataFlags & REPLICA, 'the replica write').then(() =>
+			Records.primaryStore.getEntry(id)
+		);
+	}
+
+	it('keeps a GET_RECORD answer as a replica of the stub, without an audit entry, and keeps the socket open', async () => {
+		const existing = await stub('fetched');
+		const history = (await Records.getHistoryOfRecord('fetched')).map((entry) => entry.type);
+		const replica = await keptReplica('fetched', existing);
 		assert.equal(socket.readyState, 1, 'storing the replica must not close the retrieval socket');
 		assert.equal(replica.value.body, 'complete');
 		assert.equal(replica.residencyId, residencyId);
@@ -146,16 +152,38 @@ describe('local replicas on the replication wire', function () {
 		);
 	});
 
+	it('names a row written by another node after that node', async () => {
+		const remoteId = getIdOfRemoteNode('other-resident', Records.auditStore);
+		Records.dbisDB.putSync([Symbol.for('residency_by_id'), 777], [server.hostname, 'other-resident']);
+		const context = { sourceApply: true, timestamp: Date.now() };
+		await transaction(context, async () => {
+			const resource = await Records.getResource('remote', context, { ensureLoaded: false });
+			resource._writeUpdate('remote', { id: 'remote', name: 'indexed', body: 'remote body' }, true, {
+				version: context.timestamp,
+				nodeId: remoteId,
+				residencyId: 777,
+			});
+			resource.save();
+		});
+		const entry = Records.primaryStore.getEntry('remote');
+		assert.equal(entry.nodeId, remoteId);
+		assert.ok(!(entry.metadataFlags & INVALIDATED), 'this node is a resident of the remote write');
+		socket.emit('message', encode([GET_RECORD, 13, Records.tableId, 'remote', Records.tableName]));
+		await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 13));
+		const response = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 13)[2];
+		assert.equal(response.originNode, 'other-resident', 'a resident names the writer, not itself');
+		assert.equal(response.version, context.timestamp);
+	});
+
 	it('answers GET_RECORD for a replica as not held', async () => {
-		assert.ok(Records.primaryStore.getEntry('fetched')?.metadataFlags & REPLICA, 'needs the replica kept above');
-		socket.emit('message', encode([GET_RECORD, 12, Records.tableId, 'fetched', Records.tableName]));
+		await keptReplica('not-held');
+		socket.emit('message', encode([GET_RECORD, 12, Records.tableId, 'not-held', Records.tableName]));
 		await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 12));
 		assert.equal(socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 12)[2], undefined);
 	});
 
 	it('copies a replica as a bodyless invalidation with its residency id and no lifetime', async () => {
-		const replica = Records.primaryStore.getEntry('fetched');
-		assert.ok(replica?.metadataFlags & REPLICA, 'needs the replica kept above');
+		const replica = await keptReplica('copied');
 		assert.equal(replica.expiresAt, undefined, 'the row carries no replica deadline');
 		socket.emit(
 			'message',
@@ -163,7 +191,7 @@ describe('local replicas on the replication wire', function () {
 		);
 		await until(() => socket.sent.some((frame) => frame[0] === COPY_COMPLETE));
 		const records = copiedRecords(socket, Records.tableId);
-		const copied = records.get('fetched');
+		const copied = records.get('copied');
 		assert.equal(copied?.type, 'invalidate', 'base copy promoted a replica to put');
 		assert.equal(copied.residencyId, residencyId);
 		const value = copied.getValue(Records.primaryStore);
