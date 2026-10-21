@@ -6,7 +6,8 @@
  */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { decode, encode } from 'msgpackr';
+import { decode, encode, Packr } from 'msgpackr';
+import { createStructon } from 'structon';
 import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
 import { loadGQLSchema } from '#src/core/resources/graphql';
 import { tables } from '#src/core/resources/databases';
@@ -74,7 +75,7 @@ async function settle(socket, expectedFrames) {
 
 describe('replicate: false on the send paths (harper-pro#883)', function () {
 	this.timeout(20_000);
-	let socket;
+	let socket, session;
 
 	before(async () => {
 		setHdbBasePath(process.env.STORAGE_PATH);
@@ -85,7 +86,7 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 
 	beforeEach(async () => {
 		socket = new FakeSocket();
-		replicateOverWS(socket, {}, { name: 'peer-a', replicates: true });
+		session = replicateOverWS(socket, {}, { name: 'peer-a', replicates: true });
 		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false, true)]));
 		await settle(socket, 1);
 	});
@@ -147,15 +148,168 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 		assert.doesNotMatch(response[2].error, /Cannot read properties|undefined/);
 	});
 
-	it('still serves GET_RECORD for a replicated table', async () => {
+	it('serves GET_RECORD on a retrieval socket using the requested table id', async () => {
 		const shared = tables.ReplicateFalseShared;
-		socket.emit('message', encode([GET_RECORD, 8, shared.tableId, 'shared', 'ReplicateFalseShared']));
+		const requestedId = shared.tableId + 50;
+		socket.emit('message', encode([GET_RECORD, 8, requestedId, 'shared', 'ReplicateFalseShared']));
 		await settle(socket, 3);
+		assert.equal(socket.sent.find((frame) => frame[0] === TABLE_FIXED_STRUCTURE)?.[2], requestedId);
 		const response = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE);
 		assert.ok(response, 'the control table must be served');
 		assert.equal(response[1], 8);
 		assert.equal(response[2].error, undefined);
 		assert.ok(response[2].value, 'a record value must be returned');
+	});
+
+	it('resolves repeated name-less GET_RECORD requests against the live table', async () => {
+		const shared = tables.ReplicateFalseShared;
+		socket.emit('message', encode([GET_RECORD, 20, shared.tableId, 'shared', shared.tableName]));
+		await settle(socket, 2);
+		const start = socket.sent.length;
+		socket.emit('message', encode([GET_RECORD, 21, shared.tableId, 'shared']));
+		await settle(socket, start + 1);
+		const response = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 21);
+		assert.ok(response);
+		assert.equal(response[2].error, undefined);
+		assert.ok(response[2].value);
+
+		const replicated = shared.replicate;
+		try {
+			shared.replicate = false;
+			const start = socket.sent.length;
+			socket.emit('message', encode([GET_RECORD, 22, shared.tableId, 'shared']));
+			await settle(socket, start + 1);
+			const refused = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 22);
+			assert.match(refused?.[2].error, /is not available for replication/);
+		} finally {
+			shared.replicate = replicated;
+		}
+	});
+
+	it('announces a usable decoder for every requested table, including an empty dictionary', async () => {
+		await loadGQLSchema(`
+			type GetRecordOther @table { id: ID @primaryKey payload: String }
+			type GetRecordEmpty @table { id: ID @primaryKey }
+		`);
+		await tables.GetRecordOther.put({ id: 'other', payload: 'another table' });
+		const StructonPackr = createStructon(Packr);
+		for (const [i, [table, id]] of [
+			[tables.ReplicateFalseShared, 'shared'],
+			[tables.GetRecordOther, 'other'],
+			[tables.GetRecordEmpty, 'missing'],
+		].entries()) {
+			const start = socket.sent.length;
+			socket.emit('message', encode([GET_RECORD, 30 + i, table.tableId, id, table.tableName]));
+			await settle(socket, start + 2);
+			const frames = socket.sent.slice(start);
+			const structure = frames.find((frame) => frame[0] === TABLE_FIXED_STRUCTURE);
+			assert.ok(structure, `no decoder for ${table.tableName}`);
+			assert.equal(structure[2], table.tableId);
+			assert.equal(structure[3], table.tableName);
+			const entry = frames.find((frame) => frame[0] === GET_RECORD_RESPONSE)?.[2];
+			if (id === 'missing') assert.equal(entry, undefined);
+			else {
+				assert.equal(entry?.error, undefined);
+				if (!table.primaryStore.encoder.isRocksDB) {
+					assert.equal(entry.version, table.primaryStore.getEntry(id).version);
+				}
+				const decoder = new StructonPackr({
+					typedStructs: structure[1].typedStructs,
+					structures: structure[1].structures,
+				});
+				const decoded = decoder.decode(entry.value);
+				assert.equal(decoded.id, id);
+				assert.equal(decoded.payload, (await table.get(id)).payload);
+			}
+		}
+	});
+
+	it('does not reuse a cached class after a named table is dropped', async () => {
+		await loadGQLSchema('type GetRecordDropped @table { id: ID @primaryKey payload: String }');
+		const table = tables.GetRecordDropped;
+		await table.put({ id: 'gone', payload: 'old generation' });
+		socket.emit('message', encode([GET_RECORD, 40, table.tableId, 'gone', table.tableName]));
+		await settle(socket, 2);
+		await table.dropTable();
+		const start = socket.sent.length;
+		socket.emit('message', encode([GET_RECORD, 41, table.tableId, 'gone']));
+		await settle(socket, start + 1);
+		const refused = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 41);
+		assert.match(refused?.[2].error, /is not available for replication/);
+	});
+
+	for (const randomAccessFields of [false, true]) {
+		it(`refreshes growing dictionaries and suppresses redundant announcements (typed: ${randomAccessFields})`, async () => {
+			const name = `GetRecordGrowing${randomAccessFields}`;
+			await loadGQLSchema(`type ${name} @table(randomAccessFields: ${randomAccessFields}) { id: ID @primaryKey }`);
+			const table = tables[name];
+			const StructonPackr = createStructon(Packr);
+			let decoder;
+			for (const [i, value] of [
+				{ id: 'first', payload: 'simple' },
+				{ id: 'second', payload: 'larger', extra: { nested: ['value', 42, false] } },
+			].entries()) {
+				await table.put(value);
+				const start = socket.sent.length;
+				socket.emit('message', encode([GET_RECORD, 50 + i, table.tableId, value.id, table.tableName]));
+				await settle(socket, start + 2);
+				const frames = socket.sent.slice(start);
+				const structure = frames.find((frame) => frame[0] === TABLE_FIXED_STRUCTURE);
+				assert.ok(structure, `no updated decoder for ${value.id}`);
+				decoder = new StructonPackr(structure[1]);
+				assert.deepEqual(decoder.decode(frames.find((frame) => frame[0] === GET_RECORD_RESPONSE)[2].value), value);
+			}
+			for (const [i, id] of ['second', 'missing'].entries()) {
+				const start = socket.sent.length;
+				socket.emit('message', encode([GET_RECORD, 52 + i, table.tableId, id, table.tableName]));
+				await settle(socket, start + 1);
+				const frames = socket.sent.slice(start);
+				assert.deepEqual(
+					frames.map((frame) => frame[0]),
+					[GET_RECORD_RESPONSE]
+				);
+				if (id === 'missing') assert.equal(frames[0][2], undefined);
+				else assert.equal(decoder.decode(frames[0][2].value).extra.nested[1], 42);
+			}
+		});
+	}
+
+	it('refuses blob repair before receiving a usable subscription decoder', async () => {
+		const table = tables.ReplicateFalseShared;
+		const unknown = session.getRecord({ table, id: 'shared', entry: {}, blobRepairOnly: true });
+		const earlyRequest = socket.sent.find((frame) => frame[0] === GET_RECORD);
+		if (earlyRequest) socket.emit('message', encode([GET_RECORD_RESPONSE, earlyRequest[1], { error: 'test cleanup' }]));
+		await assert.rejects(unknown, /No subscription decoder/);
+		assert.equal(earlyRequest, undefined);
+	});
+
+	it("uses the subscription's remote table id for blob repair and always sends the name", async () => {
+		const table = tables.ReplicateFalseShared;
+		const remoteId = table.tableId + 100;
+		socket.emit('message', structureFrame(table, remoteId));
+		for (let turn = 0; turn < 20; turn++) await new Promise((resolve) => setImmediate(resolve));
+		for (let i = 0; i < 2; i++) {
+			const pending = session.getRecord({ table, id: 'shared', entry: {}, blobRepairOnly: true });
+			const outcome = pending.then(
+				(entry) => ({ entry }),
+				(error) => ({ error })
+			);
+			const message = socket.sent.at(-1);
+			socket.emit(
+				'message',
+				encode([
+					GET_RECORD_RESPONSE,
+					message[1],
+					{ value: table.primaryStore.encoder.encode({ id: 'shared', payload: 'travels' }) },
+				])
+			);
+			const result = await outcome;
+			assert.equal(message[0], GET_RECORD);
+			assert.equal(message[2], remoteId);
+			assert.equal(message[4], table.tableName);
+			assert.equal(result.error, undefined);
+			assert.equal(result.entry.value.payload, 'travels');
+		}
 	});
 });
 
@@ -177,7 +331,7 @@ describe('replicate: false on the full copy (harper-pro#883)', function () {
 		socket?.close(1000);
 	});
 
-	it('copies the replicated table only, announces no other table, and streams no blob', async () => {
+	it('copies only replicated tables and keeps GET_RECORD in the subscription decoder namespace', async () => {
 		socket = new FakeSocket();
 		replicateOverWS(socket, {}, { replicates: true });
 		// Without a capability bag the sender reads this peer as v4 and waits on a legacy baseline
@@ -204,6 +358,21 @@ describe('replicate: false on the full copy (harper-pro#883)', function () {
 			socket.sent.some((frame) => frame.recordFrame > 8),
 			'the control table row must be on the wire'
 		);
+		const table = tables.ReplicateFalseShared;
+		let start = socket.sent.length;
+		socket.emit('message', encode([GET_RECORD, 70, table.tableId + 100, 'shared', table.tableName]));
+		await settle(socket, start + 1);
+		const refused = socket.sent.slice(start);
+		assert.deepEqual(
+			refused.map((frame) => frame[0]),
+			[GET_RECORD_RESPONSE]
+		);
+		assert.match(refused[0][2].error, /is not available for replication/);
+
+		start = socket.sent.length;
+		socket.emit('message', encode([GET_RECORD, 71, table.tableId, 'shared', table.tableName]));
+		await settle(socket, start + 2);
+		assert.ok(socket.sent.slice(start).find((frame) => frame[0] === GET_RECORD_RESPONSE)?.[2].value);
 	});
 });
 
