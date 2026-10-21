@@ -1,6 +1,6 @@
 # Design notes
 
-- [Send-side residency](replication/DESIGN.md#send-side-residency): every non-resident receives current stubs unless residency is by id; capability-gated copy frames preserve stubs, and GET_RECORD distinguishes not resident from absence.
+- [Send-side residency](replication/DESIGN.md#send-side-residency): every non-resident receives current stubs unless residency is by id; capability-gated copy frames preserve stubs, and GET_RECORD distinguishes not resident from absence, and RocksDB reads keep a local replica instead of relocating (never on a by-id table, nor with `replicaExpiration: 0`); LMDB reads remain proxies.
 - [A clone copies filesystem-only applications as the leader packaged them](cloneNode/DESIGN.md#a-clone-copies-filesystem-only-applications-as-the-leader-packaged-them): `node_modules` included from a leader that streams it (5.2.3+ over HTTP); an application it cannot copy keeps the clone Unavailable and uncloned.
 - [Removed-origin history](replication/DESIGN.md#removed-origin-history): membership removal preserves audit history, origin mappings and resume cursors; retention purges eligible segments independently.
 - [Replication base-copy compatibility](replication/DESIGN.md#base-copy-peer-safety): reported 5.x peers receive historical copies; v4 and unidentified peers retain baseline verification.
