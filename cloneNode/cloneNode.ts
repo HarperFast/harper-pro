@@ -13,10 +13,8 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { request as httpsRequest } from 'node:https';
-import { request as httpRequest } from 'node:http';
+import type { Readable } from 'node:stream';
 import yaml from 'yaml';
-import { decode as cborDecode } from 'cbor-x';
 
 import * as envMgr from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -38,6 +36,8 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
+import { ApplicationCloneError, cloneFilesystemOnlyApplications, streamsPackages } from './applicationClone.ts';
+import { postToLeader, readLeaderResponse, readPackageResponse, type LeaderHTTPTarget } from './leaderHTTP.ts';
 import { cloneSSHKeysFromLeader } from './sshKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
 import {
@@ -345,8 +345,11 @@ export async function cloneNode(): Promise<void> {
 		}
 	} catch (err) {
 		// Contained rather than thrown: a rejection here reaches bin/harper.js, which exits the
-		// already-started process instead of leaving it queryable.
-		await abandonClone(`Clone from leader node ${leaderURL} failed during setup (${err})`);
+		// already-started process instead of leaving it queryable. An application this node could not
+		// copy ends the attempt like a missing JWT key; other setup failures keep it for a restart to resume.
+		await stopUnfinishedClone(`Clone from leader node ${leaderURL} failed during setup (${err})`, {
+			keepAttempt: !(err instanceof ApplicationCloneError),
+		});
 		return;
 	}
 
@@ -355,14 +358,9 @@ export async function cloneNode(): Promise<void> {
 	// must not be treated as success.
 	const syncOutcome = await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
 	if (syncOutcome === 'failed') {
-		// Return (don't throw) so Harper stays running and queryable. Clear `cloned` explicitly: a
-		// forced reclone has already carried the previous `cloned: true` into the rewritten config.
-		updateConfigValue(CONFIG_PARAMS.CLONED, false);
-		clearCloneAttempt(); // same in-flight signal as the JWT-key failure below (harper-pro#737)
-		log(
-			`Clone from leader node ${leaderURL} did not complete synchronization; node is running but Unavailable and not marked as cloned`,
-			'error'
-		);
+		// Return (don't throw) so Harper stays running and queryable. Clearing `cloned` matters: a forced
+		// reclone has already carried the previous `cloned: true` into the rewritten config.
+		await stopUnfinishedClone(`Clone from leader node ${leaderURL} did not complete synchronization`);
 		return;
 	}
 
@@ -553,10 +551,10 @@ async function finishCloneSetup(): Promise<boolean> {
 }
 
 /**
- * Mirrors the unconfirmed-sync handling: keep Harper running so get_status stays queryable, publish
- * Unavailable, clear the cloned flag so a subsequent start retries the clone, and stop before finalizing.
+ * Keep Harper running so get_status stays queryable, publish Unavailable, clear the cloned flag so a
+ * subsequent start retries the clone, and stop before finalizing.
  */
-async function stopUnfinishedClone(reason: string): Promise<void> {
+async function stopUnfinishedClone(reason: string, { keepAttempt = false } = {}): Promise<void> {
 	const { set: setStatus } = await import('../core/server/status/index.js');
 	try {
 		await setStatus({ id: 'availability', status: 'Unavailable' });
@@ -573,8 +571,9 @@ async function stopUnfinishedClone(reason: string): Promise<void> {
 	// A clone that stops here keeps running, and both halves of the in-flight signal would stay set,
 	// so the replication send path would go on withholding this leader's own records from a base copy
 	// back to it for the life of the process (harper-pro#737) — including from a leader that asked for
-	// that copy because it had lost them. Retiring the attempt costs a retry a fresh base copy.
-	clearCloneAttempt();
+	// that copy because it had lost them. Retiring the attempt costs a retry a fresh base copy, which is
+	// why a stop a restart can resume from keeps it.
+	if (!keepAttempt) clearCloneAttempt();
 	log(`${reason}; node is running but Unavailable${unmarked ? ' and not marked as cloned' : ''}`, 'error');
 }
 
@@ -726,33 +725,16 @@ async function monitorSync(
 	// Leader capability: a legacy (v4) leader never replicates the system database either, while a
 	// v5+ leader must have it required up front — otherwise a small user database completing before
 	// the system subscription registers could finish the clone with the system copy unverified.
-	// registration_info is the version probe present on every leader version (see
-	// core/bin/cliOperations.ts). Fail CLOSED on that probe: only a positively-read legacy major
-	// version exempts system; a missing/unparseable version or a persistently failing probe requires
-	// it, so a transient probe error against a v5 leader cannot reopen the premature-Available race.
+	// Fail CLOSED on the version probe: only a positively-read legacy major version exempts system; a
+	// missing/unparseable version or a persistently failing probe requires it, so a transient probe
+	// error against a v5 leader cannot reopen the premature-Available race.
 	let systemSocketRequired = isReplicatedDatabase(SYSTEM_SCHEMA_NAME);
 	if (!systemSocketRequired) {
 		log(`'${SYSTEM_SCHEMA_NAME}' is not in this node's replication.databases; not requiring its socket`, 'debug');
-	}
-	const versionProbeBackoff = createBackoff({
-		initialMs: VERSION_PROBE_RETRY_DELAY_MS,
-		maxMs: VERSION_PROBE_MAX_DELAY_MS,
-		minMs: VERSION_PROBE_RETRY_DELAY_MS,
-	});
-	for (let attempt = 1; systemSocketRequired && attempt <= 3; attempt++) {
-		try {
-			const registration: any = await leaderRequest({ operation: 'registration_info' });
-			// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
-			const leaderMajorVersion = Number(String(registration?.version ?? '').match(/\d+/)?.[0] ?? NaN);
-			systemSocketRequired = !(leaderMajorVersion >= 1 && leaderMajorVersion < 5);
-			break;
-		} catch (err) {
-			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
-			if (attempt < 3) {
-				const delay = versionProbeBackoff.nextDelay();
-				if (delay !== undefined) await sleep(delay);
-			}
-		}
+	} else {
+		// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
+		const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
+		systemSocketRequired = !(leaderMajorVersion >= 1 && leaderMajorVersion < 5);
 	}
 
 	const outcome = await monitorSyncLoop({
@@ -815,21 +797,9 @@ async function fetchSyncSnapshot(): Promise<
 	try {
 		return await getLastUpdatedRecord();
 	} catch (err) {
-		await abandonClone(`Could not fetch sync targets from leader ${leaderURL} (${err})`);
+		await stopUnfinishedClone(`Could not fetch sync targets from leader ${leaderURL} (${err})`, { keepAttempt: true });
 		return undefined;
 	}
-}
-
-/** Leave Harper running and queryable, reporting Unavailable and not cloned, so a later start retries. */
-async function abandonClone(reason: string): Promise<void> {
-	const { set: setStatus } = await import('../core/server/status/index.js');
-	try {
-		await setStatus({ id: 'availability', status: 'Unavailable' });
-	} catch (statusErr) {
-		log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
-	}
-	updateConfigValue(CONFIG_PARAMS.CLONED, false);
-	log(`${reason}; node is running but Unavailable and not marked as cloned`, 'error');
 }
 
 /** Shared by the fresh and resume-retry call sites: fetch the leader snapshot and, if it
@@ -1184,49 +1154,25 @@ async function cloneConfig(): Promise<Record<string, any>> {
  */
 async function cloneApplications(): Promise<void> {
 	log('Cloning filesystem-only applications from leader');
-
-	let applicationsResponse: Record<string, any>;
-	try {
-		applicationsResponse = await leaderRequest({ operation: OPERATIONS_ENUM.GET_COMPONENTS });
-	} catch (err) {
-		log(`Failed to get applications from leader: ${err}`, 'error');
-		return;
-	}
-
-	const entries: Array<Record<string, any>> = applicationsResponse?.entries ?? [];
-	// filesystem-only applications will not have a `package` property
-	const filesystemOnlyApplications = entries.filter((entry) => Array.isArray(entry.entries) && !entry.package);
-
-	if (filesystemOnlyApplications.length === 0) {
-		log('No filesystem-only applications found on leader to clone');
-		return;
-	}
-
-	log(`Cloning ${filesystemOnlyApplications.length} application(s) not referenced in harper-config`);
-
-	const { Application, prepareApplication } = await import('../core/components/Application.ts');
-
-	for (const entry of filesystemOnlyApplications) {
-		const applicationName: string = entry.name;
-		log(`Cloning application: ${applicationName}`);
-		try {
-			const packageResponse = await leaderRequest({
-				operation: OPERATIONS_ENUM.PACKAGE_COMPONENT,
-				project: applicationName,
-				skip_node_modules: true,
-			});
-
-			const application = new Application({
-				name: applicationName,
-				payload: packageResponse.payload,
-			});
-
-			await prepareApplication(application);
-			log(`Successfully cloned application: ${applicationName}`);
-		} catch (err) {
-			log(`Failed to clone application '${applicationName}': ${err}`, 'error');
-		}
-	}
+	await cloneFilesystemOnlyApplications({
+		listComponents: () => leaderRequest({ operation: OPERATIONS_ENUM.GET_COMPONENTS }),
+		chooseTransfer: async () => {
+			// The replication socket carries an operation's answer as one buffered message, so only HTTP streams.
+			if (usingCertAuth) return { withNodeModules: false, reason: 'certificate authentication cannot stream it' };
+			// Unknown is not older: rebuilding with npm could certify a clone missing a node_modules-only package.
+			const version = await leaderVersion();
+			const streams = streamsPackages(version);
+			if (streams === undefined) throw new Error(`the leader did not report a usable version (${version ?? 'none'})`);
+			if (streams) return { withNodeModules: true };
+			return { withNodeModules: false, reason: `leader ${version} cannot stream it` };
+		},
+		requestPackage: requestApplicationPackage,
+		prepareApplication: async (name, payload) => {
+			const { Application, prepareApplication } = await import('../core/components/Application.ts');
+			await prepareApplication(new Application({ name, payload }));
+		},
+		log,
+	});
 }
 
 /**
@@ -1330,75 +1276,56 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 		});
 	}
 
-	const headers: Record<string, string> = {
-		'Content-Type': 'application/json',
-		'Accept': 'application/cbor',
+	return readLeaderResponse(await postToLeader(leaderHTTPTarget(), operation));
+}
+
+function leaderHTTPTarget(): LeaderHTTPTarget {
+	return {
+		url: leaderURL,
+		authorization: leaderToken
+			? `Bearer ${leaderToken}`
+			: `Basic ${Buffer.from(`${leaderUsername}:${leaderPassword}`).toString('base64')}`,
+		rejectUnauthorized: !allowSelfSigned,
 	};
+}
 
-	if (leaderToken) {
-		headers.Authorization = `Bearer ${leaderToken}`;
-	} else {
-		headers.Authorization = `Basic ${Buffer.from(`${leaderUsername}:${leaderPassword}`).toString('base64')}`;
-	}
+async function requestApplicationPackage(project: string, withNodeModules: boolean): Promise<string | Readable> {
+	const operation = { operation: OPERATIONS_ENUM.PACKAGE_COMPONENT, project, skip_node_modules: !withNodeModules };
+	if (!withNodeModules) return (await leaderRequest(operation)).payload;
+	return readPackageResponse(await postToLeader(leaderHTTPTarget(), { ...operation, stream: true }));
+}
 
-	const body = JSON.stringify(operation);
-	const url = new URL(leaderURL);
-	const isHttps = url.protocol === 'https:';
-	const port = url.port ? parseInt(url.port, 10) : isHttps ? 443 : 80;
-	const path = url.pathname + url.search;
-	const requestHeaders = { ...headers, 'Content-Length': Buffer.byteLength(body) };
+let probedLeaderVersion: string | undefined;
 
-	const { statusCode, statusMessage, contentType, responseBody } = await new Promise<{
-		statusCode: number;
-		statusMessage: string;
-		contentType: string;
-		responseBody: Buffer;
-	}>((resolve, reject) => {
-		const callback = (res: import('node:http').IncomingMessage) => {
-			const chunks: Buffer[] = [];
-			res.on('data', (chunk: Buffer) => chunks.push(chunk));
-			res.on('end', () =>
-				resolve({
-					statusCode: res.statusCode!,
-					statusMessage: res.statusMessage!,
-					contentType: (res.headers['content-type'] as string) ?? '',
-					responseBody: Buffer.concat(chunks),
-				})
-			);
-			res.on('error', reject);
-		};
-		const req = isHttps
-			? httpsRequest(
-					{
-						hostname: url.hostname,
-						port,
-						path,
-						method: 'POST',
-						headers: requestHeaders,
-						rejectUnauthorized: !allowSelfSigned,
-					},
-					callback
-				)
-			: httpRequest({ hostname: url.hostname, port, path, method: 'POST', headers: requestHeaders }, callback);
-		req.on('error', reject);
-		req.write(body);
-		req.end();
+/**
+ * The leader's Harper version from `registration_info`, which every leader version answers (see
+ * core/bin/cliOperations.ts), or undefined when three attempts get none. Only a version is kept, so a
+ * later caller retries a probe that failed.
+ */
+async function leaderVersion(): Promise<string | undefined> {
+	if (probedLeaderVersion !== undefined) return probedLeaderVersion;
+	const backoff = createBackoff({
+		initialMs: VERSION_PROBE_RETRY_DELAY_MS,
+		maxMs: VERSION_PROBE_MAX_DELAY_MS,
+		minMs: VERSION_PROBE_RETRY_DELAY_MS,
 	});
-
-	if (statusCode < 200 || statusCode >= 300) {
-		let reason: unknown = responseBody.toString('utf8');
+	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
-			reason =
-				(contentType.includes('cbor') ? cborDecode(responseBody) : JSON.parse(reason as string))?.error ?? reason;
-		} catch {}
-		reason = String(reason).replace(/\s+/g, ' ').trim().slice(0, 500);
-		throw new Error(`Leader request failed: ${statusCode} ${statusMessage}${reason ? `: ${reason}` : ''}`);
+			const registration: any = await leaderRequest({ operation: 'registration_info' });
+			if (registration?.version != null) {
+				probedLeaderVersion = String(registration.version);
+				return probedLeaderVersion;
+			}
+			log(`Leader version probe got no version (attempt ${attempt}/3)`);
+		} catch (err) {
+			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
+		}
+		if (attempt < 3) {
+			const delay = backoff.nextDelay();
+			if (delay !== undefined) await sleep(delay);
+		}
 	}
-
-	if (contentType.includes('application/cbor')) {
-		return cborDecode(responseBody);
-	}
-	return JSON.parse(responseBody.toString('utf8'));
+	return undefined;
 }
 
 /**
