@@ -337,7 +337,7 @@ discipline paces _retries_, and jittering a durability deadline would be activel
 ## Send-side residency
 
 Transport invariant: a stub is never sent, served, or stored as a complete record through these
-copy/retrieval paths. `sendAuditRecord` sends every write to every non-resident peer as an invalidation
+copy/retrieval paths, except the base copy to a peer without `residencyStubCopy` (below). `sendAuditRecord` sends every write to every non-resident peer as an invalidation
 unless residency is by id. The copy walk uses `invalidate`
 for `INVALIDATED` rows and translates the stored residency flag to the audit flag. GET_RECORD refuses
 stubs with an empty response and supplies current decoder structures for full rows. `Replicator.load`
