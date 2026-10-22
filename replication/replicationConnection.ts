@@ -102,6 +102,7 @@ import {
 	peerSupportsOriginCursors,
 	peerSupportsOriginFloors,
 	peerSupportsRecordLocks,
+	peerSupportsResidencyNotResident,
 	peerSupportsResidencyStubCopy,
 	peerSupportsTableLifecycle,
 	resolvePeerCapabilities,
@@ -5980,7 +5981,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								let valueBuffer = table.primaryStore.decoder.decode(binaryEntry, { valueAsBuffer: true });
 								const entry: any = lastMetadata || {};
 								if (entry[METADATA] & INVALIDATED) {
-									ws.send(encode([GET_RECORD_RESPONSE, requestId]));
+									ws.send(
+										encode(
+											peerCapabilitiesLearned && peerSupportsResidencyNotResident(peerCapabilities)
+												? [GET_RECORD_RESPONSE, requestId, false]
+												: [GET_RECORD_RESPONSE, requestId]
+										)
+									);
 									break;
 								}
 								// RocksDB carries the version inline; unwrap its metadata's value bytes.
@@ -5990,6 +5997,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 								} else {
 									entry.version = recordVersion;
+								}
+								// A stored deletion is msgpack null after its metadata prefix.
+								if (valueBuffer.length === 1 && valueBuffer[0] === 0xc0) {
+									ws.send(encode([GET_RECORD_RESPONSE, requestId]));
+									break;
 								}
 								if (entry[METADATA] & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
@@ -6066,7 +6078,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return localBlob;
 								}
 							);
-						} else resolve();
+						} else resolve(entry === false ? false : undefined);
 						awaitingResponse.delete(message[1]);
 						break;
 					}

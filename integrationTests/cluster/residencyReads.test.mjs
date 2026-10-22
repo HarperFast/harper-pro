@@ -200,7 +200,7 @@ suite('partial replication reads and placement', { timeout: 600_000 }, (ctx) => 
 		assert.equal(response.body.body, 'new payload');
 	});
 
-	test('tries another listed resident after not-held, and returns absence when all answer absent', async () => {
+	test('tries another listed resident after absence, and returns absence when all answer absent', async () => {
 		for (const id of ['retry', 'absent']) {
 			await put(nodes[0], id, { name: id, body: 'from the remaining resident' });
 			const states = await placed(id);
@@ -221,12 +221,40 @@ suite('partial replication reads and placement', { timeout: 600_000 }, (ctx) => 
 		}
 	});
 
+	test('a stale list naming only stub holders fails instead of reporting absence', async () => {
+		const id = 'stale-list';
+		await put(nodes[0], id, { name: id, body: 'still resident elsewhere' });
+		const states = await placed(id);
+		const [reader, otherStub] = states.flatMap((entry, index) => (entry.invalidated ? [index] : []));
+		await control(nodes[reader], { residencyFor: id, residents: [names[otherStub]] });
+		try {
+			const response = await waitForCondition(
+				async (signal) => {
+					const result = await request(nodes[reader], `Open/${id}`, { signal });
+					return (result.status !== 502 || /not resident/i.test(JSON.stringify(result.body))) && result;
+				},
+				{ timeoutMs: 30_000, description: 'stale-list holder answers the retrieval request' }
+			);
+			assert.equal(response.status, 502, JSON.stringify(response));
+			assert.match(JSON.stringify(response.body), /not resident/i);
+			const query = await request(nodes[reader], `Open/?name==${id}&select(id,body)`);
+			assert.ok(
+				query.status >= 500 || (query.body.length === 1 && /not resident/i.test(query.body[0].message)),
+				JSON.stringify(query)
+			);
+			assert.ok((await state(nodes[reader], id)).invalidated);
+			assert.equal((await state(nodes[0], id)).value.body, 'still resident elsewhere');
+		} finally {
+			await control(nodes[reader], { residencyFor: id, residents: states[reader].residency });
+		}
+	});
+
 	test('unreachable residents cause read failures instead of absence or a partial row', async () => {
 		await put(nodes[0], 'unavailable', { name: 'unavailable', body: 'still exists' });
 		const states = await placed('unavailable');
 		const residentIndexes = states.flatMap((entry, index) => (entry.invalidated ? [] : [index]));
 		const reader = states.findIndex((entry) => entry.invalidated);
-		// A successful empty answer is not proof of absence if another listed resident is offline.
+		// One genuine absence is sufficient once no available holder returned a record.
 		await put(
 			nodes[0],
 			'partly-unavailable',
@@ -238,7 +266,7 @@ suite('partial replication reads and placement', { timeout: 600_000 }, (ctx) => 
 		await stopNodeProcess(nodes[residentIndexes[1]]);
 		await disconnected(reader, [residentIndexes[1]]);
 		const partialResponse = await request(nodes[reader], 'Open/partly-unavailable');
-		assert.equal(partialResponse.status, 502, JSON.stringify(partialResponse));
+		assert.equal(partialResponse.status, 404, JSON.stringify(partialResponse));
 		await Promise.all(residentIndexes.map((index) => stopNodeProcess(nodes[index])));
 		await disconnected(reader, residentIndexes);
 		const response = await request(nodes[reader], 'Open/unavailable');

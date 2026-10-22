@@ -34,8 +34,10 @@ const PEER = 'residency-wire-peer';
 class Socket extends EventEmitter {
 	readyState = 1;
 	sent = [];
+	rawSent = [];
 	_socket = { bytesRead: 0, bytesWritten: 0, setMaxListeners() {} };
 	send(data) {
+		this.rawSent.push(Buffer.from(data));
 		this.sent.push(data[0] > 127 ? decode(Buffer.from(data)) : Buffer.from(data));
 	}
 	close(code = 1000, reason = '') {
@@ -74,6 +76,8 @@ describe('residency stubs on the replication wire', function () {
 		Records.setResidency(() => [PEER]);
 		await Records.put('stub', { id: 'stub', name: 'indexed', body: 'complete' });
 		await Records.put('full', { id: 'full', name: 'indexed', body: 'complete' });
+		await Records.put('deleted', { id: 'deleted', name: 'indexed', body: 'complete' });
+		await Records.delete('deleted');
 		residencyId = Records.primaryStore.getEntry('stub').residencyId;
 		const context = {};
 		await transaction(context, async () => {
@@ -101,8 +105,22 @@ describe('residency stubs on the replication wire', function () {
 
 	afterEach(() => socket?.close());
 
-	for (const mode of ['retry', 'absent', 'unreachable', 'id-derived']) {
-		it(`handles ${mode} after the first resident answers not held`, async () => {
+	for (const [mode, answers, expected] of [
+		['retry', [false, 'full'], 'full'],
+		['absent', [false, undefined], undefined],
+		['absent-first', [undefined, false], undefined],
+		['absent-then-full', [undefined, 'full'], 'full'],
+		['not-resident', [false, false], 'error'],
+		['unreachable', [false, 'offline'], 'error'],
+		['absent-unreachable', [undefined, 'offline'], undefined],
+		['not-resident-disconnect', [false, 'disconnect'], 'error'],
+		['disconnect-not-resident', ['disconnect', false], 'error'],
+		['absent-disconnect', [undefined, 'disconnect'], undefined],
+		['id-derived', [false, 'full'], 'full'],
+		['id-derived-absent-first', [undefined, 'full'], undefined],
+		['id-derived-not-resident', [false, false], 'error'],
+	]) {
+		it(`handles ${mode} across listed residents`, async () => {
 			const peers = [`residency-${mode}-first`, `residency-${mode}-second`];
 			const contacted = [];
 			const connections = [];
@@ -115,11 +133,16 @@ describe('residency stubs on the replication wire', function () {
 				}));
 				sandbox.stub(NodeReplicationConnection.prototype, 'connect').callsFake(function () {
 					connections.push(this);
-					this.isConnected = !(mode === 'unreachable' && this.nodeName === peers[1]);
+					this.isConnected = answers[peers.indexOf(this.nodeName)] !== 'offline';
 				});
 				sandbox.stub(NodeReplicationConnection.prototype, 'getRecord').callsFake(async function () {
 					contacted.push(this.nodeName);
-					return this.nodeName === peers[1] && mode === 'retry' ? complete : undefined;
+					const answer = answers[peers.indexOf(this.nodeName)];
+					if (answer === 'disconnect') {
+						this.isConnected = false;
+						throw new Error('test peer disconnected');
+					}
+					return answer === 'full' ? complete : answer;
 				});
 				for (const [index, name] of peers.entries())
 					getReplicationSharedStatus(Records.auditStore, DATABASE, name)[LATENCY_POSITION] = index;
@@ -127,11 +150,15 @@ describe('residency stubs on the replication wire', function () {
 				const pending = ReplicationSource.load({
 					key: mode,
 					residencyId: 789,
-					...(mode === 'id-derived' ? { residency: peers } : {}),
+					...(mode.startsWith('id-derived') ? { residency: peers } : {}),
 				});
-				if (mode === 'unreachable') await assert.rejects(pending, (error) => error.statusCode === 502);
-				else assert.equal(await pending, mode === 'retry' ? complete : undefined);
-				assert.deepEqual(contacted, mode === 'unreachable' || mode === 'id-derived' ? peers.slice(0, 1) : peers);
+				if (expected === 'error')
+					await assert.rejects(pending, (error) => error.statusCode === 502 && /not resident/i.test(error.message));
+				else assert.equal(await pending, expected === 'full' ? complete : undefined);
+				assert.deepEqual(
+					contacted,
+					answers[1] === 'offline' || mode === 'id-derived-absent-first' ? peers.slice(0, 1) : peers
+				);
 			} finally {
 				for (const connection of connections) {
 					connection.isFinished = true;
@@ -139,6 +166,51 @@ describe('residency stubs on the replication wire', function () {
 				}
 				sandbox.restore();
 			}
+		});
+	}
+
+	it('receives not-resident without a decoder or relocation and keeps absence distinct', async () => {
+		const relocate = sinon.spy(Records, '_recordRelocate');
+		try {
+			for (const answer of [false, undefined]) {
+				const pending = session.getRecord({ table: Records, id: 'stub' });
+				const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
+				socket.emit(
+					'message',
+					encode(answer === false ? [GET_RECORD_RESPONSE, request[1], false] : [GET_RECORD_RESPONSE, request[1]])
+				);
+				assert.equal(await pending, answer);
+			}
+			assert.equal(relocate.callCount, 0);
+		} finally {
+			relocate.restore();
+		}
+	});
+
+	for (const peer of ['pre-key', 'unlearned']) {
+		it(`sends byte-identical legacy empty responses to a ${peer} requester`, async () => {
+			socket.close();
+			socket = new Socket();
+			session = replicateOverWS(socket, { database: DATABASE }, { name: PEER, replicates: true });
+			if (peer === 'pre-key') {
+				const bag = { ...buildLocalCapabilities(90_000, false, true) };
+				delete bag.residencyNotResident;
+				socket.emit('message', encode([NODE_NAME, PEER, DATABASE, [], bag]));
+				await until(() => socket.sent.some((frame) => frame[0] === NODE_NAME));
+			}
+			for (const [index, id] of ['stub', 'missing', 'deleted'].entries()) {
+				socket.emit('message', encode([GET_RECORD, index, Records.tableId, id, Records.tableName]));
+				await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === index));
+				const bytes = socket.rawSent.find((frame) => {
+					const decoded = decode(frame);
+					return decoded[0] === GET_RECORD_RESPONSE && decoded[1] === index;
+				});
+				assert.ok(bytes.equals(encode([GET_RECORD_RESPONSE, index])));
+			}
+			const pending = session.getRecord({ table: Records, id: 'missing' });
+			const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
+			socket.emit('message', encode([GET_RECORD_RESPONSE, request[1]]));
+			assert.equal(await pending, undefined, 'an older responder still reports absence');
 		});
 	}
 
@@ -194,7 +266,7 @@ describe('residency stubs on the replication wire', function () {
 		assert.equal(socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 92)[2], undefined);
 	});
 
-	for (const id of ['stub', 'missing', 'full']) {
+	for (const id of ['stub', 'missing', 'deleted', 'full']) {
 		it(`answers GET_RECORD for ${id} without promoting partial data`, async () => {
 			socket.emit('message', encode([GET_RECORD, 7, Records.tableId, id, Records.tableName]));
 			await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE));
@@ -205,7 +277,7 @@ describe('residency stubs on the replication wire', function () {
 				const StructonPackr = createStructon(Packr);
 				const decoder = new StructonPackr({ typedStructs: structure.typedStructs, structures: structure.structures });
 				assert.equal(decoder.decode(response[2].value).body, 'complete');
-			} else assert.equal(response[2], undefined, 'a stub or missing row must answer not held');
+			} else assert.equal(response[2], id === 'stub' ? false : undefined);
 		});
 	}
 
