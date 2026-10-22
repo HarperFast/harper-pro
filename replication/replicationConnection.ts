@@ -102,6 +102,7 @@ import {
 	peerSupportsOriginCursors,
 	peerSupportsOriginFloors,
 	peerSupportsRecordLocks,
+	peerSupportsResidencyStubCopy,
 	peerSupportsTableLifecycle,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
@@ -116,6 +117,7 @@ import {
 	METADATA,
 	storedFieldsOnly,
 } from '../core/resources/RecordEncoder.ts';
+import { INVALIDATED } from '../core/resources/Table.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
 import { WebSocket } from 'ws';
@@ -4823,7 +4825,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let outstandingCommits = 0;
 	const recordRequestTables = new Map<
 		number,
-		{ name: string; table: any; typedLength: number; structureLength: number }
+		{
+			name: string;
+			table: any;
+			typedLength: number;
+			structureLength: number;
+			schemaVersion: number;
+			schemaDefined: boolean;
+		}
 	>();
 	let commitBacklogPaused = false;
 	// Wall-clock at which the current back-pressure pause began (0 when not paused). Used to discount the
@@ -5932,9 +5941,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const recordVersion = encoder.isRocksDB ? undefined : getLastVersion();
 							// Local encoder arrays can lag another worker's writes. Check durable counts,
 							// but avoid rebuilding unchanged dictionaries or loading them for a repeat miss.
+							// The receiver also takes the table's schema from this frame. Schema reloads edit
+							// `attributes` in place, so compare the version they bump, not the array.
 							const counts = binaryEntry && previous?.table === table ? encoder.getStructureCounts() : undefined;
 							if (
 								previous?.table !== table ||
+								previous.schemaVersion !== table.schemaVersion ||
+								previous.schemaDefined !== table.schemaDefined ||
 								(counts && (previous.typedLength !== counts.typed || previous.structureLength !== counts.classic))
 							) {
 								encoder._mergeStructures(encoder.getStructures());
@@ -5946,26 +5959,39 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										{
 											typedStructs: encoder.typedStructs,
 											structures: encoder.structures,
+											attributes: table.attributes,
+											schemaDefined: table.schemaDefined,
 											createdTime: advertisedCreatedTime(table),
 										},
 										tableId,
 										table.tableName,
 									])
 								);
-								recordRequestTables.set(tableId, { name: tableName, table, typedLength, structureLength });
+								recordRequestTables.set(tableId, {
+									name: tableName,
+									table,
+									typedLength,
+									structureLength,
+									schemaVersion: table.schemaVersion,
+									schemaDefined: table.schemaDefined,
+								});
 							}
 							if (binaryEntry) {
 								let valueBuffer = table.primaryStore.decoder.decode(binaryEntry, { valueAsBuffer: true });
 								const entry: any = lastMetadata || {};
+								if (entry[METADATA] & INVALIDATED) {
+									ws.send(encode([GET_RECORD_RESPONSE, requestId]));
+									break;
+								}
 								// RocksDB carries the version inline; unwrap its metadata's value bytes.
-								if (table.primaryStore.decoder.isRocksDB) {
+								if (encoder.isRocksDB) {
 									if (valueBuffer === lastMetadata && lastMetadata != null) {
 										valueBuffer = lastMetadata.value;
 									}
 								} else {
 									entry.version = recordVersion;
 								}
-								if (lastMetadata && lastMetadata[METADATA] & HAS_BLOBS) {
+								if (entry[METADATA] & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
 									// but first, the decoding process can destroy our buffer above, so we need to copy it
 									valueBuffer = Buffer.from(valueBuffer);
@@ -5991,6 +6017,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								responseData = encode([GET_RECORD_RESPONSE, requestId]);
 							}
 						} catch (error) {
+							if (supersededOrClosed()) break;
 							responseData = encode([
 								GET_RECORD_RESPONSE,
 								requestId,
@@ -6395,15 +6422,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							let invalidationEntry;
 							if (residency && !residency.includes(remoteNodeName)) {
 								// If this node won't have residency, we need to send out invalidation messages
-								const previousResidency = getResidence(auditRecord.previousResidencyId, table);
-								if (
-									(previousResidency &&
-										!previousResidency.includes(remoteNodeName) &&
-										(auditRecord.type === 'put' || auditRecord.type === 'patch')) ||
-									table.getResidencyById
-								) {
-									// if we were already omitted from the previous residency, we don't need to send out invalidation messages for record updates
-									// or if we are using residency by id, this means we don't even need any data sent to other servers
+								if (table.getResidencyById) {
 									return skipAuditRecord();
 								}
 								const recordId = auditRecord.recordId;
@@ -7165,6 +7184,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// origin (undefined/0 = us) — the same id space the wire uses.
 														const recordNodeId = entry.nodeId ?? nodeId;
 														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
+														// Any other peer gets the stub exactly as a pre-gate sender sent it, never a skip.
+														const isStub = Boolean(entry.metadataFlags & INVALIDATED);
+														const stubAsInvalidation =
+															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
+														const legacyStubCopy = isStub && !stubAsInvalidation;
+														const copyType = stubAsInvalidation ? 'invalidate' : 'put';
 														const encodeCopyRecord = () =>
 															createAuditEntry({
 																version: entry.version,
@@ -7172,11 +7197,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																recordId: entry.key,
 																previousVersion: null,
 																nodeId: recordNodeId,
-																type: 'put',
+																type: copyType,
 																encodedRecord: encodeCopyRecordValue(table.primaryStore, entry.value, (blob) =>
 																	sendBlobs(blob, entry.key)
 																),
-																extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
+																extendedType:
+																	(entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24)) |
+																	(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0),
 																residencyId: entry.residencyId,
 																previousResidencyId: null,
 																expiresAt: entry.expiresAt,
@@ -7190,7 +7217,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																// make it look like an audit record
 																recordId: entry.key,
 																tableId: table.tableId,
-																type: 'put',
+																type: copyType,
 																getValue() {
 																	return entry.value;
 																},

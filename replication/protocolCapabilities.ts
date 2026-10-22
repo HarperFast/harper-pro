@@ -54,6 +54,13 @@ export const ORIGIN_FLOORS_CAPABILITY = 1;
  */
 export const TABLE_LIFECYCLE_CAPABILITY = 1;
 
+/**
+ * Level at which a peer applies an equal-version residency invalidation without demoting a full record it
+ * holds as a resident (core harper#3322). Only then may the base copy send a stored stub as `invalidate`;
+ * an older receiver would turn its full row into a stub, so it gets the stub as a `put` it skips.
+ */
+export const RESIDENCY_STUB_COPY_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	safeCopyAudit: number;
@@ -64,6 +71,7 @@ export interface ResolvedPeerCapabilities {
 	originCursors: number;
 	originFloors: number;
 	tableLifecycle: number;
+	residencyStubCopy: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -107,11 +115,16 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		originCursors: resolveLevel(bag?.originCursors, ORIGIN_CURSORS_CAPABILITY, 0),
 		originFloors: resolveLevel(bag?.originFloors, ORIGIN_FLOORS_CAPABILITY, 0),
 		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
+		residencyStubCopy: resolveLevel(bag?.residencyStubCopy, RESIDENCY_STUB_COPY_CAPABILITY, 0),
 	});
 }
 
 export function peerSupportsTableLifecycle(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.tableLifecycle >= TABLE_LIFECYCLE_CAPABILITY;
+}
+
+export function peerSupportsResidencyStubCopy(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.residencyStubCopy >= RESIDENCY_STUB_COPY_CAPABILITY;
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
@@ -163,6 +176,7 @@ export function buildLocalCapabilities(
 		originCursors: perOriginLogs ? ORIGIN_CURSORS_CAPABILITY : 0,
 		originFloors: perOriginLogs ? ORIGIN_FLOORS_CAPABILITY : 0,
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
+		residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 	});
 }
 
@@ -177,7 +191,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.recordLocks === b.recordLocks &&
 		a.originCursors === b.originCursors &&
 		a.originFloors === b.originFloors &&
-		a.tableLifecycle === b.tableLifecycle
+		a.tableLifecycle === b.tableLifecycle &&
+		a.residencyStubCopy === b.residencyStubCopy
 	);
 }
 

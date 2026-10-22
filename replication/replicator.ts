@@ -509,10 +509,18 @@ export function setReplicator(dbName: string, table: any, options: any) {
 								}
 							}
 							// if there are no connections left, throw an error
-							if (!bestConnection)
+							if (!bestConnection) {
+								if (
+									!entry.residency &&
+									!firstError &&
+									attemptedNodes.size > 0 &&
+									residency.every((name) => name === server.hostname || attemptedNodes.has(name))
+								)
+									return;
 								throw (
 									firstError || new ServerError(`No connection to any other nodes are available: ${residency}`, 502)
 								);
+							}
 							const request = {
 								requestId: nextId++,
 								table,
@@ -521,7 +529,8 @@ export function setReplicator(dbName: string, table: any, options: any) {
 							};
 							attemptedNodes.add(bestNode);
 							try {
-								return await bestConnection.getRecord(request);
+								const found = await bestConnection.getRecord(request);
+								if (found || entry.residency) return found;
 							} catch (error) {
 								// if we are still connected, must be a non-network error
 								if (bestConnection.isConnected) throw error;
