@@ -6576,6 +6576,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									previousResidencyId,
 									encoded: encodeResidencyWireRecord(auditRecord, residencyId, previousResidencyId),
 								};
+							} else if (
+								table.residency &&
+								(auditRecord.residencySlot !== undefined || auditRecord.previousResidencySlot !== undefined)
+							) {
+								wireRecord = {
+									...auditRecord,
+									encoded: encodeResidencyWireRecord(auditRecord, residencyId, auditRecord.previousResidencyId),
+								};
 							}
 							let invalidationEntry;
 							if (residency && !residency.includes(remoteNodeName)) {
@@ -6669,7 +6677,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									])
 								);
 							}
-							if (!table.residency && residencyId && !sentResidencyLists[residencyId]) {
+							if (!hasSlot && residencyId && !sentResidencyLists[residencyId]) {
 								ws.send(encode([RESIDENCY_LIST, residency, residencyId]));
 								sentResidencyLists[residencyId] = true;
 							}

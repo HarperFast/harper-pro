@@ -39,7 +39,7 @@ export class ResidencyWireReferences {
 }
 
 /** Reframe only the header; copy the original encoded body and its blob transfer tags unchanged. */
-export function encodeResidencyWireRecord(record: any, residencyId: number, previousResidencyId?: number): Buffer {
+export function encodeResidencyWireRecord(record: any, residencyId?: number, previousResidencyId?: number): Buffer {
 	return createAuditEntry({
 		...record,
 		previousVersion: null,
@@ -52,7 +52,7 @@ export function encodeResidencyWireRecord(record: any, residencyId: number, prev
 					HAS_CURRENT_RESIDENCY_ID |
 					HAS_PREVIOUS_RESIDENCY_ID
 				)) |
-			HAS_CURRENT_RESIDENCY_ID |
+			(residencyId === undefined ? 0 : HAS_CURRENT_RESIDENCY_ID) |
 			(previousResidencyId === undefined ? 0 : HAS_PREVIOUS_RESIDENCY_ID),
 		residencyId,
 		previousResidencyId,

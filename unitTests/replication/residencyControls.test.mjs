@@ -152,6 +152,13 @@ describe('Declarative tables keep control and event traffic independent of place
 			const event = entries(socket).find((entry) => entry.type === 'message');
 			assert.equal(event.recordId, null);
 			assert.equal(event.residencyId, undefined);
+			await Records.put('published', { id: 'published', region: 0, body: 'complete' });
+			await Records.publish('published', { event: 'record-notice' });
+			await until(() => entries(socket).some((entry) => entry.type === 'message' && entry.recordId === 'published'));
+			const recordEvent = entries(socket).find((entry) => entry.type === 'message' && entry.recordId === 'published');
+			assert.equal(recordEvent.residencySlot, undefined);
+			assert.equal(recordEvent.previousResidencySlot, undefined);
+			assert.equal(recordEvent.residencyId, undefined);
 		});
 		it(`receives control traffic before the next record (byAttribute=${byAttribute})`, async () => {
 			const { Records, socket } = await connect(byAttribute, 'receive');
