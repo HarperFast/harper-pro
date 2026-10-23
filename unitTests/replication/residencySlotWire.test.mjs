@@ -12,6 +12,29 @@ import { encodeResidencyWireRecord } from '#src/replication/residencyWire';
 
 // Real audit bytes prove that a legacy reader has no new presence bits to misinterpret.
 describe('Declarative residency wire headers', () => {
+	for (const residencyId of [undefined, 42]) {
+		it(`strips an event's local slot fields without adding placement (legacy ID=${residencyId})`, () => {
+			const original = readAuditEntry(
+				createAuditEntry({
+					tableId: 2,
+					nodeId: 3,
+					version: Date.now(),
+					recordId: 'published',
+					type: 'message',
+					extendedType: HAS_CURRENT_RESIDENCY_SLOT | (residencyId === undefined ? 0 : HAS_CURRENT_RESIDENCY_ID),
+					residencySlot: 0,
+					residencyId,
+					encodedRecord: encode({ event: 'notice' }),
+				})
+			);
+			const wire = readAuditEntry(encodeResidencyWireRecord(original, residencyId));
+			assert.equal(wire.residencySlot, undefined);
+			assert.equal(wire.residencyId, residencyId);
+			assert.equal(wire.type, 'message');
+			assert.equal(Boolean(wire.extendedType & HAS_CURRENT_RESIDENCY_ID), residencyId !== undefined);
+			assert.deepEqual(wire.getBinaryValue(), original.getBinaryValue());
+		});
+	}
 	for (const slot of [0, 65535]) {
 		it(`replaces native slot ${slot} fields with connection references without changing the body`, () => {
 			const body = encode({ id: 'row', body: 'complete', region: slot });
