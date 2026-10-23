@@ -63,6 +63,7 @@ suite('partial replication reads and placement', { timeout: 600_000 }, (ctx) => 
 				});
 				await startHarper(context, {
 					config: {
+						threads: { count: 1 },
 						analytics: { aggregatePeriod: -1 },
 						logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
 						replication: { securePort: hostname + ':9933' },

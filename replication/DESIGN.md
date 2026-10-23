@@ -346,10 +346,12 @@ stubs with `[GET_RECORD_RESPONSE, requestId, false]` for a learned requester adv
 or a tombstone (null value with its deletion version) is positive evidence from a holder and settles
 the read immediately. GET_RECORD preserves the versioned tombstone response for every requester.
 It does not compare versions across holders or perform a quorum/read-repair read, for live records
-or deletions. Only a missing row returns the two-element unversioned empty response.
+or deletions. A missing row, or a stub served to a requester without learned
+`residencyNotResident` support, returns the two-element unversioned empty response.
 The receiver forwards only strict `false` as not resident, without decoding or relocation.
 `Replicator.load` tries remaining available holders after either unversioned empty or not-resident
-answers for stored and id-derived lists. If no versioned answer arrives, absence requires every
+answers for stored and id-derived lists. Requests remain sequential, so an id-derived miss may
+wait for one GET_RECORD round trip per listed non-self holder. If no versioned answer arrives, absence requires every
 listed non-self holder to answer and at least one unversioned empty answer. An unreachable holder
 then keeps the result at 502; all not-resident answers produce a 502 naming that condition.
 The first network error remains the `ServerError` cause. Blob repair shares a subscription socket, so its request and response decoder
