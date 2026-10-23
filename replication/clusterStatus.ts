@@ -1,5 +1,6 @@
 'use strict';
 
+import { residencyStatus } from './residencyTopology.ts';
 import { parentPort } from 'worker_threads';
 import { onMessageByType } from '../core/server/threads/manageThreads.js';
 import { getThisNodeName } from '../core/server/nodeName.ts';
@@ -99,6 +100,7 @@ export async function clusterStatus() {
 	// removed node's hdb_nodes delete propagates to onNodeUpdate(null) the peer is dropped and this flips.
 	response.is_enabled = response.connections.length > 0;
 
+	response.residency = residencyStatus();
 	return response;
 }
 export function applySharedStatus(socket, replicationSharedStatus: Float64Array) {

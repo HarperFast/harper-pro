@@ -10,6 +10,7 @@ import {
 	RECORD_LOCKS_CAPABILITY,
 	RESIDENCY_STUB_COPY_CAPABILITY,
 	RESIDENCY_NOT_RESIDENT_CAPABILITY,
+	RESIDENCY_SLOTS_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
@@ -19,6 +20,7 @@ import {
 	peerSupportsOriginFloors,
 	peerSupportsRecordLocks,
 	peerSupportsResidencyStubCopy,
+	peerSupportsResidencySlots,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -42,6 +44,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				tableLifecycle: 0,
 				residencyStubCopy: 0,
 				residencyNotResident: 0,
+				residencySlots: 0,
 			}
 		);
 	});
@@ -66,6 +69,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 			'protocolVersion',
 			'recordLocks',
 			'residencyNotResident',
+			'residencySlots',
 			'residencyStubCopy',
 			'safeCopyAudit',
 			'subscriptionSetupAck',
@@ -246,6 +250,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
+				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -289,6 +294,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
+				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 			}
 		);
 	});
@@ -502,5 +508,20 @@ describe('residencyNotResident', () => {
 		const full = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
 		const without = resolvePeerCapabilities({ ...buildLocalCapabilities(90_000, true, true), residencyNotResident: 0 });
 		assert.equal(samePeerCapabilities(full, without), false);
+	});
+});
+
+describe('residencySlots capability', () => {
+	it('uses node-list fallback until the peer advertises slot support', () => {
+		for (const bag of [undefined, {}, { residencySlots: 0 }, { residencySlots: 'invalid' }])
+			assert.equal(peerSupportsResidencySlots(resolvePeerCapabilities(bag)), false);
+		assert.equal(peerSupportsResidencySlots(resolvePeerCapabilities({ residencySlots: 1 })), true);
+		assert.equal(peerSupportsResidencySlots(resolvePeerCapabilities({ residencySlots: 99 })), true);
+	});
+	it('reports a slot capability change independently', () => {
+		assert.equal(
+			samePeerCapabilities(resolvePeerCapabilities({ residencySlots: 1 }), resolvePeerCapabilities({})),
+			false
+		);
 	});
 });

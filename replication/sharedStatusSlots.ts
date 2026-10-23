@@ -59,3 +59,5 @@ export function assertAllocationFits(allocated: number, capacity: number): void 
 	}
 }
 assertAllocationFits(ALLOCATED_SLOTS, REPLICATION_SHARED_STATUS_SLOTS);
+
+export const CONNECTION_STATE_CONNECTED = 2;

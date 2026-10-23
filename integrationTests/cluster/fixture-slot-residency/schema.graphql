@@ -1,0 +1,26 @@
+type SlotKeys @table(replicaExpiration: 3600) @export @residency(slots: 10, slotFrom: "Number(id.slice(-1))") {
+	id: ID @primaryKey
+	tag: String @indexed
+	body: String
+}
+type SlotAttributes
+	@table(replicaExpiration: 3600)
+	@export
+	@residency(slots: 10, byAttribute: true, slotFrom: "region") {
+	id: ID @primaryKey
+	region: Int @indexed
+	tag: String @indexed
+	body: String
+}
+type SlotHash @table @export @residency(slots: 10) {
+	id: ID @primaryKey
+	tag: String @indexed
+	body: String
+}
+type SlotNoIndex @table @export @residency(slots: 10, slotFrom: "Number(id.slice(-1))") {
+	id: ID @primaryKey
+	body: String
+}
+type SlotBarrier @table @export {
+	id: ID @primaryKey
+}
