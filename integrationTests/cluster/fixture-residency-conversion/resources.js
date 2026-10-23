@@ -26,3 +26,22 @@ export class ConversionAudit extends Resource {
 			}));
 	}
 }
+
+// The fixture stops remote reads before this explicit rollback drain.
+export class ConversionDrain extends Resource {
+	async put() {
+		const REPLICA = 4; // Primary metadata bit shared by both binaries.
+		tables.Converted.setTTLExpiration({ replicaExpiration: 0 });
+		let demoted = 0;
+		for (const entry of tables.Converted.primaryStore.getRange({ start: true })) {
+			if (entry.metadataFlags & REPLICA) {
+				await tables.Converted.evict(entry.key);
+				demoted++;
+			}
+		}
+		const remaining = Array.from(tables.Converted.primaryStore.getRange({ start: true })).filter(
+			(entry) => entry.metadataFlags & REPLICA
+		).length;
+		return { demoted, remaining };
+	}
+}
