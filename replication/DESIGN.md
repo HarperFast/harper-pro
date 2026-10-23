@@ -353,10 +353,11 @@ use the peer's table id; a missing usable decoder fails locally. After a reconne
 have no decoder until its next replicated write, so blob repair can fail for that table in the meantime.
 A subscribed sender refuses mismatched
 table ids before announcing structures; the read is synchronous, so nothing changes between that check and the send. Tests: `residencyWire.test.mjs` and the four-node `residencyReads.test.mjs`.
-The copy sends a stub as `invalidate` only to a peer advertising `residencyStubCopy`: an older
+The copy walk encodes a stub as `invalidate` only for a peer advertising `residencyStubCopy`: an older
 receiver lacks core's equal-version resident guard and would demote a full record it holds. Other
-peers get the pre-gate `put`, which they skip at equal version, and which a receiver without the row
-stores as complete — today's behavior until it upgrades. The excluded-peer invalidations and the
+peers retain the pre-gate `put` encoding. Normal residency routing still invalidates or skips excluded
+peers. For a listed peer (or when no residency list is available), the legacy `put` is skipped at
+equal version; a receiver without the row stores the projection as complete — today's behavior until it upgrades. The excluded-peer invalidations and the
 GET_RECORD empty answer stay ungated: older receivers already apply an invalidation to a
 non-resident, and read an empty answer as absence without storing anything. An older responder
 still answers a stub as empty, which the requester must count as absence. A lagging holder can also
