@@ -112,12 +112,14 @@ describe('residency stubs on the replication wire', function () {
 		['absent-then-full', [undefined, 'full'], 'full'],
 		['not-resident', [false, false], 'error'],
 		['unreachable', [false, 'offline'], 'error'],
-		['absent-unreachable', [undefined, 'offline'], undefined],
+		['absent-unreachable', [undefined, 'offline'], 'error'],
 		['not-resident-disconnect', [false, 'disconnect'], 'error'],
 		['disconnect-not-resident', ['disconnect', false], 'error'],
-		['absent-disconnect', [undefined, 'disconnect'], undefined],
+		['absent-disconnect', [undefined, 'disconnect'], 'error'],
 		['id-derived', [false, 'full'], 'full'],
-		['id-derived-absent-first', [undefined, 'full'], undefined],
+		['id-derived-absent-first', [undefined, 'full'], 'full'],
+		['id-derived-absent-unreachable', [undefined, 'offline'], 'error'],
+		['id-derived-absent', [undefined, false], undefined],
 		['id-derived-not-resident', [false, false], 'error'],
 	]) {
 		it(`handles ${mode} across listed residents`, async () => {
@@ -153,11 +155,18 @@ describe('residency stubs on the replication wire', function () {
 					...(mode.startsWith('id-derived') ? { residency: peers } : {}),
 				});
 				if (expected === 'error')
-					await assert.rejects(pending, (error) => error.statusCode === 502 && /not resident/i.test(error.message));
+					await assert.rejects(pending, (error) => {
+						assert.equal(error.statusCode, 502);
+						assert.match(
+							error.message,
+							answers.includes('offline') || answers.includes('disconnect') ? /No connection/ : /not resident/i
+						);
+						return true;
+					});
 				else assert.equal(await pending, expected === 'full' ? complete : undefined);
 				assert.deepEqual(
 					contacted,
-					answers[1] === 'offline' || mode === 'id-derived-absent-first' ? peers.slice(0, 1) : peers
+					peers.filter((_, index) => answers[index] !== 'offline')
 				);
 			} finally {
 				for (const connection of connections) {

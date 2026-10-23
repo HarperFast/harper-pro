@@ -345,10 +345,10 @@ stubs with `[GET_RECORD_RESPONSE, requestId, false]` for a learned requester adv
 `residencyNotResident`, and supplies current decoder structures for full rows. A missing or deleted
 row keeps the two-element empty response. The receiver forwards only strict `false` as not resident,
 without decoding or relocation. `Replicator.load` tries remaining available holders after either
-negative answer for a stored list; a full record wins, otherwise one genuine empty answer permits
-absence even if another holder is unavailable. If every contacted holder is not resident or
-unreachable, the read fails with a 502 `ServerError`; the first network error remains its cause. Id-derived reads retry not resident
-but retain their first genuine answer semantics. Blob repair shares a subscription socket, so its request and response decoder
+negative answer for stored and id-derived lists. A full record wins. Otherwise absence requires
+every listed non-self holder to answer and at least one genuine empty answer. Any unreachable
+holder keeps the result at 502; all not-resident answers produce a 502 naming that condition.
+The first network error remains the `ServerError` cause. Blob repair shares a subscription socket, so its request and response decoder
 use the peer's table id; a missing usable decoder fails locally. After a reconnect, an idle table may
 have no decoder until its next replicated write, so blob repair can fail for that table in the meantime.
 A subscribed sender refuses mismatched
@@ -361,7 +361,8 @@ GET_RECORD empty answer stay ungated: older receivers already apply an invalidat
 non-resident, and read an empty answer as absence without storing anything. An older responder
 still answers a stub as empty, which the requester must count as absence. A lagging holder can also
 report absence before receiving the row; this protocol has no version-qualified absence proof.
-A genuine empty answer from either can therefore produce 404 when another holder is unavailable.
+Requiring every listed holder to answer prevents an empty reply from hiding a record on an
+unreachable holder. It cannot prove absence outside the listed holders, or distinguish legacy stubs.
 The per-request wait still depends on the socket watchdog; this change adds no request timer.
 These transport guards do not repair relocate-on-read (#436/#980): query materialization uses the
 existing path, whose missing default residency can mark other peers' partial rows complete. The

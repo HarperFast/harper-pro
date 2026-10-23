@@ -511,10 +511,13 @@ export function setReplicator(dbName: string, table: any, options: any) {
 								}
 							}
 							if (!bestConnection) {
-								if (reportedAbsence) return;
+								const allAnswered =
+									!firstError &&
+									residency.every((nodeName) => nodeName === server.hostname || attemptedNodes.has(nodeName));
+								if (allAnswered && reportedAbsence) return;
 								const error = new ServerError(
-									reportedNotResident
-										? `Listed nodes are not resident or unavailable: ${residency}`
+									allAnswered && reportedNotResident
+										? `Listed nodes are not resident: ${residency}`
 										: `No connection to any other nodes are available: ${residency}`,
 									502
 								);
@@ -532,10 +535,7 @@ export function setReplicator(dbName: string, table: any, options: any) {
 								const found = await bestConnection.getRecord(request);
 								if (found) return found;
 								if (found === false) reportedNotResident = true;
-								else {
-									if (entry.residency) return;
-									reportedAbsence = true;
-								}
+								else reportedAbsence = true;
 							} catch (error) {
 								// if we are still connected, must be a non-network error
 								if (bestConnection.isConnected) throw error;

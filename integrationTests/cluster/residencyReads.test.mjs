@@ -249,12 +249,11 @@ suite('partial replication reads and placement', { timeout: 600_000 }, (ctx) => 
 		}
 	});
 
-	test('unreachable residents cause read failures instead of absence or a partial row', async () => {
+	test('unreachable residents cause read failures instead of absence or a partial row', async (t) => {
 		await put(nodes[0], 'unavailable', { name: 'unavailable', body: 'still exists' });
 		const states = await placed('unavailable');
 		const residentIndexes = states.flatMap((entry, index) => (entry.invalidated ? [] : [index]));
 		const reader = states.findIndex((entry) => entry.invalidated);
-		// One genuine absence is sufficient once no available holder returned a record.
 		await put(
 			nodes[0],
 			'partly-unavailable',
@@ -262,11 +261,21 @@ suite('partial replication reads and placement', { timeout: 600_000 }, (ctx) => 
 			residentIndexes.map((i) => names[i]).join(',')
 		);
 		await placed('partly-unavailable');
-		await control(nodes[residentIndexes[0]], { removeLocal: 'partly-unavailable' });
-		await stopNodeProcess(nodes[residentIndexes[1]]);
-		await disconnected(reader, [residentIndexes[1]]);
-		const partialResponse = await request(nodes[reader], 'Open/partly-unavailable');
-		assert.equal(partialResponse.status, 404, JSON.stringify(partialResponse));
+		await t.test('an empty holder cannot hide the record on a stopped holder', async () => {
+			const [emptyHolder, stoppedHolder] = residentIndexes;
+			await control(nodes[emptyHolder], { removeLocal: 'partly-unavailable' });
+			assert.equal((await state(nodes[emptyHolder], 'partly-unavailable')).present, false);
+			const stored = await state(nodes[stoppedHolder], 'partly-unavailable');
+			assert.equal(stored.invalidated, false);
+			assert.equal(stored.value.body, 'still exists');
+			assert.ok((await state(nodes[reader], 'partly-unavailable')).invalidated);
+			await control(nodes[reader], { prefer: names[emptyHolder] });
+			await stopNodeProcess(nodes[stoppedHolder]);
+			await disconnected(reader, [stoppedHolder]);
+			const response = await request(nodes[reader], 'Open/partly-unavailable');
+			assert.equal(response.status, 502, JSON.stringify(response));
+			assert.ok((await state(nodes[reader], 'partly-unavailable')).invalidated);
+		});
 		await Promise.all(residentIndexes.map((index) => stopNodeProcess(nodes[index])));
 		await disconnected(reader, residentIndexes);
 		const response = await request(nodes[reader], 'Open/unavailable');
