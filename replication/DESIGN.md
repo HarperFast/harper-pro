@@ -342,12 +342,16 @@ copy/retrieval paths, except the base copy to a peer without `residencyStubCopy`
 unless residency is by id. The copy walk uses `invalidate`
 for `INVALIDATED` rows and translates the stored residency flag to the audit flag. GET_RECORD refuses
 stubs with `[GET_RECORD_RESPONSE, requestId, false]` for a learned requester advertising
-`residencyNotResident`, and supplies current decoder structures for full rows. A missing or deleted
-row keeps the two-element empty response. The receiver forwards only strict `false` as not resident,
-without decoding or relocation. `Replicator.load` tries remaining available holders after either
-negative answer for stored and id-derived lists. A full record wins. Otherwise absence requires
-every listed non-self holder to answer and at least one genuine empty answer. Any unreachable
-holder keeps the result at 502; all not-resident answers produce a 502 naming that condition.
+`residencyNotResident`, and supplies current decoder structures for versioned answers. A live record
+or a tombstone (null value with its deletion version) is positive evidence from a holder and settles
+the read immediately. GET_RECORD preserves the versioned tombstone response for every requester.
+It does not compare versions across holders or perform a quorum/read-repair read, for live records
+or deletions. Only a missing row returns the two-element unversioned empty response.
+The receiver forwards only strict `false` as not resident, without decoding or relocation.
+`Replicator.load` tries remaining available holders after either unversioned empty or not-resident
+answers for stored and id-derived lists. If no versioned answer arrives, absence requires every
+listed non-self holder to answer and at least one unversioned empty answer. An unreachable holder
+then keeps the result at 502; all not-resident answers produce a 502 naming that condition.
 The first network error remains the `ServerError` cause. Blob repair shares a subscription socket, so its request and response decoder
 use the peer's table id; a missing usable decoder fails locally. After a reconnect, an idle table may
 have no decoder until its next replicated write, so blob repair can fail for that table in the meantime.
@@ -361,7 +365,7 @@ equal version; a receiver without the row stores the projection as complete — 
 GET_RECORD empty answer stay ungated: older receivers already apply an invalidation to a
 non-resident, and read an empty answer as absence without storing anything. An older responder
 still answers a stub as empty, which the requester must count as absence. A lagging holder can also
-report absence before receiving the row; this protocol has no version-qualified absence proof.
+report absence before receiving the row; an unversioned empty reply supplies no deletion version.
 Requiring every listed holder to answer prevents an empty reply from hiding a record on an
 unreachable holder. It cannot prove absence outside the listed holders, or distinguish legacy stubs.
 GET_RECORD has no per-request timer; its wait depends on the socket watchdog.

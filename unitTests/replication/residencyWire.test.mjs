@@ -207,7 +207,7 @@ describe('residency stubs on the replication wire', function () {
 				socket.emit('message', encode([NODE_NAME, PEER, DATABASE, [], bag]));
 				await until(() => socket.sent.some((frame) => frame[0] === NODE_NAME));
 			}
-			for (const [index, id] of ['stub', 'missing', 'deleted'].entries()) {
+			for (const [index, id] of ['stub', 'missing'].entries()) {
 				socket.emit('message', encode([GET_RECORD, index, Records.tableId, id, Records.tableName]));
 				await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === index));
 				const bytes = socket.rawSent.find((frame) => {
@@ -216,6 +216,11 @@ describe('residency stubs on the replication wire', function () {
 				});
 				assert.ok(bytes.equals(encode([GET_RECORD_RESPONSE, index])));
 			}
+			socket.emit('message', encode([GET_RECORD, 8, Records.tableId, 'deleted', Records.tableName]));
+			await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 8));
+			const tombstone = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 8)[2];
+			assert.equal(tombstone?.version, Records.primaryStore.getEntry('deleted').version);
+			assert.strictEqual(decode(tombstone.value), null);
 			const pending = session.getRecord({ table: Records, id: 'missing' });
 			const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
 			socket.emit('message', encode([GET_RECORD_RESPONSE, request[1]]));
@@ -286,8 +291,70 @@ describe('residency stubs on the replication wire', function () {
 				const StructonPackr = createStructon(Packr);
 				const decoder = new StructonPackr({ typedStructs: structure.typedStructs, structures: structure.structures });
 				assert.equal(decoder.decode(response[2].value).body, 'complete');
+			} else if (id === 'deleted') {
+				assert.equal(response[2]?.version, Records.primaryStore.getEntry('deleted').version);
+				assert.strictEqual(decode(response[2].value), null);
 			} else assert.strictEqual(response[2], id === 'stub' ? false : undefined);
 		});
+	}
+
+	for (const list of ['stored', 'id-derived']) {
+		for (const second of ['older-live', 'offline']) {
+			it(`a versioned deletion settles a ${list} read before an ${second} holder`, async () => {
+				socket.emit('message', encode([GET_RECORD, 950, Records.tableId, 'deleted', Records.tableName]));
+				await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 950));
+				const wireAnswer = socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 950)[2];
+				const structure = socket.sent.find((frame) => frame[0] === TABLE_FIXED_STRUCTURE);
+				socket.emit('message', encode(structure));
+				await new Promise((resolve) => setImmediate(resolve));
+				const deletionVersion = Records.primaryStore.getEntry('deleted').version;
+				const older = Records.primaryStore.getEntry('full');
+				assert.ok(older.version < deletionVersion);
+				const peers = [`deletion-${list}-${second}-first`, `deletion-${list}-${second}-second`];
+				const contacted = [];
+				const connections = [];
+				const sandbox = sinon.createSandbox();
+				try {
+					const relocate = sandbox.stub(Records, '_recordRelocate').returns(true);
+					sandbox.stub(getHDBNodeTable().primaryStore, 'getSync').callsFake((name) => ({
+						name,
+						url: `wss://${name}:9933`,
+					}));
+					sandbox.stub(NodeReplicationConnection.prototype, 'connect').callsFake(function () {
+						connections.push(this);
+						this.isConnected = this.nodeName === peers[0] || second !== 'offline';
+					});
+					sandbox.stub(NodeReplicationConnection.prototype, 'getRecord').callsFake(async function (request) {
+						contacted.push(this.nodeName);
+						if (this.nodeName === peers[1])
+							return { key: 'deleted', value: { ...older.value, id: 'deleted' }, version: older.version };
+						const pending = session.getRecord(request);
+						const sent = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
+						socket.emit('message', encode([GET_RECORD_RESPONSE, sent[1], wireAnswer]));
+						return pending;
+					});
+					for (const [index, name] of peers.entries())
+						getReplicationSharedStatus(Records.auditStore, DATABASE, name)[LATENCY_POSITION] = index;
+					Records.dbisDB.putSync([Symbol.for('residency_by_id'), 790], peers);
+					const found = await ReplicationSource.load({
+						key: 'deleted',
+						residencyId: 790,
+						...(list === 'id-derived' ? { residency: peers } : {}),
+					});
+					assert.strictEqual(found.value, null);
+					assert.equal(found.version, deletionVersion);
+					assert.deepEqual(contacted, [peers[0]]);
+					assert.equal(relocate.callCount, 1);
+					assert.strictEqual(relocate.firstCall.args[1], found);
+				} finally {
+					for (const connection of connections) {
+						connection.isFinished = true;
+						connection.emit('finished');
+					}
+					sandbox.restore();
+				}
+			});
+		}
 	}
 
 	async function copiedRecords(copySocket = socket) {

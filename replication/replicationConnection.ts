@@ -5998,11 +5998,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								} else {
 									entry.version = recordVersion;
 								}
-								// A stored deletion is msgpack null after its metadata prefix.
-								if (valueBuffer.length === 1 && valueBuffer[0] === 0xc0) {
-									ws.send(encode([GET_RECORD_RESPONSE, requestId]));
-									break;
-								}
 								if (entry[METADATA] & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
 									// but first, the decoding process can destroy our buffer above, so we need to copy it
