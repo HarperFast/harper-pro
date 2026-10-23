@@ -158,33 +158,16 @@ function clusterReplication(ctx) {
 			records: [{ id: '1', name: 'test' }],
 			replicatedConfirmation: NODE_COUNT - 1,
 		});
-		let response;
-		let retries = 0;
-		do {
-			await delay(200);
-			response = await sendOperation(ctx.nodes[1], {
+		for (let i = 0; i < NODE_COUNT; i++) {
+			const response = await sendOperation(ctx.nodes[i], {
 				operation: 'search_by_id',
 				table: 'test',
 				get_attributes: ['id', 'name'],
 				ids: ['1'],
 			});
-			if (retries++ > 10) {
-				break;
-			}
-		} while (response.length === 0);
-		if (response.length === 0) {
-			throw new Error('Node 1 did not replicate insert');
+			equal(response.length, 1, `node ${i + 1} does not have the inserted record`);
+			equal(response[0].name, 'test');
 		}
-		equal(response.length, 1);
-		equal(response[0].name, 'test');
-		response = await sendOperation(ctx.nodes[2], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 1);
-		equal(response[0].name, 'test');
 	});
 	test('replicate update from node 2', async () => {
 		await sendOperation(ctx.nodes[1], {
@@ -193,7 +176,6 @@ function clusterReplication(ctx) {
 			records: [{ id: '1', name: 'test2' }],
 			replicatedConfirmation: NODE_COUNT - 1,
 		});
-		if (ctx.testLMDB) await delay(400); // confirmation isn't working for LMDB
 		for (let i = 0; i < NODE_COUNT; i++) {
 			let response = await sendOperation(ctx.nodes[i], {
 				operation: 'search_by_id',
@@ -212,21 +194,15 @@ function clusterReplication(ctx) {
 			ids: ['1'],
 			replicatedConfirmation: NODE_COUNT - 1,
 		});
-		if (ctx.testLMDB) await delay(400);
-		let response = await sendOperation(ctx.nodes[0], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 0);
-		response = await sendOperation(ctx.nodes[1], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 0);
+		for (let i = 0; i < NODE_COUNT; i++) {
+			const response = await sendOperation(ctx.nodes[i], {
+				operation: 'search_by_id',
+				table: 'test',
+				get_attributes: ['id', 'name'],
+				ids: ['1'],
+			});
+			equal(response.length, 0, `node ${i + 1} still has the deleted record`);
+		}
 	});
 	suite('Deploy app and test replication', { timeout: 60000 }, () => {
 		before(async () => {
