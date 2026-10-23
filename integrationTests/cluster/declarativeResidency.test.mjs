@@ -219,6 +219,23 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 		await checkPlacement('SlotAttributes', 'moving', 0, 'complete body');
 		for (const node of nodes()) assert.equal((await get(node, 'SlotAttributes/moving')).body, 'complete body');
 	});
+
+	test('non-owner deletes reach owners with key, attribute, and index-free policies', async () => {
+		for (const table of ['SlotKeys', 'SlotAttributes', 'SlotNoIndex']) {
+			const id = 'delete1';
+			await put(nodes()[0], table, { id, region: 1, tag: 'deleted', body: 'remove everywhere' });
+			await checkPlacement(table, id, 1, 'remove everywhere');
+			const response = await request(nodes()[1], `${table}/${id}`, { method: 'DELETE' });
+			assert.ok(response.status >= 200 && response.status < 300, JSON.stringify(response));
+			await waitForCondition(
+				async (signal) =>
+					(await Promise.all(nodes().map((node) => rawRows(node, table, signal)))).every(
+						(rows) => !rows.some((row) => row.id === id && row.record)
+					),
+				{ description: `${table}/${id} deleted from every owner and stub holder` }
+			);
+		}
+	});
 });
 
 suite('Declarative residency with mismatched shard lists', { timeout: 300_000 }, (ctx) => {
