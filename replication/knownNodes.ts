@@ -964,7 +964,7 @@ export function filterReplicationRecipients(nodes: any[], selfReplicates: any, d
  * legacy full-mesh self-record (`true`, or an absent/unset one) — the common, non-directional case this
  * previously handled correctly.
  */
-function getReplicationRecipients(databaseName: string) {
+export function getReplicationRecipients(databaseName: string) {
 	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
 	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
 }
