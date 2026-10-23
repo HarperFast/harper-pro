@@ -485,6 +485,8 @@ export function setReplicator(dbName: string, table: any, options: any) {
 						entry.residency || (await table.dbisDB.get([Symbol.for('residency_by_id'), residencyId]));
 					if (residency) {
 						let firstError: Error;
+						let reportedAbsence = false;
+						let reportedNotResident = false;
 						const attemptedNodes = new Set<string>();
 						do {
 							// This loop is for trying multiple nodes if the first one fails. With each iteration, we add the node to the attemptedConnections,
@@ -508,18 +510,19 @@ export function setReplicator(dbName: string, table: any, options: any) {
 									}
 								}
 							}
-							// if there are no connections left, throw an error
 							if (!bestConnection) {
-								if (
-									!entry.residency &&
+								const allAnswered =
 									!firstError &&
-									attemptedNodes.size > 0 &&
-									residency.every((name) => name === server.hostname || attemptedNodes.has(name))
-								)
-									return;
-								throw (
-									firstError || new ServerError(`No connection to any other nodes are available: ${residency}`, 502)
+									residency.every((nodeName) => nodeName === server.hostname || attemptedNodes.has(nodeName));
+								if (allAnswered && reportedAbsence) return;
+								const error = new ServerError(
+									allAnswered && reportedNotResident
+										? `Listed nodes are not resident: ${residency}`
+										: `No connection to any other nodes are available: ${residency}`,
+									502
 								);
+								if (firstError) error.cause = firstError;
+								throw error;
 							}
 							const request = {
 								requestId: nextId++,
@@ -530,7 +533,9 @@ export function setReplicator(dbName: string, table: any, options: any) {
 							attemptedNodes.add(bestNode);
 							try {
 								const found = await bestConnection.getRecord(request);
-								if (found || entry.residency) return found;
+								if (found) return found;
+								if (found === false) reportedNotResident = true;
+								else reportedAbsence = true;
 							} catch (error) {
 								// if we are still connected, must be a non-network error
 								if (bestConnection.isConnected) throw error;

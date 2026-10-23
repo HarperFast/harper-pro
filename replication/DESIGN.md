@@ -79,6 +79,7 @@ Each socket resolves the peer's bag once per `NODE_NAME` into a frozen object wi
 | `originFloors`              | level        | `0` (unsupported) | `min(local, peer)`; advertised as `1` only by a RocksDB build. Gates the floor vector on `SEQUENCE_ID_UPDATE[2]`, its storage as `nodes[].closedFloor`, and a resume request that starts at a stored floor — see Non-obvious behavior 27 |
 | `tableLifecycle`            | level        | `0` (unsupported) | `min(local, peer)`; a peer at ≥1 reads lifecycle stamps and the `DB_SCHEMA[4]` drop-marker list, which is sent only to such a peer (harper#1212)                                                                                         |
 | `residencyStubCopy`         | level        | `0` (unsupported) | `min(local, peer)`; a peer at ≥1 keeps a full resident record on an equal-version invalidation (harper#3322), so the base copy may send it a stored stub as `invalidate`                                                                 |
+| `residencyNotResident`      | level        | `0` (unsupported) | `min(local, peer)`; a peer at ≥1 distinguishes a GET_RECORD not-resident answer (`false`) from an empty absence answer                                                                                                                   |
 
 The kinds are not cosmetic. A **level** coerces (`Number(value)`), because the behavior being preserved is `capabilities?.subscriptionSetupAck >= 1`, a coercing comparison that a peer sending `true` or `'1'` passes today. A **parameter** does not coerce, because its predecessor was `Number.isFinite(raw) && raw > 0`, which already rejects `'300'`. A parameter is also never min-clamped: a millisecond budget is not a feature level.
 
@@ -88,7 +89,7 @@ An absent bag resolves to all defaults, which is exactly the pre-registry behavi
 
 **Which one do you add?** A capability key for an additive feature, so peers can adopt it independently. `protocolVersion` only for a change to the SHAPE of the protocol. Neither for durable state: `COPY_ORDER_VERSION` stays in the copy cursor because it describes persisted cursor content, not a peer's abilities.
 
-**Sender-side gating discipline.** A sender must not emit a frame type, or a field a receiver must understand, that the peer has not advertised support for. This is the invariant that makes the unknown-frame default case safe to continue past. The gated frames are the record-lock control entries (`lockRelease` / `lockBarrier`, audit action nibbles 12 / 13, `isLockControlType`) and `RECORD_LOCK_HOMES_DIGEST`: `sendAuditRecord` skips a control entry, next to the `LOCAL_ONLY` skip, unless this socket has learned the peer's bag and it carries exactly the local `recordLocks` level (`peerSupportsRecordLocks`), and the skipped entry advances the peer's cursor like any other skipped record — a control entry that never arrives can only cost a requester a 423, never a second holder (see below). The digest announce is gated on the same condition. The base copy sends a stored residency stub as `invalidate` only to a learned peer advertising `residencyStubCopy`; any other peer, including one whose bag is not learned yet, gets the row exactly as before the key existed (a `put` of the stub without the residency-id flag), never a skip: the copy may be that peer's only source for the row.
+**Sender-side gating discipline.** A sender must not emit a frame type, or a field a receiver must understand, that the peer has not advertised support for. This is the invariant that makes the unknown-frame default case safe to continue past. The gated frames are the record-lock control entries (`lockRelease` / `lockBarrier`, audit action nibbles 12 / 13, `isLockControlType`) and `RECORD_LOCK_HOMES_DIGEST`: `sendAuditRecord` skips a control entry, next to the `LOCAL_ONLY` skip, unless this socket has learned the peer's bag and it carries exactly the local `recordLocks` level (`peerSupportsRecordLocks`), and the skipped entry advances the peer's cursor like any other skipped record — a control entry that never arrives can only cost a requester a 423, never a second holder (see below). The digest announce is gated on the same condition. GET_RECORD sends `false` for a stored stub only after learning a requester advertising `residencyNotResident`; every other requester receives the identical two-element empty response. The base copy sends a stored residency stub as `invalidate` only to a learned peer advertising `residencyStubCopy`; any other peer, including one whose bag is not learned yet, gets the row exactly as before the key existed (a `put` of the stub without the residency-id flag), never a skip: the copy may be that peer's only source for the row.
 
 **Observability.** The frozen result is mirrored on `NodeReplicationConnection.peerCapabilities`, replaced per socket — the slot must stay replaceable, since the object outlives the socket. `undefined` there means NOT YET LEARNED on the current socket, never "the peer does not support it": a peer that advertised nothing is the frozen defaults object, and a consumer gating on a capability must tell the two apart or it will deny a healthy peer mid-reconnect. Nothing is reported before a `NODE_NAME` lands, so a peer that wedges before its handshake is not misreported as pre-#646. The result is carried to the main thread on the existing `connected-to-node` message, deduplicated by field value. `applyConnectionMetadata` fences it with a `(worker thread id, per-worker session ordinal)` pair so a message from a replaced socket cannot overwrite the live entry; a wall clock cannot serve as that fence, since two workers can open a session in the same millisecond and a clock can step backwards. `cluster_status` reports the **effective** values per `database_sockets` entry as `peerCapabilities`, omitted while the shared-memory truth reads the socket down, plus `unknownCommandFrames`, omitted when zero. All of it is observability: the socket-local frozen object is the enforcement authority.
 
@@ -340,20 +341,36 @@ Transport invariant: a stub is never sent, served, or stored as a complete recor
 copy/retrieval paths, except the base copy to a peer without `residencyStubCopy` (below). `sendAuditRecord` sends every write to every non-resident peer as an invalidation
 unless residency is by id. The copy walk uses `invalidate`
 for `INVALIDATED` rows and translates the stored residency flag to the audit flag. GET_RECORD refuses
-stubs with an empty response and supplies current decoder structures for full rows. `Replicator.load`
-tries the remaining residents after an empty stored-stub response; absence requires every non-self
-resident to answer, while an unreachable resident leaves a read error. Id-derived reads retain their
-first-answer semantics. Blob repair shares a subscription socket, so its request and response decoder
+stubs with `[GET_RECORD_RESPONSE, requestId, false]` for a learned requester advertising
+`residencyNotResident`, and supplies current decoder structures for versioned answers. A live record
+or a tombstone (null value with its deletion version) is positive evidence from a holder and settles
+the read immediately. GET_RECORD preserves the versioned tombstone response for every requester.
+It does not compare versions across holders or perform a quorum/read-repair read, for live records
+or deletions. A missing row, or a stub served to a requester without learned
+`residencyNotResident` support, returns the two-element unversioned empty response.
+The receiver forwards only strict `false` as not resident, without decoding or relocation.
+`Replicator.load` tries remaining available holders after either unversioned empty or not-resident
+answers for stored and id-derived lists. Requests remain sequential, so an id-derived miss may
+wait for one GET_RECORD round trip per listed non-self holder. If no versioned answer arrives, absence requires every
+listed non-self holder to answer and at least one unversioned empty answer. An unreachable holder
+then keeps the result at 502; all not-resident answers produce a 502 naming that condition.
+The first network error remains the `ServerError` cause. Blob repair shares a subscription socket, so its request and response decoder
 use the peer's table id; a missing usable decoder fails locally. After a reconnect, an idle table may
 have no decoder until its next replicated write, so blob repair can fail for that table in the meantime.
 A subscribed sender refuses mismatched
 table ids before announcing structures; the read is synchronous, so nothing changes between that check and the send. Tests: `residencyWire.test.mjs` and the four-node `residencyReads.test.mjs`.
-The copy sends a stub as `invalidate` only to a peer advertising `residencyStubCopy`: an older
+The copy walk encodes a stub as `invalidate` only for a peer advertising `residencyStubCopy`: an older
 receiver lacks core's equal-version resident guard and would demote a full record it holds. Other
-peers get the pre-gate `put`, which they skip at equal version, and which a receiver without the row
-stores as complete — today's behavior until it upgrades. The excluded-peer invalidations and the
+peers retain the pre-gate `put` encoding. Normal residency routing still invalidates or skips excluded
+peers. For a listed peer (or when no residency list is available), the legacy `put` is skipped at
+equal version; a receiver without the row stores the projection as complete — today's behavior until it upgrades. The excluded-peer invalidations and the
 GET_RECORD empty answer stay ungated: older receivers already apply an invalidation to a
-non-resident, and read an empty answer as absence without storing anything.
+non-resident, and read an empty answer as absence without storing anything. An older responder
+still answers a stub as empty, which the requester must count as absence. A lagging holder can also
+report absence before receiving the row; an unversioned empty reply supplies no deletion version.
+Requiring every listed holder to answer prevents an empty reply from hiding a record on an
+unreachable holder. It cannot prove absence outside the listed holders, or distinguish legacy stubs.
+GET_RECORD has no per-request timer; its wait depends on the socket watchdog.
 These transport guards do not repair relocate-on-read (#436/#980): query materialization uses the
 existing path, whose missing default residency can mark other peers' partial rows complete. The
 RocksDB relocation audit append can also fail after returning a successful read.

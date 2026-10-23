@@ -9,6 +9,7 @@ import {
 	ORIGIN_FLOORS_CAPABILITY,
 	RECORD_LOCKS_CAPABILITY,
 	RESIDENCY_STUB_COPY_CAPABILITY,
+	RESIDENCY_NOT_RESIDENT_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
@@ -40,6 +41,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				originFloors: 0,
 				tableLifecycle: 0,
 				residencyStubCopy: 0,
+				residencyNotResident: 0,
 			}
 		);
 	});
@@ -63,6 +65,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 			'originFloors',
 			'protocolVersion',
 			'recordLocks',
+			'residencyNotResident',
 			'residencyStubCopy',
 			'safeCopyAudit',
 			'subscriptionSetupAck',
@@ -242,6 +245,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
+				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -284,6 +288,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
+				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 			}
 		);
 	});
@@ -476,5 +481,26 @@ describe('residencyStubCopy', () => {
 		const full = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
 		const without = resolvePeerCapabilities({ ...buildLocalCapabilities(90_000, true, true), residencyStubCopy: 0 });
 		assert.strictEqual(samePeerCapabilities(full, without), false);
+	});
+});
+
+describe('residencyNotResident', () => {
+	it('defaults absent and invalid levels to unsupported', () => {
+		for (const value of [undefined, null, 0, -1, 'no', {}, { toString: 0 }])
+			assert.equal(resolvePeerCapabilities({ residencyNotResident: value }).residencyNotResident, 0);
+	});
+
+	it('advertises and clamps the additive level without changing the protocol version', () => {
+		const local = buildLocalCapabilities(1, false, false);
+		assert.equal(local.residencyNotResident, 1);
+		assert.equal(local.protocolVersion, 2);
+		for (const value of [1, 5, '1'])
+			assert.equal(resolvePeerCapabilities({ residencyNotResident: value }).residencyNotResident, 1);
+	});
+
+	it('reports a change in residencyNotResident alone', () => {
+		const full = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
+		const without = resolvePeerCapabilities({ ...buildLocalCapabilities(90_000, true, true), residencyNotResident: 0 });
+		assert.equal(samePeerCapabilities(full, without), false);
 	});
 });

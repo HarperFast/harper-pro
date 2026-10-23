@@ -61,6 +61,8 @@ export const TABLE_LIFECYCLE_CAPABILITY = 1;
  */
 export const RESIDENCY_STUB_COPY_CAPABILITY = 1;
 
+export const RESIDENCY_NOT_RESIDENT_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	safeCopyAudit: number;
@@ -72,6 +74,7 @@ export interface ResolvedPeerCapabilities {
 	originFloors: number;
 	tableLifecycle: number;
 	residencyStubCopy: number;
+	residencyNotResident: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -116,6 +119,7 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		originFloors: resolveLevel(bag?.originFloors, ORIGIN_FLOORS_CAPABILITY, 0),
 		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
 		residencyStubCopy: resolveLevel(bag?.residencyStubCopy, RESIDENCY_STUB_COPY_CAPABILITY, 0),
+		residencyNotResident: resolveLevel(bag?.residencyNotResident, RESIDENCY_NOT_RESIDENT_CAPABILITY, 0),
 	});
 }
 
@@ -125,6 +129,10 @@ export function peerSupportsTableLifecycle(resolved: ResolvedPeerCapabilities): 
 
 export function peerSupportsResidencyStubCopy(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.residencyStubCopy >= RESIDENCY_STUB_COPY_CAPABILITY;
+}
+
+export function peerSupportsResidencyNotResident(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.residencyNotResident >= RESIDENCY_NOT_RESIDENT_CAPABILITY;
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
@@ -177,6 +185,7 @@ export function buildLocalCapabilities(
 		originFloors: perOriginLogs ? ORIGIN_FLOORS_CAPABILITY : 0,
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 		residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
+		residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 	});
 }
 
@@ -192,7 +201,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.originCursors === b.originCursors &&
 		a.originFloors === b.originFloors &&
 		a.tableLifecycle === b.tableLifecycle &&
-		a.residencyStubCopy === b.residencyStubCopy
+		a.residencyStubCopy === b.residencyStubCopy &&
+		a.residencyNotResident === b.residencyNotResident
 	);
 }
 
