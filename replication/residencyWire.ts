@@ -14,6 +14,10 @@ export interface SlotReference {
 	mapDigest: string;
 }
 
+export function isResidencyRecord(type: string): boolean {
+	return type === 'put' || type === 'patch' || type === 'delete' || type === 'invalidate' || type === 'relocate';
+}
+
 /** Connection-only references occupy the upper half; durable legacy IDs use the lower half. */
 export class ResidencyWireReferences {
 	private nextId = 0x80000000;

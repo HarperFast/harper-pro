@@ -2,7 +2,12 @@ import { HAS_RESIDENCY_SLOT } from '../core/resources/RecordEncoder.ts';
 import { getResidencyConfiguration, readResidencyMap, installResidencyMap } from '../core/resources/residencyMaps.ts';
 import { sameResidencyPolicy, validateResidencyMap } from '../core/resources/residencyPolicy.ts';
 import { recordResidencyConfiguration, recordResidencyMapAgreement } from './residencyTopology.ts';
-import { ResidencyWireReferences, encodeResidencyWireRecord, resolveSlotReference } from './residencyWire.ts';
+import {
+	ResidencyWireReferences,
+	encodeResidencyWireRecord,
+	resolveSlotReference,
+	isResidencyRecord,
+} from './residencyWire.ts';
 import { peerSupportsResidencySlots } from './protocolCapabilities.ts';
 import type { Logger } from '../core/utility/logging/logger.ts';
 import { createHash, type Hash } from 'node:crypto';
@@ -6540,11 +6545,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									subscribedNodeIds
 								);
 							let residencyId = auditRecord.residencyId;
-							const residency = table.residency
+							const hasSlot = table.residency && isResidencyRecord(auditRecord.type);
+							const residency = hasSlot
 								? table.getRecordResidency({ key: auditRecord.recordId, residencySlot: auditRecord.residencySlot })
 								: getResidence(residencyId, table);
 							let wireRecord = auditRecord;
-							if (table.residency) {
+							if (hasSlot) {
 								const slot = table.residency.byAttribute
 									? auditRecord.residencySlot
 									: table.getResidencySlot(auditRecord.recordId);
@@ -7923,7 +7929,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				const id = auditRecord.recordId;
 				let residencySlot: number | undefined;
-				if (tableDecoder.table?.residency) {
+				if (tableDecoder.table?.residency && isResidencyRecord(auditRecord.type)) {
 					const Table = tableDecoder.table;
 					try {
 						if (residencyList && !Array.isArray(residencyList)) {
