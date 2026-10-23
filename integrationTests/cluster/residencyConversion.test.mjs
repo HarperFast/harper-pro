@@ -183,6 +183,9 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			for (const node of nodes()) assert.equal((await request(node, 'Converted/mixed7')).body, 'legacy reader');
 			const legacyRows = await request(nodes()[1], 'ConversionRows/');
 			assert.equal(legacyRows.find((row) => row.id === 'mixed7').slot, undefined);
+			const drains = await Promise.all(nodes().map((node) => request(node, 'ConversionDrain/', {})));
+			assert.ok(drains.every((result) => result.remaining === 0));
+			assert.equal(drains.reduce((sum, result) => sum + result.demoted, 0) > 0, engine === 'rocksdb');
 			await reopen(false, previousBinary);
 			for (const node of nodes())
 				for (const id of ['legacy2', 'legacy7', 'new2', 'new7'])
