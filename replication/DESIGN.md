@@ -364,7 +364,7 @@ still answers a stub as empty, which the requester must count as absence. A lagg
 report absence before receiving the row; this protocol has no version-qualified absence proof.
 Requiring every listed holder to answer prevents an empty reply from hiding a record on an
 unreachable holder. It cannot prove absence outside the listed holders, or distinguish legacy stubs.
-The per-request wait still depends on the socket watchdog; this change adds no request timer.
+GET_RECORD has no per-request timer; its wait depends on the socket watchdog.
 These transport guards do not repair relocate-on-read (#436/#980): query materialization uses the
 existing path, whose missing default residency can mark other peers' partial rows complete. The
 RocksDB relocation audit append can also fail after returning a successful read.

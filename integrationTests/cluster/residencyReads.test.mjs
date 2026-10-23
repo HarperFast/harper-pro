@@ -270,10 +270,19 @@ suite('partial replication reads and placement', { timeout: 600_000 }, (ctx) => 
 			assert.equal(stored.value.body, 'still exists');
 			assert.ok((await state(nodes[reader], 'partly-unavailable')).invalidated);
 			await control(nodes[reader], { prefer: names[emptyHolder] });
+			await put(nodes[emptyHolder], 'partly-empty-probe', { body: 'probe' }, names[emptyHolder]);
+			await placed('partly-empty-probe');
+			await control(nodes[emptyHolder], { removeLocal: 'partly-empty-probe' });
 			await stopNodeProcess(nodes[stoppedHolder]);
 			await disconnected(reader, [stoppedHolder]);
-			const response = await request(nodes[reader], 'Open/partly-unavailable');
-			assert.equal(response.status, 502, JSON.stringify(response));
+			for (let attempt = 0; attempt < 8; attempt++) {
+				await waitForCondition(
+					async (signal) => (await request(nodes[reader], 'Open/partly-empty-probe', { signal })).status === 404,
+					{ timeoutMs: 30_000, description: 'reader receives an empty answer from the surviving holder' }
+				);
+				const response = await request(nodes[reader], 'Open/partly-unavailable');
+				assert.equal(response.status, 502, JSON.stringify(response));
+			}
 			assert.ok((await state(nodes[reader], 'partly-unavailable')).invalidated);
 		});
 		await Promise.all(residentIndexes.map((index) => stopNodeProcess(nodes[index])));

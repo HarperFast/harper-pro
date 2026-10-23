@@ -9,6 +9,7 @@ import {
 	ORIGIN_FLOORS_CAPABILITY,
 	RECORD_LOCKS_CAPABILITY,
 	RESIDENCY_STUB_COPY_CAPABILITY,
+	RESIDENCY_NOT_RESIDENT_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
@@ -244,7 +245,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
-				residencyNotResident: 1,
+				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -287,7 +288,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
-				residencyNotResident: 1,
+				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 			}
 		);
 	});

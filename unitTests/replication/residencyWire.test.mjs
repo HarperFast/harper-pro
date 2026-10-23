@@ -181,14 +181,14 @@ describe('residency stubs on the replication wire', function () {
 	it('receives not-resident without a decoder or relocation and keeps absence distinct', async () => {
 		const relocate = sinon.spy(Records, '_recordRelocate');
 		try {
-			for (const answer of [false, undefined]) {
+			for (const answer of [false, undefined, 0, null]) {
 				const pending = session.getRecord({ table: Records, id: 'stub' });
 				const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
 				socket.emit(
 					'message',
-					encode(answer === false ? [GET_RECORD_RESPONSE, request[1], false] : [GET_RECORD_RESPONSE, request[1]])
+					encode(answer === undefined ? [GET_RECORD_RESPONSE, request[1]] : [GET_RECORD_RESPONSE, request[1], answer])
 				);
-				assert.equal(await pending, answer);
+				assert.strictEqual(await pending, answer === false ? false : undefined);
 			}
 			assert.equal(relocate.callCount, 0);
 		} finally {
@@ -286,7 +286,7 @@ describe('residency stubs on the replication wire', function () {
 				const StructonPackr = createStructon(Packr);
 				const decoder = new StructonPackr({ typedStructs: structure.typedStructs, structures: structure.structures });
 				assert.equal(decoder.decode(response[2].value).body, 'complete');
-			} else assert.equal(response[2], id === 'stub' ? false : undefined);
+			} else assert.strictEqual(response[2], id === 'stub' ? false : undefined);
 		});
 	}
 
