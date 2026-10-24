@@ -1,5 +1,7 @@
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
+import { readdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { decode, encode } from 'msgpackr';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
@@ -7,7 +9,8 @@ import { transaction } from '#src/core/resources/transaction';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { INVALIDATED } from '#src/core/resources/Table';
 import { table } from '#src/core/resources/databases';
-import { createAuditEntry, readAuditEntry, Decoder } from '#src/core/resources/auditStore';
+import { createAuditEntry, readAuditEntry, Decoder, HAS_BLOBS } from '#src/core/resources/auditStore';
+import { createBlob, getFileId, getFilePathForBlob } from '#src/core/resources/blob';
 import { writeLockBarrier } from '#src/core/resources/recordLockCoordinator';
 import {
 	initializeResidencySlots,
@@ -15,7 +18,7 @@ import {
 	requireConnectedResidencyOwner,
 } from '#src/core/resources/residencyMaps';
 import { setReplicator } from '#src/replication/replicator';
-import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
+import { databaseSubscriptions, encodeCopyRecordValue, replicateOverWS } from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
 import { residencyTopologyErrors } from '#src/replication/residencyTopology';
@@ -67,7 +70,7 @@ function entries(socket) {
 	}
 	return records;
 }
-function recordFrame(Table, type, recordId, value, version, residencyId) {
+function recordFrame(Table, type, recordId, value, version, residencyId, overrides = {}) {
 	const frame = new FrameWriter();
 	frame.writeFloat64(version);
 	const entry = Buffer.from(
@@ -81,6 +84,7 @@ function recordFrame(Table, type, recordId, value, version, residencyId) {
 			extendedType: residencyId ? 512 : undefined,
 			nodeId: 0,
 			encodedRecord: type === 'lockBarrier' ? encode(value) : Buffer.from(Table.primaryStore.encoder.encode(value)),
+			...overrides,
 		})
 	);
 	const start = entry[0] === 66 ? 8 : 0;
@@ -179,6 +183,58 @@ describe('Declarative tables keep control and event traffic independent of place
 		await until(() => Records.primaryStore.getEntry('legacy-row')?.value || socket.closes.length);
 		assert.deepEqual(socket.closes, []);
 		assert.equal(Records.primaryStore.getEntry('legacy-row').value.body, 'complete');
+	});
+	it('refuses a policy-less slot reference before creating unreferenced blob files', async () => {
+		const { Records, socket } = await connect(false, 'missing_blob_policy', true);
+		const payload = Buffer.alloc(65_536, 73);
+		await Records.put('blob-donor', { id: 'blob-donor', body: createBlob(payload) });
+		const donor = Records.primaryStore.getEntry('blob-donor');
+		assert.ok(donor.metadataFlags & HAS_BLOBS);
+		const announced = [];
+		const encodedRecord = Buffer.from(
+			encodeCopyRecordValue(Records.primaryStore, donor.value, (blob) => announced.push(blob))
+		);
+		assert.equal(announced.length, 1);
+		const blobRoot = dirname(dirname(dirname(getFilePathForBlob(donor.value.body))));
+		const files = () =>
+			readdirSync(blobRoot, { recursive: true, withFileTypes: true })
+				.filter((entry) => entry.isFile())
+				.map((entry) => `${entry.parentPath}/${entry.name}`)
+				.sort();
+		const before = files();
+		const encoder = Records.primaryStore.encoder;
+		socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+		socket.emit(
+			'message',
+			encode([
+				132,
+				{
+					structures: encoder.structures,
+					typedStructs: encoder.typedStructs,
+					attributes: Records.attributes,
+					schemaDefined: true,
+				},
+				Records.tableId,
+				Records.tableName,
+			])
+		);
+		socket.emit('message', encode([130, { slot: 0, mapVersion: 1, mapDigest: 'untrusted' }, 42]));
+		socket.emit(
+			'message',
+			encode([146, { fileId: getFileId(announced[0]), size: payload.length, finished: true }, payload])
+		);
+		socket.emit(
+			'message',
+			recordFrame(Records, 'put', 'refused-blob', undefined, Date.now(), 42, {
+				encodedRecord,
+				extendedType: HAS_BLOBS | 512,
+			})
+		);
+		await until(() => socket.closes.length);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.equal(Records.primaryStore.getEntry('refused-blob'), undefined);
+		assert.deepEqual(files(), before, 'refusal must not mint a blob with no committed record');
+		assert.deepEqual(Buffer.from(await donor.value.body.arrayBuffer()), payload);
 	});
 	for (const byAttribute of [false, true])
 		for (const stubCapable of [false, true])
