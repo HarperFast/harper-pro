@@ -1,3 +1,5 @@
+import { registerResidencyConversion } from './residencyTopology.ts';
+import { getResidencyMapTable } from '../core/resources/residencyMaps.ts';
 /**
  * This is the entry module is responsible for replicating data between nodes. It is a source for tables that are replicated
  * A typical exchange should look like:
@@ -106,6 +108,7 @@ export function buildReplicationMtlsConfig(replicationOptions: any) {
 }
 
 export async function startOnMainThread(options) {
+	getResidencyMapTable();
 	await migrateSSHConfigOnce();
 	return startSubscriptionsOnMainThread(options);
 }
@@ -115,6 +118,8 @@ export async function startOnMainThread(options) {
  * @param options
  */
 export function start(options) {
+	getResidencyMapTable();
+	registerResidencyConversion();
 	logger.notify('Starting replication server');
 	// Installed here, not at module load: knownNodes → replicator → recordLockTransport is an import
 	// cycle, and assigning recordLockTransport's `downSinceReader` while that module is still evaluating
@@ -481,8 +486,9 @@ export function setReplicator(dbName: string, table: any, options: any) {
 					// await the get(): dbisDB is the raw __dbis__ RocksDB store, so get() returns a Promise on a
 					// block-cache miss. Without awaiting, a miss would make `residency` a Promise (truthy) and the
 					// `for...of` below would throw. We're already async here, so await rather than block with getSync.
-					const residency: string[] =
-						entry.residency || (await table.dbisDB.get([Symbol.for('residency_by_id'), residencyId]));
+					const residency: readonly string[] = table.residency
+						? table.getRecordResidency(entry)
+						: entry.residency || (await table.dbisDB.get([Symbol.for('residency_by_id'), residencyId]));
 					if (residency) {
 						let firstError: Error;
 						let reportedAbsence = false;
