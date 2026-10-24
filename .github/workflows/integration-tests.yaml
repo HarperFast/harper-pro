@@ -48,7 +48,7 @@ jobs:
           if [ "${{ github.event_name }}" == "pull_request" ]; then
             # Keep the full PR suites on one representative runtime, but build every supported
             # runtime for the focused cluster regression job below.
-            echo "node-versions=[24]" >> $GITHUB_OUTPUT
+            echo "node-versions=[26]" >> $GITHUB_OUTPUT
             echo 'build-node-versions=[22, 24, 26]' >> $GITHUB_OUTPUT
             # The full cluster tier with the replication worker pool on runs after merge and nightly;
             # PRs run the focused pool job below instead of doubling the cluster shards.

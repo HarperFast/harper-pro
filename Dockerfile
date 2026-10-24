@@ -4,8 +4,8 @@
 # the image. glibc is forward-compatible, so every other native dep (built
 # against <=2.36) keeps loading on trixie. Build and run stages are kept in lock-
 # step so from-source addons compiled in the build stage match the run glibc.
-ARG NODE_BUILD_VERSION=24-trixie
-ARG NODE_VERSION=24-trixie
+ARG NODE_BUILD_VERSION=26-trixie
+ARG NODE_VERSION=26-trixie
 # Runtime base image. Override with harperfast/node-pointer-compression:<ver>
 # to produce the pointer-compression image variant (harper#919): the standard
 # node image with the node binary rebuilt with V8 pointer compression (plus a

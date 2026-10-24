@@ -24,7 +24,7 @@ on:
       node-version:
         description: 'Node.js version'
         type: string
-        default: '24'
+        default: '26'
 
 permissions:
   contents: read
@@ -65,7 +65,7 @@ jobs:
             dir: template-redirector
 
     env:
-      NODE_VERSION: ${{ github.event.inputs.node-version || '24' }}
+      NODE_VERSION: ${{ github.event.inputs.node-version || '26' }}
       HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-component-stress-logs
 
     steps:

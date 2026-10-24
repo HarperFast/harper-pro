@@ -28,9 +28,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Node majors the pc variant targets — keep in sync with the pc legs in
-        # publish-docker.yaml.
-        node-major: ['24']
+        # Node majors the pc variant targets: the Dockerfile default (publish-docker.yaml's
+        # pc legs build on it) of every release line still shipping — 26 on main, 24 on v5.3.
+        # Drop a major once no supported release branch defaults to it.
+        node-major: ['24', '26']
     env:
       IMAGE: harperfast/node-pointer-compression
       MAJOR: ${{ matrix.node-major }}
@@ -103,14 +104,12 @@ jobs:
         run: |
           set -euo pipefail
           # publish-node-pc-image cancels in-progress runs per node-version, so
-          # dispatching while one runs would kill it. Skip if one is queued/running.
-          # Conservative: gh run list can't filter by the node-version input, so with
-          # multiple majors this may skip a major's rebuild for a day when a different
-          # major is mid-build — it self-heals on the next daily run and never causes
-          # a bad rebuild. (Single major today, so no effect yet.)
+          # dispatching while one runs would kill it. Skip if one for this major is
+          # queued/running; its run-name carries the major.
           active=$(gh run list --workflow=publish-node-pc-image.yaml \
             --repo "${{ github.repository }}" \
-            --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length' || echo 0)
+            --json status,displayTitle \
+            --jq "[.[] | select((.status==\"in_progress\" or .status==\"queued\") and .displayTitle==\"Publish node-pointer-compression:${MAJOR}\")] | length" || echo 0)
           echo "active publish-node-pc-image runs: ${active}"
           if [ "${active}" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"

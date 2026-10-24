@@ -1,4 +1,6 @@
 name: Publish Node Pointer-Compression Base Image
+# check-node-pc-image-drift matches in-flight runs per Node major on this title.
+run-name: Publish node-pointer-compression:${{ inputs.node-version }}
 
 # Builds Node.js from source with V8 pointer compression enabled (plus a
 # uWebSockets.js addon rebuilt against that ABI) and publishes it as
@@ -17,7 +19,7 @@ on:
       node-version:
         description: 'Node major version (tag of docker.io/node to mirror)'
         required: true
-        default: '24'
+        default: '26'
       uws-source-commit:
         description: 'uWebSockets.js source commit (the source_commit file inside the binaries tarball pinned in package.json)'
         required: true
