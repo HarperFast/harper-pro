@@ -124,6 +124,19 @@ describe('Slot reference agreement', function () {
 		assert.notEqual(refs.reference(Table, 2, false, send), id);
 		assert.deepEqual(sent[1].value, [server.hostname]);
 	});
+	it('accepts an older reference only with its advertised compatible snapshot', async () => {
+		const { resolveSlotReference } = await import('#src/replication/residencyWire');
+		const old = Maps.readResidencyMap('slot_wire');
+		await Maps.initializeResidencySlots({
+			database: 'slot_wire',
+			slots: 12,
+			ranges: [{ start: 0, end: 12, shard: 0 }],
+		});
+		const reference = { slot: 2, mapVersion: old.version, mapDigest: old.digest };
+		assert.equal(resolveSlotReference(Table, 'key', reference, old), 2);
+		assert.throws(() => resolveSlotReference(Table, 'key', reference), /map/);
+		assert.throws(() => resolveSlotReference(Table, 'key', { ...reference, mapDigest: 'unadvertised' }, old), /map/);
+	});
 	it('refuses a missing version, wrong digest, out-of-bounds slot, and a key/slot disagreement', async () => {
 		const { resolveSlotReference } = await import('#src/replication/residencyWire');
 		const map = Maps.readResidencyMap('slot_wire');

@@ -13,16 +13,36 @@ import { server } from '../core/server/Server.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import * as logger from '../core/utility/logging/harper_logger.ts';
 import { getHDBNodeTable, getReplicationRecipients, getReplicationSharedStatus } from './knownNodes.ts';
-import { CONNECTION_STATE_POSITION, CONNECTION_STATE_CONNECTED } from './sharedStatusSlots.ts';
+import { deriveConnectionTruth } from './replicationConnection.ts';
 
-function agreement(peer: string, database?: string): Int32Array {
-	return new Int32Array(
-		getHDBNodeTable().auditStore.getUserSharedBuffer(['residency-agreement', database ?? '*', peer], new ArrayBuffer(8))
-	);
+const agreements = new WeakMap<object, Map<string, Map<string, Int32Array>>>();
+
+function agreement(peer: string, database = '*'): Int32Array {
+	const store = getHDBNodeTable().auditStore;
+	let databases = agreements.get(store);
+	if (!databases) agreements.set(store, (databases = new Map()));
+	let peers = databases.get(database);
+	if (!peers) databases.set(database, (peers = new Map()));
+	let status = peers.get(peer);
+	if (!status) {
+		status = new Int32Array(store.getUserSharedBuffer(['residency-agreement', database, peer], new ArrayBuffer(8)));
+		peers.set(peer, status);
+	}
+	return status;
+}
+
+export function residencyConfigurationDigest(): string | null {
+	try {
+		return getResidencyConfiguration().digest;
+	} catch {
+		// Invalid optional topology must not prevent legacy databases from exchanging their setup.
+		// Core still refuses declarative placement, and cluster_status reports the configuration error.
+		return 'invalid';
+	}
 }
 
 export function recordResidencyConfiguration(peer: string, digest: unknown): void {
-	const local = getResidencyConfiguration().digest;
+	const local = residencyConfigurationDigest();
 	const mismatch = digest !== local && !(digest === undefined && local === null);
 	const status = agreement(peer);
 	Atomics.store(status, 0, mismatch ? 1 : 0);
@@ -32,17 +52,29 @@ export function recordResidencyConfiguration(peer: string, digest: unknown): voi
 
 export function recordResidencyMapAgreement(database: string, peer: string, error?: unknown): void {
 	const status = agreement(peer, database);
-	Atomics.store(status, 0, error ? 1 : 0);
-	if (error && Atomics.compareExchange(status, 1, 0, 1) === 0)
+	if (error) Atomics.or(status, 0, 1);
+	else Atomics.and(status, 0, ~1);
+	if (error && !(Atomics.or(status, 1, 1) & 1))
 		logger.warn?.(`Declarative residency blocked for ${database}: map from ${peer} could not be installed`, error);
+}
+
+export function recordResidencyPolicyAgreement(database: string, peer: string, error?: unknown): void {
+	const status = agreement(peer, database);
+	if (error) Atomics.or(status, 0, 2);
+	else Atomics.and(status, 0, ~2);
+	if (error && !(Atomics.or(status, 1, 2) & 2))
+		logger.warn?.(`Declarative residency blocked for ${database}: policy from ${peer} could not be installed`, error);
 }
 
 export function residencyTopologyErrors(database?: string): string[] {
 	const errors = [];
 	for (const node of server.nodes ?? []) {
 		if (Atomics.load(agreement(node.name), 0)) errors.push(`replication.shards differs from peer ${node.name}`);
-		if (database && Atomics.load(agreement(node.name, database), 0))
-			errors.push(`residency map agreement with ${node.name} is blocked`);
+		if (database) {
+			const flags = Atomics.load(agreement(node.name, database), 0);
+			if (flags & 1) errors.push(`residency map agreement with ${node.name} is blocked`);
+			if (flags & 2) errors.push(`residency policy agreement with ${node.name} is blocked`);
+		}
 	}
 	return errors;
 }
@@ -60,9 +92,7 @@ setResidencyPlacementGuard((database, owners, requireConnected) => {
 		if (
 			!auditStore ||
 			!reachable.some(
-				(node) =>
-					getReplicationSharedStatus(auditStore, database, node.name)[CONNECTION_STATE_POSITION] ===
-					CONNECTION_STATE_CONNECTED
+				(node) => deriveConnectionTruth(getReplicationSharedStatus(auditStore, database, node.name)).connected
 			)
 		)
 			throw new ClientError(`No new residency owner is connected for ${database}; attribute-slot change refused`, 503);

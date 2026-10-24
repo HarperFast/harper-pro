@@ -90,7 +90,10 @@ describe('Declarative tables keep control and event traffic independent of place
 		oldShard = env.get('replication_shard');
 		env.setProperty('replication_shards', [0]);
 		env.setProperty('replication_shard', 0);
-		server.shards = new Map([[0, [{ name: server.hostname }]]]);
+		server.shards = new Map([
+			[0, [{ name: server.hostname }]],
+			[1, [{ name: 'slot-control-peer' }]],
+		]);
 	});
 	afterEach(() => {
 		while (sockets.length) sockets.pop().close();
@@ -130,6 +133,45 @@ describe('Declarative tables keep control and event traffic independent of place
 		assert.deepEqual(socket.closes, []);
 		return { Records, socket, database };
 	}
+	it('holds record delivery when the receiver shard is not known', async () => {
+		const { Records, socket } = await connect(false, 'unknown');
+		socket.emit(
+			'message',
+			encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
+		);
+		await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+		const known = server.shards;
+		server.shards = new Map([[0, [{ name: server.hostname }]]]);
+		try {
+			await Records.put('unknown-owner', { id: 'unknown-owner', region: 0, body: 'complete' });
+			await until(() => socket.closes.length || entries(socket).some((entry) => entry.recordId === 'unknown-owner'));
+			assert.ok(socket.closes.length, 'unknown membership must hold the stream');
+			assert.ok(!entries(socket).some((entry) => entry.recordId === 'unknown-owner'));
+		} finally {
+			server.shards = known;
+		}
+	});
+
+	it('sends an extended map before a reference using its new version on an active stream', async () => {
+		const { Records, socket, database } = await connect(false, 'extension');
+		socket.emit(
+			'message',
+			encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
+		);
+		await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+		await Records.put('before', { id: 'before', region: 0, body: 'complete' });
+		await until(() => entries(socket).some((entry) => entry.recordId === 'before'));
+		const from = socket.sent.length;
+		const extended = await initializeResidencySlots({ database, slots: 4, ranges: [{ start: 0, end: 4, shard: 0 }] });
+		await Records.put('after', { id: 'after', region: 0, body: 'complete' });
+		await until(() => entries(socket).some((entry) => entry.recordId === 'after') || socket.closes.length);
+		assert.deepEqual(socket.closes, []);
+		const frames = socket.sent.slice(from);
+		const snapshot = frames.findIndex((frame) => frame[0] === 145 && frame[5]?.snapshot?.digest === extended.digest);
+		const reference = frames.findIndex((frame) => frame[0] === 130 && frame[1]?.mapDigest === extended.digest);
+		assert.ok(snapshot >= 0 && snapshot < reference, 'new snapshot must precede its reference');
+	});
+
 	for (const byAttribute of [false, true]) {
 		it(`sends control and root-topic events without a record slot (byAttribute=${byAttribute})`, async () => {
 			const { Records, socket, database } = await connect(byAttribute, 'send');
