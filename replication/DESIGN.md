@@ -358,7 +358,7 @@ The first network error remains the `ServerError` cause. Blob repair shares a su
 use the peer's table id; a missing usable decoder fails locally. After a reconnect, an idle table may
 have no decoder until its next replicated write, so blob repair can fail for that table in the meantime.
 A subscribed sender refuses mismatched
-table ids before announcing structures; the read is synchronous, so nothing changes between that check and the send. Tests: `residencyWire.test.mjs` and the four-node `residencyReads.test.mjs`.
+table ids before announcing structures; the read is synchronous, so nothing changes between that check and the send. Tests: `residencyWire.test.mjs`, `residencyReplicaWire.test.mjs` and the four-node `residencyReads.test.mjs` and `residencyReplicas.test.mjs`.
 The copy walk encodes a stub as `invalidate` only for a peer advertising `residencyStubCopy`: an older
 receiver lacks core's equal-version resident guard and would demote a full record it holds. Other
 peers retain the pre-gate `put` encoding. Normal residency routing still invalidates or skips excluded
@@ -371,9 +371,7 @@ report absence before receiving the row; an unversioned empty reply supplies no 
 Requiring every listed holder to answer prevents an empty reply from hiding a record on an
 unreachable holder. It cannot prove absence outside the listed holders, or distinguish legacy stubs.
 GET_RECORD has no per-request timer; its wait depends on the socket watchdog.
-These transport guards do not repair relocate-on-read (#436/#980): query materialization uses the
-existing path, whose missing default residency can mark other peers' partial rows complete. The
-RocksDB relocation audit append can also fail after returning a successful read.
+A read never relocates (#436 step 1). The GET_RECORD response resolver hands the fetched record to core's `_storeReplica`, which keeps it as a local `REPLICA` row of the stub on RocksDB; LMDB and tables with `replicaExpiration: 0` remain proxy-only; the resolver's promise is observed only to decide whether the received blobs stay, never awaited by frame dispatch, and a failed store is logged, not surfaced through the socket. The responder answers a `REPLICA` row as not resident using the same capability gate as a stored stub, and the copy walk projects one to the stub core would demote it to: stored index fields, primary key and created time when present, with no record expiry or blob flag. For a resident peer, the capability gate above selects `invalidate` with its residency id or the legacy stub `put` without that id; excluded peers still receive invalidations; the replica's deadline lives in core's per-table `@replicas` store and never crosses the wire. Mixed versions: an older reader still relocates on its own reads and replicates `relocate` entries, which `_writeRelocate` applies as before; the `REPLICA` bit never crosses the wire. A replica is kept current only by the stubs every writer sends to every non-resident (the send rule above); a writer on a build that still skipped peers outside both placements leaves a new reader's replica stale until its lifetime ends, and a hot replica slides. So replicas require every writer to run this send rule: ship the tier no earlier than the release after the one carrying it, or gate it on a peer capability (harper-pro#1097). An older binary reopening a store with replicas treats them as full rows and ignores their deadline store; verify every replica is demoted before downgrading, since lowering `replicaExpiration` does not rewrite existing deadlines (core `resources/DESIGN.md`).
 
 ---
 
