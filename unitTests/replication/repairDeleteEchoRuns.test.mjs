@@ -119,20 +119,25 @@ async function withDatabase(databasePath, callback) {
 	}
 }
 
+// Core now mints a unique key for every local append (harper#3510); the logs this repair targets were
+// written before that, when several transactions could share one key, so the fixture stamps the key itself.
+async function writeAtKey(db, store, key, records) {
+	let handle;
+	try {
+		await db.transaction((transaction) => {
+			handle = transaction;
+			reserveLocalKey(db, transaction);
+			transaction.setTimestamp(key);
+			for (const record of records) store.put(0, { ...record }, { transaction });
+		});
+	} finally {
+		releaseLocalKey(handle);
+	}
+}
+
 function writeTransactions(databasePath, transactions) {
 	return withDatabase(databasePath, async (db, store) => {
-		for (const [timestamp, records] of transactions) {
-			let handle;
-			try {
-				await db.transaction((transaction) => {
-					handle = transaction;
-					reserveLocalKey(db, transaction, timestamp);
-					for (const record of records) store.put(0, { ...record }, { transaction });
-				});
-			} finally {
-				releaseLocalKey(handle);
-			}
-		}
+		for (const [timestamp, records] of transactions) await writeAtKey(db, store, timestamp, records);
 	});
 }
 
@@ -297,16 +302,7 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 				expect(Array.from(log.query({ start: T + 1 }))).to.have.length(0);
 				const { lastCommittedPosition, nextLogPosition } = log.getStats();
 				expect(lastCommittedPosition).to.not.deep.equal(nextLogPosition);
-				let handle;
-				try {
-					await db.transaction((transaction) => {
-						handle = transaction;
-						reserveLocalKey(db, transaction, T + 1);
-						store.put(0, putOf('next', T + 1), { transaction });
-					});
-				} finally {
-					releaseLocalKey(handle);
-				}
+				await writeAtKey(db, store, T + 1, [putOf('next', T + 1)]);
 				expect(log.getStats().lastCommittedPosition.sequence).to.equal(2);
 			});
 			expect((await readBack(databasePath)).map(({ id }) => id)).to.deep.equal(['p', 'z', 'next']);
