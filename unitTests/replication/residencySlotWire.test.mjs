@@ -111,6 +111,22 @@ describe('Slot reference agreement', function () {
 		config.setProperty('replication_shards', oldList);
 		config.setProperty('replication_shard', oldShard);
 	});
+	it('refuses invalid attribute slots even when their map identity matches', async () => {
+		const { resolveSlotReference } = await import('#src/replication/residencyWire');
+		const snapshot = Maps.readResidencyMap('slot_wire');
+		const attributeTable = { ...Table, residency: { slots: 10, byAttribute: true } };
+		for (const slot of [-1, 10, 0.5, undefined])
+			assert.throws(
+				() =>
+					resolveSlotReference(attributeTable, 'row', {
+						slot,
+						mapVersion: snapshot.version,
+						mapDigest: snapshot.digest,
+					}),
+				/invalid record residency slot/
+			);
+	});
+
 	it('uses descriptors only for capable peers and resolved names for legacy peers', async () => {
 		const { ResidencyWireReferences } = await import('#src/replication/residencyWire');
 		const refs = new ResidencyWireReferences();

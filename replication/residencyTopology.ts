@@ -39,7 +39,9 @@ export function registerResidencySender(store: any, database: string, peer: stri
 	Atomics.store(status, 1, generation);
 	const sender = {
 		touch() {
-			if (!closed && Atomics.load(status, 1) === generation) Atomics.store(status, 2, Math.floor(Date.now() / 1000));
+			if (closed) return;
+			const active = Atomics.compareExchange(status, 1, 0, generation);
+			if (!active || active === generation) Atomics.store(status, 2, Math.floor(Date.now() / 1000));
 		},
 		close() {
 			closed = true;

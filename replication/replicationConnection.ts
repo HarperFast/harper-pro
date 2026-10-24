@@ -4714,7 +4714,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// pauseStallWatchdog} armed while paused" invariant. While paused the pause-stall watchdog is the
 	// liveness guard; removePauseReason re-arms the byte watchdog on resume. (harper-pro#466 review)
 	const resetPingTimer = () => {
-		residencySender?.touch();
+		if (residencySender && !connectionSuperseded()) residencySender.touch();
 		if (pauseReasons === 0) receiveWatchdog?.reset();
 	};
 	resetPingTimer();
@@ -4911,6 +4911,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const sentResidencyMaps = new Map<string, string>();
 	let receiverMembership: typeof server.shards;
 	let receiverShardKnown = false;
+	let peerExplicitlyUnsharded = false;
+	let peerShardAnnounced = false;
 	const sendResidencyReference = (value, id) => ws.send(encode([RESIDENCY_LIST, value, id]));
 	const slotWireReferences = new ResidencyWireReferences();
 	const MAX_OUTSTANDING_COMMITS = env.get(CONFIG_PARAMS.REPLICATION_RECORDCONCURRENCY) ?? 150; // maximum before requesting that other nodes pause
@@ -5404,8 +5406,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 							}
 							if (options.connection) options.connection.nodeName = remoteNodeName;
-							if (hasResidencySchemaAuthority(databaseName ?? message[2]))
+							if (hasResidencySchemaAuthority(databaseName ?? message[2])) {
 								recordResidencyConfiguration(remoteNodeName, message[5]?.shardsDigest);
+								peerExplicitlyUnsharded = message[5]?.shard === null;
+								peerShardAnnounced = message[5]?.shard !== undefined;
+								receiverMembership = undefined;
+							}
 							// After the peer is identified, so the post carries the same node name every other
 							// connected-to-node message does.
 							postConnectionMetadata();
@@ -6607,9 +6613,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									receiverShardKnown = Array.from(server.shards?.values() ?? []).some((members) =>
 										members.some((node: any) => (typeof node === 'string' ? node : node.name) === remoteNodeName)
 									);
-									if (!receiverShardKnown) {
-										const peer = getHDBNodeTable().primaryStore.getSync(remoteNodeName);
-										receiverShardKnown = Boolean(peer?.url && peer.shard === undefined);
+									receiverShardKnown ||= peerExplicitlyUnsharded;
+									if (!receiverShardKnown && !peerShardAnnounced) {
+										const Nodes = getHDBNodeTable();
+										const peer = Nodes.primaryStore.getEntry(remoteNodeName);
+										receiverShardKnown = Boolean(
+											peer?.value?.url &&
+											peer.value.shard === undefined &&
+											peer.nodeId &&
+											getNodeNameForId(Nodes.auditStore, peer.nodeId, true) === remoteNodeName
+										);
 									}
 								}
 								if (!receiverShardKnown)
@@ -6910,7 +6923,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								);
 								if (!resolvedDatabaseSubscription) return;
 								tableSubscriptionToReplicator = resolvedDatabaseSubscription;
-								if (closed || wsClosed) return;
+								if (closed || connectionSuperseded()) return;
 								auditStore = tableSubscriptionToReplicator.auditStore;
 								residencySender = subscriptionResidencySender = registerResidencySender(
 									auditStore,
@@ -8049,6 +8062,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						throw error;
 					}
 				} else if (residencyList && !Array.isArray(residencyList)) {
+					if (connectionSuperseded()) return;
 					const error = new Error('Received a slot reference without its table policy');
 					recordResidencyPolicyAgreement(databaseName, remoteNodeName, error);
 					throw error;
@@ -9848,7 +9862,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					databaseName,
 					tableDefinitions,
 					{ ...LOCAL_CAPABILITIES, acceptBlobCodecs: acceptedBlobCodecs() },
-					{ shardsDigest: residencyConfigurationDigest() },
+					{ shardsDigest: residencyConfigurationDigest(), shard: env.get('replication_shard') ?? null },
 				])
 			);
 		if (TEST_UNKNOWN_COMMAND_VALID) ws.send(encode([TEST_UNKNOWN_COMMAND_CODE]));
@@ -10155,10 +10169,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	// Check the attributes in the msg vs the table and if they dont match call ensureTable to create them
 	function ensureTableIfChanged(tableDefinition: any, existingTable: any) {
+		if (tableDefinition.residency || existingTable?.residency) authorizeResidencySchema(tableDefinition.database);
 		try {
 			return updateTableDefinition(tableDefinition, existingTable);
 		} catch (error) {
-			if (!(error instanceof TableGenerationDroppedError) && (tableDefinition.residency || existingTable?.residency))
+			if (
+				!connectionSuperseded() &&
+				!(error instanceof TableGenerationDroppedError) &&
+				(tableDefinition.residency || existingTable?.residency)
+			)
 				recordResidencyPolicyAgreement(tableDefinition.database, remoteNodeName, error);
 			throw error;
 		}
