@@ -122,7 +122,7 @@ export function residencyTopologyErrors(database?: string): string[] {
 setResidencyPlacementGuard((database, owners, requireConnected) => {
 	const errors = residencyTopologyErrors(database);
 	if (errors.length) throw new ClientError(`Declarative residency blocked for ${database}: ${errors.join('; ')}`, 503);
-	if (!owners || owners.includes(server.hostname)) return;
+	if (requireConnected === undefined || !owners || owners.includes(server.hostname)) return;
 	const recipients = getReplicationRecipients(database);
 	const reachable = recipients.filter((node) => owners.includes(node.name));
 	if (!reachable.length)

@@ -161,6 +161,7 @@ import {
 	getReplicationSharedStatus,
 	getExcludedTablesForRouteEntries,
 	getConfigRouteReplicates,
+	iterateRoutes,
 	routeEntriesIncludePeer,
 	resolveNodeForSendAuth,
 	isGenuineNodeDeletion,
@@ -194,7 +195,7 @@ import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
 import { createInflate } from 'node:zlib';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
-import { tableReplicates } from './replicatedDatabases.ts';
+import { isExplicitDatabaseSubscription, tableReplicates } from './replicatedDatabases.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
 import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 
@@ -5451,10 +5452,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							data.map((t) => t.table)
 						);
 						const schemaDatabaseName = message[2];
-						if (data.some((definition) => definition.residency !== undefined))
-							authorizeResidencySchema(schemaDatabaseName);
+						if (
+							(message[5] || data.some((definition) => definition.residency !== undefined)) &&
+							!authorizeResidencySchema(schemaDatabaseName, databaseName === 'system')
+						)
+							break;
 						if (message[5]) {
-							authorizeResidencySchema(schemaDatabaseName);
 							recordResidencyConfiguration(remoteNodeName, message[5].shardsDigest);
 							try {
 								const snapshot = validateResidencyMap(message[5].snapshot, schemaDatabaseName);
@@ -7924,40 +7927,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				const id = auditRecord.recordId;
 				let residencySlot: number | undefined;
-				if (tableDecoder.table?.residency && isResidencyRecord(auditRecord.type)) {
-					const Table = tableDecoder.table;
-					try {
-						if (residencyList && !Array.isArray(residencyList)) {
-							const slot = resolveSlotReference(Table, id, residencyList, referenceSnapshots.get(residencyList));
-							if (Table.residency.byAttribute) residencySlot = slot;
-						} else if (Table.residency.byAttribute) {
-							if (auditRecord.type !== 'put')
-								throw new Error('An attribute residency update requires a slot-capable sender or a complete record');
-							residencySlot = Table.getResidencySlot(id, auditRecord.getValue(tableDecoder));
-						}
-						if (
-							Table.residency.byAttribute &&
-							residencyList &&
-							!Array.isArray(residencyList) &&
-							auditRecord.type === 'put' &&
-							Table.getResidencySlot(id, auditRecord.getValue(tableDecoder)) !== residencySlot
-						)
-							throw new Error(`Peer sent an incorrect attribute-derived slot for ${databaseName}.${Table.tableName}`);
-						Table.getRecordResidency({ key: id, residencySlot });
-						residencyList = undefined;
-					} catch (error) {
-						if (connectionSuperseded()) return;
-						recordResidencyMapAgreement(databaseName, remoteNodeName, error);
-						wsClosed = true;
-						close(1011, 'residency agreement failed');
-						throw error;
-					}
-				} else if (residencyList && !Array.isArray(residencyList)) {
-					if (connectionSuperseded()) return;
-					const error = new Error('Received a slot reference without its table policy');
-					recordResidencyPolicyAgreement(databaseName, remoteNodeName, error);
-					throw error;
-				}
+
 				// A copy frame is applied as a snapshot with no duplicate detection, so it re-mints the
 				// record's blobs as fresh local files and dereferences the durable ones we already hold —
 				// and if the copy is interrupted mid-blob the record is left on a PENDING stub the source
@@ -8131,6 +8101,42 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							error
 						);
 					}
+				}
+				if (event && tableDecoder.table?.residency && isResidencyRecord(auditRecord.type)) {
+					const Table = tableDecoder.table;
+					try {
+						if (residencyList && !Array.isArray(residencyList)) {
+							const slot = resolveSlotReference(Table, id, residencyList, referenceSnapshots.get(residencyList));
+							if (Table.residency.byAttribute) residencySlot = slot;
+						} else if (Table.residency.byAttribute) {
+							if (auditRecord.type !== 'put')
+								throw new Error('An attribute residency update requires a slot-capable sender or a complete record');
+							residencySlot = Table.getResidencySlot(id, event.value);
+						}
+						if (
+							Table.residency.byAttribute &&
+							residencyList &&
+							!Array.isArray(residencyList) &&
+							auditRecord.type === 'put' &&
+							Table.getResidencySlot(id, event.value) !== residencySlot
+						)
+							throw new Error(`Peer sent an incorrect attribute-derived slot for ${databaseName}.${Table.tableName}`);
+						Table.getRecordResidency({ key: id, residencySlot });
+						event.residencyList = undefined;
+						event.residencySlot = residencySlot;
+					} catch (error) {
+						if (connectionSuperseded()) return;
+						if (receivedBlobs) setTimeout(() => receivedBlobs.forEach(deleteBlob), 60000).unref();
+						if (error.statusCode !== 503) recordResidencyMapAgreement(databaseName, remoteNodeName, error);
+						wsClosed = true;
+						close(1011, 'residency agreement failed');
+						throw error;
+					}
+				} else if (event && residencyList && !Array.isArray(residencyList)) {
+					if (connectionSuperseded()) return;
+					const error = new Error('Received a slot reference without its table policy');
+					recordResidencyPolicyAgreement(databaseName, remoteNodeName, error);
+					throw error;
 				}
 				if (!event && !(await recordReplicationHole(localSourceNodeId, tableDecoder.name, 'undecodable record')))
 					return;
@@ -9646,38 +9652,35 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return false;
 		}
 	}
-	function authorizeResidencySchema(targetDatabase: string) {
-		if (
-			!checkDatabaseAccess(targetDatabase) ||
-			(databaseName && databaseName !== 'system' && databaseName !== targetDatabase)
-		)
+	function authorizeResidencySchema(targetDatabase: string, skipUnsubscribed = false): boolean {
+		if (databaseName && databaseName !== 'system' && databaseName !== targetDatabase)
 			throw new Error('Residency metadata does not belong to an authorized database frame');
 		const superUser = authorization?.role?.permission?.super_user;
 		if (!superUser && !(authorization?.name || authorization?.replicates))
 			throw new Error('Only an authorized replication peer may declare residency policies');
-		const route =
-			options.connection?.nodeSubscriptions?.[0]?.configRouteReplicates ??
-			getConfigRouteReplicates(options, remoteNodeName);
-		if (route === false) throw new Error('The receive route does not authorize this residency database');
-		if (
-			route &&
-			typeof route === 'object' &&
-			!route.receives &&
-			!routeEntriesIncludePeer(route.receivesFrom, remoteNodeName, targetDatabase)
-		)
-			throw new Error('The receive route does not authorize this residency database');
+		const subscription = options.connection?.nodeSubscriptions?.[0];
+		const configuredRoute = Array.from(iterateRoutes(options)).find((route) => route.name === remoteNodeName);
+		const route = subscription?.configRouteReplicates ?? configuredRoute?.replicates;
+		const selective = isExplicitDatabaseSubscription(
+			subscription?.subscriptions ?? configuredRoute?.subscription,
+			targetDatabase
+		);
 		const grant = authorization?.replicates;
-		if (!superUser && route === undefined && !grant)
-			throw new Error('The peer is not authorized to send this residency database');
-		if (
-			!superUser &&
-			route === undefined &&
-			grant &&
-			typeof grant === 'object' &&
-			!grant.sends &&
-			!routeEntriesIncludePeer(grant.sendsTo, getThisNodeName(), targetDatabase)
-		)
-			throw new Error('The peer is not authorized to send this residency database');
+		const receives =
+			route === undefined
+				? superUser ||
+					(typeof grant === 'object'
+						? grant?.sends || routeEntriesIncludePeer(grant.sendsTo, getThisNodeName(), targetDatabase)
+						: !!grant)
+				: selective ||
+					(typeof route === 'object'
+						? route.receives || routeEntriesIncludePeer(route.receivesFrom, remoteNodeName, targetDatabase)
+						: route);
+		if (!checkDatabaseAccess(targetDatabase) || !receives) {
+			if (skipUnsubscribed && targetDatabase !== databaseName) return false;
+			throw new Error('The receive route does not authorize this residency database');
+		}
+		return true;
 	}
 
 	function checkDatabaseAccess(databaseName: string) {

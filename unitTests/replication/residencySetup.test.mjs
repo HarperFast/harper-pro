@@ -11,8 +11,9 @@ import {
 } from '#src/core/resources/residencyMaps';
 import { replicateOverWS } from '#src/replication/replicationConnection';
 import { server } from '#src/core/server/Server';
-import { getReplicationSharedStatus } from '#src/replication/knownNodes';
+import { getReplicationSharedStatus, getHDBNodeTable } from '#src/replication/knownNodes';
 import { table } from '#src/core/resources/databases';
+import { transaction } from '#src/core/resources/transaction';
 import {
 	CONNECTION_STATE_POSITION,
 	CONNECTION_STATE_CONNECTED,
@@ -361,6 +362,80 @@ describe('residency setup authority', function () {
 		await sendMap(socket, database, expected);
 		assert.deepEqual(socket.closes, []);
 		assert.deepEqual({ ...readResidencyMap(database) }, expected);
+	});
+	it('accepts residency metadata for an explicit selective subscription', async () => {
+		const database = 'slot_setup_selective';
+		const socket = await connect(
+			database,
+			{ name: 'slot-setup-peer', replicates: true },
+			{
+				routes: [{ hostname: 'slot-setup-peer', subscriptions: [{ database, table: 'Rows', subscribe: true }] }],
+			}
+		);
+		await sendMap(socket, database, snapshot(database));
+		assert.deepEqual(socket.closes, []);
+		assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
+	});
+	it('ignores out-of-scope residency metadata on an authorized system stream', async () => {
+		const database = 'slot_setup_unsubscribed';
+		const socket = await connect(
+			'system',
+			{ name: 'slot-setup-peer', replicates: true },
+			{
+				routes: [
+					{
+						hostname: 'slot-setup-peer',
+						replicates: { receivesFrom: [{ target: 'slot-setup-peer', database: 'system' }] },
+					},
+				],
+			}
+		);
+		socket.emit(
+			'message',
+			encode([145, [], database, undefined, [], { snapshot: snapshot(database), shardsDigest: null }])
+		);
+		await turns();
+		assert.deepEqual(socket.closes, []);
+		assert.equal(readResidencyMap(database), undefined);
+	});
+	it('resolves and receives owner projections without an outbound write route', async () => {
+		const database = 'slot_setup_receive_only';
+		const peer = 'slot-receive-owner';
+		const priorNodes = server.nodes,
+			priorShards = server.shards;
+		const Nodes = getHDBNodeTable();
+		const self = Nodes.primaryStore.getSync(server.hostname);
+		await installResidencyMap(createResidencyMap(database, 2, [{ start: 0, end: 2, shard: 1 }], 1));
+		const Records = table({
+			database,
+			table: 'Rows',
+			audit: true,
+			residency: { slots: 2 },
+			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'tag', indexed: true }, { name: 'body' }],
+		});
+		try {
+			await Nodes.put(server.hostname, { ...self, name: server.hostname, replicates: { receives: true } });
+			server.nodes = [{ name: peer }];
+			server.shards = new Map([[1, [{ name: peer }]]]);
+			assert.deepEqual(Records.getRecordResidency({ key: 'remote' }), [peer]);
+			const context = {};
+			await transaction(context, async () => {
+				const row = await Records.getResource('remote', context, { ensureLoaded: false });
+				row._writeUpdate('remote', { id: 'remote', tag: 'indexed', body: 'canonical' }, true, {
+					isNotification: true,
+					version: Date.now(),
+					nodeId: 0,
+				});
+			});
+			assert.equal(Records.primaryStore.getEntry('remote')?.value?.tag, 'indexed');
+			assert.equal(Records.primaryStore.getEntry('remote')?.value?.body, undefined);
+			await assert.rejects(async () => Records.put('local', { id: 'local', tag: 'denied' }), /No replication route/);
+		} finally {
+			if (self) await Nodes.put(server.hostname, self);
+			else await Nodes.delete(server.hostname);
+			server.nodes = priorNodes;
+			server.shards = priorShards;
+		}
 	});
 	it('does not adopt a peer policy over a local schema that declares none', async () => {
 		const database = 'slot_setup_local_schema';
