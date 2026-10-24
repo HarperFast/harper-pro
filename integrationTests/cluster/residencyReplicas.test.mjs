@@ -7,7 +7,9 @@ import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@h
 import { restartNode, sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
-const ALL_REPLICAS = process.env.HARPER_STORAGE_ENGINE === 'lmdb' ? '*' : '*;confirm=3';
+const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
+const ALL_REPLICAS = isLMDB ? '*' : '*;confirm=3';
+const replicaTest = isLMDB ? test.skip : test;
 const FIXTURE = join(import.meta.dirname, 'fixture-residency-replicas');
 const OPEN_REPLICA_EXPIRATION_MS = 4_000;
 
@@ -166,7 +168,37 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 		return { states, full, reader: stubs[0], other: stubs[1] };
 	}
 
-	test('a non-resident read keeps a replica and changes no placement, then serves from it alone', async () => {
+	for (const tableName of ['Proxy', ...(isLMDB ? ['Open'] : [])]) {
+		test(`a ${tableName} non-resident read stays a proxy without changing placement`, async () => {
+			const id = `proxy-${tableName}`;
+			const { states: before, full, reader } = await placedRecord(id, 'proxy body', tableName);
+			const response = await request(nodes[reader], `${tableName}/${id}`);
+			assert.equal(response.status, 200, JSON.stringify(response));
+			assert.equal(response.body.body, 'proxy body');
+			await waitForCondition(
+				async (signal) =>
+					(await state(nodes[reader], id, signal, tableName)).storeAttempts > before[reader].storeAttempts,
+				{
+					timeoutMs: 30_000,
+					description: 'the declined replica store to settle',
+				}
+			);
+			const after = await Promise.all(nodes.map((node) => state(node, id, undefined, tableName)));
+			for (const [index, entry] of after.entries()) {
+				assert.deepEqual(entry.residency, before[index].residency);
+				assert.deepEqual(entry.history, before[index].history);
+				assert.equal(entry.version, before[index].version);
+				assert.equal(entry.invalidated, before[index].invalidated);
+				assert.equal(entry.replica, false);
+			}
+			assert.equal(after[reader].value.body, undefined);
+			for (const index of full) await control(nodes[index], { table: tableName, removeLocal: id });
+			const missing = await request(nodes[reader], `${tableName}/${id}`);
+			assert.equal(missing.status, 404, JSON.stringify(missing));
+		});
+	}
+
+	replicaTest('a non-resident read keeps a replica and changes no placement, then serves from it alone', async () => {
 		const { states: before, full, reader, other } = await placedRecord('kept', 'complete');
 		const response = await request(nodes[reader], 'Open/kept');
 		assert.equal(response.status, 200, JSON.stringify(response));
@@ -197,7 +229,7 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 		assert.equal(absent.status, 404, JSON.stringify(absent));
 	});
 
-	test('a non-resident query materializes rows as replicas', async () => {
+	replicaTest('a non-resident query materializes rows as replicas', async () => {
 		const { reader } = await placedRecord('queried', 'complete query');
 		const result = await request(nodes[reader], 'Open/?name==queried&select(id,body)');
 		assert.equal(result.status, 200, JSON.stringify(result));
@@ -205,22 +237,25 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 		await replicaOn(reader, 'queried');
 	});
 
-	test('an owner update turns the replica back into a stub and the next read fetches the new version', async () => {
-		const { full, reader } = await placedRecord('updated', 'first');
-		await request(nodes[reader], 'Open/updated');
-		await replicaOn(reader, 'updated');
-		await put(nodes[full[0]], 'updated', { name: 'updated-2', body: 'second' });
-		await put(nodes[full[0]], 'updated-barrier', { body: 'barrier' }, ALL_REPLICAS);
-		const stub = await stubOn(reader, 'updated');
-		assert.equal(stub.value.name, 'updated-2', 'the stub carries the new indexed value');
-		assert.equal(stub.value.body, undefined);
-		const response = await request(nodes[reader], 'Open/updated');
-		assert.equal(response.status, 200, JSON.stringify(response));
-		assert.equal(response.body.body, 'second');
-		assert.equal((await replicaOn(reader, 'updated')).value.body, 'second');
-	});
+	replicaTest(
+		'an owner update turns the replica back into a stub and the next read fetches the new version',
+		async () => {
+			const { full, reader } = await placedRecord('updated', 'first');
+			await request(nodes[reader], 'Open/updated');
+			await replicaOn(reader, 'updated');
+			await put(nodes[full[0]], 'updated', { name: 'updated-2', body: 'second' });
+			await put(nodes[full[0]], 'updated-barrier', { body: 'barrier' }, ALL_REPLICAS);
+			const stub = await stubOn(reader, 'updated');
+			assert.equal(stub.value.name, 'updated-2', 'the stub carries the new indexed value');
+			assert.equal(stub.value.body, undefined);
+			const response = await request(nodes[reader], 'Open/updated');
+			assert.equal(response.status, 200, JSON.stringify(response));
+			assert.equal(response.body.body, 'second');
+			assert.equal((await replicaOn(reader, 'updated')).value.body, 'second');
+		}
+	);
 
-	test('a fetched record older than a stub that landed meanwhile is served but not kept', async () => {
+	replicaTest('a fetched record older than a stub that landed meanwhile is served but not kept', async () => {
 		const { full, reader } = await placedRecord('raced', 'first');
 		const attemptsBefore = (await state(nodes[reader], 'raced')).storeAttempts;
 		await control(nodes[reader], { holdReplicas: true });
@@ -254,7 +289,7 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 		assert.equal((await replicaOn(reader, 'raced')).value.body, 'second');
 	});
 
-	test('a replica expires back to a stub with no replicated write', async () => {
+	replicaTest('a replica expires back to a stub with no replicated write', async () => {
 		const { states: before, reader } = await placedRecord('expiring', 'complete');
 		await request(nodes[reader], 'Open/expiring');
 		await replicaOn(reader, 'expiring');
@@ -271,24 +306,20 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 	});
 
 	// LMDB has no replicatedConfirmation feasibility refusal (see residencyConfirmation.test.mjs)
-	test(
-		'replicatedConfirmation never counts a replica holder',
-		{ skip: process.env.HARPER_STORAGE_ENGINE === 'lmdb' },
-		async () => {
-			const { full, reader } = await placedRecord('confirmed', 'complete');
-			await request(nodes[reader], 'Open/confirmed');
-			await replicaOn(reader, 'confirmed');
-			const refused = await request(nodes[full[0]], 'Open/confirmed', {
-				method: 'PUT',
-				headers: { 'X-Replicate-To': '1;confirm=2' },
-				body: JSON.stringify({ id: 'confirmed', name: 'confirmed', body: 'refused' }),
-			});
-			assert.equal(refused.status, 400, JSON.stringify(refused));
-			await put(nodes[full[0]], 'confirmed', { name: 'confirmed', body: 'confirmed once' }, '1;confirm=1');
-		}
-	);
+	replicaTest('replicatedConfirmation never counts a replica holder', { skip: isLMDB }, async () => {
+		const { full, reader } = await placedRecord('confirmed', 'complete');
+		await request(nodes[reader], 'Open/confirmed');
+		await replicaOn(reader, 'confirmed');
+		const refused = await request(nodes[full[0]], 'Open/confirmed', {
+			method: 'PUT',
+			headers: { 'X-Replicate-To': '1;confirm=2' },
+			body: JSON.stringify({ id: 'confirmed', name: 'confirmed', body: 'refused' }),
+		});
+		assert.equal(refused.status, 400, JSON.stringify(refused));
+		await put(nodes[full[0]], 'confirmed', { name: 'confirmed', body: 'confirmed once' }, '1;confirm=1');
+	});
 
-	test('a replica survives a restart and stays subject to its lifetime', async () => {
+	replicaTest('a replica survives a restart and stays subject to its lifetime', async () => {
 		const kept = await placedRecord('restarted-kept', 'kept body', 'Kept');
 		const reader = kept.reader;
 		// an Open record the restarted node reads as a stub, whatever the placement function picks
