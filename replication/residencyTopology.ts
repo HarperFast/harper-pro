@@ -13,9 +13,47 @@ import { server } from '../core/server/Server.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import * as logger from '../core/utility/logging/harper_logger.ts';
 import { getHDBNodeTable, getReplicationRecipients, getReplicationSharedStatus } from './knownNodes.ts';
-import { deriveConnectionTruth } from './replicationConnection.ts';
+import { deriveConnectionTruth, LIVENESS_STALE_MS } from './replicationConnection.ts';
 
 const agreements = new WeakMap<object, Map<string, Map<string, Int32Array>>>();
+const senders = new WeakMap<object, Map<string, Map<string, Uint32Array>>>();
+
+function senderStatus(store: any, database: string, peer: string): Uint32Array {
+	let databases = senders.get(store);
+	if (!databases) senders.set(store, (databases = new Map()));
+	let peers = databases.get(database);
+	if (!peers) databases.set(database, (peers = new Map()));
+	let status = peers.get(peer);
+	if (!status) {
+		status = new Uint32Array(store.getUserSharedBuffer(['residency-sending', database, peer], new ArrayBuffer(12)));
+		peers.set(peer, status);
+	}
+	return status;
+}
+
+export function registerResidencySender(store: any, database: string, peer: string) {
+	const status = senderStatus(store, database, peer);
+	let generation = (Atomics.add(status, 0, 1) + 1) >>> 0;
+	if (!generation) generation = (Atomics.add(status, 0, 1) + 1) >>> 0;
+	let closed = false;
+	Atomics.store(status, 1, generation);
+	const sender = {
+		touch() {
+			if (!closed && Atomics.load(status, 1) === generation) Atomics.store(status, 2, Math.floor(Date.now() / 1000));
+		},
+		close() {
+			closed = true;
+			Atomics.compareExchange(status, 1, generation, 0);
+		},
+	};
+	sender.touch();
+	return sender;
+}
+
+function residencySenderConnected(store: any, database: string, peer: string): boolean {
+	const status = senderStatus(store, database, peer);
+	return Atomics.load(status, 1) !== 0 && Date.now() - Atomics.load(status, 2) * 1000 < LIVENESS_STALE_MS;
+}
 
 function agreement(peer: string, database = '*'): Int32Array {
 	const store = getHDBNodeTable().auditStore;
@@ -92,7 +130,9 @@ setResidencyPlacementGuard((database, owners, requireConnected) => {
 		if (
 			!auditStore ||
 			!reachable.some(
-				(node) => deriveConnectionTruth(getReplicationSharedStatus(auditStore, database, node.name)).connected
+				(node) =>
+					residencySenderConnected(auditStore, database, node.name) ||
+					deriveConnectionTruth(getReplicationSharedStatus(auditStore, database, node.name)).connected
 			)
 		)
 			throw new ClientError(`No new residency owner is connected for ${database}; attribute-slot change refused`, 503);

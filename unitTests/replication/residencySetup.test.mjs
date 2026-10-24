@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict';
+import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
 import { encode } from 'msgpackr';
 import { setHdbBasePath, get, setProperty } from '#src/core/utility/environment/environmentManager';
@@ -148,6 +148,97 @@ describe('residency setup authority', function () {
 			server.nodes = priorNodes;
 		}
 	});
+	for (const [name, authorization, options] of [
+		['false_grant', { name: 'slot-setup-peer', replicates: false }, {}],
+		[
+			'false_route',
+			{ name: 'slot-setup-peer', replicates: true },
+			{ routes: [{ hostname: 'slot-setup-peer', replicates: false }] },
+		],
+	])
+		it(`ignores shard claims without receive authority (${name})`, async () => {
+			const database = `slot_setup_digest_${name}`;
+			const priorNodes = server.nodes;
+			server.nodes = [{ name: 'slot-setup-peer' }];
+			try {
+				await connect(database, { name: 'slot-setup-peer', replicates: true });
+				const socket = await connect(database, authorization, options);
+				socket.emit(
+					'message',
+					encode([
+						140,
+						'slot-setup-peer',
+						database,
+						[],
+						buildLocalCapabilities(90_000, false, true),
+						{ shardsDigest: 'forged' },
+					])
+				);
+				await turns();
+				assert.deepEqual(residencyTopologyErrors(database), []);
+			} finally {
+				server.nodes = priorNodes;
+			}
+		});
+
+	it('binds a promised authenticated identity before accepting the node name', async () => {
+		const database = 'slot_setup_promised_identity';
+		const socket = new Socket();
+		sockets.push(socket);
+		replicateOverWS(socket, {}, Promise.resolve({ name: 'authenticated-peer', replicates: true }));
+		socket.emit(
+			'message',
+			encode([
+				140,
+				'forged-peer',
+				database,
+				[],
+				buildLocalCapabilities(90_000, false, true),
+				{ shardsDigest: 'forged' },
+			])
+		);
+		await turns();
+		assert.ok(
+			socket.closes.some(({ code }) => code === 1008),
+			'a promised identity must reject another claimed name'
+		);
+	});
+
+	it('ignores a delayed authorization result after its socket closes', async () => {
+		const database = 'slot_setup_closed_authorization';
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-setup-peer' }];
+		let resolve;
+		const authorization = new Promise((done) => {
+			resolve = done;
+		});
+		try {
+			await connect(database, { name: 'slot-setup-peer', replicates: true });
+			const socket = new Socket();
+			sockets.push(socket);
+			replicateOverWS(socket, {}, authorization);
+			socket.emit(
+				'message',
+				encode([
+					140,
+					'slot-setup-peer',
+					database,
+					[],
+					buildLocalCapabilities(90_000, false, true),
+					{ shardsDigest: 'forged' },
+				])
+			);
+			await turns();
+			socket.close(1000);
+			resolve({ name: 'slot-setup-peer', replicates: true });
+			await turns();
+			assert.deepEqual(residencyTopologyErrors(database), []);
+		} finally {
+			resolve(undefined);
+			server.nodes = priorNodes;
+		}
+	});
+
 	it('does not clear a replacement connection failure after an installation await', async () => {
 		const database = 'slot_setup_closed_install';
 		const Maps = getResidencyMapTable();
@@ -228,16 +319,15 @@ describe('residency setup authority', function () {
 		assert.deepEqual(socket.closes, []);
 		assert.deepEqual({ ...readResidencyMap(database) }, expected);
 	});
-	it('reports a table-policy conflict after a valid map and clears it only with matching policy setup', async () => {
-		const database = 'slot_setup_policy_conflict';
+	it('does not adopt a peer policy over a local schema that declares none', async () => {
+		const database = 'slot_setup_local_schema';
 		const map = snapshot(database);
 		await installResidencyMap(map);
-		const policy = { slots: 2, slotFrom: '0', byAttribute: false };
 		const Records = table({
 			database,
 			table: 'Rows',
+			schemaDefined: true,
 			audit: true,
-			residency: policy,
 			attributes: [
 				{ name: 'id', isPrimaryKey: true },
 				{ name: 'tag', indexed: true },
@@ -245,29 +335,121 @@ describe('residency setup authority', function () {
 		});
 		const priorNodes = server.nodes;
 		server.nodes = [{ name: 'slot-setup-peer' }];
-		const frame = (residency) => [
-			145,
-			[{ table: 'Rows', residency, attributes: Records.attributes }],
-			database,
-			undefined,
-			[],
-			{ snapshot: map, shardsDigest: null },
-		];
 		try {
 			const socket = await connect(database, { name: 'slot-setup-peer', replicates: true });
-			socket.emit('message', encode(frame({ ...policy, slotFrom: '1' })));
+			socket.emit(
+				'message',
+				encode([
+					145,
+					[
+						{
+							table: 'Rows',
+							attributes: Records.attributes,
+							residency: { slots: 2, slotFrom: '0', byAttribute: false },
+							schemaDefined: true,
+						},
+					],
+					database,
+					undefined,
+					[],
+					{ snapshot: map, shardsDigest: null },
+				])
+			);
 			await turns();
-			assert.ok(socket.closes.length, 'conflicting policy closes the stream');
-			assert.ok(residencyTopologyErrors(database).length, 'the policy conflict blocks placement visibly');
+			assert.ok(socket.closes.length, 'local schema must explicitly opt into the directive');
+			assert.equal(Records.residency, undefined);
+			assert.ok(residencyTopologyErrors(database).some((error) => error.includes('policy')));
+		} finally {
+			server.nodes = priorNodes;
+		}
+	});
+
+	it('clears a policy disagreement after the conflicting table is dropped on both peers', async () => {
+		const database = 'slot_setup_dropped_policy';
+		const map = snapshot(database);
+		await installResidencyMap(map);
+		const Records = table({
+			database,
+			table: 'Rows',
+			audit: true,
+			residency: { slots: 2, slotFrom: '0', byAttribute: false },
+			attributes: [{ name: 'id', isPrimaryKey: true }],
+		});
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-setup-peer' }];
+		try {
+			const first = await connect(database, { name: 'slot-setup-peer', replicates: true });
+			first.emit(
+				'message',
+				encode([
+					145,
+					[
+						{
+							table: 'Rows',
+							attributes: Records.attributes,
+							residency: { slots: 2, slotFrom: '1', byAttribute: false },
+						},
+					],
+					database,
+					undefined,
+					[],
+					{ snapshot: map, shardsDigest: null },
+				])
+			);
+			await turns();
+			assert.ok(residencyTopologyErrors(database).some((error) => error.includes('policy')));
+			await Records.dropTable();
 			const retry = await connect(database, { name: 'slot-setup-peer', replicates: true });
 			await sendMap(retry, database, map);
-			await turns();
-			assert.ok(residencyTopologyErrors(database).length, 'map agreement alone cannot clear a policy conflict');
-			retry.emit('message', encode(frame(policy)));
 			await turns();
 			assert.deepEqual(residencyTopologyErrors(database), []);
 		} finally {
 			server.nodes = priorNodes;
 		}
 	});
+
+	for (const system of [false, true])
+		for (const conflict of ['different', 'missing'])
+			it(`reports a ${conflict} table-policy conflict on ${system ? 'system' : 'database'} setup and clears it only with matching policy setup`, async () => {
+				const database = `slot_setup_policy_conflict_${system}_${conflict}`;
+				const map = snapshot(database);
+				await installResidencyMap(map);
+				const policy = { slots: 2, slotFrom: '0', byAttribute: false };
+				const Records = table({
+					database,
+					table: 'Rows',
+					audit: true,
+					residency: policy,
+					attributes: [
+						{ name: 'id', isPrimaryKey: true },
+						{ name: 'tag', indexed: true },
+					],
+				});
+				const priorNodes = server.nodes;
+				server.nodes = [{ name: 'slot-setup-peer' }];
+				const frame = (residency) => [
+					145,
+					[{ table: 'Rows', residency, attributes: Records.attributes }],
+					database,
+					undefined,
+					[],
+					{ snapshot: map, shardsDigest: null },
+				];
+				try {
+					const socket = await connect(system ? 'system' : database, { name: 'slot-setup-peer', replicates: true });
+					socket.emit('message', encode(frame(conflict === 'missing' ? undefined : { ...policy, slotFrom: '1' })));
+					await turns();
+					assert.ok(socket.closes.length, 'conflicting policy closes the stream');
+					assert.ok(residencyTopologyErrors(database).length, 'the policy conflict blocks placement visibly');
+					const retry = await connect(system ? 'system' : database, { name: 'slot-setup-peer', replicates: true });
+					await sendMap(retry, database, map);
+					await turns();
+					assert.ok(residencyTopologyErrors(database).length, 'map agreement alone cannot clear a policy conflict');
+					retry.emit('message', encode(frame(policy)));
+					await turns();
+					assert.deepEqual(residencyTopologyErrors(database), []);
+				} finally {
+					server.nodes = priorNodes;
+				}
+			});
 });

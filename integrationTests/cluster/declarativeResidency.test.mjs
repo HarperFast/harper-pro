@@ -155,6 +155,38 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 		}
 	}
 
+	test('initialization retries and legacy placement comparison work through the operations API', async () => {
+		const ranges = Array.from({ length: 10 }, (_, start) => ({ start, end: start + 1, shard: start % 2 }));
+		const installed = await sendOperation(nodes()[0], {
+			operation: 'initialize_residency_slots',
+			database: 'data',
+			slots: 10,
+			ranges,
+		});
+		const retry = await sendOperation(nodes()[1], {
+			operation: 'initialize_residency_slots',
+			database: 'data',
+			slots: 10,
+			ranges,
+		});
+		assert.equal(retry.digest, installed.digest);
+		assert.equal(retry.version, installed.version);
+		await put(nodes()[0], 'SlotLegacy', { id: 'legacy0', body: 'shard-zero' });
+		await put(nodes()[2], 'SlotLegacy', { id: 'legacy1', body: 'shard-one' });
+		await barriers();
+		for (const node of nodes()) {
+			const result = await sendOperation(node, {
+				operation: 'verify_residency_slots',
+				database: 'data',
+				table: 'SlotLegacy',
+				policy: { slots: 10, slotFrom: 'Number(id.slice(-1))' },
+			});
+			assert.ok(result.checked > 0);
+			assert.equal(result.mismatches, 0);
+			assert.equal(result.mapDigest, installed.digest);
+		}
+	});
+
 	test('main-thread operations inserts obey declarative placement on non-owners', async () => {
 		const result = await sendOperation(nodes()[0], {
 			operation: 'insert',

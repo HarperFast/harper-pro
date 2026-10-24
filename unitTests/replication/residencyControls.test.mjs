@@ -1,15 +1,23 @@
-import assert from 'node:assert/strict';
+import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
 import { decode, encode } from 'msgpackr';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
+import { transaction } from '#src/core/resources/transaction';
+import { INVALIDATED } from '#src/core/resources/Table';
 import { table } from '#src/core/resources/databases';
 import { createAuditEntry, readAuditEntry, Decoder } from '#src/core/resources/auditStore';
 import { writeLockBarrier } from '#src/core/resources/recordLockCoordinator';
-import { initializeResidencySlots, getResidencyConfiguration } from '#src/core/resources/residencyMaps';
+import {
+	initializeResidencySlots,
+	getResidencyConfiguration,
+	requireConnectedResidencyOwner,
+} from '#src/core/resources/residencyMaps';
 import { setReplicator } from '#src/replication/replicator';
 import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
+import { getHDBNodeTable } from '#src/replication/knownNodes';
+import { residencyTopologyErrors } from '#src/replication/residencyTopology';
 import { FrameWriter } from '#src/replication/frameWriter';
 
 class Socket extends EventEmitter {
@@ -30,7 +38,9 @@ class Socket extends EventEmitter {
 		this.close(1006);
 	}
 	ping() {}
-	pause() {}
+	pause() {
+		this.paused = true;
+	}
 	resume() {}
 }
 async function until(predicate) {
@@ -105,7 +115,13 @@ describe('Declarative tables keep control and event traffic independent of place
 		env.setProperty('replication_shards', oldList);
 		env.setProperty('replication_shard', oldShard);
 	});
-	async function connect(byAttribute, direction, legacy = false) {
+	async function connect(
+		byAttribute,
+		direction,
+		legacy = false,
+		capabilities = buildLocalCapabilities(90_000, true, true),
+		beforeConnect
+	) {
 		const database = `slot_control_${direction}_${byAttribute}`;
 		await initializeResidencySlots({ database, slots: 2, ranges: [{ start: 0, end: 2, shard: 0 }] });
 		const Records = table({
@@ -117,6 +133,7 @@ describe('Declarative tables keep control and event traffic independent of place
 		});
 		setReplicator(database, Records, {});
 		await until(() => databaseSubscriptions.get(database)?.auditStore);
+		beforeConnect?.(database);
 		const socket = new Socket();
 		sockets.push(socket);
 		replicateOverWS(socket, {}, { name: 'slot-control-peer', replicates: true });
@@ -127,7 +144,7 @@ describe('Declarative tables keep control and event traffic independent of place
 				'slot-control-peer',
 				database,
 				[],
-				buildLocalCapabilities(90_000, true, true),
+				capabilities,
 				{ shardsDigest: getResidencyConfiguration().digest },
 			])
 		);
@@ -160,6 +177,158 @@ describe('Declarative tables keep control and event traffic independent of place
 		assert.deepEqual(socket.closes, []);
 		assert.equal(Records.primaryStore.getEntry('legacy-row').value.body, 'complete');
 	});
+	for (const byAttribute of [false, true])
+		for (const stubCapable of [false, true])
+			it(`copies declarative stubs safely (attribute=${byAttribute}, stub capability=${stubCapable})`, async () => {
+				const capabilities = { ...buildLocalCapabilities(90_000, false, true), residencyStubCopy: stubCapable ? 1 : 0 };
+				const { Records, socket } = await connect(byAttribute, `copy_${stubCapable}`, false, capabilities);
+				const context = {};
+				await transaction(context, async () => {
+					const row = await Records.getResource('stub', context, { ensureLoaded: false });
+					row._writeInvalidate('stub', { id: 'stub', region: 0 }, { residencySlot: byAttribute ? 0 : undefined });
+				});
+				assert.ok(Records.primaryStore.getEntry('stub').metadataFlags & INVALIDATED);
+				Records.setTTLExpiration(3600);
+				await Records.put('full', { id: 'full', region: 0, body: 'canonical' });
+				const prior = server.shards;
+				server.shards = new Map([[0, [{ name: server.hostname }, { name: 'slot-control-peer' }]]]);
+				try {
+					socket.emit(
+						'message',
+						encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
+					);
+					await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+					assert.deepEqual(socket.closes, []);
+					const copied = entries(socket);
+					const stub = copied.find((entry) => entry.recordId === 'stub');
+					if (stubCapable) assert.equal(stub?.type, 'invalidate');
+					else
+						assert.notEqual(
+							stub?.type,
+							'put',
+							'a peer without safe invalidations must not receive a partial canonical put'
+						);
+					const full = copied.find((entry) => entry.recordId === 'full');
+					assert.equal(full?.type, 'put');
+					assert.equal(full.getValue(Records.primaryStore).body, 'canonical');
+					assert.equal(
+						full.extendedType & 0x0e000000,
+						0,
+						'primary metadata action bits must not enter the audit header'
+					);
+				} finally {
+					server.shards = prior;
+				}
+			});
+
+	it('admits a connected sending route and ignores its older socket closing', async () => {
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-control-peer', replicates: true }];
+		try {
+			const first = await connect(false, 'sender_liveness');
+			for (const socket of [first.socket]) {
+				socket.emit(
+					'message',
+					encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
+				);
+				await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+			}
+			assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
+			const state = new Uint32Array(
+				first.Records.auditStore.getUserSharedBuffer(
+					['residency-sending', first.database, 'slot-control-peer'],
+					new ArrayBuffer(12)
+				)
+			);
+			Atomics.store(state, 2, Math.floor(Date.now() / 1000) - 3600);
+			assert.throws(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']), /connected/);
+			first.socket.emit('pong');
+			assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
+			const second = await connect(false, 'sender_liveness');
+			second.socket.emit(
+				'message',
+				encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
+			);
+			await until(() => second.socket.sent.some((frame) => frame[0] === 149) || second.socket.closes.length);
+			assert.deepEqual(second.socket.closes, []);
+			first.socket.close();
+			assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
+			second.socket.close();
+			assert.throws(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']), /connected/);
+		} finally {
+			server.nodes = priorNodes;
+		}
+	});
+
+	it('does not publish a placement failure after a closed subscription wait resumes', async () => {
+		let resume, subscription;
+		const gate = new Promise((resolve) => {
+			resume = resolve;
+		});
+		const { Records, socket, database } = await connect(true, 'closed_receive', false, undefined, (database) => {
+			subscription = databaseSubscriptions.get(database);
+			databaseSubscriptions.set(database, gate);
+		});
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-control-peer' }];
+		try {
+			const encoder = Records.primaryStore.encoder;
+			socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+			socket.emit(
+				'message',
+				encode([
+					132,
+					{
+						structures: encoder.structures,
+						typedStructs: encoder.typedStructs,
+						attributes: Records.attributes,
+						schemaDefined: true,
+						residency: Records.residency,
+					},
+					Records.tableId,
+					Records.tableName,
+				])
+			);
+			socket.emit(
+				'message',
+				recordFrame(Records, 'put', 'late', { id: 'late', region: 99, body: 'invalid' }, Date.now())
+			);
+			await until(() => socket.paused || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			socket.close();
+			resume(subscription);
+			for (let n = 0; n < 30; n++) await new Promise(setImmediate);
+			assert.deepEqual(residencyTopologyErrors(database), [], 'a closed socket cannot block its replacement');
+		} finally {
+			resume(subscription);
+			databaseSubscriptions.set(database, subscription);
+			server.nodes = priorNodes;
+		}
+	});
+
+	it('sends index invalidations to a known peer without a shard', async () => {
+		const { Records, socket } = await connect(false, 'unsharded');
+		const Nodes = getHDBNodeTable();
+		const name = 'slot-control-peer';
+		const previous = Nodes.primaryStore.getSync(name);
+		const known = server.shards;
+		await Nodes.primaryStore.put(name, { name, url: 'http://127.0.0.1:19001', replicates: true });
+		server.shards = new Map([[0, [{ name: server.hostname }]]]);
+		try {
+			socket.emit('message', encode([129, [{ name, startTime: 0, tables: [], replicateByDefault: true }], []]));
+			await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+			await Records.put('unsharded-reader', { id: 'unsharded-reader', region: 0, body: 'complete' });
+			await until(() => socket.closes.length || entries(socket).some((entry) => entry.recordId === 'unsharded-reader'));
+			assert.deepEqual(socket.closes, []);
+			assert.equal(entries(socket).find((entry) => entry.recordId === 'unsharded-reader')?.type, 'invalidate');
+		} finally {
+			if (previous) await Nodes.primaryStore.put(name, previous);
+			else await Nodes.primaryStore.remove(name);
+			server.shards = known;
+		}
+	});
+
 	it('holds record delivery when the receiver shard is not known', async () => {
 		const { Records, socket } = await connect(false, 'unknown');
 		socket.emit(
