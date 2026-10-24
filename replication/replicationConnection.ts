@@ -7978,7 +7978,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				let residencyList;
 				if (auditRecord.residencyId) {
 					residencyList = receivedResidencyLists.get(auditRecord.residencyId);
-					if (residencyList === undefined) {
+					if (
+						residencyList === undefined &&
+						(tableDecoder.table?.residency ||
+							auditRecord.residencyId >= 0x80000000 ||
+							!receivedResidencyLists.has(auditRecord.residencyId))
+					) {
 						wsClosed = true;
 						close(1011, 'unknown residency reference');
 						throw new Error('Unknown connection residency reference; holding replication cursor');
