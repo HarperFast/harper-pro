@@ -187,6 +187,33 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 		}
 	});
 
+	test('attribute puts and confirmed handoffs transfer file-backed blob contents', async () => {
+		const id = 'file-backed-handoff';
+		const expected = await get(nodes()[0], `SlotBlobSeed/${id}`);
+		async function verify(node, region, signal) {
+			const actual = await get(node, `SlotBlobLocalDigest/${id}`, signal);
+			return actual.digest === expected.digest && actual.region === region;
+		}
+		await waitForCondition((signal) => verify(nodes()[1], 0, signal), {
+			description: 'original owner has the actual replicated blob bytes',
+		});
+		const response = await request(nodes()[0], `SlotBlob/${id}`, { method: 'PATCH', body: { region: 1 } });
+		assert.ok(response.status >= 200 && response.status < 300, JSON.stringify(response));
+		await waitForCondition(
+			async (signal) =>
+				(
+					await Promise.all(
+						nodes()
+							.slice(2)
+							.map((node) => verify(node, 1, signal))
+					)
+				).every(Boolean),
+			{
+				description: 'new owners have the confirmed blob bytes',
+			}
+		);
+	});
+
 	test('main-thread operations inserts obey declarative placement on non-owners', async () => {
 		const result = await sendOperation(nodes()[0], {
 			operation: 'insert',

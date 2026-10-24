@@ -84,7 +84,8 @@ export function resolveSlotReference(
 		if (!agreement.compatible || !Number.isInteger(slot) || slot < 0 || slot >= advertised.slots)
 			throw new Error(`Incompatible residency map ${mapVersion}/${mapDigest} for ${table.databaseName}`);
 	}
-	residencyOwners(table.databaseName, slot, table.residency.slots);
+	if (!Number.isInteger(slot) || slot < 0 || slot >= table.residency.slots)
+		throw new Error(`Missing or invalid record residency slot for ${table.databaseName}.${table.tableName}`);
 	if (!table.residency.byAttribute && table.getResidencySlot(id) !== slot)
 		throw new Error(`Peer sent an incorrect key-derived slot for ${table.databaseName}.${table.tableName}`);
 	return slot;
