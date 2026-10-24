@@ -10,7 +10,6 @@ import {
 } from '#src/core/resources/auditStore';
 import { encodeResidencyWireRecord } from '#src/replication/residencyWire';
 
-// Real audit bytes prove that a legacy reader has no new presence bits to misinterpret.
 describe('Declarative residency wire headers', () => {
 	for (const residencyId of [undefined, 42]) {
 		it(`strips an event's local slot fields without adding placement (legacy ID=${residencyId})`, () => {
