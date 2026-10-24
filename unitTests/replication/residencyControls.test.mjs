@@ -56,7 +56,7 @@ function entries(socket) {
 	}
 	return records;
 }
-function recordFrame(Table, type, recordId, value, version) {
+function recordFrame(Table, type, recordId, value, version, residencyId) {
 	const frame = new FrameWriter();
 	frame.writeFloat64(version);
 	const entry = Buffer.from(
@@ -66,6 +66,8 @@ function recordFrame(Table, type, recordId, value, version) {
 			recordId,
 			version,
 			previousVersion: null,
+			residencyId,
+			extendedType: residencyId ? 512 : undefined,
 			nodeId: 0,
 			encodedRecord: type === 'lockBarrier' ? encode(value) : Buffer.from(Table.primaryStore.encoder.encode(value)),
 		})
@@ -103,14 +105,14 @@ describe('Declarative tables keep control and event traffic independent of place
 		env.setProperty('replication_shards', oldList);
 		env.setProperty('replication_shard', oldShard);
 	});
-	async function connect(byAttribute, direction) {
+	async function connect(byAttribute, direction, legacy = false) {
 		const database = `slot_control_${direction}_${byAttribute}`;
 		await initializeResidencySlots({ database, slots: 2, ranges: [{ start: 0, end: 2, shard: 0 }] });
 		const Records = table({
 			database,
 			table: 'Records',
 			audit: true,
-			residency: { slots: 2, byAttribute, slotFrom: byAttribute ? 'region' : 'id.length % 2' },
+			residency: legacy ? undefined : { slots: 2, byAttribute, slotFrom: byAttribute ? 'region' : 'id.length % 2' },
 			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'region', indexed: true }, { name: 'body' }],
 		});
 		setReplicator(database, Records, {});
@@ -133,6 +135,31 @@ describe('Declarative tables keep control and event traffic independent of place
 		assert.deepEqual(socket.closes, []);
 		return { Records, socket, database };
 	}
+	it('preserves an explicitly missing legacy residency list', async () => {
+		const { Records, socket } = await connect(false, 'legacy_missing_list', true);
+		const frame = recordFrame(Records, 'put', 'legacy-row', { id: 'legacy-row', body: 'complete' }, Date.now(), 42);
+		const encoder = Records.primaryStore.encoder;
+		socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+		socket.emit(
+			'message',
+			encode([
+				132,
+				{
+					structures: encoder.structures,
+					typedStructs: encoder.typedStructs,
+					attributes: Records.attributes,
+					schemaDefined: true,
+				},
+				Records.tableId,
+				Records.tableName,
+			])
+		);
+		socket.emit('message', encode([130, undefined, 42]));
+		socket.emit('message', frame);
+		await until(() => Records.primaryStore.getEntry('legacy-row')?.value || socket.closes.length);
+		assert.deepEqual(socket.closes, []);
+		assert.equal(Records.primaryStore.getEntry('legacy-row').value.body, 'complete');
+	});
 	it('holds record delivery when the receiver shard is not known', async () => {
 		const { Records, socket } = await connect(false, 'unknown');
 		socket.emit(
