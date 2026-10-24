@@ -1,4 +1,5 @@
 import { equal } from 'node:assert';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { teardownHarper } from '@harperfast/integration-testing';
 
@@ -158,16 +159,22 @@ export async function restartNode(node, opts) {
 }
 
 /**
- * Env that keeps one node's replication off the pool on the pool-on CI legs, which set `replication.threads` for
- * every node through HARPER_CONFIG. For a node whose fault injection is application code: pool workers load
- * none, so an injector armed over HTTP never runs on the thread that owns the replication socket.
- *
- * @returns {Object} env entries to pass to startHarper/setupHarperWithFixture (empty when the pool is off)
+ * Whether this run's nodes replicate on the `replication` worker pool: the pool-on CI legs set
+ * `replication.threads` for every node through HARPER_CONFIG.
  */
-export function replicationPoolOffEnv() {
+export function replicationPoolActive() {
 	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
-	if (!(shared?.replication?.threads > 0)) return {};
-	return { HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared.replication, threads: 0 } }) };
+	return shared?.replication?.threads > 0;
+}
+
+/**
+ * `threads` config that preloads workerFaultInjector.mjs on every worker thread, `replication` pool workers
+ * included. Its features are armed by env; see that module.
+ *
+ * @param {Object} [threads] - other `threads` config to keep
+ */
+export function workerFaultInjectorThreads(threads) {
+	return { ...threads, preload: [...(threads?.preload ?? []), join(import.meta.dirname, 'workerFaultInjector.mjs')] };
 }
 
 /**
