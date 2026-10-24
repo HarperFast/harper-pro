@@ -35,7 +35,7 @@ export class ConversionDrain extends Resource {
 		let demoted = 0;
 		for (const entry of tables.Converted.primaryStore.getRange({ start: true })) {
 			if (entry.metadataFlags & REPLICA) {
-				await tables.Converted.evict(entry.key);
+				await tables.Converted.evict(entry.key, entry.value, entry.version);
 				demoted++;
 			}
 		}
