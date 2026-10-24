@@ -1,6 +1,6 @@
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
-import { encode } from 'msgpackr';
+import { decode, encode } from 'msgpackr';
 import { setHdbBasePath, get, setProperty } from '#src/core/utility/environment/environmentManager';
 import { createResidencyMap } from '#src/core/resources/residencyPolicy';
 import {
@@ -25,8 +25,11 @@ import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 class Socket extends EventEmitter {
 	readyState = 1;
 	closes = [];
+	sent = [];
 	_socket = { bytesRead: 0, bytesWritten: 0, setMaxListeners() {} };
-	send() {}
+	send(data) {
+		if (data[0] > 127) this.sent.push(decode(data));
+	}
 	close(code, reason) {
 		this.closes.push({ code, reason });
 		if (this.readyState === 3) return;
@@ -62,6 +65,16 @@ async function sendMap(socket, frameDatabase, snapshot) {
 		await new Promise((resolve) => setTimeout(resolve, 5));
 }
 const snapshot = (database) => createResidencyMap(database, 2, [{ start: 0, end: 2, shard: 0 }], 1);
+async function processed(socket) {
+	const request = 'setup-processing-barrier';
+	socket.emit('message', encode([133, request, 0, 'absent', 'MissingTable']));
+	const deadline = Date.now() + 5000;
+	while (!socket.sent.some((frame) => frame[0] === 134 && frame[1] === request)) {
+		assert.equal(socket.closes.length, 0, 'stream closed before processing the following request');
+		assert.ok(Date.now() < deadline, 'setup frame did not finish');
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
 
 describe('residency setup authority', function () {
 	this.timeout(10_000);
@@ -394,9 +407,43 @@ describe('residency setup authority', function () {
 			'message',
 			encode([145, [], database, undefined, [], { snapshot: snapshot(database), shardsDigest: null }])
 		);
-		await turns();
+		await processed(socket);
 		assert.deepEqual(socket.closes, []);
 		assert.equal(readResidencyMap(database), undefined);
+	});
+	it('ignores an out-of-scope older schema over a local declarative table on the system stream', async () => {
+		const database = 'slot_setup_unsubscribed_legacy';
+		await installResidencyMap(snapshot(database));
+		const Records = table({
+			database,
+			table: 'Rows',
+			audit: true,
+			residency: { slots: 2 },
+			attributes: [
+				{ name: 'id', isPrimaryKey: true },
+				{ name: 'tag', indexed: true },
+			],
+		});
+		const socket = await connect(
+			'system',
+			{ name: 'slot-setup-peer', replicates: true },
+			{
+				routes: [
+					{
+						hostname: 'slot-setup-peer',
+						replicates: { receivesFrom: [{ target: 'slot-setup-peer', database: 'system' }] },
+					},
+				],
+			}
+		);
+		socket.emit(
+			'message',
+			encode([145, [{ table: 'Rows', attributes: Records.attributes, schemaDefined: true }], database])
+		);
+		await processed(socket);
+		assert.deepEqual(socket.closes, []);
+		assert.deepEqual(Records.residency, { slots: 2, byAttribute: false });
+		assert.deepEqual(residencyTopologyErrors(database), []);
 	});
 	it('resolves and receives owner projections without an outbound write route', async () => {
 		const database = 'slot_setup_receive_only';

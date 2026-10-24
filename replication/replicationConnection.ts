@@ -5453,7 +5453,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 						const schemaDatabaseName = message[2];
 						if (
-							(message[5] || data.some((definition) => definition.residency !== undefined)) &&
+							(message[5] ||
+								data.some(
+									(definition) =>
+										definition.residency !== undefined || databases[schemaDatabaseName]?.[definition.table]?.residency
+								)) &&
 							!authorizeResidencySchema(schemaDatabaseName, databaseName === 'system')
 						)
 							break;
@@ -7927,6 +7931,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				const id = auditRecord.recordId;
 				let residencySlot: number | undefined;
+				if (
+					residencyList &&
+					!Array.isArray(residencyList) &&
+					(!tableDecoder.table?.residency || !isResidencyRecord(auditRecord.type))
+				) {
+					if (connectionSuperseded()) return;
+					const error = new Error('Received a slot reference without its table policy');
+					recordResidencyPolicyAgreement(databaseName, remoteNodeName, error);
+					throw error;
+				}
 
 				// A copy frame is applied as a snapshot with no duplicate detection, so it re-mints the
 				// record's blobs as fresh local files and dereferences the durable ones we already hold —
@@ -8027,6 +8041,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						repairDeclines['no-stored-entry'] = (repairDeclines['no-stored-entry'] ?? 0) + 1;
 					}
 				}
+				// Async repair inspection may have outlived this socket; do not mint files after its close sweep.
+				if (connectionSuperseded()) return;
 				let repairIndex = 0;
 				try {
 					maybeInjectDecodeFailureForTest(id);
@@ -8125,18 +8141,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						event.residencyList = undefined;
 						event.residencySlot = residencySlot;
 					} catch (error) {
-						if (connectionSuperseded()) return;
 						if (receivedBlobs) setTimeout(() => receivedBlobs.forEach(deleteBlob), 60000).unref();
+						if (connectionSuperseded()) return;
 						if (error.statusCode !== 503) recordResidencyMapAgreement(databaseName, remoteNodeName, error);
 						wsClosed = true;
 						close(1011, 'residency agreement failed');
 						throw error;
 					}
-				} else if (event && residencyList && !Array.isArray(residencyList)) {
-					if (connectionSuperseded()) return;
-					const error = new Error('Received a slot reference without its table policy');
-					recordResidencyPolicyAgreement(databaseName, remoteNodeName, error);
-					throw error;
 				}
 				if (!event && !(await recordReplicationHole(localSourceNodeId, tableDecoder.name, 'undecodable record')))
 					return;
