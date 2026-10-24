@@ -212,19 +212,30 @@ describe('local replicas on the replication wire', function () {
 			const RecordTable = RecordTableName === 'Proxy' ? Proxy : Records;
 			const existing = await stub('proxy', RecordTable);
 			const history = (await RecordTable.getHistoryOfRecord('proxy')).map((entry) => entry.type);
-			for (let attempt = 0; attempt < 2; attempt++) {
-				await fetchedRecord('proxy', existing, RecordTable);
-				const stored = RecordTable.primaryStore.getEntry('proxy');
-				assert.ok(stored.metadataFlags & INVALIDATED);
-				assert.ok(!(stored.metadataFlags & REPLICA));
-				assert.equal(stored.value.body, undefined);
-				assert.equal(stored.version, existing.version);
-				assert.equal(stored.residencyId, existing.residencyId);
-				assert.deepEqual(
-					(await RecordTable.getHistoryOfRecord('proxy')).map((entry) => entry.type),
-					history
-				);
-				assert.equal(socket.readyState, 1);
+			const storeReplica = RecordTable._storeReplica;
+			let storeAttempt;
+			RecordTable._storeReplica = function (existingEntry, entry) {
+				return (storeAttempt = storeReplica.call(this, existingEntry, entry));
+			};
+			try {
+				for (let attempt = 0; attempt < 2; attempt++) {
+					storeAttempt = undefined;
+					await fetchedRecord('proxy', existing, RecordTable);
+					assert.strictEqual(await storeAttempt, false, 'proxy reads must decline replica admission');
+					const stored = RecordTable.primaryStore.getEntry('proxy');
+					assert.ok(stored.metadataFlags & INVALIDATED);
+					assert.ok(!(stored.metadataFlags & REPLICA));
+					assert.equal(stored.value.body, undefined);
+					assert.equal(stored.version, existing.version);
+					assert.equal(stored.residencyId, existing.residencyId);
+					assert.deepEqual(
+						(await RecordTable.getHistoryOfRecord('proxy')).map((entry) => entry.type),
+						history
+					);
+					assert.equal(socket.readyState, 1);
+				}
+			} finally {
+				RecordTable._storeReplica = storeReplica;
 			}
 		});
 	}
