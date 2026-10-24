@@ -1,10 +1,24 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { encode } from 'msgpackr';
-import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
+import { setHdbBasePath, get, setProperty } from '#src/core/utility/environment/environmentManager';
 import { createResidencyMap } from '#src/core/resources/residencyPolicy';
-import { readResidencyMap } from '#src/core/resources/residencyMaps';
+import {
+	readResidencyMap,
+	installResidencyMap,
+	getResidencyMapTable,
+	requireConnectedResidencyOwner,
+} from '#src/core/resources/residencyMaps';
 import { replicateOverWS } from '#src/replication/replicationConnection';
+import { server } from '#src/core/server/Server';
+import { getReplicationSharedStatus } from '#src/replication/knownNodes';
+import { table } from '#src/core/resources/databases';
+import {
+	CONNECTION_STATE_POSITION,
+	CONNECTION_STATE_CONNECTED,
+	LAST_LIVENESS_TIME_POSITION,
+} from '#src/replication/sharedStatusSlots';
+import { residencyTopologyErrors, recordResidencyMapAgreement } from '#src/replication/residencyTopology';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 
 class Socket extends EventEmitter {
@@ -81,6 +95,131 @@ describe('residency setup authority', function () {
 		assert.ok(socket.closes.length);
 		assert.equal(readResidencyMap('slot_setup_other'), undefined);
 	});
+	it('does not clear a refused map agreement with a snapshot-free retry', async () => {
+		const database = 'slot_setup_missing_retry';
+		const expected = snapshot(database);
+		await installResidencyMap(expected);
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-setup-peer' }];
+		try {
+			const first = await connect(database, { replicates: true });
+			await sendMap(first, database, createResidencyMap(database, 2, [{ start: 0, end: 2, shard: 1 }], 1));
+			await turns();
+			assert.ok(first.closes.length);
+			assert.ok(
+				residencyTopologyErrors(database).some((error) => error.includes('map agreement')),
+				'map failure must remain blocked'
+			);
+			const retry = await connect(database, { replicates: true });
+			retry.emit('message', encode([145, [], database, undefined, [], { shardsDigest: null }]));
+			await turns();
+			assert.ok(
+				residencyTopologyErrors(database).some((error) => error.includes('map agreement')),
+				'map failure must remain blocked'
+			);
+			assert.ok(retry.closes.length, 'an incomplete snapshot cannot establish agreement');
+			assert.equal(readResidencyMap(database).digest, expected.digest);
+		} finally {
+			server.nodes = priorNodes;
+		}
+	});
+	it('ignores shard-list claims from a credential without replication authority', async () => {
+		const database = 'slot_setup_untrusted_digest';
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-setup-peer' }];
+		try {
+			await connect(database, { name: 'slot-setup-peer', replicates: true });
+			assert.deepEqual(residencyTopologyErrors(database), []);
+			const socket = await connect(database, { username: 'reader', role: { permission: {} } });
+			socket.emit(
+				'message',
+				encode([
+					140,
+					'slot-setup-peer',
+					database,
+					[],
+					buildLocalCapabilities(90_000, false, true),
+					{ shardsDigest: 'forged' },
+				])
+			);
+			await turns();
+			assert.deepEqual(residencyTopologyErrors(database), []);
+		} finally {
+			server.nodes = priorNodes;
+		}
+	});
+	it('does not clear a replacement connection failure after an installation await', async () => {
+		const database = 'slot_setup_closed_install';
+		const Maps = getResidencyMapTable();
+		const original = Maps.getResource;
+		let resume, reached;
+		const paused = new Promise((resolve) => {
+			reached = resolve;
+		});
+		const gate = new Promise((resolve) => {
+			resume = resolve;
+		});
+		Maps.getResource = async function (...args) {
+			const resource = await original.apply(this, args);
+			if (args[0] === database) {
+				reached();
+				await gate;
+			}
+			return resource;
+		};
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-setup-peer' }];
+		try {
+			const socket = await connect(database, { name: 'slot-setup-peer', replicates: true });
+			socket.emit(
+				'message',
+				encode([145, [], database, undefined, [], { snapshot: snapshot(database), shardsDigest: null }])
+			);
+			await paused;
+			socket.close(1000);
+			recordResidencyMapAgreement(database, 'slot-setup-peer', new Error('replacement connection refused its map'));
+			resume();
+			for (let n = 0; n < 200 && !readResidencyMap(database); n++)
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			await turns();
+			assert.ok(readResidencyMap(database));
+			assert.ok(
+				residencyTopologyErrors(database).some((error) => error.includes('map agreement')),
+				'map failure must remain blocked'
+			);
+		} finally {
+			resume();
+			Maps.getResource = original;
+			server.nodes = priorNodes;
+		}
+	});
+
+	it('requires fresh liveness before admitting an attribute move', async () => {
+		const database = 'slot_setup_liveness';
+		const Records = table({ database, table: 'Rows', audit: true, attributes: [{ name: 'id', isPrimaryKey: true }] });
+		const priorNodes = server.nodes;
+		const peer = 'slot-liveness-peer';
+		server.nodes = [{ name: peer, replicates: true }];
+		try {
+			const state = getReplicationSharedStatus(Records.auditStore, database, peer);
+			state[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+			state[LAST_LIVENESS_TIME_POSITION] = Date.now() - 3600000;
+			assert.throws(() => requireConnectedResidencyOwner(database, [peer]), /connected/);
+			state[LAST_LIVENESS_TIME_POSITION] = Date.now();
+			assert.doesNotThrow(() => requireConnectedResidencyOwner(database, [peer]));
+		} finally {
+			server.nodes = priorNodes;
+		}
+	});
+	it('keeps a legacy database handshake working with malformed optional shard configuration', async () => {
+		const prior = get('replication_shards');
+		setProperty('replication_shards', [0, '1']);
+		try {
+			await connect('slot_setup_legacy_configuration', { name: 'slot-setup-peer', replicates: true });
+		} finally {
+			setProperty('replication_shards', prior);
+		}
+	});
 	it('installs an authorized snapshot', async () => {
 		const database = 'slot_setup_allowed';
 		const expected = snapshot(database);
@@ -88,5 +227,47 @@ describe('residency setup authority', function () {
 		await sendMap(socket, database, expected);
 		assert.deepEqual(socket.closes, []);
 		assert.deepEqual({ ...readResidencyMap(database) }, expected);
+	});
+	it('reports a table-policy conflict after a valid map and clears it only with matching policy setup', async () => {
+		const database = 'slot_setup_policy_conflict';
+		const map = snapshot(database);
+		await installResidencyMap(map);
+		const policy = { slots: 2, slotFrom: '0', byAttribute: false };
+		const Records = table({
+			database,
+			table: 'Rows',
+			audit: true,
+			residency: policy,
+			attributes: [
+				{ name: 'id', isPrimaryKey: true },
+				{ name: 'tag', indexed: true },
+			],
+		});
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-setup-peer' }];
+		const frame = (residency) => [
+			145,
+			[{ table: 'Rows', residency, attributes: Records.attributes }],
+			database,
+			undefined,
+			[],
+			{ snapshot: map, shardsDigest: null },
+		];
+		try {
+			const socket = await connect(database, { name: 'slot-setup-peer', replicates: true });
+			socket.emit('message', encode(frame({ ...policy, slotFrom: '1' })));
+			await turns();
+			assert.ok(socket.closes.length, 'conflicting policy closes the stream');
+			assert.ok(residencyTopologyErrors(database).length, 'the policy conflict blocks placement visibly');
+			const retry = await connect(database, { name: 'slot-setup-peer', replicates: true });
+			await sendMap(retry, database, map);
+			await turns();
+			assert.ok(residencyTopologyErrors(database).length, 'map agreement alone cannot clear a policy conflict');
+			retry.emit('message', encode(frame(policy)));
+			await turns();
+			assert.deepEqual(residencyTopologyErrors(database), []);
+		} finally {
+			server.nodes = priorNodes;
+		}
 	});
 });

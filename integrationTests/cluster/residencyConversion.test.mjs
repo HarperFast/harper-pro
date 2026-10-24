@@ -142,19 +142,20 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			const before = await Promise.all(nodes().map((node) => request(node, 'ConversionRows/')));
 			const oldSchema = await readFile(join(fixture, 'schema.graphql'), 'utf8');
 			const oldResources = await readFile(join(fixture, 'resources.js'), 'utf8');
-			async function reopen(declarative, binary) {
+			async function reopen(declarative, binary, replicaExpiration = 3600) {
 				await Promise.all(contexts.map((context) => killHarper(context)));
 				for (const [i, context] of contexts.entries()) {
 					const declared = Array.isArray(declarative) ? declarative[i] : declarative;
+					const schema = oldSchema.replace('replicaExpiration: 3600', `replicaExpiration: ${replicaExpiration}`);
 					const component = join(context.harper.dataRootDir, 'components', basename(fixture));
 					await writeFile(
 						join(component, 'schema.graphql'),
 						declared
-							? oldSchema.replace(
+							? schema.replace(
 									'type Converted @table',
 									'type Converted @residency(slots: 10, slotFrom: "Number(id.slice(-1))") @table'
 								)
-							: oldSchema
+							: schema
 					);
 					await writeFile(
 						join(component, 'resources.js'),
@@ -183,6 +184,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			for (const node of nodes()) assert.equal((await request(node, 'Converted/mixed7')).body, 'legacy reader');
 			const legacyRows = await request(nodes()[1], 'ConversionRows/');
 			assert.equal(legacyRows.find((row) => row.id === 'mixed7').slot, undefined);
+			await reopen(true, currentBinary, 0);
 			const drains = await Promise.all(nodes().map((node) => request(node, 'ConversionDrain/', {})));
 			assert.ok(drains.every((result) => result.remaining === 0));
 			assert.equal(drains.reduce((sum, result) => sum + result.demoted, 0) > 0, engine === 'rocksdb');
