@@ -9,7 +9,7 @@ import {
 import { residencyMapExtends, type ResidencyMapSnapshot } from '../core/resources/residencyPolicy.ts';
 import { getResidencyMap, residencyOwners } from '../core/resources/residencyMaps.ts';
 
-export interface SlotReference {
+interface SlotReference {
 	slot: number;
 	mapVersion: number;
 	mapDigest: string;

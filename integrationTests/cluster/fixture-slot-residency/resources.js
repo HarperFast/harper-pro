@@ -1,3 +1,5 @@
+tables.SlotLegacy.setResidencyById((id) => Number(id.slice(-1)) % 2);
+
 export class SlotLocalRows extends Resource {
 	get(target) {
 		const table = tables[target.get('table')];

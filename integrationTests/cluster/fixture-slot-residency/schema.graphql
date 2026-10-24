@@ -24,3 +24,7 @@ type SlotNoIndex @table @export @residency(slots: 10, slotFrom: "Number(id.slice
 type SlotBarrier @table @export {
 	id: ID @primaryKey
 }
+type SlotLegacy @table @export {
+	id: ID @primaryKey
+	body: String
+}

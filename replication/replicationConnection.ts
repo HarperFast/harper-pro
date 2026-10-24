@@ -10,6 +10,7 @@ import {
 	recordResidencyMapAgreement,
 	recordResidencyPolicyAgreement,
 	residencyConfigurationDigest,
+	registerResidencySender,
 } from './residencyTopology.ts';
 import {
 	ResidencyWireReferences,
@@ -4460,6 +4461,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const DELAY_CLOSE_TIME = 60000; // amount of time to wait before closing the connection if we haven't any activity and there are no subscriptions
 	let delayedClose: NodeJS.Timeout;
 	let lastMessageTime = 0;
+	let residencySender: ReturnType<typeof registerResidencySender>;
 	// track bytes read and written so we can verify if a connection is really dead on pings
 	let bytesRead = 0;
 	let bytesWritten = 0;
@@ -4676,6 +4678,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// pauseStallWatchdog} armed while paused" invariant. While paused the pause-stall watchdog is the
 	// liveness guard; removePauseReason re-arms the byte watchdog on resume. (harper-pro#466 review)
 	const resetPingTimer = () => {
+		residencySender?.touch();
 		if (pauseReasons === 0) receiveWatchdog?.reset();
 	};
 	resetPingTimer();
@@ -5249,6 +5252,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			close(1008, 'Unauthorized');
 			return false;
 		}
+		remoteNodeName ??= authorization.name;
 		return true;
 	}
 	/**
@@ -5301,6 +5305,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (authorization?.then) {
 				try {
 					authorization = await authorization;
+					if (connectionSuperseded()) return;
 				} catch (error) {
 					authorizationFinished = true;
 					logger.error?.(connectionId, 'Authorization failed', error);
@@ -5362,7 +5367,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 							}
 							if (options.connection) options.connection.nodeName = remoteNodeName;
-							if (authorization.name || authorization.replicates || authorization.role?.permission?.super_user)
+							if (hasResidencySchemaAuthority(databaseName ?? message[2]))
 								recordResidencyConfiguration(remoteNodeName, message[5]?.shardsDigest);
 							// After the peer is identified, so the post carries the same node name every other
 							// connected-to-node message does.
@@ -5496,7 +5501,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								try {
 									if (databaseName === 'system') {
 										// the system connection allows us to create new databases (which wouldn't otherwise have an existing connection)
-										if (!databases[newDatabaseName]?.[tableDefinition.table]) {
+										if (
+											!databases[newDatabaseName]?.[tableDefinition.table] ||
+											tableDefinition.residency ||
+											databases[newDatabaseName]?.[tableDefinition.table]?.residency
+										) {
 											table = ensureTableIfChanged(
 												tableDefinition,
 												databases[newDatabaseName]?.[tableDefinition.table]
@@ -5528,7 +5537,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 						if (
 							!connectionSuperseded() &&
-							declaredTables.length &&
+							hasResidencySchemaAuthority(schemaDatabaseName) &&
 							declaredTables.every((table) =>
 								data.some(
 									(definition) =>
@@ -6561,6 +6570,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									receiverShardKnown = Array.from(server.shards?.values() ?? []).some((members) =>
 										members.some((node: any) => (typeof node === 'string' ? node : node.name) === remoteNodeName)
 									);
+									if (!receiverShardKnown) {
+										const peer = getHDBNodeTable().primaryStore.getSync(remoteNodeName);
+										receiverShardKnown = Boolean(peer?.url && peer.shard === undefined);
+									}
 								}
 								if (!receiverShardKnown)
 									throw new Error(`Unknown residency shard for peer ${remoteNodeName}; holding replication`);
@@ -6806,9 +6819,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							} else logger.debug?.(connectionId, 'skipping empty transaction');
 						};
 
+						let subscriptionResidencySender: ReturnType<typeof registerResidencySender>;
 						auditSubscription = new EventEmitter();
 						auditSubscription.once('close', () => {
 							closed = true;
+							subscriptionResidencySender?.close();
 							subscriptionToHdbNodes?.end();
 							wakeSender?.(); // an idle sender settles now rather than at the next transaction
 						});
@@ -6859,6 +6874,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								tableSubscriptionToReplicator = resolvedDatabaseSubscription;
 								if (closed || wsClosed) return;
 								auditStore = tableSubscriptionToReplicator.auditStore;
+								residencySender = subscriptionResidencySender = registerResidencySender(
+									auditStore,
+									databaseName,
+									remoteNodeName
+								);
 								recordPeerLockCapabilityFromHandshake();
 								sendRecordLockHomesDigestFrame();
 								tableById = tableSubscriptionToReplicator.tableById.map(tableToTableEntry);
@@ -7370,6 +7390,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														const stubAsInvalidation =
 															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
 														const legacyStubCopy = isStub && !stubAsInvalidation;
+														if (legacyStubCopy && table.residency) continue;
 														const copyType = stubAsInvalidation ? 'invalidate' : 'put';
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;
@@ -7380,6 +7401,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																copyValue[createdTimeName] = entry.value[createdTimeName];
 															if (table.primaryKey) copyValue[table.primaryKey] = entry.key;
 														}
+														const copyExtendedType =
+															(entry.metadataFlags &
+																~0xff &
+																~HAS_RESIDENCY_SLOT &
+																~(ACTION_32_BIT << 24) &
+																(isReplica ? ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS) : -1)) |
+															(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0);
 														const encodeCopyRecord = () =>
 															createAuditEntry({
 																version: entry.version,
@@ -7391,13 +7419,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																encodedRecord: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
 																	sendBlobs(blob, entry.key)
 																),
-																extendedType:
-																	(entry.metadataFlags &
-																		~0xff &
-																		~HAS_RESIDENCY_SLOT &
-																		~(ACTION_32_BIT << 24) &
-																		(isReplica ? ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS) : -1)) |
-																	(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0),
+																extendedType: copyExtendedType,
 																residencyId: entry.residencyId,
 																residencySlot: entry.residencySlot,
 																previousResidencyId: null,
@@ -7421,9 +7443,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																residencyId: entry.residencyId,
 																residencySlot: entry.residencySlot,
 																nodeId: recordNodeId,
-																extendedType: isReplica
-																	? entry.metadataFlags & ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS)
-																	: entry.metadataFlags,
+																extendedType: copyExtendedType,
+																expiresAt: isReplica ? undefined : entry.expiresAt,
 															},
 															copyTxnLogKey,
 															nodeId
@@ -7676,6 +7697,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
 			if (!(await whenSubscriptionResolved())) return;
+			if (connectionSuperseded()) return;
 			// The origin's log key for every record in this body, read once. It is what the apply
 			// transaction commits under, so the destination's log for this origin keeps the origin's clock
 			// and a downstream peer's resume cursor stays comparable with it (harper-pro#790).
@@ -7902,6 +7924,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 						if (
 							Table.residency.byAttribute &&
+							residencyList &&
+							!Array.isArray(residencyList) &&
 							auditRecord.type === 'put' &&
 							Table.getResidencySlot(id, auditRecord.getValue(tableDecoder)) !== residencySlot
 						)
@@ -7909,13 +7933,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						Table.getRecordResidency({ key: id, residencySlot });
 						residencyList = undefined;
 					} catch (error) {
+						if (connectionSuperseded()) return;
 						recordResidencyMapAgreement(databaseName, remoteNodeName, error);
 						wsClosed = true;
 						close(1011, 'residency agreement failed');
 						throw error;
 					}
 				} else if (residencyList && !Array.isArray(residencyList)) {
-					throw new Error('Received a slot reference without its table policy');
+					const error = new Error('Received a slot reference without its table policy');
+					recordResidencyPolicyAgreement(databaseName, remoteNodeName, error);
+					throw error;
 				}
 				// A copy frame is applied as a snapshot with no duplicate detection, so it re-mints the
 				// record's blobs as fresh local files and dereferences the durable ones we already hold —
@@ -8485,6 +8512,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (instanceRetired) return;
 		instanceRetired = true;
 		wsClosed = true;
+		residencySender?.close();
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
 		if (options.connection?.peerCapabilities === peerCapabilities) {
 			options.connection.peerCapabilities = undefined;
@@ -9596,8 +9624,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return residency;
 	}
 
+	function hasResidencySchemaAuthority(targetDatabase: string): boolean {
+		try {
+			authorizeResidencySchema(targetDatabase);
+			return true;
+		} catch {
+			return false;
+		}
+	}
 	function authorizeResidencySchema(targetDatabase: string) {
-		if (!checkDatabaseAccess(targetDatabase) || (databaseName !== 'system' && databaseName !== targetDatabase))
+		if (
+			!checkDatabaseAccess(targetDatabase) ||
+			(databaseName && databaseName !== 'system' && databaseName !== targetDatabase)
+		)
 			throw new Error('Residency metadata does not belong to an authorized database frame');
 		const superUser = authorization?.role?.permission?.super_user;
 		if (!superUser && !(authorization?.name || authorization?.replicates))
@@ -10020,7 +10059,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!existingTable) existingTable = {};
 		const wasSchemaDefined = existingTable.schemaDefined;
 		let hasChanges = false;
+		if (
+			existingTable.residency &&
+			tableDefinition.residency === undefined &&
+			peerSupportsResidencySlots(peerCapabilities)
+		)
+			throw new Error(`Missing residency policy for ${tableDefinition.database}.${tableDefinition.table}`);
 		if (tableDefinition.residency !== undefined) {
+			if (wasSchemaDefined && !existingTable.residency)
+				throw new Error(
+					`Local schema does not declare residency for ${tableDefinition.database}.${tableDefinition.table}`
+				);
 			if (existingTable.residency && !sameResidencyPolicy(existingTable.residency, tableDefinition.residency))
 				throw new Error(`Conflicting residency policy for ${tableDefinition.database}.${tableDefinition.table}`);
 			if (!existingTable.residency) hasChanges = true;
