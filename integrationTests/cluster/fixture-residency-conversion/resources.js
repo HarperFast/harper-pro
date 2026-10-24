@@ -27,7 +27,6 @@ export class ConversionAudit extends Resource {
 	}
 }
 
-// The fixture stops remote reads before this explicit rollback drain.
 export class ConversionDrain extends Resource {
 	async put() {
 		const REPLICA = 4; // Primary metadata bit shared by both binaries.
