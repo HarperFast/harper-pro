@@ -8,3 +8,8 @@ type Kept @table(replicaExpiration: 3600) @export {
 	name: String @indexed
 	body: String
 }
+type Proxy @table(replicaExpiration: 0) @export {
+	id: ID @primaryKey
+	name: String @indexed
+	body: String
+}

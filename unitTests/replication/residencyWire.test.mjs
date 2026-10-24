@@ -178,8 +178,8 @@ describe('residency stubs on the replication wire', function () {
 		});
 	}
 
-	it('receives not-resident without a decoder or relocation and keeps absence distinct', async () => {
-		const relocate = sinon.spy(Records, '_recordRelocate');
+	it('receives not-resident without a decoder or replica admission and keeps absence distinct', async () => {
+		const storeReplica = sinon.spy(Records, '_storeReplica');
 		try {
 			for (const answer of [false, undefined, 0, null]) {
 				const pending = session.getRecord({ table: Records, id: 'stub' });
@@ -190,9 +190,9 @@ describe('residency stubs on the replication wire', function () {
 				);
 				assert.strictEqual(await pending, answer === false ? false : undefined);
 			}
-			assert.equal(relocate.callCount, 0);
+			assert.equal(storeReplica.callCount, 0);
 		} finally {
-			relocate.restore();
+			storeReplica.restore();
 		}
 	});
 
@@ -315,7 +315,7 @@ describe('residency stubs on the replication wire', function () {
 				const connections = [];
 				const sandbox = sinon.createSandbox();
 				try {
-					const relocate = sandbox.stub(Records, '_recordRelocate').returns(true);
+					const storeReplica = sandbox.stub(Records, '_storeReplica').returns(true);
 					sandbox.stub(getHDBNodeTable().primaryStore, 'getSync').callsFake((name) => ({
 						name,
 						url: `wss://${name}:9933`,
@@ -344,8 +344,8 @@ describe('residency stubs on the replication wire', function () {
 					assert.strictEqual(found.value, null);
 					assert.equal(found.version, deletionVersion);
 					assert.deepEqual(contacted, [peers[0]]);
-					assert.equal(relocate.callCount, 1);
-					assert.strictEqual(relocate.firstCall.args[1], found);
+					assert.equal(storeReplica.callCount, 1);
+					assert.strictEqual(storeReplica.firstCall.args[1], found);
 				} finally {
 					for (const connection of connections) {
 						connection.isFinished = true;

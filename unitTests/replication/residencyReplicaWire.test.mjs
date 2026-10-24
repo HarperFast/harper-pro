@@ -23,6 +23,8 @@ const COPY_START = 148;
 const COPY_COMPLETE = 149;
 const DATABASE = 'residencyReplicaWire';
 const PEER = 'residency-replica-peer';
+const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
+const replicaTest = isLMDB ? it.skip : it;
 
 class Socket extends EventEmitter {
 	readyState = 1;
@@ -76,7 +78,7 @@ function copiedRecords(socket, tableId) {
 
 describe('local replicas on the replication wire', function () {
 	this.timeout(30_000);
-	let Records, KeyOnly, Expiring, socket, session, residencyId, stubVersion;
+	let Records, KeyOnly, Expiring, Proxy, socket, session, residencyId, stubVersion;
 
 	before(async () => {
 		setHdbBasePath(process.env.STORAGE_PATH);
@@ -84,12 +86,14 @@ describe('local replicas on the replication wire', function () {
 			{ name: 'Records', indexed: true },
 			{ name: 'KeyOnly', indexed: false },
 			{ name: 'Expiring', indexed: true, expiration: 3600 },
+			{ name: 'Proxy', indexed: true, replicaExpiration: 0 },
 		]) {
 			const { indexed } = schema;
 			const RecordTable = table({
 				database: DATABASE,
 				table: schema.name,
 				expiration: schema.expiration,
+				replicaExpiration: schema.replicaExpiration,
 				attributes: [
 					{ name: 'id', isPrimaryKey: true },
 					{ name: 'name', indexed },
@@ -100,7 +104,8 @@ describe('local replicas on the replication wire', function () {
 			});
 			if (schema.name === 'Records') Records = RecordTable;
 			else if (schema.name === 'KeyOnly') KeyOnly = RecordTable;
-			else Expiring = RecordTable;
+			else if (schema.name === 'Expiring') Expiring = RecordTable;
+			else Proxy = RecordTable;
 			RecordTable.setResidency(() => [PEER]);
 			await RecordTable.put('full', { id: 'full', name: 'indexed', body: 'complete' });
 			residencyId = RecordTable.primaryStore.getEntry('full').residencyId;
@@ -139,7 +144,7 @@ describe('local replicas on the replication wire', function () {
 		return { response, structure };
 	}
 
-	async function keptReplica(id, existing, RecordTable = Records) {
+	async function fetchedRecord(id, existing, RecordTable = Records) {
 		existing ??= await stub(id, RecordTable);
 		stubVersion = existing.version;
 		const { response, structure } = await fullRecordFrame(RecordTable);
@@ -148,27 +153,36 @@ describe('local replicas on the replication wire', function () {
 		const pending = session.getRecord({ table: RecordTable, id, entry: existing });
 		const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
 		socket.emit('message', encode([GET_RECORD_RESPONSE, request[1], { ...response, version: stubVersion }]));
-		assert.equal((await pending).value.body, 'complete');
+		const found = await pending;
+		assert.equal(found.value.body, 'complete');
+		return found;
+	}
+
+	async function keptReplica(id, existing, RecordTable = Records) {
+		await fetchedRecord(id, existing, RecordTable);
 		return until(() => RecordTable.primaryStore.getEntry(id).metadataFlags & REPLICA, 'the replica write').then(() =>
 			RecordTable.primaryStore.getEntry(id)
 		);
 	}
 
-	it('keeps a GET_RECORD answer as a replica of the stub, without an audit entry, and keeps the socket open', async () => {
-		const existing = await stub('fetched');
-		const history = (await Records.getHistoryOfRecord('fetched')).map((entry) => entry.type);
-		const replica = await keptReplica('fetched', existing);
-		assert.equal(socket.readyState, 1, 'storing the replica must not close the retrieval socket');
-		assert.equal(replica.value.body, 'complete');
-		assert.equal(replica.residencyId, residencyId);
-		assert.equal(replica.version, stubVersion);
-		assert.ok(!(replica.metadataFlags & INVALIDATED));
-		assert.deepEqual(
-			(await Records.getHistoryOfRecord('fetched')).map((entry) => entry.type),
-			history,
-			'a read must not write a relocation or any other audit entry'
-		);
-	});
+	replicaTest(
+		'keeps a GET_RECORD answer as a replica of the stub, without an audit entry, and keeps the socket open',
+		async () => {
+			const existing = await stub('fetched');
+			const history = (await Records.getHistoryOfRecord('fetched')).map((entry) => entry.type);
+			const replica = await keptReplica('fetched', existing);
+			assert.equal(socket.readyState, 1, 'storing the replica must not close the retrieval socket');
+			assert.equal(replica.value.body, 'complete');
+			assert.equal(replica.residencyId, residencyId);
+			assert.equal(replica.version, stubVersion);
+			assert.ok(!(replica.metadataFlags & INVALIDATED));
+			assert.deepEqual(
+				(await Records.getHistoryOfRecord('fetched')).map((entry) => entry.type),
+				history,
+				'a read must not write a relocation or any other audit entry'
+			);
+		}
+	);
 
 	it('names a row written by another node after that node', async () => {
 		const remoteId = getIdOfRemoteNode('other-resident', Records.auditStore);
@@ -193,17 +207,55 @@ describe('local replicas on the replication wire', function () {
 		assert.equal(response.version, context.timestamp);
 	});
 
-	it('answers GET_RECORD for a replica as not held', async () => {
-		await keptReplica('not-held');
-		socket.emit('message', encode([GET_RECORD, 12, Records.tableId, 'not-held', Records.tableName]));
-		await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 12));
-		assert.equal(socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 12)[2], undefined);
-	});
+	for (const RecordTableName of ['Proxy', ...(isLMDB ? ['Records'] : [])]) {
+		it(`proxies GET_RECORD without changing the ${RecordTableName} stub or audit history`, async () => {
+			const RecordTable = RecordTableName === 'Proxy' ? Proxy : Records;
+			const existing = await stub('proxy', RecordTable);
+			const history = (await RecordTable.getHistoryOfRecord('proxy')).map((entry) => entry.type);
+			for (let attempt = 0; attempt < 2; attempt++) {
+				await fetchedRecord('proxy', existing, RecordTable);
+				const stored = RecordTable.primaryStore.getEntry('proxy');
+				assert.ok(stored.metadataFlags & INVALIDATED);
+				assert.ok(!(stored.metadataFlags & REPLICA));
+				assert.equal(stored.value.body, undefined);
+				assert.equal(stored.version, existing.version);
+				assert.equal(stored.residencyId, existing.residencyId);
+				assert.deepEqual(
+					(await RecordTable.getHistoryOfRecord('proxy')).map((entry) => entry.type),
+					history
+				);
+				assert.equal(socket.readyState, 1);
+			}
+		});
+	}
+
+	for (const peer of ['capable', 'missing-key', 'unlearned']) {
+		replicaTest(`answers GET_RECORD for a replica as not resident to a ${peer} peer`, async () => {
+			await keptReplica('not-held');
+			if (peer !== 'capable') {
+				socket.close();
+				socket = new Socket();
+				replicateOverWS(socket, { database: DATABASE }, { name: PEER, replicates: true });
+				if (peer === 'missing-key') {
+					const bag = { ...buildLocalCapabilities(90_000, false, true) };
+					delete bag.residencyNotResident;
+					socket.emit('message', encode([NODE_NAME, PEER, DATABASE, [], bag]));
+					await until(() => socket.sent.some((frame) => frame[0] === NODE_NAME));
+				}
+			}
+			socket.emit('message', encode([GET_RECORD, 12, Records.tableId, 'not-held', Records.tableName]));
+			await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 12));
+			assert.strictEqual(
+				socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === 12)[2],
+				peer === 'capable' ? false : undefined
+			);
+		});
+	}
 
 	for (const shape of ['secondary-indexed', 'key-only', 'expiring']) {
 		const indexed = shape !== 'key-only';
 		for (const peer of ['capable', 'missing-key', 'unlearned']) {
-			it(`copies a ${shape} replica like its demoted stub to a ${peer} resident`, async () => {
+			replicaTest(`copies a ${shape} replica like its demoted stub to a ${peer} resident`, async () => {
 				const RecordTable = shape === 'expiring' ? Expiring : indexed ? Records : KeyOnly;
 				const id = `copied-${peer}`;
 				const replica = await keptReplica(id, undefined, RecordTable);

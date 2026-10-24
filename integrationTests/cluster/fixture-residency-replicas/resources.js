@@ -1,6 +1,6 @@
 const INVALIDATED = 1;
 const REPLICA = 4;
-const REPLICA_TABLES = ['Open', 'Kept'];
+const REPLICA_TABLES = ['Open', 'Kept', 'Proxy'];
 
 // A test can hold every GET_RECORD answer on this node between its arrival and the replica write,
 // so a newer stub can land in between, and count the settled attempts per record. Both are shared
