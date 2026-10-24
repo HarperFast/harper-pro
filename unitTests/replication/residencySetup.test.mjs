@@ -81,7 +81,7 @@ describe('residency setup authority', function () {
 			{ name: 'slot-setup-peer', replicates: true },
 			{ routes: [{ hostname: 'slot-setup-peer', replicates: { sends: true } }] },
 		],
-	])
+	]) {
 		it(`refuses a map from ${name}`, async () => {
 			const database = `slot_setup_${name}`;
 			const socket = await connect(database, authorization, options);
@@ -89,6 +89,49 @@ describe('residency setup authority', function () {
 			assert.ok(socket.closes.length, 'unauthorized frame closes the stream');
 			assert.equal(readResidencyMap(database), undefined);
 		});
+		for (const command of [145, 132])
+			it(`does not accept a missing-policy blocker from ${name} (command ${command})`, async () => {
+				const database = `slot_setup_missing_unauthorized_${name}_${command}`;
+				await installResidencyMap(snapshot(database));
+				const policy = { slots: 2, byAttribute: false };
+				const Records = table({
+					database,
+					table: 'Rows',
+					audit: true,
+					residency: policy,
+					attributes: [
+						{ name: 'id', isPrimaryKey: true },
+						{ name: 'tag', indexed: true },
+					],
+				});
+				const priorNodes = server.nodes;
+				server.nodes = [{ name: 'slot-setup-peer' }];
+				try {
+					const socket = await connect(database, authorization, options);
+					const definition = { table: 'Rows', attributes: Records.attributes, schemaDefined: true };
+					const encoder = Records.primaryStore.encoder;
+					socket.emit(
+						'message',
+						encode(
+							command === 145
+								? [145, [definition], database]
+								: [
+										132,
+										{ ...definition, structures: encoder.structures, typedStructs: encoder.typedStructs },
+										Records.tableId,
+										'Rows',
+									]
+						)
+					);
+					await turns();
+					assert.deepEqual(residencyTopologyErrors(database), []);
+					assert.deepEqual(Records.residency, policy);
+				} finally {
+					server.nodes = priorNodes;
+				}
+			});
+	}
+
 	it('binds the snapshot to its database frame', async () => {
 		const socket = await connect('slot_setup_frame', { replicates: true });
 		await sendMap(socket, 'slot_setup_frame', snapshot('slot_setup_other'));

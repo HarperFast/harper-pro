@@ -4,6 +4,7 @@ import { decode, encode } from 'msgpackr';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
 import { transaction } from '#src/core/resources/transaction';
+import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { INVALIDATED } from '#src/core/resources/Table';
 import { table } from '#src/core/resources/databases';
 import { createAuditEntry, readAuditEntry, Decoder } from '#src/core/resources/auditStore';
@@ -120,7 +121,8 @@ describe('Declarative tables keep control and event traffic independent of place
 		direction,
 		legacy = false,
 		capabilities = buildLocalCapabilities(90_000, true, true),
-		beforeConnect
+		beforeConnect,
+		connection
 	) {
 		const database = `slot_control_${direction}_${byAttribute}`;
 		await initializeResidencySlots({ database, slots: 2, ranges: [{ start: 0, end: 2, shard: 0 }] });
@@ -136,7 +138,8 @@ describe('Declarative tables keep control and event traffic independent of place
 		beforeConnect?.(database);
 		const socket = new Socket();
 		sockets.push(socket);
-		replicateOverWS(socket, {}, { name: 'slot-control-peer', replicates: true });
+		if (connection) connection.socket = socket;
+		replicateOverWS(socket, { connection }, { name: 'slot-control-peer', replicates: true });
 		socket.emit(
 			'message',
 			encode([
@@ -221,42 +224,96 @@ describe('Declarative tables keep control and event traffic independent of place
 				}
 			});
 
-	it('admits a connected sending route and ignores its older socket closing', async () => {
+	for (const closeNewest of [false, true])
+		it(`keeps an eligible sending route when overlapping sockets close (newest=${closeNewest})`, async () => {
+			const priorNodes = server.nodes;
+			server.nodes = [{ name: 'slot-control-peer', replicates: true }];
+			try {
+				const first = await connect(false, `sender_liveness_${closeNewest}`);
+				for (const socket of [first.socket]) {
+					socket.emit(
+						'message',
+						encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
+					);
+					await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+					assert.deepEqual(socket.closes, []);
+				}
+				assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
+				const state = new Uint32Array(
+					first.Records.auditStore.getUserSharedBuffer(
+						['residency-sending', first.database, 'slot-control-peer'],
+						new ArrayBuffer(12)
+					)
+				);
+				Atomics.store(state, 2, Math.floor(Date.now() / 1000) - 3600);
+				assert.throws(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']), /connected/);
+				first.socket.emit('pong');
+				assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
+				const second = await connect(false, `sender_liveness_${closeNewest}`);
+				second.socket.emit(
+					'message',
+					encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
+				);
+				await until(() => second.socket.sent.some((frame) => frame[0] === 149) || second.socket.closes.length);
+				assert.deepEqual(second.socket.closes, []);
+				if (closeNewest) {
+					second.socket.close();
+					first.socket.emit('pong');
+					assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
+					first.socket.close();
+				} else {
+					first.socket.close();
+					assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
+					second.socket.close();
+				}
+				assert.throws(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']), /connected/);
+			} finally {
+				server.nodes = priorNodes;
+			}
+		});
+
+	it('does not replace sender liveness when a superseded setup wait resumes', async () => {
+		let resume, subscription;
+		const gate = new Promise((resolve) => {
+			resume = resolve;
+		});
+		const connection = new EventEmitter();
 		const priorNodes = server.nodes;
 		server.nodes = [{ name: 'slot-control-peer', replicates: true }];
+		const first = await connect(
+			false,
+			'superseded_sender',
+			false,
+			undefined,
+			(database) => {
+				subscription = databaseSubscriptions.get(database);
+				databaseSubscriptions.set(database, gate);
+			},
+			connection
+		);
 		try {
-			const first = await connect(false, 'sender_liveness');
-			for (const socket of [first.socket]) {
+			const subscribe = (socket) =>
 				socket.emit(
 					'message',
 					encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
 				);
-				await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
-				assert.deepEqual(socket.closes, []);
-			}
-			assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
-			const state = new Uint32Array(
-				first.Records.auditStore.getUserSharedBuffer(
-					['residency-sending', first.database, 'slot-control-peer'],
-					new ArrayBuffer(12)
-				)
-			);
-			Atomics.store(state, 2, Math.floor(Date.now() / 1000) - 3600);
-			assert.throws(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']), /connected/);
-			first.socket.emit('pong');
-			assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
-			const second = await connect(false, 'sender_liveness');
-			second.socket.emit(
-				'message',
-				encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
-			);
+			subscribe(first.socket);
+			for (let n = 0; n < 30; n++) await new Promise(setImmediate);
+			databaseSubscriptions.set(first.database, subscription);
+			const second = await connect(false, 'superseded_sender', false, undefined, undefined, connection);
+			subscribe(second.socket);
 			await until(() => second.socket.sent.some((frame) => frame[0] === 149) || second.socket.closes.length);
 			assert.deepEqual(second.socket.closes, []);
+			assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
+			resume(subscription);
+			for (let n = 0; n < 30; n++) await new Promise(setImmediate);
 			first.socket.close();
 			assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
 			second.socket.close();
 			assert.throws(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']), /connected/);
 		} finally {
+			resume(subscription);
+			databaseSubscriptions.set(first.database, subscription);
 			server.nodes = priorNodes;
 		}
 	});
@@ -308,7 +365,18 @@ describe('Declarative tables keep control and event traffic independent of place
 	});
 
 	it('sends index invalidations to a known peer without a shard', async () => {
-		const { Records, socket } = await connect(false, 'unsharded');
+		const { Records, socket, database } = await connect(false, 'unsharded');
+		socket.emit(
+			'message',
+			encode([
+				140,
+				'slot-control-peer',
+				database,
+				[],
+				buildLocalCapabilities(90_000, true, true),
+				{ shardsDigest: getResidencyConfiguration().digest, shard: null },
+			])
+		);
 		const Nodes = getHDBNodeTable();
 		const name = 'slot-control-peer';
 		const previous = Nodes.primaryStore.getSync(name);
@@ -322,6 +390,61 @@ describe('Declarative tables keep control and event traffic independent of place
 			await until(() => socket.closes.length || entries(socket).some((entry) => entry.recordId === 'unsharded-reader'));
 			assert.deepEqual(socket.closes, []);
 			assert.equal(entries(socket).find((entry) => entry.recordId === 'unsharded-reader')?.type, 'invalidate');
+		} finally {
+			if (previous) await Nodes.primaryStore.put(name, previous);
+			else await Nodes.primaryStore.remove(name);
+			server.shards = known;
+		}
+	});
+
+	it('uses a legacy unsharded peer self-announcement without trusting tentative rows', async () => {
+		const { Records, socket } = await connect(false, 'legacy_unsharded', false, {
+			...buildLocalCapabilities(90_000, true, true),
+			residencySlots: undefined,
+		});
+		const Nodes = getHDBNodeTable();
+		const name = 'slot-control-peer';
+		const previous = Nodes.primaryStore.getSync(name);
+		const known = server.shards;
+		const context = {};
+		await transaction(context, async () => {
+			const resource = await Nodes.getResource(name, context);
+			resource._writeUpdate(name, { name, url: 'http://127.0.0.1:19001', replicates: true }, true, {
+				isNotification: true,
+				nodeId: getIdOfRemoteNode(name, Nodes.auditStore),
+			});
+			await resource.save();
+		});
+		server.shards = new Map([[0, [{ name: server.hostname }]]]);
+		try {
+			socket.emit('message', encode([129, [{ name, startTime: 0, tables: [], replicateByDefault: true }], []]));
+			await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+			await Records.put('unsharded-reader', { id: 'unsharded-reader', region: 0, body: 'complete' });
+			await until(() => socket.closes.length || entries(socket).some((entry) => entry.recordId === 'unsharded-reader'));
+			assert.deepEqual(socket.closes, []);
+			assert.equal(entries(socket).find((entry) => entry.recordId === 'unsharded-reader')?.type, 'invalidate');
+		} finally {
+			if (previous) await Nodes.primaryStore.put(name, previous);
+			else await Nodes.primaryStore.remove(name);
+			server.shards = known;
+		}
+	});
+
+	it('does not treat a tentative url-only peer row as an unsharded reader', async () => {
+		const { Records, socket } = await connect(false, 'tentative');
+		const Nodes = getHDBNodeTable();
+		const name = 'slot-control-peer';
+		const previous = Nodes.primaryStore.getSync(name);
+		const known = server.shards;
+		await Nodes.primaryStore.put(name, { name, url: 'http://127.0.0.1:19001', replicates: true });
+		server.shards = new Map([[0, [{ name: server.hostname }]]]);
+		try {
+			socket.emit('message', encode([129, [{ name, startTime: 0, tables: [], replicateByDefault: true }], []]));
+			await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+			await Records.put('tentative-owner', { id: 'tentative-owner', region: 0, body: 'complete' });
+			await until(() => socket.closes.length || entries(socket).some((entry) => entry.recordId === 'tentative-owner'));
+			assert.ok(socket.closes.length, 'a tentative row does not prove non-ownership');
+			assert.ok(!entries(socket).some((entry) => entry.recordId === 'tentative-owner'));
 		} finally {
 			if (previous) await Nodes.primaryStore.put(name, previous);
 			else await Nodes.primaryStore.remove(name);
