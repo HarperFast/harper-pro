@@ -155,7 +155,15 @@ jobs:
           submodules: 'recursive'
       - name: Get default Node version
         id: default
-        run: echo "node-version=$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile | cut -d- -f1)" >> "$GITHUB_OUTPUT"
+        # The build stage compiles native addons for its Node major, which the pc base has to match.
+        run: |
+          set -euo pipefail
+          build_major=$(sed -n 's/^ARG NODE_BUILD_VERSION=//p' Dockerfile | cut -d- -f1)
+          run_major=$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile | cut -d- -f1)
+          if [ -z "$run_major" ] || [ "$build_major" != "$run_major" ]; then
+            echo "::error::Dockerfile NODE_BUILD_VERSION (${build_major}) and NODE_VERSION (${run_major}) must share one Node major for the pc build"; exit 1
+          fi
+          echo "node-version=${run_major}" >> "$GITHUB_OUTPUT"
       - name: Setup Docker metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -174,8 +182,6 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          # The build stage keeps the Dockerfile's default NODE_BUILD_VERSION, the
-          # same major as the pc base image.
           build-args: |
             RUN_IMAGE=harperfast/node-pointer-compression:${{ steps.default.outputs.node-version }}
           labels: ${{ steps.meta.outputs.labels }}
