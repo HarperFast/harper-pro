@@ -1,11 +1,13 @@
 import { expect } from 'chai';
 import {
 	appendFileSync,
+	closeSync,
 	cpSync,
 	existsSync,
 	linkSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
@@ -774,6 +776,64 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 
 		it('exits 2 on a usage error', () => {
 			expect(run().status).to.equal(2);
+		});
+	});
+
+	describe('aborted transactions', () => {
+		// marks the first entry of each listed transaction the way rocksdb-js's abort writer does
+		async function writeWithAborted(transactions, abortedIndexes) {
+			const databasePath = newDatabase();
+			await writeTransactions(databasePath, transactions);
+			const file = join(logDir(databasePath), '1.txnlog');
+			const bytes = readFileSync(file);
+			const offsets = entryOffsets(file);
+			let entry = 0;
+			transactions.forEach(([, records], index) => {
+				if (abortedIndexes.includes(index)) bytes[offsets[entry] + 12] |= 2;
+				entry += records.length;
+			});
+			writeFileSync(file, bytes);
+			return file;
+		}
+
+		function compactToFlags(file) {
+			const outputPath = file + '.out';
+			const fd = openSync(outputPath, 'w');
+			let scan;
+			try {
+				scan = compactLogFile(file, { output: fd });
+			} finally {
+				closeSync(fd);
+			}
+			const bytes = readFileSync(outputPath);
+			return { scan, flags: entryOffsets(outputPath).map((offset) => bytes[offset + 12]) };
+		}
+
+		it('keeps a delete whose only earlier copy belongs to an aborted transaction', async () => {
+			const file = await writeWithAborted(
+				[
+					[T, [firstDelete('z')]],
+					[T, [echoedDelete('z')]],
+				],
+				[0]
+			);
+			const { scan, flags } = compactToFlags(file);
+			expect(scan.dropped).to.equal(0);
+			expect(flags).to.deep.equal([3, 1]);
+		});
+
+		it('copies an aborted transaction verbatim, with its flag, between echoes it does not interrupt', async () => {
+			const file = await writeWithAborted(
+				[
+					[T, [firstDelete('z')]],
+					[T, [echoedDelete('z'), putOf('a', T)]],
+					[T, [echoedDelete('z')]],
+				],
+				[1]
+			);
+			const { scan, flags } = compactToFlags(file);
+			expect(scan.dropped).to.equal(1);
+			expect(flags).to.deep.equal([1, 2, 1]);
 		});
 	});
 
