@@ -67,6 +67,8 @@ export interface LogPosition {
 export interface FileScan {
 	entries: number;
 	kept: number;
+	/** Entries of aborted transactions, all kept; an abort-aware reader skips them. */
+	aborted: number;
 	dropped: number;
 	bytesIn: number;
 	bytesOut: number;
@@ -230,6 +232,7 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 		const scan: FileScan = {
 			entries: 0,
 			kept: 0,
+			aborted: 0,
 			dropped: 0,
 			bytesIn: 0,
 			bytesOut: 0,
@@ -279,7 +282,6 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 			if (timestamp > scan.latestTimestamp) scan.latestTimestamp = timestamp;
 			scan.entries++;
 			scan.bytesIn += entrySize;
-			// rocksdb-js's reader rule: a transaction starts after a last entry, at a new timestamp, or at an aborted flag
 			if (lastFlags & LAST_FLAG || timestamp !== previousTimestamp || flags & ABORTED_FLAG)
 				inAborted = (flags & ABORTED_FLAG) !== 0;
 			lastFlags = flags;
@@ -296,7 +298,7 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 			spanIn += entrySize;
 			let drop = false;
 			const data = bytes.subarray(ENTRY_HEADER_SIZE);
-			// an aborted transaction never committed: it neither echoes nor is echoed, and is kept verbatim with its flag
+			if (inAborted) scan.aborted++;
 			const decoded = inAborted ? undefined : decodeEntry(data);
 			if (decoded) {
 				const replicated = data.subarray(decoded.replicatedStart);
@@ -1005,7 +1007,7 @@ function readBack(databasePath: string, stores: LogStore[], manifest: Manifest):
 		// a refused file may hold a tail the reader stops at, so only fully planned logs have a known count
 		if (store.files.some((file) => !file.scan)) continue;
 		expected[entry.name] = store.files.reduce(
-			(sum, file) => sum + (isTarget(file) ? file.scan.kept : file.scan.entries),
+			(sum, file) => sum + (isTarget(file) ? file.scan.kept : file.scan.entries) - file.scan.aborted,
 			0
 		);
 	}
