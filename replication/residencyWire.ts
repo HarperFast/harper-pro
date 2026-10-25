@@ -31,7 +31,7 @@ export class ResidencyWireReferences {
 		const key = `${snapshot.digest}:${slot}:${capable ? '' : JSON.stringify(owners)}`;
 		let id = this.references.get(key);
 		if (id !== undefined) return id;
-		if (this.nextId > 0xffffffff) throw new Error('Residency wire references exhausted; reconnect');
+		if (this.nextId > 0xffffffff) throw new Error('Sharding wire references exhausted; reconnect');
 		id = this.nextId++;
 		this.references.set(key, id);
 		send(capable ? { slot, mapVersion: snapshot.version, mapDigest: snapshot.digest } : owners, id);
@@ -75,17 +75,17 @@ export function resolveSlotReference(
 	const { snapshot } = getResidencyMap(table.databaseName, table.residency.slots);
 	if (mapVersion !== snapshot.version || mapDigest !== snapshot.digest) {
 		if (!advertised || advertised.version !== mapVersion || advertised.digest !== mapDigest)
-			throw new Error(`Unknown residency map ${mapVersion}/${mapDigest} for ${table.databaseName}`);
+			throw new Error(`Unknown shard map ${mapVersion}/${mapDigest} for ${table.databaseName}`);
 		let agreement = compatibleSnapshots.get(advertised);
 		if (agreement?.current !== snapshot) {
 			agreement = { current: snapshot, compatible: residencyMapExtends(advertised, snapshot) };
 			compatibleSnapshots.set(advertised, agreement);
 		}
 		if (!agreement.compatible || !Number.isInteger(slot) || slot < 0 || slot >= advertised.slots)
-			throw new Error(`Incompatible residency map ${mapVersion}/${mapDigest} for ${table.databaseName}`);
+			throw new Error(`Incompatible shard map ${mapVersion}/${mapDigest} for ${table.databaseName}`);
 	}
 	if (!Number.isInteger(slot) || slot < 0 || slot >= table.residency.slots)
-		throw new Error(`Missing or invalid record residency slot for ${table.databaseName}.${table.tableName}`);
+		throw new Error(`Missing or invalid record sharding slot for ${table.databaseName}.${table.tableName}`);
 	if (!table.residency.byAttribute && table.getResidencySlot(id) !== slot)
 		throw new Error(`Peer sent an incorrect key-derived slot for ${table.databaseName}.${table.tableName}`);
 	return slot;

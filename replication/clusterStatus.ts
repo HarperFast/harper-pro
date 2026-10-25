@@ -100,7 +100,7 @@ export async function clusterStatus() {
 	// removed node's hdb_nodes delete propagates to onNodeUpdate(null) the peer is dropped and this flips.
 	response.is_enabled = response.connections.length > 0;
 
-	response.residency = residencyStatus();
+	response.sharding = residencyStatus();
 	return response;
 }
 export function applySharedStatus(socket, replicationSharedStatus: Float64Array) {

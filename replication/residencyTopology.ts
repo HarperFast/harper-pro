@@ -91,7 +91,7 @@ export function recordResidencyConfiguration(peer: string, digest: unknown): voi
 	const status = agreement(peer);
 	Atomics.store(status, 0, mismatch ? 1 : 0);
 	if (mismatch && Atomics.compareExchange(status, 1, 0, 1) === 0)
-		logger.warn?.(`Declarative residency blocked: replication.shards differs from peer ${peer}`);
+		logger.warn?.(`Sharding blocked: replication.shards differs from peer ${peer}`);
 }
 
 export function recordResidencyMapAgreement(database: string, peer: string, error?: unknown): void {
@@ -99,7 +99,7 @@ export function recordResidencyMapAgreement(database: string, peer: string, erro
 	if (error) Atomics.or(status, 0, 1);
 	else Atomics.and(status, 0, ~1);
 	if (error && !(Atomics.or(status, 1, 1) & 1))
-		logger.warn?.(`Declarative residency blocked for ${database}: map from ${peer} could not be installed`, error);
+		logger.warn?.(`Sharding blocked for ${database}: map from ${peer} could not be installed`, error);
 }
 
 export function recordResidencyPolicyAgreement(database: string, peer: string, error?: unknown): void {
@@ -107,7 +107,7 @@ export function recordResidencyPolicyAgreement(database: string, peer: string, e
 	if (error) Atomics.or(status, 0, 2);
 	else Atomics.and(status, 0, ~2);
 	if (error && !(Atomics.or(status, 1, 2) & 2))
-		logger.warn?.(`Declarative residency blocked for ${database}: policy from ${peer} could not be installed`, error);
+		logger.warn?.(`Sharding blocked for ${database}: policy from ${peer} could not be installed`, error);
 }
 
 export function residencyTopologyErrors(database?: string): string[] {
@@ -116,8 +116,8 @@ export function residencyTopologyErrors(database?: string): string[] {
 		if (Atomics.load(agreement(node.name), 0)) errors.push(`replication.shards differs from peer ${node.name}`);
 		if (database) {
 			const flags = Atomics.load(agreement(node.name, database), 0);
-			if (flags & 1) errors.push(`residency map agreement with ${node.name} is blocked`);
-			if (flags & 2) errors.push(`residency policy agreement with ${node.name} is blocked`);
+			if (flags & 1) errors.push(`shard map agreement with ${node.name} is blocked`);
+			if (flags & 2) errors.push(`sharding policy agreement with ${node.name} is blocked`);
 		}
 	}
 	return errors;
@@ -125,8 +125,7 @@ export function residencyTopologyErrors(database?: string): string[] {
 
 setResidencyPlacementGuard((database, owners, requireConnected) => {
 	const errors = residencyTopologyErrors(database);
-	if (errors.length)
-		throw new ResidencyPlacementError(`Declarative residency blocked for ${database}: ${errors.join('; ')}`, 503);
+	if (errors.length) throw new ResidencyPlacementError(`Sharding blocked for ${database}: ${errors.join('; ')}`, 503);
 	if (requireConnected === undefined || !owners || owners.includes(server.hostname)) return;
 	const recipients = getReplicationRecipients(database);
 	const reachable = recipients.filter((node) => owners.includes(node.name));
@@ -136,14 +135,14 @@ setResidencyPlacementGuard((database, owners, requireConnected) => {
 		const auditStore = Object.values(databases[database] ?? {}).find((Table) => Table.auditStore)?.auditStore;
 		if (!auditStore || !reachable.some((node) => residencySenderConnected(auditStore, database, node.name)))
 			throw new ResidencyPlacementError(
-				`No new residency owner is connected for ${database}; attribute-slot change refused`,
+				`No new shard owner is connected for ${database}; attribute-slot change refused`,
 				503
 			);
 	}
 });
 
 server.registerOperation?.({
-	name: 'initialize_residency_slots',
+	name: 'initialize_shard_map',
 	execute: initializeResidencySlots,
 	httpMethod: 'POST',
 	requiresSuperUser: true,
@@ -171,7 +170,7 @@ export function residencyStatus() {
 			errors.push('replication.shard is not in replication.shards');
 		else if (!configuration.shards && !snapshot)
 			errors.push('replication.shards is required before a map is installed');
-		if (!snapshot) errors.push('no residency map is installed');
+		if (!snapshot) errors.push('no shard map is installed');
 		status[database] = {
 			version: snapshot?.version,
 			digest: snapshot?.digest,
@@ -186,14 +185,14 @@ export function residencyStatus() {
 export function registerResidencyConversion() {
 	if (isDedicatedPoolWorker() || getWorkerIndex() === undefined) return;
 	server.registerOperation({
-		name: 'verify_residency_slots',
+		name: 'verify_shard_map',
 		httpMethod: 'POST',
 		requiresSuperUser: true,
 		execute(request) {
 			const Table = databases[request.database]?.[request.table];
 			if (!Table) throw new ClientError('Table not found', 404);
 			const snapshot = readResidencyMap(request.database);
-			if (!snapshot) throw new ClientError('Install the custom residency map before comparing placement', 409);
+			if (!snapshot) throw new ClientError('Install the custom shard map before comparing placement', 409);
 			return compareResidencyPlacement(Table, request.policy, snapshot);
 		},
 	});

@@ -824,7 +824,7 @@ const confirmationTimeouts = new Map<boolean, { raw: unknown; fallback: number; 
 const warnedConfirmationTimeouts = new Set<string>();
 function replicationConfirmationTimeout(automatic = false): number {
 	const key = automatic
-		? CONFIG_PARAMS.REPLICATION_RESIDENCYCONFIRMATIONTIMEOUT
+		? CONFIG_PARAMS.REPLICATION_SHARDINGCONFIRMATIONTIMEOUT
 		: CONFIG_PARAMS.REPLICATION_CONFIRMATIONTIMEOUT;
 	const raw = env.get(key);
 	const blobTimeout = Number(env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT));

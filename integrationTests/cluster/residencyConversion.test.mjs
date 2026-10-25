@@ -98,7 +98,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			}
 			await settle();
 			await sendOperation(nodes()[0], {
-				operation: 'initialize_residency_slots',
+				operation: 'initialize_shard_map',
 				database: 'data',
 				slots: 10,
 				ranges: [
@@ -114,7 +114,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 								await sendOperation(
 									nodes()[1],
 									{
-										operation: 'verify_residency_slots',
+										operation: 'verify_shard_map',
 										database: 'data',
 										table: 'Converted',
 										policy: { slots: 10, slotFrom: 'Number(id.slice(-1))' },
@@ -131,7 +131,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			);
 			for (const node of nodes()) {
 				const report = await sendOperation(node, {
-					operation: 'verify_residency_slots',
+					operation: 'verify_shard_map',
 					database: 'data',
 					table: 'Converted',
 					policy: { slots: 10, slotFrom: 'Number(id.slice(-1))' },
@@ -153,7 +153,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 						declared
 							? schema.replace(
 									'type Converted @table',
-									'type Converted @residency(slots: 10, slotFrom: "Number(id.slice(-1))") @table'
+									'type Converted @sharded(slots: 10, slotFrom: "Number(id.slice(-1))") @table'
 								)
 							: schema
 					);

@@ -78,7 +78,7 @@ async function processed(socket, allowClose = false) {
 	}
 }
 
-describe('residency setup authority', function () {
+describe('sharding setup authority', function () {
 	this.timeout(10_000);
 	before(() => setHdbBasePath(process.env.STORAGE_PATH));
 	afterEach(() => {
@@ -783,6 +783,59 @@ describe('residency setup authority', function () {
 		}
 	});
 
+	for (const [localSlot, remoteSlot] of [
+		[0, 1],
+		[1, 0],
+	])
+		it(`carries the explicit expression in setup and refuses disagreement ${localSlot} -> ${remoteSlot}`, async () => {
+			const database = `sharded_expression_agreement_${localSlot}`;
+			const map = snapshot(database);
+			await installResidencyMap(map);
+			const expression = (slot) => `region === 'asia' ? ${slot} : ${1 - slot}`;
+			const policy = { slots: 2, by: 'region', byAttribute: true, slotFrom: expression(localSlot) };
+			const Records = table({
+				database,
+				table: 'Rows',
+				audit: true,
+				residency: policy,
+				attributes: [
+					{ name: 'id', isPrimaryKey: true },
+					{ name: 'region', type: 'String', indexed: true },
+				],
+			});
+			const priorNodes = server.nodes;
+			server.nodes = [{ name: 'slot-setup-peer' }];
+			try {
+				const socket = await connect(database, { name: 'slot-setup-peer', replicates: true });
+				const advertised = socket.sent
+					.find((frame) => frame[0] === 140)[3]
+					.find((definition) => definition.table === 'Rows');
+				assert.deepEqual(advertised.residency, policy, 'setup carries both by and the exact expression');
+				socket.emit(
+					'message',
+					encode([
+						145,
+						[
+							{
+								table: 'Rows',
+								residency: { ...policy, slotFrom: expression(remoteSlot) },
+								attributes: Records.attributes,
+							},
+						],
+						database,
+						undefined,
+						[],
+						{ snapshot: map, shardsDigest: null },
+					])
+				);
+				await processed(socket, true);
+				assert.ok(socket.closes.length, 'expression disagreement closes the stream before applying records');
+				assert.ok(residencyTopologyErrors(database).some((error) => error.includes('policy')));
+				assert.deepEqual(Records.residency, policy);
+			} finally {
+				server.nodes = priorNodes;
+			}
+		});
 	for (const system of [false, true])
 		for (const conflict of ['different', 'missing'])
 			it(`reports a ${conflict} table-policy conflict on ${system ? 'system' : 'database'} setup and clears it only with matching policy setup`, async () => {
@@ -818,7 +871,7 @@ describe('residency setup authority', function () {
 					assert.ok(residencyTopologyErrors(database).length, 'the policy conflict blocks placement visibly');
 					const retry = await connect(system ? 'system' : database, { name: 'slot-setup-peer', replicates: true });
 					await sendMap(retry, database, map);
-					await turns();
+					await processed(retry);
 					assert.ok(residencyTopologyErrors(database).length, 'map agreement alone cannot clear a policy conflict');
 					retry.emit('message', encode(frame(policy)));
 					await processed(retry);

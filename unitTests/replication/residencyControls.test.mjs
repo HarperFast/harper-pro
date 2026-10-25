@@ -2,6 +2,7 @@ import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
 import { readdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { inflateSync } from 'node:zlib';
 import { decode, encode } from 'msgpackr';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
@@ -15,9 +16,13 @@ import { createBlob, getFileId, getFilePathForBlob } from '#src/core/resources/b
 import { writeLockBarrier } from '#src/core/resources/recordLockCoordinator';
 import {
 	initializeResidencySlots,
+	installResidencyMap,
+	getResidencyMapTable,
+	acquireResidencyMapFence,
 	getResidencyConfiguration,
 	requireConnectedResidencyOwner,
 } from '#src/core/resources/residencyMaps';
+import { createResidencyMap } from '#src/core/resources/residencyPolicy';
 import { setReplicator } from '#src/replication/replicator';
 import {
 	databaseSubscriptions,
@@ -29,6 +34,7 @@ import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
 import { residencyTopologyErrors, registerResidencySender } from '#src/replication/residencyTopology';
 import { FrameWriter } from '#src/replication/frameWriter';
+import { hasActiveBlobSends } from '#src/replication/blobSendDrain';
 
 class Socket extends EventEmitter {
 	readyState = 1;
@@ -132,10 +138,11 @@ describe('Declarative tables keep control and event traffic independent of place
 		legacy = false,
 		capabilities = buildLocalCapabilities(90_000, true, true),
 		beforeConnect,
-		connection
+		connection,
+		ranges = [{ start: 0, end: 2, shard: 0 }]
 	) {
 		const database = `slot_control_${direction}_${byAttribute}`;
-		await initializeResidencySlots({ database, slots: 2, ranges: [{ start: 0, end: 2, shard: 0 }] });
+		await initializeResidencySlots({ database, slots: 2, ranges });
 		const Records = table({
 			database,
 			table: 'Records',
@@ -254,6 +261,91 @@ describe('Declarative tables keep control and event traffic independent of place
 		await until(() => cursor() === version);
 		assert.deepEqual(repaired.closes, []);
 	});
+	for (const failure of ['busy', 'fork'])
+		it(`holds the cursor for ${failure} maps despite subsequent system frames, beyond the poison budget`, async () => {
+			const database = `sharded_system_hold_${failure}`;
+			await initializeResidencySlots({ database, slots: 2, ranges: [{ start: 0, end: 2, shard: 0 }] });
+			const Maps = getResidencyMapTable();
+			const Probe = table({
+				database: 'system',
+				table: `sharded_hold_probe_${failure}`,
+				audit: true,
+				attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'body' }],
+			});
+			setReplicator('system', Maps, {});
+			setReplicator('system', Probe, {});
+			await until(() => databaseSubscriptions.get('system')?.auditStore);
+			const peer = `sharded-map-peer-${failure}`;
+			const remoteId = getIdOfRemoteNode(peer, Maps.auditStore);
+			const cursor = () => Maps.dbisDB.getSync([Symbol.for('seq'), remoteId])?.seqId;
+			const before = cursor();
+			const candidate = createResidencyMap(database, 2, [{ start: 0, end: 2, shard: 1 }], failure === 'fork' ? 1 : 2);
+			const version = Date.now() + 1000;
+			const mapFrame = recordFrame(Maps, 'put', database, candidate, version);
+			const laterFrame = recordFrame(Probe, 'put', 'later', { id: 'later', body: 'system update' }, version + 1);
+			let release = failure === 'busy' ? acquireResidencyMapFence(database, {}) : undefined;
+			async function deliver() {
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+				const socket = new Socket();
+				sockets.push(socket);
+				connection.socket = socket;
+				replicateOverWS(socket, { connection }, { name: peer, replicates: true });
+				socket.emit(
+					'message',
+					encode([
+						140,
+						peer,
+						'system',
+						[],
+						buildLocalCapabilities(90000, false, false),
+						{ shardsDigest: getResidencyConfiguration().digest },
+					])
+				);
+				await until(() => socket.sent.some((frame) => frame[0] === 140) || socket.closes.length);
+				assert.deepEqual(socket.closes, [], 'handshake reaches the actual map apply');
+				socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+				for (const Rows of [Maps, Probe])
+					socket.emit(
+						'message',
+						encode([
+							132,
+							{
+								structures: Rows.primaryStore.encoder.structures,
+								typedStructs: Rows.primaryStore.encoder.typedStructs,
+								attributes: Rows.attributes,
+							},
+							Rows.tableId,
+							Rows.tableName,
+						])
+					);
+				socket.emit('message', mapFrame);
+				socket.emit('message', laterFrame);
+				return socket;
+			}
+			try {
+				for (let attempt = 0; attempt < 7; attempt++) {
+					const socket = await deliver();
+					await until(() => socket.closes.length);
+					assert.ok(socket.closes.length, `attempt ${attempt + 1} must hold the map`);
+					assert.equal(cursor(), before);
+				}
+			} finally {
+				release?.();
+				release = undefined;
+			}
+			if (failure === 'fork')
+				await initializeResidencySlots({
+					database,
+					slots: 2,
+					ranges: candidate.ranges,
+				});
+			const repaired = await deliver();
+			await until(() => Probe.primaryStore.getEntry('later')?.value?.body === 'system update');
+			await until(() => cursor() === version + 1);
+			assert.deepEqual(repaired.closes, []);
+			assert.deepEqual(Maps.primaryStore.getSync(database).ranges, candidate.ranges);
+		});
 	it('preserves an explicitly missing legacy residency list', async () => {
 		const { Records, socket } = await connect(false, 'legacy_missing_list', true);
 		const frame = recordFrame(Records, 'put', 'legacy-row', { id: 'legacy-row', body: 'complete' }, Date.now(), 42);
@@ -435,6 +527,116 @@ describe('Declarative tables keep control and event traffic independent of place
 					server.shards = prior;
 				}
 			});
+
+	it('copies an owner blob and a non-owner replica projection in the same walk', async () => {
+		const priorShards = server.shards;
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'third-slot-owner', replicates: true }];
+		const priorList = env.get('replication_shards');
+		env.setProperty('replication_shards', [0, 1]);
+		server.shards = new Map([
+			[0, [{ name: server.hostname }, { name: 'slot-control-peer' }]],
+			[1, [{ name: 'third-slot-owner' }]],
+		]);
+		try {
+			const { socket, database } = await connect(false, 'mixed_blob_copy', false, undefined, undefined, undefined, [
+				{ start: 0, end: 1, shard: 0 },
+				{ start: 1, end: 2, shard: 1 },
+			]);
+			const Blobs = table({
+				database,
+				table: 'Blobs',
+				audit: true,
+				replicaExpiration: 3600,
+				residency: { slots: 2, slotFrom: 'id.length % 2' },
+				attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'tag', indexed: true }, { name: 'body' }],
+			});
+			setReplicator(database, Blobs, {});
+			await Blobs.put('a', { id: 'a', tag: 'projected', body: createBlob(Buffer.alloc(32768, 11)) });
+			const ownerPayload = Buffer.alloc(32768, 29);
+			await Blobs.put('bb', { id: 'bb', tag: 'owned', body: createBlob(ownerPayload), extra: { shape: 'new' } });
+			socket.emit(
+				'message',
+				encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
+			);
+			await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			await until(() => !hasActiveBlobSends());
+			const copied = entries(socket);
+			const projection = copied.find((entry) => entry.recordId === 'a');
+			assert.equal(projection?.type, 'invalidate');
+			assert.equal(projection.getValue(Blobs.primaryStore).tag, 'projected');
+			assert.equal(projection.getValue(Blobs.primaryStore).body, undefined);
+			const owner = copied.find((entry) => entry.recordId === 'bb');
+			assert.equal(owner?.type, 'put');
+			const value = owner.getValue(Blobs.primaryStore);
+			assert.deepEqual(value.extra, { shape: 'new' });
+			const chunks = socket.sent.filter((frame) => frame[0] === 146);
+			assert.ok(chunks.length > 0);
+			assert.ok(
+				chunks.every((frame) => frame[1].fileId === getFileId(value.body)),
+				'only the owner body starts a transfer, including audit catch-up'
+			);
+			const transfer = chunks.filter((frame) => frame[1].transferId === value.body.replicationTransferId);
+			assert.ok(transfer.some((frame) => frame[1].finished));
+			const bytes = Buffer.concat(transfer.map((frame) => frame[2]));
+			assert.deepEqual(transfer[0][1].codec === 'deflate' ? inflateSync(bytes) : bytes, ownerPayload);
+		} finally {
+			server.shards = priorShards;
+			server.nodes = priorNodes;
+			env.setProperty('replication_shards', priorList);
+		}
+	});
+
+	for (const indexed of [false, true])
+		for (const owner of [false, true])
+			for (const slotsCapable of [false, true])
+				it(`copies blob bytes only to owners (indexed=${indexed}, owner=${owner}, slots=${slotsCapable})`, async () => {
+					const { socket, database } = await connect(false, `blob_copy_${indexed}_${owner}_${slotsCapable}`, false, {
+						...buildLocalCapabilities(90_000, false, true),
+						residencySlots: slotsCapable ? 1 : 0,
+					});
+					const Blobs = table({
+						database,
+						table: 'Blobs',
+						audit: true,
+						residency: { slots: 2, slotFrom: '0' },
+						attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'tag', indexed }, { name: 'body' }],
+					});
+					setReplicator(database, Blobs, {});
+					const payload = Buffer.alloc(32768, 73);
+					await Blobs.put('blob', { id: 'blob', tag: 'projected', body: createBlob(payload) });
+					const prior = server.shards;
+					if (owner) server.shards = new Map([[0, [{ name: server.hostname }, { name: 'slot-control-peer' }]]]);
+					try {
+						socket.emit(
+							'message',
+							encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
+						);
+						await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+						assert.deepEqual(socket.closes, []);
+						await until(() => !hasActiveBlobSends());
+						const chunks = socket.sent.filter((frame) => frame[0] === 146);
+						const copied = entries(socket).find((entry) => entry.recordId === 'blob');
+						if (owner) {
+							assert.equal(copied?.type, 'put');
+							const transferId = copied.getValue(Blobs.primaryStore).body.replicationTransferId;
+							const transfer = chunks.filter((frame) => frame[1].transferId === transferId);
+							assert.ok(transfer.some((frame) => frame[1].finished));
+							const bytes = Buffer.concat(transfer.map((frame) => frame[2]));
+							assert.deepEqual(transfer[0][1].codec === 'deflate' ? inflateSync(bytes) : bytes, payload);
+						} else {
+							assert.equal(chunks.length, 0, 'a projection or omitted row must not leave an unclaimed blob transfer');
+							if (indexed) {
+								assert.equal(copied?.type, 'invalidate');
+								assert.equal(copied.getValue(Blobs.primaryStore).tag, 'projected');
+								assert.equal(copied.getValue(Blobs.primaryStore).body, undefined);
+							} else assert.equal(copied, undefined);
+						}
+					} finally {
+						server.shards = prior;
+					}
+				});
 
 	for (const closeNewest of [false, true])
 		it(`keeps an eligible sending route when overlapping sockets close (newest=${closeNewest})`, async () => {
@@ -721,7 +923,7 @@ describe('Declarative tables keep control and event traffic independent of place
 		}
 	});
 
-	it('sends an extended map before a reference using its new version on an active stream', async () => {
+	it('sends a newer map before a reference using its version on an active stream', async () => {
 		const { Records, socket, database } = await connect(false, 'extension');
 		socket.emit(
 			'message',
@@ -731,7 +933,8 @@ describe('Declarative tables keep control and event traffic independent of place
 		await Records.put('before', { id: 'before', region: 0, body: 'complete' });
 		await until(() => entries(socket).some((entry) => entry.recordId === 'before'));
 		const from = socket.sent.length;
-		const extended = await initializeResidencySlots({ database, slots: 4, ranges: [{ start: 0, end: 4, shard: 0 }] });
+		const extended = createResidencyMap(database, 2, [{ start: 0, end: 2, shard: 0 }], 2);
+		await installResidencyMap(extended);
 		await Records.put('after', { id: 'after', region: 0, body: 'complete' });
 		await until(() => entries(socket).some((entry) => entry.recordId === 'after') || socket.closes.length);
 		assert.deepEqual(socket.closes, []);

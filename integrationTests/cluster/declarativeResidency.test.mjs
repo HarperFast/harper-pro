@@ -49,7 +49,7 @@ async function put(node, table, body) {
 }
 const rawRows = (node, table, signal) => get(node, `SlotLocalRows/?table=${table}`, signal);
 
-suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 600_000 }, (ctx) => {
+suite(`Sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 600_000 }, (ctx) => {
 	const contexts = SHARDS.map(() => ({ name: ctx.name }));
 	const nodes = () => contexts.map((context) => context.harper);
 	let barrier = 0;
@@ -99,7 +99,7 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 							pingInterval: 500,
 							pingTimeout: 3000,
 							confirmationTimeout: 2000,
-							residencyConfirmationTimeout: 15000,
+							shardingConfirmationTimeout: 15000,
 							databases: '*',
 						},
 					},
@@ -131,7 +131,7 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 							connection.database_sockets.some((socket) => socket.database === 'data' && socket.connected)
 						)
 				),
-			{ description: 'four-node declarative residency mesh connected' }
+			{ description: 'four-node sharding mesh connected' }
 		);
 		await barriers();
 	});
@@ -163,20 +163,65 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 				assert.ok(entry.flags & 1);
 			}
 			assert.equal(entry?.residencyId, undefined);
-			assert.equal(entry?.slot, table === 'SlotAttributes' ? slot : undefined);
+			assert.equal(entry?.slot, ['SlotAttributes', 'SlotTenant', 'SlotRegional'].includes(table) ? slot : undefined);
 		}
 	}
+
+	test('hashes string and numeric tenant values identically on every node and preserves affinity', async () => {
+		for (const value of ['tenant-a', 42]) {
+			const placement = await Promise.all(
+				nodes().map((node) =>
+					get(node, `SlotPolicy/?table=SlotTenant&id=probe&value=${encodeURIComponent(JSON.stringify(value))}`)
+				)
+			);
+			const slot = placement[0].slot;
+			assert.ok(placement.every((entry) => entry.slot === slot && entry.policy.slots === 10));
+			if (typeof value === 'string') {
+				const keyPlacement = await Promise.all(
+					nodes().map((node) => get(node, `SlotPolicy/?table=SlotHash&id=${encodeURIComponent(value)}`))
+				);
+				assert.ok(
+					keyPlacement.every((entry) => entry.slot === slot),
+					'key and attribute values use the same hash'
+				);
+			}
+			for (const [index, writer] of nodes().entries()) {
+				const id = `tenant-${value}-${index}`;
+				await put(writer, 'SlotTenant', { id, tenantId: value, body: id });
+				await checkPlacement('SlotTenant', id, slot, id);
+			}
+		}
+	});
+
+	test('compiled region expressions select separate logical slots and shards on every node', async () => {
+		for (const [region, slot] of [
+			['asia', 1],
+			['europe', 2],
+		]) {
+			const placement = await Promise.all(
+				nodes().map((node) =>
+					get(node, `SlotPolicy/?table=SlotRegional&id=probe&value=${encodeURIComponent(JSON.stringify(region))}`)
+				)
+			);
+			assert.ok(placement.every((entry) => entry.slot === slot));
+			for (const [index, writer] of nodes().entries()) {
+				const id = `region-${region}-${index}`;
+				await put(writer, 'SlotRegional', { id, region, body: id });
+				await checkPlacement('SlotRegional', id, slot, id);
+			}
+		}
+	});
 
 	test('initialization retries and legacy placement comparison work through the operations API', async () => {
 		const ranges = Array.from({ length: 10 }, (_, start) => ({ start, end: start + 1, shard: start % 2 }));
 		const installed = await sendOperation(nodes()[0], {
-			operation: 'initialize_residency_slots',
+			operation: 'initialize_shard_map',
 			database: 'data',
 			slots: 10,
 			ranges,
 		});
 		const retry = await sendOperation(nodes()[1], {
-			operation: 'initialize_residency_slots',
+			operation: 'initialize_shard_map',
 			database: 'data',
 			slots: 10,
 			ranges,
@@ -188,7 +233,7 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 		await barriers();
 		for (const node of nodes()) {
 			const result = await sendOperation(node, {
-				operation: 'verify_residency_slots',
+				operation: 'verify_shard_map',
 				database: 'data',
 				table: 'SlotLegacy',
 				policy: { slots: 10, slotFrom: 'Number(id.slice(-1))' },
@@ -399,7 +444,7 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 	});
 });
 
-suite('Declarative residency with mismatched shard lists', { timeout: 300_000 }, (ctx) => {
+suite('Sharding with mismatched shard lists', { timeout: 300_000 }, (ctx) => {
 	const contexts = [0, 1].map(() => ({ name: ctx.name }));
 	const nodes = () => contexts.map((context) => context.harper);
 	before(async () => {
@@ -442,8 +487,8 @@ suite('Declarative residency with mismatched shard lists', { timeout: 300_000 },
 					await Promise.all(nodes().map((node) => sendOperation(node, { operation: 'cluster_status' }, { signal })))
 				).every(
 					(status) =>
-						status.residency?.data?.blocked &&
-						status.residency.data.errors.some((error) => error.includes('replication.shards differs'))
+						status.sharding?.data?.blocked &&
+						status.sharding.data.errors.some((error) => error.includes('replication.shards differs'))
 				),
 			{ description: 'both nodes report shard-list disagreement' }
 		);
@@ -460,7 +505,7 @@ suite('Declarative residency with mismatched shard lists', { timeout: 300_000 },
 	});
 });
 
-suite('Declarative residency quarantine on restart', { timeout: 300_000 }, (ctx) => {
+suite('Sharding quarantine on restart', { timeout: 300_000 }, (ctx) => {
 	const context = { name: ctx.name };
 	const peerContext = { name: ctx.name };
 	async function prepare(target) {
@@ -570,8 +615,8 @@ suite('Declarative residency quarantine on restart', { timeout: 300_000 }, (ctx)
 		assert.notEqual(await readNodePid(context.harper), priorPid);
 		const node = context.harper;
 		const status = await sendOperation(node, { operation: 'cluster_status' });
-		assert.equal(status.residency.data.blocked, true);
-		assert.match(status.residency.data.errors.join(' '), /replication.shard/);
+		assert.equal(status.sharding.data.blocked, true);
+		assert.match(status.sharding.data.errors.join(' '), /replication.shard/);
 		const rows = await sendOperation(node, {
 			operation: 'search_by_id',
 			database: 'healthy',
@@ -642,6 +687,6 @@ suite('Declarative residency quarantine on restart', { timeout: 300_000 }, (ctx)
 			},
 			{ description: 'repaired database resumes the held peer write' }
 		);
-		assert.equal((await sendOperation(context.harper, { operation: 'cluster_status' })).residency.data.blocked, false);
+		assert.equal((await sendOperation(context.harper, { operation: 'cluster_status' })).sharding.data.blocked, false);
 	});
 });

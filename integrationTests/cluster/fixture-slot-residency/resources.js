@@ -19,7 +19,9 @@ export class SlotLocalRows extends Resource {
 export class SlotPolicy extends Resource {
 	get(target) {
 		const table = tables[target.get('table')];
-		return { policy: table.residency, slot: table.getResidencySlot(target.get('id')) };
+		const value = target.get('value');
+		const record = value === undefined ? undefined : { [table.residency.by]: JSON.parse(value) };
+		return { policy: table.residency, slot: table.getResidencySlot(target.get('id'), record) };
 	}
 }
 

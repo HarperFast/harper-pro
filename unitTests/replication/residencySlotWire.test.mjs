@@ -10,7 +10,7 @@ import {
 } from '#src/core/resources/auditStore';
 import { encodeResidencyWireRecord } from '#src/replication/residencyWire';
 
-describe('Declarative residency wire headers', () => {
+describe('Sharding wire headers', () => {
 	for (const residencyId of [undefined, 42]) {
 		it(`strips an event's local slot fields without adding placement (legacy ID=${residencyId})`, () => {
 			const original = readAuditEntry(
@@ -122,7 +122,7 @@ describe('Slot reference agreement', function () {
 						mapVersion: snapshot.version,
 						mapDigest: snapshot.digest,
 					}),
-				/invalid record residency slot/
+				/invalid record sharding slot/
 			);
 	});
 
@@ -142,11 +142,8 @@ describe('Slot reference agreement', function () {
 	it('accepts an older reference only with its advertised compatible snapshot', async () => {
 		const { resolveSlotReference } = await import('#src/replication/residencyWire');
 		const old = Maps.readResidencyMap('slot_wire');
-		await Maps.initializeResidencySlots({
-			database: 'slot_wire',
-			slots: 12,
-			ranges: [{ start: 0, end: 12, shard: 0 }],
-		});
+		const { createResidencyMap } = await import('#src/core/resources/residencyPolicy');
+		await Maps.installResidencyMap(createResidencyMap('slot_wire', 10, old.ranges, old.version + 1));
 		const reference = { slot: 2, mapVersion: old.version, mapDigest: old.digest };
 		assert.equal(resolveSlotReference(Table, 'key', reference, old), 2);
 		assert.throws(() => resolveSlotReference(Table, 'key', reference), /map/);

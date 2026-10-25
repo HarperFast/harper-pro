@@ -5457,7 +5457,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// of an array that begins with the command code
 		if (databaseName && databaseResidencyBlockReason(databaseName)) {
 			wsClosed = true;
-			close(1011, 'Database residency configuration is quarantined; restart after repair');
+			close(1011, 'Database sharding configuration is quarantined; restart after repair');
 			return;
 		}
 		lastMessageTime = performance.now();
@@ -5528,7 +5528,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									databaseName = message[2];
 									if (databaseResidencyBlockReason(databaseName)) {
 										wsClosed = true;
-										close(1011, 'Database residency configuration is quarantined; restart after repair');
+										close(1011, 'Database sharding configuration is quarantined; restart after repair');
 										return;
 									}
 									setDatabase(databaseName);
@@ -5615,7 +5615,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (connectionSuperseded()) return;
 								recordResidencyMapAgreement(schemaDatabaseName, remoteNodeName, error);
 								wsClosed = true;
-								close(1011, 'residency map setup failed');
+								close(1011, 'shard map setup failed');
 								throw error;
 							}
 						}
@@ -5861,7 +5861,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// we need to keep track of the remote node's residency list by id
 						const residencyId = tableId;
 						if (!Number.isInteger(residencyId) || residencyId < 1 || residencyId > 0xffffffff)
-							throw new Error('Invalid connection residency reference');
+							throw new Error('Invalid connection sharding reference');
 						receivedResidencyLists.set(residencyId, data);
 						if (data && typeof data === 'object' && !Array.isArray(data)) {
 							const snapshot = receivedResidencyMaps.get(databaseName);
@@ -6444,7 +6444,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							!residencyIdentityBound &&
 							Object.values(databases[databaseName] ?? {}).some((Table) => Table.residency)
 						)
-							throw new Error('Declarative residency requires a configured peer identity');
+							throw new Error('Sharding requires a configured peer identity');
 						nodeSubscriptions = data;
 						excludedNodes = message[2]; // use the third argument for exclusion list
 						const subscriptionSetupRequestId = message[3];
@@ -6609,7 +6609,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
-						const sendAuditRecord = (auditRecord, cursor, subscriptionNodeId = auditRecord.nodeId) => {
+						const sendAuditRecord = (
+							auditRecord,
+							cursor,
+							subscriptionNodeId = auditRecord.nodeId,
+							encodeCopy?: () => Buffer
+						) => {
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnLogKey) {
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
@@ -6754,7 +6759,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 								}
 								if (!receiverShardKnown)
-									throw new Error(`Unknown residency shard for peer ${remoteNodeName}; holding replication`);
+									throw new Error(`Unknown shard for peer ${remoteNodeName}; holding replication`);
 								if (!residency.includes(remoteNodeName) && !hasStoredIndexes(table)) return skipAuditRecord();
 								const snapshot = readResidencyMap(table.databaseName);
 								if (
@@ -6854,6 +6859,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								);
 							}
 
+							// Copy encoding starts blob transfers and may add encoder structures. Do it only
+							// after placement selects a complete body, before advertising those structures.
+							if (!invalidationEntry && encodeCopy) wireRecord.encoded = encodeCopy();
 							const typedStructs = encoder.typedStructs;
 							const structures = encoder.structures;
 							if (
@@ -7612,10 +7620,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																previousResidencyId: null,
 																expiresAt: isReplica ? undefined : entry.expiresAt,
 															} as any);
-														const encoded =
-															entry.metadataFlags & HAS_BLOBS && copyValue === entry.value
-																? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
-																: encodeCopyRecord();
+														let encoded: Buffer | undefined;
+														const encodeCopy = () =>
+															(encoded =
+																entry.metadataFlags & HAS_BLOBS && copyValue === entry.value
+																	? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
+																	: encodeCopyRecord());
 														await sendAuditRecord(
 															{
 																// make it look like an audit record
@@ -7634,14 +7644,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																expiresAt: isReplica ? undefined : entry.expiresAt,
 															},
 															copyTxnLogKey,
-															nodeId
+															nodeId,
+															encodeCopy
 														);
 														logger.debug?.(
 															'sent record from table',
 															entry.key,
 															'length:',
-															encoded.length,
-															encoded.slice(0, 10)
+															encoded?.length,
+															encoded?.slice(0, 10)
 														);
 														// Periodically flush the accumulated records as a message so the follower commits this
 														// batch and advances its resume cursor. This is a plain flush with NO sequence update:
@@ -7948,7 +7959,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
 			if (!residencyIdentityBound && Object.values(databases[databaseName] ?? {}).some((Table) => Table.residency))
-				throw new Error('Declarative residency requires a configured peer identity');
+				throw new Error('Sharding requires a configured peer identity');
 			if (!(await whenSubscriptionResolved())) return;
 			if (connectionSuperseded()) return;
 			// The origin's log key for every record in this body, read once. It is what the apply
@@ -8151,8 +8162,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							!receivedResidencyLists.has(auditRecord.residencyId))
 					) {
 						wsClosed = true;
-						close(1011, 'unknown residency reference');
-						throw new Error('Unknown connection residency reference; holding replication cursor');
+						close(1011, 'unknown sharding reference');
+						throw new Error('Unknown connection sharding reference; holding replication cursor');
 					}
 					logger.trace?.(
 						connectionId,
@@ -8359,7 +8370,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (Table.residency.byAttribute) residencySlot = slot;
 						} else if (Table.residency.byAttribute) {
 							if (auditRecord.type !== 'put')
-								throw new Error('An attribute residency update requires a slot-capable sender or a complete record');
+								throw new Error('An attribute sharding update requires a slot-capable sender or a complete record');
 							residencySlot = Table.getResidencySlot(id, event.value);
 						}
 						if (
@@ -8378,7 +8389,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (connectionSuperseded()) return;
 						if (error.statusCode !== 503) recordResidencyMapAgreement(databaseName, remoteNodeName, error);
 						wsClosed = true;
-						close(1011, 'residency agreement failed');
+						close(1011, 'sharding agreement failed');
 						throw error;
 					}
 				}
@@ -9881,12 +9892,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	function authorizeResidencySchema(targetDatabase: string): boolean {
 		if (!residencyIdentityBound)
-			throw new Error('Residency metadata requires an authenticated or configured node identity');
+			throw new Error('Sharding metadata requires an authenticated or configured node identity');
 		if (databaseName && databaseName !== 'system' && databaseName !== targetDatabase)
-			throw new Error('Residency metadata does not belong to an authorized database frame');
+			throw new Error('Sharding metadata does not belong to an authorized database frame');
 		const superUser = authorization?.role?.permission?.super_user;
 		if (!superUser && !(authorization?.name || authorization?.replicates))
-			throw new Error('Only an authorized replication peer may declare residency policies');
+			throw new Error('Only an authorized replication peer may declare sharding policies');
 		const subscription = options.connection?.nodeSubscriptions?.[0];
 		const configuredRoute = Array.from(iterateRoutes(options)).find((route) => route.name === remoteNodeName);
 		const route = subscription?.configRouteReplicates ?? configuredRoute?.replicates;
@@ -9907,7 +9918,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						? route.receives || routeEntriesIncludePeer(route.receivesFrom, remoteNodeName, targetDatabase)
 						: route);
 		if (!checkDatabaseAccess(targetDatabase) || !receives) {
-			throw new Error('The receive route does not authorize this residency database');
+			throw new Error('The receive route does not authorize this sharded database');
 		}
 		return true;
 	}
@@ -10315,14 +10326,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			tableDefinition.residency === undefined &&
 			peerSupportsResidencySlots(peerCapabilities)
 		)
-			throw new Error(`Missing residency policy for ${tableDefinition.database}.${tableDefinition.table}`);
+			throw new Error(`Missing sharding policy for ${tableDefinition.database}.${tableDefinition.table}`);
 		if (tableDefinition.residency !== undefined) {
 			if (wasSchemaDefined && !existingTable.residency)
 				throw new Error(
-					`Local schema does not declare residency for ${tableDefinition.database}.${tableDefinition.table}`
+					`Local schema does not declare sharding for ${tableDefinition.database}.${tableDefinition.table}`
 				);
 			if (existingTable.residency && !sameResidencyPolicy(existingTable.residency, tableDefinition.residency))
-				throw new Error(`Conflicting residency policy for ${tableDefinition.database}.${tableDefinition.table}`);
+				throw new Error(`Conflicting sharding policy for ${tableDefinition.database}.${tableDefinition.table}`);
 			if (!existingTable.residency) hasChanges = true;
 		}
 		const schemaDefined = tableDefinition.schemaDefined;
