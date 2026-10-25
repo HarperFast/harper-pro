@@ -536,14 +536,30 @@ suite('Declarative residency quarantine on restart', { timeout: 300_000 }, (ctx)
 				(await rawRows(context.harper, 'SlotAttributes', signal)).some((row) => row.id === 'inbound-ready'),
 			{ description: 'writer has received the peer audit stream' }
 		);
+		// A copied row and a positive received watermark can precede copy finalization. Rewrite an
+		// already received key, then require its live tail and removal of the durable copy cursor.
+		await put(peerContext.harper, 'SlotAttributes', {
+			id: 'inbound-ready',
+			region: 1,
+			tag: 'live-tail',
+			body: 'peer-owned',
+		});
 		await waitForCondition(
 			async (signal) => {
-				const status = await sendOperation(context.harper, { operation: 'cluster_status' }, { signal });
-				return status.connections
-					.find((connection) => connection.name === peerContext.harper.hostname)
-					?.database_sockets.some((socket) => socket.database === 'data' && socket.lastReceivedVersion > 0);
+				const resume = await get(
+					context.harper,
+					`SlotReplicationResume/?node=${encodeURIComponent(peerContext.harper.hostname)}`,
+					signal
+				);
+				return (
+					resume.seqId > 0 &&
+					!resume.copying &&
+					(await rawRows(context.harper, 'SlotAttributes', signal)).some(
+						(row) => row.id === 'inbound-ready' && row.record?.tag === 'live-tail'
+					)
+				);
 			},
-			{ description: 'writer has an inbound resume cursor for this peer' }
+			{ description: 'writer has finished the initial copy and received the peer live tail' }
 		);
 		const before = (await rawRows(context.harper, 'SlotAttributes')).find((row) => row.id === 'quarantined');
 		const priorPid = await readNodePid(context.harper);

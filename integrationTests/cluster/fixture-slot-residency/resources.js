@@ -23,6 +23,17 @@ export class SlotPolicy extends Resource {
 	}
 }
 
+export class SlotReplicationResume extends Resource {
+	get(target) {
+		const table = tables.SlotAttributes;
+		const nodeId = table.auditStore.loadLogs().indexOf(table.auditStore.logByName.get(target.get('node')));
+		return {
+			seqId: table.dbisDB.getSync([Symbol.for('seq'), nodeId])?.seqId ?? null,
+			copying: !!table.dbisDB.getSync([Symbol.for('copyCursor'), nodeId]),
+		};
+	}
+}
+
 export class SlotBlobSeed extends Resource {
 	async get(target) {
 		const bytes = Buffer.alloc(65536);
