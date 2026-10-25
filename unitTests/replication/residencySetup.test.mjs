@@ -238,26 +238,31 @@ describe('residency setup authority', function () {
 			}
 		});
 
-	it('binds an authenticated IP through the configured route to its canonical node', async () => {
-		const database = 'slot_setup_alias';
-		const previousNodes = server.nodes;
-		server.nodes = [{ name: 'slot-setup-peer' }];
-		try {
-			const socket = await connect(
-				database,
-				{ name: '127.0.0.2', replicates: true },
-				{
-					routes: [{ hostname: 'slot-setup-peer', url: 'wss://127.0.0.2:9933', replicates: true }],
-				}
-			);
-			await sendMap(socket, database, snapshot(database));
-			assert.deepEqual(socket.closes, []);
-			assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
-			assert.deepEqual(residencyTopologyErrors(database), []);
-		} finally {
-			server.nodes = previousNodes;
-		}
-	});
+	for (const [kind, address, url] of [
+		['ipv4', '127.0.0.2', 'wss://127.0.0.2:9933'],
+		['hostname', 'peer-address.invalid', 'wss://peer-address.invalid:9933'],
+		['ipv6', '2001:db8:0:0:0:0:0:2', 'wss://[2001:db8::2]:9933'],
+	])
+		it(`binds an authenticated ${kind} through the configured route to its canonical node`, async () => {
+			const database = `slot_setup_alias_${kind}`;
+			const previousNodes = server.nodes;
+			server.nodes = [{ name: 'slot-setup-peer' }];
+			try {
+				const socket = await connect(
+					database,
+					{ name: address, replicates: true },
+					{
+						routes: [{ hostname: 'slot-setup-peer', url, replicates: true }],
+					}
+				);
+				await sendMap(socket, database, snapshot(database));
+				assert.deepEqual(socket.closes, []);
+				assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
+				assert.deepEqual(residencyTopologyErrors(database), []);
+			} finally {
+				server.nodes = previousNodes;
+			}
+		});
 
 	it('rejects an alias claim that is another known node', async () => {
 		const previousNodes = server.nodes;

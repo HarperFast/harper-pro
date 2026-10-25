@@ -3906,6 +3906,18 @@ function configuredPeerIdentity(
 	const expected = authorization?.name ?? configuredName;
 	if (!expected) return undefined;
 	if (expected === announced) return expected;
+	// URL.hostname brackets/compresses IPv6, while authenticated socket addresses are bare.
+	// Normalize only host aliases; canonical node names remain exact identifiers.
+	const hostAlias = (name: string): string => {
+		if (isIP(name) !== 6) return name;
+		try {
+			return new URL(`https://[${name}]`).hostname;
+		} catch {
+			return name;
+		}
+	};
+	const expectedHost = hostAlias(expected);
+	const announcedHost = hostAlias(announced);
 	const aliases = (record: any): string[] => {
 		if (!record?.name || !record.url) return [];
 		try {
@@ -3917,8 +3929,8 @@ function configuredPeerIdentity(
 	const matches = configured.filter(
 		(record) =>
 			record?.name &&
-			(record.name === expected || aliases(record).includes(expected)) &&
-			(record.name === announced || aliases(record).includes(announced))
+			(record.name === expected || aliases(record).includes(expectedHost)) &&
+			(record.name === announced || aliases(record).includes(announcedHost))
 	);
 	const names = new Set(matches.map((record) => record.name));
 	if (names.size !== 1) throw new Error('Node name mismatch');
