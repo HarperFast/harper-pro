@@ -241,6 +241,67 @@ describe('Declarative tables keep control and event traffic independent of place
 		assert.deepEqual(files(), before, 'refusal must not mint a blob with no committed record');
 		assert.deepEqual(Buffer.from(await donor.value.body.arrayBuffer()), payload);
 	});
+	for (const fails of [false, true])
+		it(`refreshes a delayed blob confirmation only after a successful save (failure=${fails})`, async () => {
+			const { Records, socket } = await connect(false, `delayed_blob_ack_${fails}`, true);
+			const id = 'delayed-blob';
+			const payload = Buffer.alloc(65_536, 83);
+			await Records.put(id, { id, body: createBlob(payload) });
+			const donor = Records.primaryStore.getEntry(id);
+			const announced = [];
+			const encodedRecord = Buffer.from(
+				encodeCopyRecordValue(Records.primaryStore, donor.value, (blob) => announced.push(blob))
+			);
+			assert.equal(announced.length, 1);
+			const version = Date.now() + 1;
+			const encoder = Records.primaryStore.encoder;
+			socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+			socket.emit(
+				'message',
+				encode([
+					132,
+					{ structures: encoder.structures, typedStructs: encoder.typedStructs, attributes: Records.attributes },
+					Records.tableId,
+					Records.tableName,
+				])
+			);
+			socket.emit(
+				'message',
+				recordFrame(Records, 'put', id, undefined, version, undefined, { encodedRecord, extendedType: HAS_BLOBS })
+			);
+			await until(() => socket.sent.some((frame) => frame[0] === 144));
+			assert.equal(Records.primaryStore.getEntry(id)?.version, version, 'the record commits before its blob finishes');
+			const confirmations = () => socket.sent.filter((frame) => frame[0] === 144).map((frame) => frame[1]);
+			assert.ok(
+				confirmations().every((confirmed) => confirmed < version),
+				'unfinished bytes cannot be confirmed'
+			);
+			socket.emit(
+				'message',
+				encode([
+					146,
+					{
+						fileId: getFileId(announced[0]),
+						size: payload.length,
+						finished: true,
+						...(fails ? { error: 'temporarily unavailable', errorStatus: 503 } : {}),
+					},
+					fails ? Buffer.alloc(0) : payload,
+				])
+			);
+			if (fails) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				assert.ok(
+					confirmations().every((confirmed) => confirmed < version),
+					'a failed blob still holds confirmation'
+				);
+			} else {
+				const record = Records.primaryStore.getEntry(id).value;
+				assert.deepEqual(Buffer.from(await record.body.arrayBuffer()), payload);
+				await until(() => confirmations().includes(version));
+			}
+			assert.deepEqual(socket.closes, []);
+		});
 	for (const byAttribute of [false, true])
 		for (const stubCapable of [false, true])
 			it(`copies declarative stubs safely (attribute=${byAttribute}, stub capability=${stubCapable})`, async () => {

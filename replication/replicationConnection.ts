@@ -4435,11 +4435,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				originCursors,
 				async onCommit() {
 					await flushCopyRowsDurable();
+					if (releasePending) queueCommitConfirmation(seqId);
 				},
 			};
 		}
-		// only an update that carries floors, or a blob drain releasing held ones, pays for a commit callback
-		if (!originFloors && !(releasePending && pendingOriginFloors.size > 0)) {
+		// Blob drain must refresh a receipt that the earlier record commit clamped below its blob.
+		if (!originFloors && !releasePending) {
 			return {
 				type: 'end_txn',
 				localTime: seqId,
@@ -4461,6 +4462,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			onCommit() {
 				pendingOriginFloors.note(originFloors);
 				event.originFloors = pendingOriginFloors.take(cursorBlockedByBlob());
+				if (releasePending) queueCommitConfirmation(seqId);
 			},
 		};
 		return event;
@@ -5095,6 +5097,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function advanceDurableWatermark() {
 		lastDurableSequenceId = committedSequence;
 		creditDurableProgress();
+	}
+	function queueCommitConfirmation(sequence: number) {
+		if (!sequence || connectionSuperseded()) return;
+		if (!lastSequenceIdCommitted) {
+			setTimeout(() => {
+				// A record can commit before its blob finishes. The drain's end_txn calls this again
+				// after durability (and a copy flush), even if no later record arrives to prompt a receipt.
+				const confirmed = Math.min(lastSequenceIdCommitted, lastDurableSequenceId);
+				lastSequenceIdCommitted = null;
+				if (connectionSuperseded()) return;
+				ws.send(encode([COMMITTED_UPDATE, confirmed]));
+				logger.trace?.(connectionId, 'sent confirmation of a commit at', confirmed);
+			}, COMMITTED_UPDATE_DELAY);
+		}
+		lastSequenceIdCommitted = Math.max(lastSequenceIdCommitted ?? 0, sequence);
 	}
 	// Blob-divergence escalation (harper-pro#386). Each blob save failure already logs at `error`, but a
 	// sustained failing link emits that per-blob spam without a single line naming it as ongoing
@@ -8589,24 +8606,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// This restores the original unconditional maybeFinishCopy() call; the blob-durability gate
 					// now lives inside flushDurableCopyCursor()/maybeFinishCopy().
 					flushDurableCopyCursor();
-					if (!lastSequenceIdCommitted && sequenceIdReceived) {
-						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
-						setTimeout(() => {
-							// Gate the receipt on the durable watermark. Now that onCommit no longer awaits the
-							// blob saves, a commit's blobs may still be in flight at send time; confirming the raw
-							// committed sequence would tell the sender we durably hold past `lastDurableSequenceId`
-							// and let it discard a blob we haven't yet saved. Clamp to the watermark so we never
-							// claim durability beyond what we'd actually resume from after a crash. (Copy frames
-							// already awaited their blobs above, so the watermark covers them too.)
-							const confirmed = Math.min(lastSequenceIdCommitted, lastDurableSequenceId);
-							ws.send(encode([COMMITTED_UPDATE, confirmed]));
-							logger.trace?.(connectionId, 'sent confirmation of a commit at', confirmed);
-							lastSequenceIdCommitted = null;
-						}, COMMITTED_UPDATE_DELAY);
-					}
-					if (sequenceIdReceived) {
-						lastSequenceIdCommitted = sequenceIdReceived;
-					}
+					queueCommitConfirmation(sequenceIdReceived);
 					logger.debug?.(
 						'last sequence committed',
 						lastSequenceIdCommitted ? new Date(lastSequenceIdCommitted) : 'none',
