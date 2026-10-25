@@ -16,11 +16,11 @@ on:
         description: 'Node.js version'
         required: true
         type: choice
-        default: '24'
+        default: '26'
         options:
           - '22'
           - '24'
-          - '25'
+          - '26'
       soak-minutes:
         description: 'Soak duration in minutes (Priority 1)'
         required: false
@@ -49,7 +49,7 @@ on:
 
 jobs:
   build:
-    name: Build Harper Pro (Node.js v${{ inputs.node-version || '24' }})
+    name: Build Harper Pro (Node.js v${{ inputs.node-version || '26' }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -57,10 +57,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: 'recursive'
-      - name: Setup Node.js ${{ inputs.node-version || '24' }}
+      - name: Setup Node.js ${{ inputs.node-version || '26' }}
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: ${{ inputs.node-version || '24' }}
+          node-version: ${{ inputs.node-version || '26' }}
           package-manager-cache: false
       - name: Install dependencies
         run: .github/scripts/retry.sh "npm install" -- npm install
@@ -69,7 +69,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: harper-stress-build-${{ inputs.node-version || '24' }}
+          name: harper-stress-build-${{ inputs.node-version || '26' }}
           path: |
             dist/
             static/
@@ -78,7 +78,7 @@ jobs:
           retention-days: 1
 
   stress:
-    name: Stress ${{ matrix.test.name }} (Node.js v${{ inputs.node-version || '24' }})
+    name: Stress ${{ matrix.test.name }} (Node.js v${{ inputs.node-version || '26' }})
     needs: build
     runs-on: ubuntu-latest
     # Each test gets its own slot; the soak's worst case (240 min) drives
@@ -140,15 +140,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: 'recursive'
-      - name: Setup Node.js ${{ inputs.node-version || '24' }}
+      - name: Setup Node.js ${{ inputs.node-version || '26' }}
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: ${{ inputs.node-version || '24' }}
+          node-version: ${{ inputs.node-version || '26' }}
           package-manager-cache: false
       - name: Download build artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: harper-stress-build-${{ inputs.node-version || '24' }}
+          name: harper-stress-build-${{ inputs.node-version || '26' }}
       # The artifact-restored node_modules/ already has everything resolved; this only needs to
       # recreate node_modules/.bin symlinks, so --offline keeps it off the registry entirely.
       - name: Relink bin scripts
@@ -180,7 +180,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: stress-logs-${{ matrix.test.name }}-node-${{ inputs.node-version || '24' }}
+          name: stress-logs-${{ matrix.test.name }}-node-${{ inputs.node-version || '26' }}
           path: /tmp/harper-integration-test-logs/
           retention-days: 7
           if-no-files-found: ignore

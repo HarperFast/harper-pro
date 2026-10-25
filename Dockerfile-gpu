@@ -1,5 +1,5 @@
-ARG NODE_BUILD_VERSION=24
-ARG NODE_VERSION=24
+ARG NODE_BUILD_VERSION=26
+ARG NODE_VERSION=26
 
 # Runtime base. CUDA 13.x supports Turing (SM 7.5 / T4) — Turing is the minimum
 # architecture in the 13.x line (Maxwell/Pascal/Volta were dropped). The 13.x
@@ -28,7 +28,7 @@ RUN env NO_USE_GIT=true npm run package
 
 FROM ${CUDA_RUNTIME_IMAGE} AS run
 
-ARG NODE_VERSION=24
+ARG NODE_VERSION
 
 # Required by NVIDIA Container Runtime to expose GPUs to the container
 ENV NVIDIA_VISIBLE_DEVICES=all

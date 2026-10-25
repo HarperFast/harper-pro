@@ -23,20 +23,51 @@ permissions:
   actions: write # dispatch publish-node-pc-image
 
 jobs:
+  lines:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.lines.outputs.matrix }}
+    steps:
+      - name: Resolve each release line's Node major
+        id: lines
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Each release line still shipping a pc image; drop one at end of life.
+          REFS: main v5.3
+        run: |
+          set -euo pipefail
+          lines='[]'
+          for ref in $REFS; do
+            major=$(gh api "repos/${{ github.repository }}/contents/Dockerfile?ref=${ref}" \
+              -H 'Accept: application/vnd.github.raw' | sed -n 's/^ARG NODE_VERSION=//p' | cut -d- -f1)
+            if [ -z "$major" ]; then
+              echo "::error::no ARG NODE_VERSION default in ${ref}'s Dockerfile"; exit 1
+            fi
+            lines=$(jq -c --arg ref "$ref" --arg major "$major" '. + [{ref: $ref, major: $major}]' <<<"$lines")
+          done
+          # A base is built from its line's pins, so two lines on one major would publish over
+          # each other's :<major> tag, and their builds would cancel each other.
+          shared=$(jq -r 'group_by(.major) | map(select(length > 1) | "\(map(.ref) | join(" and ")) both default to Node \(.[0].major)") | .[]' <<<"$lines")
+          if [ -n "$shared" ]; then
+            echo "::error::${shared}; keep one release line per Node major in REFS"; exit 1
+          fi
+          echo "lines: ${lines}"
+          echo "matrix=${lines}" >> "$GITHUB_OUTPUT"
   check:
+    needs: lines
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Node majors the pc variant targets — keep in sync with the pc legs in
-        # publish-docker.yaml.
-        node-major: ['24']
+        include: ${{ fromJSON(needs.lines.outputs.matrix) }}
     env:
       IMAGE: harperfast/node-pointer-compression
-      MAJOR: ${{ matrix.node-major }}
+      REF: ${{ matrix.ref }}
+      MAJOR: ${{ matrix.major }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ matrix.ref }}
           sparse-checkout: |
             build-tools/pc-image-signature.sh
             package.json
@@ -103,14 +134,13 @@ jobs:
         run: |
           set -euo pipefail
           # publish-node-pc-image cancels in-progress runs per node-version, so
-          # dispatching while one runs would kill it. Skip if one is queued/running.
-          # Conservative: gh run list can't filter by the node-version input, so with
-          # multiple majors this may skip a major's rebuild for a day when a different
-          # major is mid-build — it self-heals on the next daily run and never causes
-          # a bad rebuild. (Single major today, so no effect yet.)
+          # dispatching while one runs would kill it. Its run-name carries the major; a
+          # run without that title (dispatched from a branch whose workflow predates the
+          # run-name) could be any major, so it blocks every major.
           active=$(gh run list --workflow=publish-node-pc-image.yaml \
             --repo "${{ github.repository }}" \
-            --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length' || echo 0)
+            --json status,displayTitle \
+            --jq "[.[] | select((.status==\"in_progress\" or .status==\"queued\") and (.displayTitle==\"Publish node-pointer-compression:${MAJOR}\" or (.displayTitle | startswith(\"Publish node-pointer-compression:\") | not)))] | length" || echo 0)
           echo "active publish-node-pc-image runs: ${active}"
           if [ "${active}" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -126,7 +156,7 @@ jobs:
           PPROF_VERSION: ${{ steps.drift.outputs.pprof_version }}
         run: |
           set -euo pipefail
-          echo "dispatching publish-node-pc-image: node=${MAJOR} uws=${UWS_COMMIT} pprof=${PPROF_VERSION}"
+          echo "dispatching publish-node-pc-image from ${REF}: node=${MAJOR} uws=${UWS_COMMIT} pprof=${PPROF_VERSION}"
           # workflow_dispatch/repository_dispatch are the documented exceptions to
           # GITHUB_TOKEN recursion prevention, so this triggers the run (needs the
           # actions:write permission above). `gh workflow run` exits non-zero if the
@@ -134,7 +164,7 @@ jobs:
           # loudly rather than silently skipping a needed rebuild.
           gh workflow run publish-node-pc-image.yaml \
             --repo "${{ github.repository }}" \
-            --ref "${{ github.ref_name }}" \
+            --ref "${REF}" \
             -f node-version="${MAJOR}" \
             -f uws-source-commit="${UWS_COMMIT}" \
             -f pprof-version="${PPROF_VERSION}"

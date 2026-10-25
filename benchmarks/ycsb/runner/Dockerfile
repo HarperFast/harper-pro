@@ -7,11 +7,11 @@ FROM ubuntu:26.04
 ARG RUNNER_VERSION=2.336.0
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Toolchain for harper-pro's native deps (rocksdb-js / lmdb prebuilds + gyp fallback) + node 24.
+# Toolchain for harper-pro's native deps (rocksdb-js / lmdb prebuilds + gyp fallback) + node 26.
 # (apt lists are kept for installdependencies.sh below, then cleaned in that layer.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
 		ca-certificates curl git jq build-essential python3 sudo \
-	&& curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+	&& curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
 	&& apt-get install -y --no-install-recommends nodejs
 
 RUN useradd -m -s /bin/bash runner

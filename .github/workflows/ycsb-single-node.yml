@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   ycsb-single-node:
-    name: YCSB single-node (Node.js v24)
+    name: YCSB single-node (Node.js v26)
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -48,7 +48,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: 26
           package-manager-cache: false
 
       - name: Install dependencies

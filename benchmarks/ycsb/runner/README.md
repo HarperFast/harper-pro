@@ -111,7 +111,7 @@ entirely.
 ## Setup
 
 ```sh
-# 1. Build the runner image (once; node 24 + build toolchain + the Actions runner)
+# 1. Build the runner image (once; node 26 + build toolchain + the Actions runner)
 docker build -t harper-bench-runner benchmarks/ycsb/runner
 
 # 2. Run the supervisor. It polls each repo and drains one queued harper-bench job at a
