@@ -23,36 +23,56 @@ permissions:
   actions: write # dispatch publish-node-pc-image
 
 jobs:
+  lines:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.lines.outputs.matrix }}
+    steps:
+      - name: Resolve each release line's Node major
+        id: lines
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Each release line still shipping a pc image; drop one at end of life.
+          REFS: main v5.3
+        run: |
+          set -euo pipefail
+          lines='[]'
+          for ref in $REFS; do
+            major=$(gh api "repos/${{ github.repository }}/contents/Dockerfile?ref=${ref}" \
+              -H 'Accept: application/vnd.github.raw' | sed -n 's/^ARG NODE_VERSION=//p' | cut -d- -f1)
+            if [ -z "$major" ]; then
+              echo "::error::no ARG NODE_VERSION default in ${ref}'s Dockerfile"; exit 1
+            fi
+            lines=$(jq -c --arg ref "$ref" --arg major "$major" '. + [{ref: $ref, major: $major}]' <<<"$lines")
+          done
+          # A base is built from its line's pins, so two lines on one major would publish over
+          # each other's :<major> tag, and their builds would cancel each other.
+          shared=$(jq -r 'group_by(.major) | map(select(length > 1) | "\(map(.ref) | join(" and ")) both default to Node \(.[0].major)") | .[]' <<<"$lines")
+          if [ -n "$shared" ]; then
+            echo "::error::${shared}; keep one release line per Node major in REFS"; exit 1
+          fi
+          echo "lines: ${lines}"
+          echo "matrix=${lines}" >> "$GITHUB_OUTPUT"
   check:
+    needs: lines
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Each release line still shipping a pc image. A line's base is built from its own
-        # Dockerfile default and pins, so one line per Node major: two lines on the same major
-        # would publish over each other's :<major> tag.
-        ref: ['main', 'v5.3']
+        include: ${{ fromJSON(needs.lines.outputs.matrix) }}
     env:
       IMAGE: harperfast/node-pointer-compression
       REF: ${{ matrix.ref }}
+      MAJOR: ${{ matrix.major }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ matrix.ref }}
           sparse-checkout: |
-            Dockerfile
             build-tools/pc-image-signature.sh
             package.json
             package-lock.json
           sparse-checkout-cone-mode: false
-      - name: Get the release line's Node major
-        run: |
-          set -euo pipefail
-          major=$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile | cut -d- -f1)
-          if [ -z "$major" ]; then
-            echo "::error::no ARG NODE_VERSION default in ${REF}'s Dockerfile"; exit 1
-          fi
-          echo "MAJOR=${major}" >> "$GITHUB_ENV"
       - name: Login to Docker Hub
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
