@@ -536,6 +536,15 @@ suite('Declarative residency quarantine on restart', { timeout: 300_000 }, (ctx)
 				(await rawRows(context.harper, 'SlotAttributes', signal)).some((row) => row.id === 'inbound-ready'),
 			{ description: 'writer has received the peer audit stream' }
 		);
+		await waitForCondition(
+			async (signal) => {
+				const status = await sendOperation(context.harper, { operation: 'cluster_status' }, { signal });
+				return status.connections
+					.find((connection) => connection.name === peerContext.harper.hostname)
+					?.database_sockets.some((socket) => socket.database === 'data' && socket.lastReceivedVersion > 0);
+			},
+			{ description: 'writer has an inbound resume cursor for this peer' }
+		);
 		const before = (await rawRows(context.harper, 'SlotAttributes')).find((row) => row.id === 'quarantined');
 		const priorPid = await readNodePid(context.harper);
 		await stopNodeProcess(context.harper);
