@@ -42,7 +42,33 @@ import {
 	assertResidentsReachable,
 } from '#src/replication/knownNodes';
 
+import { get, setProperty } from '#src/core/utility/environment/environmentManager';
+
 describe('createConfirmationWaiter', () => {
+	it('reads the configured explicit timeout when creating each waiter', async () => {
+		const prior = get('replication_confirmationTimeout');
+		const awaiting = new Set();
+		try {
+			for (const setting of [15, '25']) {
+				setProperty('replication_confirmationTimeout', setting);
+				const waiting = createConfirmationWaiter(awaiting, 'configured-timeout', 100, 1);
+				const outcome = await Promise.race([
+					waiting.then(
+						() => 'confirmed',
+						(error) => error
+					),
+					new Promise((resolve) => setTimeout(() => resolve('still waiting'), 200)),
+				]);
+				notifyConfirmedWaiters(awaiting, 'cleanup', 0, 101);
+				expect(outcome).to.be.instanceOf(Error);
+				expect(outcome.message).to.match(/confirm replication|confirmation/i);
+			}
+		} finally {
+			notifyConfirmedWaiters(awaiting, 'cleanup', 0, 101);
+			setProperty('replication_confirmationTimeout', prior);
+		}
+	});
+
 	it('resolves once confirmationCount distinct peers confirm, and is immediately removed from awaiting', async () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 2, 5000);

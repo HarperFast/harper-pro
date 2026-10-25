@@ -12,7 +12,7 @@ import {
 import { replicateOverWS } from '#src/replication/replicationConnection';
 import { server } from '#src/core/server/Server';
 import { getReplicationSharedStatus, getHDBNodeTable } from '#src/replication/knownNodes';
-import { table } from '#src/core/resources/databases';
+import { databases, table } from '#src/core/resources/databases';
 import { transaction } from '#src/core/resources/transaction';
 import {
 	CONNECTION_STATE_POSITION,
@@ -147,7 +147,7 @@ describe('residency setup authority', function () {
 	}
 
 	it('binds the snapshot to its database frame', async () => {
-		const socket = await connect('slot_setup_frame', { replicates: true });
+		const socket = await connect('slot_setup_frame', { name: 'slot-setup-peer', replicates: true });
 		await sendMap(socket, 'slot_setup_frame', snapshot('slot_setup_other'));
 		assert.ok(socket.closes.length);
 		assert.equal(readResidencyMap('slot_setup_other'), undefined);
@@ -159,7 +159,7 @@ describe('residency setup authority', function () {
 		const priorNodes = server.nodes;
 		server.nodes = [{ name: 'slot-setup-peer' }];
 		try {
-			const first = await connect(database, { replicates: true });
+			const first = await connect(database, { name: 'slot-setup-peer', replicates: true });
 			await sendMap(first, database, createResidencyMap(database, 2, [{ start: 0, end: 2, shard: 1 }], 1));
 			await turns();
 			assert.ok(first.closes.length);
@@ -167,7 +167,7 @@ describe('residency setup authority', function () {
 				residencyTopologyErrors(database).some((error) => error.includes('map agreement')),
 				'map failure must remain blocked'
 			);
-			const retry = await connect(database, { replicates: true });
+			const retry = await connect(database, { name: 'slot-setup-peer', replicates: true });
 			retry.emit('message', encode([145, [], database, undefined, [], { shardsDigest: null }]));
 			await turns();
 			assert.ok(
@@ -237,6 +237,45 @@ describe('residency setup authority', function () {
 				server.nodes = priorNodes;
 			}
 		});
+
+	it('binds an authenticated IP through the configured route to its canonical node', async () => {
+		const database = 'slot_setup_alias';
+		const previousNodes = server.nodes;
+		server.nodes = [{ name: 'slot-setup-peer' }];
+		try {
+			const socket = await connect(
+				database,
+				{ name: '127.0.0.2', replicates: true },
+				{
+					routes: [{ hostname: 'slot-setup-peer', url: 'wss://127.0.0.2:9933', replicates: true }],
+				}
+			);
+			await sendMap(socket, database, snapshot(database));
+			assert.deepEqual(socket.closes, []);
+			assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
+			assert.deepEqual(residencyTopologyErrors(database), []);
+		} finally {
+			server.nodes = previousNodes;
+		}
+	});
+
+	it('rejects an alias claim that is another known node', async () => {
+		const previousNodes = server.nodes;
+		server.nodes = [{ name: 'authenticated-peer' }, { name: 'forged-peer' }];
+		try {
+			const socket = new Socket();
+			sockets.push(socket);
+			replicateOverWS(socket, {}, { name: 'authenticated-peer', url: 'wss://forged-peer:9933', replicates: true });
+			socket.emit(
+				'message',
+				encode([140, 'forged-peer', 'slot_setup_alias_forgery', [], buildLocalCapabilities(90_000, false, true)])
+			);
+			await turns();
+			assert.ok(socket.closes.some(({ code }) => code === 1008));
+		} finally {
+			server.nodes = previousNodes;
+		}
+	});
 
 	it('binds a promised authenticated identity before accepting the node name', async () => {
 		const database = 'slot_setup_promised_identity';
@@ -354,7 +393,11 @@ describe('residency setup authority', function () {
 			state[LAST_LIVENESS_TIME_POSITION] = Date.now() - 3600000;
 			assert.throws(() => requireConnectedResidencyOwner(database, [peer]), /connected/);
 			state[LAST_LIVENESS_TIME_POSITION] = Date.now();
-			assert.doesNotThrow(() => requireConnectedResidencyOwner(database, [peer]));
+			assert.throws(
+				() => requireConnectedResidencyOwner(database, [peer]),
+				/connected/,
+				'connection truth alone is not a received message'
+			);
 		} finally {
 			server.nodes = priorNodes;
 		}
@@ -371,7 +414,7 @@ describe('residency setup authority', function () {
 	it('installs an authorized snapshot', async () => {
 		const database = 'slot_setup_allowed';
 		const expected = snapshot(database);
-		const socket = await connect(database, { replicates: true });
+		const socket = await connect(database, { name: 'slot-setup-peer', replicates: true });
 		await sendMap(socket, database, expected);
 		assert.deepEqual(socket.closes, []);
 		assert.deepEqual({ ...readResidencyMap(database) }, expected);
@@ -438,12 +481,27 @@ describe('residency setup authority', function () {
 		);
 		socket.emit(
 			'message',
-			encode([145, [{ table: 'Rows', attributes: Records.attributes, schemaDefined: true }], database])
+			encode([
+				145,
+				[
+					{ table: 'Rows', attributes: Records.attributes, schemaDefined: true },
+					{ table: 'LegacyRows', attributes: [{ name: 'id', isPrimaryKey: true }], schemaDefined: true },
+				],
+				database,
+			])
 		);
 		await processed(socket);
 		assert.deepEqual(socket.closes, []);
 		assert.deepEqual(Records.residency, { slots: 2, byAttribute: false });
+		assert.ok(databases[database].LegacyRows, 'legacy discovery in a mixed frame still runs');
 		assert.deepEqual(residencyTopologyErrors(database), []);
+		socket.emit('message', encode([145, [], database, undefined, [{ table: 'Rows', droppedTime: Date.now() + 1000 }]]));
+		await processed(socket);
+		assert.equal(
+			databases[database].Rows,
+			Records,
+			'a marker-only frame cannot drop an out-of-scope declarative table'
+		);
 	});
 	it('resolves and receives owner projections without an outbound write route', async () => {
 		const database = 'slot_setup_receive_only';

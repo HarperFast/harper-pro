@@ -13,6 +13,8 @@ import { getResidencyMapTable } from '../core/resources/residencyMaps.ts';
 
 import {
 	databases,
+	databaseResidencyBlockReason,
+	assertDatabaseResidencyAvailable,
 	databaseEventsEmitter,
 	getDatabases,
 	pendingOrRecordedDropTime,
@@ -447,6 +449,7 @@ export function setReplicator(dbName: string, table: any, options: any) {
 			static connection: NodeReplicationConnection;
 			static subscription: IterableEventQueue;
 			static async subscribe() {
+				assertDatabaseResidencyAvailable(dbName);
 				const dbSubscriptions = options.databaseSubscriptions || databaseSubscriptions;
 				let subscription = dbSubscriptions.get(dbName);
 				const tableById = subscription?.tableById || [];
@@ -924,6 +927,7 @@ export function forEachReplicatedDatabase(options, callback) {
 }
 
 function forReplicatedDatabase(databaseName, options, callback) {
+	if (databaseResidencyBlockReason(databaseName)) return;
 	const database = databases[databaseName];
 	logger.trace('Checking replication status of ', databaseName, options?.databases);
 	if (

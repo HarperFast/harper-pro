@@ -44,3 +44,27 @@ export class SlotBlobLocalDigest extends Resource {
 		return { digest: createHash('sha256').update(Buffer.from(bytes)).digest('hex'), region: record.region };
 	}
 }
+
+const freezeState = new Uint8Array(
+	tables.SlotAttributes.auditStore.getUserSharedBuffer('test-freeze-on-commit', new ArrayBuffer(4096))
+);
+const freezeLength = new Int32Array(freezeState.buffer, freezeState.byteOffset, 1);
+tables.SlotAttributes.auditStore.prependListener('aftercommit', (entries) => {
+	const length = Atomics.load(freezeLength, 0);
+	if (!length) return;
+	const { id, pids } = JSON.parse(Buffer.from(freezeState.subarray(4, 4 + length)).toString());
+	if (!entries.some((entry) => entry.tableId === tables.SlotAttributes.tableId && entry.recordId === id)) return;
+	if (Atomics.compareExchange(freezeLength, 0, length, 0) !== length) return;
+	for (const pid of pids) process.kill(pid, 'SIGSTOP');
+});
+export class SlotFreezeOnCommit extends Resource {
+	get() {
+		return { armed: Atomics.load(freezeLength, 0) > 0 };
+	}
+	post({ id, pids }) {
+		const bytes = Buffer.from(JSON.stringify({ id, pids }));
+		freezeState.set(bytes, 4);
+		Atomics.store(freezeLength, 0, bytes.length);
+		return { armed: true, id, pids };
+	}
+}

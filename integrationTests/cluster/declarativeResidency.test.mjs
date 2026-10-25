@@ -4,7 +4,14 @@ import { basename, join } from 'node:path';
 import { cp, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
+import {
+	sendOperation,
+	stopAndTeardownNodes,
+	waitForCondition,
+	readNodePid,
+	stopNodeProcess,
+	postOperation,
+} from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT =
 	process.env.HARPER_SLOT_BASELINE_INSTALL_SCRIPT || join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
@@ -89,6 +96,10 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 							securePort: context.harper.hostname + ':9933',
 							shard: SHARDS[i],
 							shards: [1, 0],
+							pingInterval: 500,
+							pingTimeout: 3000,
+							confirmationTimeout: 2000,
+							residencyConfirmationTimeout: 15000,
 							databases: '*',
 						},
 					},
@@ -146,6 +157,7 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 			const entry = (await rawRows(node, table)).find((entry) => entry.id === id);
 			if (SHARDS[i] === slot % 2) assert.equal(entry.record.body, body);
 			else if (table === 'SlotNoIndex') assert.equal(entry?.record, undefined);
+			else if (entry.flags & 4) assert.equal(entry.record.body, body);
 			else {
 				assert.equal(entry.record.body, undefined);
 				assert.ok(entry.flags & 1);
@@ -198,6 +210,15 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 			description: 'original owner has the actual replicated blob bytes',
 		});
 		const response = await request(nodes()[0], `SlotBlob/${id}`, { method: 'PATCH', body: { region: 1 } });
+		if (response.status >= 300)
+			console.error('Blob handoff failed', {
+				response,
+				owners: await Promise.all(
+					nodes()
+						.slice(2)
+						.map((node) => get(node, `SlotBlobLocalDigest/${id}`))
+				),
+			});
 		assert.ok(response.status >= 200 && response.status < 300, JSON.stringify(response));
 		await waitForCondition(
 			async (signal) =>
@@ -211,6 +232,87 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 			{
 				description: 'new owners have the confirmed blob bytes',
 			}
+		);
+	});
+
+	test('a frozen new owner is refused before commit and a local replica does not confirm a committed move', async () => {
+		const writer = nodes()[0];
+		const owners = nodes().slice(2);
+		const pids = await Promise.all(owners.map(readNodePid));
+		for (const pid of pids) assert.ok(Number.isInteger(pid));
+		const id = 'bounded-move';
+		await put(writer, 'SlotAttributes', { id, region: 0, tag: 'before', body: 'must reach the owner' });
+		await barriers();
+		try {
+			for (const pid of pids) process.kill(pid, 'SIGSTOP');
+			await waitForCondition(
+				async (signal) => {
+					const status = await sendOperation(writer, { operation: 'cluster_status' }, { signal });
+					const ownerConnections = status.connections.filter((connection) =>
+						owners.some((owner) => owner.hostname === connection.node_name || owner.hostname === connection.name)
+					);
+					return (
+						ownerConnections.length === owners.length &&
+						ownerConnections.every(
+							(connection) =>
+								!connection.database_sockets.some((socket) => socket.database === 'data' && socket.connected)
+						)
+					);
+				},
+				{ timeoutMs: 15000, description: 'frozen owners lose their data subscriptions' }
+			);
+			const refused = await request(writer, `SlotAttributes/${id}`, {
+				method: 'PATCH',
+				body: { region: 1 },
+				signal: AbortSignal.timeout(8000),
+			});
+			assert.equal(refused.status, 503, JSON.stringify(refused));
+			assert.equal((await rawRows(writer, 'SlotAttributes')).find((row) => row.id === id).record.region, 0);
+		} finally {
+			for (const pid of pids) process.kill(pid, 'SIGCONT');
+		}
+		await barriers();
+		const armed = await request(writer, 'SlotFreezeOnCommit/', { method: 'POST', body: { id, pids } });
+		assert.equal(armed.status, 200, JSON.stringify(armed));
+		assert.deepEqual(armed.data, { armed: true, id, pids });
+		const started = Date.now();
+		try {
+			const uncertain = await request(writer, `SlotAttributes/${id}`, {
+				method: 'PATCH',
+				body: { region: 1 },
+				signal: AbortSignal.timeout(25000),
+			});
+			assert.equal(
+				uncertain.status,
+				504,
+				JSON.stringify({ uncertain, freeze: await get(writer, 'SlotFreezeOnCommit/') })
+			);
+			assert.equal(uncertain.data.replicationUnconfirmed, true);
+			assert.equal(uncertain.data.retryable, false);
+			assert.match(uncertain.data.title, /15000ms/);
+			assert.ok(Date.now() - started < 22000);
+			const local = (await rawRows(writer, 'SlotAttributes')).find((row) => row.id === id);
+			assert.ok(local.flags & 4, 'committed writer body is a replica');
+			assert.equal((await get(writer, `SlotAttributes/${id}`)).body, 'must reach the owner');
+		} finally {
+			for (const pid of pids) process.kill(pid, 'SIGCONT');
+		}
+		await waitForCondition(
+			async (signal) =>
+				(await Promise.all(owners.map((node) => rawRows(node, 'SlotAttributes', signal)))).every((rows) =>
+					rows.some((row) => row.id === id && row.record?.region === 1 && row.record?.body === 'must reach the owner')
+				),
+			{ description: 'recovered owners receive the complete committed body' }
+		);
+		await put(writer, 'SlotAttributes', { id, region: 0, tag: 'reset', body: 'confirmed body' });
+		await barriers();
+		const confirmed = await request(writer, `SlotAttributes/${id}`, { method: 'PATCH', body: { region: 1 } });
+		assert.ok(confirmed.status >= 200 && confirmed.status < 300, JSON.stringify(confirmed));
+		assert.ok(
+			(await Promise.all(owners.map((node) => rawRows(node, 'SlotAttributes')))).some((rows) =>
+				rows.some((row) => row.id === id && row.record?.body === 'confirmed body' && row.record?.region === 1)
+			),
+			'2xx follows a real owner body'
 		);
 	});
 
@@ -237,7 +339,7 @@ suite(`Declarative residency (replication pool ${POOL ? 'on' : 'off'})`, { timeo
 	});
 
 	test('cold reads proxy to owners and indexed replicas stay non-authoritative', async () => {
-		await put(nodes()[0], 'SlotKeys', { id: 'cached1', tag: 'old', body: 'original' });
+		await put(nodes()[2], 'SlotKeys', { id: 'cached1', tag: 'old', body: 'original' });
 		await checkPlacement('SlotKeys', 'cached1', 1, 'original');
 		assert.equal((await get(nodes()[0], 'SlotKeys/cached1')).body, 'original');
 		await waitForCondition(
@@ -355,5 +457,152 @@ suite('Declarative residency with mismatched shard lists', { timeout: 300_000 },
 				false
 			);
 		}
+	});
+});
+
+suite('Declarative residency quarantine on restart', { timeout: 300_000 }, (ctx) => {
+	const context = { name: ctx.name };
+	const peerContext = { name: ctx.name };
+	async function prepare(target) {
+		target.harper = { hostname: await getNextAvailableLoopbackAddress() };
+		target.harper.dataRootDir = await mkdtemp(
+			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-')
+		);
+		await cp(FIXTURE, join(target.harper.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
+	}
+	async function start(shards, target = context, shard = 0) {
+		await startHarper(target, {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false, stdStreams: false, level: 'warn' },
+				replication: { securePort: target.harper.hostname + ':9933', shard, shards, databases: '*' },
+			},
+		});
+	}
+	before(async () => {
+		await prepare(context);
+		await prepare(peerContext);
+		await start([0, 1]);
+		await start([0, 1], peerContext, 1);
+		const { operation_token: token } = await sendOperation(context.harper, {
+			operation: 'create_authentication_tokens',
+			authorization: context.harper.admin,
+		});
+		await sendOperation(peerContext.harper, {
+			operation: 'add_node',
+			hostname: context.harper.hostname,
+			authorization: 'Bearer ' + token,
+			rejectUnauthorized: false,
+		});
+		await waitForCondition(
+			async (signal) =>
+				(
+					await request(context.harper, 'SlotAttributes/quarantine-ready', {
+						method: 'PUT',
+						body: { id: 'quarantine-ready', region: 0 },
+						signal,
+					})
+				).status === 204,
+			{ description: 'canonical shard membership is visible' }
+		);
+	});
+	after(() => stopAndTeardownNodes([context.harper, peerContext.harper]));
+	test('serves healthy data and operations while the invalid database stays fenced until repair and restart', async () => {
+		await put(context.harper, 'SlotAttributes', { id: 'quarantined', region: 0, body: 'preserved' });
+		await sendOperation(context.harper, { operation: 'create_database', database: 'healthy' });
+		await sendOperation(context.harper, {
+			operation: 'create_table',
+			database: 'healthy',
+			table: 'Rows',
+			primary_key: 'id',
+		});
+		await sendOperation(context.harper, {
+			operation: 'insert',
+			database: 'healthy',
+			table: 'Rows',
+			records: [{ id: 'good', body: 'available' }],
+		});
+		await waitForCondition(
+			async (signal) =>
+				(await rawRows(peerContext.harper, 'SlotAttributes', signal)).some((row) => row.id === 'quarantined'),
+			{ description: 'peer has the original slot projection' }
+		);
+		// Establish this direction's durable resume cursor before queuing the held write. Otherwise
+		// restart bootstraps a primary-store copy, which intentionally cannot promote a non-owner's
+		// replica to an authoritative body; this case exercises audit-tail resume through quarantine.
+		await put(peerContext.harper, 'SlotAttributes', { id: 'inbound-ready', region: 1, body: 'peer-owned' });
+		await waitForCondition(
+			async (signal) =>
+				(await rawRows(context.harper, 'SlotAttributes', signal)).some((row) => row.id === 'inbound-ready'),
+			{ description: 'writer has received the peer audit stream' }
+		);
+		const before = (await rawRows(context.harper, 'SlotAttributes')).find((row) => row.id === 'quarantined');
+		const priorPid = await readNodePid(context.harper);
+		await stopNodeProcess(context.harper);
+		await put(peerContext.harper, 'SlotAttributes', { id: 'quarantined', region: 0, body: 'delayed peer write' });
+		await start([1]);
+		assert.notEqual(await readNodePid(context.harper), priorPid);
+		const node = context.harper;
+		const status = await sendOperation(node, { operation: 'cluster_status' });
+		assert.equal(status.residency.data.blocked, true);
+		assert.match(status.residency.data.errors.join(' '), /replication.shard/);
+		const rows = await sendOperation(node, {
+			operation: 'search_by_id',
+			database: 'healthy',
+			table: 'Rows',
+			ids: ['good'],
+			get_attributes: ['*'],
+		});
+		assert.equal(rows[0].body, 'available');
+		await sendOperation(node, {
+			operation: 'insert',
+			database: 'healthy',
+			table: 'Rows',
+			records: [{ id: 'still', body: 'serving' }],
+		});
+		for (const operation of [
+			{
+				operation: 'search_by_id',
+				database: 'data',
+				table: 'SlotAttributes',
+				ids: ['quarantined'],
+				get_attributes: ['*'],
+			},
+			{
+				operation: 'update',
+				database: 'data',
+				table: 'SlotAttributes',
+				records: [{ id: 'quarantined', body: 'forbidden' }],
+			},
+		]) {
+			const response = await postOperation(node, operation);
+			assert.equal(response.status, 503, JSON.stringify(response));
+			assert.match(JSON.stringify(response.body), /replication.shard/);
+		}
+		for (const method of ['GET', 'PATCH']) {
+			const response = await request(node, 'SlotAttributes/quarantined', {
+				method,
+				...(method === 'PATCH' ? { body: { body: 'forbidden' } } : {}),
+			});
+			assert.equal(response.status, 503, JSON.stringify(response));
+			assert.match(JSON.stringify(response.data), /replication.shard/);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+		assert.deepEqual(
+			(await rawRows(node, 'SlotAttributes')).find((row) => row.id === 'quarantined'),
+			before,
+			'no apply while quarantined'
+		);
+		await stopNodeProcess(node);
+		await start([0, 1]);
+		await waitForCondition(
+			async (signal) => {
+				const response = await request(context.harper, 'SlotAttributes/quarantined', { signal });
+				assert.ok([200, 502, 503].includes(response.status), JSON.stringify(response));
+				return response.status === 200 && response.data.body === 'delayed peer write';
+			},
+			{ description: 'repaired database resumes the held peer write' }
+		);
+		assert.equal((await sendOperation(context.harper, { operation: 'cluster_status' })).residency.data.blocked, false);
 	});
 });

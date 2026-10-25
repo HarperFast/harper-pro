@@ -25,6 +25,7 @@ import { toBufferKey } from 'ordered-binary';
 import {
 	getDatabases,
 	databases,
+	databaseResidencyBlockReason,
 	table as ensureTable,
 	onUpdatedTable,
 	onRemovedDB,
@@ -738,7 +739,7 @@ const SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY = 300;
 const COMMITTED_UPDATE_DELAY = 2;
 const PING_INTERVAL = env.get(CONFIG_PARAMS.REPLICATION_PINGINTERVAL) ?? 30000;
 // Time (ms) without any socket activity before a connection is treated as dead.
-const PING_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_PINGTIMEOUT) ?? PING_INTERVAL * 2;
+export const PING_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_PINGTIMEOUT) ?? PING_INTERVAL * 2;
 // During an initial base copy of a large table the *sender* can be stuck in writableNeedDrain
 // backpressure for a long stretch, so no socket bytes reach the receiver for well over PING_TIMEOUT
 // (default 60s) even though the copy is healthy and will resume. Timing the receiver out on that gap
@@ -3893,6 +3894,40 @@ export class NodeReplicationConnection extends EventEmitter {
 	}
 }
 
+function configuredPeerIdentity(
+	authorization: any,
+	options: any,
+	announced: string,
+	configuredName?: string
+): string | undefined {
+	const configured = [authorization, ...iterateRoutes(options), ...(server.nodes ?? [])];
+	const subscription = options.connection?.nodeSubscriptions?.[0];
+	if (subscription) configured.push(subscription);
+	const expected = authorization?.name ?? configuredName;
+	if (!expected) return undefined;
+	if (expected === announced) return expected;
+	const aliases = (record: any): string[] => {
+		if (!record?.name || !record.url) return [];
+		try {
+			return [new URL(record.url).hostname];
+		} catch {
+			return [];
+		}
+	};
+	const matches = configured.filter(
+		(record) =>
+			record?.name &&
+			(record.name === expected || aliases(record).includes(expected)) &&
+			(record.name === announced || aliases(record).includes(announced))
+	);
+	const names = new Set(matches.map((record) => record.name));
+	if (names.size !== 1) throw new Error('Node name mismatch');
+	const canonical = matches[0].name;
+	if (announced !== canonical && (server.nodes ?? []).some((node) => node.name === announced))
+		throw new Error('Node name belongs to another known node');
+	return canonical;
+}
+
 /**
  * This handles both incoming and outgoing WS allowing either one to issue a subscription and get replication and/or handle subscription requests
  */
@@ -3955,6 +3990,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		);
 	}
 	let remoteNodeName: string;
+	let residencyIdentityBound = false;
+	const configuredPeerName = options.connection?.tentativeNode
+		? undefined
+		: (options.connection?.nodeSubscriptions?.[0]?.name ?? options.connection?.nodeName);
 	const awaitingResponse = new Map();
 	let receivingDataFromNodeIds = [];
 	remoteNodeName = authorization.name;
@@ -4498,6 +4537,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const DELAY_CLOSE_TIME = 60000; // amount of time to wait before closing the connection if we haven't any activity and there are no subscriptions
 	let delayedClose: NodeJS.Timeout;
 	let lastMessageTime = 0;
+	let lastReceivedTime = 0;
 	let residencySender: ReturnType<typeof registerResidencySender>;
 	// track bytes read and written so we can verify if a connection is really dead on pings
 	let bytesRead = 0;
@@ -4715,7 +4755,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// pauseStallWatchdog} armed while paused" invariant. While paused the pause-stall watchdog is the
 	// liveness guard; removePauseReason re-arms the byte watchdog on resume. (harper-pro#466 review)
 	const resetPingTimer = () => {
-		if (residencySender && !connectionSuperseded()) residencySender.touch();
+		lastReceivedTime = Date.now();
+		if (residencySender && !connectionSuperseded()) residencySender.touch(lastReceivedTime);
 		if (pauseReasons === 0) receiveWatchdog?.reset();
 	};
 	resetPingTimer();
@@ -5362,6 +5403,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!authorization) return;
 		// A replication header should begin with either a transaction timestamp or messagepack message of
 		// of an array that begins with the command code
+		if (databaseName && databaseResidencyBlockReason(databaseName)) {
+			wsClosed = true;
+			close(1011, 'Database residency configuration is quarantined; restart after repair');
+			return;
+		}
 		lastMessageTime = performance.now();
 		try {
 			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
@@ -5385,26 +5431,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// The slot must stay replaceable — this object outlives the socket and is re-mirrored
 							// on every handshake.
 							if (options.connection) options.connection.peerCapabilities = peerCapabilities;
-							// this is the node name
-							if (remoteNodeName) {
-								if (remoteNodeName !== data) {
-									logger.error?.(
-										connectionId,
-										`Node name mismatch, expecting to connect to ${remoteNodeName}, but peer reported name as ${data}, disconnecting`
-									);
-									ws.send(encode([DISCONNECT]));
-									close(1008, 'Node name mismatch');
-									return;
-								}
-							} else {
-								remoteNodeName = data;
-								if (options.connection?.tentativeNode) {
-									// if this was a tentative node, we need to update the node name
-									const nodeToAdd = options.connection.tentativeNode;
-									nodeToAdd.name = remoteNodeName;
-									options.connection.tentativeNode = null;
-									ensureNode(remoteNodeName, nodeToAdd);
-								}
+							let canonical: string;
+							try {
+								canonical = configuredPeerIdentity(authorization, options, data, configuredPeerName);
+								if (remoteNodeName && !canonical) throw new Error('Node name mismatch');
+							} catch {
+								ws.send(encode([DISCONNECT]));
+								close(1008, 'Node name mismatch');
+								return;
+							}
+							residencyIdentityBound = Boolean(canonical);
+
+							remoteNodeName = canonical ?? data;
+							if (options.connection?.tentativeNode) {
+								const nodeToAdd = options.connection.tentativeNode;
+								nodeToAdd.name = remoteNodeName;
+								options.connection.tentativeNode = null;
+								ensureNode(remoteNodeName, nodeToAdd);
 							}
 							if (options.connection) options.connection.nodeName = remoteNodeName;
 							if (hasResidencySchemaAuthority(databaseName ?? message[2])) {
@@ -5430,7 +5473,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!databaseName) {
 								// this means we are the server
 								try {
-									setDatabase((databaseName = message[2]));
+									databaseName = message[2];
+									if (databaseResidencyBlockReason(databaseName)) {
+										wsClosed = true;
+										close(1011, 'Database residency configuration is quarantined; restart after repair');
+										return;
+									}
+									setDatabase(databaseName);
 									if (databaseName === 'system') {
 										schemaUpdateListener = forEachReplicatedDatabase(options, (database, databaseName) => {
 											if (checkDatabaseAccess(databaseName)) sendDBSchema(databaseName);
@@ -5489,16 +5538,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							data.map((t) => t.table)
 						);
 						const schemaDatabaseName = message[2];
-						if (
-							(message[5] ||
-								data.some(
-									(definition) =>
-										definition.residency !== undefined || databases[schemaDatabaseName]?.[definition.table]?.residency
-								)) &&
-							!authorizeResidencySchema(schemaDatabaseName, databaseName === 'system')
-						)
-							break;
-						if (message[5]) {
+						const incomingMarkers = validateDropMarkers(message[4]);
+						const hasResidencyMetadata =
+							message[5] ||
+							incomingMarkers.some((marker) => databases[schemaDatabaseName]?.[marker.table]?.residency) ||
+							data.some(
+								(definition) =>
+									definition.residency !== undefined || databases[schemaDatabaseName]?.[definition.table]?.residency
+							);
+						const residencyAuthorized =
+							!hasResidencyMetadata || authorizeResidencySchema(schemaDatabaseName, databaseName === 'system');
+						if (message[5] && residencyAuthorized) {
 							recordResidencyConfiguration(remoteNodeName, message[5].shardsDigest);
 							try {
 								const snapshot = validateResidencyMap(message[5].snapshot, schemaDatabaseName);
@@ -5514,6 +5564,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								throw error;
 							}
 						}
+						if (databaseResidencyBlockReason(schemaDatabaseName)) break;
 						// Markers drop tables, so they need the authority the subscription path requires to receive.
 						const markersAuthorized =
 							authorization?.name || authorization?.replicates || authorization?.role?.permission?.super_user;
@@ -5521,7 +5572,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const routeExcluded = excludedTablesFromPeer(schemaDatabaseName);
 						const peerDropMarkers =
 							markersAuthorized && checkDatabaseAccess(schemaDatabaseName)
-								? validateDropMarkers(message[4]).filter((marker) => !routeExcluded?.has(marker.table))
+								? incomingMarkers.filter(
+										(marker) =>
+											!routeExcluded?.has(marker.table) &&
+											(residencyAuthorized || !databases[schemaDatabaseName]?.[marker.table]?.residency)
+									)
 								: [];
 						// A stale local generation goes before this frame's definitions are compared. Markers for a database
 						// not open here wait, refusing what they retire, until a definition opens it.
@@ -5537,6 +5592,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							pendingMarkers = [];
 						}
 						for (const tableDefinition of data) {
+							if (
+								!residencyAuthorized &&
+								(tableDefinition.residency !== undefined ||
+									databases[schemaDatabaseName]?.[tableDefinition.table]?.residency)
+							)
+								continue;
 							const newDatabaseName = schemaDatabaseName;
 							tableDefinition.database = newDatabaseName;
 							let table: any;
@@ -6324,6 +6385,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					}
 					case SUBSCRIPTION_REQUEST: {
+						if (
+							!residencyIdentityBound &&
+							Object.values(databases[databaseName] ?? {}).some((Table) => Table.residency)
+						)
+							throw new Error('Declarative residency requires a configured peer identity');
 						nodeSubscriptions = data;
 						excludedNodes = message[2]; // use the third argument for exclusion list
 						const subscriptionSetupRequestId = message[3];
@@ -6935,7 +7001,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								residencySender = subscriptionResidencySender = registerResidencySender(
 									auditStore,
 									databaseName,
-									remoteNodeName
+									remoteNodeName,
+									lastReceivedTime
 								);
 								recordPeerLockCapabilityFromHandshake();
 								sendRecordLockHomesDigestFrame();
@@ -7825,6 +7892,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			 * handles parsing and transacting these replication messages */
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
+			if (!residencyIdentityBound && Object.values(databases[databaseName] ?? {}).some((Table) => Table.residency))
+				throw new Error('Declarative residency requires a configured peer identity');
 			if (!(await whenSubscriptionResolved())) return;
 			if (connectionSuperseded()) return;
 			// The origin's log key for every record in this body, read once. It is what the apply
@@ -9773,6 +9842,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	function authorizeResidencySchema(targetDatabase: string, skipUnsubscribed = false): boolean {
+		if (!residencyIdentityBound)
+			throw new Error('Residency metadata requires an authenticated or configured node identity');
 		if (databaseName && databaseName !== 'system' && databaseName !== targetDatabase)
 			throw new Error('Residency metadata does not belong to an authorized database frame');
 		const superUser = authorization?.role?.permission?.super_user;

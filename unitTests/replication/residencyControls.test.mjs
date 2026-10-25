@@ -18,7 +18,12 @@ import {
 	requireConnectedResidencyOwner,
 } from '#src/core/resources/residencyMaps';
 import { setReplicator } from '#src/replication/replicator';
-import { databaseSubscriptions, encodeCopyRecordValue, replicateOverWS } from '#src/replication/replicationConnection';
+import {
+	databaseSubscriptions,
+	encodeCopyRecordValue,
+	replicateOverWS,
+	PING_TIMEOUT,
+} from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
 import { residencyTopologyErrors } from '#src/replication/residencyTopology';
@@ -301,7 +306,7 @@ describe('Declarative tables keep control and event traffic independent of place
 						new ArrayBuffer(12)
 					)
 				);
-				Atomics.store(state, 2, Math.floor(Date.now() / 1000) - 3600);
+				Atomics.store(state, 2, Date.now() - PING_TIMEOUT - 1);
 				assert.throws(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']), /connected/);
 				first.socket.emit('pong');
 				assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));

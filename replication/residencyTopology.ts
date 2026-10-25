@@ -1,7 +1,7 @@
 import { compareResidencyPlacement } from '../core/resources/residencyConversion.ts';
 import { getWorkerIndex } from '../core/server/threads/manageThreads.js';
 import { isDedicatedPoolWorker } from '../core/server/threads/workerPools.ts';
-import { databases } from '../core/resources/databases.ts';
+import { databases, databaseResidencyBlockReason } from '../core/resources/databases.ts';
 import {
 	getResidencyConfiguration,
 	readResidencyMap,
@@ -12,8 +12,8 @@ import {
 import { server } from '../core/server/Server.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import * as logger from '../core/utility/logging/harper_logger.ts';
-import { getHDBNodeTable, getReplicationRecipients, getReplicationSharedStatus } from './knownNodes.ts';
-import { deriveConnectionTruth, LIVENESS_STALE_MS } from './replicationConnection.ts';
+import { getHDBNodeTable, getReplicationRecipients } from './knownNodes.ts';
+import { PING_TIMEOUT } from './replicationConnection.ts';
 
 const agreements = new WeakMap<object, Map<string, Map<string, Int32Array>>>();
 const senders = new WeakMap<object, Map<string, Map<string, Uint32Array>>>();
@@ -31,30 +31,30 @@ function senderStatus(store: any, database: string, peer: string): Uint32Array {
 	return status;
 }
 
-export function registerResidencySender(store: any, database: string, peer: string) {
+export function registerResidencySender(store: any, database: string, peer: string, receivedAt = Date.now()) {
 	const status = senderStatus(store, database, peer);
 	let generation = (Atomics.add(status, 0, 1) + 1) >>> 0;
 	if (!generation) generation = (Atomics.add(status, 0, 1) + 1) >>> 0;
 	let closed = false;
 	Atomics.store(status, 1, generation);
 	const sender = {
-		touch() {
+		touch(receivedAt = Date.now()) {
 			if (closed) return;
 			const active = Atomics.compareExchange(status, 1, 0, generation);
-			if (!active || active === generation) Atomics.store(status, 2, Math.floor(Date.now() / 1000));
+			if (!active || active === generation) Atomics.store(status, 2, receivedAt >>> 0);
 		},
 		close() {
 			closed = true;
 			Atomics.compareExchange(status, 1, generation, 0);
 		},
 	};
-	sender.touch();
+	sender.touch(receivedAt);
 	return sender;
 }
 
 function residencySenderConnected(store: any, database: string, peer: string): boolean {
 	const status = senderStatus(store, database, peer);
-	return Atomics.load(status, 1) !== 0 && Date.now() - Atomics.load(status, 2) * 1000 < LIVENESS_STALE_MS;
+	return Atomics.load(status, 1) !== 0 && (Date.now() - Atomics.load(status, 2)) >>> 0 < PING_TIMEOUT;
 }
 
 function agreement(peer: string, database = '*'): Int32Array {
@@ -129,14 +129,7 @@ setResidencyPlacementGuard((database, owners, requireConnected) => {
 		throw new ClientError(`No replication route reaches the owners of a record in ${database}`, 503);
 	if (requireConnected) {
 		const auditStore = Object.values(databases[database] ?? {}).find((Table) => Table.auditStore)?.auditStore;
-		if (
-			!auditStore ||
-			!reachable.some(
-				(node) =>
-					residencySenderConnected(auditStore, database, node.name) ||
-					deriveConnectionTruth(getReplicationSharedStatus(auditStore, database, node.name)).connected
-			)
-		)
+		if (!auditStore || !reachable.some((node) => residencySenderConnected(auditStore, database, node.name)))
 			throw new ClientError(`No new residency owner is connected for ${database}; attribute-slot change refused`, 503);
 	}
 });
@@ -163,6 +156,8 @@ export function residencyStatus() {
 	for (const database of declarations) {
 		const snapshot = readResidencyMap(database);
 		const errors = residencyTopologyErrors(database);
+		const quarantine = databaseResidencyBlockReason(database);
+		if (quarantine) errors.push(quarantine);
 		if (configurationError) errors.push(configurationError);
 		else if (configuration.shards && !configuration.shards.includes(configuration.shard))
 			errors.push('replication.shard is not in replication.shards');
