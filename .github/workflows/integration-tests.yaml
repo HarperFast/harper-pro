@@ -360,7 +360,7 @@ jobs:
 
   # The core OCSP/CRL/subscription-revocation suites against the assembled Pro build, on every
   # supported runtime including PRs: Node 26.8 broke revocation checking only on that major
-  # (harper#2380), so a Node-24-only PR run cannot catch that class of regression.
+  # (harper#2380), so a single-version PR run cannot catch that class of regression.
   run-revocation-suites:
     name: Core Revocation Suites (Node.js v${{ matrix.node-version }})
     runs-on: ubuntu-latest

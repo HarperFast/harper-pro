@@ -16,7 +16,7 @@
 # the pinned uWS version bumps), and consumed by the main Dockerfile via the
 # RUN_IMAGE build arg.
 
-ARG NODE_VERSION=24
+ARG NODE_VERSION=26
 
 FROM docker.io/node:${NODE_VERSION} AS build
 

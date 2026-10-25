@@ -651,6 +651,9 @@ jobs:
           # dispatches that matrix three times. The pinned version is the one the
           # release line ships: its Dockerfile default.
           NODE_MAJOR=$(git show "origin/${RELEASE_BRANCH}:Dockerfile" | sed -n 's/^ARG NODE_VERSION=//p' | cut -d- -f1)
+          if [ -z "$NODE_MAJOR" ]; then
+            echo "::error::no ARG NODE_VERSION default in ${RELEASE_BRANCH}'s Dockerfile"; exit 1
+          fi
           gh workflow run integration-tests.yaml --ref "$BRANCH" --repo "$GITHUB_REPOSITORY" -f node-version="$NODE_MAJOR"
 
           # Locate the dispatched integration-tests run id (creation is async)
