@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792915329862,
+  "lastUpdate": 1792915332436,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -15404,6 +15404,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 54.25,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "b7f0aed9557feba1467b661498d18baa1c8482a1",
+          "message": "Make Node 26 the default runtime for Harper Pro 5.4 images (#1119)\n\n* Ship Node 26 as the default runtime for 5.4\n\nNode 26 enters Active LTS on 2026-10-28 and Node 24 has left it. The\nun-suffixed harper-pro image tags (which Fabric runs) follow the\nDockerfile default, so moving that default moves the release line.\n\n- Dockerfile and Dockerfile-gpu default to Node 26; .node-version too.\n  Dockerfile-openshift stays on 24: UBI10 has no nodejs-26-minimal yet.\n- The -pc legs build on the Dockerfile's default major instead of a\n  hard-coded 24, so the pointer-compression image follows the runtime.\n- The drift check covers 24 (v5.3) and 26 (main), and matches in-flight\n  base-image builds per major via the workflow's new run-name, so one\n  major's build no longer suppresses the other's rebuild.\n- Cherry-pick test dispatch pins the target release line's own Node\n  major, read from its Dockerfile, instead of a fixed 24.\n- PR, smoke, stress and YCSB defaults and the bench runner image move\n  to 26, so tests and trends run on the shipped runtime.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Build each pc base from the release line that ships it\n\nThe drift check now runs per release branch (main, v5.3), derives the\nNode major from that branch's Dockerfile and builds from its pins, so\nthe :24 base no longer takes main's uWS/pprof pins. A publish run\nwithout the per-major title blocks every major instead of none. The\ncherry-pick test dispatch fails loudly when a release Dockerfile has\nno Node default instead of falling through to the full matrix.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Fail the pc drift check when two release lines share a Node major\n\nResolve each release line's Node major in a first job and refuse to run\nwhen two lines default to the same one: their bases would publish over\nthe same :<major> tag and their builds would cancel each other.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Fail the pc image build when the Dockerfile's build and run majors differ\n\nThe pc leg pairs the build stage's NODE_BUILD_VERSION with a pc base\npicked from NODE_VERSION; native addons only load when both share a\nmajor, so check it instead of stating it in a comment.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Inherit the global NODE_VERSION in Dockerfile-gpu's run stage\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T03:12:44Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/b7f0aed9557feba1467b661498d18baa1c8482a1"
+        },
+        "date": 1792915332372,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 10.62,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 22.78,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 24.43,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 28.58,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 33.36,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 26.98,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 68.97,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 151.63,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 58.88,
             "unit": "ms"
           }
         ]
