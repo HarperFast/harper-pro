@@ -1,5 +1,10 @@
 import { HAS_RESIDENCY_SLOT } from '../core/resources/RecordEncoder.ts';
-import { readResidencyMap, installResidencyMap, residencyOwners } from '../core/resources/residencyMaps.ts';
+import {
+	readResidencyMap,
+	installResidencyMap,
+	residencyOwners,
+	ResidencyPlacementError,
+} from '../core/resources/residencyMaps.ts';
 import {
 	sameResidencyPolicy,
 	validateResidencyMap,
@@ -505,8 +510,11 @@ export function holdFailedFrame(
 	attemptsByPeer: Map<string, { position: number; attempts: number }>,
 	peerKey: string,
 	position: number,
-	maxReplays: number
+	maxReplays: number,
+	error?: unknown
 ): boolean {
+	// Placement can recover without changing the frame; skipping it would permanently lose a valid write.
+	if (error instanceof ResidencyPlacementError) return true;
 	const prior = attemptsByPeer.get(peerKey);
 	const attempts = prior?.position === position ? prior.attempts + 1 : 1;
 	attemptsByPeer.set(peerKey, { position, attempts });
@@ -4483,7 +4491,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	// Returns true to hold: core then records no cursor for this connection's later frames either.
 	function onFrameFailure(error: unknown, position: number): boolean {
-		if (holdFailedFrame(failedFrameAttempts, `${remoteNodeName}/${databaseName}`, position, FAILED_FRAME_REPLAYS)) {
+		if (
+			holdFailedFrame(failedFrameAttempts, `${remoteNodeName}/${databaseName}`, position, FAILED_FRAME_REPLAYS, error)
+		) {
 			logger.warn?.(connectionId, 'Replicated transaction failed; reconnecting to replay it', position, error);
 			close(1011, 'Replicated transaction failed');
 			return true;
@@ -5589,7 +5599,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									definition.residency !== undefined || databases[schemaDatabaseName]?.[definition.table]?.residency
 							);
 						const residencyAuthorized =
-							!hasResidencyMetadata || authorizeResidencySchema(schemaDatabaseName, databaseName === 'system');
+							!hasResidencyMetadata ||
+							(databaseName === 'system'
+								? hasResidencySchemaAuthority(schemaDatabaseName)
+								: authorizeResidencySchema(schemaDatabaseName));
 						if (message[5] && residencyAuthorized) {
 							recordResidencyConfiguration(remoteNodeName, message[5].shardsDigest);
 							try {
@@ -6261,8 +6274,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 								// RocksDB carries the version inline; unwrap its metadata's value bytes.
 								if (encoder.isRocksDB) {
-									if (valueBuffer === lastMetadata && lastMetadata != null) {
-										valueBuffer = lastMetadata.value;
+									if (valueBuffer === entry) {
+										valueBuffer = entry.value;
 									}
 								} else {
 									entry.version = recordVersion;
@@ -9866,7 +9879,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return false;
 		}
 	}
-	function authorizeResidencySchema(targetDatabase: string, skipUnsubscribed = false): boolean {
+	function authorizeResidencySchema(targetDatabase: string): boolean {
 		if (!residencyIdentityBound)
 			throw new Error('Residency metadata requires an authenticated or configured node identity');
 		if (databaseName && databaseName !== 'system' && databaseName !== targetDatabase)
@@ -9894,7 +9907,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						? route.receives || routeEntriesIncludePeer(route.receivesFrom, remoteNodeName, targetDatabase)
 						: route);
 		if (!checkDatabaseAccess(targetDatabase) || !receives) {
-			if (skipUnsubscribed && targetDatabase !== databaseName) return false;
 			throw new Error('The receive route does not authorize this residency database');
 		}
 		return true;

@@ -55,7 +55,7 @@ async function connect(database, authorization, options = {}) {
 		'message',
 		encode([140, 'slot-setup-peer', database, [], buildLocalCapabilities(90_000, false, true), null])
 	);
-	await turns();
+	await processed(socket);
 	assert.deepEqual(socket.closes, [], 'handshake succeeds before the tested frame');
 	return socket;
 }
@@ -65,11 +65,13 @@ async function sendMap(socket, frameDatabase, snapshot) {
 		await new Promise((resolve) => setTimeout(resolve, 5));
 }
 const snapshot = (database) => createResidencyMap(database, 2, [{ start: 0, end: 2, shard: 0 }], 1);
-async function processed(socket) {
-	const request = 'setup-processing-barrier';
+let barrierSequence = 0;
+async function processed(socket, allowClose = false) {
+	const request = `setup-processing-barrier-${barrierSequence++}`;
 	socket.emit('message', encode([133, request, 0, 'absent', 'MissingTable']));
 	const deadline = Date.now() + 5000;
 	while (!socket.sent.some((frame) => frame[0] === 134 && frame[1] === request)) {
+		if (allowClose && socket.closes.length) return;
 		assert.equal(socket.closes.length, 0, 'stream closed before processing the following request');
 		assert.ok(Date.now() < deadline, 'setup frame did not finish');
 		await new Promise((resolve) => setTimeout(resolve, 5));
@@ -139,7 +141,7 @@ describe('residency setup authority', function () {
 									]
 						)
 					);
-					await turns();
+					await processed(socket, true);
 					assert.deepEqual(residencyTopologyErrors(database), []);
 					assert.deepEqual(Records.residency, policy);
 				} finally {
@@ -306,7 +308,7 @@ describe('residency setup authority', function () {
 					{ shardsDigest: 'forged' },
 				])
 			);
-			await turns();
+			await processed(socket, true);
 			assert.deepEqual(residencyTopologyErrors(database), []);
 		} finally {
 			server.nodes = priorNodes;
@@ -338,7 +340,7 @@ describe('residency setup authority', function () {
 						{ shardsDigest: 'forged' },
 					])
 				);
-				await turns();
+				await processed(socket, true);
 				assert.deepEqual(residencyTopologyErrors(database), []);
 			} finally {
 				server.nodes = priorNodes;
@@ -439,7 +441,7 @@ describe('residency setup authority', function () {
 			await turns();
 			socket.close(1000);
 			resolve({ name: 'slot-setup-peer', replicates: true });
-			await turns();
+			await processed(socket, true);
 			assert.deepEqual(residencyTopologyErrors(database), []);
 		} finally {
 			resolve(undefined);
@@ -615,6 +617,44 @@ describe('residency setup authority', function () {
 			'a marker-only frame cannot drop an out-of-scope declarative table'
 		);
 	});
+	it('keeps legacy schema discovery on an unbound system stream', async () => {
+		const database = 'slot_setup_unbound_legacy';
+		await installResidencyMap(snapshot(database));
+		const Records = table({
+			database,
+			table: 'Rows',
+			audit: true,
+			residency: { slots: 2 },
+			attributes: [
+				{ name: 'id', isPrimaryKey: true },
+				{ name: 'tag', indexed: true },
+			],
+		});
+		const socket = await connect('system', { username: 'discovery', replicates: true });
+		socket.emit(
+			'message',
+			encode([
+				145,
+				[
+					{ table: 'Rows', attributes: Records.attributes, schemaDefined: true },
+					{ table: 'LegacyRows', attributes: [{ name: 'id', isPrimaryKey: true }], schemaDefined: true },
+				],
+				database,
+			])
+		);
+		await processed(socket);
+		assert.deepEqual(socket.closes, []);
+		assert.deepEqual(Records.residency, { slots: 2, byAttribute: false });
+		assert.ok(databases[database].LegacyRows, 'legacy discovery in a mixed frame still runs');
+		assert.deepEqual(residencyTopologyErrors(database), []);
+		socket.emit('message', encode([145, [], database, undefined, [{ table: 'Rows', droppedTime: Date.now() + 1000 }]]));
+		await processed(socket);
+		assert.equal(
+			databases[database].Rows,
+			Records,
+			'a marker-only frame cannot drop an out-of-scope declarative table'
+		);
+	});
 	it('resolves and receives owner projections without an outbound write route', async () => {
 		const database = 'slot_setup_receive_only';
 		const peer = 'slot-receive-owner';
@@ -736,7 +776,7 @@ describe('residency setup authority', function () {
 			await Records.dropTable();
 			const retry = await connect(database, { name: 'slot-setup-peer', replicates: true });
 			await sendMap(retry, database, map);
-			await turns();
+			await processed(retry);
 			assert.deepEqual(residencyTopologyErrors(database), []);
 		} finally {
 			server.nodes = priorNodes;
@@ -781,7 +821,7 @@ describe('residency setup authority', function () {
 					await turns();
 					assert.ok(residencyTopologyErrors(database).length, 'map agreement alone cannot clear a policy conflict');
 					retry.emit('message', encode(frame(policy)));
-					await turns();
+					await processed(retry);
 					assert.deepEqual(residencyTopologyErrors(database), []);
 				} finally {
 					server.nodes = priorNodes;

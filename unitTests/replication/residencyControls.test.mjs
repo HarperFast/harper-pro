@@ -5,6 +5,7 @@ import { dirname } from 'node:path';
 import { decode, encode } from 'msgpackr';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
+import { DatabaseTransaction } from '#src/core/resources/DatabaseTransaction';
 import { transaction } from '#src/core/resources/transaction';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { INVALIDATED } from '#src/core/resources/Table';
@@ -164,6 +165,95 @@ describe('Declarative tables keep control and event traffic independent of place
 		assert.deepEqual(socket.closes, []);
 		return { Records, socket, database };
 	}
+	it('unwraps an owner record after residency resolution decodes another native entry', async () => {
+		const { Records, socket } = await connect(false, 'metadata_decode');
+		await Records.put('requested', { id: 'requested', region: 0, body: 'canonical' });
+		await Records.put('other', { id: 'other', region: 0, body: 'unrelated' });
+		const resolveOwners = Records.getRecordResidency;
+		Records.getRecordResidency = function (entry) {
+			const owners = resolveOwners.call(this, entry);
+			const bytes = Records.primaryStore.getBinary('other');
+			Records.primaryStore.decoder.decode(bytes, { valueAsBuffer: true });
+			return owners;
+		};
+		try {
+			socket.emit('message', encode([133, 'metadata-decode', Records.tableId, 'requested', Records.tableName]));
+			await until(() => socket.sent.some((frame) => frame[0] === 134 && frame[1] === 'metadata-decode'));
+			const answer = socket.sent.find((frame) => frame[0] === 134 && frame[1] === 'metadata-decode')[2];
+			assert.equal(answer.error, undefined);
+			assert.ok(Buffer.isBuffer(answer.value), 'the response carries encoded value bytes, not native metadata');
+			assert.equal(Records.primaryStore.decoder.decode(answer.value, { valueOnly: true }).body, 'canonical');
+		} finally {
+			Records.getRecordResidency = resolveOwners;
+		}
+	});
+	it('holds a canonical frame through repeated owner changes and commits after membership stabilizes', async () => {
+		const { Records, socket: initial, database } = await connect(false, 'churn');
+		initial.close();
+		const version = Date.now() + 1;
+		const frame = recordFrame(Records, 'put', 'held', { id: 'held', region: 0, body: 'canonical' }, version, 42);
+		const original = DatabaseTransaction.prototype.refuseUnconfirmable;
+		let refusals = 0;
+		DatabaseTransaction.prototype.refuseUnconfirmable = function (...args) {
+			if (!this.sourceApply || !this.writes.some((write) => write?.store?.rootStore.databaseName === database))
+				return original.apply(this, args);
+			const prior = server.shards;
+			server.shards = new Map(prior);
+			server.shards.set(0, [...prior.get(0), { name: 'new-owner-during-submit' }]);
+			try {
+				refusals++;
+				return original.apply(this, args);
+			} finally {
+				server.shards = prior;
+			}
+		};
+		async function deliver() {
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [{ name: 'slot-control-peer', replicateByDefault: true }];
+			const { socket } = await connect(false, 'churn', false, undefined, undefined, connection);
+			const encoder = Records.primaryStore.encoder;
+			socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+			socket.emit(
+				'message',
+				encode([
+					132,
+					{
+						structures: encoder.structures,
+						typedStructs: encoder.typedStructs,
+						attributes: Records.attributes,
+						residency: Records.residency,
+						schemaDefined: true,
+					},
+					Records.tableId,
+					Records.tableName,
+				])
+			);
+			socket.emit('message', encode([130, [server.hostname], 42]));
+			socket.emit('message', frame);
+			return socket;
+		}
+		const remoteId = getIdOfRemoteNode('slot-control-peer', Records.auditStore);
+		const cursor = () => Records.dbisDB.getSync([Symbol.for('seq'), remoteId])?.seqId;
+		const before = cursor();
+		try {
+			for (let attempt = 0; attempt < 7; attempt++) {
+				const socket = await deliver();
+				await until(
+					() => socket.closes.length || socket.sent.some((message) => message[0] === 144 && message[1] >= version)
+				);
+				assert.ok(socket.closes.length, `delivery ${attempt + 1} must hold, not skip`);
+				assert.equal(cursor(), before, 'a refused canonical frame cannot advance its durable cursor');
+				assert.equal(Records.primaryStore.getEntry('held'), undefined);
+			}
+			assert.ok(refusals >= 7, 'every delivery reaches the native pre-submit owner fence');
+		} finally {
+			DatabaseTransaction.prototype.refuseUnconfirmable = original;
+		}
+		const repaired = await deliver();
+		await until(() => Records.primaryStore.getEntry('held')?.value?.body === 'canonical');
+		await until(() => cursor() === version);
+		assert.deepEqual(repaired.closes, []);
+	});
 	it('preserves an explicitly missing legacy residency list', async () => {
 		const { Records, socket } = await connect(false, 'legacy_missing_list', true);
 		const frame = recordFrame(Records, 'put', 'legacy-row', { id: 'legacy-row', body: 'complete' }, Date.now(), 42);

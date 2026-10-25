@@ -8,6 +8,7 @@ import {
 	initializeResidencySlots,
 	setResidencyPlacementGuard,
 	residencyDeclarationDatabases,
+	ResidencyPlacementError,
 } from '../core/resources/residencyMaps.ts';
 import { server } from '../core/server/Server.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
@@ -124,16 +125,20 @@ export function residencyTopologyErrors(database?: string): string[] {
 
 setResidencyPlacementGuard((database, owners, requireConnected) => {
 	const errors = residencyTopologyErrors(database);
-	if (errors.length) throw new ClientError(`Declarative residency blocked for ${database}: ${errors.join('; ')}`, 503);
+	if (errors.length)
+		throw new ResidencyPlacementError(`Declarative residency blocked for ${database}: ${errors.join('; ')}`, 503);
 	if (requireConnected === undefined || !owners || owners.includes(server.hostname)) return;
 	const recipients = getReplicationRecipients(database);
 	const reachable = recipients.filter((node) => owners.includes(node.name));
 	if (!reachable.length)
-		throw new ClientError(`No replication route reaches the owners of a record in ${database}`, 503);
+		throw new ResidencyPlacementError(`No replication route reaches the owners of a record in ${database}`, 503);
 	if (requireConnected) {
 		const auditStore = Object.values(databases[database] ?? {}).find((Table) => Table.auditStore)?.auditStore;
 		if (!auditStore || !reachable.some((node) => residencySenderConnected(auditStore, database, node.name)))
-			throw new ClientError(`No new residency owner is connected for ${database}; attribute-slot change refused`, 503);
+			throw new ResidencyPlacementError(
+				`No new residency owner is connected for ${database}; attribute-slot change refused`,
+				503
+			);
 	}
 });
 
