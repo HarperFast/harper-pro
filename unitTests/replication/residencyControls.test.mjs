@@ -26,7 +26,7 @@ import {
 } from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
-import { residencyTopologyErrors } from '#src/replication/residencyTopology';
+import { residencyTopologyErrors, registerResidencySender } from '#src/replication/residencyTopology';
 import { FrameWriter } from '#src/replication/frameWriter';
 
 class Socket extends EventEmitter {
@@ -361,13 +361,17 @@ describe('Declarative tables keep control and event traffic independent of place
 					assert.deepEqual(socket.closes, []);
 				}
 				assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
-				const state = new Uint32Array(
+				const state = new BigUint64Array(
 					first.Records.auditStore.getUserSharedBuffer(
 						['residency-sending', first.database, 'slot-control-peer'],
-						new ArrayBuffer(12)
+						new ArrayBuffer(16)
 					)
 				);
-				Atomics.store(state, 2, Date.now() - PING_TIMEOUT - 1);
+				Atomics.store(
+					state,
+					1,
+					(Atomics.load(state, 1) & 0xffffffff00000000n) | BigInt((Date.now() - PING_TIMEOUT - 1) >>> 0)
+				);
 				assert.throws(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']), /connected/);
 				first.socket.emit('pong');
 				assert.doesNotThrow(() => requireConnectedResidencyOwner(first.database, ['slot-control-peer']));
@@ -393,6 +397,40 @@ describe('Declarative tables keep control and event traffic independent of place
 				server.nodes = priorNodes;
 			}
 		});
+
+	it('publishes a replacement sender heartbeat atomically with its generation', async () => {
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-control-peer', replicates: true }];
+		let first, replacement;
+		const store = Atomics.store;
+		try {
+			const { Records, database } = await connect(false, 'atomic_sender');
+			first = registerResidencySender(Records.auditStore, database, 'slot-control-peer');
+			assert.doesNotThrow(() => requireConnectedResidencyOwner(database, ['slot-control-peer']));
+			let observed = false;
+			// This synchronous scheduler hook lets a reader run at the shared-state publication.
+			Atomics.store = (state, index, value) => {
+				const result = store(state, index, value);
+				if (index === 1 && !observed) {
+					observed = true;
+					assert.throws(() => requireConnectedResidencyOwner(database, ['slot-control-peer']), /connected/);
+				}
+				return result;
+			};
+			replacement = registerResidencySender(
+				Records.auditStore,
+				database,
+				'slot-control-peer',
+				Date.now() - PING_TIMEOUT - 1
+			);
+			assert.equal(observed, true, 'observed the replacement publication');
+		} finally {
+			Atomics.store = store;
+			replacement?.close();
+			first?.close();
+			server.nodes = priorNodes;
+		}
+	});
 
 	it('does not replace sender liveness when a superseded setup wait resumes', async () => {
 		let resume, subscription;

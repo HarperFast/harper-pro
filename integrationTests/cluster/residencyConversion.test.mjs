@@ -30,8 +30,8 @@ async function request(node, path, body, signal = AbortSignal.timeout(30_000)) {
 
 for (const engine of ['rocksdb', 'lmdb']) {
 	test(
-		`zero-movement conversion and previous-binary key-policy rollback (${engine})`,
-		{ timeout: 900_000, skip: !previousBinary && 'Set HARPER_PRO_PREVIOUS_VERSION_PATH to a built prior binary' },
+		`zero-movement conversion with optional previous-binary rollback (${engine})`,
+		{ timeout: 900_000 },
 		async (ctx) => {
 			const contexts = [0, 1].map(() => ({ name: ctx.name }));
 			const nodes = () => contexts.map((context) => context.harper);
@@ -178,16 +178,25 @@ for (const engine of ['rocksdb', 'lmdb']) {
 					assert.equal(row.previousSlot, undefined);
 					assert.equal(row.flags & 0x30000, 0);
 				}
-			await reopen([true, false], [currentBinary, previousBinary]);
-			await request(nodes()[0], 'Converted/mixed7', { id: 'mixed7', tag: 'mixed', body: 'legacy reader' });
+			if (previousBinary) {
+				await reopen([true, false], [currentBinary, previousBinary]);
+				await request(nodes()[0], 'Converted/mixed7', { id: 'mixed7', tag: 'mixed', body: 'legacy reader' });
+				await settle();
+				for (const node of nodes()) assert.equal((await request(node, 'Converted/mixed7')).body, 'legacy reader');
+				const legacyRows = await request(nodes()[1], 'ConversionRows/');
+				assert.equal(legacyRows.find((row) => row.id === 'mixed7').slot, undefined);
+			}
+			// Seed a non-owner writer replica even when the optional mixed-version arm did not run.
+			await request(nodes()[0], 'Converted/drain7', { id: 'drain7', tag: 'drain', body: 'temporary writer copy' });
 			await settle();
-			for (const node of nodes()) assert.equal((await request(node, 'Converted/mixed7')).body, 'legacy reader');
-			const legacyRows = await request(nodes()[1], 'ConversionRows/');
-			assert.equal(legacyRows.find((row) => row.id === 'mixed7').slot, undefined);
 			await reopen(true, currentBinary, 0);
 			const drains = await Promise.all(nodes().map((node) => request(node, 'ConversionDrain/', {})));
 			assert.ok(drains.every((result) => result.remaining === 0));
 			assert.equal(drains.reduce((sum, result) => sum + result.demoted, 0) > 0, engine === 'rocksdb');
+			if (!previousBinary) {
+				ctx.diagnostic('Previous-binary rollback not exercised: HARPER_PRO_PREVIOUS_VERSION_PATH is unset');
+				return;
+			}
 			await reopen(false, previousBinary);
 			for (const node of nodes())
 				for (const id of ['legacy2', 'legacy7', 'new2', 'new7'])

@@ -549,6 +549,7 @@ suite('Declarative residency quarantine on restart', { timeout: 300_000 }, (ctx)
 		const priorPid = await readNodePid(context.harper);
 		await stopNodeProcess(context.harper);
 		await put(peerContext.harper, 'SlotAttributes', { id: 'quarantined', region: 0, body: 'delayed peer write' });
+		const quarantineStarted = Date.now();
 		await start([1]);
 		assert.notEqual(await readNodePid(context.harper), priorPid);
 		const node = context.harper;
@@ -596,7 +597,20 @@ suite('Declarative residency quarantine on restart', { timeout: 300_000 }, (ctx)
 			assert.equal(response.status, 503, JSON.stringify(response));
 			assert.match(JSON.stringify(response.data), /replication.shard/);
 		}
-		await new Promise((resolve) => setTimeout(resolve, 1500));
+		await waitForCondition(
+			async (signal) => {
+				const status = await sendOperation(peerContext.harper, { operation: 'cluster_status' }, { signal });
+				return status.connections
+					.find((connection) => connection.name === node.hostname)
+					?.database_sockets.some(
+						(socket) =>
+							socket.database === 'data' &&
+							socket.lastConnectionError?.code === 1011 &&
+							Date.parse(socket.lastConnectionError.time) >= quarantineStarted
+					);
+			},
+			{ description: 'peer observes a refused data connection after the quarantined restart' }
+		);
 		assert.deepEqual(
 			(await rawRows(node, 'SlotAttributes')).find((row) => row.id === 'quarantined'),
 			before,

@@ -16,16 +16,16 @@ import { getHDBNodeTable, getReplicationRecipients } from './knownNodes.ts';
 import { PING_TIMEOUT } from './replicationConnection.ts';
 
 const agreements = new WeakMap<object, Map<string, Map<string, Int32Array>>>();
-const senders = new WeakMap<object, Map<string, Map<string, Uint32Array>>>();
+const senders = new WeakMap<object, Map<string, Map<string, BigUint64Array>>>();
 
-function senderStatus(store: any, database: string, peer: string): Uint32Array {
+function senderStatus(store: any, database: string, peer: string): BigUint64Array {
 	let databases = senders.get(store);
 	if (!databases) senders.set(store, (databases = new Map()));
 	let peers = databases.get(database);
 	if (!peers) databases.set(database, (peers = new Map()));
 	let status = peers.get(peer);
 	if (!status) {
-		status = new Uint32Array(store.getUserSharedBuffer(['residency-sending', database, peer], new ArrayBuffer(12)));
+		status = new BigUint64Array(store.getUserSharedBuffer(['residency-sending', database, peer], new ArrayBuffer(16)));
 		peers.set(peer, status);
 	}
 	return status;
@@ -33,28 +33,31 @@ function senderStatus(store: any, database: string, peer: string): Uint32Array {
 
 export function registerResidencySender(store: any, database: string, peer: string, receivedAt = Date.now()) {
 	const status = senderStatus(store, database, peer);
-	let generation = (Atomics.add(status, 0, 1) + 1) >>> 0;
-	if (!generation) generation = (Atomics.add(status, 0, 1) + 1) >>> 0;
+	let generation = (Atomics.add(status, 0, 1n) + 1n) & 0xffffffffn;
+	if (!generation) generation = (Atomics.add(status, 0, 1n) + 1n) & 0xffffffffn;
+	const identity = generation << 32n;
+	const stamp = (receivedAt: number) => identity | BigInt(receivedAt >>> 0);
 	let closed = false;
-	Atomics.store(status, 1, generation);
-	const sender = {
+	// Publish identity and receive time together. Separate stores let a new connection borrow
+	// the previous connection's heartbeat, and a late touch could overwrite its successor's time.
+	Atomics.store(status, 1, stamp(receivedAt));
+	return {
 		touch(receivedAt = Date.now()) {
 			if (closed) return;
-			const active = Atomics.compareExchange(status, 1, 0, generation);
-			if (!active || active === generation) Atomics.store(status, 2, receivedAt >>> 0);
+			const active = Atomics.load(status, 1);
+			if (!active || active >> 32n === generation) Atomics.compareExchange(status, 1, active, stamp(receivedAt));
 		},
 		close() {
 			closed = true;
-			Atomics.compareExchange(status, 1, generation, 0);
+			const active = Atomics.load(status, 1);
+			if (active >> 32n === generation) Atomics.compareExchange(status, 1, active, 0n);
 		},
 	};
-	sender.touch(receivedAt);
-	return sender;
 }
 
 function residencySenderConnected(store: any, database: string, peer: string): boolean {
-	const status = senderStatus(store, database, peer);
-	return Atomics.load(status, 1) !== 0 && (Date.now() - Atomics.load(status, 2)) >>> 0 < PING_TIMEOUT;
+	const active = Atomics.load(senderStatus(store, database, peer), 1);
+	return active !== 0n && (Date.now() - Number(active & 0xffffffffn)) >>> 0 < PING_TIMEOUT;
 }
 
 function agreement(peer: string, database = '*'): Int32Array {

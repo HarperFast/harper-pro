@@ -9,7 +9,7 @@ import {
 	getResidencyMapTable,
 	requireConnectedResidencyOwner,
 } from '#src/core/resources/residencyMaps';
-import { replicateOverWS } from '#src/replication/replicationConnection';
+import { replicateOverWS, NodeReplicationConnection } from '#src/replication/replicationConnection';
 import { server } from '#src/core/server/Server';
 import { getReplicationSharedStatus, getHDBNodeTable } from '#src/replication/knownNodes';
 import { databases, table } from '#src/core/resources/databases';
@@ -85,6 +85,8 @@ describe('residency setup authority', function () {
 	for (const [name, authorization, options] of [
 		['credential', { username: 'reader', role: { permission: {} } }, {}],
 		['false_grant', { name: 'slot-setup-peer', replicates: false }, {}],
+		['receive_only_grant', { name: 'slot-setup-peer', replicates: { receives: true } }, {}],
+		['receive_from_grant', { name: 'slot-setup-peer', replicates: { receivesFrom: ['*'] } }, {}],
 		[
 			'false_route',
 			{ name: 'slot-setup-peer', replicates: true },
@@ -145,6 +147,58 @@ describe('residency setup authority', function () {
 				}
 			});
 	}
+
+	for (const [name, grant] of [
+		['sends', { sends: true }],
+		['sends_to', { sendsTo: [{ target: server.hostname }] }],
+	])
+		it(`accepts a map under the peer ${name} grant`, async () => {
+			const database = `slot_setup_grant_${name}`;
+			const socket = await connect(database, { name: 'slot-setup-peer', replicates: grant });
+			await sendMap(socket, database, snapshot(database));
+			assert.deepEqual(socket.closes, []);
+			assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
+		});
+
+	it('authenticates the dialed failover peer independently of the subscribed origin', async () => {
+		const database = 'slot_setup_failover';
+		const connection = new NodeReplicationConnection(
+			'wss://slot-setup-peer:9933',
+			undefined,
+			database,
+			'slot-setup-peer'
+		);
+		connection.nodeName = 'unavailable-origin';
+		connection.nodeSubscriptions = [{ name: 'unavailable-origin' }];
+		const socket = await connect(database, { replicates: true }, { connection });
+		await sendMap(socket, database, snapshot(database));
+		assert.deepEqual(socket.closes, []);
+		assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
+	});
+
+	it('refuses an address alias shared by different configured nodes', async () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		replicateOverWS(
+			socket,
+			{
+				routes: [
+					{ hostname: 'slot-setup-peer', url: 'wss://127.0.0.2:9933', replicates: true },
+					{ hostname: 'other-peer', url: 'wss://127.0.0.2:9934', replicates: true },
+				],
+			},
+			{ name: '127.0.0.2', replicates: true }
+		);
+		socket.emit(
+			'message',
+			encode([140, 'slot-setup-peer', 'slot_setup_ambiguous', [], buildLocalCapabilities(90_000, false, true)])
+		);
+		await turns();
+		assert.ok(
+			socket.closes.some(({ code }) => code === 1008),
+			'an ambiguous authenticated host must not select a canonical peer'
+		);
+	});
 
 	it('binds the snapshot to its database frame', async () => {
 		const socket = await connect('slot_setup_frame', { name: 'slot-setup-peer', replicates: true });

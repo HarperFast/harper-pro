@@ -3544,6 +3544,8 @@ export class NodeReplicationConnection extends EventEmitter {
 	nodeName?: string;
 	authorization?: string;
 	tentativeNode?: any;
+	// The node actually dialed, independent of an origin subscribed through a failover peer.
+	configuredNodeName?: string;
 	// The subscription half of this connection's key; differs from `url` only for a proxied failover subscription.
 	subscriptionUrl?: string;
 	// Shared-memory connection-health buffer for this outbound (db, peer) link, stashed by replicateOverWS
@@ -3565,7 +3567,8 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.subscription = subscription;
 		this.databaseName = databaseName;
 		this.authorization = authorization;
-		this.nodeName = this.nodeName ?? urlToNodeName(url);
+		this.configuredNodeName = nodeName ?? urlToNodeName(url);
+		this.nodeName = this.configuredNodeName;
 	}
 
 	async connect() {
@@ -3926,15 +3929,16 @@ function configuredPeerIdentity(
 			return [];
 		}
 	};
-	const matches = configured.filter(
-		(record) =>
-			record?.name &&
-			(record.name === expected || aliases(record).includes(expectedHost)) &&
-			(record.name === announced || aliases(record).includes(announcedHost))
+	// Resolve the authenticated alias before looking at the claim. Otherwise two nodes on one
+	// host could select either identity just by announcing it, even though the IP proves neither.
+	const candidates = configured.filter(
+		(record) => aliases(record).length && (record.name === expected || aliases(record).includes(expectedHost))
 	);
-	const names = new Set(matches.map((record) => record.name));
+	const names = new Set(candidates.map((record) => record.name));
 	if (names.size !== 1) throw new Error('Node name mismatch');
-	const canonical = matches[0].name;
+	const canonical = candidates[0].name;
+	if (!candidates.some((record) => record.name === announced || aliases(record).includes(announcedHost)))
+		throw new Error('Node name mismatch');
 	if (announced !== canonical && (server.nodes ?? []).some((node) => node.name === announced))
 		throw new Error('Node name belongs to another known node');
 	return canonical;
@@ -4005,7 +4009,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let residencyIdentityBound = false;
 	const configuredPeerName = options.connection?.tentativeNode
 		? undefined
-		: (options.connection?.nodeSubscriptions?.[0]?.name ?? options.connection?.nodeName);
+		: (options.connection?.configuredNodeName ??
+			options.connection?.nodeName ??
+			options.connection?.nodeSubscriptions?.[0]?.name);
 	const awaitingResponse = new Map();
 	let receivingDataFromNodeIds = [];
 	remoteNodeName = authorization.name;
@@ -5102,8 +5108,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!sequence || connectionSuperseded()) return;
 		if (!lastSequenceIdCommitted) {
 			setTimeout(() => {
-				// A record can commit before its blob finishes. The drain's end_txn calls this again
-				// after durability (and a copy flush), even if no later record arrives to prompt a receipt.
+				// Never confirm past the durable resume cursor: a record can commit before its blobs.
 				const confirmed = Math.min(lastSequenceIdCommitted, lastDurableSequenceId);
 				lastSequenceIdCommitted = null;
 				if (connectionSuperseded()) return;
@@ -9868,6 +9873,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			subscription?.subscriptions ?? configuredRoute?.subscription,
 			targetDatabase
 		);
+		// A peer's hdb_nodes grant describes its sends; a local configured route describes our receives.
 		const grant = authorization?.replicates;
 		const receives =
 			route === undefined

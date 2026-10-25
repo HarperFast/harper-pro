@@ -25,6 +25,8 @@ Real-time, peer-to-peer replication of table data across cluster nodes via persi
 | `protocolCapabilities.ts`  | The protocol capability registry: the single normalization point for the peer capability bag in `NODE_NAME[4]`.                                                                                                       |
 | `recordLockTransport.ts`   | Cluster record locks (harper-pro#438): the home map (`homeMap()`) keys are homed by, the delegation wire (`recordLockRpc.ts`), and per-database coordinator ownership — what core's `LockCoordinator` cannot know     |
 | `recordLock*.ts` (others)  | `recordLockHomes.ts` (home-map row + operations), `recordLockApply.ts` (`record_lock_apply_homes`), `recordLockRpc.ts` (RPCs, relays), `recordLockFreshness.ts`, `recordLockPoison.ts`, `recordLockConfig.ts`         |
+| `residencyTopology.ts`     | Per-database map/configuration agreement, operation registration and shared sender liveness for owner admission.                                                                                                      |
+| `residencyWire.ts`         | Capability-aware slot references and legacy owner-list fallback.                                                                                                                                                      |
 | `replicationWorkers.ts`    | The one selector of workers that may own a subscription or record-lock coordination: http workers minus isolated-application ones (harper-pro#974). Broadcasts and fences still reach every http worker.              |
 | `repairDeleteEchoRuns.ts`  | Offline, operator-run compaction of echoed replicated-delete runs out of RocksDB transaction logs (CLI `bin/repairDeleteEchoRuns.ts`); imports nothing from the runtime. See non-obvious behavior 21.                 |
 
@@ -340,10 +342,9 @@ discipline paces _retries_, and jittering a durability deadline would be activel
 ## Send-side residency
 
 Transport invariant: a stub is never sent, served, or stored as a complete record through these
-copy/retrieval paths, except the base copy to a peer without `residencyStubCopy` (below). `sendAuditRecord` sends every write to every non-resident peer as an invalidation
-unless residency is by id. The copy walk uses `invalidate`
+copy/retrieval paths. Legacy tables retain the base-copy exception for a peer without `residencyStubCopy` (below); declarative stubs are never sent as complete rows. `sendAuditRecord` sends non-owner invalidations for indexed declarative tables regardless of whether slots derive from keys or attributes. Index-free declarative tables and legacy by-id tables omit non-owner rows. The copy walk uses `invalidate`
 for `INVALIDATED` rows and translates the stored residency flag to the audit flag. GET_RECORD refuses
-stubs with `[GET_RECORD_RESPONSE, requestId, false]` for a learned requester advertising
+stubs and every declarative row this node does not own with `[GET_RECORD_RESPONSE, requestId, false]` for a learned requester advertising
 `residencyNotResident`, and supplies current decoder structures for versioned answers. A live record
 or a tombstone (null value with its deletion version) is positive evidence from a holder and settles
 the read immediately. GET_RECORD preserves the versioned tombstone response for every requester.
@@ -363,7 +364,7 @@ A subscribed sender refuses mismatched
 table ids before announcing structures; the read is synchronous, so nothing changes between that check and the send. Tests: `residencyWire.test.mjs`, `residencyReplicaWire.test.mjs` and the four-node `residencyReads.test.mjs` and `residencyReplicas.test.mjs`.
 The copy walk encodes a stub as `invalidate` only for a peer advertising `residencyStubCopy`: an older
 receiver lacks core's equal-version resident guard and would demote a full record it holds. Other
-peers retain the pre-gate `put` encoding. Normal residency routing still invalidates or skips excluded
+peers retain the pre-gate `put` encoding for legacy tables; declarative stubs are skipped. Normal residency routing still invalidates or skips excluded
 peers. For a listed peer (or when no residency list is available), the legacy `put` is skipped at
 equal version; a receiver without the row stores the projection as complete — today's behavior until it upgrades. The excluded-peer invalidations and the
 GET_RECORD empty answer stay ungated: older receivers already apply an invalidation to a
@@ -635,3 +636,5 @@ Quarantined databases are excluded from subscription discovery and reject incomi
 NODE_NAME binding uses the authenticated identity plus explicit configured route/node aliases without expanding certificate or IP authentication. The resulting canonical name keys topology, sender receipt state and owner acknowledgments. Unbound credential discovery remains available for legacy connections, but cannot declare or exchange residency data. A mixed DB_SCHEMA frame skips only unauthorized declarative definitions and their drop markers; legacy discovery continues.
 
 New-owner admission requires an active sender generation whose received message/ping/pong timestamp is within pingTimeout; generic connection truth cannot substitute. The shared clock stores milliseconds modulo uint32, and freshness subtracts modulo uint32. Subscription setup carries its last actual receipt, so a delayed setup does not manufacture fresh activity. Automatic confirmation selects residencyConfirmationTimeout (30 seconds); explicit confirmation selects confirmationTimeout (15 minutes, with the historical blobTimeout floor only when unset). Settings are lazy, bounded to Node's timer range and cached by raw value. The core callback's optional automatic flag defaults to explicit for older callers. Both failures retain the committed uncertain-outcome contract; a local writer replica cannot count as a peer acknowledgment.
+
+Sender liveness publishes the connection generation and received-at timestamp as one atomic 64-bit value. A replacement cannot borrow its predecessor's heartbeat, and a late heartbeat uses compare-and-swap so it cannot overwrite a different active generation. An overlapping live sender may take over an empty slot only with its own received traffic. Outbound identity uses the configured dialed peer, separately from a failover subscription's origin; ambiguous shared-host aliases are refused before the announced name is considered.
