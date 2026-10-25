@@ -175,6 +175,35 @@ describe('residency setup authority', function () {
 		assert.deepEqual(socket.closes, []);
 		assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
 	});
+	for (const route of ['127.0.0.2', 'slot-setup-peer:9933']) {
+		it(`preserves an unbound outbound legacy peer name through route ${route}`, async () => {
+			const database = `slot_setup_legacy_route_${route.includes(':') ? 'port' : 'ip'}`;
+			const connection = new NodeReplicationConnection(`wss://${route}`, undefined, database, route);
+			connection.nodeSubscriptions = [{ name: route, url: `wss://${route}`, configRouteReplicates: true }];
+			const socket = await connect(database, { replicates: true }, { connection });
+			assert.equal(connection.nodeName, 'slot-setup-peer', 'legacy resume state keeps the announced identity');
+			await processed(socket);
+			await sendMap(socket, database, snapshot(database));
+			assert.ok(socket.closes.length, 'an unbound legacy identity cannot declare residency');
+			assert.equal(readResidencyMap(database), undefined);
+		});
+		it(`binds outbound route ${route} through an explicit canonical node record`, async () => {
+			const database = `slot_setup_bound_route_${route.includes(':') ? 'port' : 'ip'}`;
+			const priorNodes = server.nodes;
+			server.nodes = [{ name: 'slot-setup-peer', url: `wss://${route}`, replicates: true }];
+			try {
+				const connection = new NodeReplicationConnection(`wss://${route}`, undefined, database, route);
+				connection.nodeSubscriptions = [{ name: route, url: `wss://${route}`, configRouteReplicates: true }];
+				const socket = await connect(database, { replicates: true }, { connection });
+				assert.equal(connection.nodeName, 'slot-setup-peer');
+				await sendMap(socket, database, snapshot(database));
+				assert.deepEqual(socket.closes, []);
+				assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
+			} finally {
+				server.nodes = priorNodes;
+			}
+		});
+	}
 
 	it('refuses an address alias shared by different configured nodes', async () => {
 		const socket = new Socket();
@@ -198,6 +227,30 @@ describe('residency setup authority', function () {
 			socket.closes.some(({ code }) => code === 1008),
 			'an ambiguous authenticated host must not select a canonical peer'
 		);
+	});
+	it('refuses outbound discovery claiming an unrelated known node', async () => {
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-setup-peer', url: 'wss://127.0.0.99:9933', replicates: true }];
+		try {
+			const connection = new NodeReplicationConnection(
+				'wss://127.0.0.2:9933',
+				undefined,
+				'slot_discovery',
+				'127.0.0.2'
+			);
+			connection.nodeSubscriptions = [{ name: '127.0.0.2', url: 'wss://127.0.0.2:9933', configRouteReplicates: true }];
+			const socket = new Socket();
+			sockets.push(socket);
+			replicateOverWS(socket, { connection }, { replicates: true });
+			socket.emit(
+				'message',
+				encode([140, 'slot-setup-peer', 'slot_discovery', [], buildLocalCapabilities(90_000, false, true)])
+			);
+			await turns();
+			assert.ok(socket.closes.some(({ code }) => code === 1008));
+		} finally {
+			server.nodes = priorNodes;
+		}
 	});
 
 	it('binds the snapshot to its database frame', async () => {

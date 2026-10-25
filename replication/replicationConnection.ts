@@ -3903,12 +3903,19 @@ function configuredPeerIdentity(
 	announced: string,
 	configuredName?: string
 ): string | undefined {
-	const configured = [authorization, ...iterateRoutes(options), ...(server.nodes ?? [])];
 	const subscription = options.connection?.nodeSubscriptions?.[0];
-	if (subscription) configured.push(subscription);
 	const expected = authorization?.name ?? configuredName;
 	if (!expected) return undefined;
 	if (expected === announced) return expected;
+	let discoveryHost: string;
+	if (!authorization?.name && subscription?.name === expected && subscription.url) {
+		const endpoint = new URL(subscription.url);
+		if (expected === endpoint.hostname || expected === endpoint.host) discoveryHost = endpoint.hostname;
+	}
+	// A dialed address is a legacy discovery label, not a second canonical node record.
+	// Only explicit configured records may bind that connection for residency metadata.
+	const configured = [authorization, ...iterateRoutes(options), ...(server.nodes ?? [])];
+	if (subscription && !discoveryHost) configured.push(subscription);
 	// URL.hostname brackets/compresses IPv6, while authenticated socket addresses are bare.
 	// Normalize only host aliases; canonical node names remain exact identifiers.
 	const hostAlias = (name: string): string => {
@@ -3919,7 +3926,7 @@ function configuredPeerIdentity(
 			return name;
 		}
 	};
-	const expectedHost = hostAlias(expected);
+	const expectedHost = discoveryHost ?? hostAlias(expected);
 	const announcedHost = hostAlias(announced);
 	const aliases = (record: any): string[] => {
 		if (!record?.name || !record.url) return [];
@@ -3935,6 +3942,7 @@ function configuredPeerIdentity(
 		(record) => aliases(record).length && (record.name === expected || aliases(record).includes(expectedHost))
 	);
 	const names = new Set(candidates.map((record) => record.name));
+	if (!names.size && discoveryHost && !(server.nodes ?? []).some((node) => node.name === announced)) return undefined;
 	if (names.size !== 1) throw new Error('Node name mismatch');
 	const canonical = candidates[0].name;
 	if (!candidates.some((record) => record.name === announced || aliases(record).includes(announcedHost)))

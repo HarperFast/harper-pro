@@ -819,7 +819,7 @@ export function countAlreadyConfirmedPeers(
 // that never applies this specific write, a peer that drops its connection mid-wait, or any other
 // gap between the requested count and what actually gets acked) hangs the request forever — the
 // promise below had no reject path at all (harper-pro#213).
-//
+// An unset explicit timeout covers the blob transfer window; automatic handoffs have their own bound.
 const confirmationTimeouts = new Map<boolean, { raw: unknown; fallback: number; value: number }>();
 const warnedConfirmationTimeouts = new Set<string>();
 function replicationConfirmationTimeout(automatic = false): number {
