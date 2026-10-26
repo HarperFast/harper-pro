@@ -337,7 +337,7 @@ export class BootstrapLocal extends Resource {
 			existing_owner: true,
 			expected_digest: lost.sharding.data.digest,
 		});
-		const refusedAfter = Date.now() + 2000;
+		const refusedAfter = Date.now() + 6000;
 		await waitForCondition(
 			async (signal) => {
 				const status = await sendOperation(contexts[2].harper, { operation: 'cluster_status' }, { signal });
@@ -348,7 +348,7 @@ export class BootstrapLocal extends Resource {
 				);
 				return Date.now() >= refusedAfter;
 			},
-			{ timeoutMs: 10_000, description: 'advancing wall time cannot clear missing history' }
+			{ timeoutMs: 15_000, description: 'advancing wall time cannot clear missing history' }
 		);
 		const ownedQuery = await postOperation(contexts[2].harper, {
 			operation: 'sql',
