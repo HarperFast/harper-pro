@@ -47,6 +47,9 @@ export const RECORD_LOCK_HOMES_AGREEMENT_POSITION = allocate();
 export const RECORD_LOCK_LEVEL_POSITION = allocate();
 // 1 while the peer's current socket advertises `originFloors`: a relay forwards that peer's floor only then.
 export const PEER_CERTIFIES_FLOORS_POSITION = allocate();
+// `Date.now()` of this (database, peer)'s last send-log-break reconnect, read by every worker so an
+// accepted session that redials onto another worker cannot skip the floor.
+export const LAST_SEND_LOG_BREAK_RECONNECT_TIME_POSITION = allocate();
 
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
 export const ALLOCATED_SLOTS = cursor;

@@ -14,7 +14,7 @@ const NOW = 1_000_000;
 
 describe('sendLogBreakReconnectDelayMs', () => {
 	it('allows the first reconnect immediately', () => {
-		expect(sendLogBreakReconnectDelayMs(undefined, NOW)).to.equal(0);
+		expect(sendLogBreakReconnectDelayMs(0, NOW)).to.equal(0);
 	});
 
 	it('defers a repeat for the rest of the floor rather than refusing it', () => {

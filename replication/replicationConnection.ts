@@ -71,6 +71,7 @@ import {
 	FIRE_MECHANISMS,
 	FIRE_COUNTER_BASE_POSITION,
 	PEER_CERTIFIES_FLOORS_POSITION,
+	LAST_SEND_LOG_BREAK_RECONNECT_TIME_POSITION,
 } from './sharedStatusSlots.ts';
 import {
 	recordPeerLockCapability,
@@ -1613,17 +1614,18 @@ export function maybeDeadAuditIterableForTest<T>(databaseName: string | undefine
 	} as T;
 }
 
-// Minimum spacing of send-log-break reconnects per (database, peer) on one worker thread. A peer cursor
-// behind a tear that is still there re-stops the replacement session, so without this floor a stopped
-// log beside busy healthy logs would reconnect on every commit.
+// Minimum spacing of send-log-break reconnects per (database, peer), across workers. A peer cursor behind
+// a tear that is still there re-stops the replacement session, so without this floor a stopped log beside
+// busy healthy logs would reconnect on every commit.
 export const SEND_LOG_BREAK_RECONNECT_INTERVAL_MS = 5 * 60_000;
-const lastSendLogBreakReconnectAt = new Map<string, number>();
+// Spread on a deferred reconnect, so peers whose floors started together do not reconnect together.
+export const SEND_LOG_BREAK_RECONNECT_JITTER_MS = 30_000;
 export function sendLogBreakReconnectDelayMs(
-	lastAt: number | undefined,
+	lastAt: number,
 	now: number,
 	intervalMs: number = SEND_LOG_BREAK_RECONNECT_INTERVAL_MS
 ): number {
-	return lastAt === undefined ? 0 : Math.max(0, intervalMs - (now - lastAt));
+	return lastAt > 0 ? Math.max(0, intervalMs - (now - lastAt)) : 0;
 }
 
 // Test-only fault injection for the copy-progress false-fire repro: when HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB
@@ -7474,47 +7476,51 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// cannot do safely (harper-pro#876). The stopped range stays in place until then, so the
 										// certification check below still sees its failure.
 										if (range?.corruptFrameStop?.breaks > 0 && auditStore.reusableIterable) {
-											const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 											if (range.corruptFrameStop.midLogBreak) {
 												// Core's fail-stop: no fresh range can cross a mid-log break, so reconnecting would only churn.
 												if (reportedMidLogBreakRange !== range) {
 													reportedMidLogBreakRange = range;
 													logger.error?.(
 														connectionId,
-														`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind it are not sent on this connection. Repair the transaction log or re-clone this node.`
+														`Replication send to ${remoteNodeName} (db: "${databaseName}") stopped at a mid-log corrupt transaction-log frame; entries behind it are not sent on this connection. Repair the transaction log or re-clone this node.`
 													);
 												}
 											} else if (sendLogStopGeneration === undefined) {
 												sendLogStopGeneration = nextTransaction;
-											} else if (sendLogRecoveryPending || sendLogStopGeneration !== nextTransaction) {
-												const reconnectKey = `${databaseName}\0${remoteNodeName}`;
-												const now = performance.now();
-												const delayMs = sendLogBreakReconnectDelayMs(
-													lastSendLogBreakReconnectAt.get(reconnectKey),
-													now
-												);
+											} else if (
+												sendLogRecoveryTimer === undefined &&
+												(sendLogRecoveryPending || sendLogStopGeneration !== nextTransaction)
+											) {
 												// A superseded loop must not tear down its replacement's socket.
 												if (supersededOrClosed()) return;
+												const status = getSharedStatus();
+												const now = Date.now();
+												const delayMs = sendLogBreakReconnectDelayMs(
+													status?.[LAST_SEND_LOG_BREAK_RECONNECT_TIME_POSITION] ?? 0,
+													now
+												);
 												if (delayMs === 0) {
-													lastSendLogBreakReconnectAt.set(reconnectKey, now);
+													if (status) status[LAST_SEND_LOG_BREAK_RECONNECT_TIME_POSITION] = now;
 													closed = true;
 													const fireDetail = recordFireForLog('send-log-break');
 													logger.warn?.(
 														connectionId,
-														`Replication send to ${remoteNodeName}${dbContext} stopped at a torn transaction-log frame; reconnecting so the peer resumes from its cursor — ${fireDetail}`
+														`Replication send to ${remoteNodeName} (db: "${databaseName}") stopped at a torn transaction-log frame; reconnecting so the peer resumes from its cursor — ${fireDetail}`
 													);
 													if (options.connection) options.connection.forceReconnect();
 													else close(1011, 'send range stopped at a torn transaction-log frame; reconnecting');
 													return;
 												}
 												sendLogRecoveryPending = true;
-												if (!sendLogRecoveryTimer)
-													sendLogRecoveryTimer = setTimeout(() => {
+												sendLogRecoveryTimer = setTimeout(
+													() => {
 														sendLogRecoveryTimer = undefined;
 														wakeSender?.();
-													}, delayMs).unref();
+													},
+													delayMs + Math.random() * SEND_LOG_BREAK_RECONNECT_JITTER_MS
+												).unref();
 											}
-										}
+										} else if (sendLogRecoveryPending) sendLogRecoveryPending = false;
 										if (frame.position - frame.encodingStart > 8) {
 											sendAuditRecord(
 												{
@@ -7552,6 +7558,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// A commit that landed during the scan rotated the promise captured before it: rescan
 										// immediately, without paying for timer setup, a Promise/executor allocation or a waker.
 										if (whenNextTransaction(auditStore) !== nextTransaction) continue;
+										// The recovery timer fired during this pass, when no waker was parked to receive it.
+										if (sendLogRecoveryPending && sendLogRecoveryTimer === undefined) continue;
 										// an `includeNodes` update re-admits a log whose entries are already committed
 										let wake: () => void;
 										// one timer per loop; an exit that skips the clear leaks nothing but one unreferenced timer
