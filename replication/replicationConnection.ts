@@ -7544,7 +7544,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// that aggregate applies `exactStart` only to the logs named in `startByLog`. Gated on the store
 												// itself, not STORAGE_IS_ROCKSDB: that is a config snapshot that can misreport the engine in a
 												// worker, and an LMDB audit store would read these range options as a scan from its start.
-												const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+												const logName =
+													auditStore.reusableIterable === true && excludedNodes
+														? 'local'
+														: subscribedNodeName === getThisNodeName()
+															? 'local'
+															: subscribedNodeName;
 												const canResumePastAnchor = auditStore.reusableIterable === true && logName === 'local';
 												// If resuming, the follower already committed every table before currentTable (records commit
 												// in stable iteration order), so skip to currentTable and continue after its last committed key.
@@ -7609,10 +7614,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
 												const relayedAnchors =
 													!copyResume && canResumePastAnchor && excludedNodes
-														? collectRelayedLogAnchors(
-																auditStore,
-																new Set([...excludedNodes, ...nodeSubscriptions.map(({ name }) => name)])
-															)
+														? collectRelayedLogAnchors(auditStore, new Set(excludedNodes))
 														: undefined;
 												const boundaryFailure = (rangeOptions: any) => rangeBoundaryFailure(auditStore, rangeOptions);
 												// Relayed logs whose boundary probe succeeded and therefore resume in append order.
@@ -9946,7 +9948,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				start: Symbol.for('seq'),
 				end: [Symbol.for('seq'), Buffer.from([0xff])],
 			});
-			if (seqEntries) lastTxnTimes = collectLastTxnTimes(seqEntries, shardingCursorAdmission(databaseName, auditStore));
+			if (seqEntries && !shardingLayout(databaseName)) lastTxnTimes = collectLastTxnTimes(seqEntries);
 		} catch (error) {
 			// if the database is closed, just proceed (matches multiple error messages)
 			if (!error.message.includes('Can not re')) throw error;

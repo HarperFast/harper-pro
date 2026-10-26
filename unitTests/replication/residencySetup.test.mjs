@@ -11,6 +11,8 @@ import {
 } from '#src/core/resources/residencyMaps';
 import { replicateOverWS, NodeReplicationConnection } from '#src/replication/replicationConnection';
 import { server } from '#src/core/server/Server';
+import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
+import { shardingSourceAgreement, publishShardingCertificate } from '#src/replication/shardingRecovery';
 import { getReplicationSharedStatus, getHDBNodeTable } from '#src/replication/knownNodes';
 import { databases, table } from '#src/core/resources/databases';
 import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
@@ -230,6 +232,84 @@ describe('sharding setup authority', function () {
 			assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
 		});
 
+	it('does not raise a sharded origin’s direct resume past a co-owner’s observed maximum', async () => {
+		const database = 'slot_setup_direct_resume';
+		const priorShard = get('replication_shard');
+		const priorNodes = server.nodes;
+		const peer = 'slot-setup-peer';
+		try {
+			setProperty('replication_shard', 0);
+			server.nodes = [
+				{ name: peer, shard: 0, replicates: true },
+				{ name: 'complete-co-owner', shard: 0, replicates: true },
+			];
+			await getHDBNodeTable().put(peer, { name: peer, shard: 0, replicates: true });
+			await installResidencyMap(snapshot(database));
+			const Rows = table({
+				database,
+				table: 'Rows',
+				audit: true,
+				residency: { slots: 2 },
+				attributes: [{ name: 'id', isPrimaryKey: true }],
+			});
+			const originId = getIdOfRemoteNode(peer, Rows.auditStore);
+			const relayId = getIdOfRemoteNode('complete-co-owner', Rows.auditStore);
+			const relayStatus = getReplicationSharedStatus(Rows.auditStore, database, 'complete-co-owner');
+			relayStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+			publishShardingCertificate(relayStatus, 0, shardingSourceAgreement(database));
+			const direct = Date.now() - 1000;
+			await Rows.dbisDB.put([Symbol.for('seq'), originId], { seqId: direct, nodes: [] });
+			await Rows.dbisDB.put([Symbol.for('seq'), relayId], {
+				seqId: direct + 500,
+				nodes: [{ id: originId, lastTxnTime: direct + 500, originLogKey: direct + 500 }],
+			});
+			const connection = new NodeReplicationConnection(`wss://${peer}`, undefined, database, peer);
+			connection.nodeSubscriptions = [{ name: peer, url: `wss://${peer}`, replicates: true, replicateByDefault: true }];
+			const socket = new Socket();
+			sockets.push(socket);
+			connection.socket = socket;
+			replicateOverWS(socket, { connection }, { name: peer, replicates: true });
+			socket.emit(
+				'message',
+				encode([
+					140,
+					peer,
+					database,
+					[],
+					buildLocalCapabilities(90_000, false, true),
+					{
+						shard: 0,
+						shardingCertificate: shardingSourceAgreement(database),
+						shardsDigest: residencyConfigurationDigest(),
+					},
+				])
+			);
+			await processed(socket);
+			const request = socket.sent.find((frame) => frame[0] === 129);
+			assert.ok(request, 'the authenticated peer receives a subscription');
+			assert.equal(request[1][0].startTime, direct);
+			connection.emit('exclusion-origins-updated', ['unavailable-origin']);
+			connection.emit('exclusion-origins-updated', []);
+			const include = socket.sent.find(
+				(frame) => frame[0] === 147 && frame[1].includeNodes?.includes('unavailable-origin')
+			);
+			assert.ok(include, 'the existing co-owner stream includes the unavailable origin');
+			assert.equal(
+				socket.sent.filter((frame) => frame[0] === 129).length,
+				1,
+				'failover does not replace the primary subscription'
+			);
+			connection.emit('exclusion-origins-updated', ['unavailable-origin']);
+			assert.ok(
+				socket.sent.at(-1)[1].excludeNodes.includes('unavailable-origin'),
+				'direct recovery restores exclusion'
+			);
+		} finally {
+			server.nodes = priorNodes;
+			setProperty('replication_shard', priorShard);
+			await getHDBNodeTable().delete(peer);
+		}
+	});
 	it('authenticates the dialed failover peer independently of the subscribed origin', async () => {
 		const database = 'slot_setup_failover';
 		const connection = new NodeReplicationConnection(
@@ -311,6 +391,7 @@ describe('sharding setup authority', function () {
 			connection.nodeSubscriptions = [{ name: '127.0.0.2', url: 'wss://127.0.0.2:9933', configRouteReplicates: true }];
 			const socket = new Socket();
 			sockets.push(socket);
+			connection.socket = socket;
 			replicateOverWS(socket, { connection }, { replicates: true });
 			socket.emit(
 				'message',

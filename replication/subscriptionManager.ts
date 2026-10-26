@@ -989,9 +989,12 @@ export function getConfiguredRoutes(): Route[] {
 export function computeExclusionOrigins(databaseName: string): string[] {
 	const thisNodeName = getThisNodeName();
 	const origins: string[] = [];
+	const shardedFailover = shardingLayout(databaseName) && env.get(CONFIG_PARAMS.REPLICATION_FAILOVER);
 	if (!thisNodeName) return origins;
 	for (const node of getHDBNodeTable().search([])) {
 		if (!node.name || node.name === thisNodeName) continue;
+		if (shardedFailover && connectionReplicationMap.get(getNodeURL(node))?.get(databaseName)?.connected === false)
+			continue;
 		const matchingRoute = routes.find((r) => r.name === node.name);
 		const routeReplicates =
 			typeof matchingRoute?.replicates === 'object'
@@ -1006,6 +1009,18 @@ export function computeExclusionOrigins(databaseName: string): string[] {
 		origins.push(node.name);
 	}
 	return origins;
+}
+
+function updateShardingFailover(database: string): void {
+	const entries = [...connectionReplicationMap.values()].map((databases) => databases.get(database)).filter(Boolean);
+	const canRelay =
+		env.get(CONFIG_PARAMS.REPLICATION_FAILOVER) &&
+		entries.some((entry) => entry.connected === true && shardingPeerCanRelay(database, entry.nodes[0]?.name));
+	for (const entry of entries) {
+		const origin = entry.nodes[0]?.name;
+		if (origin) recordShardingWait(database, origin, entry.connected === false && !canRelay);
+	}
+	scheduleExclusionOriginsBroadcast();
 }
 
 // Re-derive the exclusion-origin set for every database with a live subscription entry and push it to
@@ -1613,6 +1628,10 @@ export async function startOnMainThread(options) {
 			if (connection.finished) {
 				return;
 			} // intentionally closed connection
+			if (shardingLayout(connection.database)) {
+				updateShardingFailover(connection.database);
+				return;
+			}
 			if (!env.get(CONFIG_PARAMS.REPLICATION_FAILOVER)) {
 				for (const node of existingWorkerEntry.nodes) recordShardingWait(connection.database, node.name, true);
 				// if failover is disabled, immediately return
@@ -1703,6 +1722,10 @@ export async function startOnMainThread(options) {
 			logger.debug('Connected node is not named yet', connection.database, mainWorkerEntry.url);
 			return;
 		}
+		if (shardingLayout(connection.database)) {
+			updateShardingFailover(connection.database);
+			return;
+		}
 		if (!env.get(CONFIG_PARAMS.REPLICATION_FAILOVER)) {
 			// if failover is disabled, immediately return, we don't need to restore anything
 			return;
@@ -1722,15 +1745,7 @@ export async function startOnMainThread(options) {
 				connection.url === restoredNode.url
 			) {
 				// if it is not connected and has extra nodes, grab them
-				for (const node of failOverNodes) {
-					if (shardingLayout(connection.database)) {
-						if (!mainWorkerEntry.nodes.some((existing) => existing.name === node.name))
-							mainWorkerEntry.nodes.push(node);
-						connectToNextWorker(node, connection.database, restoredNode);
-						recordShardingWait(connection.database, node.name, false);
-					} else connectToNextWorker(node, connection.database);
-				}
-				if (shardingLayout(connection.database)) failOverConnections.nodes = [failOverNodes[0]];
+				for (const node of failOverNodes) connectToNextWorker(node, connection.database);
 			} else {
 				// remove the restored node from any other connections list of node
 				removeRestoredNodeFromFailoverEntry(failOverConnections, restoredNode, connection.database);

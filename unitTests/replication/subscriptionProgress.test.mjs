@@ -7,7 +7,11 @@ import { transaction } from '#src/core/resources/transaction';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { Decoder, readAuditEntry } from '#src/core/resources/auditStore';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
-import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
+import {
+	databaseSubscriptions,
+	findLastCommittedLogKey,
+	replicateOverWS,
+} from '#src/replication/replicationConnection';
 import { setReplicator } from '#src/replication/replicator';
 
 const SUBSCRIPTION_REQUEST = 129;
@@ -194,5 +198,82 @@ describe('subscription replay progress', function () {
 		assert.ok(!rows(socket).includes('included-row'), 'the remote origin begins excluded');
 		socket.emit('message', encode([147, { includeNodes: [origin] }]));
 		await until(() => rows(socket).includes('included-row'), 'included origin reaches the current iterator');
+	});
+	it('anchors a multi-origin copy on the physical source log rather than its last listed origin', async () => {
+		const database = 'subscriptionCopyAnchor';
+		const Records = table({ database, table: 'Records', audit: true, attributes: [{ name: 'id', isPrimaryKey: true }] });
+		await Records.put('anchor', { id: 'anchor' });
+		setReplicator(database, Records, {});
+		await until(() => databaseSubscriptions.get(database)?.auditStore, 'anchor database subscription');
+		const anchor = findLastCommittedLogKey(Records.auditStore, 'local');
+		assert.ok(anchor > 0, 'the physical source has a committed native anchor');
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		socket = new Socket();
+		replicateOverWS(socket, {}, { name: 'progress-peer', replicates: true });
+		socket.emit(
+			'message',
+			encode([NODE_NAME, 'progress-peer', database, [], buildLocalCapabilities(90_000, false, true)])
+		);
+		await until(() => socket.sent.some((frame) => frame[0] === NODE_NAME), 'multi-origin handshake');
+		socket.emit(
+			'message',
+			encode([
+				SUBSCRIPTION_REQUEST,
+				[
+					{ name: server.hostname, startTime: 0, tables: ['Records'], replicateByDefault: false },
+					{ name: 'update-origin', startTime: 0, tables: ['Records'], replicateByDefault: false },
+				],
+				[],
+			])
+		);
+		await until(() => socket.sent.some((frame) => frame[0] === 148), 'multi-origin copy starts');
+		assert.equal(
+			socket.sent.find((frame) => frame[0] === 148)[1],
+			anchor,
+			'a relayed origin cannot replace the source append-order anchor with wall time'
+		);
+	});
+	it('tails an origin append below the source clock after that key was passed by the copy walk', async () => {
+		const copyDatabase = 'subscriptionCopyLateOrigin';
+		const Rows = table({
+			database: copyDatabase,
+			table: 'Rows',
+			audit: true,
+			attributes: [{ name: 'id', isPrimaryKey: true }],
+		});
+		await Rows.put('z', { id: 'z' });
+		setReplicator(copyDatabase, Rows, {});
+		await until(() => databaseSubscriptions.get(copyDatabase)?.auditStore, 'late-origin subscription');
+		const origin = 'late-copy-origin';
+		const nodeId = getIdOfRemoteNode(origin, Rows.auditStore);
+		const key = findLastCommittedLogKey(Rows.auditStore, 'local') - 100;
+		socket = new Socket();
+		replicateOverWS(socket, {}, { name: 'progress-peer', replicates: true });
+		socket.emit(
+			'message',
+			encode([NODE_NAME, 'progress-peer', copyDatabase, [], buildLocalCapabilities(90_000, false, true)])
+		);
+		await until(() => socket.sent.some((frame) => frame[0] === NODE_NAME), 'late-origin handshake');
+		socket._socket.writableNeedDrain = true;
+		socket.emit(
+			'message',
+			encode([SUBSCRIPTION_REQUEST, [{ name: origin, startTime: 0, tables: [], replicateByDefault: true }], []])
+		);
+		await until(() => socket._socket.listenerCount('drain') > 0, 'copy walk has encoded z');
+		const context = { source: {}, sourceApply: true, timestamp: key };
+		await transaction(context, async () => {
+			const row = await Rows.getResource('a', context);
+			return row._writeUpdate('a', { id: 'a' }, true, { isNotification: true, nodeId, version: key });
+		});
+		assert.ok(
+			[...Rows.auditStore.getRange({ log: nodeId, start: 1 })].some(
+				(entry) => entry.recordId === 'a' && entry.txnLogKey === key
+			),
+			'the lower-keyed append reached the real origin log'
+		);
+		socket._socket.writableNeedDrain = false;
+		socket._socket.emit('drain');
+		await until(() => socket.sent.some((frame) => frame[0] === 149), 'late-origin copy completes');
+		await until(() => rows(socket).includes('a'), 'append-order tail delivers the row missed by the snapshot walk');
 	});
 });
