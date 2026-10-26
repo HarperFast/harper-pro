@@ -91,6 +91,7 @@ const localLayouts = new Map<string, string | undefined>();
 let enabled = false;
 const admittedRoots = new WeakMap<object, Map<string, number>>();
 const lostOrigins = new Map<string, string>();
+const checkedOrigins = new Map<string, Map<string, string>>();
 
 export class ShardingOriginHistoryLostError extends ResidencyPlacementError {
 	constructor(origin: string) {
@@ -370,7 +371,7 @@ export async function hasPriorShardingOrigin(database: string, layout: string, o
 	return false;
 }
 
-async function checkNewShardingOrigin(current: View, queryMembers = true): Promise<number | undefined> {
+async function checkNewShardingOrigin(current: View, refreshEvidence = true): Promise<number | undefined> {
 	const name = getThisNodeName();
 	const roots = shardingNativeRoots(current.database);
 	if (
@@ -392,14 +393,19 @@ async function checkNewShardingOrigin(current: View, queryMembers = true): Promi
 			})
 		)
 			throw new ShardingOriginHistoryLostError(name);
-		if (!queryMembers) return;
+		const evidenceScope = JSON.stringify([generation, current.agreement]);
+		if (!refreshEvidence && checkedOrigins.get(current.database)?.get(current.layout) === evidenceScope) return;
 		const answers = await Promise.allSettled(
 			current.members.filter((member) => member.name !== name).map((member) => call(member, current, 'origin-bound'))
 		);
-		return validateShardingOriginEvidence(
+		const bound = validateShardingOriginEvidence(
 			answers.map((answer) => (answer.status === 'fulfilled' ? answer.value : {})),
 			name
 		);
+		let layouts = checkedOrigins.get(current.database);
+		if (!layouts) checkedOrigins.set(current.database, (layouts = new Map()));
+		layouts.set(current.layout, evidenceScope);
+		return bound;
 	} catch (error) {
 		if (error instanceof ShardingOriginHistoryLostError) {
 			lostOrigins.set(current.database, generation);
@@ -884,6 +890,7 @@ export function startShardingBootstrap(): void {
 		diagnostics.delete(database);
 		localLayouts.delete(database);
 		lostOrigins.delete(database);
+		checkedOrigins.delete(database);
 	});
 	if (!isMainThread) return;
 	answerMainThreadRequests(ORIGIN_BOUND_REQUEST, receiveShardingOriginBound);
