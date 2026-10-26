@@ -54,6 +54,13 @@ describe('fire counter slot map', () => {
 		}
 	});
 
+	it('allocates the ninth pair contiguously with the first eight, via the registry', () => {
+		expect(fireCounterPositions('send-log-break')).to.deep.equal({
+			redundant: FIRE_COUNTER_BASE_POSITION + 16,
+			loadBearing: FIRE_COUNTER_BASE_POSITION + 17,
+		});
+	});
+
 	it('has no positions for an unrecognized mechanism', () => {
 		expect(fireCounterPositions('not-a-mechanism')).to.equal(undefined);
 	});
@@ -68,6 +75,7 @@ describe('fire counter slot map', () => {
 			'subscription-setup',
 			'wedge-reconcile',
 			'receive-stall-net',
+			'send-log-break',
 		]);
 	});
 });
