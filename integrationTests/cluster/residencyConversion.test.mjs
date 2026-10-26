@@ -158,7 +158,7 @@ for (const engine of ['rocksdb']) {
 			const before = await Promise.all(nodes().map((node) => request(node, 'ConversionRows/')));
 			const oldSchema = await readFile(join(fixture, 'schema.graphql'), 'utf8');
 			const oldResources = await readFile(join(fixture, 'resources.js'), 'utf8');
-			async function reopen(declarative, binary, replicaExpiration = 3600) {
+			async function reopen(declarative, binary, replicaExpiration = 3600, settleReplication = true) {
 				await Promise.all(contexts.map((context) => killHarper(context)));
 				for (const [i, context] of contexts.entries()) {
 					const declared = Array.isArray(declarative) ? declarative[i] : declarative;
@@ -181,9 +181,9 @@ for (const engine of ['rocksdb']) {
 					);
 					await startHarper(context, options(context, i, Array.isArray(binary) ? binary[i] : binary));
 				}
-				await settle();
+				if (settleReplication) await settle();
 			}
-			await reopen(true, currentBinary);
+			await reopen(true, currentBinary, 3600, false);
 			await waitForCondition(
 				async (signal) => {
 					const status = await sendOperation(nodes()[1], { operation: 'cluster_status' }, { signal });
@@ -214,6 +214,7 @@ for (const engine of ['rocksdb']) {
 				);
 			}
 			await ready();
+			await settle();
 			for (const [i, node] of nodes().entries()) assert.deepEqual(await request(node, 'PlainRows/'), plainBefore[i]);
 			await request(nodes()[0], 'Plain/plain2', { id: 'plain2', body: 'changed-at-owner' });
 			await waitForCondition(
