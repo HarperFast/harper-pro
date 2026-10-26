@@ -687,6 +687,14 @@ suite('Sharding quarantine on restart', { timeout: 300_000 }, (ctx) => {
 			},
 			{ description: 'repaired database resumes the held peer write' }
 		);
-		assert.equal((await sendOperation(context.harper, { operation: 'cluster_status' })).sharding.data.blocked, false);
+		// A complete read hit is available before the origin-admission coordinator finishes.
+		// Both must recover, but receiving the held row does not order the status transition.
+		await waitForCondition(
+			async (signal) => {
+				const status = await sendOperation(context.harper, { operation: 'cluster_status' }, { signal });
+				return status.sharding.data.blocked === false;
+			},
+			{ description: 'repaired database reopens sharded write admission' }
+		);
 	});
 });
