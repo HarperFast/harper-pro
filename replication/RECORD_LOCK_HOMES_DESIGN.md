@@ -134,7 +134,7 @@ staged?.generation ?? 0, highestActedOn)`, and refuses a `quiesce` that omits a 
 Per thread, cache this node's active generation per database, updated **only** when this node's
 own `active` row changes locally (on `stage` clearing it, or `activate` setting it) — never read
 from storage, hashed or sorted inside `homeMap()` itself. Each call checks every peer named in
-`homes` against shared-status slots 29 (capability) and 30 (digest agreement), failing closed when
+`homes` against shared-status slots 31 (capability) and 32 (digest agreement), failing closed when
 either is unknown, and returns a new object. With `replication.recordLocks` off, no table watcher
 or cache exists at all.
 
@@ -163,7 +163,7 @@ Reusing `NODE_NAME` as a live refresh is unproven — its handler has side effec
 (b) standalone, on every live outbound connection for a database whose local `active` digest just
 changed (on `activate`) — with no other handshake side effect triggered. Receipt writes only a
 tri-state match/mismatch/unknown result into the per-(database, peer) shared status buffer
-(slot 30, beside slot 29's capability support flag) — the full digest itself travels on the wire,
+(slot 32, beside slot 31's capability support flag) — the full digest itself travels on the wire,
 compared byte-exact on the socket thread, never truncated into shared memory.
 
 ### 7. `homeIncarnation` per coordination incarnation, gated centrally
@@ -444,7 +444,7 @@ activate `g+1`:
 | delegations `C` granted to survivors              | the survivor's own drain surrenders them, which is part of its proof                                                                                                                                                                                                                                                                                                                                                                           |
 | a grant reply from `C` still in flight            | a staged survivor has no home map, so core's post-reply check (`reply.token[0] !== homeMap()?.generation`) hands it back; after activation the token's generation is `g`                                                                                                                                                                                                                                                                       |
 | a delegation request from `C` still in flight     | refused for no map while staged, and for generation or `unknown-node` after activation                                                                                                                                                                                                                                                                                                                                                         |
-| `C` restarts with its old `active` row            | the per-peer digest agreement (slot 30) is process memory, so a restarted `C` starts with no agreement. The survey of this transition (this call's, or the earlier call whose recorded fence a retry passes on) required a majority of `C`'s ring to report it active, so `C`'s row holds that ring and its live members now announce `g+1`; §4 withholds `C`'s whole map. It cannot lock until a later generation that includes it is applied |
+| `C` restarts with its old `active` row            | the per-peer digest agreement (slot 32) is process memory, so a restarted `C` starts with no agreement. The survey of this transition (this call's, or the earlier call whose recorded fence a retry passes on) required a majority of `C`'s ring to report it active, so `C`'s row holds that ring and its live members now announce `g+1`; §4 withholds `C`'s whole map. It cannot lock until a later generation that includes it is applied |
 
 A `C` that is actually alive and partitioned keeps its retained digest agreement and self-homes its own
 keys under `g` whether or not the call waits, so the attestation was already load-bearing on the wait

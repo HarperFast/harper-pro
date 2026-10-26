@@ -156,7 +156,7 @@ origin)` sharing one request and one nonce is only sound for a caller whose depe
   unregister or replacement); every timer, listener and emitter callback is a non-throwing shell;
   synchronous `send`/`postMessage` are wrapped. `cluster_status.recordLocks` reports `freshness`
   (outstanding, applied, timeouts, rejections by reason) and `poisoned`.
-- **Capability level 4, exact level recorded** (slot 31). A peer at another level withholds the
+- **Capability level 4, exact level recorded** (slot 33). A peer at another level withholds the
   home map, and a freshness refusal names the required level. **LMDB resolves the feature gate to
   `false`** with one error line (`recordLockConfig.ts`: level 0, the fail-closed transport,
   default placement). **Rollback runbook**: disable `replication.recordLocks` on every node and
