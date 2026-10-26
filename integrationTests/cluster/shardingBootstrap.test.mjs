@@ -350,11 +350,20 @@ export class BootstrapLocal extends Resource {
 			},
 			{ timeoutMs: 15_000, description: 'advancing wall time cannot clear missing history' }
 		);
-		const ownedQuery = await postOperation(contexts[2].harper, {
-			operation: 'sql',
-			sql: 'SELECT * FROM `data`.`Rows`',
-		});
-		assert.equal(ownedQuery.status, 503, JSON.stringify(ownedQuery));
+		for (const operation of [
+			{ operation: 'sql', sql: 'SELECT * FROM `data`.`Rows`' },
+			{ operation: 'sql', sql: "SELECT * FROM `data`.`Rows` WHERE id = 'lost-key'" },
+			{
+				operation: 'search_by_hash',
+				database: 'data',
+				table: 'Rows',
+				hash_values: ['lost-key'],
+				get_attributes: ['*'],
+			},
+		]) {
+			const ownedQuery = await postOperation(contexts[2].harper, operation);
+			assert.equal(ownedQuery.status, 503, JSON.stringify(ownedQuery));
+		}
 		for (const region of ['asia', 'europe']) {
 			const response = await postOperation(contexts[2].harper, {
 				operation: 'insert',
