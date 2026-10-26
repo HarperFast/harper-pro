@@ -6137,8 +6137,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// rows that carry no local log entry, and the record-lock barrier must know that.
 							try {
 								await markRecloned(databaseName);
-								for (const { catalog } of shardingNativeRoots(databaseName))
-									await catalog.flush({ allowWriteStall: true });
+								for (const { catalog } of shardingNativeRoots(databaseName)) {
+									if (typeof catalog.flush === 'function') await catalog.flush({ allowWriteStall: true });
+									else await catalog.flushed; // LMDB exposes its durability barrier as a promise.
+								}
 							} catch (error) {
 								logger.error?.(connectionId, 'failed to record the clone for record locks', databaseName, error);
 								wsClosed = true;
