@@ -23,7 +23,7 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			config: {
 				threads: { count: 1 },
 				analytics: { aggregatePeriod: -1 },
-				logging: { colors: false, stdStreams: false, level: 'warn' },
+				logging: { colors: false, stdStreams: false, level: process.env.HARPER_TEST_SHARDING_LOG_LEVEL || 'warn' },
 				replication: {
 					failover: true,
 					securePort: context.harper.hostname + ':9933',
@@ -125,10 +125,11 @@ export class BootstrapLocal extends Resource {
   const origin = Table.auditStore.loadLogs().indexOf(Table.auditStore.logByName.get(target.get('origin')));
   const cursors = Array.from(Table.dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([255])] }));
   return { path: Table.primaryStore.rootStore.path,
+   recoveryBound: Table.dbisDB.getSync([Symbol.for('sharding-origin-recovery-bound'), 'data']),
    localAudit: Array.from(Table.auditStore.getRange({ log: 0, start: 1, includeLogName: true }), entry => ({ table: entry.tableId, type: entry.type, id: entry.recordId, origin: entry.nodeId, log: entry.logName, slot: entry.residencySlot, key: entry.txnLogKey })),
    bootstrap: Array.from(Table.dbisDB.getRange({ start: Symbol.for('sharding-bootstrap-history'), end: [Symbol.for('sharding-bootstrap-history'), Buffer.from([255])] }), entry => entry.value),
    peers: server.nodes?.map(peer => ({ name: peer.name, shard: peer.shard, status: Array.from(new Uint32Array(Table.auditStore.getUserSharedBuffer(['replicated', 'data', peer.name], new ArrayBuffer(512)))) })),
-   rows: Array.from(Table.primaryStore.getRange({ start: true }), entry => ({ id: entry.key, body: entry.value?.body, flags: entry.metadataFlags, slot: entry.residencySlot })),
+   rows: Array.from(Table.primaryStore.getRange({ start: true }), entry => ({ id: entry.key, version: entry.version, body: entry.value?.body, flags: entry.metadataFlags, slot: entry.residencySlot })),
    cursors: cursors.map(entry => ({ key: entry.key, value: entry.value })),
    originProgress: cursors.flatMap(entry => entry.value?.nodes?.filter(node => node.id === origin).map(node => ({ source: entry.key[1], ...node })) ?? []) };
  }
@@ -377,5 +378,46 @@ export class BootstrapLocal extends Resource {
 		await ready();
 		await ownedRows(0);
 		await ownedRows(2);
+		const restored = await local(2, AbortSignal.timeout(10_000));
+		const recovered = restored.rows.find((row) => row.id === 'after-recovery-bound');
+		assert.ok(recovered, 'the backup contains the replacement origin’s old row');
+		assert.ok(restored.recoveryBound >= recovered.version);
+		assert.ok(
+			!restored.localAudit.some((row) => row.id === recovered.id && row.type === 'put'),
+			'a recovered self-origin snapshot must not append an old mutation to local audit'
+		);
+		const starts = restored.bootstrap.map((history) => history.localFloor);
+		await sendOperation(contexts[2].harper, {
+			operation: 'insert',
+			database: 'data',
+			table: 'Rows',
+			records: [{ id: 'after-backup', region: 'asia', body: 'new-after-backup' }],
+		});
+		await sendOperation(contexts[2].harper, {
+			operation: 'update',
+			database: 'data',
+			table: 'Rows',
+			records: [{ id: recovered.id, body: 'updated-after-backup' }],
+		});
+		await waitForCondition(
+			async (signal) => {
+				const owner = await local(0, signal);
+				const otherShard = await local(3, signal);
+				return (
+					owner.rows.some((row) => row.id === recovered.id && row.body === 'updated-after-backup') &&
+					otherShard.rows.some((row) => row.id === recovered.id && row.version > restored.recoveryBound) &&
+					otherShard.rows.some((row) => row.id === 'after-backup' && row.version > restored.recoveryBound)
+				);
+			},
+			{
+				timeoutMs: 30_000,
+				description: 'restored origin inserts and updates reach another shard above recovered bounds',
+			}
+		);
+		const updated = await local(2, AbortSignal.timeout(10_000));
+		assert.deepEqual(
+			updated.bootstrap.map((history) => history.localFloor),
+			starts
+		);
 	});
 });

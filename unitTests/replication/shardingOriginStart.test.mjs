@@ -5,7 +5,11 @@ import { raiseAuditFloor, getAuditFloor } from '#src/core/resources/auditStore';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { shardingLayout, shardingSourceAgreement, certifyShardingCopy } from '#src/replication/shardingRecovery';
 import { inheritShardingHistory } from '#src/replication/shardingBootstrapState';
-import { shardingInitialFloor, canResumeShardingHistory } from '#src/replication/shardingBootstrap';
+import {
+	shardingInitialFloor,
+	noteShardingOriginStart,
+	canResumeShardingHistory,
+} from '#src/replication/shardingBootstrap';
 
 describe('Sharding origin start authority', () => {
 	const database = 'shardingOriginStart';
@@ -33,30 +37,39 @@ describe('Sharding origin start authority', () => {
 	});
 	after(() => env.setProperty('replication_shard', priorShard));
 	it('cannot use a starting floor before obtaining a complete owned baseline', async () => {
+		await noteShardingOriginStart(database, 'late', { 0: { agreement, floor: floor + 10 } });
 		assert.equal(shardingInitialFloor(database, 'founder'), undefined);
-		assert.equal(shardingInitialFloor(database, 'late', 'late', { 0: { agreement, floor } }), undefined);
+		assert.equal(shardingInitialFloor(database, 'late'), undefined);
 		await certifyShardingCopy(database, shardingLayout(database));
 		assert.equal(shardingInitialFloor(database, 'founder'), floor);
+		assert.equal(shardingInitialFloor(database, 'late'), floor + 10);
 	});
-	it('admits a late origin only from its own authenticated setup under the current policy', () => {
-		const starts = { 0: { agreement, floor: floor + 10 } };
-		assert.equal(shardingInitialFloor(database, 'late', 'late', starts), floor + 10);
-		assert.equal(shardingInitialFloor(database, 'late', 'relay', starts), undefined);
-		assert.equal(shardingInitialFloor(database, 'late', undefined, starts), undefined);
-		assert.equal(shardingInitialFloor(database, 'late', 'late', { 1: starts[0] }), undefined);
-		assert.equal(
-			shardingInitialFloor(database, 'late', 'late', { 0: { agreement: 'other-policy', floor } }),
-			undefined
-		);
-		for (const value of [0, -1, NaN, Infinity, '123'])
-			assert.equal(shardingInitialFloor(database, 'late', 'late', { 0: { agreement, floor: value } }), undefined);
+	it('accepts only the authenticated peer’s own start under the current policy', async () => {
+		await noteShardingOriginStart(database, 'relay', { 0: { agreement, floor: floor + 10 } });
+		assert.equal(shardingInitialFloor(database, 'unknown'), undefined);
+		for (const starts of [
+			{ 1: { agreement, floor } },
+			{ 0: { agreement: 'other-policy', floor } },
+			...[0, -1, NaN, Infinity, '123'].map((value) => ({ 0: { agreement, floor: value } })),
+		]) {
+			await noteShardingOriginStart(database, 'unknown', starts);
+			assert.equal(shardingInitialFloor(database, 'unknown'), undefined);
+		}
 	});
-	it('never skips an earlier proven start after a later direct announcement', () => {
-		assert.equal(shardingInitialFloor(database, 'founder', 'founder', { 0: { agreement, floor: floor + 10 } }), floor);
-		assert.equal(
-			shardingInitialFloor(database, 'founder', 'founder', { 0: { agreement, floor: floor - 1 } }),
-			floor - 1
-		);
+	it('never skips an earlier proven start after a later direct announcement', async () => {
+		await noteShardingOriginStart(database, 'founder', { 0: { agreement, floor: floor + 10 } });
+		assert.equal(shardingInitialFloor(database, 'founder'), floor);
+		await noteShardingOriginStart(database, 'founder', { 0: { agreement, floor: floor - 1 } });
+		assert.equal(shardingInitialFloor(database, 'founder'), floor - 1);
+	});
+	it('retains the minimum after reconnects and later announcements', async () => {
+		assert.equal(shardingInitialFloor(database, 'late'), floor + 10);
+		await noteShardingOriginStart(database, 'late', { 0: { agreement, floor: floor + 20 } });
+		assert.equal(shardingInitialFloor(database, 'late'), floor + 10);
+		await noteShardingOriginStart(database, 'late', { 0: { agreement, floor: floor + 5 } });
+		assert.equal(shardingInitialFloor(database, 'late'), floor + 5);
+		await noteShardingOriginStart(database, 'relay', { 0: { agreement, floor: floor - 20 } });
+		assert.equal(shardingInitialFloor(database, 'late'), floor + 5);
 	});
 	it('refuses a starting floor whose history has fallen outside retention', () => {
 		assert.equal(canResumeShardingHistory(database, 0, floor), true);
