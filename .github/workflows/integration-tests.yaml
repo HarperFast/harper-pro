@@ -476,6 +476,7 @@ jobs:
           integrationTests/cluster/recordLockCluster.test.mjs
           integrationTests/cluster/cacheReplicationSource.test.mjs
           integrationTests/cluster/isolatedApplicationReplication.test.mjs
+          integrationTests/cluster/staticSharding.test.mjs
 
       - name: Upload Harper server logs
         if: failure() || cancelled()
