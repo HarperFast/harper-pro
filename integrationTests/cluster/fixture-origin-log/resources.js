@@ -104,9 +104,39 @@ export class ClosedFloors extends Resource {
 				certifiedFrom: node.certifiedFrom ?? null,
 				floorRevoked: node.floorRevoked ?? null,
 				hole: node.hole ?? null,
+				partialHistory: node.partialHistory ?? null,
 			};
 		}
 		return { seqId: row?.seqId ?? null, nodes };
+	}
+}
+
+/**
+ * POST /SetRouteCoverage with `{ peer: '<remote node name>', fullCoverage?: boolean, clearSeq?: boolean }`
+ * mutates `[Symbol.for('seq'), peerId]` (and `[Symbol.for('copyCursor'), peerId]` when `clearSeq` is true)
+ * on `data`'s `dbisDB` so integration tests can exercise partial-to-full coverage widening and base-copy recovery.
+ */
+export class SetRouteCoverage extends Resource {
+	static loadAsInstance = false;
+
+	async post(data) {
+		const peerName = data?.peer ?? this.getId();
+		const Table = tables.Item;
+		const peerId = Table.getNodeId(peerName);
+		const seqKey = [Symbol.for('seq'), peerId];
+		if (data?.clearSeq) {
+			await Table.dbisDB.remove(seqKey);
+			await Table.dbisDB.remove([Symbol.for('copyCursor'), peerId]);
+			return { cleared: true };
+		}
+		const row = Table.dbisDB.get(seqKey);
+		if (!row?.nodes) return { updated: false };
+		const nodes = row.nodes.map((node) => ({
+			...node,
+			fullCoverage: data?.fullCoverage ?? false,
+		}));
+		await Table.dbisDB.put(seqKey, { ...row, nodes });
+		return { updated: true };
 	}
 }
 

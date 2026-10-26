@@ -19,8 +19,8 @@ import { readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import mqtt from 'mqtt';
-import { killHarper, startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
+import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 
 // Level 2 is advertised only by an engine that syncs the floor record (`syncWal`, rocksdb-js#949); on 2.12.0 no
 // node certifies at level 2 and every case below would wait out its deadline.
@@ -53,7 +53,7 @@ async function startNode(node) {
 }
 
 async function restartNode(node) {
-	await killHarper({ harper: node });
+	await stopNodeProcess(node);
 	return startNode(node);
 }
 
@@ -326,6 +326,36 @@ suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
 		} finally {
 			await endMqtt(onB.client);
 		}
+	});
+	test('a route widened from partial coverage marks partialHistory and clears it once a base copy completes', async () => {
+		const { A, B } = ctx;
+		// Simulate B having previously replicated A with partial coverage before reconnecting with full coverage.
+		await postToFixture(B, 'SetRouteCoverage', { peer: A.name, fullCoverage: false });
+		await restartNode(B);
+		await waitForState(
+			B,
+			A,
+			A,
+			(state) => state?.partialHistory === true && state?.certifiedFrom === null,
+			'widened route on B marks partialHistory and clears certifiedFrom'
+		);
+
+		// Clear B's sequence watermark for A and restart B so A initiates a fresh base copy to B.
+		await postToFixture(B, 'SetRouteCoverage', { peer: A.name, clearSeq: true });
+		await restartNode(B);
+		await upsert(A, 'after-widening-copy');
+		await waitForRecord(B, 'after-widening-copy');
+		await waitForState(
+			B,
+			A,
+			A,
+			(state) =>
+				state?.partialHistory === null &&
+				state?.fullCoverage === true &&
+				state?.closedFloor > 0 &&
+				state?.certifiedFrom !== null,
+			'base copy completion clears partialHistory and restores checkpoint-grade state on B'
+		);
 	});
 	test('a peer that stops certifying at level 2 is revoked on its direct receiver and one hop beyond', async () => {
 		const { A, B, C } = ctx;

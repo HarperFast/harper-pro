@@ -312,4 +312,73 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		pending.note([[7, T - 10, true, 'gen-2', true]]);
 		assert.deepStrictEqual(pending.take(false), [[7, T - 10, true, 'gen-2', true]]);
 	});
+
+	it('PendingOriginFloors lets a generation-stamped certificate replace an unstamped higher floor and clones input tuples', () => {
+		const pending = new PendingOriginFloors();
+		const first = [7, T, false];
+		pending.note([first]);
+		pending.note([[7, T, true, 'gen-1', true]]);
+		assert.strictEqual(first[2], false, 'caller tuple must not be mutated in place');
+		assert.deepStrictEqual(pending.take(false), [[7, T, true, 'gen-1', true]]);
+
+		pending.note([[7, T, false]]);
+		pending.note([[7, T - 10, true, 'gen-2', true]]);
+		assert.deepStrictEqual(pending.take(false), [[7, T - 10, true, 'gen-2', true]]);
+	});
+
+	it('PendingRouteState coalesces marks by originId and orders partialHistory clear before false', () => {
+		const state = new PendingRouteState();
+		state.certifiedFrom(1, T - 5, 'g1');
+		state.noteGeneration(1, 'g1');
+		state.partialHistory(1, true);
+		// partialHistory(true) on the same origin clears the earlier optimistic certifiedFrom.
+		const ev1 = {};
+		state.attachTo(ev1);
+		assert.deepStrictEqual(ev1.originRouteStates, [[1, undefined, true, undefined, 'g1']]);
+
+		// Completing a copy in the same batch emits the clear mark first, then partialHistory=false.
+		state.partialHistory(1, false, 'g1');
+		const ev2 = {};
+		state.attachTo(ev2);
+		assert.deepStrictEqual(ev2.originRouteStates, [
+			[1, undefined, true, undefined, 'g1'],
+			[1, undefined, false, undefined, 'g1'],
+		]);
+	});
+
+	it('PendingRouteState reconcile retains marks when persistIncomingSequence was skipped and drops them once persisted', () => {
+		let persistedNodes = [{ id: 1, originGeneration: 'g1', certifiedFrom: T - 10 }];
+		const state = new PendingRouteState(() => ({ nodes: persistedNodes }));
+		state.noteGeneration(1, 'g1');
+		state.partialHistory(1, true);
+		state.hole(2, 'g2');
+		state.revoke(3, 'g3');
+
+		// Simulate an event committing whose sequence update was skipped in persistIncomingSequence:
+		const ev1 = {};
+		state.takeInto(ev1);
+		assert.deepStrictEqual(ev1.originRouteStates, [
+			[1, undefined, true, undefined, 'g1'],
+			[2, undefined, undefined, true, 'g2'],
+		]);
+		assert.deepStrictEqual(ev1.originFloorRevocations, [[3, 'g3']]);
+
+		// Because persistedNodes does not reflect partialHistory/hole/floorRevoked yet, entries stay pending:
+		const ev2 = {};
+		state.attachTo(ev2);
+		assert.deepStrictEqual(ev2.originRouteStates, [
+			[1, undefined, true, undefined, 'g1'],
+			[2, undefined, undefined, true, 'g2'],
+		]);
+		assert.deepStrictEqual(ev2.originFloorRevocations, [[3, 'g3']]);
+
+		// Once persisted in [seq, peer], reconcile drops the settled entries.
+		persistedNodes = [
+			{ id: 1, originGeneration: 'g1', partialHistory: true },
+			{ id: 2, originGeneration: 'g2', hole: true },
+			{ id: 3, originGeneration: 'g3', floorRevoked: true },
+		];
+		state.reconcile();
+		assert.strictEqual(state.size, 0);
+	});
 });

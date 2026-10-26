@@ -23,6 +23,7 @@ export interface CopyCursorValue {
 	currentTable: any;
 	afterKey: any;
 	copyOrder: any;
+	widened?: boolean;
 }
 
 interface BlobTagNode {

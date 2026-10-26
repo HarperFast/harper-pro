@@ -165,11 +165,6 @@ export function peerCertifiesCheckpointFloors(resolved: ResolvedPeerCapabilities
 export const ABSENT_PEER_CAPABILITIES: ResolvedPeerCapabilities = resolvePeerCapabilities(undefined);
 
 /**
- * The budget is passed in, not derived here: it comes from `PING_INTERVAL`, an `env.get` read evaluated
- * when `replicationConnection.ts` loads. Deriving it behind this module's import graph would let an
- * earlier importer evaluate it before config loads and silently advertise a default-derived budget.
- */
-/**
  * The `recordLocks` level this node ADVERTISES — the only thing a peer can act on. A node whose bag
  * is suppressed (the test's `HARPER_TEST_OMIT_REPLICATION_CAPABILITIES`, or any future path that sends
  * no bag) advertises 0 even with the feature enabled, and must then treat itself as a non-member too:
@@ -181,11 +176,16 @@ export function advertisedRecordLocksLevel(recordLocksEnabled: boolean, bagOmitt
 	return recordLocksEnabled && !bagOmitted ? RECORD_LOCKS_CAPABILITY : 0;
 }
 
+/**
+ * The budget is passed in, not derived here: it comes from `PING_INTERVAL`, an `env.get` read evaluated
+ * when `replicationConnection.ts` loads. Deriving it behind this module's import graph would let an
+ * earlier importer evaluate it before config loads and silently advertise a default-derived budget.
+ */
 export function buildLocalCapabilities(
 	subscriptionSetupBudgetMs: number,
 	recordLocksEnabled: boolean,
 	perOriginLogs: boolean,
-	durableFloors = true
+	durableFloors = false
 ): Readonly<Record<string, number>> {
 	return Object.freeze({
 		safeCopyAudit: 1,
