@@ -1596,11 +1596,11 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 // Test-only: the first outbound subscription for this database scans a drained audit iterable carrying a
 // corrupt-frame stop, which is what core's `endIteratorOnCorruptFrame` leaves on a reusable range.
 // `HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB=<db>` reports a torn tail; `<db>:midlog` a mid-log break.
+const DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST = process.env.HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB;
 let deadAuditIterableForTestArmed = false;
 export function maybeDeadAuditIterableForTest<T>(databaseName: string | undefined): T | undefined {
-	const spec = process.env.HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB;
-	if (!spec || deadAuditIterableForTestArmed) return undefined;
-	const [specDb, shape] = spec.split(':');
+	if (!DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST || deadAuditIterableForTestArmed) return undefined;
+	const [specDb, shape] = DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST.split(':');
 	if (specDb !== databaseName) return undefined;
 	deadAuditIterableForTestArmed = true;
 	const midLogBreak = shape === 'midlog';
@@ -1613,22 +1613,18 @@ export function maybeDeadAuditIterableForTest<T>(databaseName: string | undefine
 	} as T;
 }
 
-// Minimum spacing of send-log-break reconnects per (database, peer) in this process. The probe below
-// should make a repeat impossible, but a peer cursor behind the tear would re-stop the replacement
-// session, and without this floor that becomes a reconnect per commit.
+// Minimum spacing of send-log-break reconnects per (database, peer) on one worker thread. A peer cursor
+// behind a tear that is still there re-stops the replacement session, so without this floor a stopped
+// log beside busy healthy logs would reconnect on every commit.
 export const SEND_LOG_BREAK_RECONNECT_INTERVAL_MS = 5 * 60_000;
 const lastSendLogBreakReconnectAt = new Map<string, number>();
-
-/**
- * Whether a fresh range reads past the corrupt frame that stopped the session's reusable send range.
- * Core latches each log's iterator done at a corrupt frame, so the cached range never yields again even
- * after the log is readable; only a new range can tell. Drained here, not sent.
- */
-export function freshSendRangeReadsPast(
-	probe: Iterable<unknown> & { corruptFrameStop?: any; failedLogs?: Set<string> }
-): boolean {
-	for (const _entry of probe);
-	return !(probe.corruptFrameStop?.breaks > 0) && !(probe.failedLogs?.size > 0);
+/** How long a send-log-break reconnect for `key` must still wait; 0 when it may run now. */
+export function sendLogBreakReconnectDelayMs(
+	lastAt: number | undefined,
+	now: number,
+	intervalMs: number = SEND_LOG_BREAK_RECONNECT_INTERVAL_MS
+): number {
+	return lastAt === undefined ? 0 : Math.max(0, intervalMs - (now - lastAt));
 }
 
 // Test-only fault injection for the copy-progress false-fire repro: when HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB
@@ -6892,8 +6888,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								};
 								let isFirst = true;
 								// The generation pending when the scan that first saw a torn-tail stop began. Only a commit
-								// after it can make a fresh range read past the tear.
+								// after it can need delivery past the tear.
 								let sendLogStopGeneration: Promise<unknown> | undefined;
+								// A commit landed after the stop while reconnects were in their floor: still owed once it ends.
+								let sendLogRecoveryPending = false;
+								let sendLogRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 								let reportedMidLogBreakRange: unknown;
 								// A `return` from inside the loop (close, rejection) still runs this finally, so a timer
 								// armed in the exiting pass can never outlive it to wake a later, superseding loop that
@@ -7470,11 +7469,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// that may never come on an otherwise-idle database.
 											continue;
 										}
-										// A reusable range stopped at a corrupt frame never yields again, so this session would sit
-										// connected with nothing more sent. Repair by reconnecting: the peer's durable and per-origin
-										// cursors then position a fresh range, which a sender-side reseed cannot do safely
-										// (harper-pro#876). The stopped range stays in place until then, so certification below
-										// still sees its failure.
+										// Core latches a log's iterator done at a corrupt frame, and a reusable range is kept for the
+										// session, so that log sends nothing more on this connection. Recover by reconnecting: the
+										// peer's durable and per-origin cursors position the next range, which a sender-side reseed
+										// cannot do safely (harper-pro#876). The stopped range stays in place until then, so the
+										// certification check below still sees its failure.
 										if (range?.corruptFrameStop?.breaks > 0 && auditStore.reusableIterable) {
 											const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 											if (range.corruptFrameStop.midLogBreak) {
@@ -7488,38 +7487,33 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												}
 											} else if (sendLogStopGeneration === undefined) {
 												sendLogStopGeneration = nextTransaction;
-											} else if (sendLogStopGeneration !== nextTransaction) {
+											} else if (sendLogRecoveryPending || sendLogStopGeneration !== nextTransaction) {
 												const reconnectKey = `${databaseName}\0${remoteNodeName}`;
 												const now = performance.now();
-												if (
-													!supersededOrClosed() &&
-													now - (lastSendLogBreakReconnectAt.get(reconnectKey) ?? -Infinity) >=
-														SEND_LOG_BREAK_RECONNECT_INTERVAL_MS &&
-													freshSendRangeReadsPast(
-														auditStore.getRange({
-															start: currentSequenceId || 1,
-															exclusiveStart: true,
-															exactStart: false,
-															log: excludedNodes ? undefined : logName,
-															excludeLogs: excludedNodes,
-															onlyKeys: true,
-															snapshot: false,
-														})
-													)
-												) {
+												const delayMs = sendLogBreakReconnectDelayMs(
+													lastSendLogBreakReconnectAt.get(reconnectKey),
+													now
+												);
+												// A superseded loop must not tear down its replacement's socket.
+												if (supersededOrClosed()) return;
+												if (delayMs === 0) {
 													lastSendLogBreakReconnectAt.set(reconnectKey, now);
 													closed = true;
 													const fireDetail = recordFireForLog('send-log-break');
 													logger.warn?.(
 														connectionId,
-														`Replication send to ${remoteNodeName}${dbContext} stopped at a torn transaction-log frame that a fresh range now reads past; reconnecting so the peer resumes from its cursor — ${fireDetail}`
+														`Replication send to ${remoteNodeName}${dbContext} stopped at a torn transaction-log frame; reconnecting so the peer resumes from its cursor — ${fireDetail}`
 													);
 													if (options.connection) options.connection.forceReconnect();
 													else close(1011, 'send range stopped at a torn transaction-log frame; reconnecting');
 													return;
 												}
-												// Still stopped, or reconnected recently: wait for another commit.
-												sendLogStopGeneration = nextTransaction;
+												sendLogRecoveryPending = true;
+												if (!sendLogRecoveryTimer)
+													sendLogRecoveryTimer = setTimeout(() => {
+														sendLogRecoveryTimer = undefined;
+														wakeSender?.();
+													}, delayMs).unref();
 											}
 										}
 										if (frame.position - frame.encodingStart > 8) {
@@ -7589,6 +7583,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									} while (!closed);
 								} finally {
 									clearTimeout(floorTimer);
+									clearTimeout(sendLogRecoveryTimer);
 								}
 							})
 							.catch((error) => {

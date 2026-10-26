@@ -15,15 +15,16 @@
  *
  * The two shapes are opposites, and each test pins one:
  *
- *   TORN TAIL — after the next commit the sender probes a fresh range; it reads past, so the session
- *   reconnects once and the peer resumes from its own cursor.
+ *   TORN TAIL — after the next commit the session reconnects once (then at most once per floor), so
+ *   the peer resumes from its own cursors and a fresh range is built.
  *
  *   MID-LOG BREAK — entries behind the break are unreadable and harper#2087 makes stopping there the
  *   intended policy. It is reported and the session stays up; no reconnect can cross it.
  *
  * `HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB=<db>[:midlog]` serves the drained, corrupt-frame-stopped
- * iterable that `endIteratorOnCorruptFrame` leaves behind. It is one-shot, so the probe and the
- * replacement session see a healthy log and recovery is observed rather than merely asserted.
+ * iterable that `endIteratorOnCorruptFrame` leaves behind. It is one-shot, so the replacement session
+ * sees a healthy log and recovery is observed rather than merely asserted. It does not model real torn
+ * bytes, so it proves the reconnect and resume, not that a real tear is readable afterwards.
  *
  * Stress-gated (spawns two Harper child processes) like the other cluster tests.
  */
@@ -55,7 +56,7 @@ const RECOVERY_TIMEOUT_MS = 120_000;
 // rather than a race with the first one.
 const NO_RECOVERY_WINDOW_MS = 60_000;
 const POLL_MS = 500;
-const REPAIRED = /stopped at a torn transaction-log frame that a fresh range now reads past; reconnecting/;
+const REPAIRED = /stopped at a torn transaction-log frame; reconnecting so the peer resumes from its cursor/;
 const QUARANTINED = /stopped at a mid-log corrupt transaction-log frame/;
 const DISCONNECTED = /Disconnected from wss:/;
 
@@ -192,7 +193,7 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS || !ROCKSDB, t
 		}
 	});
 
-	test('a torn tail is repaired by one reconnect once a fresh range reads past it', async () => {
+	test('a torn tail is repaired by one reconnect after the next commit', async () => {
 		const { source, subscriber } = await startWedgedPair(ctx, 'torn-tail', 'tail');
 
 		await waitForCondition((signal) => hasRow(subscriber, 'after-wedge', signal), {
@@ -200,14 +201,6 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS || !ROCKSDB, t
 			pollMs: POLL_MS,
 			description: 'the live row to replicate once the send range is rebuilt',
 		});
-
-		const log = await readLog(source);
-		equal(
-			log.match(new RegExp(REPAIRED, 'g'))?.length,
-			1,
-			'the source should reconnect exactly once for the stopped range'
-		);
-		ok(/fire=\{mechanism: send-log-break/.test(log), 'the fire should be classified like every other net');
 
 		// And the leg is genuinely healthy afterwards, not merely caught up once.
 		await sendOperation(source, {
@@ -221,6 +214,14 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS || !ROCKSDB, t
 			pollMs: POLL_MS,
 			description: 'a live write after recovery to replicate over the repaired leg',
 		});
+
+		const log = await readLog(source);
+		equal(
+			log.match(new RegExp(REPAIRED, 'g'))?.length,
+			1,
+			'the source should reconnect exactly once for the stopped range'
+		);
+		ok(/fire=\{mechanism: send-log-break/.test(log), 'the fire should be classified like every other net');
 	});
 
 	test('a mid-log break is reported and left alone — reconnecting cannot cross it', async () => {
