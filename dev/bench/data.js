@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792915332436,
+  "lastUpdate": 1793024333753,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -6759,6 +6759,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2097.24,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "e6570e0d566858afba69b311357ac98638fa2a64",
+          "message": "Fix sourcedFrom blob metadata divergence (#647)\n\n* test(cluster): cover competing sourced blob fills\n\nPin connections to every worker on two replicated nodes and race independent sourcedFrom fills through an external barrier. Require the raw record, point reads, metadata, and blob payload to converge on one write.\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n* test(cluster): harden sourced blob race coverage\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n* test(cluster): harden sourced race observers\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n* test(cluster): explain post-probe convergence check\n\nClarify why the raw stores are scanned again after every worker has materialized the record.\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n* test(cluster): bound operation retries and take the last version row\n\nPre-push review (codex graded + Gemini + Cursor Composer + Harper-domain\nadjudication) on this rebase found several reliability/correctness gaps in\nthe harper-pro#645 regression:\n\n- rawOperation and the cluster_status poll used bare fetch with no\n  AbortSignal, so a node that accepts the connection but never answers hangs\n  the retry loop until the suite's outer timeout. Bound both, and widen the\n  add_node retry classification to treat an abort/timeout as retryable\n  (it previously only matched ECONNREFUSED/ECONNRESET/connect errors and\n  would hard-fail on a timeout instead of retrying).\n- The final per-worker assertion loop had no retry, unlike every other probe\n  in this file, so a blob mid-write/pending-replication 500 could fail a\n  trial that was otherwise converged; wrap it in the same bounded retry.\n- Nothing asserted the two source fills came from different nodes, so the\n  regression could silently degrade to racing one node against itself;\n  assert distinct originTrial.calls[].node values.\n- PairPointProbe/PairScanProbe scanned from start: null and returned the\n  first version row for a key; take the last (highest-version) row instead\n  and start the scan at the key, removing an open question about whether a\n  superseded row could stand in for the live one.\n- Reworded the post-probe re-scan comment to state why it's needed (full\n  per-node records for the deepEqual/payloadToken checks, not just the\n  version+token match waitForAllWorkers already proved) instead of\n  narrating the line below it.\n\nVerified: build clean, npm run test:unit (1068 passing), lint:required\nclean, and the targeted regression 10/10 (env -u HDB_ROOT) after each round\nof fixes — including catching that the first AbortSignal.timeout(5000) on\nadd_node was too tight for this host's current load and needed widening to\n20000ms plus the retry-classification fix above.\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01JipTU3AWDqkji2bbgQVgDJ\n\n* test(cluster): correct version-scan claim, surface fetch's wrapped cause\n\nDelta pre-push review round 2 (codex resume + Gemini) on the prior fix\ncommit found two real problems and disproved one of my own assumptions:\n\n- Verified against lmdb-js's own RangeOptions doc (\"Include version numbers\n  in each entry returned\") that versions:true decorates one row per key,\n  it does not expose multiple rows — so the prior commit's \"take the last\n  version row\" comment and logic were solving a problem that can't occur.\n  Simplified both probes back to a single bounded check-then-break at\n  start: target.id (keeps the earlier scan-bound efficiency fix, drops the\n  now-disproven multi-row handling and its inaccurate comment).\n- rawOperation's catch only forwarded error.message. Node's fetch wraps a\n  low-level connection failure (e.g. a peer not yet listening) in a generic\n  \"fetch failed\" TypeError and puts the real code on error.cause.code, so\n  the add_node retry-classification regex could never see it and would\n  hard-fail setup on a transient connection error instead of retrying.\n  Append error.cause.code to the forwarded message.\n- Reworded the post-probe re-scan comment: waitForAllWorkers's probes do\n  carry full records, its stability check just doesn't compare them: the\n  re-scan exists to get the node[0]/node[1] pairing the assertions need,\n  not because a full record was otherwise unavailable.\n\nDeferred (recorded for the PR body instead of fixed here — each is a\njudgment call already surfaced in round 1's decision ledger, not a defect):\nbootstrap-phase/wait-budget arithmetic that can exceed the suite's 300s\ntimeout on a genuine wedge, the barrier's fixed 10s window under load, and\nrunning all 10 trials on every cluster CI pass.\n\nVerified: build clean (also recovered node_modules from a pnpm-layout\nrewrite the review CLI made mid-run per the known\nharper-pro-local-engine-override issue: rm pnpm-lock.yaml\npnpm-workspace.yaml && npm ci), npm run test:unit (1068 passing),\nlint:required clean, targeted regression 10/10 (env -u HDB_ROOT).\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01JipTU3AWDqkji2bbgQVgDJ\n\n* test(cluster): cover the equal-version tie and both storage engines\n\nThe regression only exercised the easy half of the convergence claim: the\norigin never reported a `lastModified`, so each node minted its own monotonic\nversion and ordinary version ordering settled every race. The tie — both\nreplicas at the same candidate version, which cache-fill resolution has to\nbreak without node identity — was never reached, and only the default storage\nengine ran even though the resolution branches on `isRocksDB`.\n\nAdds a `tied-late` shape that parks the losing fill at the origin until its\npeer's record has replicated in, so the fill commits against a raced record at\nan equal version, and runs the suite over rocksdb and lmdb the way\nfullyConnectedReplication.test.mjs does. A barrier that never staged two\nconcurrent fills now restages on a suite-wide budget instead of failing a\ntrial that demonstrated nothing.\n\nMutating core's guard at resources/Table.ts:7214 — either to `true` or to\n`>=`, which reinstates the divergence — survives the previous test and fails\nthis one on both engines.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* test(cluster): bound bootstrap phases and harden worker discovery\n\nPre-push review found three ways this file can fail as a process rather than\nas a test, all of them worse now that it bootstraps twice — once per engine.\n\n`connectNodes` budgeted each retry attempt but not each phase, so a node that\naccepts the operations socket and never answers could spend ~22 minutes across\nthe three loops, and twice that across both suites: past the 25-minute cluster\njob cap, so the workflow dies before any phase reports its own diagnostic. Each\nphase now carries one deadline and hands its remaining budget to the request.\n\n`pendingFills` was constructed and only awaited after `releaseLateFill` had\nawaited real I/O, so a fill that rejected in between reached node as an\nunhandled rejection and took the whole runner down instead of failing one\ntrial.\n\nWorker discovery aborted the bootstrap on a single transient response from a\nworker still warming up, and dropped the agents it had already opened — they\nare unreachable from `ctx.agentsByNode`, which is never assigned when the\n`Promise.all` rejects, so `after` could not close them.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* test(cluster): bound worker discovery and never orphan a node\n\nMaking a failed worker probe non-fatal last round removed the only thing\nbounding discovery: 40 probes each waiting out a 20s request timeout is ~13\nminutes per node. Discovery now shares the bootstrap phase budget, which drops\nto 60s so all four phases together stay inside the suite's own 300s as well as\nthe cluster job cap.\n\n`startHarper` REPLACES `nodeCtx.harper` rather than filling it in, so a node\nwhose startup threw was never recorded and `after` could not tear it down —\nthe orphaned child then held its loopback ports against the next run. The\nhandle is now captured in a `finally`. Pinned agents are likewise assigned per\nnode instead of from the `Promise.all` result, so one node failing no longer\nstrands the sockets the other already opened, and the barrier origin rejects a\n`listen` error instead of letting it reach the runner unhandled.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* test(cluster): settle every setup task before failing the bootstrap\n\n`Promise.all` rejects on the first failure, so `after` could run while a\nsibling was still starting a node or pinning workers; that task then published\nits handle into the suite context after cleanup had already walked it, leaving\na Harper child holding its loopback ports for the rest of the run. Both setup\nfan-outs now settle fully and rethrow the first rejection afterwards, so every\nresource is registered before teardown looks for it.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* test(cluster): release the barrier on every giving-up path\n\nreleaseLateFill returned early when no second fill showed up inside the\nbarrier window, leaving the origin trial unreleased. A second fill that was\nonly slow then arrived to a state that armed a fresh 10s timer on top of the\ntime it had already spent, pushing its own request past the 20s socket timeout\n— so a merely-delayed race threw out of the trial instead of restaging. The\nrelease now happens in a finally covering both waits.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* test(cluster): survive a hole in the pinned-agent array during teardown\n\nA node whose worker pinning threw leaves its slot unassigned, so the cleanup\nloop read `undefined.values()` and threw out of `after` before reaching\nteardownHarper — leaking both Harper children and the origin server on exactly\nthe failure it was there to clean up after.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* test(cluster): yield on every miss while waiting for the late fill\n\nThe wait for the parked fill only yielded when fewer than two origin calls had\narrived. Once two had, an unrecognized hostname left `findIndex` at -1 and the\nloop spun synchronously for the whole barrier window — on the same event loop\nthe barrier origin answers from, so nothing could make progress out of it.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: GPT-5 Codex <noreply@openai.com>\nCo-authored-by: Claude Sonnet 5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-26T12:13:33Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/e6570e0d566858afba69b311357ac98638fa2a64"
+        },
+        "date": 1793024331747,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 5872.85,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 12999.18,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 7780.77,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 5226.73,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 3661.42,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 1957.87,
             "unit": "ops/sec"
           }
         ]
