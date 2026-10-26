@@ -22,15 +22,8 @@ import mqtt from 'mqtt';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 
-// Level 2 is advertised only by an engine that syncs the floor record (`syncWal`, rocksdb-js#949); on 2.12.0 no
-// node certifies at level 2 and every case below would wait out its deadline.
-const engine = await import('@harperfast/rocksdb-js');
-const ENGINE_SKIP =
-	typeof engine.RocksDatabase?.prototype?.syncWal === 'function'
-		? false
-		: 'the installed @harperfast/rocksdb-js has no syncWal(), so no level-2 floor certificate is advertised';
-
 const TEST_DIR = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
+const STANDIN_SYNC_WAL = join(TEST_DIR, 'fixture-origin-log', 'standinSyncWal.mjs');
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 'dist', 'bin', 'harper.js');
 
 const TABLE = 'checkpoint_origin';
@@ -44,7 +37,12 @@ const nodeOptions = (node, env = {}) => ({
 		replication: { port: node.hostname + ':9933', securePort: null, databases: ['data'] },
 		originLogFixture: { package: join(TEST_DIR, 'fixture-origin-log') },
 	},
-	env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS: String(FLOOR_INTERVAL_MS), ...env },
+	env: {
+		HARPER_NO_FLUSH_ON_EXIT: true,
+		HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS: String(FLOOR_INTERVAL_MS),
+		NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import ${STANDIN_SYNC_WAL}`].filter(Boolean).join(' '),
+		...env,
+	},
 });
 
 async function startNode(node) {
@@ -173,7 +171,7 @@ const endMqtt = (client) => new Promise((resolve) => client.end(true, {}, () => 
 const topicIds = (received) => received.map(({ topic }) => topic.split('/').pop());
 
 const SUITE = 'Subscription checkpoints resume across nodes (harper-pro#922 items 3–4)';
-suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
+suite(SUITE, { timeout: 900_000 }, (ctx) => {
 	before(async () => {
 		[ctx.A, ctx.B, ctx.C, ctx.E] = await Promise.all([
 			startNewNode(ctx.name),
@@ -215,11 +213,20 @@ suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
 
 	test('level-2 certificates carry the origin generation and coverage, and a restart resumes floor-only', async () => {
 		const { A, B, C, E } = ctx;
+		const closedFloorsOnB = await postToFixture(B, 'ClosedFloors', { peer: A.hostname });
+		equal(closedFloorsOnB.syncWalInstalled, true, 'standinSyncWal is installed on the database rootStore');
 		const checkpointGrade = (state) =>
 			state?.closedFloor > 0 && typeof state.originGeneration === 'string' && state.fullCoverage === true;
 		await waitForState(B, A, A, checkpointGrade, 'a checkpoint-grade certificate from A');
-		await waitForState(C, B, A, checkpointGrade, "A's certificate relayed through B with its coverage");
 		await waitForState(C, B, B, checkpointGrade, "B's own certificate");
+		await waitForState(B, C, C, checkpointGrade, "C's own certificate on B");
+		await waitForState(
+			C,
+			B,
+			A,
+			(state) => state?.closedFloor > 0 && state.originGeneration == null,
+			"A's floor relayed through B as level 1 before B has a certifiedFrom prefix for A"
+		);
 		equal(
 			(await stateFor(A, E, E))?.originGeneration ?? null,
 			null,
@@ -229,8 +236,10 @@ suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
 
 		// a reconnect on a level-2 route resumes exactly below the floor and records where its complete prefix begins
 		await restartNode(B);
-		await restartNode(C);
 		await waitForState(B, A, A, (state) => state?.certifiedFrom > 0, "B's route to A marked certified-from");
+		await waitForState(B, C, C, (state) => state?.certifiedFrom > 0, "B's route to C marked certified-from");
+		await waitForState(C, B, A, checkpointGrade, "A's certificate relayed through B with its coverage");
+		await restartNode(C);
 		await waitForState(C, B, A, (state) => state?.certifiedFrom > 0, "C's route to A marked certified-from");
 		await waitForState(C, B, B, (state) => state?.certifiedFrom > 0, "C's route to B marked certified-from");
 		const onB = await stateFor(B, A, A);
@@ -276,6 +285,17 @@ suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
 		const refused = await subscription(B, { action: 'resume', name: 'foreign', checkpoint: foreign });
 		equal(refused.refused?.statusCode, 410, 'a member set this node cannot serve is refused');
 		equal(refused.refused?.code, 'RESUME_HISTORY_UNAVAILABLE');
+
+		const scalarResumed = await subscription(B, { action: 'resume', name: 'scalar', startTime: checkpoint.time });
+		equal(scalarResumed.refused, undefined, 'a scalar start-time resume is accepted without checkpoint verification');
+		await waitForEvents(B, 'scalar', ['after']);
+		const scalarStatus = await subscription(B, { action: 'status', name: 'scalar' });
+		equal(scalarStatus.verified, null, 'scalar-only resume does not run checkpoint verification');
+		ok(
+			!scalarStatus.events.includes('held'),
+			'scalar startTime at checkpoint.time misses the transaction held below it'
+		);
+		await subscription(B, { action: 'close', name: 'scalar' });
 	});
 
 	test('an MQTT durable session fails over from C to B and receives the transaction committed below its checkpoint', async () => {
@@ -329,8 +349,7 @@ suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
 	});
 	test('a route widened from partial coverage marks partialHistory and clears it once a base copy completes', async () => {
 		const { A, B } = ctx;
-		// Simulate B having previously replicated A with partial coverage before reconnecting with full coverage.
-		await postToFixture(B, 'SetRouteCoverage', { peer: A.name, fullCoverage: false });
+		await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
 		await restartNode(B);
 		await waitForState(
 			B,
@@ -340,21 +359,103 @@ suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
 			'widened route on B marks partialHistory and clears certifiedFrom'
 		);
 
-		// Clear B's sequence watermark for A and restart B so A initiates a fresh base copy to B.
-		await postToFixture(B, 'SetRouteCoverage', { peer: A.name, clearSeq: true });
+		await postToFixture(A, 'HoldTransaction', { id: 'held-copy-bound' });
+		try {
+			await upsert(A, 'copied-above-pinned-floor');
+			await upsert(A, 'copy-anchor-record');
+			await waitForRecord(B, 'copy-anchor-record');
+			const copiedVersions = await postToFixture(A, 'RecordVersions', {
+				ids: ['copied-above-pinned-floor', 'copy-anchor-record'],
+			});
+			const maxCopiedVersion = Math.max(
+				copiedVersions['copied-above-pinned-floor'] ?? 0,
+				copiedVersions['copy-anchor-record'] ?? 0
+			);
+			await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, clearSeq: true });
+			await restartNode(B);
+			await waitForRecord(B, 'copied-above-pinned-floor');
+			await upsert(A, 'after-widening-copy');
+			await waitForRecord(B, 'after-widening-copy');
+			await waitForState(
+				B,
+				A,
+				A,
+				(state) =>
+					state?.partialHistory === false &&
+					state?.fullCoverage === true &&
+					state?.closedFloor > 0 &&
+					state?.certifiedFrom === null,
+				'base copy completion clears partialHistory without certifying audit-less copyApply history'
+			);
+
+			const logKeyBeforePinnedRestart = (await stateFor(B, A, A))?.originLogKey ?? 0;
+			await restartNode(B);
+			await upsert(A, 'while-floor-pinned');
+			await waitForRecord(B, 'while-floor-pinned');
+			await waitForState(
+				B,
+				A,
+				A,
+				(state) => (state?.originLogKey ?? 0) > logKeyBeforePinnedRestart,
+				"B's seq row for A to persist the post-restart resume batch while A's floor is still pinned"
+			);
+			equal(
+				(await stateFor(B, A, A))?.certifiedFrom,
+				null,
+				'persisted copyBound suppresses floor-only certification while closedFloor <= maxCopiedVersion'
+			);
+
+			await postToFixture(A, 'ReleaseTransaction', {});
+			await upsert(A, 'after-floor-unpinned');
+			await waitForRecord(B, 'after-floor-unpinned');
+			await waitForState(
+				B,
+				A,
+				A,
+				(state) => (state?.closedFloor ?? 0) > maxCopiedVersion + 1,
+				"A's closedFloor on B to advance past the copied rows after releasing the held transaction"
+			);
+		} finally {
+			await postToFixture(A, 'ReleaseTransaction', {}).catch(() => {});
+		}
+
 		await restartNode(B);
-		await upsert(A, 'after-widening-copy');
-		await waitForRecord(B, 'after-widening-copy');
+		let firstCertifiedFrom = 0;
 		await waitForState(
 			B,
 			A,
 			A,
-			(state) =>
-				state?.partialHistory === null &&
-				state?.fullCoverage === true &&
-				state?.closedFloor > 0 &&
-				state?.certifiedFrom !== null,
-			'base copy completion clears partialHistory and restores checkpoint-grade state on B'
+			(state) => {
+				if (
+					state?.partialHistory === false &&
+					state?.fullCoverage === true &&
+					state?.closedFloor > 0 &&
+					state?.certifiedFrom > 0
+				) {
+					firstCertifiedFrom = state.certifiedFrom;
+					return true;
+				}
+				return false;
+			},
+			'subsequent floor-only reconnect records certifiedFrom on the restored route'
+		);
+		await upsert(A, 'after-first-certified-resume');
+		await waitForRecord(B, 'after-first-certified-resume');
+		const floorBeforeSecondRestart = (await stateFor(B, A, A))?.closedFloor ?? 0;
+		await waitForState(
+			B,
+			A,
+			A,
+			(state) => (state?.closedFloor ?? 0) > floorBeforeSecondRestart,
+			"A's floor on B to advance past firstCertifiedFrom"
+		);
+		await restartNode(B);
+		await waitForState(
+			B,
+			A,
+			A,
+			(state) => state?.certifiedFrom === firstCertifiedFrom,
+			'lowest-wins certifiedFrom preserved across a second floor-only reconnect with a higher floor'
 		);
 	});
 	test('a peer that stops certifying at level 2 is revoked on its direct receiver and one hop beyond', async () => {
@@ -368,7 +469,14 @@ suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
 		await subscription(C, { action: 'open', name: 'after-downgrade' });
 		await upsert(A, 'post-downgrade');
 		await waitForEvents(C, 'after-downgrade', ['post-downgrade']);
-		await new Promise((resolve) => setTimeout(resolve, 3 * FLOOR_INTERVAL_MS));
+		const bFloorBefore = (await stateFor(C, B, B))?.closedFloor ?? 0;
+		await waitForState(
+			C,
+			B,
+			B,
+			(state) => (state?.closedFloor ?? 0) > bFloorBefore,
+			"B's own floor certificate to advance on C after post-downgrade"
+		);
 		const status = await subscription(C, { action: 'status', name: 'after-downgrade' });
 		equal(status.checkpoint, null, 'strict availability: no checkpoint while a known origin is revoked');
 		await subscription(C, { action: 'close', name: 'after-downgrade' });
@@ -377,7 +485,14 @@ suite(SUITE, { timeout: 900_000, skip: ENGINE_SKIP }, (ctx) => {
 		await restartNode(A);
 		await upsert(A, 'post-upgrade');
 		await waitForRecord(C, 'post-upgrade');
-		await new Promise((resolve) => setTimeout(resolve, 3 * FLOOR_INTERVAL_MS));
+		const bFloorBeforeUpgrade = (await stateFor(C, B, B))?.closedFloor ?? 0;
+		await waitForState(
+			C,
+			B,
+			B,
+			(state) => (state?.closedFloor ?? 0) > bFloorBeforeUpgrade,
+			"B's floor certificate to advance on C after A's upgrade"
+		);
 		equal((await stateFor(B, A, A)).floorRevoked, true, 'a revocation is sticky within the generation');
 	});
 });

@@ -1,3 +1,5 @@
+import './standinSyncWal.mjs';
+
 // Writes the way the replication apply loop does (explicit timestamp, origin `nodeId`), so a record whose origin
 // is `ghost` lands in the `ghost` transaction log.
 export class OriginLogWrite extends Resource {
@@ -107,7 +109,11 @@ export class ClosedFloors extends Resource {
 				partialHistory: node.partialHistory ?? null,
 			};
 		}
-		return { seqId: row?.seqId ?? null, nodes };
+		return {
+			seqId: row?.seqId ?? null,
+			syncWalInstalled: typeof auditStore?.rootStore?.syncWal === 'function',
+			nodes,
+		};
 	}
 }
 
@@ -119,17 +125,41 @@ export class ClosedFloors extends Resource {
 export class SetRouteCoverage extends Resource {
 	static loadAsInstance = false;
 
-	async post(data) {
-		const peerName = data?.peer ?? this.getId();
-		const Table = tables.Item;
-		const peerId = Table.getNodeId(peerName);
+	async post(target, data) {
+		const Table = databases.data[data.table];
+		const auditStore = Table.auditStore;
+		const nodeLogs = auditStore.loadLogs();
+		const peerId = nodeLogs.indexOf(auditStore.logByName.get(data.peer));
+		if (!(peerId > 0)) return { updated: false };
 		const seqKey = [Symbol.for('seq'), peerId];
+		const row = Table.dbisDB.getSync(seqKey);
 		if (data?.clearSeq) {
-			await Table.dbisDB.remove(seqKey);
+			for (const entry of Table.dbisDB.getRange({
+				start: Symbol.for('seq'),
+				end: [Symbol.for('seq'), Buffer.from([0xff])],
+			})) {
+				const value = entry.value;
+				if (!value?.nodes) continue;
+				const clearedNodes = value.nodes.map((node) => ({
+					...node,
+					lastTxnTime: undefined,
+					originLogKey: undefined,
+				}));
+				await Table.dbisDB.put(entry.key, {
+					...value,
+					...(Array.isArray(entry.key) && entry.key[1] === peerId ? { seqId: 0 } : undefined),
+					nodes: clearedNodes,
+				});
+			}
 			await Table.dbisDB.remove([Symbol.for('copyCursor'), peerId]);
+			for (const entry of Table.dbisDB.getRange({
+				start: Symbol.for('copyBound'),
+				end: [Symbol.for('copyBound'), Buffer.from([0xff])],
+			})) {
+				await Table.dbisDB.remove(entry.key);
+			}
 			return { cleared: true };
 		}
-		const row = Table.dbisDB.get(seqKey);
 		if (!row?.nodes) return { updated: false };
 		const nodes = row.nodes.map((node) => ({
 			...node,
@@ -150,26 +180,36 @@ export class OriginFloor extends Resource {
 
 // A transaction held open with a staged write: its reserved key holds this node's floor until it is released.
 let releaseHeldTransaction;
+let heldTransactionDone;
 export class HoldTransaction extends Resource {
 	static loadAsInstance = false;
-	post(target, data) {
+	async post(target, data) {
 		const Table = databases.data[data.table];
 		const context = {};
+		let markStaged;
+		const staged = new Promise((resolve) => (markStaged = resolve));
 		const released = new Promise((resolve) => (releaseHeldTransaction = resolve));
-		transaction(context, async () => {
+		heldTransactionDone = transaction(context, async () => {
 			await Table.put({ id: data.id, name: 'held' }, context);
+			markStaged();
 			await released;
-		}).catch(() => {});
+		}).catch(() => {
+			markStaged?.();
+		});
+		await staged;
 		return { held: data.id };
 	}
 }
 
 export class ReleaseTransaction extends Resource {
 	static loadAsInstance = false;
-	post() {
+	async post() {
 		const released = releaseHeldTransaction !== undefined;
+		const done = heldTransactionDone;
 		releaseHeldTransaction?.();
 		releaseHeldTransaction = undefined;
+		heldTransactionDone = undefined;
+		await done;
 		return { released };
 	}
 }
@@ -192,7 +232,10 @@ export class CheckpointSubscription extends Resource {
 					if (event.type === 'put' || event.type === 'delete') events.push(event.id);
 				},
 			};
-			if (data.action === 'resume') request.resume = data.checkpoint;
+			if (data.action === 'resume') {
+				if (data.checkpoint !== undefined) request.resume = data.checkpoint;
+				if (data.startTime !== undefined) request.startTime = data.startTime;
+			}
 			let subscription;
 			try {
 				subscription = await Table.subscribe(request);

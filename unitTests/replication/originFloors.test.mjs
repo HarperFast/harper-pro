@@ -4,11 +4,15 @@ import {
 	PendingOriginFloors,
 	PendingRouteState,
 	buildOriginCursorVector,
+	checkpointGradeRow,
 	collectRelayableCertificates,
 	cursorBelowFloor,
 	encodeOriginCertificate,
+	mergePersistedCopyBounds,
 	parseOriginCertificates,
+	persistMergedCopyBounds,
 	resolveOriginFloors,
+	restoreCompletedCopyPass,
 	resumeStartWithFloor,
 } from '#src/replication/replicationConnection';
 
@@ -181,10 +185,24 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(encodeOriginCertificate({ revoked: true }, 1), undefined);
 	});
 
-	it('relays checkpoint-grade qualifiers only from a row whose socket certifies at level 2, and a revocation always', () => {
+	it('relays checkpoint-grade qualifiers only from a row whose socket certifies at level 2 and has certifiedFrom <= below(floor), and a revocation always', () => {
 		const rows = new Map([
-			row(1, { id: 1, closedFloor: T - 5, relayable: true, originGeneration: 'gen-p', fullCoverage: true }),
-			row(2, { id: 2, closedFloor: T - 6, relayable: true, originGeneration: 'gen-r', fullCoverage: false }),
+			row(1, {
+				id: 1,
+				closedFloor: T - 5,
+				relayable: true,
+				originGeneration: 'gen-p',
+				fullCoverage: true,
+				certifiedFrom: 0,
+			}),
+			row(2, {
+				id: 2,
+				closedFloor: T - 6,
+				relayable: true,
+				originGeneration: 'gen-r',
+				fullCoverage: false,
+				certifiedFrom: 0,
+			}),
 			row(3, { id: 3, closedFloor: T - 7, relayable: true, floorRevoked: true }),
 		]);
 		const names = ['peer', 'relayed', 'other'];
@@ -207,6 +225,31 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.deepStrictEqual(
 			[...collectRelayableCertificates(rows, names, nameToId, () => 0)],
 			[['other', { revoked: true }]]
+		);
+		// A route without certifiedFrom (or with certifiedFrom > cursorBelowFloor(closedFloor)) relays only its scalar floor.
+		const uncertifiedRows = new Map([
+			row(1, {
+				id: 1,
+				closedFloor: T - 5,
+				relayable: true,
+				originGeneration: 'gen-p',
+				fullCoverage: true,
+			}),
+			row(2, {
+				id: 2,
+				closedFloor: T - 6,
+				relayable: true,
+				originGeneration: 'gen-r',
+				fullCoverage: true,
+				certifiedFrom: T - 6,
+			}),
+		]);
+		assert.deepStrictEqual(
+			[...collectRelayableCertificates(uncertifiedRows, names, nameToId, () => 2)],
+			[
+				['peer', { floor: T - 5 }],
+				['relayed', { floor: T - 6 }],
+			]
 		);
 	});
 
@@ -245,11 +288,12 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		});
 	});
 
-	it('PendingOriginFloors keeps the level-2 fields a same-floor certificate carries', () => {
+	it('PendingOriginFloors keeps the level-2 fields a same-floor certificate carries and updates fullCoverage', () => {
 		const pending = new PendingOriginFloors();
 		pending.note([[7, T, false]]);
 		pending.note([[7, T, true, 'gen', true]]);
-		assert.deepStrictEqual(pending.take(false), [[7, T, true, 'gen', true]]);
+		pending.note([[7, T, true, 'gen', false]]);
+		assert.deepStrictEqual(pending.take(false), [[7, T, true, 'gen', false]]);
 	});
 
 	it('PendingRouteState attaches generation-scoped marks and revocations, settled when their update commits', async () => {
@@ -278,7 +322,13 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(pending.size, 1);
 		const rest = {};
 		pending.takeInto(rest);
-		assert.deepStrictEqual(rest, { originRouteStates: [[3, undefined, false, undefined, 'g3']] });
+		assert.deepStrictEqual(rest.originRouteStates, [[3, undefined, false, undefined, 'g3']]);
+		assert.strictEqual(pending.size, 0);
+		rest.onFailure(new Error('failed'), 1);
+		assert.strictEqual(pending.size, 1);
+		const retried = {};
+		pending.takeInto(retried);
+		assert.deepStrictEqual(retried.originRouteStates, [[3, undefined, false, undefined, 'g3']]);
 		assert.strictEqual(pending.size, 0);
 		const empty = {};
 		pending.attachTo(empty);
@@ -329,9 +379,8 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 	it('PendingRouteState coalesces marks by originId and orders partialHistory clear before false', () => {
 		const state = new PendingRouteState();
 		state.certifiedFrom(1, T - 5, 'g1');
-		state.noteGeneration(1, 'g1');
 		state.partialHistory(1, true);
-		// partialHistory(true) on the same origin clears the earlier optimistic certifiedFrom.
+		// partialHistory(true) on the same origin clears the earlier optimistic certifiedFrom while keeping its generation.
 		const ev1 = {};
 		state.attachTo(ev1);
 		assert.deepStrictEqual(ev1.originRouteStates, [[1, undefined, true, undefined, 'g1']]);
@@ -346,39 +395,398 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		]);
 	});
 
-	it('PendingRouteState reconcile retains marks when persistIncomingSequence was skipped and drops them once persisted', () => {
-		let persistedNodes = [{ id: 1, originGeneration: 'g1', certifiedFrom: T - 10 }];
-		const state = new PendingRouteState(() => ({ nodes: persistedNodes }));
-		state.noteGeneration(1, 'g1');
-		state.partialHistory(1, true);
-		state.hole(2, 'g2');
+	it('PendingRouteState tracks pending revocations and checkpointGradeRow rejects holes, partialHistory, and revocations', () => {
+		const state = new PendingRouteState();
+		assert.strictEqual(state.hasPendingRevocation(3), false);
 		state.revoke(3, 'g3');
+		assert.strictEqual(state.hasPendingRevocation(3), true);
+		const ev = {};
+		state.takeInto(ev);
+		assert.deepStrictEqual(ev.originFloorRevocations, [[3, 'g3']]);
+		assert.strictEqual(state.hasPendingRevocation(3), false);
 
-		// Simulate an event committing whose sequence update was skipped in persistIncomingSequence:
+		const base = { id: 1, closedFloor: T - 5, originGeneration: 'g1', fullCoverage: true };
+		assert.strictEqual(checkpointGradeRow(base), true);
+		assert.strictEqual(checkpointGradeRow({ ...base, hole: true }), false);
+		assert.strictEqual(checkpointGradeRow({ ...base, partialHistory: true }), false);
+		assert.strictEqual(checkpointGradeRow({ ...base, floorRevoked: true }), false);
+		assert.strictEqual(checkpointGradeRow({ ...base, fullCoverage: false }), false);
+	});
+
+	it('collectRelayableCertificates checks requestedStart against certifiedFrom and requires a numeric certifiedFrom', () => {
+		const rows = new Map([
+			[
+				1,
+				{
+					seqId: T,
+					nodes: [
+						{
+							id: 1,
+							closedFloor: T - 5,
+							relayable: true,
+							originGeneration: 'gen-1',
+							fullCoverage: true,
+							certifiedFrom: T - 100,
+						},
+					],
+				},
+			],
+		]);
+		// Without requestedStart, certifiedFrom > 0 withholds level-2 qualifiers.
+		assert.deepStrictEqual(collectRelayableCertificates(rows, ['peer'], nameToId, () => 2).get('peer'), {
+			floor: T - 5,
+		});
+		// With requestedStart >= certifiedFrom, the relay scan covers the gap so level-2 qualifiers are forwarded.
+		assert.deepStrictEqual(
+			collectRelayableCertificates(
+				rows,
+				['peer'],
+				nameToId,
+				() => 2,
+				() => T - 50
+			).get('peer'),
+			{ floor: T - 5, generation: 'gen-1', fullCoverage: true }
+		);
+		// With requestedStart < certifiedFrom, the relay holds a gap below certifiedFrom so only level-1 floor is forwarded.
+		assert.deepStrictEqual(
+			collectRelayableCertificates(
+				rows,
+				['peer'],
+				nameToId,
+				() => 2,
+				() => T - 200
+			).get('peer'),
+			{ floor: T - 5 }
+		);
+		// When certifiedFrom is unset (undefined), level-2 qualifiers are withheld until a copy or resume establishes certifiedFrom.
+		const uncertifiedHistoryRows = new Map([
+			[
+				1,
+				{
+					seqId: T,
+					nodes: [
+						{
+							id: 1,
+							closedFloor: T - 5,
+							relayable: true,
+							originGeneration: 'gen-1',
+							fullCoverage: true,
+						},
+					],
+				},
+			],
+		]);
+		assert.deepStrictEqual(
+			collectRelayableCertificates(
+				uncertifiedHistoryRows,
+				['peer'],
+				nameToId,
+				() => 2,
+				() => T - 50
+			).get('peer'),
+			{ floor: T - 5 }
+		);
+		// When certifiedFrom === 0 (held from genesis), level-2 qualifiers are forwarded even when requestedStart is undefined.
+		const fullHistoryRows = new Map([
+			[
+				1,
+				{
+					seqId: T,
+					nodes: [
+						{
+							id: 1,
+							closedFloor: T - 5,
+							relayable: true,
+							originGeneration: 'gen-1',
+							fullCoverage: true,
+							certifiedFrom: 0,
+						},
+					],
+				},
+			],
+		]);
+		assert.deepStrictEqual(
+			collectRelayableCertificates(
+				fullHistoryRows,
+				['peer'],
+				nameToId,
+				() => 2,
+				() => undefined
+			).get('peer'),
+			{ floor: T - 5, generation: 'gen-1', fullCoverage: true }
+		);
+	});
+
+	it('PendingOriginFloors restores taken floors on commit failure and detects generation changes across takes', () => {
+		const pending = new PendingOriginFloors();
+		pending.note([[1, T, true, 'gen-1', true]]);
 		const ev1 = {};
-		state.takeInto(ev1);
-		assert.deepStrictEqual(ev1.originRouteStates, [
-			[1, undefined, true, undefined, 'g1'],
-			[2, undefined, undefined, true, 'g2'],
-		]);
-		assert.deepStrictEqual(ev1.originFloorRevocations, [[3, 'g3']]);
+		pending.takeForCommit(ev1, false);
+		assert.deepStrictEqual(ev1.originFloors, [[1, T, true, 'gen-1', true]]);
+		assert.strictEqual(pending.size, 0);
 
-		// Because persistedNodes does not reflect partialHistory/hole/floorRevoked yet, entries stay pending:
+		// Simulate commit failure: floors are restored and merged with any newer notes.
+		pending.note([[2, T + 5, false, 'gen-2', false]]);
+		ev1.onFailure(new Error('fail'), T);
+		assert.strictEqual(pending.size, 2);
+
 		const ev2 = {};
-		state.attachTo(ev2);
-		assert.deepStrictEqual(ev2.originRouteStates, [
-			[1, undefined, true, undefined, 'g1'],
-			[2, undefined, undefined, true, 'g2'],
+		pending.takeForCommit(ev2, false);
+		assert.deepStrictEqual(ev2.originFloors, [
+			[1, T, true, 'gen-1', true],
+			[2, T + 5, false, 'gen-2', false],
 		]);
-		assert.deepStrictEqual(ev2.originFloorRevocations, [[3, 'g3']]);
 
-		// Once persisted in [seq, peer], reconcile drops the settled entries.
-		persistedNodes = [
-			{ id: 1, originGeneration: 'g1', partialHistory: true },
-			{ id: 2, originGeneration: 'g2', hole: true },
-			{ id: 3, originGeneration: 'g3', floorRevoked: true },
-		];
-		state.reconcile();
+		// Even after taking gen-1, a lower floor under gen-2 replaces a pending level-1 floor for origin 1.
+		pending.note([[1, T + 100, true]]);
+		pending.note([[1, T - 50, true, 'gen-2', true]]);
+		assert.deepStrictEqual(pending.take(false), [[1, T - 50, true, 'gen-2', true]]);
+
+		// A higher bare level-1 floor replacing a pending level-2 entry drops the level-2 qualifiers.
+		pending.note([[1, T, true, 'gen-2', true]]);
+		pending.note([[1, T + 10, false]]);
+		assert.deepStrictEqual(pending.take(false), [[1, T + 10, false]]);
+	});
+
+	it('PendingRouteState ignores certifiedFrom while partialHistory is pending, skips empty remoteNodeIds, and drops settled snapshots across queued events', async () => {
+		const state = new PendingRouteState();
+		state.partialHistory(1, true, 'g1');
+		assert.strictEqual(state.hasPendingPartialHistory(1), true);
+		state.certifiedFrom(1, T - 10, 'g1');
+		const emptyPeersEvent = { remoteNodeIds: [] };
+		state.attachTo(emptyPeersEvent);
+		assert.strictEqual(emptyPeersEvent.originRouteStates, undefined);
+		assert.strictEqual(state.size, 1);
+
+		const ev1 = { remoteNodeIds: [1] };
+		state.attachTo(ev1);
+		assert.deepStrictEqual(ev1.originRouteStates, [[1, undefined, true, undefined, 'g1']]);
+		assert.strictEqual(state.size, 1, 'marks remain pending until onCommit settles them');
+
+		// Simulate two subsequent events queued before ev1 commits: ev2 restores copy pass in onCommit via takeInto,
+		// and ev3 was attached with the stale partialHistory:true snapshot before ev1 or ev2 committed.
+		const ev2 = {
+			remoteNodeIds: [1],
+			onCommit: () => {
+				state.partialHistory(1, false, 'g1');
+				state.takeInto(ev2);
+			},
+		};
+		state.attachTo(ev2);
+		const ev3 = { remoteNodeIds: [1] };
+		state.attachTo(ev3);
+		assert.deepStrictEqual(ev3.originRouteStates, [[1, undefined, true, undefined, 'g1']]);
+
+		await ev1.onCommit();
 		assert.strictEqual(state.size, 0);
+		await ev2.onCommit();
+		assert.deepStrictEqual(ev2.originRouteStates, [[1, undefined, false, undefined, 'g1']]);
+		await ev3.onCommit();
+		assert.strictEqual(ev3.originRouteStates, undefined, 'ev3 drops stale partialHistory:true snapshot settled by ev1');
+	});
+
+	it('buildOriginCursorVector skips floor-only resume when cursorBelowFloor is at or below minFloorOnlyStart', () => {
+		const seqRows = new Map([
+			[
+				1,
+				{
+					nodes: [
+						{
+							id: 2,
+							originLogKey: T + 50,
+							closedFloor: T + 10,
+							originGeneration: 'g-relayed',
+							fullCoverage: true,
+						},
+					],
+				},
+			],
+		]);
+		const certified = [];
+		const cursors = buildOriginCursorVector(
+			seqRows,
+			1,
+			nameForId,
+			isMember,
+			true,
+			(id, start, gen) => certified.push([id, start, gen]),
+			new Map([[2, T + 10]])
+		);
+		assert.strictEqual(certified.length, 0, 'floor-only resume is suppressed when floor <= maxCopiedVersion');
+		assert.strictEqual(cursors.relayed, T + 50);
+	});
+
+	it('restoreCompletedCopyPass clears partialHistory without certifying copyStartTime', () => {
+		const routeState = new PendingRouteState();
+		const partialMarked = new Set([1, 2]);
+		routeState.partialHistory(1, true, 'g1');
+		routeState.partialHistory(2, true, 'g2');
+		const pass = {
+			passId: 3,
+			startTime: T,
+			resumed: false,
+			resumedWithWidening: false,
+			seqDurableAtCopyStart: true,
+			completeReceived: true,
+			restored: false,
+			originGenerations: new Map([
+				[1, 'g1'],
+				[2, 'g2'],
+			]),
+		};
+		assert.strictEqual(restoreCompletedCopyPass(pass, 3, partialMarked, routeState), true);
+		assert.strictEqual(pass.restored, true);
+		assert.strictEqual(partialMarked.size, 0);
+		const ev = { remoteNodeIds: [1] };
+		routeState.attachTo(ev);
+		assert.deepStrictEqual(ev.originRouteStates, [
+			[1, undefined, true, undefined, 'g1'],
+			[1, undefined, false, undefined, 'g1'],
+			[2, undefined, true, undefined, 'g2'],
+			[2, undefined, false, undefined, 'g2'],
+		]);
+	});
+
+	it('restoreCompletedCopyPass preserves pre-existing holes on origins whose partialHistory is cleared', () => {
+		const routeState = new PendingRouteState();
+		const partialMarked = new Set([1, 2]);
+		const pass = {
+			passId: 4,
+			startTime: T,
+			resumed: false,
+			resumedWithWidening: false,
+			seqDurableAtCopyStart: true,
+			completeReceived: true,
+			restored: false,
+			originGenerations: new Map([
+				[1, 'g1'],
+				[2, 'g2'],
+			]),
+			holedOrigins: new Set([1]),
+		};
+		assert.strictEqual(restoreCompletedCopyPass(pass, 4, partialMarked, routeState), true);
+		const ev = { remoteNodeIds: [1] };
+		routeState.attachTo(ev);
+		assert.deepStrictEqual(ev.originRouteStates, [
+			[1, undefined, false, true, 'g1'],
+			[2, undefined, false, undefined, 'g2'],
+		]);
+	});
+
+	it('database-wide copyBound suppresses floor-only resume and level-2 relay across peer routes and voids stale [seq, *] certifiedFrom in dbisDB', async () => {
+		const store = new Map();
+		const keyOf = (k) => JSON.stringify([k[0]?.description ?? String(k[0]), k[1]]);
+		const parseKey = (s) => {
+			const [symDesc, id] = JSON.parse(s);
+			return [Symbol.for(symDesc), id];
+		};
+		const sharedBuffers = new Map();
+		const rootStore = {
+			getUserSharedBuffer(name, defaultBuffer) {
+				if (!sharedBuffers.has(name)) sharedBuffers.set(name, defaultBuffer);
+				return sharedBuffers.get(name);
+			},
+		};
+		const dbisDB = {
+			rootStore,
+			getSync: (k) => store.get(keyOf(k)),
+			put: async (k, v) => {
+				store.set(keyOf(k), v);
+			},
+			getRange({ start }) {
+				const prefix = start?.description ?? String(start);
+				const out = [];
+				for (const [k, v] of store.entries()) {
+					const [sym, id] = parseKey(k);
+					if (sym.description === prefix) out.push({ key: [sym, id], value: v });
+				}
+				return out;
+			},
+		};
+		// Disconnected peer 2's persisted [seq, 2] row has certifiedFrom <= T + 800 for origin 2,
+		// and certifiedFrom > T + 500 for origin 1 (which should remain intact).
+		await dbisDB.put([Symbol.for('seq'), 2], {
+			seqId: T,
+			nodes: [
+				{
+					id: 2,
+					originLogKey: T + 1000,
+					closedFloor: T + 600,
+					relayable: true,
+					originGeneration: 'g2',
+					fullCoverage: true,
+					certifiedFrom: T + 100,
+				},
+				{
+					id: 1,
+					originLogKey: T + 1000,
+					closedFloor: T + 900,
+					relayable: true,
+					originGeneration: 'g1',
+					fullCoverage: true,
+					certifiedFrom: T + 700,
+				},
+			],
+		});
+		// Copy from peer 1 copied origin 2's rows up to T + 800 (keyed under peer 1).
+		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 800]]), 1, rootStore);
+		// Concurrent/later copy from peer 3 copied origin 1's rows up to T + 500 (keyed under peer 3);
+		// neither peer's copyBound entry overwrites the other.
+		await persistMergedCopyBounds(dbisDB, new Map([[1, T + 500]]), 3, rootStore);
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1]), { 2: T + 800 });
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3]), { 1: T + 500 });
+		const loaded = mergePersistedCopyBounds(new Map(), dbisDB);
+		assert.strictEqual(loaded.get(1), T + 500);
+		assert.strictEqual(loaded.get(2), T + 800);
+
+		// Persisting the bound voided origin 2's stale certifiedFrom in [seq, 2] on disk, while preserving origin 1's
+		// certifiedFrom (T + 700 > T + 500) and bumping the shared origin-state-epoch buffer.
+		const persistedPeer2Seq = dbisDB.getSync([Symbol.for('seq'), 2]);
+		assert.strictEqual(persistedPeer2Seq.nodes.find((n) => n.id === 2).certifiedFrom, undefined);
+		assert.strictEqual(persistedPeer2Seq.nodes.find((n) => n.id === 1).certifiedFrom, T + 700);
+		const epochWord = new Int32Array(sharedBuffers.get('origin-state-epoch'));
+		assert.strictEqual(Atomics.load(epochWord, 0), 1);
+
+		const seqRows = new Map([
+			[
+				1,
+				{
+					seqId: T,
+					nodes: [
+						{
+							id: 2,
+							originLogKey: T + 1000,
+							closedFloor: T + 600,
+							originGeneration: 'g2',
+							fullCoverage: true,
+							certifiedFrom: T + 100,
+						},
+					],
+				},
+			],
+			[2, persistedPeer2Seq],
+		]);
+		const certified = [];
+		const vector = buildOriginCursorVector(
+			seqRows,
+			1,
+			nameForId,
+			isMember,
+			true,
+			(id, start) => certified.push([id, start]),
+			loaded
+		);
+		assert.deepStrictEqual(vector, { relayed: T + 1000 });
+		assert.deepStrictEqual(certified, []);
+
+		const relayed = collectRelayableCertificates(
+			seqRows,
+			['relayed'],
+			nameToId,
+			() => 2,
+			() => T + 200,
+			loaded
+		);
+		assert.deepStrictEqual(relayed.get('relayed'), { floor: T + 600 });
 	});
 });
