@@ -201,7 +201,12 @@ describe('subscription replay progress', function () {
 	});
 	it('anchors a multi-origin copy on the physical source log rather than its last listed origin', async () => {
 		const database = 'subscriptionCopyAnchor';
-		const Records = table({ database, table: 'Records', audit: true, attributes: [{ name: 'id', isPrimaryKey: true }] });
+		const Records = table({
+			database,
+			table: 'Records',
+			audit: true,
+			attributes: [{ name: 'id', isPrimaryKey: true }],
+		});
 		await Records.put('anchor', { id: 'anchor' });
 		setReplicator(database, Records, {});
 		await until(() => databaseSubscriptions.get(database)?.auditStore, 'anchor database subscription');
