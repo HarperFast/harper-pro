@@ -325,6 +325,7 @@ export function missingShardingOriginStart(database: string): boolean {
 }
 
 export async function hasPriorShardingOrigin(database: string, layout: string, origin: string): Promise<boolean> {
+	const conversions = shardingConvertedTables(database);
 	for (const { root, catalog, auditStore } of shardingNativeRoots(database)) {
 		if (
 			isValidFloor(readShardingHistory(catalog, layout)?.floors?.[origin]) ||
@@ -333,10 +334,11 @@ export async function hasPriorShardingOrigin(database: string, layout: string, o
 			return true;
 		const id = exportIdMapping(auditStore)[origin];
 		if (id === undefined) continue;
-		const tables = new Set(
+		const converted = new Set(conversions.find((entry) => entry.catalog === catalog)?.tables.map(({ name }) => name));
+		const tables = new Map(
 			Object.values(databases[database] ?? {})
 				.filter((Table) => Table.residency && Table.auditStore === auditStore)
-				.map((Table) => Table.tableId)
+				.map((Table) => [Table.tableId, !converted.has(Table.tableName)])
 		);
 		const entries = auditStore.getRange({ log: id, start: 1 });
 		let count = 0;
@@ -345,7 +347,7 @@ export async function hasPriorShardingOrigin(database: string, layout: string, o
 			if (
 				tables.has(entry.tableId) &&
 				isResidencyRecord(entry.type) &&
-				(entry.residencySlot !== undefined || entry.previousResidencySlot !== undefined)
+				(tables.get(entry.tableId) || entry.residencySlot !== undefined || entry.previousResidencySlot !== undefined)
 			)
 				return true;
 			if (++count % 256 === 0) {

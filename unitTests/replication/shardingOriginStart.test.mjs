@@ -1,6 +1,7 @@
 import assert from 'node:assert';
 import sinon from 'sinon';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
+import { shardingConvertedTables } from '#src/core/resources/shardingCompleteness';
 import { table } from '#src/core/resources/databases';
 import { initializeResidencySlots } from '#src/core/resources/residencyMaps';
 import { raiseAuditFloor, getAuditFloor } from '#src/core/resources/auditStore';
@@ -17,7 +18,7 @@ import {
 
 describe('Sharding origin start authority', () => {
 	const database = 'shardingOriginStart';
-	let Rows, priorShard, floor, agreement;
+	let Rows, Converted, priorShard, floor, agreement;
 	before(async () => {
 		priorShard = env.get('replication_shard');
 		env.setProperty('replication_shard', 0);
@@ -29,6 +30,14 @@ describe('Sharding origin start authority', () => {
 			residency: { slots: 2 },
 			attributes: [{ name: 'id', isPrimaryKey: true }],
 		});
+		const definition = {
+			database,
+			table: 'Converted',
+			audit: true,
+			attributes: [{ name: 'id', isPrimaryKey: true }],
+		};
+		table(definition);
+		Converted = table({ ...definition, residency: { slots: 2 } });
 		floor = Math.max(Date.now(), getAuditFloor(Rows.auditStore)) + 1;
 		agreement = shardingSourceAgreement(database);
 		inheritShardingHistory(Rows.dbisDB, shardingLayout(database), {
@@ -44,19 +53,29 @@ describe('Sharding origin start authority', () => {
 		assert.equal(await hasPriorShardingOrigin(database, shardingLayout(database), 'founder'), true);
 		assert.equal(await hasPriorShardingOrigin(database, shardingLayout(database), 'unadmitted'), false);
 	});
-	it('recognizes retained slot mutations but not preconversion records or metadata alone', async () => {
+	it('recognizes key and attribute mutations without mistaking preconversion records for sharded history', async () => {
+		assert.deepEqual(
+			shardingConvertedTables(database).flatMap(({ tables }) => tables.map(({ name }) => name)),
+			['Converted']
+		);
 		const origin = 'retained-origin';
 		getIdOfRemoteNode(origin, Rows.auditStore);
 		const scan = sinon.stub(Rows.auditStore, 'getRange');
 		try {
 			for (const [entry, expected] of [
-				[{ type: 'put', tableId: Rows.tableId }, false],
+				[{ type: 'put', tableId: Rows.tableId }, true],
+				[{ type: 'put', tableId: Converted.tableId }, false],
+				[{ type: 'put', tableId: Converted.tableId, residencySlot: 0 }, true],
 				[{ type: 'put', tableId: Rows.tableId, residencySlot: 0 }, true],
 				[{ type: 'delete', tableId: Rows.tableId, previousResidencySlot: 0 }, true],
 				[{ type: 'put', tableId: Rows.tableId + 100, residencySlot: 0 }, false],
 			]) {
 				scan.returns([entry]);
-				assert.equal(await hasPriorShardingOrigin(database, shardingLayout(database), origin), expected);
+				assert.equal(
+					await hasPriorShardingOrigin(database, shardingLayout(database), origin),
+					expected,
+					JSON.stringify(entry)
+				);
 			}
 		} finally {
 			scan.restore();
