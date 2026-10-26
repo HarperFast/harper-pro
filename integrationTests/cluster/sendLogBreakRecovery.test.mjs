@@ -64,6 +64,9 @@ function nodeConfig(hostname, env) {
 	return {
 		config: {
 			analytics: { aggregatePeriod: -1 },
+			// One worker: the injection arms once per worker thread, and a redial onto a second worker would
+			// be served another stopped range.
+			threads: { count: 1 },
 			logging: { colors: false, console: true, level: 'debug' },
 			replication: {
 				securePort: hostname + ':9933',

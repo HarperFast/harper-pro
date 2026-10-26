@@ -1594,8 +1594,9 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
 }
 
-// Test-only: the first outbound subscription for this database scans a drained audit iterable carrying a
-// corrupt-frame stop, which is what core's `endIteratorOnCorruptFrame` leaves on a reusable range.
+// Test-only, once per worker thread: the first outbound subscription for this database scans a drained
+// audit iterable carrying a corrupt-frame stop, which is what core's `endIteratorOnCorruptFrame` leaves on
+// a reusable range.
 // `HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB=<db>` reports a torn tail; `<db>:midlog` a mid-log break.
 const DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST = process.env.HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB;
 let deadAuditIterableForTestArmed = false;
