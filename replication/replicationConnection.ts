@@ -6716,6 +6716,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (subscription.copyResume) copyResume = subscription.copyResume;
 						}
 
+						const sendSubscription = auditSubscription;
 						// A promise that never settles here would leave this WS ping-alive forever with the
 						// receiver seeing no application frames and no cursor progress (harper-pro#642). Bound
 						// each gate separately so the log identifies which one stuck, then close transiently so
@@ -7470,6 +7471,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// that may never come on an otherwise-idle database.
 											continue;
 										}
+										if (frame.position - frame.encodingStart > 8) {
+											sendAuditRecord(
+												{
+													type: 'end_txn',
+												},
+												currentSequenceId
+											);
+										}
 										// Core latches a log's iterator done at a corrupt frame, and a reusable range is kept for the
 										// session, so that log sends nothing more on this connection. Recover by reconnecting: the
 										// peer's durable and per-origin cursors position the next range, which a sender-side reseed
@@ -7478,6 +7487,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										if (range?.corruptFrameStop?.breaks > 0 && auditStore.reusableIterable) {
 											if (range.corruptFrameStop.midLogBreak) {
 												// Core's fail-stop: no fresh range can cross a mid-log break, so reconnecting would only churn.
+												sendLogRecoveryPending = false;
 												if (reportedMidLogBreakRange !== range) {
 													reportedMidLogBreakRange = range;
 													logger.error?.(
@@ -7521,14 +7531,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												).unref();
 											}
 										} else if (sendLogRecoveryPending) sendLogRecoveryPending = false;
-										if (frame.position - frame.encodingStart > 8) {
-											sendAuditRecord(
-												{
-													type: 'end_txn',
-												},
-												currentSequenceId
-											);
-										}
 										if (capturedFloors) {
 											const liveRange: any = auditLogIterable;
 											// exactStartFailures alone is not a scan-integrity signal on an ordinary range: core
@@ -7595,12 +7597,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							})
 							.catch((error) => {
 								logger.error?.(connectionId, 'Error handling subscription to node', error);
+								// A replaced subscription's failure must not set the veto its replacement inherits.
+								if (auditSubscription === sendSubscription && !supersededOrClosed())
+									options.connection?.onSendFailed?.();
 								// An authorization-watch rejection before it resolves reaches this chain too (the setup
 								// gate awaits the same promise), and that chain has already closed with a more accurate
-								// code — so a second close here would only overwrite the reason. A superseded
-								// subscription's failure must not set the send-failure veto its replacement inherits.
+								// code — so a second close here would only overwrite the reason.
 								if (closed || wsClosed) return;
-								if (!supersededOrClosed()) options.connection?.onSendFailed?.();
 								closed = true;
 								close(1008, 'Error handling subscription to node ' + error);
 							});
