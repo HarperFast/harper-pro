@@ -281,7 +281,7 @@ suite(`Static sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 60
 		assert.equal((await get(nodes()[3], `Sharded/${id}`)).body, id);
 	});
 
-	test('limit queries load complete rows from pooled stubs without changing placement (#980)', async () => {
+	test('limit queries load complete rows from pooled stubs without changing placement (#198, #980)', async () => {
 		const ids = [0, 1, 2, 3, 4].map((i) => `0:limit-${i}`);
 		for (const id of ids) await put(nodes()[0], id, 'limit');
 		await waitForRows(nodes()[1], ids);
@@ -310,18 +310,20 @@ suite(`Static sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 60
 			}
 		}
 		for (const node of nonowners) assert.deepEqual(await get(node, query, { local: true }), []);
+		if (POOL)
+			for (const id of ids) assert.deepStrictEqual(await get(nonowners[0], `SettledReads/${id}`), { settled: 0 });
 		const remote = await get(nonowners[0], query);
 		if (POOL) {
 			assert.equal(remote.length, 3);
 			assert.equal(new Set(remote.map((row) => row.id)).size, 3);
 			for (const row of remote) {
 				assert.ok(ids.includes(row.id));
-				assert.deepEqual(row, recordFor(row.id, 'limit'));
+				assert.deepStrictEqual(row, recordFor(row.id, 'limit'));
 			}
 			await waitForCondition(
 				async (signal) =>
 					(await Promise.all(remote.map((row) => get(nonowners[0], `SettledReads/${row.id}`, { signal })))).every(
-						(count) => count > 0
+						({ settled }) => settled > 0
 					),
 				{ description: 'replica storage attempts for the returned rows to finish' }
 			);

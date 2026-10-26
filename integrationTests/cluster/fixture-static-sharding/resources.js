@@ -3,6 +3,7 @@ for (const table of [tables.Sharded, tables.OtherSharded])
 tables.Placed.setResidency((record) => record.homes);
 
 // GET_RECORD resolves before replica storage; the probe must wait across HTTP workers for that storage attempt.
+// Retrieval storage runs on these fixture-loaded HTTP workers, not the replication pool workers.
 const settledFor = (id) =>
 	new Int32Array(tables.Sharded.auditStore.getUserSharedBuffer(`shard-read-settled:${id}`, new ArrayBuffer(4)));
 const storeReplica = tables.Sharded._storeReplica;
@@ -15,18 +16,19 @@ tables.Sharded._storeReplica = async function (existingEntry, entry) {
 };
 
 export class SettledReads extends Resource {
+	static loadAsInstance = false;
+
 	get(target) {
-		return Atomics.load(settledFor(target.id), 0);
+		return { settled: Atomics.load(settledFor(target.id), 0) };
 	}
 }
 
 export class LocalRows extends Resource {
 	get(target) {
 		const table = tables[target.get('table')];
-		return Array.from(table.primaryStore.getRange({ start: true }), ({ key }) => {
-			const entry = table.primaryStore.getEntry(key);
+		return Array.from(table.primaryStore.getRange({ start: true, versions: true }), (entry) => {
 			return {
-				id: key,
+				id: entry.key,
 				record: entry.value,
 				metadataFlags: entry.metadataFlags,
 				invalidated: Boolean(entry.metadataFlags & 1),
