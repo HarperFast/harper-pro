@@ -33,7 +33,18 @@ export function inheritShardingHistory(catalog: any, layout: string, state: Shar
 			if (previous?.phase === 'witnessed' && previous.run !== state.run)
 				throw new Error('Conflicting witnessed sharding history requires recovery');
 			const { scope: _scope, localFloor: _localFloor, localOrigin: _localOrigin, ...inherited } = state;
-			transaction.putSync([historyKey, layout], inherited);
+			if (previous?.phase === 'witnessed') {
+				if (
+					previous.agreement !== state.agreement ||
+					previous.initializer !== state.initializer ||
+					Object.keys(previous.floors ?? {}).length !== Object.keys(state.floors).length ||
+					Object.keys(state.floors).some((origin) => previous.floors?.[origin] !== state.floors[origin])
+				)
+					throw new Error('Conflicting witnessed sharding history requires recovery');
+				// A peer can activate between our inspection and activation RPC. Keep this root's
+				// durable start and scope; the peer's local fields never certify this root.
+				transaction.putSync([historyKey, layout], { ...previous, phase: 'active' });
+			} else transaction.putSync([historyKey, layout], inherited);
 			return true;
 		},
 		{ retryOnBusy: true }

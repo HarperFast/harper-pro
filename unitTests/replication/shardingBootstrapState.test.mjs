@@ -107,10 +107,14 @@ describe('Durable sharding startup evidence', () => {
 			phase: 'active',
 			floors: { a: 100 },
 			scope: 'source-root',
+			localFloor: 100,
+			localOrigin: 'a',
 		};
 		inheritShardingHistory(catalog, 'late-root', active);
 		assert.equal(readShardingHistory(catalog, 'late-root').phase, 'active');
 		assert.equal(readShardingHistory(catalog, 'late-root').scope, undefined);
+		assert.equal(readShardingHistory(catalog, 'late-root').localFloor, undefined);
+		assert.equal(readShardingHistory(catalog, 'late-root').localOrigin, undefined);
 		assert.equal(readShardingBaseline(catalog, 'late-root'), undefined);
 		assert.throws(
 			() => advanceShardingHistory(catalog, 'late-root', { ...active, phase: 'witnessed' }, true),
@@ -121,6 +125,36 @@ describe('Durable sharding startup evidence', () => {
 				advanceShardingHistory(catalog, 'late-root', { ...active, run: 'new-run', phase: 'began' }, false, 'old-run'),
 			/run changed/
 		);
+	});
+	it('keeps its own durable witness when another member activates the same run first', () => {
+		const local = {
+			initializer: 'a',
+			run: 'activation-race',
+			agreement: 'same-members',
+			phase: 'began',
+			localFloor: 101,
+			localOrigin: 'b',
+			scope: 'local-root',
+		};
+		advanceShardingHistory(catalog, 'activation-race', local);
+		const witnessed = { ...local, phase: 'witnessed', floors: { a: 100, b: 101 } };
+		advanceShardingHistory(catalog, 'activation-race', witnessed, true);
+		const peer = { ...witnessed, phase: 'active', localFloor: 100, localOrigin: 'a', scope: 'peer-root' };
+		for (const changed of [
+			{ run: 'another-run' },
+			{ agreement: 'another-membership' },
+			{ initializer: 'b' },
+			{ floors: { a: 100, b: 102 } },
+		]) {
+			assert.throws(
+				() => inheritShardingHistory(catalog, 'activation-race', { ...peer, ...changed }),
+				/Conflicting witnessed/
+			);
+			assert.deepEqual({ ...readShardingHistory(catalog, 'activation-race') }, witnessed);
+		}
+		inheritShardingHistory(catalog, 'activation-race', peer);
+		assert.deepEqual({ ...readShardingHistory(catalog, 'activation-race') }, { ...witnessed, phase: 'active' });
+		assert.deepEqual({ ...readShardingBaseline(catalog, 'activation-race') }, witnessed);
 	});
 
 	it('aborts the witness and baseline together if either write fails', () => {
