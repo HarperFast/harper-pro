@@ -1619,13 +1619,13 @@ export function maybeDeadAuditIterableForTest<T>(databaseName: string | undefine
 // busy healthy logs would reconnect on every commit.
 export const SEND_LOG_BREAK_RECONNECT_INTERVAL_MS = 5 * 60_000;
 // Spread on a deferred reconnect, so peers whose floors started together do not reconnect together.
-export const SEND_LOG_BREAK_RECONNECT_JITTER_MS = 30_000;
+const SEND_LOG_BREAK_RECONNECT_JITTER_MS = 30_000;
 export function sendLogBreakReconnectDelayMs(
 	lastAt: number,
 	now: number,
 	intervalMs: number = SEND_LOG_BREAK_RECONNECT_INTERVAL_MS
 ): number {
-	return lastAt > 0 ? Math.max(0, intervalMs - (now - lastAt)) : 0;
+	return lastAt > 0 ? Math.min(intervalMs, Math.max(0, intervalMs - (now - lastAt))) : 0;
 }
 
 // Test-only fault injection for the copy-progress false-fire repro: when HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB
@@ -7517,8 +7517,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														connectionId,
 														`Replication send to ${remoteNodeName} (db: "${databaseName}") stopped at a torn transaction-log frame; reconnecting so the peer resumes from its cursor — ${fireDetail}`
 													);
-													if (options.connection) options.connection.forceReconnect();
-													else close(1011, 'send range stopped at a torn transaction-log frame; reconnecting');
+													// A graceful close, not forceReconnect's terminate: the socket is healthy, and the
+													// transaction flushed above must reach the peer. The close handler's retry reconnects.
+													close(1011, 'send range stopped at a torn transaction-log frame; reconnecting');
 													return;
 												}
 												sendLogRecoveryPending = true;

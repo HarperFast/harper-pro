@@ -21,6 +21,10 @@ describe('sendLogBreakReconnectDelayMs', () => {
 		expect(sendLogBreakReconnectDelayMs(NOW, NOW + 60_000)).to.equal(SEND_LOG_BREAK_RECONNECT_INTERVAL_MS - 60_000);
 	});
 
+	it('never waits longer than the floor when the clock steps backward', () => {
+		expect(sendLogBreakReconnectDelayMs(NOW, NOW - 60_000)).to.equal(SEND_LOG_BREAK_RECONNECT_INTERVAL_MS);
+	});
+
 	it('allows a repeat once the floor has passed', () => {
 		expect(sendLogBreakReconnectDelayMs(NOW, NOW + SEND_LOG_BREAK_RECONNECT_INTERVAL_MS)).to.equal(0);
 		expect(sendLogBreakReconnectDelayMs(NOW, NOW + 2 * SEND_LOG_BREAK_RECONNECT_INTERVAL_MS)).to.equal(0);
