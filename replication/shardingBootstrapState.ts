@@ -131,7 +131,5 @@ export function frozenShardingOriginFloor(
 	state: ShardingBootstrapState | undefined,
 	origin: string
 ): number | undefined {
-	return state && (state.localOrigin === undefined || state.localOrigin === origin) && isValidFloor(state.localFloor)
-		? state.localFloor
-		: undefined;
+	return state && state.localOrigin === origin && isValidFloor(state.localFloor) ? state.localFloor : undefined;
 }

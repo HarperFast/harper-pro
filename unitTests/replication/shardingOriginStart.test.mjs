@@ -151,5 +151,6 @@ describe('Reused sharding origin admission evidence', () => {
 		const state = { phase: 'active', run: 'r', initializer: 'a', agreement: 'm', localFloor: 100, localOrigin: 'a' };
 		assert.equal(frozenShardingOriginFloor(state, 'a'), 100);
 		assert.equal(frozenShardingOriginFloor(state, 'b'), undefined);
+		assert.equal(frozenShardingOriginFloor({ ...state, localOrigin: undefined }, 'a'), undefined);
 	});
 });

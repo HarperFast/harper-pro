@@ -377,7 +377,9 @@ async function checkNewShardingOrigin(current: View): Promise<number | undefined
 			(await hasPriorShardingOrigin(current.database, current.layout, name)) ||
 			roots.some(({ catalog }) => {
 				const history = readShardingHistory(catalog, current.layout);
-				return history?.localOrigin !== undefined && history.localOrigin !== name;
+				return (
+					(history?.localFloor !== undefined || history?.localOrigin !== undefined) && history.localOrigin !== name
+				);
 			})
 		)
 			throw new ShardingOriginHistoryLostError(name);
