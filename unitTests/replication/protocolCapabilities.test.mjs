@@ -11,6 +11,7 @@ import {
 	RESIDENCY_STUB_COPY_CAPABILITY,
 	RESIDENCY_NOT_RESIDENT_CAPABILITY,
 	RESIDENCY_SLOTS_CAPABILITY,
+	SHARDING_RECOVERY_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
@@ -21,6 +22,7 @@ import {
 	peerSupportsRecordLocks,
 	peerSupportsResidencyStubCopy,
 	peerSupportsResidencySlots,
+	peerSupportsShardingRecovery,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -45,6 +47,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				residencyStubCopy: 0,
 				residencyNotResident: 0,
 				residencySlots: 0,
+				shardingRecovery: 0,
 			}
 		);
 	});
@@ -72,6 +75,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 			'residencySlots',
 			'residencyStubCopy',
 			'safeCopyAudit',
+			'shardingRecovery',
 			'subscriptionSetupAck',
 			'subscriptionSetupBudgetMs',
 			'tableLifecycle',
@@ -251,6 +255,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
+				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -295,6 +300,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
+				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
 			}
 		);
 	});
@@ -523,5 +529,19 @@ describe('residencySlots capability', () => {
 			samePeerCapabilities(resolvePeerCapabilities({ residencySlots: 1 }), resolvePeerCapabilities({})),
 			false
 		);
+	});
+});
+
+describe('Sharding recovery capability', () => {
+	it('requires the minimum level and republishes a recovery-only change', () => {
+		assert.equal(peerSupportsShardingRecovery(resolvePeerCapabilities({})), false);
+		assert.equal(peerSupportsShardingRecovery(resolvePeerCapabilities({ shardingRecovery: 1 })), true);
+		assert.equal(peerSupportsShardingRecovery(resolvePeerCapabilities({ shardingRecovery: 2 })), true);
+		assert.equal(
+			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ shardingRecovery: 1 })),
+			false
+		);
+		assert.equal(buildLocalCapabilities(1000, false, true).shardingRecovery, 1);
+		assert.equal(buildLocalCapabilities(1000, false, false).shardingRecovery, 0);
 	});
 });

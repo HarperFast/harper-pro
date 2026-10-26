@@ -13,14 +13,22 @@ import { replicateOverWS, NodeReplicationConnection } from '#src/replication/rep
 import { server } from '#src/core/server/Server';
 import { getReplicationSharedStatus, getHDBNodeTable } from '#src/replication/knownNodes';
 import { databases, table } from '#src/core/resources/databases';
+import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
 import { transaction } from '#src/core/resources/transaction';
 import {
 	CONNECTION_STATE_POSITION,
 	CONNECTION_STATE_CONNECTED,
 	LAST_LIVENESS_TIME_POSITION,
 } from '#src/replication/sharedStatusSlots';
-import { residencyTopologyErrors, recordResidencyMapAgreement } from '#src/replication/residencyTopology';
-import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
+import {
+	residencyTopologyErrors,
+	recordResidencyMapAgreement,
+	recordResidencyConfiguration,
+	recordResidencyPolicyAgreement,
+	recordShardingRecoveryCapability,
+	residencyConfigurationDigest,
+} from '#src/replication/residencyTopology';
+import { buildLocalCapabilities, resolvePeerCapabilities } from '#src/replication/protocolCapabilities';
 
 class Socket extends EventEmitter {
 	readyState = 1;
@@ -83,6 +91,66 @@ describe('sharding setup authority', function () {
 	before(() => setHdbBasePath(process.env.STORAGE_PATH));
 	afterEach(() => {
 		while (sockets.length) sockets.pop().close(1000);
+	});
+
+	it('keeps the recovery hold independent of map/config agreement and requires bound identity to change it', () => {
+		const previousNodes = server.nodes;
+		const peer = 'recovery-capability-peer';
+		try {
+			server.nodes = [{ name: peer }];
+			const current = resolvePeerCapabilities({ shardingRecovery: 1 });
+			const old = resolvePeerCapabilities({});
+			recordShardingRecoveryCapability(peer, current, true);
+			const warm = residencyTopologyErrors('data');
+			recordShardingRecoveryCapability(peer, old, false);
+			assert.equal(residencyTopologyErrors('data'), warm);
+			recordShardingRecoveryCapability(peer, old, true);
+			assert.ok(residencyTopologyErrors('data').some((error) => error.includes('recovery admission')));
+			assert.deepEqual(
+				residencyTopologyErrors('data', false),
+				[],
+				'recovery capability holds sharded origination without fencing legacy tables'
+			);
+			recordResidencyConfiguration(peer, residencyConfigurationDigest());
+			recordResidencyMapAgreement('data', peer);
+			recordResidencyPolicyAgreement('data', peer);
+			recordShardingRecoveryCapability(peer, current, false);
+			assert.ok(residencyTopologyErrors('data').some((error) => error.includes('recovery admission')));
+			assert.equal(getHDBNodeTable().dbisDB.getSync([Symbol.for('sharding-peer-recovery'), peer]), false);
+			server.nodes = [];
+			assert.deepEqual(residencyTopologyErrors('data'), []);
+			server.nodes = [{ name: peer }];
+			assert.ok(residencyTopologyErrors('data').some((error) => error.includes('recovery admission')));
+			recordShardingRecoveryCapability(peer, current, true);
+			assert.deepEqual(residencyTopologyErrors('data'), []);
+			assert.equal(getHDBNodeTable().dbisDB.getSync([Symbol.for('sharding-peer-recovery'), peer]), true);
+		} finally {
+			server.nodes = previousNodes;
+		}
+	});
+	it('heals a peer disagreement after local repair without another peer handshake', () => {
+		const nodes = server.nodes;
+		const shards = get('replication_shards');
+		const shard = get('replication_shard');
+		try {
+			server.nodes = [{ name: 'repair-peer' }];
+			setProperty('replication_shard', 0);
+			setProperty('replication_shards', [0, 1]);
+			const digest = residencyConfigurationDigest();
+			recordResidencyConfiguration('repair-peer', digest);
+			assert.deepEqual(residencyTopologyErrors(), []);
+			setProperty('replication_shards', [0, 2]);
+			assert.equal(residencyTopologyErrors().length, 1);
+			recordResidencyConfiguration('repair-peer', digest);
+			setProperty('replication_shards', [0, 1]);
+			assert.deepEqual(residencyTopologyErrors(), []);
+			const cached = residencyTopologyErrors();
+			assert.equal(residencyTopologyErrors(), cached, 'healthy verdict reuses the cached result');
+		} finally {
+			server.nodes = nodes;
+			setProperty('replication_shards', shards);
+			setProperty('replication_shard', shard);
+		}
 	});
 	for (const [name, authorization, options] of [
 		['credential', { username: 'reader', role: { permission: {} } }, {}],
@@ -675,7 +743,7 @@ describe('sharding setup authority', function () {
 			server.nodes = [{ name: peer }];
 			server.shards = new Map([[1, [{ name: peer }]]]);
 			assert.deepEqual(Records.getRecordResidency({ key: 'remote' }), [peer]);
-			const context = {};
+			const context = { sourceApply: true, [REPLICATION_APPLY]: true };
 			await transaction(context, async () => {
 				const row = await Records.getResource('remote', context, { ensureLoaded: false });
 				row._writeUpdate('remote', { id: 'remote', tag: 'indexed', body: 'canonical' }, true, {

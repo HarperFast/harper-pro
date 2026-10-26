@@ -49,7 +49,7 @@ describe('createConfirmationWaiter', () => {
 		const prior = get('replication_confirmationTimeout');
 		const awaiting = new Set();
 		try {
-			for (const setting of [15, '25']) {
+			for (const setting of [15, '60000']) {
 				setProperty('replication_confirmationTimeout', setting);
 				const waiting = createConfirmationWaiter(awaiting, 'configured-timeout', 100, 1);
 				const outcome = await Promise.race([
@@ -60,8 +60,13 @@ describe('createConfirmationWaiter', () => {
 					new Promise((resolve) => setTimeout(() => resolve('still waiting'), 200)),
 				]);
 				notifyConfirmedWaiters(awaiting, 'cleanup', 0, 101);
-				expect(outcome).to.be.instanceOf(Error);
-				expect(outcome.message).to.match(/confirm replication|confirmation/i);
+				if (setting === 15) {
+					expect(outcome).to.be.instanceOf(Error);
+					expect(outcome.message).to.match(/confirm replication|confirmation/i);
+				} else {
+					expect(outcome).to.equal('still waiting');
+					await waiting;
+				}
 			}
 		} finally {
 			notifyConfirmedWaiters(awaiting, 'cleanup', 0, 101);

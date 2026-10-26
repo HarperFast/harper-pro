@@ -8,6 +8,7 @@ import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
 import { DatabaseTransaction } from '#src/core/resources/DatabaseTransaction';
 import { transaction } from '#src/core/resources/transaction';
+import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { INVALIDATED } from '#src/core/resources/Table';
 import { table } from '#src/core/resources/databases';
@@ -172,6 +173,191 @@ describe('Declarative tables keep control and event traffic independent of place
 		assert.deepEqual(socket.closes, []);
 		return { Records, socket, database };
 	}
+	for (const destinationOwner of [true, false])
+		it(`relays foreign projections only to non-owners (destinationOwner=${destinationOwner})`, async () => {
+			const priorNodes = server.nodes;
+			server.nodes = [{ name: 'slot-control-peer', replicates: true }];
+			try {
+				const { Records, socket } = await connect(
+					false,
+					`foreign_projection_${destinationOwner}`,
+					false,
+					buildLocalCapabilities(90_000, true, true),
+					undefined,
+					undefined,
+					[{ start: 0, end: 2, shard: destinationOwner ? 1 : 0 }]
+				);
+				const origin = 'foreign-projection-origin';
+				const nodeId = getIdOfRemoteNode(origin, Records.auditStore);
+				socket.emit(
+					'message',
+					encode([129, [{ name: origin, startTime: 0, tables: [], replicateByDefault: true }], []])
+				);
+				await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				socket.sent.length = 0;
+				const version = Date.now() + 100;
+				const context = { source: {}, sourceApply: true, timestamp: version };
+				await transaction(context, async () => {
+					const row = await Records.getResource('relay', context);
+					return row._writeInvalidate('relay', { id: 'relay', region: 1 }, { nodeId, version });
+				});
+				const invalidation = Array.from(Records.auditStore.getRange({ start: 1 })).find(
+					(entry) => entry.tableId === Records.tableId && entry.recordId === 'relay'
+				);
+				assert.equal(invalidation.type, 'invalidate');
+				assert.equal(invalidation.nodeId, nodeId);
+				await until(() => socket.closes.length || entries(socket).some((entry) => entry.recordId === 'relay'));
+				if (destinationOwner) {
+					assert.ok(socket.closes.length, 'a projection cannot certify a canonical body to an owner');
+					assert.equal(
+						entries(socket).some((entry) => entry.recordId === 'relay'),
+						false
+					);
+					assert.equal(
+						socket.sent.some((frame) => Buffer.isBuffer(frame)),
+						false,
+						'no progress frame passes the refused record'
+					);
+				} else {
+					assert.deepEqual(socket.closes, []);
+					assert.equal(entries(socket).find((entry) => entry.recordId === 'relay').type, 'invalidate');
+				}
+			} finally {
+				server.nodes = priorNodes;
+			}
+		});
+	for (const owned of [true, false]) {
+		for (const kind of [
+			'foreign-origin',
+			'foreign-after-prefix',
+			'direct-projection',
+			'projection-after-prefix',
+			'copy',
+			'foreign-floor',
+		])
+			it(`enforces the complete-source boundary before cursor mutation (${kind}, owned=${owned})`, async () => {
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: 'slot-control-peer', replicateByDefault: true }];
+				const { Records, socket } = await connect(
+					false,
+					`inbound_${kind}_${owned}`,
+					false,
+					undefined,
+					undefined,
+					connection,
+					[{ start: 0, end: 2, shard: owned ? 0 : 1 }]
+				);
+				const peerId = getIdOfRemoteNode('slot-control-peer', Records.auditStore);
+				getIdOfRemoteNode('foreign-source', Records.auditStore);
+				const seqKey = [Symbol.for('seq'), peerId];
+				const copyKey = [Symbol.for('copyCursor'), peerId];
+				const beforeSeq = Records.dbisDB.getSync(seqKey);
+				const beforeCopy = Records.dbisDB.getSync(copyKey);
+				const version = Date.now() + 100;
+				let incoming = recordFrame(Records, 'invalidate', 'incoming', { id: 'incoming', region: 0 }, version, 42, {
+					nodeId: kind.startsWith('foreign-') ? 1 : 0,
+				});
+				if (kind.endsWith('after-prefix')) {
+					const prefix = recordFrame(
+						Records,
+						'put',
+						'prefix',
+						{ id: 'prefix', region: 0, body: 'complete' },
+						version,
+						undefined
+					);
+					incoming = Buffer.concat([prefix.subarray(0, -10), incoming.subarray(8)]);
+				}
+				socket.emit(
+					'message',
+					encode([141, { 'slot-control-peer': 0, 'foreign-source': 1 }, ['slot-control-peer', 'foreign-source']])
+				);
+				const encoder = Records.primaryStore.encoder;
+				socket.emit(
+					'message',
+					encode([
+						132,
+						{
+							structures: encoder.structures,
+							typedStructs: encoder.typedStructs,
+							attributes: Records.attributes,
+							residency: Records.residency,
+							schemaDefined: true,
+						},
+						Records.tableId,
+						Records.tableName,
+					])
+				);
+				socket.emit('message', encode([130, [server.hostname], 42]));
+				if (kind === 'copy') socket.emit('message', encode([148, version - 1000, 1]));
+				if (kind === 'foreign-floor') socket.emit('message', encode([143, version, { 'foreign-source': version - 1 }]));
+				else socket.emit('message', incoming);
+				if (kind === 'copy') socket.emit('message', encode([149]));
+				socket.emit('message', encode([143, version + 1]));
+				await until(() => socket.closes.length || Records.dbisDB.getSync(seqKey)?.seqId >= version);
+				if (owned) {
+					assert.ok(socket.closes.length, 'the owner refuses the stream');
+					assert.deepEqual(Records.dbisDB.getSync(seqKey), beforeSeq, 'durable origin and floor cursors do not move');
+					assert.deepEqual(Records.dbisDB.getSync(copyKey), beforeCopy, 'copy cursor does not move');
+					assert.equal(Records.primaryStore.getEntry('incoming'), undefined);
+				} else {
+					assert.deepEqual(socket.closes, []);
+					if (kind !== 'foreign-floor')
+						assert.ok(Records.primaryStore.getEntry('incoming').metadataFlags & INVALIDATED);
+				}
+			});
+	}
+	it('flushes newer copy projections without appending their snapshot identity to the origin log', async () => {
+		const connection = new EventEmitter();
+		connection.nodeSubscriptions = [{ name: 'slot-control-peer', replicateByDefault: true }];
+		const { Records, socket } = await connect(false, 'newer_copy_projection', false, undefined, undefined, connection, [
+			{ start: 0, end: 2, shard: 1 },
+		]);
+		const peerId = getIdOfRemoteNode('slot-control-peer', Records.auditStore);
+		const version = Date.now() + 100;
+		const incoming = recordFrame(Records, 'invalidate', 'newer-copy', { id: 'newer-copy', region: 0 }, version, 42);
+		const encoder = Records.primaryStore.encoder;
+		let reloads = 0;
+		const originalReload = Records.writeReloadMarker;
+		Records.writeReloadMarker = function (...args) {
+			reloads++;
+			return originalReload.apply(this, args);
+		};
+		try {
+			socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+			socket.emit(
+				'message',
+				encode([
+					132,
+					{
+						structures: encoder.structures,
+						typedStructs: encoder.typedStructs,
+						attributes: Records.attributes,
+						residency: Records.residency,
+						schemaDefined: true,
+					},
+					Records.tableId,
+					Records.tableName,
+				])
+			);
+			socket.emit('message', encode([130, [server.hostname], 42]));
+			socket.emit('message', encode([148, version - 1000, 1]));
+			socket.emit('message', incoming);
+			socket.emit('message', encode([149]));
+			await until(() => reloads > 0 || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			assert.ok(Records.primaryStore.getEntry('newer-copy').metadataFlags & INVALIDATED);
+			assert.equal(Records.dbisDB.getSync([Symbol.for('copyCursor'), peerId]), undefined);
+			assert.equal(
+				Array.from(Records.auditStore.getRange({ start: 1 })).filter((entry) => entry.recordId === 'newer-copy').length,
+				0
+			);
+			assert.equal(reloads, 1, 'audit-free projections participate in durable copy completion');
+		} finally {
+			Records.writeReloadMarker = originalReload;
+		}
+	});
 	it('unwraps an owner record after residency resolution decodes another native entry', async () => {
 		const { Records, socket } = await connect(false, 'metadata_decode');
 		await Records.put('requested', { id: 'requested', region: 0, body: 'canonical' });
@@ -488,18 +674,34 @@ describe('Declarative tables keep control and event traffic independent of place
 		for (const stubCapable of [false, true])
 			it(`copies declarative stubs safely (attribute=${byAttribute}, stub capability=${stubCapable})`, async () => {
 				const capabilities = { ...buildLocalCapabilities(90_000, false, true), residencyStubCopy: stubCapable ? 1 : 0 };
-				const { Records, socket } = await connect(byAttribute, `copy_${stubCapable}`, false, capabilities);
-				const context = {};
-				await transaction(context, async () => {
-					const row = await Records.getResource('stub', context, { ensureLoaded: false });
-					row._writeInvalidate('stub', { id: 'stub', region: 0 }, { residencySlot: byAttribute ? 0 : undefined });
-				});
-				assert.ok(Records.primaryStore.getEntry('stub').metadataFlags & INVALIDATED);
-				Records.setTTLExpiration(3600);
-				await Records.put('full', { id: 'full', region: 0, body: 'canonical' });
+				const priorList = env.get('replication_shards');
 				const prior = server.shards;
-				server.shards = new Map([[0, [{ name: server.hostname }, { name: 'slot-control-peer' }]]]);
 				try {
+					env.setProperty('replication_shards', [0, 1]);
+					const { Records, socket } = await connect(
+						byAttribute,
+						`copy_${stubCapable}`,
+						false,
+						capabilities,
+						undefined,
+						undefined,
+						[
+							{ start: 0, end: 1, shard: 0 },
+							{ start: 1, end: 2, shard: 1 },
+						]
+					);
+					const context = { sourceApply: true, [REPLICATION_APPLY]: true };
+					await transaction(context, async () => {
+						const row = await Records.getResource('stubx', context, { ensureLoaded: false });
+						row._writeInvalidate('stubx', { id: 'stubx', region: 1 }, { residencySlot: byAttribute ? 1 : undefined });
+					});
+					assert.ok(Records.primaryStore.getEntry('stubx').metadataFlags & INVALIDATED);
+					Records.setTTLExpiration(3600);
+					await Records.put('full', { id: 'full', region: 0, body: 'canonical' });
+					server.shards = new Map([
+						[0, [{ name: server.hostname }, { name: 'slot-control-peer' }]],
+						[1, [{ name: 'third-slot-owner' }]],
+					]);
 					socket.emit(
 						'message',
 						encode([129, [{ name: 'slot-control-peer', startTime: 0, tables: [], replicateByDefault: true }], []])
@@ -507,7 +709,7 @@ describe('Declarative tables keep control and event traffic independent of place
 					await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
 					assert.deepEqual(socket.closes, []);
 					const copied = entries(socket);
-					const stub = copied.find((entry) => entry.recordId === 'stub');
+					const stub = copied.find((entry) => entry.recordId === 'stubx');
 					if (stubCapable) assert.equal(stub?.type, 'invalidate');
 					else
 						assert.notEqual(
@@ -525,6 +727,7 @@ describe('Declarative tables keep control and event traffic independent of place
 					);
 				} finally {
 					server.shards = prior;
+					env.setProperty('replication_shards', priorList);
 				}
 			});
 

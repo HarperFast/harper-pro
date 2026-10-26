@@ -6,3 +6,7 @@ type Converted @table(replicaExpiration: 3600) @export {
 type ConversionBarrier @table @export {
 	id: ID @primaryKey
 }
+type Plain @table @export {
+	id: ID @primaryKey
+	body: String
+}

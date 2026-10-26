@@ -108,6 +108,30 @@ describe('sendOperationToNode', function () {
 		expect(socket.closeCalls).to.equal(1);
 	});
 
+	it('bounds dialing and closes a socket that arrives after the deadline', async () => {
+		let connect;
+		replicationConnection.createWebSocket.returns(
+			new Promise((resolve) => {
+				connect = resolve;
+			})
+		);
+		const result = rejection(sendOperationToNode(PEER, { operation: 'recovery' }, { timeoutMs: 20 }));
+		expect((await result).message).to.match(/did not answer within 20ms/);
+		connect(socket);
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(socket.closeCalls).to.equal(1);
+		expect(replicationConnection.replicateOverWS.called).to.equal(false);
+		expect(session.sendOperation.called).to.equal(false);
+	});
+
+	it('settles a failed dial without opening a replication session', async () => {
+		replicationConnection.createWebSocket.rejects(new Error('dial failed'));
+		expect(
+			(await rejection(sendOperationToNode(PEER, { operation: 'recovery' }, { timeoutMs: 500 }))).message
+		).to.equal('dial failed');
+		expect(replicationConnection.replicateOverWS.called).to.equal(false);
+	});
+
 	// Node fires a timer at once when its delay exceeds 2^31-1ms.
 	it('holds a deadline beyond the timer range instead of firing it at once', async () => {
 		let deliver;

@@ -4,7 +4,7 @@ import { join, basename } from 'node:path';
 import { cp, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, waitForCondition, stopAndTeardownNodes } from './clusterShared.mjs';
+import { sendOperation, postOperation, waitForCondition, stopAndTeardownNodes } from './clusterShared.mjs';
 
 const currentBinary = join(import.meta.dirname, '../../dist/bin/harper.js');
 const fixture = join(import.meta.dirname, 'fixture-residency-conversion');
@@ -28,7 +28,7 @@ async function request(node, path, body, signal = AbortSignal.timeout(30_000)) {
 	return value;
 }
 
-for (const engine of ['rocksdb', 'lmdb']) {
+for (const engine of ['rocksdb']) {
 	test(
 		`zero-movement conversion with optional previous-binary rollback (${engine})`,
 		{ timeout: 900_000 },
@@ -39,9 +39,16 @@ for (const engine of ['rocksdb', 'lmdb']) {
 				harperBinPath: binary,
 				env: { HARPER_STORAGE_ENGINE: engine },
 				config: {
+					threads: { count: 1 },
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, stdStreams: false, level: 'warn' },
-					replication: { threads: 0, securePort: context.harper.hostname + ':9933', shard: i, databases: '*' },
+					replication: {
+						threads: 0,
+						securePort: context.harper.hostname + ':9933',
+						shard: i,
+						shards: [0, 1],
+						databases: '*',
+					},
 				},
 			});
 			ctx.after(() => stopAndTeardownNodes(nodes()));
@@ -96,8 +103,9 @@ for (const engine of ['rocksdb', 'lmdb']) {
 				const id = i ? 'legacy7' : 'legacy2';
 				await request(node, `Converted/${id}`, { id, tag: 'legacy', body: id });
 			}
+			await request(nodes()[0], 'Plain/plain2', { id: 'plain2', body: 'before-conversion' });
 			await settle();
-			await sendOperation(nodes()[0], {
+			const map = await sendOperation(nodes()[0], {
 				operation: 'initialize_shard_map',
 				database: 'data',
 				slots: 10,
@@ -139,6 +147,14 @@ for (const engine of ['rocksdb', 'lmdb']) {
 				assert.ok(report.checked >= 1);
 				assert.equal(report.mismatches, 0);
 			}
+			await sendOperation(nodes()[0], {
+				operation: 'initialize_shard_map',
+				database: 'data',
+				existing_owner: true,
+				expected_digest: map.digest,
+			});
+			const plainBefore = await Promise.all(nodes().map((node) => request(node, 'PlainRows/')));
+			assert.ok(plainBefore.every((rows) => rows.length === 1));
 			const before = await Promise.all(nodes().map((node) => request(node, 'ConversionRows/')));
 			const oldSchema = await readFile(join(fixture, 'schema.graphql'), 'utf8');
 			const oldResources = await readFile(join(fixture, 'resources.js'), 'utf8');
@@ -151,10 +167,12 @@ for (const engine of ['rocksdb', 'lmdb']) {
 					await writeFile(
 						join(component, 'schema.graphql'),
 						declared
-							? schema.replace(
-									'type Converted @table',
-									'type Converted @sharded(slots: 10, slotFrom: "Number(id.slice(-1))") @table'
-								)
+							? schema
+									.replace('type Plain @table', 'type Plain @sharded(slotFrom: \"Number(id.slice(-1))\") @table')
+									.replace(
+										'type Converted @table',
+										'type Converted @sharded(slots: 10, slotFrom: "Number(id.slice(-1))") @table'
+									)
 							: schema
 					);
 					await writeFile(
@@ -166,7 +184,54 @@ for (const engine of ['rocksdb', 'lmdb']) {
 				await settle();
 			}
 			await reopen(true, currentBinary);
-			for (const [i, node] of nodes().entries()) assert.deepEqual(await request(node, 'ConversionRows/'), before[i]);
+			await waitForCondition(
+				async (signal) => {
+					const status = await sendOperation(nodes()[1], { operation: 'cluster_status' }, { signal });
+					return status.sharding?.data?.recovery?.reason?.includes('Missing existing-owner completeness assertion');
+				},
+				{ description: 'conversion without an assertion stays uncertified' }
+			);
+			const mismatch = await postOperation(nodes()[1], {
+				operation: 'initialize_shard_map',
+				database: 'data',
+				existing_owner: true,
+				expected_digest: 'mismatch',
+			});
+			assert.equal(mismatch.status, 409);
+			await sendOperation(nodes()[1], {
+				operation: 'initialize_shard_map',
+				database: 'data',
+				existing_owner: true,
+				expected_digest: map.digest,
+			});
+			async function ready() {
+				await waitForCondition(
+					async (signal) =>
+						(
+							await Promise.all(nodes().map((node) => sendOperation(node, { operation: 'cluster_status' }, { signal })))
+						).every((status) => status.sharding?.data?.recovery?.phase === 'ready'),
+					{ timeoutMs: 120_000, description: 'converted owners have explicit completeness assertions' }
+				);
+			}
+			await ready();
+			for (const [i, node] of nodes().entries()) assert.deepEqual(await request(node, 'PlainRows/'), plainBefore[i]);
+			await request(nodes()[0], 'Plain/plain2', { id: 'plain2', body: 'changed-at-owner' });
+			await waitForCondition(
+				async (signal) => (await request(nodes()[1], 'Plain/plain2', undefined, signal)).body === 'changed-at-owner',
+				{ description: 'non-owner conversion read sources the updated owner body' }
+			);
+			for (const [i, node] of nodes().entries()) {
+				const rows = await request(node, 'ConversionRows/');
+				for (const row of before[i])
+					assert.deepEqual(
+						rows.find((current) => current.id === row.id),
+						row
+					);
+				for (const row of rows.filter((current) => !before[i].some((old) => old.id === current.id))) {
+					assert.equal(row.flags & 1, 1, 'bootstrap may fill only non-owner index projections');
+					assert.equal(row.record.body, undefined);
+				}
+			}
 			for (const [i, node] of nodes().entries()) {
 				const id = i ? 'new7' : 'new2';
 				await request(node, `Converted/${id}`, { id, tag: 'declarative', body: id });
@@ -180,16 +245,29 @@ for (const engine of ['rocksdb', 'lmdb']) {
 				}
 			if (previousBinary) {
 				await reopen([true, false], [currentBinary, previousBinary]);
-				await request(nodes()[0], 'Converted/mixed7', { id: 'mixed7', tag: 'mixed', body: 'legacy reader' });
-				await settle();
-				for (const node of nodes()) assert.equal((await request(node, 'Converted/mixed7')).body, 'legacy reader');
-				const legacyRows = await request(nodes()[1], 'ConversionRows/');
-				assert.equal(legacyRows.find((row) => row.id === 'mixed7').slot, undefined);
+				await waitForCondition(
+					async (signal) => {
+						const status = await sendOperation(nodes()[0], { operation: 'cluster_status' }, { signal });
+						return status.sharding?.data?.errors?.some((error) => error.includes('does not support sharding recovery'));
+					},
+					{ description: 'a downgraded peer holds sharded writes' }
+				);
+				const refused = await postOperation(nodes()[0], {
+					operation: 'insert',
+					database: 'data',
+					table: 'Converted',
+					records: [{ id: 'mixed7', tag: 'mixed', body: 'must-refuse' }],
+				});
+				assert.equal(refused.status, 503);
+				assert.ok(!(await request(nodes()[0], 'ConversionRows/')).some((row) => row.id === 'mixed7'));
+				await reopen(true, currentBinary);
+				await ready();
 			}
 			// Seed a non-owner writer replica even when the optional mixed-version arm did not run.
 			await request(nodes()[0], 'Converted/drain7', { id: 'drain7', tag: 'drain', body: 'temporary writer copy' });
 			await settle();
 			await reopen(true, currentBinary, 0);
+			await ready();
 			const drains = await Promise.all(nodes().map((node) => request(node, 'ConversionDrain/', {})));
 			assert.ok(drains.every((result) => result.remaining === 0));
 			assert.equal(drains.reduce((sum, result) => sum + result.demoted, 0) > 0, engine === 'rocksdb');

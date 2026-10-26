@@ -1,3 +1,4 @@
+import { shardingFailoverShard, shardingPeerCanRelay, recordShardingWait, shardingLayout } from './shardingRecovery.ts';
 /**
  * This module is responsible for managing the subscriptions for replication. It determines the connections and
  * subscriptions that are needed and delegates them to the available threads. It also manages when connections are
@@ -1613,6 +1614,7 @@ export async function startOnMainThread(options) {
 				return;
 			} // intentionally closed connection
 			if (!env.get(CONFIG_PARAMS.REPLICATION_FAILOVER)) {
+				for (const node of existingWorkerEntry.nodes) recordShardingWait(connection.database, node.name, true);
 				// if failover is disabled, immediately return
 				return;
 			}
@@ -1627,7 +1629,7 @@ export async function startOnMainThread(options) {
 				// no replication, so just return
 				return;
 			}
-			const shard = mainNode.shard;
+			const shard = shardingFailoverShard(connection.database, mainNode.shard);
 			let nextIndex = (existingIndex + 1) % nodeNames.length;
 			while (existingIndex !== nextIndex) {
 				const nextNodeName = nodeNames[nextIndex];
@@ -1637,7 +1639,8 @@ export async function startOnMainThread(options) {
 				if (
 					!failoverWorkerEntry ||
 					failoverWorkerEntry.connected === false ||
-					failoverWorkerEntry.nodes[0].shard !== shard
+					failoverWorkerEntry.nodes[0].shard !== shard ||
+					!shardingPeerCanRelay(connection.database, nextNodeName)
 				) {
 					// try the next node if this isn't connected or isn't in the same shard
 					nextIndex = (nextIndex + 1) % nodeNames.length;
@@ -1653,6 +1656,7 @@ export async function startOnMainThread(options) {
 					}
 					if (node.endTime < Date.now()) continue; // already expired
 					nodes.push(node);
+					recordShardingWait(connection.database, node.name, false);
 					logger.info(`Failing over ${connection.database} from ${connection.name} to ${nextNodeName}`);
 					connectToNextWorker(node, connection.database, failoverWorkerEntry.nodes[0]);
 					hasMovedNodes = true;
@@ -1663,6 +1667,7 @@ export async function startOnMainThread(options) {
 				}
 				return;
 			}
+			for (const node of existingWorkerEntry.nodes) recordShardingWait(connection.database, node.name, true);
 			logger.warn('Unable to find any other node to fail over to', connection.name, connection.url);
 		} catch (error) {
 			logger.error('Error failing over node', error);
@@ -1704,16 +1709,28 @@ export async function startOnMainThread(options) {
 		}
 
 		mainWorkerEntry.nodes = [restoredNode]; // restart with just our own connection
+		recordShardingWait(connection.database, restoredNode.name, false);
 		for (const nodeWorkers of connectionReplicationMap.values()) {
 			const failOverConnections = nodeWorkers.get(connection.database);
 			if (!failOverConnections || failOverConnections == mainWorkerEntry) continue;
 			const { nodes: failOverNodes, connected } = failOverConnections;
 			if (!failOverNodes) continue;
-			if (connected === false && failOverNodes[0].shard === restoredNode.shard && connection.url === restoredNode.url) {
+			if (
+				connected === false &&
+				shardingFailoverShard(connection.database, failOverNodes[0].shard) === restoredNode.shard &&
+				shardingPeerCanRelay(connection.database, restoredNode.name) &&
+				connection.url === restoredNode.url
+			) {
 				// if it is not connected and has extra nodes, grab them
-				for (let node of failOverNodes) {
-					connectToNextWorker(node, connection.database);
+				for (const node of failOverNodes) {
+					if (shardingLayout(connection.database)) {
+						if (!mainWorkerEntry.nodes.some((existing) => existing.name === node.name))
+							mainWorkerEntry.nodes.push(node);
+						connectToNextWorker(node, connection.database, restoredNode);
+						recordShardingWait(connection.database, node.name, false);
+					} else connectToNextWorker(node, connection.database);
 				}
+				if (shardingLayout(connection.database)) failOverConnections.nodes = [failOverNodes[0]];
 			} else {
 				// remove the restored node from any other connections list of node
 				removeRestoredNodeFromFailoverEntry(failOverConnections, restoredNode, connection.database);

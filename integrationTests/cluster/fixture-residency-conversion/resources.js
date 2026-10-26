@@ -44,3 +44,14 @@ export class ConversionDrain extends Resource {
 		return { demoted, remaining };
 	}
 }
+
+export class PlainRows extends Resource {
+	get() {
+		return Array.from(tables.Plain.primaryStore.getRange({ start: true }), (entry) => ({
+			id: entry.key,
+			version: entry.version,
+			record: entry.value,
+			flags: entry.metadataFlags,
+		}));
+	}
+}

@@ -26,6 +26,28 @@ function throwingEntry() {
 }
 
 describe('collectLastTxnTimes', () => {
+	it('does not borrow an origin watermark from an inadmissible relay', () => {
+		const rows = [
+			{ key: [Symbol.for('seq'), 1], value: { nodes: [{ id: 1, lastTxnTime: 100 }] } },
+			{
+				key: [Symbol.for('seq'), 2],
+				value: {
+					nodes: [
+						{ id: 1, lastTxnTime: 1000 },
+						{ id: 2, lastTxnTime: 200 },
+					],
+				},
+			},
+			{ key: [Symbol.for('seq'), 3], value: { nodes: [{ id: 1, lastTxnTime: 300 }] } },
+		];
+		expect(collectLastTxnTimes(rows, (source, origin) => source === origin || source === 3)).to.deep.equal(
+			new Map([
+				[1, 300],
+				[2, 200],
+			])
+		);
+	});
+
 	it('returns an empty map for no entries', () => {
 		expect(collectLastTxnTimes([])).to.deep.equal(new Map());
 	});
