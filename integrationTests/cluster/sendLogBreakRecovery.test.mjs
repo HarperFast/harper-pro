@@ -15,17 +15,15 @@
  *
  * The two shapes are opposites, and each test pins one:
  *
- *   TORN TAIL — nothing was lost behind the break and the tail grows again, so a fresh iterator reads
- *   past it. The cached iterable is dropped and the SAME session resumes sending; nothing is closed,
- *   which the test asserts directly by requiring that neither side ever logs a disconnect.
+ *   TORN TAIL — after the next commit the sender probes a fresh range; it reads past, so the session
+ *   reconnects once and the peer resumes from its own cursor.
  *
  *   MID-LOG BREAK — entries behind the break are unreadable and harper#2087 makes stopping there the
- *   intended policy. A fresh iterator stops at the same frame, so it is reported and the range is NOT
- *   rebuilt on first sight (a much longer floor governs re-checking, far beyond this test's window).
+ *   intended policy. It is reported and the session stays up; no reconnect can cross it.
  *
  * `HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB=<db>[:midlog]` serves the drained, corrupt-frame-stopped
- * iterable that `endIteratorOnCorruptFrame` leaves behind. It is one-shot, so the rebuilt range is a
- * healthy one and recovery is observed rather than merely asserted.
+ * iterable that `endIteratorOnCorruptFrame` leaves behind. It is one-shot, so the probe and the
+ * replacement session see a healthy log and recovery is observed rather than merely asserted.
  *
  * Stress-gated (spawns two Harper child processes) like the other cluster tests.
  */
@@ -57,9 +55,8 @@ const RECOVERY_TIMEOUT_MS = 120_000;
 // rather than a race with the first one.
 const NO_RECOVERY_WINDOW_MS = 60_000;
 const POLL_MS = 500;
-const REPAIRED = /Rebuilding the send range from/;
+const REPAIRED = /stopped at a torn transaction-log frame that a fresh range now reads past; reconnecting/;
 const QUARANTINED = /stopped at a mid-log corrupt transaction-log frame/;
-// The repair must not disturb the socket: it replaces a cached local, nothing more.
 const DISCONNECTED = /Disconnected from wss:/;
 
 function nodeConfig(hostname, env) {
@@ -195,7 +192,7 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS || !ROCKSDB, t
 		}
 	});
 
-	test('a torn tail is repaired in place — the same session resumes sending', async () => {
+	test('a torn tail is repaired by one reconnect once a fresh range reads past it', async () => {
 		const { source, subscriber } = await startWedgedPair(ctx, 'torn-tail', 'tail');
 
 		await waitForCondition((signal) => hasRow(subscriber, 'after-wedge', signal), {
@@ -205,12 +202,12 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS || !ROCKSDB, t
 		});
 
 		const log = await readLog(source);
-		ok(REPAIRED.test(log), 'the source should say it rebuilt the send range');
+		equal(
+			log.match(new RegExp(REPAIRED, 'g'))?.length,
+			1,
+			'the source should reconnect exactly once for the stopped range'
+		);
 		ok(/fire=\{mechanism: send-log-break/.test(log), 'the fire should be classified like every other net');
-		// The whole point of repairing the cached local rather than closing: the socket is healthy and
-		// bidirectional, and tearing it down would abort the peer's in-flight blob receives for nothing.
-		equal(DISCONNECTED.test(log), false, 'repairing the send range must not disturb the socket');
-		equal(DISCONNECTED.test(await readLog(subscriber)), false, 'the peer must not see a reconnect either');
 
 		// And the leg is genuinely healthy afterwards, not merely caught up once.
 		await sendOperation(source, {
@@ -234,7 +231,7 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS || !ROCKSDB, t
 
 		const deadline = Date.now() + NO_RECOVERY_WINDOW_MS;
 		while (Date.now() < deadline) {
-			equal(REPAIRED.test(await readLog(source)), false, 'a mid-log break must not rebuild the send range');
+			equal(REPAIRED.test(await readLog(source)), false, 'a mid-log break must not reconnect');
 			await delay(2_000);
 		}
 
