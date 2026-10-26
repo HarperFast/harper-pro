@@ -85,7 +85,7 @@ function entries(socket) {
 	}
 	return records;
 }
-function recordFrame(Table, type, recordId, value, version, residencyId, overrides = {}) {
+function recordFrame(Table, type, recordId, value, version, residencyId, overrides = {}, includeSequence = true) {
 	const frame = new FrameWriter();
 	frame.writeFloat64(version);
 	const entry = Buffer.from(
@@ -105,9 +105,11 @@ function recordFrame(Table, type, recordId, value, version, residencyId, overrid
 	const start = entry[0] === 66 ? 8 : 0;
 	frame.writeInt(entry.length - start);
 	frame.writeBytes(entry, start);
-	frame.writeInt(9);
-	frame.writeInt(11);
-	frame.writeFloat64(version);
+	if (includeSequence) {
+		frame.writeInt(9);
+		frame.writeInt(11);
+		frame.writeFloat64(version);
+	}
 	return Buffer.from(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
 }
 
@@ -186,6 +188,38 @@ describe('Declarative tables keep control and event traffic independent of place
 		assert.deepEqual(socket.closes, []);
 		return { Records, socket, database };
 	}
+	it('persists the frozen origin start from an inbound initial handshake', async () => {
+		const { Records, socket: initial, database } = await connect(false, 'inbound_origin_start');
+		initial.close();
+		const socket = new Socket();
+		sockets.push(socket);
+		replicateOverWS(socket, {}, { name: 'slot-control-peer', replicates: true });
+		socket.emit(
+			'message',
+			encode([
+				140,
+				'slot-control-peer',
+				database,
+				[],
+				buildLocalCapabilities(90_000, true, true),
+				{
+					shardsDigest: getResidencyConfiguration().digest,
+					shardingStarts: { 0: { agreement: shardingSourceAgreement(database), floor: 123 } },
+				},
+			])
+		);
+		socket.emit('message', encode([133, 'inbound-start-barrier', 0, 'absent', 'MissingTable']));
+		await until(
+			() =>
+				socket.sent.some((frame) => frame[0] === 134 && frame[1] === 'inbound-start-barrier') || socket.closes.length
+		);
+		assert.deepEqual(socket.closes, []);
+		assert.equal(
+			Records.dbisDB.getSync([Symbol.for('sharding-origin-start'), shardingLayout(database), 'slot-control-peer']),
+			123
+		);
+	});
+
 	it('refuses owned record-source authority after losing its frozen origin start', async () => {
 		const { Records, socket, database } = await connect(false, 'lost_record_source');
 		await Records.put('owned', { id: 'owned', region: 0, body: 'complete copied body' });
@@ -350,24 +384,23 @@ describe('Declarative tables keep control and event traffic independent of place
 				}
 			});
 	}
-	it('does not certify a replacement copy from the prior pass flush', async () => {
-		const { Records, socket, database } = await connect(false, 'replacement_copy_certificate');
+	it('does not split an open live frame when a prior commit completes the copy', async () => {
+		const { Records, socket, database } = await connect(false, 'copy_frame_boundary');
 		const Nodes = getHDBNodeTable();
 		const peer = 'slot-control-peer';
 		const previous = Nodes.primaryStore.getSync(peer);
 		const subscription = databaseSubscriptions.get(database);
 		const send = subscription.send;
-		const root = Records.auditStore.rootStore;
-		const flush = root.flush;
-		const commits = [];
-		let releaseFlush, flushStarted;
+		const waitForDrain = subscription.waitForDrain;
+		const queue = subscription.queue;
+		const events = [];
+		let release, paused;
 		const gate = new Promise((resolve) => {
-			releaseFlush = resolve;
+			release = resolve;
 		});
 		const reached = new Promise((resolve) => {
-			flushStarted = resolve;
+			paused = resolve;
 		});
-		let completion;
 		try {
 			await Nodes.primaryStore.put(peer, { name: peer, shard: 0, replicates: true });
 			socket.emit(
@@ -385,51 +418,190 @@ describe('Declarative tables keep control and event traffic independent of place
 					},
 				])
 			);
-			subscription.send = function (event) {
-				if (event.type === 'end_txn' && event.remoteNodeIds?.length === 0 && event.onCommit) commits.push(event);
-				else return send.call(this, event);
-			};
-			const anchor = Date.now();
-			socket.emit('message', encode([148, anchor, 1]));
-			socket.emit('message', encode([149]));
-			await until(() => commits.length === 1 || socket.closes.length);
-			assert.deepEqual(socket.closes, []);
-			assert.equal(shardingCertificate(database), undefined);
-			root.flush = async function (...args) {
-				flushStarted();
-				await gate;
-				return flush.apply(this, args);
-			};
-			completion = commits[0].onCommit();
-			await Promise.race([
-				reached,
-				new Promise((_, reject) => setTimeout(() => reject(new Error('copy flush not reached')), 5000).unref()),
-			]);
-			socket.emit('message', encode([148, anchor + 1, 1]));
-			socket.emit('message', encode([133, 'copy-restart-barrier', 0, 'absent', 'MissingTable']));
+			const anchor = Date.now() + 100;
+			const first = recordFrame(Records, 'put', 'first', { id: 'first', region: 0 }, anchor - 1, 42, {}, false);
+			const live = recordFrame(Records, 'put', 'live', { id: 'live', region: 0 }, anchor + 1, 42, {}, false);
+			const encoder = Records.primaryStore.encoder;
+			socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+			socket.emit(
+				'message',
+				encode([
+					132,
+					{
+						structures: encoder.structures,
+						typedStructs: encoder.typedStructs,
+						attributes: Records.attributes,
+						residency: Records.residency,
+						schemaDefined: true,
+					},
+					Records.tableId,
+					Records.tableName,
+				])
+			);
+			socket.emit('message', encode([130, [server.hostname], 42]));
+			socket.emit('message', encode([133, 'frame-setup-barrier', 0, 'absent', 'MissingTable']));
 			await until(
 				() =>
-					socket.sent.some((frame) => frame[0] === 134 && frame[1] === 'copy-restart-barrier') || socket.closes.length
+					socket.sent.some((frame) => frame[0] === 134 && frame[1] === 'frame-setup-barrier') || socket.closes.length
 			);
 			assert.deepEqual(socket.closes, []);
-			releaseFlush();
-			await completion;
-			assert.equal(shardingCertificate(database), undefined, 'an earlier pass cannot certify the replacement');
-			socket.emit('message', encode([149]));
-			await until(() => commits.length === 2 || socket.closes.length);
+			subscription.send = (event) => {
+				events.push(event);
+			};
+			socket.emit('message', first);
+			await until(() => events.some((event) => event.type === 'end_txn') || socket.closes.length);
 			assert.deepEqual(socket.closes, []);
-			assert.equal(commits.length, 2, 'the replacement owns a fresh certification attempt');
-			await commits[1].onCommit();
-			assert.equal(shardingCertificate(database), shardingLayout(database));
+			const firstCommit = events.find((event) => event.type === 'end_txn');
+			socket.emit('message', encode([148, anchor, 1]));
+			socket.emit('message', encode([149]));
+			subscription.queue = { length: 100000 };
+			subscription.waitForDrain = () => {
+				paused();
+				return gate;
+			};
+			socket.emit('message', live);
+			await Promise.race([
+				reached,
+				new Promise((_, reject) => setTimeout(() => reject(new Error('live frame did not pause')), 5000).unref()),
+			]);
+			await firstCommit.onCommit();
+			assert.equal(
+				events.filter((event) => event.type === 'end_txn').length,
+				1,
+				'copy certification cannot terminate a live frame prefix'
+			);
+			release();
+			await until(() => events.filter((event) => event.type === 'end_txn').length === 2 || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			await events.filter((event) => event.type === 'end_txn')[1].onCommit();
+			await until(() => events.filter((event) => event.type === 'end_txn').length === 3);
+			assert.deepEqual(events.filter((event) => event.type === 'end_txn')[2].remoteNodeIds, []);
 		} finally {
-			releaseFlush();
-			await completion;
-			root.flush = flush;
+			release();
 			subscription.send = send;
+			subscription.waitForDrain = waitForDrain;
+			subscription.queue = queue;
 			if (previous) await Nodes.primaryStore.put(peer, previous);
 			else await Nodes.primaryStore.remove(peer);
 		}
 	});
+
+	for (const clone of [false, true])
+		it(`does not certify a replacement copy from the prior pass flush (clone=${clone})`, async () => {
+			const { Records, socket, database } = await connect(false, 'replacement_copy_certificate_' + clone);
+			const Nodes = getHDBNodeTable();
+			const peer = 'slot-control-peer';
+			const previous = Nodes.primaryStore.getSync(peer);
+			const subscription = databaseSubscriptions.get(database);
+			const send = subscription.send;
+			const root = Records.auditStore.rootStore;
+			const flush = root.flush;
+			const commits = [];
+			let releaseFlush, flushStarted;
+			const gate = new Promise((resolve) => {
+				releaseFlush = resolve;
+			});
+			const reached = new Promise((resolve) => {
+				flushStarted = resolve;
+			});
+			let completion;
+			const previousCloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
+			const remove = Records.dbisDB.remove;
+			let releaseRevoke, revoking;
+			const revokeGate = new Promise((resolve) => {
+				releaseRevoke = resolve;
+			});
+			const revokeReached = new Promise((resolve) => {
+				revoking = resolve;
+			});
+			try {
+				await Nodes.primaryStore.put(peer, { name: peer, shard: 0, replicates: true });
+				socket.emit(
+					'message',
+					encode([
+						140,
+						peer,
+						database,
+						[],
+						buildLocalCapabilities(90_000, true, true),
+						{
+							shardsDigest: getResidencyConfiguration().digest,
+							shard: 0,
+							shardingCertificate: shardingSourceAgreement(database),
+						},
+					])
+				);
+				subscription.send = function (event) {
+					if (event.type === 'end_txn' && event.remoteNodeIds?.length === 0 && event.onCommit) commits.push(event);
+					else return send.call(this, event);
+				};
+				if (clone) process.env.HARPER_CLONE_ATTEMPT = 'copy-pass-test';
+				const anchor = Date.now();
+				socket.emit('message', encode([148, anchor, 1]));
+				socket.emit('message', encode([149]));
+				await until(() => commits.length === 1 || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(shardingCertificate(database), undefined);
+				root.flush = async function (...args) {
+					flushStarted();
+					await gate;
+					return flush.apply(this, args);
+				};
+				completion = commits[0].onCommit();
+				await Promise.race([
+					reached,
+					new Promise((_, reject) => setTimeout(() => reject(new Error('copy flush not reached')), 5000).unref()),
+				]);
+				if (clone)
+					Records.dbisDB.remove = async function (...args) {
+						revoking();
+						await revokeGate;
+						return remove.apply(this, args);
+					};
+				socket.emit('message', encode([148, anchor + 1, 1]));
+				if (clone) {
+					await Promise.race([
+						revokeReached,
+						new Promise((_, reject) => setTimeout(() => reject(new Error('revocation not reached')), 5000).unref()),
+					]);
+					releaseFlush();
+					await completion;
+					assert.equal(
+						shardingCertificate(database),
+						undefined,
+						'revocation invalidates the old pass before awaiting storage'
+					);
+					releaseRevoke();
+				}
+
+				socket.emit('message', encode([133, 'copy-restart-barrier', 0, 'absent', 'MissingTable']));
+				await until(
+					() =>
+						socket.sent.some((frame) => frame[0] === 134 && frame[1] === 'copy-restart-barrier') || socket.closes.length
+				);
+				assert.deepEqual(socket.closes, []);
+				releaseFlush();
+				await completion;
+				assert.equal(shardingCertificate(database), undefined, 'an earlier pass cannot certify the replacement');
+				socket.emit('message', encode([149]));
+				await until(() => commits.length === 2 || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(commits.length, 2, 'the replacement owns a fresh certification attempt');
+				await commits[1].onCommit();
+				assert.equal(shardingCertificate(database), shardingLayout(database));
+			} finally {
+				releaseRevoke();
+				Records.dbisDB.remove = remove;
+				if (previousCloneAttempt === undefined) delete process.env.HARPER_CLONE_ATTEMPT;
+				else process.env.HARPER_CLONE_ATTEMPT = previousCloneAttempt;
+				releaseFlush();
+				await completion;
+				root.flush = flush;
+				subscription.send = send;
+				if (previous) await Nodes.primaryStore.put(peer, previous);
+				else await Nodes.primaryStore.remove(peer);
+			}
+		});
 
 	it('flushes newer copy projections without appending their snapshot identity to the origin log', async () => {
 		const connection = new EventEmitter();

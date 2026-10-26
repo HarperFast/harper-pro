@@ -2898,10 +2898,7 @@ export function shouldEmitCopyReloadMarker(
  * `unitTests/replication/collectLastTxnTimes.test.mjs`; production callers go through
  * `sendSubscriptionRequestUpdate` in `replicateOverWS`.
  */
-export function collectLastTxnTimes(
-	seqEntries: Iterable<{ key?: any; value: any }>,
-	admits?: (source: number, origin: number) => boolean
-): Map<any, number> {
+export function collectLastTxnTimes(seqEntries: Iterable<{ value: any }>): Map<any, number> {
 	const lastTxnTimes = new Map();
 	for (const entry of seqEntries) {
 		let value: any;
@@ -2921,7 +2918,6 @@ export function collectLastTxnTimes(
 			// non-numeric lastTxnTime, which would throw out of the loop (defeating the crash-tolerance) or
 			// pollute the map with a nullish key. Only fold in well-formed entries.
 			if (node && typeof node === 'object' && typeof node.lastTxnTime === 'number' && node.id != null) {
-				if (admits && !admits(entry.key?.[1], node.id)) continue;
 				if (node.lastTxnTime > (lastTxnTimes.get(node.id) ?? 0)) lastTxnTimes.set(node.id, node.lastTxnTime);
 			}
 		}
@@ -3960,8 +3956,7 @@ function configuredPeerIdentity(
 	// Only explicit configured records may bind that connection for residency metadata.
 	const configured = [authorization, ...iterateRoutes(options), ...(server.nodes ?? [])];
 	if (subscription && !discoveryHost) configured.push(subscription);
-	if (expected === announced && (!discoveryHost || configured.some((record) => record?.name === expected)))
-		return expected;
+	if (expected === announced && configured.some((record) => record?.name === expected)) return expected;
 	// URL.hostname brackets/compresses IPv6, while authenticated socket addresses are bare.
 	// Normalize only host aliases; canonical node names remain exact identifiers.
 	const hostAlias = (name: string): string => {
@@ -3988,7 +3983,12 @@ function configuredPeerIdentity(
 		(record) => aliases(record).length && (record.name === expected || aliases(record).includes(expectedHost))
 	);
 	const names = new Set(candidates.map((record) => record.name));
-	if (!names.size && discoveryHost && !(server.nodes ?? []).some((node) => node.name === announced)) return undefined;
+	if (
+		!names.size &&
+		!configured.some((record) => record?.name === expected) &&
+		!(server.nodes ?? []).some((node) => node.name === announced)
+	)
+		return undefined;
 	if (names.size !== 1) throw new Error('Node name mismatch');
 	const canonical = candidates[0].name;
 	if (!candidates.some((record) => record.name === announced || aliases(record).includes(announcedHost)))
@@ -4199,6 +4199,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 			if (copyFlushInFlight) return; // a flush is persisting the final cursor; finish on its completion
 			if (projectionCopy || copyCertification) {
+				// A yielded live frame has queued its prefix but not its own end_txn yet.
+				// Its commit re-enters finalization after the complete frame is queued.
+				if (frameOpen) return;
 				if (copyCertificationPending) return;
 				copyCertificationPending = true;
 				const certification = copyCertification;
@@ -5639,6 +5642,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				switch (command) {
 					case NODE_NAME: {
 						if (data) {
+							const announcedDatabase = databaseName ?? message[2];
+							if (databaseResidencyBlockReason(announcedDatabase)) {
+								wsClosed = true;
+								close(1011, 'Database sharding configuration is quarantined; restart after repair');
+								return;
+							}
 							peerCapabilities = resolvePeerCapabilities(message[4]);
 							const setupCapability = subscriptionSetupCapabilityFrom(
 								peerCapabilities,
@@ -5679,8 +5688,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								announcedPeerShard = message[5]?.shard;
 								peerShardingCertificate = message[5]?.shardingCertificate;
 								peerShardingStarts = message[5]?.shardingStarts;
-								if (databaseName && residencyIdentityBound)
-									await noteShardingOriginStart(databaseName, remoteNodeName, peerShardingStarts);
+								if (residencyIdentityBound)
+									await noteShardingOriginStart(announcedDatabase, remoteNodeName, peerShardingStarts);
 								if (connectionSuperseded()) return;
 								shardingAdmissionDirty = true;
 								receiverMembership = undefined;
@@ -6103,6 +6112,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const layout = shardingLayout(databaseName);
 						copyCertification =
 							layout && !projectionCopy ? { layout, scopes: shardingRecoveryScopes(databaseName) } : undefined;
+						// Revoke every old callback's pass before revocation itself can yield.
+						copyWatermark.beginPass();
+						copyCertificationPending = false;
+						copyCompleteReceived = false;
+						pendingCopyCursor = null;
 						if (copyCertification && process.env.HARPER_CLONE_ATTEMPT) {
 							await revokeShardingCertificate(databaseName);
 							if (connectionSuperseded()) return;
@@ -6112,15 +6126,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						repairWindowMissRunByNode.clear();
 						inCopyMode = true;
 						if (!copyWasAlreadyActive) subscriptionSetupWatchdog?.pause();
-						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
-						// A prior pass's staged cursors (and its in-flight persists — see passAtPersist) must not
-						// be persisted under this pass: they claim delivery this pass's walk has not made (#699).
-						copyWatermark.beginPass();
-						copyCertificationPending = false;
-						// A COPY_COMPLETE from the prior pass must not finalize this one: with the flag left set,
-						// the first commit/blob drain that found nothing outstanding would remove the cursor and
-						// exit copy mode mid-walk, advertising a partial copy as caught-up.
-						copyCompleteReceived = false;
 						copiedTablesThisPass.clear(); // reset per-pass reload-marker tracking (harper-pro#495)
 						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)
 						lastCopyFlushTime = performance.now();
