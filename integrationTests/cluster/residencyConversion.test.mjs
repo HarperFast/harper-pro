@@ -168,7 +168,7 @@ for (const engine of ['rocksdb']) {
 						join(component, 'schema.graphql'),
 						declared
 							? schema
-									.replace('type Plain @table', 'type Plain @sharded(slotFrom: \"Number(id.slice(-1))\") @table')
+									.replace('type Plain @table', 'type Plain @sharded(slotFrom: "Number(id.slice(-1))") @table')
 									.replace(
 										'type Converted @table',
 										'type Converted @sharded(slots: 10, slotFrom: "Number(id.slice(-1))") @table'

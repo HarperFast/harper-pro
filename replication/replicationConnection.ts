@@ -12,7 +12,6 @@ import { databaseBaselineHoldReason } from '../core/resources/databaseLiveGuard.
 import { SHARDING_BOOTSTRAP_OPERATION, receiveShardingBootstrap } from './shardingBootstrapRpc.ts';
 import {
 	shardingLayout,
-	shardingCertificate,
 	shardingSourceAgreement,
 	shardingSourceCertificate,
 	onShardingRecoveryChange,
@@ -5201,7 +5200,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			refreshBlobStreamsOnResume(blobsInFlight, Date.now() - pauseStartTime);
 		}
 	}
-	let subscriptionRequest, auditSubscription;
+	let auditSubscription;
 	let activeNodeSubscriptions;
 	let updateSendingSubscription: ((data: any) => void) | undefined;
 	// undefined = not yet computed; null = nothing blocked; Map = table name -> why it is dropped.
@@ -9190,7 +9189,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`);
 		}
 		if (auditSubscription) auditSubscription.emit('close');
-		if (subscriptionRequest) subscriptionRequest.end();
 		// Wake queued blob senders and writer waits so they observe wsClosed instead of parking forever
 		while (blobSentCallbacks.length > 0) blobSentCallbacks.shift()?.();
 		for (const callbacks of blobFileSentCallbacks.values()) {
@@ -10645,7 +10643,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	return {
 		end() {
 			// cleanup
-			if (subscriptionRequest) subscriptionRequest.end();
 			if (auditSubscription) auditSubscription.emit('close');
 		},
 		// Full teardown for a session whose socket is being replaced without a delivered 'close'
