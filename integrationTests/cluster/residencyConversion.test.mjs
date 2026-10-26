@@ -93,7 +93,7 @@ for (const engine of ['rocksdb']) {
 										)
 									)
 								)
-							).every((rows) => rows.length === 1),
+							).every((rows) => rows.length === 1 && rows[0].id === id),
 						{ description: 'conversion nodes caught up' }
 					);
 				}
@@ -245,7 +245,7 @@ for (const engine of ['rocksdb']) {
 					assert.equal(row.flags & 0x30000, 0);
 				}
 			if (previousBinary) {
-				await reopen([true, false], [currentBinary, previousBinary]);
+				await reopen([true, false], [currentBinary, previousBinary], 3600, false);
 				await waitForCondition(
 					async (signal) => {
 						const status = await sendOperation(nodes()[0], { operation: 'cluster_status' }, { signal });
@@ -261,14 +261,16 @@ for (const engine of ['rocksdb']) {
 				});
 				assert.equal(refused.status, 503);
 				assert.ok(!(await request(nodes()[0], 'ConversionRows/')).some((row) => row.id === 'mixed7'));
-				await reopen(true, currentBinary);
+				await reopen(true, currentBinary, 3600, false);
 				await ready();
+				await settle();
 			}
 			// Seed a non-owner writer replica even when the optional mixed-version arm did not run.
 			await request(nodes()[0], 'Converted/drain7', { id: 'drain7', tag: 'drain', body: 'temporary writer copy' });
 			await settle();
-			await reopen(true, currentBinary, 0);
+			await reopen(true, currentBinary, 0, false);
 			await ready();
+			await settle();
 			const drains = await Promise.all(nodes().map((node) => request(node, 'ConversionDrain/', {})));
 			assert.ok(drains.every((result) => result.remaining === 0));
 			assert.equal(drains.reduce((sum, result) => sum + result.demoted, 0) > 0, engine === 'rocksdb');
@@ -282,7 +284,9 @@ for (const engine of ['rocksdb']) {
 					assert.equal((await request(node, `Converted/${id}`)).body, id);
 			await request(nodes()[0], 'Converted/new7', { id: 'new7', tag: 'rollback', body: 'written by prior binary' });
 			await settle();
-			await reopen(true, currentBinary);
+			await reopen(true, currentBinary, 3600, false);
+			await ready();
+			await settle();
 			for (const node of nodes()) assert.equal((await request(node, 'Converted/new7')).body, 'written by prior binary');
 		}
 	);
