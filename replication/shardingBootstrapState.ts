@@ -7,6 +7,7 @@ export interface ShardingBootstrapState {
 	phase: 'began' | 'witnessed' | 'active';
 	floors?: Record<string, number>;
 	localFloor?: number;
+	localOrigin?: string;
 	scope?: string;
 }
 
@@ -31,7 +32,7 @@ export function inheritShardingHistory(catalog: any, layout: string, state: Shar
 			if (previous?.phase === 'active') return true;
 			if (previous?.phase === 'witnessed' && previous.run !== state.run)
 				throw new Error('Conflicting witnessed sharding history requires recovery');
-			const { scope: _scope, localFloor: _localFloor, ...inherited } = state;
+			const { scope: _scope, localFloor: _localFloor, localOrigin: _localOrigin, ...inherited } = state;
 			transaction.putSync([historyKey, layout], inherited);
 			return true;
 		},
@@ -90,6 +91,8 @@ export function advanceShardingHistory(
 				throw new Error('Sharding bootstrap requires a valid local origin floor');
 			if (previous?.run === next.run && previous.localFloor !== undefined && previous.localFloor !== next.localFloor)
 				throw new Error('Sharding bootstrap local origin floor changed');
+			if (previous?.localOrigin !== undefined && previous.localOrigin !== next.localOrigin)
+				throw new Error('Sharding bootstrap local origin identity changed');
 			if (next.phase !== 'began' && !next.floors) throw new Error('Sharding bootstrap has no durable origin baseline');
 			if (next.phase === 'active' && previous?.phase === 'began')
 				throw new Error('Sharding bootstrap has no durable ready witness');
@@ -111,4 +114,13 @@ export function advanceShardingHistory(
 		{ retryOnBusy: true }
 	);
 	if (committed !== true) throw new Error('Sharding bootstrap state did not commit');
+}
+
+export function frozenShardingOriginFloor(
+	state: ShardingBootstrapState | undefined,
+	origin: string
+): number | undefined {
+	return state && (state.localOrigin === undefined || state.localOrigin === origin) && isValidFloor(state.localFloor)
+		? state.localFloor
+		: undefined;
 }

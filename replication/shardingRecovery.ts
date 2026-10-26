@@ -9,6 +9,8 @@ import { readResidencyMap, getResidencyConfiguration } from '../core/resources/r
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
 import { getHDBNodeTable, getReplicationSharedStatus } from './knownNodes.ts';
 import { server } from '../core/server/Server.ts';
+import { getThisNodeName } from '../core/server/nodeName.ts';
+import { readShardingHistory, frozenShardingOriginFloor } from './shardingBootstrapState.ts';
 import {
 	SHARDING_CERTIFICATE_GENERATION_POSITION,
 	SHARDING_CERTIFICATE_POSITION,
@@ -83,8 +85,13 @@ export function shardingSourceAgreement(database: string, shard?: number): strin
 }
 
 export function shardingSourceCertificate(database: string): string | undefined {
-	return shardingCertificate(database) &&
-		shardingNativeRoots(database).every(({ root }) => Atomics.load(shardingBaselineState(root, database), 0) === 1)
+	const layout = shardingCertificate(database);
+	return layout &&
+		shardingNativeRoots(database).every(
+			({ root, catalog }) =>
+				Atomics.load(shardingBaselineState(root, database), 0) === 1 &&
+				frozenShardingOriginFloor(readShardingHistory(catalog, layout), getThisNodeName()) !== undefined
+		)
 		? shardingSourceAgreement(database)
 		: undefined;
 }

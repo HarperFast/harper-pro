@@ -100,7 +100,7 @@ describe('sharding setup authority', function () {
 		const peer = 'recovery-capability-peer';
 		try {
 			server.nodes = [{ name: peer }];
-			const current = resolvePeerCapabilities({ shardingRecovery: 1 });
+			const current = resolvePeerCapabilities({ shardingRecovery: 2 });
 			const old = resolvePeerCapabilities({});
 			recordShardingRecoveryCapability(peer, current, true);
 			const warm = residencyTopologyErrors('data');

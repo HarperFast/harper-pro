@@ -6590,6 +6590,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					}
 					case SUBSCRIPTION_REQUEST: {
+						if (missingShardingOriginStart(databaseName)) {
+							wsClosed = true;
+							close(
+								1011,
+								'Sharding source has no frozen origin start; restore its complete audit or use a new node name'
+							);
+							return;
+						}
 						if (
 							!residencyIdentityBound &&
 							Object.values(databases[databaseName] ?? {}).some((Table) => Table.residency)

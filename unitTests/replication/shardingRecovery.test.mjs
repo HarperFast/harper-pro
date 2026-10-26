@@ -12,6 +12,9 @@ import {
 	certifyShardingCopy,
 	revokeShardingCertificate,
 } from '#src/replication/shardingRecovery';
+import { advanceShardingHistory } from '#src/replication/shardingBootstrapState';
+import { getThisNodeName } from '#src/core/server/nodeName';
+import { originReadyWord, recordShardingOriginBound } from '#src/replication/shardingOriginAdmission';
 import { table } from '#src/core/resources/databases';
 import { initializeResidencySlots } from '#src/core/resources/residencyMaps';
 import { shardingBaselineState } from '#src/core/resources/shardingCompleteness';
@@ -96,6 +99,16 @@ describe('Native sharding completeness certificates', () => {
 			'a catalog receipt alone does not publish a ready baseline'
 		);
 		Atomics.store(shardingBaselineState(Rows.primaryStore.rootStore, database), 0, 1);
+		assert.equal(shardingSourceCertificate(database), undefined, 'copied bodies cannot authorize a lost origin');
+		const state = {
+			initializer: getThisNodeName(),
+			agreement: 'test',
+			run: 'certificate-test',
+			phase: 'began',
+			localFloor: 100,
+			localOrigin: getThisNodeName(),
+		};
+		advanceShardingHistory(Rows.dbisDB, layout, state);
 		const token = shardingSourceCertificate(database);
 		assert.equal(token, shardingSourceAgreement(database));
 		table({
@@ -107,6 +120,13 @@ describe('Native sharding completeness certificates', () => {
 		});
 		assert.equal(shardingLayout(database), layout);
 		assert.notEqual(shardingSourceCertificate(database), token);
+	});
+	it('keeps a preserved source certificate while a temporary origin bound holds writes', async () => {
+		const before = shardingSourceCertificate(database);
+		assert.ok(before);
+		await recordShardingOriginBound(Rows.primaryStore.rootStore, Rows.dbisDB, database, Date.now() + 1000, 'peer');
+		assert.equal(Atomics.load(originReadyWord(Rows.primaryStore.rootStore, database), 0) & 1, 0);
+		assert.equal(shardingSourceCertificate(database), before);
 	});
 	it('revokes admission and refuses an older copy certificate after a later legacy activation', async () => {
 		const scopes = shardingRecoveryScopes(database);

@@ -59,6 +59,7 @@ import {
 	readShardingHistory,
 	readShardingBaseline,
 	validateShardingFloors,
+	frozenShardingOriginFloor,
 	type ShardingBootstrapState,
 } from './shardingBootstrapState.ts';
 import { SHARDING_BOOTSTRAP_OPERATION, setShardingBootstrapHandler } from './shardingBootstrapRpc.ts';
@@ -82,13 +83,43 @@ type Request = {
 	expected?: Record<string, string | null>;
 };
 type RootEvidence = { generation: string; history?: ShardingBootstrapState };
-type Evidence = { roots: RootEvidence[]; certificate?: string; floor?: number; bound?: number };
+type Evidence = { roots: RootEvidence[]; certificate?: string; floor?: number; bound?: number; priorOrigin?: boolean };
 type Diagnostic = { phase: string; reason?: string; shard?: number; backupRequired?: boolean };
 const readiness = new Map<string, Map<number, Int32Array>>();
 const diagnostics = new Map<string, Uint8Array>();
 const localLayouts = new Map<string, string | undefined>();
 let enabled = false;
 const admittedRoots = new WeakMap<object, Map<string, number>>();
+const lostOrigins = new Map<string, string>();
+
+export class ShardingOriginHistoryLostError extends ResidencyPlacementError {
+	constructor(origin: string) {
+		super(
+			`Sharding origin history lost for ${origin.slice(0, 200)}: restore a complete backup preserving its audit, or rejoin with a fresh root under a new node name`,
+			503
+		);
+	}
+}
+
+export function validateShardingOriginEvidence(
+	answers: { priorOrigin?: boolean; bound?: number }[],
+	origin: string
+): number {
+	if (answers.some((answer) => answer.priorOrigin === true)) throw new ShardingOriginHistoryLostError(origin);
+	if (
+		answers.some(
+			(answer) =>
+				answer.priorOrigin !== false ||
+				typeof answer.bound !== 'number' ||
+				!Number.isFinite(answer.bound) ||
+				answer.bound < 0
+		)
+	)
+		throw new Error(
+			'Waiting for prior sharding origin evidence from every member; upgrade peers with incomplete evidence'
+		);
+	return Math.max(0, ...answers.map((answer) => answer.bound));
+}
 
 function digest(value: unknown): string {
 	return createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -277,15 +308,91 @@ async function recordedOriginBound(database: string, origin: string): Promise<nu
 }
 
 export function missingShardingOriginStart(database: string): boolean {
+	if (!Object.values(databases[database] ?? {}).some((Table) => Table.residency)) return false;
 	const shards = new Set(readResidencyMap(database)?.ranges.map((range) => range.shard));
 	return (
 		shards.size > 0 &&
 		shardingNativeRoots(database).some(({ catalog }) =>
 			[...shards].some(
-				(shard) => !isValidFloor(readShardingHistory(catalog, shardingLayout(database, shard))?.localFloor)
+				(shard) =>
+					frozenShardingOriginFloor(
+						readShardingHistory(catalog, shardingLayout(database, shard)),
+						getThisNodeName()
+					) === undefined
 			)
 		)
 	);
+}
+
+export async function hasPriorShardingOrigin(database: string, layout: string, origin: string): Promise<boolean> {
+	for (const { root, catalog, auditStore } of shardingNativeRoots(database)) {
+		if (
+			isValidFloor(readShardingHistory(catalog, layout)?.floors?.[origin]) ||
+			isValidFloor(catalog.getSync([originStartKey, layout, origin]))
+		)
+			return true;
+		const id = exportIdMapping(auditStore)[origin];
+		if (id === undefined) continue;
+		const tables = new Set(
+			Object.values(databases[database] ?? {})
+				.filter((Table) => Table.residency && Table.auditStore === auditStore)
+				.map((Table) => Table.tableId)
+		);
+		const entries = auditStore.getRange({ log: id, start: 1 });
+		let count = 0;
+		for (const entry of entries) {
+			if (typeof entry.type !== 'string') throw new Error('Sharding admission requires readable prior-origin history');
+			if (
+				tables.has(entry.tableId) &&
+				isResidencyRecord(entry.type) &&
+				(entry.residencySlot !== undefined || entry.previousResidencySlot !== undefined)
+			)
+				return true;
+			if (++count % 256 === 0) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				if (root.status === 'closed' || root.status === 'closing') throw new Error('Sharding database is closing');
+			}
+		}
+		if (entries.failedLogs?.size || entries.corruptFrameStop?.breaks)
+			throw new Error('Sharding admission requires readable prior-origin history');
+	}
+	return false;
+}
+
+async function checkNewShardingOrigin(current: View): Promise<number | undefined> {
+	const name = getThisNodeName();
+	const roots = shardingNativeRoots(current.database);
+	if (
+		roots.every(
+			({ catalog }) => frozenShardingOriginFloor(readShardingHistory(catalog, current.layout), name) !== undefined
+		)
+	)
+		return;
+	const generation = JSON.stringify([name, boundRootGenerations(current.database)]);
+	if (lostOrigins.get(current.database) === generation) throw new ShardingOriginHistoryLostError(name);
+	try {
+		if (
+			(await hasPriorShardingOrigin(current.database, current.layout, name)) ||
+			roots.some(({ catalog }) => {
+				const history = readShardingHistory(catalog, current.layout);
+				return history?.localOrigin !== undefined && history.localOrigin !== name;
+			})
+		)
+			throw new ShardingOriginHistoryLostError(name);
+		const answers = await Promise.allSettled(
+			current.members.filter((member) => member.name !== name).map((member) => call(member, current, 'origin-bound'))
+		);
+		return validateShardingOriginEvidence(
+			answers.map((answer) => (answer.status === 'fulfilled' ? answer.value : {})),
+			name
+		);
+	} catch (error) {
+		if (error instanceof ShardingOriginHistoryLostError) {
+			lostOrigins.set(current.database, generation);
+			logger.warn?.(`${current.database}: ${error.message}`);
+		}
+		throw error;
+	}
 }
 
 const ORIGIN_BOUND_REQUEST = 'sharding-origin-bound';
@@ -374,7 +481,7 @@ export async function noteShardingResumeBound(database: string, requested: numbe
 	);
 }
 
-async function enableOrigin(current: View): Promise<void> {
+async function enableOrigin(current: View, priorBound = 0): Promise<void> {
 	const roots = shardingNativeRoots(current.database);
 	const pending = roots
 		.map((stores) => ({
@@ -389,15 +496,7 @@ async function enableOrigin(current: View): Promise<void> {
 		return;
 	}
 	Atomics.store(readyWord(current.database, current.shard), 0, 0);
-	let bound = await recordedOriginBound(current.database, getThisNodeName());
-	if (pending.some(({ catalog }) => readShardingHistory(catalog, current.layout)?.localFloor === undefined)) {
-		const answers = await Promise.all(current.members.map((member) => call(member, current, 'origin-bound')));
-		if (
-			answers.some((answer) => typeof answer.bound !== 'number' || !Number.isFinite(answer.bound) || answer.bound < 0)
-		)
-			throw new Error('Waiting for valid prior-origin recovery bounds from every member');
-		bound = Math.max(bound, ...answers.map((answer) => answer.bound));
-	}
+	const bound = Math.max(priorBound, await recordedOriginBound(current.database, getThisNodeName()));
 	for (const { root, catalog, auditStore, admission } of pending) {
 		if (root.status === 'closed' || root.status === 'closing') throw new Error('Sharding database is closing');
 		const history = readShardingHistory(catalog, current.layout);
@@ -422,7 +521,7 @@ async function enableOrigin(current: View): Promise<void> {
 					throw new Error('Sharding origin initialization requires readable audit history');
 				if (tables.has(entry.tableId) && isResidencyRecord(entry.type))
 					throw new Error(
-						'Local sharding history has no frozen origin start; restore a complete backup or assert existing-owner completeness'
+						'Local sharding history has no frozen origin start; restore a complete backup or rejoin with a fresh root under a new node name'
 					);
 				if (++count % 256 === 0) {
 					await new Promise<void>((resolve) => setImmediate(resolve));
@@ -445,7 +544,11 @@ async function enableOrigin(current: View): Promise<void> {
 				`Waiting for sharding origin floor ${floor} to reach recovery bound ${required} from ${catalog.getSync([recoveryBoundSourceKey, current.database]) ?? 'configured origin history'}`
 			);
 		if (history.localFloor === undefined)
-			advanceShardingHistory(catalog, current.layout, { ...history, localFloor: floor });
+			advanceShardingHistory(catalog, current.layout, {
+				...history,
+				localFloor: floor,
+				localOrigin: getThisNodeName(),
+			});
 		await catalog.flush({ allowWriteStall: true });
 		if (root.status === 'closed' || root.status === 'closing') throw new Error('Sharding database is closing');
 		if ((Atomics.load(originReadyWord(root, current.database), 0) & ~ORIGIN_READY) !== admission)
@@ -569,7 +672,11 @@ async function receive(request: Request, member: string): Promise<Evidence> {
 		throw new Error('Sharding membership, map or policy agreement differs');
 	if (request.action === 'origin-bound') {
 		await flushRoots(current.database);
-		return { ...evidence(current), bound: await recordedOriginBound(current.database, member) };
+		return {
+			...evidence(current),
+			bound: await recordedOriginBound(current.database, member),
+			priorOrigin: await hasPriorShardingOrigin(current.database, current.layout, member),
+		};
 	}
 	if (request.action === 'inspect') {
 		await flushRoots(current.database);
@@ -611,7 +718,11 @@ async function receive(request: Request, member: string): Promise<Evidence> {
 				}
 				const floor = readOriginClosedFloor(auditStore);
 				if (!isValidFloor(floor)) throw new Error('No durable local origin floor is available');
-				advanceShardingHistory(catalog, current.layout, { ...history, localFloor: floor });
+				advanceShardingHistory(catalog, current.layout, {
+					...history,
+					localFloor: floor,
+					localOrigin: getThisNodeName(),
+				});
 			}
 		} else if (request.action === 'witness') {
 			const answers = await Promise.all(
@@ -674,7 +785,8 @@ async function coordinate(current: View): Promise<void> {
 	if (local.every(({ catalog }) => readShardingHistory(catalog, current.layout)?.phase === 'active')) {
 		return;
 	}
-	const reports = await Promise.all(current.members.map((member) => call(member, current, 'inspect')));
+	const inspections = await Promise.allSettled(current.members.map((member) => call(member, current, 'inspect')));
+	const reports = inspections.filter((result) => result.status === 'fulfilled').map((result) => result.value);
 	const histories = reports.flatMap((report) => report.roots.map((root) => root.history).filter(Boolean));
 	const established = histories.find((history) => history.phase === 'active');
 	if (established) {
@@ -683,6 +795,8 @@ async function coordinate(current: View): Promise<void> {
 		await flushRoots(current.database);
 		return;
 	}
+	const failed = inspections.find((result) => result.status === 'rejected');
+	if (failed) throw failed.reason;
 	if (current.initializer !== getThisNodeName())
 		throw new Error(`Waiting for initial owner ${current.initializer} of shard ${current.shard}`);
 	localSeed(current);
@@ -752,6 +866,7 @@ export function startShardingBootstrap(): void {
 		readiness.delete(database);
 		diagnostics.delete(database);
 		localLayouts.delete(database);
+		lostOrigins.delete(database);
 	});
 	if (!isMainThread) return;
 	answerMainThreadRequests(ORIGIN_BOUND_REQUEST, receiveShardingOriginBound);
@@ -774,8 +889,12 @@ export function startShardingBootstrap(): void {
 				if (retry.next > Date.now()) continue;
 				try {
 					await publishLocalBaseline(database);
-					for (const shard of new Set(readResidencyMap(database)?.ranges.map((range) => range.shard)))
-						await coordinate(view(database, shard));
+					const originChecks = [];
+					for (const shard of new Set(readResidencyMap(database)?.ranges.map((range) => range.shard))) {
+						const current = view(database, shard);
+						await coordinate(current);
+						originChecks.push({ current, bound: await checkNewShardingOrigin(current) });
+					}
 					await publishLocalBaseline(database);
 					if (localLayouts.get(database) && !shardingCertificate(database)) {
 						const converted = shardingConvertedTables(database).some((root) => root.tables.length);
@@ -785,8 +904,7 @@ export function startShardingBootstrap(): void {
 								: 'Waiting for a certified same-shard copy; if the entire shard was lost, restore a complete backup';
 						report(database, { phase: 'recovery-required', reason, backupRequired: true });
 					} else {
-						for (const shard of new Set(readResidencyMap(database)?.ranges.map((range) => range.shard)))
-							await enableOrigin(view(database, shard));
+						for (const { current, bound } of originChecks) await enableOrigin(current, bound);
 						for (const { root } of shardingNativeRoots(database)) {
 							const word = originReadyWord(root, database);
 							const state = Atomics.load(word, 0);
@@ -805,7 +923,11 @@ export function startShardingBootstrap(): void {
 					retry.backoff.reset();
 					retry.next = Date.now() + 1000;
 				} catch (error) {
-					report(database, { phase: 'waiting', reason: String(error.message).slice(0, 700) });
+					report(database, {
+						phase: error instanceof ShardingOriginHistoryLostError ? 'origin-history-lost' : 'waiting',
+						reason: String(error.message).slice(0, 700),
+						...(error instanceof ShardingOriginHistoryLostError ? { backupRequired: true } : {}),
+					});
 					retry.next = Date.now() + retry.backoff.nextDelay();
 				}
 			}

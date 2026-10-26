@@ -535,13 +535,13 @@ describe('residencySlots capability', () => {
 describe('Sharding recovery capability', () => {
 	it('requires the minimum level and republishes a recovery-only change', () => {
 		assert.equal(peerSupportsShardingRecovery(resolvePeerCapabilities({})), false);
-		assert.equal(peerSupportsShardingRecovery(resolvePeerCapabilities({ shardingRecovery: 1 })), true);
+		assert.equal(peerSupportsShardingRecovery(resolvePeerCapabilities({ shardingRecovery: 1 })), false);
 		assert.equal(peerSupportsShardingRecovery(resolvePeerCapabilities({ shardingRecovery: 2 })), true);
 		assert.equal(
 			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ shardingRecovery: 1 })),
 			false
 		);
-		assert.equal(buildLocalCapabilities(1000, false, true).shardingRecovery, 1);
+		assert.equal(buildLocalCapabilities(1000, false, true).shardingRecovery, SHARDING_RECOVERY_CAPABILITY);
 		assert.equal(buildLocalCapabilities(1000, false, false).shardingRecovery, 0);
 	});
 });

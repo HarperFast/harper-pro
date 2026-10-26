@@ -35,6 +35,8 @@ import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
 import { residencyTopologyErrors, registerResidencySender } from '#src/replication/residencyTopology';
 import { FrameWriter } from '#src/replication/frameWriter';
+import { advanceShardingHistory } from '#src/replication/shardingBootstrapState';
+import { shardingLayout } from '#src/replication/shardingRecovery';
 import { hasActiveBlobSends } from '#src/replication/blobSendDrain';
 
 class Socket extends EventEmitter {
@@ -151,9 +153,20 @@ describe('Declarative tables keep control and event traffic independent of place
 			residency: legacy ? undefined : { slots: 2, byAttribute, slotFrom: byAttribute ? 'region' : 'id.length % 2' },
 			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'region', indexed: true }, { name: 'body' }],
 		});
+		if (!legacy)
+			for (const shard of new Set(ranges.map((range) => range.shard))) {
+				advanceShardingHistory(Records.dbisDB, shardingLayout(database, shard), {
+					initializer: server.hostname,
+					agreement: 'fixture',
+					run: 'fixture',
+					phase: 'began',
+					localFloor: 1,
+					localOrigin: server.hostname,
+				});
+			}
 		setReplicator(database, Records, {});
 		await until(() => databaseSubscriptions.get(database)?.auditStore);
-		beforeConnect?.(database);
+		beforeConnect?.(database, Records);
 		const socket = new Socket();
 		sockets.push(socket);
 		if (connection) connection.socket = socket;
@@ -173,6 +186,26 @@ describe('Declarative tables keep control and event traffic independent of place
 		assert.deepEqual(socket.closes, []);
 		return { Records, socket, database };
 	}
+	it('refuses repeated subscriptions from a lost origin before any forced copy', async () => {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const { socket } = await connect(
+				false,
+				'missing_start_' + attempt,
+				false,
+				buildLocalCapabilities(90_000, true, true),
+				(database, Records) => {
+					Records.dbisDB.removeSync([Symbol.for('sharding-bootstrap-history'), shardingLayout(database)]);
+				}
+			);
+			socket.emit(
+				'message',
+				encode([129, [{ name: server.hostname, startTime: 1, tables: [], replicateByDefault: true }], []])
+			);
+			await until(() => socket.closes.length);
+			assert.match(socket.closes[0].reason, /frozen origin start/);
+			assert.ok(!socket.sent.some((frame) => frame[0] === 148 || frame[0] === 149), 'no copy cursor is sent');
+		}
+	});
 	for (const destinationOwner of [true, false])
 		it(`relays foreign projections only to non-owners (destinationOwner=${destinationOwner})`, async () => {
 			const priorNodes = server.nodes;
@@ -742,19 +775,29 @@ describe('Declarative tables keep control and event traffic independent of place
 			[1, [{ name: 'third-slot-owner' }]],
 		]);
 		try {
-			const { socket, database } = await connect(false, 'mixed_blob_copy', false, undefined, undefined, undefined, [
-				{ start: 0, end: 1, shard: 0 },
-				{ start: 1, end: 2, shard: 1 },
-			]);
-			const Blobs = table({
-				database,
-				table: 'Blobs',
-				audit: true,
-				replicaExpiration: 3600,
-				residency: { slots: 2, slotFrom: 'id.length % 2' },
-				attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'tag', indexed: true }, { name: 'body' }],
-			});
-			setReplicator(database, Blobs, {});
+			let Blobs;
+			const { socket } = await connect(
+				false,
+				'mixed_blob_copy',
+				false,
+				undefined,
+				(database) => {
+					Blobs = table({
+						database,
+						table: 'Blobs',
+						audit: true,
+						replicaExpiration: 3600,
+						residency: { slots: 2, slotFrom: 'id.length % 2' },
+						attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'tag', indexed: true }, { name: 'body' }],
+					});
+					setReplicator(database, Blobs, {});
+				},
+				undefined,
+				[
+					{ start: 0, end: 1, shard: 0 },
+					{ start: 1, end: 2, shard: 1 },
+				]
+			);
 			await Blobs.put('a', { id: 'a', tag: 'projected', body: createBlob(Buffer.alloc(32768, 11)) });
 			const ownerPayload = Buffer.alloc(32768, 29);
 			await Blobs.put('bb', { id: 'bb', tag: 'owned', body: createBlob(ownerPayload), extra: { shape: 'new' } });
@@ -795,18 +838,26 @@ describe('Declarative tables keep control and event traffic independent of place
 		for (const owner of [false, true])
 			for (const slotsCapable of [false, true])
 				it(`copies blob bytes only to owners (indexed=${indexed}, owner=${owner}, slots=${slotsCapable})`, async () => {
-					const { socket, database } = await connect(false, `blob_copy_${indexed}_${owner}_${slotsCapable}`, false, {
-						...buildLocalCapabilities(90_000, false, true),
-						residencySlots: slotsCapable ? 1 : 0,
-					});
-					const Blobs = table({
-						database,
-						table: 'Blobs',
-						audit: true,
-						residency: { slots: 2, slotFrom: '0' },
-						attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'tag', indexed }, { name: 'body' }],
-					});
-					setReplicator(database, Blobs, {});
+					let Blobs;
+					const { socket } = await connect(
+						false,
+						`blob_copy_${indexed}_${owner}_${slotsCapable}`,
+						false,
+						{
+							...buildLocalCapabilities(90_000, false, true),
+							residencySlots: slotsCapable ? 1 : 0,
+						},
+						(database) => {
+							Blobs = table({
+								database,
+								table: 'Blobs',
+								audit: true,
+								residency: { slots: 2, slotFrom: '0' },
+								attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'tag', indexed }, { name: 'body' }],
+							});
+							setReplicator(database, Blobs, {});
+						}
+					);
 					const payload = Buffer.alloc(32768, 73);
 					await Blobs.put('blob', { id: 'blob', tag: 'projected', body: createBlob(payload) });
 					const prior = server.shards;

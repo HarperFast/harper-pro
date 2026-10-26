@@ -17,6 +17,7 @@ const fixture = join(import.meta.dirname, 'fixture-sharding-quarantine');
 
 suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 	const contexts = [];
+	const retiredNodes = [];
 	let lastStatuses;
 	const start = (context, i) =>
 		startHarper(context, {
@@ -26,6 +27,7 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 				logging: { colors: false, stdStreams: false, level: process.env.HARPER_TEST_SHARDING_LOG_LEVEL || 'warn' },
 				replication: {
 					failover: true,
+					threads: Number(process.env.HARPER_TEST_SHARDING_POOL || 0),
 					securePort: context.harper.hostname + ':9933',
 					databases: '*',
 					shard: i % 2,
@@ -85,27 +87,26 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			{ timeoutMs: 30_000, description: `node ${i} stores complete owned bodies` }
 		);
 	}
-	before(async () => {
-		for (let i = 0; i < 4; i++) {
-			const hostname = await getNextAvailableLoopbackAddress();
-			const dataRootDir = await mkdtemp(
-				join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'shard-start-')
-			);
-			const context = { name: ctx.name, harper: { hostname, dataRootDir } };
-			contexts.push(context);
-			const component = join(dataRootDir, 'components', basename(fixture));
-			await cp(fixture, component, { recursive: true });
-			await writeFile(
-				join(component, 'schema.graphql'),
-				`type Rows @table @export @sharded(slots: 2, by: "region", slotFrom: "region == 'asia' ? 0 : 1") {
+	async function provision(i) {
+		const hostname = await getNextAvailableLoopbackAddress();
+		const dataRootDir = await mkdtemp(
+			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'shard-start-')
+		);
+		const context = { name: ctx.name, harper: { hostname, dataRootDir } };
+		contexts[i] = context;
+		const component = join(dataRootDir, 'components', basename(fixture));
+		await cp(fixture, component, { recursive: true });
+		await writeFile(
+			join(component, 'schema.graphql'),
+			`type Rows @table @export @sharded(slots: 2, by: "region", slotFrom: "region == 'asia' ? 0 : 1") {
 				id: ID @primaryKey
 				region: String @indexed
 				body: String
 			}`
-			);
-			await appendFile(
-				join(component, 'resources.js'),
-				`
+		);
+		await appendFile(
+			join(component, 'resources.js'),
+			`
 export class BootstrapLocal extends Resource {
  async put(update) {
   const Table = tables.Rows;
@@ -135,9 +136,11 @@ export class BootstrapLocal extends Resource {
  }
 }
 `
-			);
-			await start(context, i);
-		}
+		);
+		await start(context, i);
+	}
+	before(async () => {
+		for (let i = 0; i < 4; i++) await provision(i);
 		const first = contexts[0].harper;
 		const { operation_token } = await sendOperation(first, {
 			operation: 'create_authentication_tokens',
@@ -163,7 +166,7 @@ export class BootstrapLocal extends Resource {
 	});
 	after(async () => {
 		if (lastStatuses) console.log('Last sharding bootstrap statuses:', JSON.stringify(lastStatuses));
-		await stopAndTeardownNodes(contexts.map((context) => context.harper));
+		await stopAndTeardownNodes([...contexts.map((context) => context.harper), ...retiredNodes]);
 	});
 	test('a fresh four-node, two-shard cluster certifies every owner and serves writes', async () => {
 		await ready();
@@ -297,55 +300,112 @@ export class BootstrapLocal extends Resource {
 		}
 		await ready();
 	});
-	test('a replaced owner recovers through its co-owner and waits for a newer origin bound held by another peer', async () => {
-		const future = Date.now() + 30_000;
-		const update = await local(3, AbortSignal.timeout(10_000), contexts[2].harper.hostname, {
-			origin: contexts[2].harper.hostname,
-			floor: future,
+	test('a lost origin refuses its old name, then a new name and the retired origin both converge', async () => {
+		const oldName = contexts[2].harper.hostname;
+		await stopNodeProcess(contexts[3].harper);
+		await sendOperation(contexts[2].harper, {
+			operation: 'insert',
+			database: 'data',
+			table: 'Rows',
+			records: [{ id: 'pending-old-origin', region: 'europe', body: 'retired-origin-body' }],
 		});
-		assert.ok(update.changed > 0);
+		await waitForCondition(
+			async (signal) =>
+				(await local(1, signal, oldName)).rows.some(
+					(row) => row.id === 'pending-old-origin' && row.body === 'retired-origin-body'
+				),
+			{ timeoutMs: 30_000, description: 'another shard retains the old-origin write while its co-owner is offline' }
+		);
 		const path = await dataPath(2);
 		await stopNodeProcess(contexts[2].harper);
 		await rm(path, { recursive: true });
 		await start(contexts[2], 2);
+		let lost;
+		await waitForCondition(
+			async (signal) => {
+				lost = await sendOperation(contexts[2].harper, { operation: 'cluster_status' }, { signal });
+				return lost.sharding?.data?.recovery?.phase === 'origin-history-lost';
+			},
+			{ timeoutMs: 45_000, description: 'the wiped name reports missing origin history even while a member is offline' }
+		);
+		assert.match(lost.sharding.data.recovery.reason, /complete backup/);
+		assert.match(lost.sharding.data.recovery.reason, /new node name/);
+		await sendOperation(contexts[2].harper, {
+			operation: 'initialize_shard_map',
+			database: 'data',
+			existing_owner: true,
+			expected_digest: lost.sharding.data.digest,
+		});
+		const refusedAfter = Date.now() + 2000;
 		await waitForCondition(
 			async (signal) => {
 				const status = await sendOperation(contexts[2].harper, { operation: 'cluster_status' }, { signal });
-				return status.sharding?.data?.recovery?.reason?.includes(String(future));
+				assert.equal(status.sharding.data.recovery.phase, 'origin-history-lost');
+				return Date.now() >= refusedAfter;
 			},
-			{ timeoutMs: 15_000, description: 'replacement observes the newer peer-held origin bound before enabling writes' }
+			{ timeoutMs: 10_000, description: 'advancing wall time cannot clear missing history' }
 		);
 		for (const region of ['asia', 'europe']) {
 			const response = await postOperation(contexts[2].harper, {
 				operation: 'insert',
 				database: 'data',
 				table: 'Rows',
-				records: [{ id: 'held-' + region, region, body: 'must refuse' }],
+				records: [{ id: 'lost-' + region, region, body: 'must refuse' }],
 			});
 			assert.equal(response.status, 503);
 		}
+		await stopNodeProcess(contexts[2].harper);
+		const removeOld = async (i) => {
+			const response = await postOperation(contexts[i].harper, { operation: 'remove_node', hostname: oldName });
+			if (response.status !== 200) {
+				assert.equal(response.status, 400);
+				assert.equal(response.body.error, oldName + ' does not exist');
+			}
+		};
+		for (const i of [0, 1]) await removeOld(i);
+		retiredNodes.push(contexts[2].harper);
+		await provision(2);
+		assert.notEqual(contexts[2].harper.hostname, oldName);
+		const first = contexts[0].harper;
+		const { operation_token } = await sendOperation(first, {
+			operation: 'create_authentication_tokens',
+			authorization: first.admin,
+		});
+		await sendOperation(contexts[2].harper, {
+			operation: 'add_node',
+			hostname: first.hostname,
+			authorization: 'Bearer ' + operation_token,
+			rejectUnauthorized: false,
+		});
+		await start(contexts[3], 3);
+		await removeOld(3);
 		await ready();
-		assert.ok(Date.now() >= future);
 		await ownedRows(2);
 		await sendOperation(contexts[2].harper, {
 			operation: 'insert',
 			database: 'data',
 			table: 'Rows',
-			records: [{ id: 'after-recovery-bound', region: 'asia', body: 'above-peer-bound' }],
+			records: [{ id: 'after-rename', region: 'europe', body: 'new-origin-body' }],
 		});
 		await waitForCondition(
-			async (signal) =>
-				(await local(3, signal, contexts[2].harper.hostname)).rows.some((row) => row.id === 'after-recovery-bound'),
-			{ timeoutMs: 30_000, description: 'the peer with the newer bound receives the replacement’s write' }
+			async (signal) => {
+				const state = await local(3, signal, oldName);
+				return (
+					state.rows.some((row) => row.id === 'pending-old-origin' && row.body === 'retired-origin-body') &&
+					state.rows.some((row) => row.id === 'after-rename' && row.body === 'new-origin-body')
+				);
+			},
+			{
+				timeoutMs: 60_000,
+				description: 'the lagging shard owner receives retained old-origin and fresh new-origin bodies after removal',
+			}
 		);
-		const state = await local(2, AbortSignal.timeout(10_000));
-		assert.ok(state.localAudit.some((row) => row.id === 'after-recovery-bound' && row.key >= future));
 	});
 	test('losing a whole shard requires a complete backup and cannot mint another empty baseline', async () => {
 		const paths = await Promise.all([0, 2].map(dataPath));
 		await Promise.all([0, 2].map((i) => stopNodeProcess(contexts[i].harper)));
-		const backup = join(contexts[0].harper.dataRootDir, 'saved-shard-backup');
-		await cp(paths[0], backup, { recursive: true });
+		const backups = [0, 2].map((i) => join(contexts[i].harper.dataRootDir, 'saved-shard-backup'));
+		for (let index = 0; index < paths.length; index++) await cp(paths[index], backups[index], { recursive: true });
 		for (const path of paths) await rm(path, { recursive: true });
 		for (const i of [0, 2]) await start(contexts[i], i);
 		await waitForCondition(
@@ -371,21 +431,18 @@ export class BootstrapLocal extends Resource {
 			assert.equal(response.status, 503, JSON.stringify(response.body));
 			assert.ok(!(await local(i, AbortSignal.timeout(10_000))).rows.some((row) => row.id === 'lost-' + i));
 		}
-		await stopNodeProcess(contexts[0].harper);
-		await rm(paths[0], { recursive: true });
-		await cp(backup, paths[0], { recursive: true });
-		await start(contexts[0], 0);
+		for (const [index, i] of [0, 2].entries()) {
+			await stopNodeProcess(contexts[i].harper);
+			await rm(paths[index], { recursive: true });
+			await cp(backups[index], paths[index], { recursive: true });
+			await start(contexts[i], i);
+		}
 		await ready();
 		await ownedRows(0);
 		await ownedRows(2);
 		const restored = await local(2, AbortSignal.timeout(10_000));
-		const recovered = restored.rows.find((row) => row.id === 'after-recovery-bound');
-		assert.ok(recovered, 'the backup contains the replacement origin’s old row');
-		assert.ok(restored.recoveryBound >= recovered.version);
-		assert.ok(
-			!restored.localAudit.some((row) => row.id === recovered.id && row.type === 'put'),
-			'a recovered self-origin snapshot must not append an old mutation to local audit'
-		);
+		const recovered = restored.rows.find((row) => row.id === '1');
+		assert.ok(recovered, 'the complete backup preserves an owned record');
 		const starts = restored.bootstrap.map((history) => history.localFloor);
 		await sendOperation(contexts[2].harper, {
 			operation: 'insert',
@@ -405,8 +462,8 @@ export class BootstrapLocal extends Resource {
 				const otherShard = await local(3, signal);
 				return (
 					owner.rows.some((row) => row.id === recovered.id && row.body === 'updated-after-backup') &&
-					otherShard.rows.some((row) => row.id === recovered.id && row.version > restored.recoveryBound) &&
-					otherShard.rows.some((row) => row.id === 'after-backup' && row.version > restored.recoveryBound)
+					otherShard.rows.some((row) => row.id === recovered.id && row.version > recovered.version) &&
+					otherShard.rows.some((row) => row.id === 'after-backup' && row.version > recovered.version)
 				);
 			},
 			{
