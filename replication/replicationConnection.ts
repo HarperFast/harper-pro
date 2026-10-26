@@ -1618,7 +1618,6 @@ export function maybeDeadAuditIterableForTest<T>(databaseName: string | undefine
 // log beside busy healthy logs would reconnect on every commit.
 export const SEND_LOG_BREAK_RECONNECT_INTERVAL_MS = 5 * 60_000;
 const lastSendLogBreakReconnectAt = new Map<string, number>();
-/** How long a send-log-break reconnect for `key` must still wait; 0 when it may run now. */
 export function sendLogBreakReconnectDelayMs(
 	lastAt: number | undefined,
 	now: number,

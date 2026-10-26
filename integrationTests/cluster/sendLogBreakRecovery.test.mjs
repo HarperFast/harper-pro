@@ -171,6 +171,14 @@ async function startWedgedPair(ctx, name, shape) {
 		description: 'the seed row to replicate before the send iterable is stopped',
 	});
 
+	// The stop must be in place before the write: a write committed before the stopped pass captured its
+	// transaction generation would not count as a commit after the stop.
+	await waitForCondition(async () => /serving a drained audit iterable/.test(await readLog(source)), {
+		timeoutMs: RECOVERY_TIMEOUT_MS,
+		pollMs: POLL_MS,
+		description: 'the source send loop to scan the stopped iterable',
+	});
+
 	// This live write must flow after torn-tail repair and remain behind a mid-log break.
 	await sendOperation(source, {
 		operation: 'insert',
