@@ -153,6 +153,15 @@ function diagnosticBuffer(database: string): Uint8Array {
 }
 
 function report(database: string, status: Diagnostic): void {
+	if (
+		lostOrigins.has(database) &&
+		lostOrigins.get(database) === JSON.stringify([getThisNodeName(), boundRootGenerations(database)])
+	)
+		status = {
+			phase: 'origin-history-lost',
+			reason: new ShardingOriginHistoryLostError(getThisNodeName()).message,
+			backupRequired: true,
+		};
 	const buffer = diagnosticBuffer(database);
 	const words = new Int32Array(buffer.buffer, buffer.byteOffset, 2);
 	const bytes = Buffer.from(JSON.stringify(status));
@@ -361,7 +370,7 @@ export async function hasPriorShardingOrigin(database: string, layout: string, o
 	return false;
 }
 
-async function checkNewShardingOrigin(current: View): Promise<number | undefined> {
+async function checkNewShardingOrigin(current: View, queryMembers = true): Promise<number | undefined> {
 	const name = getThisNodeName();
 	const roots = shardingNativeRoots(current.database);
 	if (
@@ -383,6 +392,7 @@ async function checkNewShardingOrigin(current: View): Promise<number | undefined
 			})
 		)
 			throw new ShardingOriginHistoryLostError(name);
+		if (!queryMembers) return;
 		const answers = await Promise.allSettled(
 			current.members.filter((member) => member.name !== name).map((member) => call(member, current, 'origin-bound'))
 		);
@@ -830,13 +840,16 @@ async function publishLocalBaseline(database: string): Promise<void> {
 		localLayouts.set(database, layout);
 		if (!layout) return;
 		const scopes = shardingRecoveryScopes(database);
-		if (
-			shardingCertificate(database) !== layout &&
-			(scopes.every(({ catalog, scope }) => readShardingBaseline(catalog, layout)?.scope === scope) ||
-				(scopes.every(({ catalog }) => readShardingHistory(catalog, layout)?.phase === 'active') &&
-					hasExistingOwnerAssertion(database)))
-		)
-			await certifyShardingCopy(database, layout, scopes);
+		if (shardingCertificate(database) !== layout) {
+			const witnessed = scopes.every(({ catalog, scope }) => readShardingBaseline(catalog, layout)?.scope === scope);
+			const asserted =
+				scopes.every(({ catalog }) => readShardingHistory(catalog, layout)?.phase === 'active') &&
+				hasExistingOwnerAssertion(database);
+			if (asserted && !witnessed)
+				for (const shard of new Set(readResidencyMap(database)?.ranges.map((range) => range.shard)))
+					await checkNewShardingOrigin(view(database, shard));
+			if (witnessed || asserted) await certifyShardingCopy(database, layout, scopes);
+		}
 		const certified = shardingCertificate(database) === layout;
 		if (
 			certified &&
@@ -893,11 +906,12 @@ export function startShardingBootstrap(): void {
 				if (retry.next > Date.now()) continue;
 				try {
 					await publishLocalBaseline(database);
-					const originChecks = [];
+					const origins = [];
 					for (const shard of new Set(readResidencyMap(database)?.ranges.map((range) => range.shard))) {
 						const current = view(database, shard);
 						await coordinate(current);
-						originChecks.push({ current, bound: await checkNewShardingOrigin(current) });
+						await checkNewShardingOrigin(current, false);
+						origins.push(current);
 					}
 					await publishLocalBaseline(database);
 					if (localLayouts.get(database) && !shardingCertificate(database)) {
@@ -908,7 +922,7 @@ export function startShardingBootstrap(): void {
 								: 'Waiting for a certified same-shard copy; if the entire shard was lost, restore a complete backup';
 						report(database, { phase: 'recovery-required', reason, backupRequired: true });
 					} else {
-						for (const { current, bound } of originChecks) await enableOrigin(current, bound);
+						for (const current of origins) await enableOrigin(current, await checkNewShardingOrigin(current));
 						for (const { root } of shardingNativeRoots(database)) {
 							const word = originReadyWord(root, database);
 							const state = Atomics.load(word, 0);

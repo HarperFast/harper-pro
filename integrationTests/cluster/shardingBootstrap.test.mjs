@@ -317,6 +317,7 @@ export class BootstrapLocal extends Resource {
 			{ timeoutMs: 30_000, description: 'another shard retains the old-origin write while its co-owner is offline' }
 		);
 		const path = await dataPath(2);
+		await stopNodeProcess(contexts[0].harper);
 		await stopNodeProcess(contexts[2].harper);
 		await rm(path, { recursive: true });
 		await start(contexts[2], 2);
@@ -340,11 +341,20 @@ export class BootstrapLocal extends Resource {
 		await waitForCondition(
 			async (signal) => {
 				const status = await sendOperation(contexts[2].harper, { operation: 'cluster_status' }, { signal });
-				assert.equal(status.sharding.data.recovery.phase, 'origin-history-lost');
+				assert.equal(
+					status.sharding.data.recovery.phase,
+					'origin-history-lost',
+					JSON.stringify(status.sharding.data.recovery)
+				);
 				return Date.now() >= refusedAfter;
 			},
 			{ timeoutMs: 10_000, description: 'advancing wall time cannot clear missing history' }
 		);
+		const ownedQuery = await postOperation(contexts[2].harper, {
+			operation: 'sql',
+			sql: 'SELECT * FROM `data`.`Rows`',
+		});
+		assert.equal(ownedQuery.status, 503, JSON.stringify(ownedQuery));
 		for (const region of ['asia', 'europe']) {
 			const response = await postOperation(contexts[2].harper, {
 				operation: 'insert',
@@ -355,6 +365,7 @@ export class BootstrapLocal extends Resource {
 			assert.equal(response.status, 503);
 		}
 		await stopNodeProcess(contexts[2].harper);
+		await start(contexts[0], 0);
 		const removeOld = async (i) => {
 			const response = await postOperation(contexts[i].harper, { operation: 'remove_node', hostname: oldName });
 			if (response.status !== 200) {

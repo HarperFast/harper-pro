@@ -827,10 +827,10 @@ function replicationConfirmationTimeout(automatic = false): number {
 		? CONFIG_PARAMS.REPLICATION_SHARDINGCONFIRMATIONTIMEOUT
 		: CONFIG_PARAMS.REPLICATION_CONFIRMATIONTIMEOUT;
 	const raw = env.get(key);
-	const blobTimeout = Number(env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT));
+	const blobTimeout = automatic ? 0 : Number(env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT));
 	const fallback = automatic ? 30000 : Math.max(900000, blobTimeout > 0 && blobTimeout <= 2147483647 ? blobTimeout : 0);
 	const cached = confirmationTimeouts.get(automatic);
-	if (cached && cached.raw === raw && cached.fallback === fallback) return cached.value;
+	if (cached && Object.is(cached.raw, raw) && cached.fallback === fallback) return cached.value;
 	let value = raw === undefined ? fallback : Number(raw);
 	if (
 		!Number.isInteger(value) ||

@@ -57,14 +57,11 @@ const sockets = [];
 const turns = async () => {
 	for (let n = 0; n < 30; n++) await new Promise(setImmediate);
 };
-async function connect(database, authorization, options = {}) {
+async function connect(database, authorization, options = {}, announced = 'slot-setup-peer') {
 	const socket = new Socket();
 	sockets.push(socket);
 	replicateOverWS(socket, options, authorization);
-	socket.emit(
-		'message',
-		encode([140, 'slot-setup-peer', database, [], buildLocalCapabilities(90_000, false, true), null])
-	);
+	socket.emit('message', encode([140, announced, database, [], buildLocalCapabilities(90_000, false, true), null]));
 	await processed(socket);
 	assert.deepEqual(socket.closes, [], 'handshake succeeds before the tested frame');
 	return socket;
@@ -354,6 +351,36 @@ describe('sharding setup authority', function () {
 			}
 		});
 	}
+
+	for (const route of ['127.0.0.2', '127.0.0.2:9933'])
+		it(`keeps matching discovery address ${route} unbound for sharding`, async () => {
+			const database = `slot_setup_matching_discovery_${route.includes(':') ? 'port' : 'ip'}`;
+			const connection = new NodeReplicationConnection(`wss://${route}`, undefined, database, route);
+			connection.nodeSubscriptions = [{ name: route, url: `wss://${route}`, configRouteReplicates: true }];
+			const socket = await connect(database, { replicates: true }, { connection }, route);
+			await sendMap(socket, database, snapshot(database));
+			await processed(socket, true);
+			assert.ok(socket.closes.length, 'matching an unconfigured discovery address does not grant schema authority');
+			assert.equal(readResidencyMap(database), undefined);
+		});
+
+	for (const route of ['127.0.0.2', '127.0.0.2:9933'])
+		it(`binds matching address ${route} when an explicit node record exists`, async () => {
+			const database = `slot_setup_explicit_matching_${route.includes(':') ? 'port' : 'ip'}`;
+			const priorNodes = server.nodes;
+			server.nodes = [{ name: route, url: `wss://${route}`, replicates: true }];
+			try {
+				const connection = new NodeReplicationConnection(`wss://${route}`, undefined, database, route);
+				connection.nodeSubscriptions = [{ name: route, url: `wss://${route}`, configRouteReplicates: true }];
+				const socket = await connect(database, { replicates: true }, { connection }, route);
+				await sendMap(socket, database, snapshot(database));
+				await processed(socket);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(readResidencyMap(database)?.digest, snapshot(database).digest);
+			} finally {
+				server.nodes = priorNodes;
+			}
+		});
 
 	it('refuses an address alias shared by different configured nodes', async () => {
 		const socket = new Socket();

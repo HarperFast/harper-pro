@@ -41,10 +41,6 @@ export function shardingLayout(database: string, shard?: number): string | undef
 	return digest;
 }
 
-export function shardingRecoveryCatalogs(database: string): any[] {
-	return shardingNativeRoots(database).map(({ catalog }) => catalog);
-}
-
 export function shardingRecoveryScopes(database: string): { catalog: any; scope: string }[] {
 	return shardingConvertedTables(database).map(({ catalog, tables }) => ({
 		catalog,
@@ -143,17 +139,6 @@ export function agreedPeerShard(peer: string, announced: unknown): number | unde
 	// Callers bind the announcement to the authenticated member (or compare it in the direct startup agreement).
 	if (Nodes.primaryStore.getSync(peer)?.shard !== announced) return;
 	return announced as number;
-}
-
-export function admitsShardedOrigin(
-	ownedLayout: string | undefined,
-	localShard: number,
-	peer: string,
-	origin: string,
-	peerShard: number | undefined,
-	peerCertificate: unknown
-): boolean {
-	return !ownedLayout || peer === origin || (peerShard === localShard && peerCertificate === ownedLayout);
 }
 
 export function admitsShardedCopy(

@@ -3951,7 +3951,6 @@ function configuredPeerIdentity(
 	const subscription = options.connection?.nodeSubscriptions?.[0];
 	const expected = authorization?.name ?? configuredName;
 	if (!expected) return undefined;
-	if (expected === announced) return expected;
 	let discoveryHost: string;
 	if (!authorization?.name && subscription?.name === expected && subscription.url) {
 		const endpoint = new URL(subscription.url);
@@ -3961,6 +3960,8 @@ function configuredPeerIdentity(
 	// Only explicit configured records may bind that connection for residency metadata.
 	const configured = [authorization, ...iterateRoutes(options), ...(server.nodes ?? [])];
 	if (subscription && !discoveryHost) configured.push(subscription);
+	if (expected === announced && (!discoveryHost || configured.some((record) => record?.name === expected)))
+		return expected;
 	// URL.hostname brackets/compresses IPv6, while authenticated socket addresses are bare.
 	// Normalize only host aliases; canonical node names remain exact identifiers.
 	const hostAlias = (name: string): string => {
@@ -4202,6 +4203,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				copyCertificationPending = true;
 				const certification = copyCertification;
 				const projection = projectionCopy;
+				const pass = copyWatermark.currentPass;
+				const anchor = copyModeStartTime;
+				const source = copyFromNodeId;
+				const stillCurrent = () => !connectionSuperseded() && copyWatermark.currentPass === pass;
 				tableSubscriptionToReplicator.send({
 					type: 'end_txn',
 					remoteNodeIds: [],
@@ -4210,23 +4215,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					async onCommit() {
 						try {
 							await flushCopyRowsDurable();
-							if (connectionSuperseded()) return;
+							if (!stillCurrent()) return;
 							if (projection) {
 								const { dbisDB } = getDatabaseStores();
-								await dbisDB.put([Symbol.for('shardingProjectionComplete'), copyFromNodeId], {
-									anchor: copyModeStartTime,
+								await dbisDB.put([Symbol.for('shardingProjectionComplete'), source], {
+									anchor,
 									agreement: shardingSourceAgreement(databaseName),
 								});
+								if (!stillCurrent()) return;
 								await dbisDB.flush({ allowWriteStall: true });
+								if (!stillCurrent()) return;
 								wsClosed = true;
 								close(1011, 'Sharding projection complete; resuming owned origins separately');
 								return;
 							}
 							await certifyShardingCopy(databaseName, certification.layout, certification.scopes);
+							if (!stillCurrent()) return;
 							copyCertification = undefined;
 							copyCertificationPending = false;
 							maybeFinishCopy();
 						} catch (error) {
+							if (!stillCurrent()) return;
 							wsClosed = true;
 							close(1011, 'Sharding copy could not establish a durable baseline');
 							logger.warn?.(connectionId, 'Sharding copy certification failed', error);
@@ -6094,7 +6103,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const layout = shardingLayout(databaseName);
 						copyCertification =
 							layout && !projectionCopy ? { layout, scopes: shardingRecoveryScopes(databaseName) } : undefined;
-						if (copyCertification && process.env.HARPER_CLONE_ATTEMPT) await revokeShardingCertificate(databaseName);
+						if (copyCertification && process.env.HARPER_CLONE_ATTEMPT) {
+							await revokeShardingCertificate(databaseName);
+							if (connectionSuperseded()) return;
+						}
 						const copyWasAlreadyActive = inCopyMode;
 						if (copyWasAlreadyActive) sawCopyRestart = true;
 						repairWindowMissRunByNode.clear();
@@ -6104,6 +6116,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// A prior pass's staged cursors (and its in-flight persists — see passAtPersist) must not
 						// be persisted under this pass: they claim delivery this pass's walk has not made (#699).
 						copyWatermark.beginPass();
+						copyCertificationPending = false;
 						// A COPY_COMPLETE from the prior pass must not finalize this one: with the flag left set,
 						// the first commit/blob drain that found nothing outstanding would remove the cursor and
 						// exit copy mode mid-walk, advertising a partial copy as caught-up.
@@ -6137,9 +6150,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// rows that carry no local log entry, and the record-lock barrier must know that.
 							try {
 								await markRecloned(databaseName);
+								if (connectionSuperseded()) return;
 								for (const { catalog } of shardingNativeRoots(databaseName)) {
 									if (typeof catalog.flush === 'function') await catalog.flush({ allowWriteStall: true });
 									else await catalog.flushed; // LMDB exposes its durability barrier as a promise.
+									if (connectionSuperseded()) return;
 								}
 							} catch (error) {
 								logger.error?.(connectionId, 'failed to record the clone for record locks', databaseName, error);
@@ -6408,7 +6423,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								);
 								break;
 							}
-							if (table.residency && databaseBaselineHoldReason(table.primaryStore.rootStore)) {
+							if (
+								table.residency &&
+								(missingShardingOriginStart(databaseName) || databaseBaselineHoldReason(table.primaryStore.rootStore))
+							) {
 								ws.send(
 									encode(
 										peerCapabilitiesLearned && peerSupportsResidencyNotResident(peerCapabilities)
@@ -6807,6 +6825,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							receiverLayout && !restrictedSendingOrigins
 								? shardingNativeRoots(databaseName).map(({ root }) => shardingBaselineState(root, databaseName))
 								: [];
+						const sourceNotReady = (word: Int32Array) => Atomics.load(word, 0) !== 1;
 						const currentTransaction = { txnLogKey: 0 };
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
@@ -6818,8 +6837,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							encodeCopy?: () => Buffer
 						) => {
 							if (closed || wsClosed) return;
-							if (sourceReadiness.some((word) => Atomics.load(word, 0) !== 1))
-								throw new Error('Sharding source completeness was revoked');
+							if (sourceReadiness.some(sourceNotReady)) throw new Error('Sharding source completeness was revoked');
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnLogKey) {
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {

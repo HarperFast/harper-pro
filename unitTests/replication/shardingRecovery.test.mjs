@@ -1,6 +1,5 @@
 import assert from 'node:assert';
 import {
-	admitsShardedOrigin,
 	admitsShardedCopy,
 	publishShardingCertificate,
 	peerHasShardingCertificate,
@@ -28,13 +27,6 @@ import {
 } from '#src/replication/sharedStatusSlots';
 
 describe('Sharding complete source admission', () => {
-	it('an owner accepts the origin or a certified co-owner only', () => {
-		assert.equal(admitsShardedOrigin('owned', 0, 'origin', 'origin', 1, undefined), true);
-		assert.equal(admitsShardedOrigin('owned', 0, 'relay', 'origin', 1, 'owned'), false);
-		assert.equal(admitsShardedOrigin('owned', 0, 'relay', 'origin', 0, undefined), false);
-		assert.equal(admitsShardedOrigin('owned', 0, 'relay', 'origin', 0, 'different-slots'), false);
-		assert.equal(admitsShardedOrigin('owned', 0, 'relay', 'origin', 0, 'owned'), true);
-	});
 	it('an owner copy requires a complete co-owner even when the source is an origin', () => {
 		assert.equal(admitsShardedCopy('owned', 0, 1, 'owned'), false);
 		assert.equal(admitsShardedCopy('owned', 0, 0, undefined), false);
@@ -68,7 +60,6 @@ describe('Sharding complete source admission', () => {
 		);
 	});
 	it('zero-slot receivers retain unrestricted stub streams and copies', () => {
-		assert.equal(admitsShardedOrigin(undefined, undefined, 'relay', 'origin', 1, undefined), true);
 		assert.equal(admitsShardedCopy(undefined, undefined, 1, undefined), true);
 	});
 });
