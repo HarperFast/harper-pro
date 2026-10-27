@@ -3559,10 +3559,10 @@ export class PendingRouteState {
 			unverifiedBatch = this.recordUnverifiedBatch(event, activeMarks, activeRevocations, settled);
 		};
 		const prevOnFailure = event.onFailure;
-		event.onFailure = (error: unknown, position: number) => {
+		event.onFailure = (error: unknown, position: number, afterCommit?: boolean) => {
 			this.removeUnverifiedBatch(unverifiedBatch);
 			this.restore(activeMarks, activeRevocations, settled);
-			return prevOnFailure ? prevOnFailure(error, position) : false;
+			return prevOnFailure ? prevOnFailure(error, position, afterCommit) : false;
 		};
 	}
 	/** For a commit callback already running: attaches and settles at once, restoring on failure. */
@@ -3573,10 +3573,10 @@ export class PendingRouteState {
 		const settled = this.settle(sent[0], sent[1]);
 		const unverifiedBatch = this.recordUnverifiedBatch(event, sent[0], sent[1], settled);
 		const prevOnFailure = event.onFailure;
-		event.onFailure = (error: unknown, position: number) => {
+		event.onFailure = (error: unknown, position: number, afterCommit?: boolean) => {
 			this.removeUnverifiedBatch(unverifiedBatch);
 			this.restore(sent[0], sent[1], settled);
-			return prevOnFailure ? prevOnFailure(error, position) : false;
+			return prevOnFailure ? prevOnFailure(error, position, afterCommit) : false;
 		};
 	}
 	get size(): number {
@@ -3631,9 +3631,9 @@ export class PendingOriginFloors {
 		this.pending.clear();
 		event.originFloors = [...batch.values()];
 		const prevOnFailure = event.onFailure;
-		event.onFailure = (error: unknown, position: number) => {
+		event.onFailure = (error: unknown, position: number, afterCommit?: boolean) => {
 			this.restore(batch);
-			return prevOnFailure ? prevOnFailure(error, position) : false;
+			return prevOnFailure ? prevOnFailure(error, position, afterCommit) : false;
 		};
 	}
 	private restore(batch: Map<number, ReceivedOriginFloor>): void {
@@ -5109,11 +5109,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 		};
 		const prevOnFailure = event.onFailure;
-		event.onFailure = (error: unknown, position: number) => {
+		event.onFailure = (error: unknown, position: number, afterCommit?: boolean) => {
 			if (!connectionSuperseded()) {
 				deferCopyCursorRemoval(nodeId);
 			}
-			return prevOnFailure ? prevOnFailure(error, position) : false;
+			return prevOnFailure ? prevOnFailure(error, position, afterCommit) : false;
 		};
 	}
 	function drainCopyOriginAnchors(): void {
@@ -10035,12 +10035,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						: Math.max(lastSequenceIdReceived ?? 0, maxBatchTxnLogKey), // resume cursor from the batch even without a sequence-update
 				remoteNodeIds: receivingDataFromNodeIds,
 				txnStream,
-				// core skips this frame's onCommit when it fails, so release what onCommit would have
-				onFailure(error: unknown, position: number) {
-					outstandingCommits--;
-					if (commitBacklogPaused) {
-						commitBacklogPaused = false;
-						removePauseReason();
+				// core skips this frame's onCommit when the transaction fails, so release what onCommit would have;
+				// a failed sequence-row write comes after onCommit already did
+				onFailure(error: unknown, position: number, afterCommit?: boolean) {
+					if (!afterCommit) {
+						outstandingCommits--;
+						if (commitBacklogPaused) {
+							commitBacklogPaused = false;
+							removePauseReason();
+						}
 					}
 					return onFrameFailure(error, position);
 				},
