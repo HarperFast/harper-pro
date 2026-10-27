@@ -27,7 +27,14 @@ const topologyCaches = new WeakMap<
 	object,
 	Map<
 		string,
-		{ generation: number; configuration: unknown; nodes: unknown; errors: string[]; agreementErrors: string[] }
+		{
+			generation: number;
+			configuration: unknown;
+			nodes: unknown;
+			errors: string[];
+			agreementErrors: string[];
+			declarationErrors: string[];
+		}
 	>
 >();
 
@@ -192,7 +199,7 @@ export function recordResidencyPolicyAgreement(database: string, peer: string, e
 		logger.warn?.(`Sharding blocked for ${database}: policy from ${peer} could not be installed`, error);
 }
 
-export function residencyTopologyErrors(database = '*', includeRecovery = true): string[] {
+export function residencyTopologyErrors(database = '*', includeRecovery = true, forDeclaration = false): string[] {
 	const store = getHDBNodeTable().auditStore;
 	const generation = Atomics.load(topologyGeneration(store), 0);
 	let configuration;
@@ -209,9 +216,10 @@ export function residencyTopologyErrors(database = '*', includeRecovery = true):
 		previous.configuration === configuration &&
 		previous.nodes === server.nodes
 	)
-		return includeRecovery ? previous.errors : previous.agreementErrors;
+		return forDeclaration ? previous.declarationErrors : includeRecovery ? previous.errors : previous.agreementErrors;
 	const local = digestFingerprint(configuration === 'invalid' ? configuration : configuration.digest);
 	const agreementErrors = [];
+	const policyErrors = [];
 	const recoveryErrors = [];
 	for (const node of server.nodes ?? []) {
 		if (Atomics.load(recoveryLevel(node.name), 0) === -1)
@@ -222,16 +230,18 @@ export function residencyTopologyErrors(database = '*', includeRecovery = true):
 		if (database !== '*') {
 			const flags = Atomics.load(agreement(node.name, database), 0);
 			if (flags & 1) agreementErrors.push(`shard map agreement with ${node.name} is blocked`);
-			if (flags & 2) agreementErrors.push(`sharding policy agreement with ${node.name} is blocked`);
+			if (flags & 2) policyErrors.push(`sharding policy agreement with ${node.name} is blocked`);
 		}
 	}
+	const declarationErrors = agreementErrors.slice();
+	agreementErrors.push(...policyErrors);
 	const errors = [...agreementErrors, ...recoveryErrors];
-	cache.set(database, { generation, configuration, nodes: server.nodes, errors, agreementErrors });
-	return includeRecovery ? errors : agreementErrors;
+	cache.set(database, { generation, configuration, nodes: server.nodes, errors, agreementErrors, declarationErrors });
+	return forDeclaration ? declarationErrors : includeRecovery ? errors : agreementErrors;
 }
 
-setResidencyPlacementGuard((database, owners, requireConnected, shard, root) => {
-	const errors = residencyTopologyErrors(database, requireConnected !== undefined);
+setResidencyPlacementGuard((database, owners, requireConnected, shard, root, forDeclaration) => {
+	const errors = residencyTopologyErrors(database, requireConnected !== undefined, forDeclaration);
 	if (errors.length) throw new ResidencyPlacementError(`Sharding blocked for ${database}: ${errors.join('; ')}`, 503);
 	if (requireConnected !== undefined && shard !== undefined) assertShardingStartupReady(database, shard, root);
 	if (requireConnected === undefined || !owners || owners.includes(server.hostname)) return;

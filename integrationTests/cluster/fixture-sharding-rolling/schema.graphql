@@ -1,0 +1,8 @@
+type RollingRows @table @export {
+	id: ID @primaryKey
+	tag: String @indexed
+	body: String
+}
+type HealthyRows @table(database: "healthy") @export {
+	id: ID @primaryKey
+}

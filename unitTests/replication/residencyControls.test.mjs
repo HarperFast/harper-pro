@@ -13,7 +13,7 @@ import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { INVALIDATED } from '#src/core/resources/Table';
 import { table } from '#src/core/resources/databases';
 import { createAuditEntry, readAuditEntry, Decoder, HAS_BLOBS } from '#src/core/resources/auditStore';
-import { createBlob, getFileId, getFilePathForBlob } from '#src/core/resources/blob';
+import { createBlob, getFileId, getFilePathForBlob, blobFileMissingOrIncomplete } from '#src/core/resources/blob';
 import { writeLockBarrier } from '#src/core/resources/recordLockCoordinator';
 import {
 	initializeResidencySlots,
@@ -984,6 +984,165 @@ describe('Declarative tables keep control and event traffic independent of place
 		assert.deepEqual(socket.closes, []);
 		assert.equal(Records.primaryStore.getEntry('legacy-row').value.body, 'complete');
 	});
+	for (const [legacy, multiple, cold = false] of [
+		[true, false],
+		[false, false],
+		[false, true],
+		[false, false, true],
+	])
+		it(`repairs cursorless copy damage or withholds certification (F-1020, legacy=${legacy}, multiple=${multiple}, cold=${cold})`, async () => {
+			const direction = `cursorless_blob_${legacy}_${multiple}_${cold}`;
+			const peer = 'slot-control-peer';
+			const Nodes = getHDBNodeTable();
+			const previous = Nodes.primaryStore.getSync(peer);
+			const { Records, socket: first, database } = await connect(false, direction, legacy);
+			const subscription = databaseSubscriptions.get(database);
+			const originalSend = subscription.send;
+			const originalGetEntry = Records.primaryStore.getEntry;
+			let coldRead = false;
+			let certificationFinished = false;
+			try {
+				await Nodes.primaryStore.put(peer, { name: peer, shard: 0, replicates: true });
+				const payload = Buffer.alloc(65_536, 79);
+				await Records.put('donor', {
+					id: 'donor',
+					region: 0,
+					body: createBlob(payload),
+					...(multiple ? { extra: createBlob(Buffer.alloc(65_536, 83)) } : {}),
+				});
+				const donor = Records.primaryStore.getEntry('donor');
+				const announced = [];
+				const encodedRecord = Buffer.from(
+					encodeCopyRecordValue(Records.primaryStore, donor.value, (blob) => announced.push(blob))
+				);
+				const version = Date.now() + 100;
+				const encoder = Records.primaryStore.encoder;
+				const sendRow = (socket, leading = false) => {
+					if (!legacy)
+						socket.emit(
+							'message',
+							encode([
+								140,
+								peer,
+								database,
+								[],
+								buildLocalCapabilities(90_000, true, true),
+								{
+									shardsDigest: getResidencyConfiguration().digest,
+									shard: 0,
+									shardingCertificate: shardingSourceAgreement(database),
+								},
+							])
+						);
+					socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+					socket.emit(
+						'message',
+						encode([
+							132,
+							{
+								structures: encoder.structures,
+								typedStructs: encoder.typedStructs,
+								attributes: Records.attributes,
+								schemaDefined: true,
+								residency: Records.residency,
+							},
+							Records.tableId,
+							Records.tableName,
+						])
+					);
+					socket.emit('message', encode([130, [server.hostname], 42]));
+					socket.emit('message', encode([148, version + 1000, 1]));
+					if (leading)
+						for (let i = 0; i < 9; i++)
+							socket.emit(
+								'message',
+								recordFrame(Records, 'put', 'leading-' + i, undefined, version, 42, {
+									encodedRecord,
+									extendedType: HAS_BLOBS | 512,
+								})
+							);
+					socket.emit(
+						'message',
+						recordFrame(Records, 'put', 'interrupted', undefined, version, 42, {
+							encodedRecord,
+							extendedType: HAS_BLOBS | 512,
+						})
+					);
+				};
+				sendRow(first);
+				await until(() => first.closes.length || Records.primaryStore.getEntry('interrupted')?.version === version);
+				assert.deepEqual(first.closes, []);
+				const original = Records.primaryStore.getEntry('interrupted').value.body;
+				const originalFile = getFileId(original);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				assert.equal(Records.dbisDB.getSync([Symbol.for('copyCursor'), peerId]), undefined);
+				first.close(1011, 'interrupt first copy before blob bytes');
+				await until(() => blobFileMissingOrIncomplete(original) === true);
+				const { socket: second } = await connect(false, direction, legacy);
+				subscription.send = function (event) {
+					if (
+						event.type === 'end_txn' &&
+						event.remoteNodeIds?.length === 0 &&
+						event.onCommit?.constructor.name === 'AsyncFunction'
+					) {
+						const onCommit = event.onCommit;
+						event.onCommit = async (...args) => {
+							try {
+								return await onCommit(...args);
+							} finally {
+								certificationFinished = true;
+							}
+						};
+					}
+					return originalSend.call(this, event);
+				};
+				if (cold)
+					Records.primaryStore.getEntry = function (id, ...args) {
+						const entry = originalGetEntry.call(this, id, ...args);
+						if (id !== 'interrupted' || coldRead) return entry;
+						coldRead = true;
+						return Promise.resolve(entry);
+					};
+				sendRow(second, !multiple);
+				for (const [index, blob] of announced.entries())
+					second.emit(
+						'message',
+						encode([
+							146,
+							{ fileId: getFileId(blob), size: payload.length, finished: true },
+							Buffer.alloc(payload.length, index ? 83 : 79),
+						])
+					);
+				second.emit('message', encode([149]));
+				if (multiple) {
+					await until(() => second.closes.length || certificationFinished);
+					assert.deepEqual(second.closes, [], 'unrepairable pairing holds certification without reconnect churn');
+					assert.equal(shardingCertificate(database), undefined, 'pending owned bytes must not certify readiness');
+					assert.equal(
+						Records.dbisDB.getSync([Symbol.for('copyCursor'), peerId]),
+						undefined,
+						'a future repair copy must revisit the damaged row'
+					);
+					assert.equal(blobFileMissingOrIncomplete(original), true);
+				} else {
+					await until(() => second.closes.length || blobFileMissingOrIncomplete(original) === false);
+					assert.deepEqual(second.closes, []);
+					assert.equal(getFileId(Records.primaryStore.getEntry('interrupted').value.body), originalFile);
+					assert.deepEqual(Buffer.from(await original.arrayBuffer()), payload);
+					if (cold) assert.equal(coldRead, true);
+					if (!legacy) {
+						await until(() => certificationFinished);
+						assert.equal(shardingCertificate(database), shardingLayout(database));
+					}
+				}
+			} finally {
+				subscription.send = originalSend;
+				Records.primaryStore.getEntry = originalGetEntry;
+				if (previous) await Nodes.primaryStore.put(peer, previous);
+				else await Nodes.primaryStore.remove(peer);
+			}
+		});
+
 	it('refuses a policy-less slot reference before creating unreferenced blob files', async () => {
 		const { Records, socket } = await connect(false, 'missing_blob_policy', true);
 		const payload = Buffer.alloc(65_536, 73);

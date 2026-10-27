@@ -14,6 +14,7 @@ import { server } from '#src/core/server/Server';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { shardingSourceAgreement, publishShardingCertificate } from '#src/replication/shardingRecovery';
 import { getReplicationSharedStatus, getHDBNodeTable } from '#src/replication/knownNodes';
+import { loadGQLSchema } from '#src/core/resources/graphql';
 import { databases, table } from '#src/core/resources/databases';
 import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
 import { transaction } from '#src/core/resources/transaction';
@@ -57,11 +58,11 @@ const sockets = [];
 const turns = async () => {
 	for (let n = 0; n < 30; n++) await new Promise(setImmediate);
 };
-async function connect(database, authorization, options = {}, announced = 'slot-setup-peer') {
+async function connect(database, authorization, options = {}, announced = 'slot-setup-peer', metadata = null) {
 	const socket = new Socket();
 	sockets.push(socket);
 	replicateOverWS(socket, options, authorization);
-	socket.emit('message', encode([140, announced, database, [], buildLocalCapabilities(90_000, false, true), null]));
+	socket.emit('message', encode([140, announced, database, [], buildLocalCapabilities(90_000, false, true), metadata]));
 	await processed(socket);
 	assert.deepEqual(socket.closes, [], 'handshake succeeds before the tested frame');
 	return socket;
@@ -127,6 +128,89 @@ describe('sharding setup authority', function () {
 			server.nodes = previousNodes;
 		}
 	});
+	it('activates the local legacy declaration after a peer declares first (F-1021)', async () => {
+		const database = 'rolling_policy_reload';
+		const priorNodes = server.nodes,
+			priorShards = server.shards;
+		const priorList = get('replication_shards'),
+			priorShard = get('replication_shard');
+		const peer = 'rolling-policy-peer';
+		try {
+			setProperty('replication_shards', [0, 1]);
+			setProperty('replication_shard', 0);
+			server.nodes = [{ name: peer }];
+			server.shards = new Map([
+				[0, [{ name: server.hostname }]],
+				[1, [{ name: peer }]],
+			]);
+			await installResidencyMap(
+				createResidencyMap(
+					database,
+					2,
+					[
+						{ start: 0, end: 1, shard: 0 },
+						{ start: 1, end: 2, shard: 1 },
+					],
+					1
+				)
+			);
+			await loadGQLSchema(
+				`type RollingRows @table(database: "${database}") { id: ID @primaryKey tag: String @indexed }`
+			);
+			const Records = databases[database].RollingRows;
+			Records.setResidencyById((id) => Number(id));
+			await Records.put('0', { id: '0', tag: 'owned' });
+			const prior = Records.primaryStore.getEntry('0');
+			const socket = await connect(database, { name: peer, replicates: true }, {}, peer, {
+				shardsDigest: residencyConfigurationDigest(),
+			});
+			const policy = { slots: 2, slotFrom: 'Number(id)', byAttribute: false };
+			socket.emit(
+				'message',
+				encode([
+					145,
+					[{ table: Records.tableName, attributes: Records.attributes, schemaDefined: true, residency: policy }],
+					database,
+				])
+			);
+			await processed(socket, true);
+			assert.ok(
+				residencyTopologyErrors(database).some((error) => error.includes('policy agreement')),
+				'peer announcement sets the real shared mismatch'
+			);
+			assert.equal(Records.residency, undefined);
+			await loadGQLSchema(
+				`type RollingRows @table(database: "${database}") @sharded(slots: 2, slotFrom: "Number(id)") { id: ID @primaryKey tag: String @indexed }`
+			);
+			assert.deepEqual(Records.residency, policy, 'local reload must resolve its own missing declaration');
+			assert.equal(Records.primaryStore.getEntry('0').version, prior.version, 'equivalent conversion moves no records');
+			assert.ok(
+				residencyTopologyErrors(database).some((error) => error.includes('policy agreement')),
+				'declaration must not clear or poison the live-admission cache'
+			);
+			await assert.rejects(() => Records.put('0', { id: '0', tag: 'refused' }), /policy agreement/);
+			const retry = await connect(database, { name: peer, replicates: true }, {}, peer, {
+				shardsDigest: residencyConfigurationDigest(),
+			});
+			retry.emit(
+				'message',
+				encode([
+					145,
+					[{ table: Records.tableName, attributes: Records.attributes, schemaDefined: true, residency: policy }],
+					database,
+				])
+			);
+			await processed(retry, true);
+			assert.ok(!residencyTopologyErrors(database).some((error) => error.includes('policy agreement')));
+		} finally {
+			recordResidencyPolicyAgreement(database, peer);
+			server.nodes = priorNodes;
+			server.shards = priorShards;
+			setProperty('replication_shards', priorList);
+			setProperty('replication_shard', priorShard);
+		}
+	});
+
 	it('heals a peer disagreement after local repair without another peer handshake', () => {
 		const nodes = server.nodes;
 		const shards = get('replication_shards');

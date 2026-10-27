@@ -1510,7 +1510,10 @@ export function createRepairInflater(stream: Readable, expectedSize: number): Re
  * classification the in-place repair uses, so a compressed body ties only once it has inflated to its
  * declared size and a torn one (which a length check cannot see) does not.
  */
-async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
+async function storedBlobsAreComplete(
+	value: unknown,
+	onIncomplete?: (blob: Blob, damaged: boolean | undefined) => void
+): Promise<boolean> {
 	if (value == null) return false;
 	const blobs: Blob[] = [];
 	findBlobsInObject(value, (blob: Blob) => {
@@ -1519,7 +1522,13 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	// The header claimed blobs but none was reachable (e.g. one living only in a patch chain): we
 	// cannot prove the local copy is whole, so it must not tie.
 	if (blobs.length === 0) return false;
-	for (const blob of blobs) if ((await blobFileMissingOrIncompleteAsync(blob)) !== false) return false;
+	for (const blob of blobs) {
+		const damaged = await blobFileMissingOrIncompleteAsync(blob);
+		if (damaged !== false) {
+			onIncomplete?.(blob, damaged);
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -4071,6 +4080,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let projectionRequested = false;
 	let copyCertification: { layout: string; scopes: ReturnType<typeof shardingRecoveryScopes> } | undefined;
 	let copyCertificationPending = false;
+	let incompleteCopyTies: { table: any; id: any }[] = [];
 	const copyCursorKey = () => Symbol.for(projectionCopy ? 'shardingProjectionCursor' : 'copyCursor');
 	let copyModeStartTime = 0;
 	let copyModeOrderVersion; // copy-order version the leader announced in COPY_START; persisted in the cursor (#421)
@@ -4232,6 +4242,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								close(1011, 'Sharding projection complete; resuming owned origins separately');
 								return;
 							}
+							for (const { table, id } of incompleteCopyTies) {
+								const entry = await table.getEntry(id);
+								if (!stillCurrent()) return;
+								if (entry?.value && entry.metadataFlags & HAS_BLOBS && !(await storedBlobsAreComplete(entry.value))) {
+									if (!stillCurrent()) return;
+									if (source !== undefined) {
+										const { dbisDB } = getDatabaseStores();
+										await dbisDB.remove([copyCursorKey(), source]);
+										await dbisDB.flush({ allowWriteStall: true });
+									}
+									if (!stillCurrent()) return;
+									copyFinalizeWatchdog?.stop();
+									logger.warn?.(
+										connectionId,
+										`Sharding recovery required for ${databaseName}.${table.name} record ${String(id).slice(0, 256)}: an owned blob is pending or incomplete; run repair_blob_data and reconnect before certifying the copy`
+									);
+									return;
+								}
+							}
+							if (!stillCurrent()) return;
 							await certifyShardingCopy(databaseName, certification.layout, certification.scopes);
 							if (!stillCurrent()) return;
 							copyCertification = undefined;
@@ -4701,15 +4731,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Blobs whose file was (or is being) repaired IN PLACE (#699): these are files a committed
 	// record already references, so they must never enter a decode-failure/relocation cleanup list.
 	const inPlaceRepairedBlobs = new WeakSet();
-	// Repair candidates exist only on a link that is re-delivering already-applied records: a copy
-	// that resumed from a persisted cursor, a copy restarted on a live connection, or a resume's
-	// leading-duplicate tail. A virgin base copy never pays the stored-entry read.
-	let copyResumeRequested = false;
-	let sawCopyRestart = false;
-	// Latch the repair window OFF once the resumed walk has provably passed the re-delivered span:
-	// re-delivered duplicates are contiguous, so a run of stored-entry misses means every later
-	// record is genuinely new and the per-record getEntry would be a pure miss tax for the rest of
-	// the copy. A hit resets the run (healthy duplicates also reset it — still inside the window).
+	// Only the live resume tail has a miss cutoff. A cursorless copy can encounter an incomplete
+	// stored blob anywhere in its walk, so copy repair uses the identity check's entry throughout.
 	const repairWindowMissRunByNode = new Map<number | undefined, number>();
 	const repairDeclines: Record<string, number> = {};
 	// Blob-transfer ids whose record was skipped as an identity tie. The chunk handler drops their chunks on sight,
@@ -6112,6 +6135,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							layout && !projectionCopy ? { layout, scopes: shardingRecoveryScopes(databaseName) } : undefined;
 						// Revoke every old callback's pass before revocation itself can yield.
 						copyWatermark.beginPass();
+						incompleteCopyTies = [];
 						copyCertificationPending = false;
 						copyCompleteReceived = false;
 						pendingCopyCursor = null;
@@ -6120,7 +6144,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (connectionSuperseded()) return;
 						}
 						const copyWasAlreadyActive = inCopyMode;
-						if (copyWasAlreadyActive) sawCopyRestart = true;
 						repairWindowMissRunByNode.clear();
 						inCopyMode = true;
 						if (!copyWasAlreadyActive) subscriptionSetupWatchdog?.pause();
@@ -8592,20 +8615,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					throw error;
 				}
 
-				// A copy frame is applied as a snapshot with no duplicate detection, so it re-mints the
-				// record's blobs as fresh local files and dereferences the durable ones we already hold —
-				// and if the copy is interrupted mid-blob the record is left on a PENDING stub the source
-				// cannot fill. Skip a frame that ties with what we have, which copy mode would otherwise
-				// never detect: it is outside the leading-duplicate window (a copy has no resume cursor).
-				// Blob-carrying records only; re-applying an identical blob-less record is harmless.
+				let copyBlobEntry;
+				if (messageIsCopyFrame && auditRecord.extendedType & HAS_BLOBS) {
+					try {
+						copyBlobEntry = tableDecoder?.getEntry?.(id);
+						if (copyBlobEntry?.then) copyBlobEntry = await copyBlobEntry;
+					} catch {
+						repairDeclines['entry-read-error'] = (repairDeclines['entry-read-error'] ?? 0) + 1;
+					}
+				}
+				let copyBlobDamage: { blob: Blob; damaged: boolean | undefined } | undefined;
 				if (
-					messageIsCopyFrame &&
-					!!(auditRecord.extendedType & HAS_BLOBS) &&
+					copyBlobEntry &&
 					(await isDurableIdentityTie(
-						readLocalEntry(tableDecoder, id),
+						copyBlobEntry,
 						auditRecord.version,
 						remoteShortIdToLocalId?.get(auditRecord.nodeId),
-						true
+						true,
+						(value) =>
+							storedBlobsAreComplete(value, (blob, damaged) => {
+								copyBlobDamage = { blob, damaged };
+							})
 					))
 				) {
 					let skippedBlobs: Blob[] | undefined;
@@ -8663,14 +8693,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				let repairTargets: any[] | null = null;
 				if (
 					auditRecord.extendedType & HAS_BLOBS &&
-					(repairWindowMissRunByNode.get(localSourceNodeId) ?? 0) < 8 &&
-					((messageIsCopyFrame && (copyResumeRequested || sawCopyRestart)) ||
-						leadingDupCursorByNode.has(localSourceNodeId as any))
+					(messageIsCopyFrame ||
+						((repairWindowMissRunByNode.get(localSourceNodeId) ?? 0) < 8 &&
+							leadingDupCursorByNode.has(localSourceNodeId as any)))
 				) {
 					let storedEntry: any = null;
 					let entryReadResolved = false;
 					try {
-						storedEntry = tableDecoder?.getEntry?.(id);
+						storedEntry = messageIsCopyFrame ? copyBlobEntry : tableDecoder?.getEntry?.(id);
 						if (storedEntry && typeof storedEntry.then === 'function') storedEntry = await storedEntry;
 						entryReadResolved = true;
 					} catch {
@@ -8683,7 +8713,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							id,
 							auditRecord.version,
 							localSourceNodeId,
-							blobFileMissingOrIncompleteAsync,
+							(blob) =>
+								copyBlobDamage?.blob === blob ? copyBlobDamage.damaged : blobFileMissingOrIncompleteAsync(blob),
 							repairDeclines,
 							storedEntry
 						);
@@ -8694,6 +8725,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 						repairDeclines['no-stored-entry'] = (repairDeclines['no-stored-entry'] ?? 0) + 1;
 					}
+				}
+				if (messageIsCopyFrame && copyCertification && copyBlobDamage) {
+					await revokeShardingCertificate(databaseName);
+					if (!repairTargets) incompleteCopyTies.push({ table: tableDecoder, id });
 				}
 				// Async repair inspection may have outlived this socket; do not mint files after its close sweep.
 				if (connectionSuperseded()) return;
@@ -10194,7 +10229,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				let copyResume;
 				if (copyCursor && !shardingProjection) {
-					copyResumeRequested = true;
 					startTime = 0; // request a copy; the cursor tells the leader where to resume
 					copyResume = {
 						copyStartTime: copyCursor.copyStartTime,

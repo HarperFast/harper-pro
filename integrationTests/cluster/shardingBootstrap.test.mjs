@@ -53,6 +53,18 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 		assert.equal(response.status, 200);
 		return response.json();
 	}
+	async function blob(i, seed = false, signal = AbortSignal.timeout(10_000)) {
+		const node = contexts[i].harper;
+		const response = await fetch(`${node.httpURL}/BootstrapBlob${seed ? '?seed=1' : ''}`, {
+			signal,
+			headers: {
+				Authorization: 'Basic ' + Buffer.from(`${node.admin.username}:${node.admin.password}`).toString('base64'),
+			},
+		});
+		assert.equal(response.status, 200, 'a ready owner must serve its owned blob');
+		return response.json();
+	}
+
 	async function dataPath(i) {
 		const state = await local(i, AbortSignal.timeout(10_000));
 		const path = await realpath(state.path);
@@ -106,12 +118,15 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 				id: ID @primaryKey
 				region: String @indexed
 				body: String
+				payload: Blob
 			}`
 		);
 		await appendFile(
 			join(component, 'resources.js'),
 			`
-import { transaction } from 'harper';
+import { transaction, createBlob } from 'harper';
+import { createHash } from 'node:crypto';
+import { Readable } from 'node:stream';
 let releaseReservation, reservationDone, reservationTimer;
 export class BootstrapReservation extends Resource {
  async get(target) {
@@ -136,6 +151,16 @@ export class BootstrapReservation extends Resource {
   }).finally(() => { releaseReservation = undefined; clearTimeout(reservationTimer); });
   reservationDone.catch(() => {});
   return started.promise;
+ }
+}
+export class BootstrapBlob extends Resource {
+ async get(target) {
+  const bytes = Buffer.alloc(65536, 79);
+  if (target.get('seed')) await tables.Rows.put('replacement-blob', { id: 'replacement-blob', region: 'asia', body: 'copy-blob', payload: createBlob(Readable.from([bytes]), {saveBeforeCommit: true}) });
+  const entry = tables.Rows.primaryStore.getEntry('replacement-blob');
+  if (!entry?.value?.payload) return { digest: null };
+  const actual = Buffer.from(await entry.value.payload.arrayBuffer());
+  return { digest: createHash('sha256').update(actual).digest('hex'), size: actual.length, version: entry.version };
  }
 }
 export class BootstrapLocal extends Resource {
@@ -389,6 +414,10 @@ export class BootstrapLocal extends Resource {
 	});
 	test('a lost origin refuses its old name, then a new name and the retired origin both converge', async () => {
 		const oldName = contexts[2].harper.hostname;
+		const expectedBlob = await blob(0, true);
+		await waitForCondition(async (signal) => (await blob(2, false, signal)).digest === expectedBlob.digest, {
+			description: 'co-owner receives the original blob before replacement',
+		});
 		await stopNodeProcess(contexts[3].harper);
 		await sendOperation(contexts[2].harper, {
 			operation: 'insert',
@@ -487,6 +516,7 @@ export class BootstrapLocal extends Resource {
 		await start(contexts[3], 3);
 		await removeOld(3);
 		await ready();
+		assert.deepEqual(await blob(2), expectedBlob, 'fresh-name readiness includes complete owned blob bytes');
 		await ownedRows(2);
 		await sendOperation(contexts[2].harper, {
 			operation: 'insert',
