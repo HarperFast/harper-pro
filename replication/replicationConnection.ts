@@ -3491,6 +3491,7 @@ export function mergePersistedCopyBounds(
 	dbisDB: DbisStore | undefined,
 	cursor?: DbisCursor
 ): Map<number, number> {
+	let scannedRange = false;
 	if (typeof dbisDB?.getRange === 'function') {
 		try {
 			for (const entry of dbisDB.getRange({
@@ -3505,18 +3506,21 @@ export function mergePersistedCopyBounds(
 				}
 				mergeCopyBoundRecordInto(target, value);
 			}
+			scannedRange = true;
 		} catch {
 			// Fall back to direct key read below if range iteration is unavailable or closed.
 		}
 	}
-	mergeCopyBoundRecordInto(target, readDbisCursorSync(dbisDB, 'copyBound', 0));
+	if (!scannedRange) {
+		mergeCopyBoundRecordInto(target, readDbisCursorSync(dbisDB, 'copyBound', 0));
+	}
 	mergeCopyBoundRecordInto(target, cursor?.maxCopiedVersionByOrigin);
 	return target;
 }
 
 /**
  * Merges `bounds` into `[Symbol.for('copyBound'), peerId]` in `dbisDB`, voids any persisted `[seq, *]`
- * route `certifiedFrom <= bound` across all peers so a disconnected peer's stale row cannot satisfy
+ * route `certifiedFrom <= bound` on other peers' rows so a disconnected peer's stale row cannot satisfy
  * `admitCheckpoint` in core, and bumps the origin state epoch.
  */
 export function persistMergedCopyBounds(
@@ -3534,15 +3538,20 @@ export function persistMergedCopyBounds(
 	];
 	let clearedAnySeqCertification = false;
 	if (typeof dbisDB.getRange === 'function') {
+		let seqRows: Map<number, DbisCursor> | undefined;
 		try {
-			const seqRows = collectSeqRows(
+			seqRows = collectSeqRows(
 				dbisDB.getRange({
 					start: SEQ_KEY,
 					end: [SEQ_KEY, Buffer.from([0xff])],
 				})
 			);
+		} catch {
+			// Ignore range scan failure on closing stores.
+		}
+		if (seqRows) {
 			for (const [seqPeerId, row] of seqRows) {
-				if (!Array.isArray(row?.nodes)) continue;
+				if ((peerId > 0 && seqPeerId === peerId) || !Array.isArray(row?.nodes)) continue;
 				let changed = false;
 				const nodes = row.nodes.map((node: any) => {
 					if (!node || typeof node.id !== 'number' || typeof node.certifiedFrom !== 'number') return node;
@@ -3558,8 +3567,6 @@ export function persistMergedCopyBounds(
 					writes.push(Promise.resolve(dbisDB.put([SEQ_KEY, seqPeerId], { ...row, nodes })));
 				}
 			}
-		} catch {
-			// Ignore range scan failure on closing stores.
 		}
 	}
 	return Promise.all(writes).then((res) => {
@@ -4697,7 +4704,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						await getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
 					} else {
 						pendingCopyCursorRemovalNodeId = nodeId;
-						flushRouteState();
 					}
 				}
 			}
@@ -5826,12 +5832,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		STORAGE_IS_ROCKSDB && peerCapabilitiesLearned && peerSupportsOriginFloors(peerCapabilities);
 	const certifiesCheckpointFloors = () =>
 		STORAGE_IS_ROCKSDB && peerCapabilitiesLearned && peerCertifiesCheckpointFloors(peerCapabilities);
+	const supportsCheckpointFloors = () =>
+		STORAGE_IS_ROCKSDB &&
+		originFloorsDurable((auditStore ?? getDatabaseStores().auditStore)?.rootStore ?? RocksDatabase.prototype);
 	const pendingOriginFloors = new PendingOriginFloors();
 	const pendingRouteState = new PendingRouteState();
 	/** Origins marked partial on this socket, cleared only by a copy begun after the mark. */
 	const partialMarked = new Set<number>();
 	/** Origins with a durable replication hole on this route, preserved across copy-pass restoration. */
 	const holedOrigins = new Set<number>();
+	/** Origins revoked on this socket (`originId -> generation`), re-asserted if a settled write fails to persist. */
+	const revokedOrigins = new Map<number, string | undefined>();
 	/** Origins optimistically marked certifiedFrom by the latest subscription request before knowing if the peer copies. */
 	const optimisticCertifiedOrigins = new Map<number, { start: number; generation?: string }>();
 	let copyWasResumed = false;
@@ -5839,11 +5850,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let requestIsCopy = false;
 	/** Highest audit-less copyApply record version applied per origin, bounding floor-only resume. */
 	const maxCopiedVersionByOrigin = new Map<number, number>();
+	/** Other peers' persisted `certifiedFrom` thresholds per origin at copy start, so copy batches only persist bounds when crossing one. */
+	const otherPeerCertifiedFroms = new Map<number, number[]>();
 	function loadPersistedCopyBounds(cursor?: DbisCursor): void {
+		if (!supportsCheckpointFloors()) return;
 		mergePersistedCopyBounds(maxCopiedVersionByOrigin, getDatabaseStores().dbisDB, cursor);
 	}
 	async function persistCopyBounds(): Promise<boolean> {
-		if (maxCopiedVersionByOrigin.size === 0 || connectionSuperseded()) return true;
+		if (!supportsCheckpointFloors() || maxCopiedVersionByOrigin.size === 0 || connectionSuperseded()) return true;
 		try {
 			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? dbAuditStore;
@@ -5914,7 +5928,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const nameToId = exportIdMapping(store);
 			const thisNodeName = getThisNodeName();
 			const directFullCoverage: string[] = options.connection?.exclusionOrigins ?? [];
-			// this socket replicates every table of the database to this node
 			const routeFullCoverage = directFullCoverage.includes(remoteNodeName);
 			loadPersistedCopyBounds();
 			const peerId = getIdOfRemoteNode(remoteNodeName, store);
@@ -5925,13 +5938,41 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const id = nameToId[name];
 				const rawState = Array.isArray(peerNodes) ? peerNodes.find((n: any) => n?.id === id) : undefined;
 				const state = rawState ? { ...rawState } : undefined;
+				if (partialMarked.has(id) && state?.partialHistory !== true) {
+					const gen = typeof state?.originGeneration === 'string' ? state.originGeneration : certificate.generation;
+					pendingRouteState.partialHistory(id, true, gen);
+				}
+				if (holedOrigins.has(id) && state?.hole !== true) {
+					const gen = typeof state?.originGeneration === 'string' ? state.originGeneration : certificate.generation;
+					pendingRouteState.hole(id, gen);
+				}
+				if (revokedOrigins.has(id)) {
+					const revokedGen = revokedOrigins.get(id);
+					if (
+						state?.floorRevoked === true ||
+						(revokedGen !== undefined &&
+							((typeof state?.originGeneration === 'string' && state.originGeneration !== revokedGen) ||
+								(!certificate.revoked &&
+									typeof certificate.generation === 'string' &&
+									certificate.generation !== revokedGen)))
+					) {
+						revokedOrigins.delete(id);
+					} else {
+						pendingRouteState.revoke(
+							id,
+							revokedGen ?? (typeof state?.originGeneration === 'string' ? state.originGeneration : undefined)
+						);
+					}
+				}
 				const copyBound = maxCopiedVersionByOrigin.get(id);
 				if (copyBound !== undefined) {
 					clearCopyBoundedCertification(id, copyBound, state, certificate.generation);
 				}
 				if (certificate.revoked) {
 					if (checkpointGrade) {
-						pendingRouteState.revoke(id);
+						const gen = typeof state?.originGeneration === 'string' ? state.originGeneration : undefined;
+						revokedOrigins.set(id, gen);
+						pendingRouteState.revoke(id, gen);
 						pendingOriginFloors.drop(id);
 					}
 					continue;
@@ -5987,9 +6028,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					const floorCursor = cursorBelowFloor(certificate.floor!);
 					if (floorCursor > (lastSentBareFloorCursors.get(name) ?? 0)) {
-						lastSentBareFloorCursors.set(name, floorCursor);
 						try {
 							ws.send(encode([SUBSCRIPTION_UPDATE, { originCursors: { [name]: floorCursor } }]));
+							lastSentBareFloorCursors.set(name, floorCursor);
 						} catch (error) {
 							logger.debug?.(connectionId, 'could not send bare-floor originCursor update for', name, error);
 						}
@@ -6660,6 +6701,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const peerIdForCopy = remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined;
 							const seqEntryForCopy =
 								peerIdForCopy !== undefined ? readDbisCursorSync(dbisDB, 'seq', peerIdForCopy) : undefined;
+							otherPeerCertifiedFroms.clear();
+							if (supportsCheckpointFloors() && typeof dbisDB?.getRange === 'function') {
+								try {
+									const seqRows = collectSeqRows(
+										dbisDB.getRange({
+											start: SEQ_KEY,
+											end: [SEQ_KEY, Buffer.from([0xff])],
+										})
+									);
+									for (const [seqPeerId, row] of seqRows) {
+										if (seqPeerId === peerIdForCopy || !Array.isArray(row?.nodes)) continue;
+										for (const node of row.nodes) {
+											if (node && typeof node.id === 'number' && typeof node.certifiedFrom === 'number') {
+												let list = otherPeerCertifiedFroms.get(node.id);
+												if (!list) {
+													list = [];
+													otherPeerCertifiedFroms.set(node.id, list);
+												}
+												list.push(node.certifiedFrom);
+											}
+										}
+									}
+								} catch {
+									// Ignore range scan failure on closing stores.
+								}
+							}
 							for (const state of seqEntryForCopy?.nodes ?? []) {
 								if (state && typeof state.id === 'number') {
 									copyMarkOrigins.set(
@@ -7916,7 +7983,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											const revokedKey = name + '\0' + (lastKnownGenerations.get(name) ?? '');
 											if (peerLevel < 2 || revokedSent.has(revokedKey)) continue;
 											(rising ??= new Map()).set(name, 0);
-											revokedSent.add(revokedKey);
 											continue;
 										}
 										const floor = certificate.floor!;
@@ -7941,7 +8007,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									if (!rising || closed || wsClosed) return;
 									ws.send(encode([SEQUENCE_ID_UPDATE, currentSequenceId, Object.fromEntries(rising)]));
 									for (const [name, encoded] of rising) {
-										if (encoded === 0) continue;
+										if (encoded === 0) {
+											revokedSent.add(name + '\0' + (lastKnownGenerations.get(name) ?? ''));
+											continue;
+										}
 										for (const key of revokedSent) {
 											if (key === name || key.startsWith(name + '\0')) revokedSent.delete(key);
 										}
@@ -8764,7 +8833,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				currentCopyPass?.resumedWithWidening || options.connection?.routeFullCoverage === false
 			);
 			const copyFrameFullCoverage = options.connection?.routeFullCoverage !== false;
-			let batchAdvancedCopyBound = false;
+			let batchCrossedOtherPeerCertifiedFrom = false;
 			do {
 				getSharedStatus();
 				const eventLength = decoder.readInt();
@@ -9181,12 +9250,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// live subscribers" — a copy frame at or after copyStartTime carries a real audit entry
 					// and already delivers per-row events, so it needs no marker and is intentionally excluded.
 					if (event.isCopyApply && event.table) copiedTablesThisPass.add(event.table);
-					if (event.isCopyApply && typeof event.nodeId === 'number') {
+					if (event.isCopyApply && typeof event.nodeId === 'number' && supportsCheckpointFloors()) {
 						const prevMax = maxCopiedVersionByOrigin.get(event.nodeId) ?? 0;
 						if (auditRecord.version > prevMax) {
 							maxCopiedVersionByOrigin.set(event.nodeId, auditRecord.version);
-							batchAdvancedCopyBound = true;
 							clearCopyBoundedCertification(event.nodeId, auditRecord.version);
+							const otherThresholds = otherPeerCertifiedFroms.get(event.nodeId);
+							if (otherThresholds && otherThresholds.length > 0) {
+								const remaining = otherThresholds.filter((t) => t > auditRecord.version);
+								if (remaining.length < otherThresholds.length) {
+									batchCrossedOtherPeerCertifiedFrom = true;
+									if (remaining.length > 0) {
+										otherPeerCertifiedFroms.set(event.nodeId, remaining);
+									} else {
+										otherPeerCertifiedFroms.delete(event.nodeId);
+									}
+								}
+							}
 						}
 					}
 					if (messageIsCopyFrame && event.table) lastCopyFrameKey = { table: event.table, id: event.id };
@@ -9315,7 +9395,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// core reads these after awaiting onCommit
 					endTxnEvent.originCursors = takeDurableOriginCursors();
 					pendingOriginFloors.takeForCommit(endTxnEvent, cursorBlockedByBlob());
-					if (batchAdvancedCopyBound) {
+					if (batchCrossedOtherPeerCertifiedFrom) {
 						await persistCopyBounds();
 					}
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
@@ -10479,6 +10559,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// the peer stopped certifying at level 2 (a rollback, or a downgrade to none): it may write below
 				// the floor it certified, and nothing it relayed is checkpoint-grade any more
 				for (const state of level2Rows) {
+					revokedOrigins.set(state.id, state.originGeneration);
 					pendingRouteState.revoke(state.id, state.originGeneration);
 					state.floorRevoked = true;
 					state.closedFloor = undefined;
@@ -10486,8 +10567,42 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 			optimisticCertifiedOrigins.clear();
 			for (const state of allNodes) {
-				if (state.partialHistory === true) partialMarked.add(state.id);
-				if (state.hole === true) holedOrigins.add(state.id);
+				if (state.partialHistory === true) {
+					partialMarked.add(state.id);
+				} else if (partialMarked.has(state.id)) {
+					pendingRouteState.partialHistory(
+						state.id,
+						true,
+						typeof state.originGeneration === 'string' ? state.originGeneration : undefined
+					);
+					state.partialHistory = true;
+					state.certifiedFrom = undefined;
+				}
+				if (state.hole === true) {
+					holedOrigins.add(state.id);
+				} else if (holedOrigins.has(state.id)) {
+					pendingRouteState.hole(
+						state.id,
+						typeof state.originGeneration === 'string' ? state.originGeneration : undefined
+					);
+					state.hole = true;
+				}
+				if (revokedOrigins.has(state.id)) {
+					const revokedGen = revokedOrigins.get(state.id);
+					if (
+						state.floorRevoked === true ||
+						(revokedGen !== undefined &&
+							typeof state.originGeneration === 'string' &&
+							state.originGeneration !== revokedGen)
+					) {
+						revokedOrigins.delete(state.id);
+					} else {
+						const gen = revokedGen ?? (typeof state.originGeneration === 'string' ? state.originGeneration : undefined);
+						pendingRouteState.revoke(state.id, gen);
+						state.floorRevoked = true;
+						state.closedFloor = undefined;
+					}
+				}
 				const copyBound = maxCopiedVersionByOrigin.get(state.id);
 				if (copyBound !== undefined) {
 					clearCopyBoundedCertification(state.id, copyBound, state);

@@ -728,24 +728,48 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 				},
 			],
 		});
+		// Copying peer 1's own [seq, 1] row is managed via PendingRouteState on its connection and is not
+		// rewritten directly by persistMergedCopyBounds(..., 1).
+		await dbisDB.put([Symbol.for('seq'), 1], {
+			seqId: T,
+			nodes: [{ id: 2, certifiedFrom: T + 100 }],
+		});
 		// Copy from peer 1 copied origin 2's rows up to T + 800 (keyed under peer 1).
 		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 800]]), 1, rootStore);
+		assert.strictEqual(dbisDB.getSync([Symbol.for('seq'), 1]).nodes[0].certifiedFrom, T + 100);
+		const epochWord = new Int32Array(sharedBuffers.get('origin-state-epoch'));
+		assert.strictEqual(Atomics.load(epochWord, 0), 1);
 		// Concurrent/later copy from peer 3 copied origin 1's rows up to T + 500 (keyed under peer 3);
-		// neither peer's copyBound entry overwrites the other.
+		// neither peer's copyBound entry overwrites the other, and peer 3's pass voids peer 1's stale [seq, 1] row.
 		await persistMergedCopyBounds(dbisDB, new Map([[1, T + 500]]), 3, rootStore);
+		assert.strictEqual(dbisDB.getSync([Symbol.for('seq'), 1]).nodes[0].certifiedFrom, undefined);
+		assert.strictEqual(Atomics.load(epochWord, 0), 2);
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1]), { 2: T + 800 });
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3]), { 1: T + 500 });
 		const loaded = mergePersistedCopyBounds(new Map(), dbisDB);
 		assert.strictEqual(loaded.get(1), T + 500);
 		assert.strictEqual(loaded.get(2), T + 800);
 
+		// A failing [seq, *] put propagates out of persistMergedCopyBounds rather than being swallowed by the scan try/catch.
+		const failingDbis = {
+			...dbisDB,
+			put(key, val) {
+				if (Array.isArray(key) && key[0] === Symbol.for('seq')) {
+					return Promise.reject(new Error('simulated seq put failure'));
+				}
+				return dbisDB.put(key, val);
+			},
+		};
+		await assert.rejects(
+			() => persistMergedCopyBounds(failingDbis, new Map([[1, T + 900]]), 3, rootStore),
+			/simulated seq put failure/
+		);
+
 		// Persisting the bound voided origin 2's stale certifiedFrom in [seq, 2] on disk, while preserving origin 1's
-		// certifiedFrom (T + 700 > T + 500) and bumping the shared origin-state-epoch buffer.
+		// certifiedFrom (T + 700 > T + 500).
 		const persistedPeer2Seq = dbisDB.getSync([Symbol.for('seq'), 2]);
 		assert.strictEqual(persistedPeer2Seq.nodes.find((n) => n.id === 2).certifiedFrom, undefined);
 		assert.strictEqual(persistedPeer2Seq.nodes.find((n) => n.id === 1).certifiedFrom, T + 700);
-		const epochWord = new Int32Array(sharedBuffers.get('origin-state-epoch'));
-		assert.strictEqual(Atomics.load(epochWord, 0), 1);
 
 		const seqRows = new Map([
 			[
