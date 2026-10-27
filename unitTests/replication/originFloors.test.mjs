@@ -5,7 +5,6 @@ import {
 	PendingRouteState,
 	buildOriginCursorVector,
 	checkpointGradeRow,
-	clearGenlessClosedFloorOnSeqRow,
 	collectRelayableCertificates,
 	cursorBelowFloor,
 	encodeOriginCertificate,
@@ -701,7 +700,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(partialRouteState.hasPending(), false);
 	});
 
-	it('database-wide copyBound suppresses floor-only resume and level-2 relay across peer routes and voids stale [seq, *] certifiedFrom in dbisDB', async () => {
+	it('a copy writes only its own [copyBound, peer] row, by a locked max-merge, and the database-wide bound suppresses floor-only resume and level-2 relay', async () => {
 		const store = new Map();
 		const keyOf = (k) => JSON.stringify([k[0]?.description ?? String(k[0]), k[1]]);
 		const parseKey = (s) => {
@@ -715,11 +714,23 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 				return sharedBuffers.get(name);
 			},
 		};
+		const locks = new Map();
 		const dbisDB = {
 			rootStore,
 			getSync: (k) => store.get(keyOf(k)),
+			// lands a turn later, so two unlocked read-merge-writes of one row would interleave
 			put: async (k, v) => {
+				await new Promise((resolve) => setImmediate(resolve));
 				store.set(keyOf(k), v);
+			},
+			withLock(k, callback) {
+				const previous = locks.get(keyOf(k)) ?? Promise.resolve();
+				const run = previous.then(() => callback());
+				locks.set(
+					keyOf(k),
+					run.catch(() => {})
+				);
+				return run;
 			},
 			getRange({ start }) {
 				const prefix = start?.description ?? String(start);
@@ -731,9 +742,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 				return out;
 			},
 		};
-		// Disconnected peer 2's persisted [seq, 2] row has certifiedFrom <= T + 800 for origin 2,
-		// and certifiedFrom > T + 500 for origin 1 (which should remain intact).
-		await dbisDB.put([Symbol.for('seq'), 2], {
+		const seqRow2 = {
 			seqId: T,
 			nodes: [
 				{
@@ -745,83 +754,36 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 					fullCoverage: true,
 					certifiedFrom: T + 100,
 				},
-				{
-					id: 1,
-					originLogKey: T + 1000,
-					closedFloor: T + 900,
-					relayable: true,
-					originGeneration: 'g1',
-					fullCoverage: true,
-					certifiedFrom: T + 700,
-				},
 			],
-		});
-		// Copying peer 1's own [seq, 1] row is managed via PendingRouteState on its connection and is not
-		// rewritten directly by persistMergedCopyBounds(..., 1).
-		await dbisDB.put([Symbol.for('seq'), 1], {
-			seqId: T,
-			nodes: [{ id: 2, certifiedFrom: T + 100 }],
-		});
-		// Copy from peer 1 copied origin 2's rows up to T + 800 (keyed under peer 1).
-		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 800]]), 1, rootStore);
-		assert.strictEqual(dbisDB.getSync([Symbol.for('seq'), 1]).nodes[0].certifiedFrom, T + 100);
-		const epochWord = new Int32Array(sharedBuffers.get('origin-state-epoch'));
-		assert.strictEqual(Atomics.load(epochWord, 0), 1);
-		// Concurrent/later copy from peer 3 copied origin 1's rows up to T + 500 (keyed under peer 3);
-		// neither peer's copyBound entry overwrites the other, and peer 3's pass voids peer 1's stale [seq, 1] row.
-		await persistMergedCopyBounds(dbisDB, new Map([[1, T + 500]]), 3, rootStore);
-		assert.strictEqual(dbisDB.getSync([Symbol.for('seq'), 1]).nodes[0].certifiedFrom, undefined);
-		assert.strictEqual(Atomics.load(epochWord, 0), 2);
-		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1]), { 2: T + 800 });
+		};
+		store.set(keyOf([Symbol.for('seq'), 2]), seqRow2);
+		const epochWord = () => Atomics.load(new Int32Array(sharedBuffers.get('origin-state-epoch')), 0);
+		assert.strictEqual(await persistMergedCopyBounds(dbisDB, new Map([[2, T + 800]]), 1, rootStore), true);
+		assert.strictEqual(await persistMergedCopyBounds(dbisDB, new Map([[1, T + 500]]), 3, rootStore), true);
+		assert.strictEqual(epochWord(), 2, 'each committed advance bumps the origin-state epoch');
+		assert.strictEqual(dbisDB.getSync([Symbol.for('seq'), 2]), seqRow2, 'no route row is written');
+		// never lowered, and an unchanged bound writes nothing
+		assert.strictEqual(await persistMergedCopyBounds(dbisDB, new Map([[2, T + 700]]), 1, rootStore), false);
+		assert.strictEqual(epochWord(), 2);
+		// two writers of one peer's row serialize on its lock, so neither loses the other's bound
+		await Promise.all([
+			persistMergedCopyBounds(dbisDB, new Map([[2, T + 900]]), 1, rootStore),
+			persistMergedCopyBounds(dbisDB, new Map([[3, T + 850]]), 1, rootStore),
+		]);
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1]), { 2: T + 900, 3: T + 850 });
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3]), { 1: T + 500 });
+		const epochBeforeFailure = epochWord();
+		const failingDbis = { ...dbisDB, put: () => Promise.reject(new Error('simulated copy bound put failure')) };
+		await assert.rejects(
+			() => persistMergedCopyBounds(failingDbis, new Map([[2, T + 990]]), 1, rootStore),
+			/simulated copy bound put failure/
+		);
+		assert.strictEqual(epochWord(), epochBeforeFailure, 'the epoch moves only after a commit');
 		const loaded = mergePersistedCopyBounds(new Map(), dbisDB);
 		assert.strictEqual(loaded.get(1), T + 500);
-		assert.strictEqual(loaded.get(2), T + 800);
+		assert.strictEqual(loaded.get(2), T + 900);
 
-		const failingDbis = {
-			...dbisDB,
-			put(key, val) {
-				if (Array.isArray(key) && key[0] === Symbol.for('seq')) {
-					return Promise.reject(new Error('simulated seq put failure'));
-				}
-				return dbisDB.put(key, val);
-			},
-		};
-		await assert.rejects(
-			() => persistMergedCopyBounds(failingDbis, new Map([[1, T + 900]]), 3, rootStore),
-			/simulated seq put failure/
-		);
-		assert.strictEqual(
-			Atomics.load(epochWord, 0),
-			3,
-			'origin-state-epoch still bumps in finally when a [seq, *] void write was issued before failure'
-		);
-
-		// Persisting the bound voided origin 2's stale certifiedFrom in [seq, 2] on disk, while preserving origin 1's
-		// certifiedFrom (T + 700 > T + 500).
-		const persistedPeer2Seq = dbisDB.getSync([Symbol.for('seq'), 2]);
-		assert.strictEqual(persistedPeer2Seq.nodes.find((n) => n.id === 2).certifiedFrom, undefined);
-		assert.strictEqual(persistedPeer2Seq.nodes.find((n) => n.id === 1).certifiedFrom, T + 700);
-
-		const seqRows = new Map([
-			[
-				1,
-				{
-					seqId: T,
-					nodes: [
-						{
-							id: 2,
-							originLogKey: T + 1000,
-							closedFloor: T + 600,
-							originGeneration: 'g2',
-							fullCoverage: true,
-							certifiedFrom: T + 100,
-						},
-					],
-				},
-			],
-			[2, persistedPeer2Seq],
-		]);
+		const seqRows = new Map([[1, { seqId: T, nodes: [{ ...seqRow2.nodes[0] }] }]]);
 		const certified = [];
 		const vector = buildOriginCursorVector(
 			seqRows,
@@ -834,9 +796,8 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		);
 		assert.deepStrictEqual(vector, { relayed: T + 1000 });
 		assert.deepStrictEqual(certified, []);
-
 		const relayed = collectRelayableCertificates(
-			seqRows,
+			new Map([[2, seqRow2]]),
 			['relayed'],
 			nameToId,
 			() => 2,
@@ -844,48 +805,23 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			loaded
 		);
 		assert.deepStrictEqual(relayed.get('relayed'), { floor: T + 600 });
+	});
 
-		const failingRangeDbis = {
-			...dbisDB,
-			getRange(opts) {
-				if (opts?.start === Symbol.for('seq')) {
-					throw new Error('simulated seq getRange failure');
-				}
-				return dbisDB.getRange(opts);
-			},
-		};
-		await assert.rejects(
-			() => persistMergedCopyBounds(failingRangeDbis, new Map([[1, T + 950]]), 3, rootStore),
-			/simulated seq getRange failure/,
-			'persistMergedCopyBounds rejects if scanning [seq, *] throws so callers cannot treat un-voided routes as safe'
-		);
-
-		let concurrentPutInjected = false;
-		const racingDbis = {
-			...dbisDB,
-			getSync(key) {
-				if (!concurrentPutInjected && Array.isArray(key) && key[0] === Symbol.for('seq') && key[1] === 1) {
-					concurrentPutInjected = true;
-					const cur = dbisDB.getSync(key);
-					store.set(keyOf(key), {
-						...cur,
-						seqId: T + 1234,
-						nodes: [{ ...cur.nodes[0], originLogKey: T + 1234, hole: true }],
-					});
-				}
-				return dbisDB.getSync(key);
-			},
-		};
-		await dbisDB.put([Symbol.for('seq'), 1], {
-			seqId: T,
-			nodes: [{ id: 1, originLogKey: T + 100, certifiedFrom: T + 200, originGeneration: 'g1' }],
-		});
-		await persistMergedCopyBounds(racingDbis, new Map([[1, T + 960]]), 3, rootStore);
-		const racedRow = dbisDB.getSync([Symbol.for('seq'), 1]);
-		assert.strictEqual(racedRow.seqId, T + 1234, 'concurrent seqId advance is preserved when voiding certifiedFrom');
-		assert.strictEqual(racedRow.nodes[0].originLogKey, T + 1234, 'concurrent originLogKey advance is preserved');
-		assert.strictEqual(racedRow.nodes[0].hole, true, 'concurrent hole mark is preserved');
-		assert.strictEqual(racedRow.nodes[0].certifiedFrom, undefined, 'certifiedFrom <= bound is voided');
+	it("PendingRouteState carries a coverage restore as the mark's sixth element and a level-1 floor clear as a revocation naming no generation", () => {
+		const routeState = new PendingRouteState(() => {});
+		routeState.fullCoverage(1, 'g1');
+		routeState.revoke(2, undefined);
+		const event = { remoteNodeIds: [1] };
+		routeState.takeInto(event);
+		assert.deepStrictEqual(event.originRouteStates, [[1, undefined, undefined, undefined, 'g1', true]]);
+		assert.deepStrictEqual(event.originFloorRevocations, [[2, undefined]]);
+		// a cleared level-1 floor is never checked for a sticky revocation, and a later certificate may floor it again
+		assert.strictEqual(routeState.verifyPersisted([{ id: 2, closedFloor: T + 5 }], event), true);
+		assert.strictEqual(routeState.hasPending(), false);
+		// a closed connection keeps only safety marks: a coverage restore belongs to the copy that earned it
+		routeState.fullCoverage(1, 'g1');
+		routeState.retainOnlySafetyMarks();
+		assert.strictEqual(routeState.hasPending(), false);
 	});
 
 	it('PendingRouteState verifyPersisted restores settled safety marks and revocations if the [seq, peer] write did not persist them', () => {
@@ -980,38 +916,6 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		);
 		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
 		assert.strictEqual(routeState.hasPending(), false);
-	});
-
-	it('clearGenlessClosedFloorOnSeqRow awaits [seq, peer] put and clears closedFloor and relayable only on genless nodes', async () => {
-		const store = new Map();
-		const keyOf = (k) => JSON.stringify([k[0]?.description ?? String(k[0]), k[1]]);
-		const sharedBuffers = new Map();
-		const rootStore = {
-			getUserSharedBuffer(name, defaultBuffer) {
-				if (!sharedBuffers.has(name)) sharedBuffers.set(name, defaultBuffer);
-				return sharedBuffers.get(name);
-			},
-		};
-		const dbisDB = {
-			rootStore,
-			getSync: (k) => store.get(keyOf(k)),
-			put: async (k, v) => {
-				store.set(keyOf(k), v);
-			},
-		};
-		await dbisDB.put([Symbol.for('seq'), 1], {
-			seqId: T,
-			nodes: [
-				{ id: 2, originLogKey: T + 500, closedFloor: T + 300, relayable: true },
-				{ id: 3, originLogKey: T + 500, closedFloor: T + 300, relayable: true, originGeneration: 'g3' },
-			],
-		});
-		assert.strictEqual(await clearGenlessClosedFloorOnSeqRow(dbisDB, 1, 2, rootStore), true);
-		const updated = dbisDB.getSync([Symbol.for('seq'), 1]);
-		assert.strictEqual(updated.nodes[0].closedFloor, undefined);
-		assert.strictEqual(updated.nodes[0].relayable, false);
-		assert.strictEqual(updated.nodes[1].closedFloor, T + 300);
-		assert.strictEqual(updated.nodes[1].relayable, true);
 	});
 
 	it('buildOriginCursorVector never uses floor-only resume for removed origins seeded from another row or unnamed node ids', () => {
