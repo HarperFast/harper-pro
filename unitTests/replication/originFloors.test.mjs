@@ -5,6 +5,7 @@ import {
 	PendingRouteState,
 	buildOriginCursorVector,
 	checkpointGradeRow,
+	clearGenlessClosedFloorOnSeqRow,
 	collectRelayableCertificates,
 	cursorBelowFloor,
 	encodeOriginCertificate,
@@ -680,6 +681,24 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			[2, undefined, false, undefined, 'g2'],
 			[3, undefined, false, undefined, 'g3-new'],
 		]);
+
+		const partialRouteState = new PendingRouteState();
+		const partialRouteMarked = new Map([[1, 'g1']]);
+		const partialPass = {
+			passId: 5,
+			startTime: T,
+			resumed: false,
+			resumedWithWidening: false,
+			fullCoverage: false,
+			seqDurableAtCopyStart: true,
+			completeReceived: true,
+			restored: false,
+			originGenerations: new Map([[1, 'g1']]),
+		};
+		assert.strictEqual(restoreCompletedCopyPass(partialPass, 5, partialRouteMarked, partialRouteState), true);
+		assert.strictEqual(partialPass.restored, true);
+		assert.strictEqual(partialRouteMarked.size, 1);
+		assert.strictEqual(partialRouteState.hasPending(), false);
 	});
 
 	it('database-wide copyBound suppresses floor-only resume and level-2 relay across peer routes and voids stale [seq, *] certifiedFrom in dbisDB', async () => {
@@ -947,5 +966,37 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			true
 		);
 		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
+	});
+
+	it('clearGenlessClosedFloorOnSeqRow awaits [seq, peer] put and clears closedFloor and relayable only on genless nodes', async () => {
+		const store = new Map();
+		const keyOf = (k) => JSON.stringify([k[0]?.description ?? String(k[0]), k[1]]);
+		const sharedBuffers = new Map();
+		const rootStore = {
+			getUserSharedBuffer(name, defaultBuffer) {
+				if (!sharedBuffers.has(name)) sharedBuffers.set(name, defaultBuffer);
+				return sharedBuffers.get(name);
+			},
+		};
+		const dbisDB = {
+			rootStore,
+			getSync: (k) => store.get(keyOf(k)),
+			put: async (k, v) => {
+				store.set(keyOf(k), v);
+			},
+		};
+		await dbisDB.put([Symbol.for('seq'), 1], {
+			seqId: T,
+			nodes: [
+				{ id: 2, originLogKey: T + 500, closedFloor: T + 300, relayable: true },
+				{ id: 3, originLogKey: T + 500, closedFloor: T + 300, relayable: true, originGeneration: 'g3' },
+			],
+		});
+		assert.strictEqual(await clearGenlessClosedFloorOnSeqRow(dbisDB, 1, 2, rootStore), true);
+		const updated = dbisDB.getSync([Symbol.for('seq'), 1]);
+		assert.strictEqual(updated.nodes[0].closedFloor, undefined);
+		assert.strictEqual(updated.nodes[0].relayable, false);
+		assert.strictEqual(updated.nodes[1].closedFloor, T + 300);
+		assert.strictEqual(updated.nodes[1].relayable, true);
 	});
 });

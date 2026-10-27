@@ -3731,7 +3731,7 @@ function notifyLiveRouteBoundListeners(dbisDB: DbisStore | undefined, rootStore?
 	}
 }
 
-async function clearGenlessClosedFloorOnSeqRow(
+export async function clearGenlessClosedFloorOnSeqRow(
 	dbisDB: DbisStore | undefined,
 	peerNodeId: number | undefined,
 	originId: number,
