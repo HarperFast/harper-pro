@@ -813,7 +813,6 @@ const SUBSCRIPTION_SETUP_TIMEOUT_MS = positiveMsOr(
 );
 const SEND_SUBSCRIPTION_SETUP_BUDGET_MS = SEND_SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL;
 const TEST_FORCE_ORIGIN_FLOORS_LEVEL_1 = process.env.HARPER_TEST_FORCE_ORIGIN_FLOORS_LEVEL_1 === '1';
-// Builds the capability bag for a handshake from the database's store when known, falling back to the engine prototype.
 const getLocalCapabilities = (store?: any) =>
 	buildLocalCapabilities(
 		SEND_SUBSCRIPTION_SETUP_BUDGET_MS,
@@ -3090,9 +3089,26 @@ export class PendingRouteState {
 	private settledRevokeVersion = new Map<number, number>();
 	private takenEvents = new WeakSet<object>();
 	private unverifiedBatches: UnverifiedRouteStateBatch[] = [];
-	private readonly onSettled?: (event: any) => void;
+	private onSettled?: (event: any) => void;
 	constructor(onSettled?: (event: any) => void) {
 		this.onSettled = onSettled;
+	}
+	setOnSettled(onSettled?: (event: any) => void): void {
+		this.onSettled = onSettled;
+	}
+	retainOnlySafetyMarks(): void {
+		if (!this.marks) return;
+		for (const [originId, entry] of this.marks) {
+			const isPartialTrue = entry.mark[2] === true;
+			const isClear = Boolean(entry.clearCertifiedFirst);
+			const isHole = entry.mark[3] === true;
+			if (!isPartialTrue && !isClear && !isHole) {
+				this.marks.delete(originId);
+			} else {
+				entry.mark[1] = undefined;
+				if (!isPartialTrue) entry.mark[2] = undefined;
+			}
+		}
 	}
 	hasPending(): boolean {
 		return Boolean(this.marks?.size || this.revocations?.size);
@@ -3342,8 +3358,21 @@ export class PendingRouteState {
 		revocations: Map<number, PendingRouteRevocationEntry> | undefined,
 		settled: SettledRouteStateVersions
 	): UnverifiedRouteStateBatch | undefined {
-		if (!marks?.size && !revocations?.size) return undefined;
-		const batch: UnverifiedRouteStateBatch = { event, marks, revocations, settled };
+		let safetyMarks: Map<number, PendingRouteMarkEntry> | undefined;
+		for (const [originId, entry] of marks ?? []) {
+			const isPartialTrue = entry.mark[2] === true;
+			const isClear = Boolean(entry.clearCertifiedFirst);
+			const isHole = entry.mark[3] === true;
+			if (!isPartialTrue && !isClear && !isHole) continue;
+			(safetyMarks ??= new Map()).set(originId, {
+				mark: [entry.mark[0], undefined, isPartialTrue ? true : undefined, isHole ? true : undefined, entry.mark[4]],
+				clearCertifiedFirst: isClear || isPartialTrue ? true : undefined,
+				version: entry.version,
+				clearVersion: entry.clearVersion,
+			});
+		}
+		if (!safetyMarks?.size && !revocations?.size) return undefined;
+		const batch: UnverifiedRouteStateBatch = { event, marks: safetyMarks, revocations, settled };
 		this.unverifiedBatches.push(batch);
 		this.onSettled?.(event);
 		return batch;
@@ -3378,7 +3407,7 @@ export class PendingRouteState {
 			for (const [originId, entry] of batch.marks ?? []) {
 				const [, certifiedFrom, partialHistory, hole, gen] = entry.mark;
 				const node = Array.isArray(peerNodes) ? peerNodes.find((n: any) => n?.id === originId) : undefined;
-				if (gen !== undefined && typeof node?.originGeneration === 'string' && node.originGeneration !== gen) {
+				if (gen !== undefined && node?.originGeneration !== gen) {
 					continue;
 				}
 				if (!node) {
@@ -3401,20 +3430,12 @@ export class PendingRouteState {
 					batchPersisted = false;
 					break;
 				}
-				if (
-					typeof certifiedFrom === 'number' &&
-					node.partialHistory !== true &&
-					!(typeof node.certifiedFrom === 'number' && node.certifiedFrom <= certifiedFrom)
-				) {
-					batchPersisted = false;
-					break;
-				}
 			}
 			if (batchPersisted) {
 				for (const [originId, entry] of batch.revocations ?? []) {
 					const [, gen] = entry.revocation;
 					const node = Array.isArray(peerNodes) ? peerNodes.find((n: any) => n?.id === originId) : undefined;
-					if (gen !== undefined && typeof node?.originGeneration === 'string' && node.originGeneration !== gen) {
+					if (gen !== undefined && node?.originGeneration !== gen) {
 						continue;
 					}
 					if (node?.floorRevoked !== true) {
@@ -3604,6 +3625,60 @@ export function restoreCompletedCopyPass(
 const COPY_BOUND_KEY = Symbol.for('copyBound');
 const SEQ_KEY = Symbol.for('seq');
 const fallbackOriginStateEpochs = new WeakMap<object, number>();
+const liveRouteBoundListeners = new WeakMap<object, Set<() => void>>();
+
+type SharedRouteSafetyState = {
+	pendingRouteState: PendingRouteState;
+	partialMarked: Map<number, string | undefined>;
+	holedOrigins: Map<number, string | undefined>;
+	revokedOrigins: Map<number, string | undefined>;
+	bareFloorClearedOrigins: Set<number>;
+	ownerConnectionId?: string;
+};
+const sharedRouteSafetyByDb = new WeakMap<object, Map<string, SharedRouteSafetyState>>();
+
+function notifyLiveRouteBoundListeners(dbisDB: DbisStore | undefined, rootStore?: any): void {
+	const resolvedRoot = rootStore ?? (dbisDB as any)?.rootStore;
+	const keyObj = resolvedRoot && typeof resolvedRoot === 'object' ? resolvedRoot : (dbisDB as any);
+	if (!keyObj || typeof keyObj !== 'object') return;
+	const listeners = liveRouteBoundListeners.get(keyObj);
+	if (!listeners) return;
+	for (const fn of Array.from(listeners)) {
+		try {
+			fn();
+		} catch {
+			// Ignore listener errors so copy-bound persistence is unaffected.
+		}
+	}
+}
+
+function clearGenlessClosedFloorOnSeqRow(
+	dbisDB: DbisStore | undefined,
+	peerNodeId: number | undefined,
+	originId: number,
+	rootStore?: any
+): void {
+	if (!dbisDB?.put || peerNodeId === undefined) return;
+	const row = readDbisCursorSync(dbisDB, 'seq', peerNodeId);
+	if (!Array.isArray(row?.nodes)) return;
+	let changed = false;
+	const nodes = row.nodes.map((node: any) => {
+		if (
+			node &&
+			node.id === originId &&
+			typeof node.originGeneration !== 'string' &&
+			(typeof node.closedFloor === 'number' || node.relayable === true)
+		) {
+			changed = true;
+			return { ...node, closedFloor: undefined, relayable: false };
+		}
+		return node;
+	});
+	if (changed) {
+		void Promise.resolve(dbisDB.put([SEQ_KEY, peerNodeId], { ...row, nodes })).catch(() => {});
+		bumpCopyBoundEpoch(dbisDB, rootStore, true);
+	}
+}
 
 function bumpCopyBoundEpoch(dbisDB: DbisStore | undefined, rootStore?: any, bumpShared = true): void {
 	const resolvedRoot = rootStore ?? (dbisDB as any)?.rootStore;
@@ -3661,7 +3736,9 @@ function mergeSeqRowVoidingCopyBounds(
 				} else if (typeof prev.closedFloor === 'number' && !(next.closedFloor >= prev.closedFloor)) {
 					next.closedFloor = prev.closedFloor;
 				}
-				if (prev.hole === true) next.hole = true;
+				if (prev.hole === true && !(prev.partialHistory === true && node.partialHistory === false)) {
+					next.hole = true;
+				}
 				if (prev.partialHistory === true && node.partialHistory !== false) next.partialHistory = true;
 			}
 			byId.set(node.id, next);
@@ -3743,21 +3820,35 @@ export function persistMergedCopyBounds(
 	rootStore?: any
 ): Promise<unknown> | undefined {
 	if (!dbisDB?.put || bounds.size === 0) return undefined;
-	const peerMerged = new Map<number, number>(bounds);
-	mergeCopyBoundRecordInto(peerMerged, readDbisCursorSync(dbisDB, 'copyBound', peerId));
+	const existingPeerRecord = readDbisCursorSync(dbisDB, 'copyBound', peerId);
+	const existingPeerBounds = new Map<number, number>();
+	mergeCopyBoundRecordInto(existingPeerBounds, existingPeerRecord);
+	const peerMerged = new Map<number, number>(existingPeerBounds);
+	let boundAdvanced = existingPeerRecord == null;
+	for (const [originId, v] of bounds) {
+		if (Number.isInteger(originId) && typeof v === 'number' && Number.isFinite(v)) {
+			const prev = peerMerged.get(originId) ?? 0;
+			if (v > prev) {
+				peerMerged.set(originId, v);
+				boundAdvanced = true;
+			}
+		}
+	}
 	const allBounds = mergePersistedCopyBounds(new Map(peerMerged), dbisDB);
 	let clearedAnySeqCertification = false;
 	let issuedAnyWrite = false;
 	const bumpEpoch = () => {
 		if (issuedAnyWrite || clearedAnySeqCertification) {
-			bumpCopyBoundEpoch(dbisDB, rootStore, clearedAnySeqCertification);
+			bumpCopyBoundEpoch(dbisDB, rootStore, boundAdvanced || clearedAnySeqCertification);
+			notifyLiveRouteBoundListeners(dbisDB, rootStore);
 		}
 	};
-	let writes: Promise<unknown>[];
-	const touchedSeqPeers: Array<{ seqPeerId: number; snapshotRow: DbisCursor }> = [];
+	const writes: Promise<unknown>[] = [];
 	try {
-		issuedAnyWrite = true;
-		writes = [Promise.resolve(dbisDB.put([COPY_BOUND_KEY, peerId], Object.fromEntries(peerMerged)))];
+		if (boundAdvanced) {
+			issuedAnyWrite = true;
+			writes.push(Promise.resolve(dbisDB.put([COPY_BOUND_KEY, peerId], Object.fromEntries(peerMerged))));
+		}
 		if (typeof dbisDB.getRange === 'function') {
 			const seqRows = collectSeqRows(
 				dbisDB.getRange({
@@ -3771,7 +3862,7 @@ export function persistMergedCopyBounds(
 				const { merged, changed } = mergeSeqRowVoidingCopyBounds(latestRow, row, allBounds);
 				if (changed) {
 					clearedAnySeqCertification = true;
-					touchedSeqPeers.push({ seqPeerId, snapshotRow: merged });
+					issuedAnyWrite = true;
 					writes.push(Promise.resolve(dbisDB.put([SEQ_KEY, seqPeerId], merged)));
 				}
 			}
@@ -3780,21 +3871,8 @@ export function persistMergedCopyBounds(
 		bumpEpoch();
 		return Promise.reject(error);
 	}
-	return Promise.all(writes)
-		.then(async () => {
-			if (touchedSeqPeers.length === 0) return;
-			const rewrites: Promise<unknown>[] = [];
-			for (const { seqPeerId, snapshotRow } of touchedSeqPeers) {
-				const postWriteRow = readDbisCursorSync(dbisDB, 'seq', seqPeerId);
-				if (!postWriteRow) continue;
-				const { merged, changed } = mergeSeqRowVoidingCopyBounds(postWriteRow, snapshotRow, allBounds);
-				if (changed) {
-					rewrites.push(Promise.resolve(dbisDB.put([SEQ_KEY, seqPeerId], merged)));
-				}
-			}
-			if (rewrites.length > 0) await Promise.all(rewrites);
-		})
-		.finally(bumpEpoch);
+	if (writes.length === 0) return Promise.resolve();
+	return Promise.all(writes).finally(bumpEpoch);
 }
 
 /**
@@ -4911,6 +4989,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// synchronously when COPY_COMPLETE is decoded while batches are still queued — would freeze the cursor
 	// and risk a crash that loses both the cursor and the not-yet-durable rows, leaving the next start to
 	// resume from seqId with gaps.
+	const txnStream = {};
+	// true while a frame's records are queued without its end_txn; an end_txn queued meanwhile would close it
+	let frameOpen = false;
+	let drainEndTxnDeferred = false;
 	let pendingCopyCursorRemovalNodeId: number | undefined;
 	let copyCursorRemovalRetryTimer: NodeJS.Timeout | undefined;
 	function deferCopyCursorRemoval(nodeId: number): void {
@@ -4926,28 +5008,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	function isCopyPassRouteRestoredDurable(nodeId: number): boolean {
-		if (partialMarked.size > 0 || pendingRouteState.size > 0 || pendingRouteState.hasUnverifiedBatches()) return false;
-		if (currentCopyPass && currentCopyPass.startTime > 0 && !currentCopyPass.resumedWithWidening) {
-			if (!currentCopyPass.restored) return false;
-			const { dbisDB } = getDatabaseStores();
-			if (dbisDB) {
-				const seqEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
-				if (Array.isArray(seqEntry?.nodes)) {
-					for (const [originId, gen] of currentCopyPass.originGenerations ?? []) {
-						const nodeState = seqEntry.nodes.find((n: any) => n?.id === originId);
-						if (!nodeState) return false;
-						if (
-							gen !== undefined &&
-							typeof nodeState.originGeneration === 'string' &&
-							nodeState.originGeneration !== gen
-						) {
-							continue;
-						}
-						if (nodeState.partialHistory !== false) return false;
+		if (pendingRouteState.size > 0 || pendingRouteState.hasUnverifiedBatches()) return false;
+		if (!currentCopyPass || currentCopyPass.startTime <= 0 || currentCopyPass.resumedWithWidening) {
+			return partialMarked.size === 0;
+		}
+		if (!currentCopyPass.restored) return false;
+		const { dbisDB } = getDatabaseStores();
+		if (dbisDB) {
+			const seqEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
+			if (Array.isArray(seqEntry?.nodes)) {
+				for (const [originId, gen] of currentCopyPass.originGenerations ?? []) {
+					if (partialMarked.has(originId)) return false;
+					const nodeState = seqEntry.nodes.find((n: any) => n?.id === originId);
+					if (!nodeState) return false;
+					if (gen !== undefined && nodeState.originGeneration !== gen) {
+						continue;
 					}
-				} else if ((currentCopyPass.originGenerations?.size ?? 0) > 0) {
-					return false;
+					if (nodeState.partialHistory !== false) {
+						pendingRouteState.partialHistory(originId, false, gen);
+						if (holedOrigins.has(originId)) {
+							pendingRouteState.hole(originId, holedOrigins.get(originId) ?? gen);
+						}
+						return false;
+					}
 				}
+			} else if ((currentCopyPass.originGenerations?.size ?? 0) > 0) {
+				return false;
 			}
 		}
 		return true;
@@ -4958,14 +5044,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		event.onCommit = async (...args: unknown[]) => {
 			if (prevOnCommit) await prevOnCommit(...args);
 			if (connectionSuperseded()) return;
-			if (!afterSeqWrite && tableSubscriptionToReplicator?.send) {
-				const barrierEvent: any = {
-					type: 'end_txn',
-					remoteNodeIds: [],
-					txnStream: {},
-				};
-				attachCopyCursorRemoval(barrierEvent, nodeId, true);
-				tableSubscriptionToReplicator.send(barrierEvent);
+			if (!afterSeqWrite) {
+				if (!frameOpen && tableSubscriptionToReplicator?.send && !tableSubscriptionToReplicator?.then) {
+					const barrierEvent: any = {
+						type: 'end_txn',
+						remoteNodeIds: [],
+						txnStream,
+					};
+					attachCopyCursorRemoval(barrierEvent, nodeId, true);
+					tableSubscriptionToReplicator.send(barrierEvent);
+				} else {
+					deferCopyCursorRemoval(nodeId);
+				}
 				return;
 			}
 			if (!verifySettledRouteState()) {
@@ -5065,7 +5155,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (frameOpen) {
 					pendingCopyCursorRemovalNodeId = copyNodeId;
 					drainEndTxnDeferred = true;
-				} else if (tableSubscriptionToReplicator?.send) {
+				} else if (tableSubscriptionToReplicator?.send && !tableSubscriptionToReplicator?.then) {
 					const finishEvent = seqUpdateEndTxn(
 						Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId),
 						undefined,
@@ -5079,11 +5169,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 			} else if (copyNodeId !== undefined) {
 				if (!isCopyPassRouteRestoredDurable(copyNodeId)) {
-					if (!frameOpen && tableSubscriptionToReplicator?.send) {
+					if (!frameOpen && tableSubscriptionToReplicator?.send && !tableSubscriptionToReplicator?.then) {
 						const barrierEvent: any = {
 							type: 'end_txn',
 							remoteNodeIds: [],
-							txnStream: {},
+							txnStream,
 						};
 						attachCopyCursorRemoval(barrierEvent, copyNodeId, true);
 						tableSubscriptionToReplicator.send(barrierEvent);
@@ -5482,10 +5572,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return false;
 		}
 	}
-	const txnStream = {};
-	// true while a frame's records are queued without its end_txn; an end_txn queued meanwhile would close it
-	let frameOpen = false;
-	let drainEndTxnDeferred = false;
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	// Re-learned from every NODE_NAME and never carried across sockets: the peer may have been upgraded or
@@ -6137,25 +6223,109 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		STORAGE_IS_ROCKSDB &&
 		originFloorsDurable((auditStore ?? getDatabaseStores().auditStore)?.rootStore ?? RocksDatabase.prototype);
 	const pendingOriginFloors = new PendingOriginFloors();
-	const pendingRouteState = new PendingRouteState((event) => scheduleRouteStateVerification(event));
-	/** Origins marked partial on this socket (`originId -> generation`), cleared only by a copy begun after the mark. */
-	const partialMarked = new Map<number, string | undefined>();
+	let pendingRouteState = new PendingRouteState((event) => scheduleRouteStateVerification(event));
+	/** Origins marked partial on this route (`originId -> generation`), cleared only by a copy begun after the mark. */
+	let partialMarked = new Map<number, string | undefined>();
 	/** Origins with a durable replication hole on this route (`originId -> generation`), preserved across copy-pass restoration. */
-	const holedOrigins = new Map<number, string | undefined>();
-	/** Origins revoked on this socket (`originId -> generation`), re-asserted if a settled write fails to persist. */
-	const revokedOrigins = new Map<number, string | undefined>();
+	let holedOrigins = new Map<number, string | undefined>();
+	/** Origins revoked on this route (`originId -> generation`), re-asserted if a settled write fails to persist. */
+	let revokedOrigins = new Map<number, string | undefined>();
+	/** Origins whose genless (level-1) floor was revoked on this route, cleared once a new floor is accepted. */
+	let bareFloorClearedOrigins = new Set<number>();
 	/** Origins optimistically marked certifiedFrom by the latest subscription request before knowing if the peer copies. */
 	const optimisticCertifiedOrigins = new Map<number, { start: number; generation?: string }>();
-	let routeStateVerifyScheduled = false;
+	let boundSharedRouteSafety: SharedRouteSafetyState | undefined;
+	let registeredBoundKeyObj: object | undefined;
+	const onPeerCopyBoundUpdated = () => {
+		if (wsClosed || connectionSuperseded()) return;
+		loadPersistedCopyBounds();
+		for (const [originId, bound] of maxCopiedVersionByOrigin) {
+			clearCopyBoundedCertification(originId, bound);
+		}
+		scheduleRouteStateVerification();
+	};
+	function bindSharedRouteSafety(): void {
+		if (!remoteNodeName || !databaseName) return;
+		try {
+			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
+			const store = auditStore ?? dbAuditStore;
+			const rootObj = (store?.rootStore ?? (dbisDB as any)?.rootStore ?? dbisDB) as object | undefined;
+			if (!rootObj || typeof rootObj !== 'object') return;
+			if (registeredBoundKeyObj !== rootObj) {
+				if (registeredBoundKeyObj) {
+					liveRouteBoundListeners.get(registeredBoundKeyObj)?.delete(onPeerCopyBoundUpdated);
+				}
+				registeredBoundKeyObj = rootObj;
+				let listeners = liveRouteBoundListeners.get(rootObj);
+				if (!listeners) {
+					listeners = new Set();
+					liveRouteBoundListeners.set(rootObj, listeners);
+				}
+				listeners.add(onPeerCopyBoundUpdated);
+			}
+			if (boundSharedRouteSafety) return;
+			let byPeer = sharedRouteSafetyByDb.get(rootObj);
+			if (!byPeer) {
+				byPeer = new Map();
+				sharedRouteSafetyByDb.set(rootObj, byPeer);
+			}
+			let shared = byPeer.get(remoteNodeName);
+			if (!shared) {
+				pendingRouteState.retainOnlySafetyMarks();
+				shared = {
+					pendingRouteState,
+					partialMarked,
+					holedOrigins,
+					revokedOrigins,
+					bareFloorClearedOrigins,
+					ownerConnectionId: connectionId,
+				};
+				byPeer.set(remoteNodeName, shared);
+			} else {
+				if (shared.ownerConnectionId !== connectionId) {
+					shared.pendingRouteState.retainOnlySafetyMarks();
+					shared.ownerConnectionId = connectionId;
+				}
+				for (const [k, v] of partialMarked) shared.partialMarked.set(k, v);
+				for (const [k, v] of holedOrigins) shared.holedOrigins.set(k, v);
+				for (const [k, v] of revokedOrigins) shared.revokedOrigins.set(k, v);
+				for (const k of bareFloorClearedOrigins) shared.bareFloorClearedOrigins.add(k);
+				pendingRouteState = shared.pendingRouteState;
+				partialMarked = shared.partialMarked;
+				holedOrigins = shared.holedOrigins;
+				revokedOrigins = shared.revokedOrigins;
+				bareFloorClearedOrigins = shared.bareFloorClearedOrigins;
+			}
+			pendingRouteState.setOnSettled((event) => scheduleRouteStateVerification(event));
+			boundSharedRouteSafety = shared;
+		} catch {
+			// Stores not yet initialized; will bind once available.
+		}
+	}
+	bindSharedRouteSafety();
+	let postSeqWriteBarrierInFlight = false;
+	let postSeqWriteCheckDeferred = false;
+	let postSeqWriteNeedsAnotherPass = false;
 	let routeStateRetryTimer: NodeJS.Timeout | undefined;
 	ws.once('close', () => {
 		clearTimeout(routeStateRetryTimer);
 		routeStateRetryTimer = undefined;
+		if (registeredBoundKeyObj) {
+			liveRouteBoundListeners.get(registeredBoundKeyObj)?.delete(onPeerCopyBoundUpdated);
+			registeredBoundKeyObj = undefined;
+		}
+		if (!boundSharedRouteSafety || boundSharedRouteSafety.ownerConnectionId === connectionId) {
+			pendingRouteState.retainOnlySafetyMarks();
+			pendingRouteState.setOnSettled(undefined);
+		}
 	});
 	function verifySettledRouteState(targetEvent?: any): boolean {
+		bindSharedRouteSafety();
 		if (!pendingRouteState.hasUnverifiedBatches()) return true;
 		if (connectionSuperseded() || wsClosed) {
-			pendingRouteState.clearUnverified(targetEvent);
+			if (!boundSharedRouteSafety || boundSharedRouteSafety.ownerConnectionId === connectionId) {
+				pendingRouteState.retainOnlySafetyMarks();
+			}
 			return true;
 		}
 		try {
@@ -6180,21 +6350,98 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}, 250);
 		routeStateRetryTimer.unref?.();
 	}
-	function scheduleRouteStateVerification(event: any): void {
-		if (routeStateVerifyScheduled || wsClosed) return;
-		routeStateVerifyScheduled = true;
-		setImmediate(() => {
-			routeStateVerifyScheduled = false;
-			if (wsClosed || connectionSuperseded()) {
-				pendingRouteState.clearUnverified();
-				return;
+	function runPostSeqWriteChecks(): void {
+		if (wsClosed || connectionSuperseded()) {
+			if (!boundSharedRouteSafety || boundSharedRouteSafety.ownerConnectionId === connectionId) {
+				pendingRouteState.retainOnlySafetyMarks();
 			}
-			const verified = verifySettledRouteState(event);
-			if (!verified && pendingRouteState.hasPending()) {
-				if (!frameOpen) flushRouteState();
-				else scheduleRouteStateFlushRetry();
+			return;
+		}
+		bindSharedRouteSafety();
+		try {
+			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
+			const store = auditStore ?? dbAuditStore;
+			const peerId = remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined;
+			if (peerId !== undefined) {
+				if (bareFloorClearedOrigins.size > 0) {
+					for (const originId of bareFloorClearedOrigins) {
+						clearGenlessClosedFloorOnSeqRow(dbisDB, peerId, originId, store?.rootStore);
+					}
+				}
+				loadPersistedCopyBounds();
+				if (maxCopiedVersionByOrigin.size > 0 && dbisDB?.put) {
+					const latestRow = readDbisCursorSync(dbisDB, 'seq', peerId);
+					if (latestRow && Array.isArray(latestRow.nodes)) {
+						for (const node of latestRow.nodes) {
+							if (node && typeof node.id === 'number') {
+								const bound = maxCopiedVersionByOrigin.get(node.id);
+								if (bound !== undefined) {
+									clearCopyBoundedCertification(node.id, bound, node);
+								}
+							}
+						}
+						const { merged, changed } = mergeSeqRowVoidingCopyBounds(latestRow, latestRow, maxCopiedVersionByOrigin);
+						if (changed) {
+							void Promise.resolve(dbisDB.put([SEQ_KEY, peerId], merged)).catch(() => {});
+							bumpCopyBoundEpoch(dbisDB, store?.rootStore, true);
+						}
+					}
+				}
 			}
-		});
+		} catch {
+			// Ignore transient store lookup errors; retry timer handles unverified route state.
+		}
+		const verified = verifySettledRouteState();
+		if (!verified && pendingRouteState.hasPending()) {
+			if (!frameOpen) flushRouteState();
+			else scheduleRouteStateFlushRetry();
+		}
+	}
+	function enqueuePostSeqWriteBarrier(): void {
+		if (wsClosed || connectionSuperseded()) {
+			postSeqWriteCheckDeferred = false;
+			if (!boundSharedRouteSafety || boundSharedRouteSafety.ownerConnectionId === connectionId) {
+				pendingRouteState.retainOnlySafetyMarks();
+			}
+			return;
+		}
+		if (frameOpen) {
+			postSeqWriteCheckDeferred = true;
+			return;
+		}
+		postSeqWriteCheckDeferred = false;
+		if (postSeqWriteBarrierInFlight) {
+			postSeqWriteNeedsAnotherPass = true;
+			return;
+		}
+		if (tableSubscriptionToReplicator?.send && !tableSubscriptionToReplicator?.then) {
+			postSeqWriteBarrierInFlight = true;
+			postSeqWriteNeedsAnotherPass = false;
+			const barrierEvent: any = {
+				type: 'end_txn',
+				remoteNodeIds: [],
+				txnStream,
+				onFailure() {
+					postSeqWriteBarrierInFlight = false;
+					runPostSeqWriteChecks();
+					return false;
+				},
+				onCommit() {
+					postSeqWriteBarrierInFlight = false;
+					runPostSeqWriteChecks();
+					if (postSeqWriteNeedsAnotherPass || pendingRouteState.hasUnverifiedBatches()) {
+						postSeqWriteNeedsAnotherPass = false;
+						enqueuePostSeqWriteBarrier();
+					}
+				},
+			};
+			tableSubscriptionToReplicator.send(barrierEvent);
+		} else {
+			setImmediate(() => runPostSeqWriteChecks());
+		}
+	}
+	function scheduleRouteStateVerification(_event?: any): void {
+		enqueuePostSeqWriteBarrier();
 	}
 	let copyWasResumed = false;
 	let copyResumedWithWidening = false;
@@ -6334,6 +6581,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const floorsAccepted = !(inCopyMode && !copyCompleteReceived);
 		let entries: ReceivedOriginFloor[] | undefined;
 		try {
+			bindSharedRouteSafety();
 			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? dbAuditStore;
 			const nameToId = exportIdMapping(store);
@@ -6364,9 +6612,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						(typeof state?.originGeneration === 'string' || partialGen === undefined)
 					) {
 						const gen =
-							typeof state?.originGeneration === 'string'
-								? (partialGen ?? state.originGeneration)
-								: (partialGen ?? certificate.generation);
+							typeof state?.originGeneration === 'string' ? (partialGen ?? state.originGeneration) : undefined;
 						pendingRouteState.partialHistory(id, true, gen);
 					}
 				}
@@ -6381,10 +6627,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					) {
 						holedOrigins.delete(id);
 					} else if (state?.hole !== true && (typeof state?.originGeneration === 'string' || holedGen === undefined)) {
-						const gen =
-							typeof state?.originGeneration === 'string'
-								? (holedGen ?? state.originGeneration)
-								: (holedGen ?? certificate.generation);
+						const gen = typeof state?.originGeneration === 'string' ? (holedGen ?? state.originGeneration) : undefined;
 						pendingRouteState.hole(id, gen);
 					}
 				}
@@ -6408,17 +6651,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					clearCopyBoundedCertification(id, copyBound, state, certificate.generation);
 				}
 				if (certificate.revoked) {
-					if (checkpointGrade) {
-						pendingOriginFloors.drop(id);
-						const gen = typeof state?.originGeneration === 'string' ? state.originGeneration : undefined;
-						if (typeof gen === 'string') {
-							revokedOrigins.set(id, gen);
-							pendingRouteState.revoke(id, gen);
-						}
+					pendingOriginFloors.drop(id);
+					const gen = typeof state?.originGeneration === 'string' ? state.originGeneration : undefined;
+					if (checkpointGrade && typeof gen === 'string') {
+						revokedOrigins.set(id, gen);
+						pendingRouteState.revoke(id, gen);
+					} else {
+						bareFloorClearedOrigins.add(id);
+						clearGenlessClosedFloorOnSeqRow(dbisDB, peerId, id, store?.rootStore);
+						scheduleRouteStateVerification();
 					}
 					continue;
 				}
 				if (!floorsAccepted || pendingRouteState.hasPendingRevocation(id)) continue;
+				bareFloorClearedOrigins.delete(id);
 				const entry: ReceivedOriginFloor = [id, certificate.floor!, directFullCoverage.includes(name)];
 				if (checkpointGrade && typeof certificate.generation === 'string') {
 					entry[3] = certificate.generation;
@@ -6791,6 +7037,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 							}
 							if (options.connection) options.connection.nodeName = remoteNodeName;
+							bindSharedRouteSafety();
 							// After the peer is identified, so the post carries the same node name every other
 							// connected-to-node message does.
 							postConnectionMetadata();
@@ -7175,7 +7422,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							passId: copyWatermark.currentPass,
 							startTime: data,
 							resumed: copyWasResumed,
-							resumedWithWidening: copyResumedWithWidening,
+							resumedWithWidening: copyResumedWithWidening || options.connection?.routeFullCoverage === false,
 							seqDurableAtCopyStart: false,
 							completeReceived: false,
 							restored: false,
@@ -9255,7 +9502,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			);
 			const copyFrameFullCoverage = options.connection?.routeFullCoverage !== false;
 			const copyFrameSupportsCheckpoints = messageIsCopyFrame && copyApplyActive() && supportsCheckpointFloors();
-			let batchCrossedOtherPeerCertifiedFrom = false;
+			let batchCrossedOtherPeerCertifiedFrom = copyFrameSupportsCheckpoints && refreshOtherPeerCertifiedFromsIfNeeded();
 			do {
 				getSharedStatus();
 				const eventLength = decoder.readInt();
@@ -9678,9 +9925,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							maxCopiedVersionByOrigin.set(event.nodeId, auditRecord.version);
 							clearCopyBoundedCertification(event.nodeId, auditRecord.version);
 						}
-						if (refreshOtherPeerCertifiedFromsIfNeeded()) {
-							batchCrossedOtherPeerCertifiedFrom = true;
-						}
 						const otherThresholds = otherPeerCertifiedFroms.get(event.nodeId);
 						if (otherThresholds && otherThresholds.length > 0 && auditRecord.version >= otherThresholds[0]) {
 							batchCrossedOtherPeerCertifiedFrom = true;
@@ -9951,6 +10195,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				tableSubscriptionToReplicator.send(routeEvent);
 			}
+			if (postSeqWriteCheckDeferred) {
+				enqueuePostSeqWriteBarrier();
+			}
 		} catch (error) {
 			closeOnInboundMessageError(error, {
 				connectionId,
@@ -9962,6 +10209,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (frameOpen) {
 				frameOpen = false;
 				tableSubscriptionToReplicator.send({ type: 'abort_txn', txnStream });
+			}
+			if (postSeqWriteCheckDeferred) {
+				enqueuePostSeqWriteBarrier();
 			}
 		}
 	}
@@ -10808,9 +11058,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 							if (
 								pendingRouteState.hasPendingRevocation(node.id) ||
-								(!certifiesCheckpointFloors() && typeof copy.originGeneration === 'string')
+								(!certifiesCheckpointFloors() && typeof copy.originGeneration === 'string') ||
+								(bareFloorClearedOrigins.has(node.id) && typeof copy.originGeneration !== 'string')
 							) {
-								copy = { ...copy, closedFloor: undefined };
+								copy = { ...copy, closedFloor: undefined, relayable: false };
 							}
 							return copy;
 						}),
@@ -10902,6 +11153,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
 		// if it hasn't been set yet, do so now
 		if (!auditStore) auditStore = databaseAuditStore;
+		bindSharedRouteSafety();
+		pendingRouteState.retainOnlySafetyMarks();
 		// iterate through all the sequence entries and find the newest txn time for each node.
 		// collectLastTxnTimes tolerates a `seq` row that fails to decode (harper-pro#352) so one
 		// undecodable cursor entry can't crash the subscription handshake.
@@ -11026,6 +11279,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			optimisticCertifiedOrigins.clear();
 			for (const state of allNodes) {
 				const stateGen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
+				if (bareFloorClearedOrigins.has(state.id)) {
+					if (stateGen !== undefined) {
+						bareFloorClearedOrigins.delete(state.id);
+					} else {
+						state.closedFloor = undefined;
+						state.relayable = false;
+					}
+				}
 				if (state.partialHistory === true) {
 					partialMarked.set(state.id, stateGen);
 				} else if (partialMarked.has(state.id)) {
@@ -11068,7 +11329,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 			}
 			let forceFullCopyOnWidening = false;
-			if (nodeId !== undefined && connectedNode === node && options.connection) {
+			if (
+				nodeId !== undefined &&
+				connectedNode === node &&
+				options.connection &&
+				supportsCheckpointFloors() &&
+				certifiesCheckpointFloors()
+			) {
 				const fullCoverage = (options.connection.exclusionOrigins ?? []).includes(node.name);
 				const previous = options.connection.routeFullCoverage;
 				options.connection.routeFullCoverage = fullCoverage;
@@ -11112,7 +11379,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						} catch (error) {
 							logger.warn?.(connectionId, 'could not persist restarted full-copy cursor for', databaseName, error);
 						}
-					} else if (fullCoverage && (previous === false || ownState?.fullCoverage === false) && !copyCursor) {
+					} else if (
+						fullCoverage &&
+						(previous === false || ownState?.fullCoverage === false || ownState?.partialHistory === true) &&
+						!copyCursor
+					) {
 						forceFullCopyOnWidening = true;
 						requestIsCopy = true;
 						logger.warn?.(

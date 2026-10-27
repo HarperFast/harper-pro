@@ -438,17 +438,19 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			"A's floor on B to advance past firstCertifiedFrom"
 		);
 		await restartNode(B);
+		await upsert(A, 'after-second-certified-resume');
+		await waitForRecord(B, 'after-second-certified-resume');
+		const floorAfterSecondRestart = (await stateFor(B, A, A))?.closedFloor ?? 0;
 		await waitForState(
 			B,
 			A,
 			A,
-			(state) => state?.certifiedFrom === firstCertifiedFrom,
+			(state) => (state?.closedFloor ?? 0) > floorAfterSecondRestart && state?.certifiedFrom === firstCertifiedFrom,
 			'lowest-wins certifiedFrom preserved across a second floor-only reconnect with a higher floor'
 		);
 	});
 	test('a peer that stops certifying at level 2 is revoked on its direct receiver and one hop beyond', async () => {
 		const { A, B, C } = ctx;
-		// A comes back at level 1: it still advertises originFloors: 1, not level 2
 		A.testEnv = { HARPER_TEST_FORCE_ORIGIN_FLOORS_LEVEL_1: '1' };
 		await restartNode(A);
 		await waitForState(B, A, A, (state) => state?.floorRevoked === true, "A revoked on B after A's downgrade");
@@ -468,7 +470,6 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 		const status = await subscription(C, { action: 'status', name: 'after-downgrade' });
 		equal(status.checkpoint, null, 'strict availability: no checkpoint while a known origin is revoked');
 		await subscription(C, { action: 'close', name: 'after-downgrade' });
-		// back on level 2, A's next certificate names the same generation and stays revoked
 		A.testEnv = undefined;
 		await restartNode(A);
 		await upsert(A, 'post-upgrade');
@@ -483,7 +484,6 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 		);
 		equal((await stateFor(B, A, A)).floorRevoked, true, 'a revocation is sticky within the generation');
 
-		// a peer that comes back without a capability bag at all (2 -> 0) is also revoked
 		C.testEnv = { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' };
 		await restartNode(C);
 		await waitForState(

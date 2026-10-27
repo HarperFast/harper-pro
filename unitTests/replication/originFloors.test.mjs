@@ -869,12 +869,13 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(racedRow.nodes[0].certifiedFrom, undefined, 'certifiedFrom <= bound is voided');
 	});
 
-	it('PendingRouteState verifyPersisted restores settled marks and revocations if the [seq, peer] write did not persist them', () => {
+	it('PendingRouteState verifyPersisted restores settled safety marks and revocations if the [seq, peer] write did not persist them', () => {
 		const settledEvents = [];
 		const routeState = new PendingRouteState((ev) => settledEvents.push(ev));
 		routeState.partialHistory(1, true, 'g1');
 		routeState.hole(2, 'g2');
 		routeState.revoke(3, 'g3');
+		routeState.certifiedFrom(4, 100, 'g4');
 		const event = { remoteNodeIds: [1] };
 		routeState.takeInto(event);
 		assert.strictEqual(routeState.hasPending(), false);
@@ -885,6 +886,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			{ id: 1, originGeneration: 'g1' },
 			{ id: 2, originGeneration: 'g2' },
 			{ id: 3, originGeneration: 'g3' },
+			{ id: 4, originGeneration: 'g4' },
 		];
 		assert.strictEqual(routeState.verifyPersisted(unpersistedNodes, event), false);
 		assert.strictEqual(routeState.hasPending(), true);
