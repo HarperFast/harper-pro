@@ -214,13 +214,22 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 				['other', { revoked: true }],
 			]
 		);
+		// a row that still holds a generation on a socket that dropped to level 1 is about to be revoked: relaying its
+		// floor bare would clear the generation downstream before the revocation arrives
 		assert.deepStrictEqual(
 			[...collectRelayableCertificates(rows, names, nameToId, () => 1)],
+			[['other', { revoked: true }]]
+		);
+		assert.deepStrictEqual(
 			[
-				['peer', { floor: T - 5 }],
-				['relayed', { floor: T - 6 }],
-				['other', { revoked: true }],
-			]
+				...collectRelayableCertificates(
+					new Map([row(1, { id: 1, closedFloor: T - 5, relayable: true })]),
+					names,
+					nameToId,
+					() => 1
+				),
+			],
+			[['peer', { floor: T - 5 }]]
 		);
 		assert.deepStrictEqual(
 			[...collectRelayableCertificates(rows, names, nameToId, () => 0)],

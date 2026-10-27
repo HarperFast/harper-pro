@@ -3015,6 +3015,9 @@ export function collectRelayableCertificates(
 		}
 		const level = certifies(name);
 		if (!level) continue;
+		// a level-2 row whose socket dropped a level is revoked next: a bare floor sent first would strip the
+		// generation downstream, and the revocation would then land on a row with none to revoke within
+		if (level !== 2 && typeof state.originGeneration === 'string') continue;
 		if (state.relayable !== true || !isValidFloor(state.closedFloor)) continue;
 		const certificate: OriginCertificate = { floor: state.closedFloor };
 		const start = requestedStart?.(name);
