@@ -41,7 +41,12 @@ import {
 } from '../core/resources/auditStore.ts';
 import { isValidFloor, originFloorsDurable } from '../core/resources/originClosedFloor.ts';
 import { commitTrackedRocksTransaction } from '../core/resources/DatabaseTransaction.ts';
-import { COPY_BOUND_KEY, bumpOriginStateEpoch, readCopyBounds } from '../core/resources/subscriptionCheckpoint.ts';
+import {
+	COPY_BOUND_KEY,
+	bumpOriginStateEpoch,
+	readCopyBounds,
+	readOriginStateEpoch,
+} from '../core/resources/subscriptionCheckpoint.ts';
 import { RocksDatabase, Transaction as RocksTransaction } from '@harperfast/rocksdb-js';
 import {
 	exportIdMapping,
@@ -2326,7 +2331,7 @@ export type DbisStore = {
  */
 export function readDbisCursorSync(
 	dbisDB: DbisStore | undefined,
-	kind: 'seq' | 'copyCursor' | 'cloneCopyComplete' | 'copyBound',
+	kind: 'seq' | 'copyCursor' | 'cloneCopyComplete',
 	id: any
 ): DbisCursor | undefined {
 	// getSync is load-bearing here: reverting it to get() would return a MaybePromise that no longer
@@ -3055,10 +3060,9 @@ export function checkpointGradeRow(node: any): boolean {
 
 /**
  * Route state core merges into the seq row (`originRouteStates`): `[id, certifiedFrom, partialHistory, hole,
- * generation]`, where the generation names the origin generation the mark was derived under; a revocation is
- * `[id, generation]`. Core ignores a mark whose generation is no longer the row's.
+ * generation?, fullCoverage?]`, where the generation names the origin generation the mark was derived under; a
+ * revocation is `[id, generation]`. Core ignores a mark whose generation is no longer the row's.
  */
-/** `[id, certifiedFrom, partialHistory, hole, generation?, fullCoverage?]`, as core's `originRouteStates`. */
 type OriginRouteState = [number, number | undefined, boolean | undefined, boolean | undefined, string?, boolean?];
 type PendingRouteMarkEntry = {
 	mark: OriginRouteState;
@@ -3864,12 +3868,13 @@ export function settleCopyBounds(
 	copied: ReadonlyMap<number, number>,
 	peerId = 0,
 	rootStore?: any,
-	pass = 0
+	pass = 0,
+	keepReservation = false
 ): Promise<boolean> {
 	if (!dbisDB?.put) return Promise.resolve(false);
 	return writeCopyBoundRows(dbisDB, peerId, pass, rootStore, (settled) => ({
 		settled: maxMergeInto(settled, copied),
-		reserved: 'remove',
+		reserved: keepReservation ? false : 'remove',
 	}));
 }
 
@@ -5047,11 +5052,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		return true;
 	}
-	/** Only a completed full-coverage copy, which back-filled every table, ends the route's partial coverage. */
-	async function clearPartialRouteCoverage(nodeId: number): Promise<void> {
-		if (!currentCopyPass || currentCopyPass.resumedWithWidening || currentCopyPass.fullCoverage === false) return;
-		await getDatabaseStores().dbisDB?.remove?.([Symbol.for('routeCoverage'), nodeId]);
-	}
 	/** A copy run with full coverage makes the route whole again: the mark rides this route's next update. */
 	function restoreRouteFullCoverage(nodeId: number): void {
 		if (!currentCopyPass || currentCopyPass.resumedWithWidening || currentCopyPass.fullCoverage === false) return;
@@ -5095,7 +5095,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!connectionSuperseded() && isCopyPassRouteRestoredDurable(nodeId)) {
 				if (persisted) {
 					try {
-						await clearPartialRouteCoverage(nodeId);
 						await getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
 					} catch (error) {
 						logger.warn?.(connectionId, 'could not remove copy cursor for', databaseName, error);
@@ -5212,9 +5211,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						.then((ok) => {
 							if (connectionSuperseded()) return;
 							if (ok && isCopyPassRouteRestoredDurable(copyNodeId)) {
-								return clearPartialRouteCoverage(copyNodeId).then(() =>
-									getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), copyNodeId])
-								);
+								return getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), copyNodeId]);
 							}
 							deferCopyCursorRemoval(copyNodeId);
 						})
@@ -6442,13 +6439,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const committedCopyBounds = new Map<number, number>();
 	/** The exact highest version this pass copied per origin, carried in the copy cursor across a resume. */
 	const copiedVersionByOrigin = new Map<number, number>();
+	let committedPass: number | undefined;
+	let settledPass: number | undefined;
+	let lastCopyBoundLoadEpoch = -1;
 	let copyBoundPersist: Promise<boolean> | undefined;
 	let lastCopyBoundWarnAt = 0;
 	function loadPersistedCopyBounds(cursor?: DbisCursor): void {
 		if (!supportsCheckpointFloors()) return;
 		const { dbisDB } = getDatabaseStores();
+		// a reservation counts as committed only for its own pass, which a later settle may drop
+		if (committedPass !== copyModeStartTime) {
+			committedCopyBounds.clear();
+			committedPass = copyModeStartTime;
+			lastCopyBoundLoadEpoch = -1;
+		}
+		// every bound commit bumps the origin-state epoch, so an unchanged epoch means unchanged rows
+		const epoch = readOriginStateEpoch((auditStore ?? getDatabaseStores().auditStore)?.rootStore);
+		if (!cursor && epoch === lastCopyBoundLoadEpoch) return;
 		try {
 			mergePersistedCopyBounds(maxCopiedVersionByOrigin, dbisDB, cursor);
+			lastCopyBoundLoadEpoch = epoch;
 			// neither a cursor's versions nor another pass's reservation, which its settle drops, count as committed
 			if (dbisDB) {
 				const committed = readCommittedCopyBounds(dbisDB, ownCopyPeerId(), copyModeStartTime);
@@ -6495,7 +6505,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	/** Commits every reserved bound; one persist runs at a time and later reservations join it. */
 	function persistCopyBounds(): Promise<boolean> {
 		if (connectionSuperseded() || wsClosed) return Promise.resolve(false);
-		if (!supportsCheckpointFloors() || copyBoundsCommitted()) return Promise.resolve(true);
+		// a settled pass applies no more rows; writing again would recreate the reservation its settle dropped
+		if (!supportsCheckpointFloors() || copyBoundsCommitted() || settledPass === copyModeStartTime) {
+			return Promise.resolve(true);
+		}
 		if (copyBoundPersist) return copyBoundPersist;
 		const run = (async () => {
 			try {
@@ -6506,15 +6519,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				while (!copyBoundsCommitted()) {
 					if (connectionSuperseded() || wsClosed) return false;
 					const reserved = new Map(maxCopiedVersionByOrigin);
+					const pass = copyModeStartTime;
 					if (!dbisDB) return false;
 					const advanced = await persistMergedCopyBounds(
 						dbisDB,
 						reserved,
 						peerId,
 						store?.rootStore ?? (dbisDB as any).rootStore,
-						copyModeStartTime
+						pass
 					);
 					if (advanced) logger.debug?.(connectionId, 'committed copy bounds for', databaseName, reserved);
+					if (pass !== copyModeStartTime) continue;
+					loadPersistedCopyBounds();
 					for (const [originId, bound] of reserved) {
 						if (!(committedCopyBounds.get(originId)! >= bound)) committedCopyBounds.set(originId, bound);
 					}
@@ -6548,16 +6564,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const store = auditStore ?? dbAuditStore;
 			const peerId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
+			// a resumed pass cannot know every row an earlier attempt applied past its saved cursor, and the source
+			// need not re-send one it has since removed, so the reservation stays
+			const resumed = currentCopyPass?.startTime === pass && currentCopyPass.resumed === true;
 			await settleCopyBounds(
 				dbisDB,
 				copiedVersionByOrigin,
 				peerId,
 				store?.rootStore ?? (dbisDB as any)?.rootStore,
-				pass
+				pass,
+				resumed
 			);
-			// the dropped reservation no longer covers anything; what stays committed is re-read, never assumed
+			settledPass = pass;
+			// what stays committed is re-read, never assumed
 			if (copyModeStartTime === pass) {
 				committedCopyBounds.clear();
+				lastCopyBoundLoadEpoch = -1;
 				loadPersistedCopyBounds();
 			}
 			return !connectionSuperseded() && !wsClosed;
@@ -11345,23 +11367,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				certifiesCheckpointFloors()
 			) {
 				const fullCoverage = (options.connection.exclusionOrigins ?? []).includes(node.name);
-				// a partial route is remembered until a full-coverage copy completes, since a restart loses the in-memory
-				// flag and the direct origin's own entry need not show it
-				const routeCoverageKey = [Symbol.for('routeCoverage'), nodeId];
-				const persistedPartialRoute = (dbisDB as any)?.getSync?.(routeCoverageKey)?.partial === true;
-				const previous = options.connection.routeFullCoverage ?? (persistedPartialRoute ? false : undefined);
+				const previous = options.connection.routeFullCoverage;
 				options.connection.routeFullCoverage = fullCoverage;
-				if (!fullCoverage && !persistedPartialRoute) {
-					try {
-						dbisDB
-							?.put?.(routeCoverageKey, { partial: true })
-							?.catch?.((error: unknown) =>
-								logger.warn?.(connectionId, 'could not record partial route coverage for', databaseName, error)
-							);
-					} catch (error) {
-						logger.warn?.(connectionId, 'could not record partial route coverage for', databaseName, error);
-					}
-				}
 				const ownState = allNodes.find((state) => state.id === nodeId);
 				const copyFromPartialCoverage =
 					copyCursor?.fullCoverage === true
