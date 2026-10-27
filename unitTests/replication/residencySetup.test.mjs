@@ -188,7 +188,7 @@ describe('sharding setup authority', function () {
 				residencyTopologyErrors(database).some((error) => error.includes('policy agreement')),
 				'declaration must not clear or poison the live-admission cache'
 			);
-			await assert.rejects(() => Records.put('0', { id: '0', tag: 'refused' }), /policy agreement/);
+			await assert.rejects(async () => Records.put('0', { id: '0', tag: 'refused' }), /policy agreement/);
 			const retry = await connect(database, { name: peer, replicates: true }, {}, peer, {
 				shardsDigest: residencyConfigurationDigest(),
 			});
