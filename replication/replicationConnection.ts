@@ -230,7 +230,6 @@ import {
 } from '../core/resources/blob.ts';
 import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
 import { createInflate } from 'node:zlib';
-import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
 import { isExplicitDatabaseSubscription, tableReplicates } from './replicatedDatabases.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
@@ -241,6 +240,7 @@ import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 type ReplicationWebSocket = WebSocket & { _socket: Socket | null };
 
 const logger = forComponent('replication').conditional as Logger;
+let lmdbGetLastVersion: typeof import('lmdb').getLastVersion;
 
 // msgpackr v2 removed the built-in `randomAccessStructure` option; that random-access
 // struct support now lives in the `structon` package (the same wrapper core's
@@ -6469,7 +6469,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								? table.primaryStore.getBinarySync(recordId)
 								: table.primaryStore.getBinary(recordId);
 							// A subsequent dictionary read also changes LMDB's thread-local last version.
-							const recordVersion = encoder.isRocksDB ? undefined : getLastVersion();
+							const recordVersion = encoder.isRocksDB
+								? undefined
+								: (lmdbGetLastVersion ??= (require('lmdb') as typeof import('lmdb')).getLastVersion)();
 							// Local encoder arrays can lag another worker's writes. Check durable counts,
 							// but avoid rebuilding unchanged dictionaries or loading them for a repeat miss.
 							// The receiver also takes the table's schema from this frame. Schema reloads edit
