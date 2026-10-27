@@ -1,9 +1,5 @@
-/**
- * Coverage for `resolveCopyFrameStoredBlobs`: the per-copy-frame decision that both the identity-tie
- * skip and in-place blob repair read from. It is consulted on every blob-carrying copy frame, cursor or
- * not, so it must read the stored entry once, probe blob files only for a same-version, same-node
- * record, and hold no state across frames (a run of absent rows cannot suppress a later repair).
- */
+// Runs on every blob-carrying copy frame, so it must read once, probe only same-version, same-node
+// rows, and keep no state across frames.
 
 import { expect } from 'chai';
 import { resolveCopyFrameStoredBlobs } from '#src/replication/replicationConnection';
@@ -67,27 +63,32 @@ describe('resolveCopyFrameStoredBlobs', () => {
 		expect(probe.calls).to.equal(0);
 	});
 
-	it('probes nothing for an absent row or a different version', async () => {
+	it('probes and declines nothing for an absent row or a different version or node', async () => {
 		const probe = countingProbe(true);
+		const verify = countingProbe(false);
 		const declines = {};
-		expect(
-			await resolveCopyFrameStoredBlobs(
-				countingDecoder(() => undefined),
-				'k',
-				5,
-				2,
-				probe,
-				declines,
-				torn
-			)
-		).to.deep.equal({ tie: false, repairTargets: null });
-		const stale = countingDecoder(() => ({ version: 4, nodeId: 2, value: { x: blobA } }));
-		expect(await resolveCopyFrameStoredBlobs(stale, 'k', 5, 2, probe, declines, torn)).to.deep.equal({
-			tie: false,
-			repairTargets: null,
-		});
-		expect(probe.calls).to.equal(0);
-		expect(declines).to.deep.equal({ 'version-mismatch': 1 });
+		const rows = [
+			undefined,
+			{ version: 4, nodeId: 2, value: { x: blobA } },
+			{ version: 5, nodeId: 3, value: { x: blobA } },
+		];
+		for (const row of rows)
+			expect(
+				await resolveCopyFrameStoredBlobs(
+					countingDecoder(() => row),
+					'k',
+					5,
+					2,
+					probe,
+					declines,
+					verify
+				)
+			).to.deep.equal({
+				tie: false,
+				repairTargets: null,
+			});
+		expect(probe.calls + verify.calls).to.equal(0);
+		expect(declines).to.deep.equal({});
 	});
 
 	it('still repairs after any number of absent rows', async () => {

@@ -2114,11 +2114,11 @@ export async function collectBlobRepairTargets(
 }
 
 /**
- * The stored-state decision for a blob-carrying copy frame, from ONE stored-entry read: `tie` when the
- * stored record is a durable identity tie (its blobs provably whole, so the frame may be skipped), else
- * the in-place repair targets for a tie whose single stored blob is damaged. Every copy frame asks,
- * with or without a resume cursor: a reconnect that banked no copy cursor is another full copy over
- * rows already committed, possibly on PENDING stubs. Never throws.
+ * The stored-state decision for a blob-carrying copy frame, from one stored-entry read: `tie` when the
+ * frame may be skipped as a durable identity tie, else the in-place repair targets for a same-version,
+ * same-node row whose stored blob is damaged. Asked on every copy frame, cursor or not: a reconnect
+ * that banked no copy cursor is another full copy over committed rows, possibly on PENDING stubs. A
+ * cold entry is awaited, unlike the live leading-duplicate skip, because repair needs the stored row.
  */
 export async function resolveCopyFrameStoredBlobs(
 	tableDecoder: any,
@@ -2137,7 +2137,8 @@ export async function resolveCopyFrameStoredBlobs(
 		declines['entry-read-error'] = (declines['entry-read-error'] ?? 0) + 1;
 		return { tie: false, repairTargets: null };
 	}
-	if (entry == null) return { tie: false, repairTargets: null };
+	if (entry == null || entry.version !== incomingVersion || (entry.nodeId ?? 0) !== sourceNodeId)
+		return { tie: false, repairTargets: null };
 	if (await isDurableIdentityTie(entry, incomingVersion, sourceNodeId, true, verifyBlobs))
 		return { tie: true, repairTargets: null };
 	return {
@@ -7887,6 +7888,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								repairDeclines
 							)
 						: undefined;
+				if (wsClosed) return;
 				// A copy frame is applied as a snapshot with no duplicate detection, so it re-mints the
 				// record's blobs as fresh local files and dereferences the durable ones we already hold —
 				// and if the copy is interrupted mid-blob the record is left on a PENDING stub the source
@@ -7917,8 +7919,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
 				// Dangling-blob repair pairing (#699): computed only for blob-carrying records in the windows
-				// where identity-tie duplicates occur — every copy frame (a reconnect with no banked cursor is
-				// another full copy over the rows already committed) and a resume's leading-duplicate tail —
+				// where identity-tie duplicates occur — every copy frame and a resume's leading-duplicate tail —
 				// so live replication never pays the existing-entry read. A tie's re-delivered bytes stream
 				// INTO the stored record's damaged fileIds (repairBlobFile), so the tie-skipped record needs
 				// no rewrite and its dangling reference heals in place. MUST be computed BEFORE
@@ -7945,7 +7946,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				let repairTargets: any[] | null = null;
 				if (copyStored) {
-					// No miss cutoff on copy frames: absent rows prove nothing about a later damaged one.
+					// no miss cutoff: absent copy rows say nothing about a later damaged one
 					repairTargets = copyStored.repairTargets;
 				} else if (
 					auditRecord.extendedType & HAS_BLOBS &&
