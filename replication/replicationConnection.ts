@@ -6462,13 +6462,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!cursor && epoch === lastCopyBoundLoadEpoch) return;
 		try {
 			mergePersistedCopyBounds(maxCopiedVersionByOrigin, dbisDB, cursor);
-			lastCopyBoundLoadEpoch = epoch;
 			// neither a cursor's versions nor another pass's reservation, which its settle drops, count as committed
 			if (dbisDB) {
 				const committed = readCommittedCopyBounds(dbisDB, ownCopyPeerId(), copyPassToken);
 				for (const [originId, bound] of committed) {
 					if (!(committedCopyBounds.get(originId)! >= bound)) committedCopyBounds.set(originId, bound);
 				}
+				lastCopyBoundLoadEpoch = epoch;
 			}
 		} catch (error) {
 			// admission refuses on the same read, and the relay gate certifies nothing; the connection carries on
