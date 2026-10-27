@@ -4546,7 +4546,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const inPlaceRepairedBlobs = new WeakSet();
 	// Latch a resume's leading-duplicate repair window OFF once the resumed stream has passed the
 	// re-delivered span: a run of stored-entry misses means later records are new and the per-record
-	// getEntry would be a pure miss tax. A hit resets the run.
+	// getEntry would be a pure miss tax.
 	const repairWindowMissRunByNode = new Map<number | undefined, number>();
 	const repairDeclines: Record<string, number> = {};
 	// Blob-transfer ids whose record was skipped as an identity tie. The chunk handler drops their chunks on sight,

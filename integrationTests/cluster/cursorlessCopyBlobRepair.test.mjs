@@ -89,8 +89,9 @@ suite('Cursorless copy re-delivery repairs a blob aborted mid-receive', { timeou
 		// A deploys the stall fixture rather than starting from it: a node started from a fixture does not
 		// listen on its replication port.
 		await startHarper(nodeA, sourceOptions(nodeA.harper.hostname));
+		ctx.nodes = [nodeA.harper];
 		await setupHarperWithFixture(nodeB, STALL_FIXTURE, { config: sharedConfig(nodeB.harper.hostname) });
-		ctx.nodes = [nodeA.harper, nodeB.harper];
+		ctx.nodes.push(nodeB.harper);
 
 		const [A] = ctx.nodes;
 		for (const [project, path] of [
