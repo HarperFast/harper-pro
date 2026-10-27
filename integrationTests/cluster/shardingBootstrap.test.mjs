@@ -63,6 +63,10 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			},
 		});
 		assert.equal(response.status, 200, 'a ready owner must serve its owned blob');
+		if (seed) {
+			await response.json();
+			return blob(i, false, signal);
+		}
 		return response.json();
 	}
 
@@ -157,7 +161,10 @@ export class BootstrapReservation extends Resource {
 export class BootstrapBlob extends Resource {
  async get(target) {
   const bytes = Buffer.alloc(65536, 79);
-  if (target.get('seed')) await tables.Rows.put('replacement-blob', { id: 'replacement-blob', region: 'asia', body: 'copy-blob', payload: createBlob(Readable.from([bytes]), {saveBeforeCommit: true}) });
+  if (target.get('seed')) {
+   await tables.Rows.put('replacement-blob', { id: 'replacement-blob', region: 'asia', body: 'copy-blob', payload: createBlob(Readable.from([bytes]), {saveBeforeCommit: true}) });
+   return { seeded: true };
+  }
   const entry = await tables.Rows.primaryStore.getEntry('replacement-blob');
   if (!entry?.value?.payload) return { digest: null };
   const actual = Buffer.from(await entry.value.payload.arrayBuffer());
