@@ -34,7 +34,7 @@ import {
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
-const BLOB_RECORDS = 10; // /LargeLocation/{n} on A — each a deterministic ~50 KB file-backed blob
+const BLOB_RECORDS = 10;
 const BLOB_BYTES = 50 * 1024;
 const STALL_FIXTURE = join(import.meta.dirname, 'fixture-blob-stall-source');
 

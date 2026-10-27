@@ -7946,7 +7946,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				let repairTargets: any[] | null = null;
 				if (copyStored) {
-					// no miss cutoff: absent copy rows say nothing about a later damaged one
 					repairTargets = copyStored.repairTargets;
 				} else if (
 					auditRecord.extendedType & HAS_BLOBS &&
@@ -7980,6 +7979,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 						repairDeclines['no-stored-entry'] = (repairDeclines['no-stored-entry'] ?? 0) + 1;
 					}
+					if (connectionSuperseded()) return;
 				}
 				let repairIndex = 0;
 				try {

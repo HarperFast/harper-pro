@@ -1,6 +1,3 @@
-// Runs on every blob-carrying copy frame, so it must read once, probe only same-version, same-node
-// rows, and keep no state across frames.
-
 import { expect } from 'chai';
 import { resolveCopyFrameStoredBlobs } from '#src/replication/replicationConnection';
 
