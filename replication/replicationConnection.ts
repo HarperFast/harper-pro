@@ -7888,7 +7888,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								repairDeclines
 							)
 						: undefined;
-				if (wsClosed) return;
+				if (connectionSuperseded()) return;
 				// A copy frame is applied as a snapshot with no duplicate detection, so it re-mints the
 				// record's blobs as fresh local files and dereferences the durable ones we already hold —
 				// and if the copy is interrupted mid-blob the record is left on a PENDING stub the source
