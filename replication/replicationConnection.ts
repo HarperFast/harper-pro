@@ -3999,7 +3999,11 @@ export function buildOriginCursorVector(
 		const name = nameForId(id);
 		if (name === undefined || cursors.has(name) || isMember(name)) continue;
 		const ownNodes = Array.isArray(row.nodes) ? row.nodes : [];
-		const cursor = cursorOf(ownNodes.find((node) => node?.id === id), false) ?? row.seqId;
+		const cursor =
+			cursorOf(
+				ownNodes.find((node) => node?.id === id),
+				false
+			) ?? row.seqId;
 		if (isValidFrameTxnLogKey(cursor) && cursor > 1) cursors.set(name, cursor);
 	}
 	return Object.fromEntries(cursors);
@@ -5632,7 +5636,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		cursorBlockedByBlob() ? lastDurableSequenceId : (lastSequenceIdReceived ?? lastDurableSequenceId ?? 0);
 	let routeStateDeferred = false;
 	function flushRouteState(attempt = 0) {
-		if ((pendingRouteState.size === 0 && pendingCopyCursorRemovalNodeId === undefined) || wsClosed) return;
+		if (
+			(pendingRouteState.size === 0 && pendingCopyCursorRemovalNodeId === undefined) ||
+			wsClosed ||
+			connectionSuperseded()
+		)
+			return;
 		try {
 			if (tableSubscriptionToReplicator?.retired)
 				tableSubscriptionToReplicator = subscriptionForConnection(

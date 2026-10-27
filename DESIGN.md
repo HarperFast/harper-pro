@@ -12,7 +12,7 @@
 - [A YCSB trend point is published only from a turbo-off host](benchmarks/ycsb/DESIGN.md#a-trend-point-is-published-only-from-a-turbo-off-host): the bench runner owns turbo (off per job, on when idle); the nightly checks sysfs itself and skips the publish when the CPU was not at base clock.
 - [A marker-free PR is green only if every submodule pointer it moves is settled (`workflows/companion-check.yaml`)](.github/DESIGN.md#a-marker-free-pr-is-green-only-if-every-submodule-pointer-it-moves-is-settled-workflowscompanion-checkyaml): settle branch is the base-named submodule branch else its default; patchless file entries are decided by the head tree; unreadable is pending.
 - [Release-candidate CI gate](scripts/DESIGN.md#release-candidate-ci-gate): pinned candidate SHAs, per-job workflow evidence, and the override.
-- [Checkpoint-grade certificates, floor-only resume and revocation](replication/DESIGN.md#non-obvious-behavior): level-2 `originFloors` carry the origin generation and coverage, resume exactly below a stored floor, record where a route's complete prefix begins, and revoke on downgrade (harper-pro#922 items 3–4).
+- [Checkpoint-grade certificates, floor-only resume and revocation](replication/DESIGN.md#non-obvious-behaviors): level-2 `originFloors` carry the origin generation and coverage, resume exactly below a stored floor, record where a route's complete prefix begins, and revoke on downgrade (harper-pro#922 items 3–4).
 - [Startup dependencies](#startup-dependencies): packages the built-in components load only on first use.
 
 ## Startup dependencies
