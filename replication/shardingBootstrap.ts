@@ -484,14 +484,31 @@ export async function noteShardingCopyBound(database: string, bound: number, sou
 export async function noteShardingResumeBound(database: string, requested: number, source: string): Promise<void> {
 	if (!enabled || !isValidFloor(requested) || !readResidencyMap(database)) return;
 	const roots = shardingNativeRoots(database);
-	for (const { root, auditStore } of roots) {
-		const candidate = certifyOriginFloor(root);
-		if (candidate !== undefined && candidate !== null) {
-			persistOriginClosedFloor(auditStore, candidate);
-			publishOriginFloor(root, candidate);
+	const belowIssuance = roots.every(({ root }) => requested <= root.getMonotonicTimestamp());
+	const deadline = performance.now() + 25;
+	for (;;) {
+		const current = shardingNativeRoots(database);
+		if (
+			current.length !== roots.length ||
+			roots.some(({ root }) => root.status !== 'open' || !current.some((entry) => entry.root === root))
+		)
+			throw new ResidencyPlacementError('Sharding database changed during origin recovery', 503);
+		for (const { root, auditStore } of roots) {
+			const candidate = certifyOriginFloor(root);
+			if (candidate !== undefined && candidate !== null && candidate > readOriginClosedFloor(auditStore)) {
+				persistOriginClosedFloor(auditStore, candidate);
+				publishOriginFloor(root, candidate);
+			}
 		}
+		if (roots.every(({ auditStore }) => readOriginClosedFloor(auditStore) >= requested)) return;
+		if (!belowIssuance) break;
+		if (performance.now() >= deadline)
+			throw new ResidencyPlacementError(
+				`Waiting for older local transactions before resuming sharding subscription at ${requested} for ${source}`,
+				503
+			);
+		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
-	if (roots.every(({ auditStore }) => readOriginClosedFloor(auditStore) >= requested)) return;
 	if (!isMainThread) return requestOriginBound('resume', database, requested, source);
 	for (const word of readiness.get(database)?.values() ?? []) Atomics.store(word, 0, 0);
 	for (const { root, catalog } of roots) await recordShardingOriginBound(root, catalog, database, requested, source);

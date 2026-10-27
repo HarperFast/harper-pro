@@ -1,6 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
-import { cp, mkdtemp, writeFile, appendFile, realpath, rm } from 'node:fs/promises';
+import { cp, mkdtemp, writeFile, appendFile, realpath, rm, readFile } from 'node:fs/promises';
 import { basename, join, relative, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
@@ -24,7 +24,12 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			config: {
 				threads: { count: 1 },
 				analytics: { aggregatePeriod: -1 },
-				logging: { colors: false, stdStreams: false, level: process.env.HARPER_TEST_SHARDING_LOG_LEVEL || 'warn' },
+				logging: {
+					colors: false,
+					stdStreams: false,
+					root: join(context.harper.dataRootDir, 'test-logs'),
+					level: process.env.HARPER_TEST_SHARDING_LOG_LEVEL || (i === 0 ? 'debug' : 'warn'),
+				},
 				replication: {
 					failover: true,
 					threads: Number(process.env.HARPER_TEST_SHARDING_POOL || 0),
@@ -106,6 +111,33 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 		await appendFile(
 			join(component, 'resources.js'),
 			`
+import { transaction } from 'harper';
+let releaseReservation, reservationDone, reservationTimer;
+export class BootstrapReservation extends Resource {
+ async get(target) {
+  if (target.get('release')) {
+   releaseReservation?.();
+   await reservationDone;
+   return { released: true };
+  }
+  if (releaseReservation) throw new Error('reservation already held');
+  const started = Promise.withResolvers();
+  const hold = Promise.withResolvers();
+  const released = new Error('test reservation released');
+  releaseReservation = hold.resolve;
+  reservationTimer = setTimeout(hold.resolve, 120000).unref();
+  reservationDone = transaction({}, async () => {
+   await tables.Rows.put('held-reservation', { id: 'held-reservation', region: 'asia', body: 'never-committed' });
+   started.resolve({ key: tables.Rows.primaryStore.rootStore.getMonotonicTimestamp(), threadId });
+   await hold.promise;
+   throw released;
+  }).catch(error => {
+   if (error !== released) { started.reject(error); throw error; }
+  }).finally(() => { releaseReservation = undefined; clearTimeout(reservationTimer); });
+  reservationDone.catch(() => {});
+  return started.promise;
+ }
+}
 export class BootstrapLocal extends Resource {
  get(target) {
   const Table = tables.Rows;
@@ -207,6 +239,75 @@ export class BootstrapLocal extends Resource {
 		}
 		assert.ok(lastStatuses.every((status) => status.connections.length === 3));
 		for (let i = 0; i < 4; i++) await ownedRows(i);
+	});
+	test('a reconnect below issuance waits for an older worker reservation without holding writers', async () => {
+		await ready();
+		const node = contexts[0].harper;
+		const headers = {
+			Authorization: 'Basic ' + Buffer.from(`${node.admin.username}:${node.admin.password}`).toString('base64'),
+		};
+		const control = async (release = false) => {
+			const response = await fetch(`${node.httpURL}/BootstrapReservation${release ? '?release=1' : ''}`, {
+				headers,
+				signal: AbortSignal.timeout(10_000),
+			});
+			assert.equal(response.status, 200);
+			return response.json();
+		};
+		const held = await control();
+		assert.ok(held.threadId > 0, 'a real request worker owns the reservation');
+		try {
+			await sendOperation(
+				node,
+				{
+					operation: 'insert',
+					database: 'data',
+					table: 'Rows',
+					records: [{ id: 'resume-cursor', region: 'asia', body: 'committed-above-reservation' }],
+				},
+				{ signal: AbortSignal.timeout(10_000) }
+			);
+			await waitForCondition(
+				async (signal) =>
+					(await local(2, signal)).rows.some((row) => row.id === 'resume-cursor' && row.version > held.key),
+				{ timeoutMs: 30_000, description: 'peer holds a committed cursor above the older reservation' }
+			);
+			await stopNodeProcess(contexts[2].harper);
+			await start(contexts[2], 2);
+			await waitForCondition(
+				async () => {
+					const log = await readFile(join(node.logDir ?? join(node.dataRootDir, 'test-logs'), 'hdb.log'), 'utf8');
+					return log.includes('Waiting for older local transactions before resuming sharding subscription');
+				},
+				{ timeoutMs: 30_000, description: 'the real reconnect reaches closed-prefix link admission' }
+			);
+			const status = await sendOperation(
+				node,
+				{ operation: 'cluster_status' },
+				{ signal: AbortSignal.timeout(10_000) }
+			);
+			assert.equal(status.sharding.data.recovery.phase, 'ready');
+			await sendOperation(
+				node,
+				{
+					operation: 'insert',
+					database: 'data',
+					table: 'Rows',
+					records: [{ id: 'resume-independent', region: 'asia', body: 'writer-remains-live' }],
+				},
+				{ signal: AbortSignal.timeout(10_000) }
+			);
+		} finally {
+			await control(true);
+		}
+		await waitForCondition(
+			async (signal) =>
+				(await local(2, signal)).rows.some(
+					(row) => row.id === 'resume-independent' && row.body === 'writer-remains-live' && !(row.flags & 5)
+				),
+			{ timeoutMs: 60_000, description: 'reconnected peer receives writes after the reservation settles' }
+		);
+		await ready();
 	});
 	test('an owner resumes an offline origin through its co-owner and visibly waits when both sources are down', async () => {
 		try {

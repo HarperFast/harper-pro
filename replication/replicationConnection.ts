@@ -4527,7 +4527,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (seqId >=
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
-	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn with no flush gate. (harper-pro#480)
+	// audited/durable), mid-copy updates below copyStartTime, and projections that publish no cursor — is a plain end_txn with no flush gate. (harper-pro#480)
 	function seqUpdateEndTxn(seqId: number, originFloors?: [number, number, boolean][], releasePending = false): any {
 		if (projectionCopy)
 			return {
@@ -4535,9 +4535,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				remoteNodeIds: [],
 				txnStream,
 				onFailure: onFrameFailure,
-				async onCommit() {
-					await flushCopyRowsDurable();
-				},
 			};
 		const originCursors = takeDurableOriginCursors();
 		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && seqId >= copyModeStartTime) {
@@ -5665,7 +5662,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							try {
 								canonical = configuredPeerIdentity(authorization, options, data, configuredPeerName);
 								if (remoteNodeName && !canonical) throw new Error('Node name mismatch');
-							} catch {
+							} catch (error) {
+								logger.warn?.(connectionId, 'Replication peer identity mismatch', (error as Error)?.message);
 								ws.send(encode([DISCONNECT]));
 								close(1008, 'Node name mismatch');
 								return;
@@ -6652,7 +6650,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								requestedOriginCursors?.[localName] ?? 0,
 								...nodeSubscriptions.filter((node) => node.name === localName).map((node) => node.startTime ?? 0)
 							);
-							await noteShardingResumeBound(databaseName, requested, remoteNodeName);
+							try {
+								await noteShardingResumeBound(databaseName, requested, remoteNodeName);
+							} catch (error) {
+								if (!(error instanceof ResidencyPlacementError) || error.statusCode !== 503) throw error;
+								logger.debug?.(connectionId, error.message);
+								wsClosed = true;
+								close(1011, 'Sharding subscription is waiting for local origin certification');
+								return;
+							}
 							if (supersededOrClosed()) return;
 						}
 						// permission check to make sure that this node is allowed to subscribe to this database, that is that
@@ -9018,7 +9024,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// flush persists the cursor with rows still in the memtable and no copyCursor, and a crash loses
 					// them (resume-from-seq skips pre-copyStartTime rows). core awaits this onCommit, then calls
 					// updateRecordedSequenceId, so awaiting the flush here orders flush-before-seq. (harper-pro#480)
-					if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && lastDurableSequenceId >= copyModeStartTime) {
+					if (
+						!projectionCopy &&
+						copyApplyActive() &&
+						inCopyMode &&
+						copyModeStartTime > 0 &&
+						lastDurableSequenceId >= copyModeStartTime
+					) {
 						await flushCopyRowsDurable();
 					}
 					if (isCopyFrame) {

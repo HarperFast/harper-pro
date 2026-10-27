@@ -603,6 +603,138 @@ describe('Declarative tables keep control and event traffic independent of place
 			}
 		});
 
+	for (const [traffic, closeBeforeFlush] of [
+		['sequence', false],
+		['frame', false],
+		['frame', true],
+	])
+		it(`flushes projection ${traffic} traffic only when publishing durable completion (close=${closeBeforeFlush})`, async () => {
+			env.setProperty('replication_shards', [0, 1]);
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [{ name: 'slot-control-peer', replicateByDefault: true }];
+			const { Records, socket, database } = await connect(
+				false,
+				'projection_flush_' + traffic + '_' + closeBeforeFlush,
+				false,
+				undefined,
+				undefined,
+				connection,
+				[
+					{ start: 0, end: 1, shard: 0 },
+					{ start: 1, end: 2, shard: 1 },
+				]
+			);
+			await until(() => socket.sent.some((frame) => frame[0] === 129));
+			assert.equal(socket.sent.find((frame) => frame[0] === 129)[1][0].shardingProjection, true);
+			const subscription = databaseSubscriptions.get(database);
+			const send = subscription.send;
+			const root = Records.auditStore.rootStore;
+			const flush = root.flush;
+			const peerId = getIdOfRemoteNode('slot-control-peer', Records.auditStore);
+			const marker = () => Records.dbisDB.getSync([Symbol.for('shardingProjectionComplete'), peerId]);
+			const sequence = Records.dbisDB.getSync([Symbol.for('seq'), peerId]);
+			const anchor = Date.now() + 100;
+			let flushes = 0,
+				committed = 0;
+			const commits = [];
+			const gate = Promise.withResolvers();
+			let blockFlush = false,
+				blockFinalFlush = false,
+				blockedFlush = false,
+				finalCommitted = false;
+			root.flush = async function (...args) {
+				flushes++;
+				if (blockFlush) {
+					blockedFlush = true;
+					await gate.promise;
+				}
+				return flush.apply(this, args);
+			};
+			subscription.send = function (event) {
+				if (event.type === 'end_txn') {
+					const final = blockFinalFlush && event.localTime === undefined;
+					if (final) blockFlush = true;
+					commits.push(event);
+					const onCommit = event.onCommit;
+					event.onCommit = async function (...args) {
+						await onCommit?.apply(this, args);
+						committed++;
+						if (final) finalCommitted = true;
+					};
+				}
+				return send.call(this, event);
+			};
+			try {
+				const frames = Array.from({ length: 3 }, (_, n) =>
+					recordFrame(Records, 'invalidate', `projection-x${n}`, { id: `projection-x${n}`, region: 0 }, anchor + n, 42)
+				);
+				const encoder = Records.primaryStore.encoder;
+				socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+				socket.emit(
+					'message',
+					encode([
+						132,
+						{
+							structures: encoder.structures,
+							typedStructs: encoder.typedStructs,
+							attributes: Records.attributes,
+							residency: Records.residency,
+							schemaDefined: true,
+						},
+						Records.tableId,
+						Records.tableName,
+					])
+				);
+				socket.emit('message', encode([130, [server.hostname], 42]));
+				socket.emit('message', encode([148, anchor, 1, undefined, { shardingProjection: true }]));
+				socket.emit('message', encode([133, 'projection-started', 0, 'absent', 'MissingTable']));
+				await until(
+					() =>
+						socket.sent.some((frame) => frame[0] === 134 && frame[1] === 'projection-started') || socket.closes.length
+				);
+				assert.deepEqual(socket.closes, []);
+				const before = flushes;
+				for (let n = 0; n < 3; n++) {
+					if (traffic === 'sequence') socket.emit('message', encode([143, anchor + n]));
+					else socket.emit('message', frames[n]);
+					await until(() => committed >= n + 1 || socket.closes.length);
+					assert.deepEqual(socket.closes, []);
+				}
+				assert.equal(flushes, before, 'projection events publish no cursor requiring a per-event flush');
+				for (const event of commits) {
+					assert.deepEqual(event.remoteNodeIds, []);
+					assert.equal(event.originCursors, undefined);
+				}
+				assert.deepEqual(Records.dbisDB.getSync([Symbol.for('seq'), peerId]), sequence);
+				assert.equal(marker(), undefined);
+				if (traffic === 'frame')
+					for (let n = 0; n < 3; n++)
+						assert.ok(Records.primaryStore.getEntry(`projection-x${n}`)?.metadataFlags & INVALIDATED);
+				blockFinalFlush = true;
+				socket.emit('message', encode([149]));
+				await until(() => blockedFlush || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(marker(), undefined, 'completion cannot precede row durability');
+				if (closeBeforeFlush) socket.close();
+				gate.resolve();
+				if (closeBeforeFlush) {
+					await until(() => finalCommitted);
+					assert.equal(marker(), undefined, 'a closed projection cannot publish its completion after the flush');
+					assert.deepEqual(Records.dbisDB.getSync([Symbol.for('seq'), peerId]), sequence);
+				} else {
+					await until(() => marker() || socket.closes.length);
+					assert.equal(marker()?.anchor, anchor);
+					await until(() => socket.closes.length);
+					assert.match(socket.closes[0].reason, /projection complete/);
+				}
+			} finally {
+				gate.resolve();
+				root.flush = flush;
+				subscription.send = send;
+				env.setProperty('replication_shards', [0]);
+			}
+		});
+
 	it('flushes newer copy projections without appending their snapshot identity to the origin log', async () => {
 		const connection = new EventEmitter();
 		connection.nodeSubscriptions = [{ name: 'slot-control-peer', replicateByDefault: true }];
