@@ -3715,6 +3715,7 @@ type SharedRouteSafetyState = {
 	ownerConnectionId?: string;
 };
 const sharedRouteSafetyByDb = new WeakMap<object, Map<string, SharedRouteSafetyState>>();
+const COPY_BOUND_HEADROOM_MS = 60_000;
 
 function mergeCopyBoundRecordInto(target: Map<number, number>, source: unknown): void {
 	if (!source || typeof source !== 'object') return;
@@ -6382,6 +6383,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		return true;
 	};
+	/**
+	 * A copy-applied row's frame key is below the copy start, so reserving the start for every known origin before
+	 * the first row covers the pass with one commit, the origins it carries no rows for included. The first row
+	 * joins that commit.
+	 */
+	function reserveCopyStartBounds(copyStart: number): void {
+		if (!(copyStart > 0)) return;
+		const store = auditStore ?? getDatabaseStores().auditStore;
+		const ids = [0, ...Object.values(store ? exportIdMapping(store) : {})];
+		for (const originId of ids) {
+			if (typeof originId === 'number' && !(maxCopiedVersionByOrigin.get(originId)! >= copyStart)) {
+				maxCopiedVersionByOrigin.set(originId, copyStart);
+				clearCopyBoundedCertification(originId, copyStart);
+			}
+		}
+		void persistCopyBounds();
+	}
 	/** Commits every reserved bound; one persist runs at a time and later reservations join it. */
 	function persistCopyBounds(): Promise<boolean> {
 		if (connectionSuperseded() || wsClosed) return Promise.resolve(false);
@@ -6397,7 +6415,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (connectionSuperseded() || wsClosed) return false;
 					const reserved = new Map(maxCopiedVersionByOrigin);
 					if (!dbisDB) return false;
-					await persistMergedCopyBounds(dbisDB, reserved, peerId, store?.rootStore ?? (dbisDB as any).rootStore);
+					const advanced = await persistMergedCopyBounds(
+						dbisDB,
+						reserved,
+						peerId,
+						store?.rootStore ?? (dbisDB as any).rootStore
+					);
+					if (advanced) logger.debug?.(connectionId, 'committed copy bounds for', databaseName, reserved);
 					for (const [originId, bound] of reserved) {
 						if (!(committedCopyBounds.get(originId)! >= bound)) committedCopyBounds.set(originId, bound);
 					}
@@ -7319,6 +7343,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyOriginAnchors = recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						loadPersistedCopyBounds();
+						if (copyApplyActive() && supportsCheckpointFloors()) reserveCopyStartBounds(copyModeStartTime);
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
 						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
@@ -9803,9 +9828,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (event.isCopyApply && copyFrameSupportsCheckpoints && typeof event.nodeId === 'number') {
 						const version = auditRecord.version;
 						if (!(maxCopiedVersionByOrigin.get(event.nodeId)! >= version)) {
-							// reserving through the copy start covers every later row of the origin below it (their frame
-							// keys are below it by the isCopyApply gate), so a pass commits about one bound per origin
-							const reserved = Math.max(version, copyModeStartTime);
+							// an origin first seen in this pass, or an explicit version above the copy start: past the
+							// start the reservation reaches ahead by its distance, up to a minute, so dense rows share commits
+							const reserved =
+								version > copyModeStartTime
+									? version + Math.min(version - copyModeStartTime, COPY_BOUND_HEADROOM_MS)
+									: copyModeStartTime;
 							maxCopiedVersionByOrigin.set(event.nodeId, reserved);
 							clearCopyBoundedCertification(event.nodeId, reserved);
 						}
