@@ -6490,9 +6490,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return true;
 	};
 	/**
-	 * A copy-applied row's frame key is below the copy start, so reserving the start for every known origin before
-	 * the first row covers the pass with one commit, the origins it carries no rows for included. The first row
-	 * joins that commit.
+	 * A copy-applied row's frame key is below the copy start, so reserving the start for every known origin covers the
+	 * pass with one commit, the origins it carries no rows for included. A row no committed bound covers waits for it.
 	 */
 	function reserveCopyStartBounds(copyStart: number): void {
 		if (!(copyStart > 0)) return;
