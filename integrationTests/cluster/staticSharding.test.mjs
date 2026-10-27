@@ -281,7 +281,7 @@ suite(`Static sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 60
 		assert.equal((await get(nodes()[3], `Sharded/${id}`)).body, id);
 	});
 
-	test('limit queries do not fan out to the owning shard, including with pool invalidations (#198)', async () => {
+	test('limit queries load complete rows from pooled stubs without changing placement (#198, #980)', async () => {
 		const ids = [0, 1, 2, 3, 4].map((i) => `0:limit-${i}`);
 		for (const id of ids) await put(nodes()[0], id, 'limit');
 		await waitForRows(nodes()[1], ids);
@@ -289,9 +289,49 @@ suite(`Static sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 60
 		const owner = await get(nodes()[0], 'Sharded/?tag=limit&limit(3)');
 		assert.equal(owner.length, 3);
 		assert.ok(owner.every((row) => ids.includes(row.id)));
-		await checkNonowners(ids, nodes().slice(2));
-		const remote = await get(nodes()[2], 'Sharded/?tag=limit&limit(3)');
-		assert.deepEqual(remote, []);
+		const nonowners = nodes().slice(2);
+		const query = 'Sharded/?tag=limit&limit(3)';
+		const snapshot = () =>
+			Promise.all(nonowners.map(async (node) => (await rawRows(node)).filter((row) => ids.includes(row.id))));
+		await checkNonowners(ids, nonowners);
+		const before = await snapshot();
+		const residents = nodes()
+			.slice(0, 2)
+			.map((node) => node.hostname)
+			.sort();
+		for (const rows of before) {
+			assert.deepEqual(rows.map((row) => row.id).sort(), POOL ? [...ids].sort() : []);
+			if (POOL) {
+				for (const row of rows) {
+					assert.equal(row.invalidated, true);
+					assert.ok(row.residencyId > 0);
+					assert.deepEqual([...row.residency].sort(), residents);
+				}
+			}
+		}
+		for (const node of nonowners) assert.deepEqual(await get(node, query, { local: true }), []);
+		if (POOL)
+			for (const id of ids) assert.deepStrictEqual(await get(nonowners[0], `SettledReads/${id}`), { settled: 0 });
+		const remote = await get(nonowners[0], query);
+		if (POOL) {
+			assert.equal(remote.length, 3);
+			assert.equal(new Set(remote.map((row) => row.id)).size, 3);
+			for (const row of remote) {
+				assert.ok(ids.includes(row.id));
+				assert.deepStrictEqual(row, recordFor(row.id, 'limit'));
+			}
+			await waitForCondition(
+				async (signal) =>
+					(await Promise.all(remote.map((row) => get(nonowners[0], `SettledReads/${row.id}`, { signal })))).every(
+						({ settled }) => settled > 0
+					),
+				{ description: 'replica storage attempts for the returned rows to finish' }
+			);
+		} else assert.deepEqual(remote, []);
+		assert.deepEqual(await snapshot(), before);
+		await barriers();
+		assert.deepEqual(await snapshot(), before);
+		for (const node of nonowners) assert.deepEqual(await get(node, query, { local: true }), []);
 		assert.equal((await get(nodes()[2], `Sharded/${ids[4]}`)).body, ids[4]);
 	});
 
