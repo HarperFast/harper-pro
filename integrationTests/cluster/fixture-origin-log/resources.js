@@ -118,10 +118,10 @@ export class ClosedFloors extends Resource {
 }
 
 /**
- * POST /SetRouteCoverage with `{ peer: '<remote node name>', fullCoverage?: boolean, clearSeq?: boolean, clearCertifiedFrom?: boolean, clearCopyBounds?: boolean, setCopyBound?: { origin: string, version: number } }`
- * mutates `[Symbol.for('seq'), peerId]`, `[Symbol.for('copyCursor'), peerId]`, and `[Symbol.for('copyBound'), *]`
- * on `data`'s `dbisDB` (and bumps `origin-state-epoch` when `clearSeq` is true) so integration tests can exercise
- * partial-to-full coverage widening, base-copy recovery, and copy-bound floor-resume gates.
+ * POST /SetRouteCoverage with `{ table: '<table name>', peer: '<remote node name>', fullCoverage?: boolean, clearSeq?: boolean }`
+ * mutates `[Symbol.for('seq'), peerId]` and `[Symbol.for('copyCursor'), peerId]` on `data`'s `dbisDB`
+ * (and bumps `origin-state-epoch` when `clearSeq` is true) so integration tests can exercise
+ * partial-to-full coverage widening and base-copy recovery.
  */
 export class SetRouteCoverage extends Resource {
 	static loadAsInstance = false;

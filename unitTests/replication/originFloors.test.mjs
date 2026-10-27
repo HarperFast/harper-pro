@@ -649,7 +649,11 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 
 	it('restoreCompletedCopyPass preserves pre-existing holes on origins whose partialHistory is cleared', () => {
 		const routeState = new PendingRouteState();
-		const partialMarked = new Set([1, 2]);
+		const partialMarked = new Map([
+			[1, 'g1'],
+			[2, 'g2'],
+			[3, 'g3-new'],
+		]);
 		const pass = {
 			passId: 4,
 			startTime: T,
@@ -661,8 +665,12 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			originGenerations: new Map([
 				[1, 'g1'],
 				[2, 'g2'],
+				[3, 'g3-new'],
 			]),
-			holedOrigins: new Set([1]),
+			holedOrigins: new Map([
+				[1, 'g1'],
+				[3, 'g3-old'],
+			]),
 		};
 		assert.strictEqual(restoreCompletedCopyPass(pass, 4, partialMarked, routeState), true);
 		const ev = { remoteNodeIds: [1] };
@@ -670,6 +678,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.deepStrictEqual(ev.originRouteStates, [
 			[1, undefined, false, true, 'g1'],
 			[2, undefined, false, undefined, 'g2'],
+			[3, undefined, false, undefined, 'g3-new'],
 		]);
 	});
 
@@ -750,7 +759,6 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(loaded.get(1), T + 500);
 		assert.strictEqual(loaded.get(2), T + 800);
 
-		// A failing [seq, *] put propagates out of persistMergedCopyBounds rather than being swallowed by the scan try/catch.
 		const failingDbis = {
 			...dbisDB,
 			put(key, val) {
@@ -763,6 +771,11 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		await assert.rejects(
 			() => persistMergedCopyBounds(failingDbis, new Map([[1, T + 900]]), 3, rootStore),
 			/simulated seq put failure/
+		);
+		assert.strictEqual(
+			Atomics.load(epochWord, 0),
+			3,
+			'origin-state-epoch still bumps in finally when a [seq, *] void write was issued before failure'
 		);
 
 		// Persisting the bound voided origin 2's stale certifiedFrom in [seq, 2] on disk, while preserving origin 1's
