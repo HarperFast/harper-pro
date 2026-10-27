@@ -3755,54 +3755,103 @@ export function mergePersistedCopyBounds(
 }
 
 /**
- * Max-merges `bounds` into `[copyBound, peerId]`, the one row this copy owns, and resolves `true` once the merged
- * row is committed and the origin-state epoch bumped, so core's admission and every captured checkpoint see it
- * (`readCopyBounds` in core `resources/subscriptionCheckpoint.ts`; route `[seq, *]` rows are never written here).
- * The read-merge-write holds `withLock` on the key, so a superseded connection's write cannot lower the bound, and
- * is staged into a transaction so a RocksDB write stall is absorbed off the event loop.
+ * The rows a copy from `peerId` owns, which no other writer touches: `[copyBound, peerId]` holds the exact highest
+ * version each completed pass copied per origin, and `[copyBound, peerId, 'reserved']` the bounds a pass in progress
+ * reserved ahead of its rows. Core's admission reads both (`readCopyBounds` in core
+ * `resources/subscriptionCheckpoint.ts`); route `[seq, *]` rows are never written here.
  */
-export async function persistMergedCopyBounds(
+function copyBoundKeys(peerId: number): { settled: any[]; reserved: any[] } {
+	return { settled: [COPY_BOUND_KEY, peerId], reserved: [COPY_BOUND_KEY, peerId, 'reserved'] };
+}
+
+/**
+ * Applies `change` to this peer's two bound rows under `withLock` on its settled key, so a superseded connection
+ * cannot lower a bound, staged into one transaction so a RocksDB write stall is absorbed off the event loop, then
+ * bumps the origin-state epoch so admission and every captured checkpoint see it. A malformed bound row anywhere
+ * fails the write: admission refuses on it, and rewriting it from what parses would reopen that.
+ */
+async function writeCopyBoundRows(
+	dbisDB: DbisStore,
+	peerId: number,
+	rootStore: any,
+	change: (
+		settled: Map<number, number>,
+		reserved: Map<number, number>
+	) => { settled?: boolean; reserved?: boolean | 'remove' }
+): Promise<boolean> {
+	const keys = copyBoundKeys(peerId);
+	let wrote = false;
+	const write = async () => {
+		readCopyBounds(dbisDB);
+		const settled = new Map<number, number>();
+		const reserved = new Map<number, number>();
+		mergeCopyBoundRecordInto(settled, (dbisDB as any).getSync(keys.settled));
+		const reservedRow = (dbisDB as any).getSync(keys.reserved);
+		mergeCopyBoundRecordInto(reserved, reservedRow);
+		const changed = change(settled, reserved);
+		const removeReserved = changed.reserved === 'remove' && reservedRow != null;
+		if (!changed.settled && changed.reserved !== true && !removeReserved) return;
+		const store = (dbisDB as any).store;
+		const transaction = store ? new RocksTransaction(store) : undefined;
+		const options = transaction ? { transaction } : undefined;
+		try {
+			if (changed.settled) (dbisDB as any).putSync(keys.settled, Object.fromEntries(settled), options);
+			if (changed.reserved === true) (dbisDB as any).putSync(keys.reserved, Object.fromEntries(reserved), options);
+			if (removeReserved) (dbisDB as any).removeSync(keys.reserved, options);
+			if (transaction) await commitTrackedRocksTransaction(transaction, dbisDB, rootStore ?? (dbisDB as any).rootStore);
+		} catch (error) {
+			try {
+				transaction?.abort();
+			} catch {}
+			throw error;
+		}
+		wrote = true;
+		bumpOriginStateEpoch(rootStore ?? (dbisDB as any).rootStore);
+	};
+	if (typeof (dbisDB as any).withLock === 'function') await (dbisDB as any).withLock(keys.settled, write);
+	else await write();
+	return wrote;
+}
+
+function maxMergeInto(target: Map<number, number>, bounds: ReadonlyMap<number, number>): boolean {
+	let advanced = false;
+	for (const [originId, bound] of bounds) {
+		if (Number.isInteger(originId) && Number.isFinite(bound) && !(target.get(originId)! >= bound)) {
+			target.set(originId, bound);
+			advanced = true;
+		}
+	}
+	return advanced;
+}
+
+/** Reserves `bounds` for a pass in progress; resolves true once a raised reservation is committed. */
+export function persistMergedCopyBounds(
 	dbisDB: DbisStore | undefined,
 	bounds: ReadonlyMap<number, number>,
 	peerId = 0,
 	rootStore?: any
 ): Promise<boolean> {
-	if (!dbisDB?.put || bounds.size === 0) return false;
-	const key = [COPY_BOUND_KEY, peerId];
-	let advanced = false;
-	const write = async () => {
-		// a malformed row fails admission closed; rewriting it from what parses would reopen it
-		readCopyBounds(dbisDB);
-		const merged = new Map<number, number>();
-		mergeCopyBoundRecordInto(merged, readDbisCursorSync(dbisDB, 'copyBound', peerId));
-		for (const [originId, bound] of bounds) {
-			if (Number.isInteger(originId) && Number.isFinite(bound) && !(merged.get(originId)! >= bound)) {
-				merged.set(originId, bound);
-				advanced = true;
-			}
-		}
-		if (!advanced) return;
-		const value = Object.fromEntries(merged);
-		const store = (dbisDB as any).store;
-		if (!store) {
-			await dbisDB.put(key, value);
-		} else {
-			const transaction = new RocksTransaction(store);
-			try {
-				(dbisDB as any).putSync(key, value, { transaction });
-				await commitTrackedRocksTransaction(transaction, dbisDB, rootStore ?? (dbisDB as any).rootStore);
-			} catch (error) {
-				try {
-					transaction.abort();
-				} catch {}
-				throw error;
-			}
-		}
-		bumpOriginStateEpoch(rootStore ?? (dbisDB as any).rootStore);
-	};
-	if (typeof (dbisDB as any).withLock === 'function') await (dbisDB as any).withLock(key, write);
-	else await write();
-	return advanced;
+	if (!dbisDB?.put || bounds.size === 0) return Promise.resolve(false);
+	return writeCopyBoundRows(dbisDB, peerId, rootStore, (_settled, reserved) => ({
+		reserved: maxMergeInto(reserved, bounds),
+	}));
+}
+
+/**
+ * Once a pass's rows are durable: merges the exact versions it copied into the settled row and drops its
+ * reservation in the same commit, so a route can certify again from just above what was actually copied.
+ */
+export function settleCopyBounds(
+	dbisDB: DbisStore | undefined,
+	copied: ReadonlyMap<number, number>,
+	peerId = 0,
+	rootStore?: any
+): Promise<boolean> {
+	if (!dbisDB?.put) return Promise.resolve(false);
+	return writeCopyBoundRows(dbisDB, peerId, rootStore, (settled) => ({
+		settled: maxMergeInto(settled, copied),
+		reserved: 'remove',
+	}));
 }
 
 /**
@@ -5018,7 +5067,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				deferCopyCursorRemoval(nodeId);
 				return;
 			}
-			const persisted = await persistCopyBounds();
+			const persisted = await settlePassCopyBounds();
 			if (!connectionSuperseded() && isCopyPassRouteRestoredDurable(nodeId)) {
 				if (persisted) {
 					try {
@@ -5134,7 +5183,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						deferCopyCursorRemoval(copyNodeId);
 					}
 				} else {
-					void persistCopyBounds()
+					void settlePassCopyBounds()
 						.then((ok) => {
 							if (connectionSuperseded()) return;
 							if (ok && isCopyPassRouteRestoredDurable(copyNodeId)) {
@@ -6364,6 +6413,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const maxCopiedVersionByOrigin = new Map<number, number>();
 	/** What is committed in a `[copyBound, *]` row; a copied row above it waits for `persistCopyBounds`. */
 	const committedCopyBounds = new Map<number, number>();
+	/** The exact highest version this pass copied per origin, carried in the copy cursor across a resume. */
+	const copiedVersionByOrigin = new Map<number, number>();
 	let copyBoundPersist: Promise<boolean> | undefined;
 	let lastCopyBoundWarnAt = 0;
 	function loadPersistedCopyBounds(cursor?: DbisCursor): void {
@@ -6449,6 +6500,30 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (copyBoundPersist === run) copyBoundPersist = undefined;
 		});
 		return run;
+	}
+	/**
+	 * At the end of a pass whose rows are durable: the exact versions replace the reservation, so a route reconnecting
+	 * soon after the copy can certify from just above what was copied rather than above the copy start.
+	 */
+	async function settlePassCopyBounds(): Promise<boolean> {
+		if (!(await persistCopyBounds())) return false;
+		if (!supportsCheckpointFloors() || !copyApplyActive()) return true;
+		try {
+			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
+			const store = auditStore ?? dbAuditStore;
+			const peerId =
+				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
+			await settleCopyBounds(dbisDB, copiedVersionByOrigin, peerId, store?.rootStore ?? (dbisDB as any)?.rootStore);
+			if (connectionSuperseded() || wsClosed) return false;
+			copiedVersionByOrigin.clear();
+			maxCopiedVersionByOrigin.clear();
+			committedCopyBounds.clear();
+			loadPersistedCopyBounds();
+			return true;
+		} catch (error) {
+			logger.warn?.(connectionId, 'could not settle copy bounds for', databaseName, error);
+			return false;
+		}
 	}
 	function clearCopyBoundedCertification(originId: number, bound: number, state?: any, generation?: string): void {
 		const optimistic = optimisticCertifiedOrigins.get(originId);
@@ -9835,6 +9910,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (event.isCopyApply && event.table) copiedTablesThisPass.add(event.table);
 					if (event.isCopyApply && copyFrameSupportsCheckpoints && typeof event.nodeId === 'number') {
 						const version = auditRecord.version;
+						if (!(copiedVersionByOrigin.get(event.nodeId)! >= version))
+							copiedVersionByOrigin.set(event.nodeId, version);
 						if (!(maxCopiedVersionByOrigin.get(event.nodeId)! >= version)) {
 							const reserved = copyBoundReservation(version, copyModeStartTime);
 							maxCopiedVersionByOrigin.set(event.nodeId, reserved);
@@ -10010,8 +10087,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								copyOrder: copyFrameOrder, // validated by the leader before it trusts the resume skip (#421)
 								...(copyFrameWidened ? { widened: true } : undefined),
 								fullCoverage: copyFrameFullCoverage,
-								...(maxCopiedVersionByOrigin.size > 0
-									? { maxCopiedVersionByOrigin: Object.fromEntries(maxCopiedVersionByOrigin) }
+								...(copiedVersionByOrigin.size > 0
+									? { maxCopiedVersionByOrigin: Object.fromEntries(copiedVersionByOrigin) }
 									: undefined),
 							});
 						} else if (event && !event.table && copyFromNodeId !== undefined) {
@@ -11116,6 +11193,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				databaseName
 			);
 			loadPersistedCopyBounds(copyCursor);
+			copiedVersionByOrigin.clear();
+			mergeCopyBoundRecordInto(copiedVersionByOrigin, copyCursor?.maxCopiedVersionByOrigin);
 			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 			const copyCompletion = cloneAttempt ? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId) : undefined;
 			if (!copyCursor && matchesCloneCopyCompletion(copyCompletion, cloneAttempt)) {

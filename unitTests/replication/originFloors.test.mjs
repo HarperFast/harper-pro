@@ -13,6 +13,7 @@ import {
 	parseOriginCertificates,
 	persistMergedCopyBounds,
 	resolveOriginFloors,
+	settleCopyBounds,
 	restoreCompletedCopyPass,
 	resumeStartWithFloor,
 } from '#src/replication/replicationConnection';
@@ -731,12 +732,12 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.ok(commitsFor(dense) <= 1);
 	});
 
-	it('a copy writes only its own [copyBound, peer] row, by a locked max-merge, and the database-wide bound suppresses floor-only resume and level-2 relay', async () => {
+	it('a copy writes only its own [copyBound, peer] rows, reserving then settling to exact versions under a lock, and the database-wide bound suppresses floor-only resume and level-2 relay', async () => {
 		const store = new Map();
-		const keyOf = (k) => JSON.stringify([k[0]?.description ?? String(k[0]), k[1]]);
+		const keyOf = (k) => JSON.stringify([k[0]?.description ?? String(k[0]), ...k.slice(1)]);
 		const parseKey = (s) => {
-			const [symDesc, id] = JSON.parse(s);
-			return [Symbol.for(symDesc), id];
+			const [symDesc, ...rest] = JSON.parse(s);
+			return [Symbol.for(symDesc), ...rest];
 		};
 		const sharedBuffers = new Map();
 		const rootStore = {
@@ -749,11 +750,13 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		const dbisDB = {
 			rootStore,
 			getSync: (k) => store.get(keyOf(k)),
-			// lands a turn later, so two unlocked read-merge-writes of one row would interleave
 			put: async (k, v) => {
-				await new Promise((resolve) => setImmediate(resolve));
 				store.set(keyOf(k), v);
 			},
+			putSync: (k, v) => {
+				store.set(keyOf(k), v);
+			},
+			removeSync: (k) => store.delete(keyOf(k)),
 			withLock(k, callback) {
 				const previous = locks.get(keyOf(k)) ?? Promise.resolve();
 				const run = previous.then(() => callback());
@@ -767,8 +770,8 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 				const prefix = start?.description ?? String(start);
 				const out = [];
 				for (const [k, v] of store.entries()) {
-					const [sym, id] = parseKey(k);
-					if (sym.description === prefix) out.push({ key: [sym, id], value: v });
+					const key = parseKey(k);
+					if (key[0].description === prefix) out.push({ key, value: v });
 				}
 				return out;
 			},
@@ -801,10 +804,20 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			persistMergedCopyBounds(dbisDB, new Map([[2, T + 900]]), 1, rootStore),
 			persistMergedCopyBounds(dbisDB, new Map([[3, T + 850]]), 1, rootStore),
 		]);
-		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1]), { 2: T + 900, 3: T + 850 });
-		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3]), { 1: T + 500 });
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved']), { 2: T + 900, 3: T + 850 });
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3, 'reserved']), { 1: T + 500 });
+		// a completed pass replaces its reservation with the exact versions it copied, in one commit
+		assert.strictEqual(await settleCopyBounds(dbisDB, new Map([[2, T + 640]]), 1, rootStore), true);
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1]), { 2: T + 640 });
+		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved']), undefined);
+		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 900]]), 1, rootStore);
 		const epochBeforeFailure = epochWord();
-		const failingDbis = { ...dbisDB, put: () => Promise.reject(new Error('simulated copy bound put failure')) };
+		const failingDbis = {
+			...dbisDB,
+			putSync: () => {
+				throw new Error('simulated copy bound put failure');
+			},
+		};
 		await assert.rejects(
 			() => persistMergedCopyBounds(failingDbis, new Map([[2, T + 990]]), 1, rootStore),
 			/simulated copy bound put failure/
