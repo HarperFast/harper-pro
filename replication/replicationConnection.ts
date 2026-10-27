@@ -3462,13 +3462,6 @@ export class PendingRouteState {
 	hasUnverifiedBatches(): boolean {
 		return this.unverifiedBatches.length > 0;
 	}
-	clearUnverified(targetEvent?: any): void {
-		if (targetEvent === undefined) {
-			this.unverifiedBatches.length = 0;
-			return;
-		}
-		this.unverifiedBatches = this.unverifiedBatches.filter((b) => b.event !== targetEvent);
-	}
 	verifyPersisted(peerNodes: any[] | undefined, targetEvent?: any): boolean {
 		if (this.unverifiedBatches.length === 0) return true;
 		const matching: UnverifiedRouteStateBatch[] = [];
@@ -3769,6 +3762,8 @@ export async function persistMergedCopyBounds(
 	const key = [COPY_BOUND_KEY, peerId];
 	let advanced = false;
 	const write = async () => {
+		// a malformed row fails admission closed; rewriting it from what parses would reopen it
+		readCopyBounds(dbisDB);
 		const merged = new Map<number, number>();
 		mergeCopyBoundRecordInto(merged, readDbisCursorSync(dbisDB, 'copyBound', peerId));
 		for (const [originId, bound] of bounds) {
@@ -6366,8 +6361,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!supportsCheckpointFloors()) return;
 		const { dbisDB } = getDatabaseStores();
 		try {
-			mergePersistedCopyBounds(maxCopiedVersionByOrigin, dbisDB, cursor);
-			mergePersistedCopyBounds(committedCopyBounds, dbisDB, cursor);
+			// a cursor's reservations are not proof of a committed bound row
+			for (const [originId, bound] of mergePersistedCopyBounds(new Map(), dbisDB)) {
+				if (!(committedCopyBounds.get(originId)! >= bound)) committedCopyBounds.set(originId, bound);
+				if (!(maxCopiedVersionByOrigin.get(originId)! >= bound)) maxCopiedVersionByOrigin.set(originId, bound);
+			}
+			mergeCopyBoundRecordInto(maxCopiedVersionByOrigin, cursor?.maxCopiedVersionByOrigin);
 		} catch (error) {
 			// admission refuses on the same read, and the relay gate certifies nothing; the connection carries on
 			const now = Date.now();
@@ -6438,6 +6437,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	let currentCopyPass: CopyPassState | undefined;
 	function tryRestoreCopyPass(pass: CopyPassState | undefined, eventForImmediateTake?: any, deferFlush = false): void {
+		// the marks are shared with a replacement connection, whose own pass owns them now
+		if (connectionSuperseded()) return;
 		if (!restoreCompletedCopyPass(pass, copyWatermark.currentPass, partialMarked, pendingRouteState)) return;
 		drainCopyOriginAnchors();
 		if (eventForImmediateTake) {
@@ -7267,7 +7268,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (maybeLeakConnectionAfterCopyStartForTest(options.connection, ws, databaseName)) wedgedForTest = true;
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						const copyMarkOrigins = new Map<number, string | undefined>();
-						{
+						// only an engine that can certify a checkpoint has a route history to mark partial
+						if (supportsCheckpointFloors()) {
 							const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
 							const store = auditStore ?? databaseAuditStore;
 							const peerIdForCopy = remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined;
@@ -8525,7 +8527,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									let rising: Map<string, unknown> | undefined;
 									const thisNodeName = getThisNodeName();
 									const peerLevel = certifiesCheckpointFloors() ? 2 : 1;
-									for (let [name, certificate] of floors) {
+									for (const [name, certificate] of floors) {
 										if (excludedNodes?.includes(name)) continue;
 										if (certificate.revoked) {
 											// once per connection and generation: the receiver's revocation is sticky within one
@@ -8539,10 +8541,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// one whose socket stopped certifying during it may be an older binary now
 										const level = name === thisNodeName ? 2 : originCertifies(name);
 										if (!level) continue;
-										// the level-2 fields were captured from a row whose socket may have dropped a level since
-										if (certificate.generation !== undefined && level < 2) {
-											certificate = { floor };
-										}
+										// captured from a level-2 row whose socket has dropped a level since: withheld, as at capture,
+										// until its revocation, which a bare floor sent first would leave nothing to revoke within
+										if (certificate.generation !== undefined && level < 2) continue;
 										const qualifiersChanged =
 											certificate.generation !== undefined
 												? connectionCertifiedGenerations.get(name) !== certificate.generation ||

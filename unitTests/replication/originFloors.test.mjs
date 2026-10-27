@@ -788,6 +788,14 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			/simulated copy bound put failure/
 		);
 		assert.strictEqual(epochWord(), epochBeforeFailure, 'the epoch moves only after a commit');
+		// a malformed row is never rewritten from what parses, which would turn admission's refusal into a pass
+		store.set(keyOf([Symbol.for('copyBound'), 5]), { 2: 'x' });
+		await assert.rejects(
+			() => persistMergedCopyBounds(dbisDB, new Map([[2, T + 995]]), 5, rootStore),
+			(error) => error.statusCode === 410
+		);
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 5]), { 2: 'x' });
+		store.delete(keyOf([Symbol.for('copyBound'), 5]));
 		const loaded = mergePersistedCopyBounds(new Map(), dbisDB);
 		assert.strictEqual(loaded.get(1), T + 500);
 		assert.strictEqual(loaded.get(2), T + 900);
