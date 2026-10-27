@@ -817,8 +817,11 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', 0]), undefined);
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', T + 7]), { 2: T + 980 });
 		assert.strictEqual(readCommittedCopyBounds(dbisDB, 3, 0).get(2), T + 640);
-		// a resumed pass settles its exact versions but keeps its reservation, which may cover rows past the cursor
-		assert.strictEqual(await settleCopyBounds(dbisDB, new Map([[2, T + 650]]), 1, rootStore, T + 7, true), true);
+		// a later attempt on the same anchor settles only its own row; the earlier attempt's, which may cover rows it
+		// applied past its saved cursor, stays
+		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 990]]), 1, rootStore, `${T + 7}:retry`);
+		assert.strictEqual(await settleCopyBounds(dbisDB, new Map([[2, T + 650]]), 1, rootStore, `${T + 7}:retry`), true);
+		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', `${T + 7}:retry`]), undefined);
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', T + 7]), { 2: T + 980 });
 		store.delete(keyOf([Symbol.for('copyBound'), 1, 'reserved', T + 7]));
 		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 900]]), 1, rootStore);

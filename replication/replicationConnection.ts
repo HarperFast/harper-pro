@@ -1,5 +1,5 @@
 import type { Logger } from '../core/utility/logging/logger.ts';
-import { createHash, type Hash } from 'node:crypto';
+import { createHash, randomUUID, type Hash } from 'node:crypto';
 import { toBufferKey } from 'ordered-binary';
 import {
 	getDatabases,
@@ -3765,12 +3765,12 @@ export function mergePersistedCopyBounds(
  * `resources/subscriptionCheckpoint.ts`); route `[seq, *]` rows are never written here. A pass that never settles
  * leaves its reservation, which only voids route starts at or below its own copy start.
  */
-function copyBoundKeys(peerId: number, pass: number): { settled: any[]; reserved: any[] } {
+function copyBoundKeys(peerId: number, pass: number | string): { settled: any[]; reserved: any[] } {
 	return { settled: [COPY_BOUND_KEY, peerId], reserved: [COPY_BOUND_KEY, peerId, 'reserved', pass] };
 }
 
 /** The bounds that stay committed: every settled row, and this pass's own reservation (others' can be dropped). */
-export function readCommittedCopyBounds(dbisDB: DbisStore, peerId: number, pass: number): Map<number, number> {
+export function readCommittedCopyBounds(dbisDB: DbisStore, peerId: number, pass: number | string): Map<number, number> {
 	readCopyBounds(dbisDB);
 	const committed = new Map<number, number>();
 	for (const { key, value } of dbisDB.getRange!({
@@ -3793,7 +3793,7 @@ export function readCommittedCopyBounds(dbisDB: DbisStore, peerId: number, pass:
 async function writeCopyBoundRows(
 	dbisDB: DbisStore,
 	peerId: number,
-	pass: number,
+	pass: number | string,
 	rootStore: any,
 	change: (
 		settled: Map<number, number>,
@@ -3851,7 +3851,7 @@ export function persistMergedCopyBounds(
 	bounds: ReadonlyMap<number, number>,
 	peerId = 0,
 	rootStore?: any,
-	pass = 0
+	pass: number | string = 0
 ): Promise<boolean> {
 	if (!dbisDB?.put || bounds.size === 0) return Promise.resolve(false);
 	return writeCopyBoundRows(dbisDB, peerId, pass, rootStore, (_settled, reserved) => ({
@@ -3868,13 +3868,12 @@ export function settleCopyBounds(
 	copied: ReadonlyMap<number, number>,
 	peerId = 0,
 	rootStore?: any,
-	pass = 0,
-	keepReservation = false
+	pass: number | string = 0
 ): Promise<boolean> {
 	if (!dbisDB?.put) return Promise.resolve(false);
 	return writeCopyBoundRows(dbisDB, peerId, pass, rootStore, (settled) => ({
 		settled: maxMergeInto(settled, copied),
-		reserved: keepReservation ? false : 'remove',
+		reserved: 'remove',
 	}));
 }
 
@@ -6439,8 +6438,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const committedCopyBounds = new Map<number, number>();
 	/** The exact highest version this pass copied per origin, carried in the copy cursor across a resume. */
 	const copiedVersionByOrigin = new Map<number, number>();
-	let committedPass: number | undefined;
-	let settledPass: number | undefined;
+	/**
+	 * Names this attempt's reservation row: an attempt deletes only its own at settle, so an earlier attempt's, which
+	 * may cover rows it applied past its saved cursor, stays and voids only starts at or below its own copy start.
+	 */
+	let copyPassToken = '';
+	let committedPass: string | undefined;
+	let settledPass: string | undefined;
 	let lastCopyBoundLoadEpoch = -1;
 	let copyBoundPersist: Promise<boolean> | undefined;
 	let lastCopyBoundWarnAt = 0;
@@ -6448,9 +6452,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!supportsCheckpointFloors()) return;
 		const { dbisDB } = getDatabaseStores();
 		// a reservation counts as committed only for its own pass, which a later settle may drop
-		if (committedPass !== copyModeStartTime) {
+		if (committedPass !== copyPassToken) {
 			committedCopyBounds.clear();
-			committedPass = copyModeStartTime;
+			committedPass = copyPassToken;
 			lastCopyBoundLoadEpoch = -1;
 		}
 		// every bound commit bumps the origin-state epoch, so an unchanged epoch means unchanged rows
@@ -6461,7 +6465,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			lastCopyBoundLoadEpoch = epoch;
 			// neither a cursor's versions nor another pass's reservation, which its settle drops, count as committed
 			if (dbisDB) {
-				const committed = readCommittedCopyBounds(dbisDB, ownCopyPeerId(), copyModeStartTime);
+				const committed = readCommittedCopyBounds(dbisDB, ownCopyPeerId(), copyPassToken);
 				for (const [originId, bound] of committed) {
 					if (!(committedCopyBounds.get(originId)! >= bound)) committedCopyBounds.set(originId, bound);
 				}
@@ -6506,7 +6510,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function persistCopyBounds(): Promise<boolean> {
 		if (connectionSuperseded() || wsClosed) return Promise.resolve(false);
 		// a settled pass applies no more rows; writing again would recreate the reservation its settle dropped
-		if (!supportsCheckpointFloors() || copyBoundsCommitted() || settledPass === copyModeStartTime) {
+		if (!supportsCheckpointFloors() || copyBoundsCommitted() || settledPass === copyPassToken) {
 			return Promise.resolve(true);
 		}
 		if (copyBoundPersist) return copyBoundPersist;
@@ -6519,7 +6523,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				while (!copyBoundsCommitted()) {
 					if (connectionSuperseded() || wsClosed) return false;
 					const reserved = new Map(maxCopiedVersionByOrigin);
-					const pass = copyModeStartTime;
+					const pass = copyPassToken;
 					if (!dbisDB) return false;
 					const advanced = await persistMergedCopyBounds(
 						dbisDB,
@@ -6529,7 +6533,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						pass
 					);
 					if (advanced) logger.debug?.(connectionId, 'committed copy bounds for', databaseName, reserved);
-					if (pass !== copyModeStartTime) continue;
+					if (pass !== copyPassToken) continue;
 					loadPersistedCopyBounds();
 					for (const [originId, bound] of reserved) {
 						if (!(committedCopyBounds.get(originId)! >= bound)) committedCopyBounds.set(originId, bound);
@@ -6556,7 +6560,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * soon after the copy can certify from just above what was copied rather than above the copy start.
 	 */
 	async function settlePassCopyBounds(): Promise<boolean> {
-		const pass = copyModeStartTime;
+		const pass = copyPassToken;
 		if (!(await persistCopyBounds())) return false;
 		if (!supportsCheckpointFloors() || !copyApplyActive()) return true;
 		try {
@@ -6564,20 +6568,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const store = auditStore ?? dbAuditStore;
 			const peerId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
-			// a resumed pass cannot know every row an earlier attempt applied past its saved cursor, and the source
-			// need not re-send one it has since removed, so the reservation stays
-			const resumed = currentCopyPass?.startTime === pass && currentCopyPass.resumed === true;
 			await settleCopyBounds(
 				dbisDB,
 				copiedVersionByOrigin,
 				peerId,
 				store?.rootStore ?? (dbisDB as any)?.rootStore,
-				pass,
-				resumed
+				pass
 			);
 			settledPass = pass;
 			// what stays committed is re-read, never assumed
-			if (copyModeStartTime === pass) {
+			if (copyPassToken === pass) {
 				committedCopyBounds.clear();
 				lastCopyBoundLoadEpoch = -1;
 				loadPersistedCopyBounds();
@@ -7437,6 +7437,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// watchdog is armed — reproduces the stale-fire class the identity guard suppresses.
 						if (maybeLeakConnectionAfterCopyStartForTest(options.connection, ws, databaseName)) wedgedForTest = true;
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
+						copyPassToken = `${data}:${randomUUID()}`;
 						const copyMarkOrigins = new Map<number, string | undefined>();
 						// only an engine that can certify a checkpoint has a route history to mark partial
 						if (supportsCheckpointFloors()) {
