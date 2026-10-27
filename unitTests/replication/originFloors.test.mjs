@@ -12,6 +12,7 @@ import {
 	mergePersistedCopyBounds,
 	parseOriginCertificates,
 	persistMergedCopyBounds,
+	readCommittedCopyBounds,
 	resolveOriginFloors,
 	settleCopyBounds,
 	restoreCompletedCopyPass,
@@ -804,12 +805,19 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			persistMergedCopyBounds(dbisDB, new Map([[2, T + 900]]), 1, rootStore),
 			persistMergedCopyBounds(dbisDB, new Map([[3, T + 850]]), 1, rootStore),
 		]);
-		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved']), { 2: T + 900, 3: T + 850 });
-		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3, 'reserved']), { 1: T + 500 });
-		// a completed pass replaces its reservation with the exact versions it copied, in one commit
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', 0]), { 2: T + 900, 3: T + 850 });
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3, 'reserved', 0]), { 1: T + 500 });
+		// another pass's reservation, which its settle drops, never counts as committed for this one
+		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 980]]), 1, rootStore, T + 7);
+		assert.strictEqual(readCommittedCopyBounds(dbisDB, 1, 0).get(2), T + 900);
+		assert.strictEqual(readCommittedCopyBounds(dbisDB, 3, 0).get(2), undefined);
+		// a completed pass replaces only its own reservation with the exact versions it copied, in one commit
 		assert.strictEqual(await settleCopyBounds(dbisDB, new Map([[2, T + 640]]), 1, rootStore), true);
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1]), { 2: T + 640 });
-		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved']), undefined);
+		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', 0]), undefined);
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', T + 7]), { 2: T + 980 });
+		assert.strictEqual(readCommittedCopyBounds(dbisDB, 3, 0).get(2), T + 640);
+		store.delete(keyOf([Symbol.for('copyBound'), 1, 'reserved', T + 7]));
 		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 900]]), 1, rootStore);
 		const epochBeforeFailure = epochWord();
 		const failingDbis = {
