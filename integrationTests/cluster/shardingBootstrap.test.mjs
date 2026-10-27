@@ -36,7 +36,7 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 				operationsApi: { network: { domainSocket: false } },
 			},
 		});
-	async function local(i, signal, origin = contexts[1].harper.hostname, update) {
+	async function local(i, signal, origin = contexts[1].harper.hostname) {
 		const node = contexts[i].harper;
 		const response = await fetch(`${node.httpURL}/BootstrapLocal?origin=${encodeURIComponent(origin)}`, {
 			signal,
@@ -44,7 +44,6 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 				'Authorization': 'Basic ' + Buffer.from(`${node.admin.username}:${node.admin.password}`).toString('base64'),
 				'Content-Type': 'application/json',
 			},
-			...(update ? { method: 'PUT', body: JSON.stringify(update) } : {}),
 		});
 		assert.equal(response.status, 200);
 		return response.json();
@@ -108,19 +107,6 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			join(component, 'resources.js'),
 			`
 export class BootstrapLocal extends Resource {
- async put(update) {
-  const Table = tables.Rows;
-  const origin = Table.auditStore.loadLogs().indexOf(Table.auditStore.logByName.get(update.origin));
-  if (!(origin > 0)) throw new Error('The future-bound fixture requires an existing remote origin');
-  let changed = 0;
-  for (const { key, value } of Table.dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([255])] })) {
-   if (!value.nodes?.some(node => node.id === origin)) continue;
-   await Table.dbisDB.put(key, { ...value, nodes: value.nodes.map(node => node.id === origin ? { ...node, closedFloor: update.floor, relayable: true } : node) });
-   changed++;
-  }
-  await Table.dbisDB.flush({ allowWriteStall: true });
-  return { changed };
- }
  get(target) {
   const Table = tables.Rows;
   const origin = Table.auditStore.loadLogs().indexOf(Table.auditStore.logByName.get(target.get('origin')));

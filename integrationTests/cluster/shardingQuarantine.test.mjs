@@ -38,6 +38,15 @@ async function request(node, path, signal, body) {
 	return { status: response.status, thread: response.headers.get('x-sharding-thread'), body: await response.text() };
 }
 
+async function assertQuarantineSQL(node) {
+	const response = await postOperation(node, {
+		operation: 'sql',
+		sql: "SELECT IIF(tenant = 'a', body, 'other') FROM data.ShardedRows",
+	});
+	assert.equal(response.status, 503, JSON.stringify(response.body));
+	assert.match(JSON.stringify(response.body), /repair the configuration and restart this node/);
+}
+
 for (const healthyFirst of [false, true]) {
 	suite(`Sharding database quarantine (healthy first=${healthyFirst})`, { timeout: 600_000 }, (ctx) => {
 		const contexts = [{ name: ctx.name }, { name: ctx.name }];
@@ -234,10 +243,12 @@ for (const healthyFirst of [false, true]) {
 			const quarantined = await workers(node);
 			await assertEveryWorker(node, 'HealthyRows/healthy', 200, quarantined);
 			await assertEveryWorker(node, 'ShardedRows/sharded', 503, quarantined);
+			await assertQuarantineSQL(node);
 			await sendOperation(node, { operation: 'set_configuration', replication_shards: [0, 1] });
 			const replacement = await replace(node, quarantined);
 			await assertEveryWorker(node, 'HealthyRows/healthy', 200, replacement);
 			await assertEveryWorker(node, 'ShardedRows/sharded', 503, replacement);
+			await assertQuarantineSQL(node);
 			await stopNodeProcess(node);
 			await start(contexts[0], 4, [0, 1]);
 			const restarted = await workers(node);
