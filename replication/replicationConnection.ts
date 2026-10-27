@@ -3716,6 +3716,14 @@ type SharedRouteSafetyState = {
 };
 const sharedRouteSafetyByDb = new WeakMap<object, Map<string, SharedRouteSafetyState>>();
 const COPY_BOUND_HEADROOM_MS = 60_000;
+/**
+ * The bound a copy-applied row reserves: the copy start covers every row below it, and past the start the
+ * reservation reaches ahead by at least the row's distance, so any series of explicit versions above the start
+ * costs a logarithmic number of bound commits. Over-reserving only voids more route starts.
+ */
+export function copyBoundReservation(version: number, copyStart: number): number {
+	return version > copyStart ? version + Math.max(version - copyStart, COPY_BOUND_HEADROOM_MS) : copyStart;
+}
 
 function mergeCopyBoundRecordInto(target: Map<number, number>, source: unknown): void {
 	if (!source || typeof source !== 'object') return;
@@ -9828,12 +9836,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (event.isCopyApply && copyFrameSupportsCheckpoints && typeof event.nodeId === 'number') {
 						const version = auditRecord.version;
 						if (!(maxCopiedVersionByOrigin.get(event.nodeId)! >= version)) {
-							// an origin first seen in this pass, or an explicit version above the copy start: past the
-							// start the reservation reaches ahead by its distance, up to a minute, so dense rows share commits
-							const reserved =
-								version > copyModeStartTime
-									? version + Math.min(version - copyModeStartTime, COPY_BOUND_HEADROOM_MS)
-									: copyModeStartTime;
+							const reserved = copyBoundReservation(version, copyModeStartTime);
 							maxCopiedVersionByOrigin.set(event.nodeId, reserved);
 							clearCopyBoundedCertification(event.nodeId, reserved);
 						}

@@ -6,6 +6,7 @@ import {
 	buildOriginCursorVector,
 	checkpointGradeRow,
 	collectRelayableCertificates,
+	copyBoundReservation,
 	cursorBelowFloor,
 	encodeOriginCertificate,
 	mergePersistedCopyBounds,
@@ -707,6 +708,27 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(partialPass.restored, true);
 		assert.strictEqual(partialRouteMarked.size, 1);
 		assert.strictEqual(partialRouteState.hasPending(), false);
+	});
+
+	it('a copy pass commits a logarithmic number of bounds for explicit versions above the copy start', () => {
+		const copyStart = T;
+		assert.strictEqual(copyBoundReservation(T - 5, copyStart), copyStart);
+		const commitsFor = (versions) => {
+			let reserved = copyStart;
+			let commits = 0;
+			for (const version of versions) {
+				if (version > reserved) {
+					reserved = copyBoundReservation(version, copyStart);
+					commits++;
+				}
+			}
+			return commits;
+		};
+		// 10,000 future-dated rows a minute and a second apart, in copy order
+		const spaced = Array.from({ length: 10_000 }, (_, i) => copyStart + (i + 1) * 61_000);
+		assert.ok(commitsFor(spaced) <= 14, `spaced series committed ${commitsFor(spaced)} bounds`);
+		const dense = Array.from({ length: 10_000 }, (_, i) => copyStart + i);
+		assert.ok(commitsFor(dense) <= 1);
 	});
 
 	it('a copy writes only its own [copyBound, peer] row, by a locked max-merge, and the database-wide bound suppresses floor-only resume and level-2 relay', async () => {
