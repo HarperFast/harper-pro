@@ -41,7 +41,7 @@ import {
 } from '../core/resources/auditStore.ts';
 import { isValidFloor, originFloorsDurable } from '../core/resources/originClosedFloor.ts';
 import { commitTrackedRocksTransaction } from '../core/resources/DatabaseTransaction.ts';
-import { COPY_BOUND_KEY, bumpOriginStateEpoch } from '../core/resources/subscriptionCheckpoint.ts';
+import { COPY_BOUND_KEY, bumpOriginStateEpoch, readCopyBounds } from '../core/resources/subscriptionCheckpoint.ts';
 import { RocksDatabase, Transaction as RocksTransaction } from '@harperfast/rocksdb-js';
 import {
 	exportIdMapping,
@@ -3735,38 +3735,18 @@ function mergeCopyBoundRecordInto(target: Map<number, number>, source: unknown):
 }
 
 /**
- * Merges every persisted `[Symbol.for('copyBound'), peerId]` entry and an optional copy cursor's
- * `maxCopiedVersionByOrigin` into `target`. Bounds are written under each copying peer's own key so
- * concurrent copies from different peers never clobber one another, and merged across all peers on read
- * because `copyApply` writes snapshot rows without local audit entries regardless of which peer delivered them.
+ * Merges every peer's `[copyBound, peerId]` row (core's `readCopyBounds`, which throws on a malformed row) and an
+ * optional copy cursor's `maxCopiedVersionByOrigin` into `target`.
  */
 export function mergePersistedCopyBounds(
 	target: Map<number, number>,
 	dbisDB: DbisStore | undefined,
 	cursor?: DbisCursor
 ): Map<number, number> {
-	let scannedRange = false;
 	if (typeof dbisDB?.getRange === 'function') {
-		try {
-			for (const entry of dbisDB.getRange({
-				start: COPY_BOUND_KEY,
-				end: [COPY_BOUND_KEY, Buffer.from([0xff])],
-			})) {
-				let value: unknown;
-				try {
-					value = entry.value;
-				} catch {
-					continue;
-				}
-				mergeCopyBoundRecordInto(target, value);
-			}
-			scannedRange = true;
-		} catch {
-			// Fall back to direct key read below if range iteration is unavailable or closed.
+		for (const [originId, bound] of readCopyBounds(dbisDB)) {
+			if (!(target.get(originId)! >= bound)) target.set(originId, bound);
 		}
-	}
-	if (!scannedRange) {
-		mergeCopyBoundRecordInto(target, readDbisCursorSync(dbisDB, 'copyBound', 0));
 	}
 	mergeCopyBoundRecordInto(target, cursor?.maxCopiedVersionByOrigin);
 	return target;
@@ -6385,8 +6365,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function loadPersistedCopyBounds(cursor?: DbisCursor): void {
 		if (!supportsCheckpointFloors()) return;
 		const { dbisDB } = getDatabaseStores();
-		mergePersistedCopyBounds(maxCopiedVersionByOrigin, dbisDB, cursor);
-		mergePersistedCopyBounds(committedCopyBounds, dbisDB, cursor);
+		try {
+			mergePersistedCopyBounds(maxCopiedVersionByOrigin, dbisDB, cursor);
+			mergePersistedCopyBounds(committedCopyBounds, dbisDB, cursor);
+		} catch (error) {
+			// admission refuses on the same read, and the relay gate certifies nothing; the connection carries on
+			const now = Date.now();
+			if (now - lastCopyBoundWarnAt >= 60_000) {
+				lastCopyBoundWarnAt = now;
+				logger.warn?.(connectionId, 'could not read copy bounds for', databaseName, error);
+			}
+		}
 	}
 	const copyBoundsCommitted = () => {
 		for (const [originId, bound] of maxCopiedVersionByOrigin) {

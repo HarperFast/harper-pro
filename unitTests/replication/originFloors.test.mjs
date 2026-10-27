@@ -791,6 +791,12 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		const loaded = mergePersistedCopyBounds(new Map(), dbisDB);
 		assert.strictEqual(loaded.get(1), T + 500);
 		assert.strictEqual(loaded.get(2), T + 900);
+		// a malformed row is not read as no bound: the relay that reads it certifies nothing
+		const corrupt = { ...dbisDB, getRange: () => [{ key: [Symbol.for('copyBound'), 4], value: { 2: 'x' } }] };
+		assert.throws(
+			() => mergePersistedCopyBounds(new Map(), corrupt),
+			(error) => error.statusCode === 410
+		);
 
 		const seqRows = new Map([[1, { seqId: T, nodes: [{ ...seqRow2.nodes[0] }] }]]);
 		const certified = [];
