@@ -3968,12 +3968,12 @@ export function buildOriginCursorVector(
 	/** Highest copied record version per origin from an audit-less base copy; a floor at or below it must not resume floor-only. */
 	minFloorOnlyStart?: ReadonlyMap<number, number>
 ): Record<string, number> {
-	const cursorOf = (node: any): number | undefined => {
+	const cursorOf = (node: any, allowFloorOnly = true): number | undefined => {
 		const position = isValidFrameTxnLogKey(node?.originLogKey) ? node.originLogKey : undefined;
 		if (!useFloors || !isValidFloor(node?.closedFloor)) return position;
 		// a checkpoint-grade row resumes exactly below its floor, so a transaction reserved below the
 		// position and committed after it is re-sent rather than filtered by the sender's position
-		if (floorOnly && checkpointGradeRow(node)) {
+		if (allowFloorOnly && floorOnly && checkpointGradeRow(node)) {
 			const start = cursorBelowFloor(node.closedFloor);
 			const minStart = minFloorOnlyStart?.get(node.id);
 			if (!(minStart !== undefined && start <= minStart)) {
@@ -3989,17 +3989,17 @@ export function buildOriginCursorVector(
 	const peerNodes = seqRows.get(peerId)?.nodes;
 	for (const node of Array.isArray(peerNodes) ? peerNodes : []) {
 		if (!node || typeof node !== 'object' || node.id === 0) continue;
-		const cursor = cursorOf(node);
-		if (cursor === undefined) continue;
 		const name = nameForId(node.id);
-		if (name !== undefined) cursors.set(name, cursor);
+		if (name === undefined) continue;
+		const cursor = cursorOf(node, true);
+		if (cursor !== undefined) cursors.set(name, cursor);
 	}
 	for (const [id, row] of seqRows) {
 		if (id === peerId || id === 0) continue;
 		const name = nameForId(id);
 		if (name === undefined || cursors.has(name) || isMember(name)) continue;
 		const ownNodes = Array.isArray(row.nodes) ? row.nodes : [];
-		const cursor = cursorOf(ownNodes.find((node) => node?.id === id)) ?? row.seqId;
+		const cursor = cursorOf(ownNodes.find((node) => node?.id === id), false) ?? row.seqId;
 		if (isValidFrameTxnLogKey(cursor) && cursor > 1) cursors.set(name, cursor);
 	}
 	return Object.fromEntries(cursors);

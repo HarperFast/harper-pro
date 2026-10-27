@@ -1013,4 +1013,45 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(updated.nodes[1].closedFloor, T + 300);
 		assert.strictEqual(updated.nodes[1].relayable, true);
 	});
+
+	it('buildOriginCursorVector never uses floor-only resume for removed origins seeded from another row or unnamed node ids', () => {
+		const seqRows = new Map([
+			[
+				1,
+				{
+					seqId: T,
+					nodes: [
+						{ id: 1, originLogKey: T + 100, closedFloor: T + 10, originGeneration: 'g1', fullCoverage: true },
+						{ id: 2, originLogKey: T + 200, closedFloor: T + 20, originGeneration: 'g2', fullCoverage: true },
+						{ id: 99, originLogKey: T + 900, closedFloor: T + 90, originGeneration: 'g99', fullCoverage: true },
+					],
+				},
+			],
+			[
+				3,
+				{
+					seqId: T + 50,
+					nodes: [{ id: 3, originLogKey: T + 300, closedFloor: T + 30, originGeneration: 'g3', fullCoverage: true }],
+				},
+			],
+		]);
+		const reported = [];
+		const vector = buildOriginCursorVector(
+			seqRows,
+			1,
+			nameForId,
+			(name) => name === 'peer',
+			true,
+			(id, start, generation) => reported.push([id, start, generation])
+		);
+		assert.deepStrictEqual(vector, {
+			peer: cursorBelowFloor(T + 10),
+			relayed: cursorBelowFloor(T + 20),
+			other: T + 300,
+		});
+		assert.deepStrictEqual(reported, [
+			[1, cursorBelowFloor(T + 10), 'g1'],
+			[2, cursorBelowFloor(T + 20), 'g2'],
+		]);
+	});
 });
