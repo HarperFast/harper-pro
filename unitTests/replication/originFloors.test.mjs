@@ -825,5 +825,86 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			loaded
 		);
 		assert.deepStrictEqual(relayed.get('relayed'), { floor: T + 600 });
+
+		const failingRangeDbis = {
+			...dbisDB,
+			getRange(opts) {
+				if (opts?.start === Symbol.for('seq')) {
+					throw new Error('simulated seq getRange failure');
+				}
+				return dbisDB.getRange(opts);
+			},
+		};
+		await assert.rejects(
+			() => persistMergedCopyBounds(failingRangeDbis, new Map([[1, T + 950]]), 3, rootStore),
+			/simulated seq getRange failure/,
+			'persistMergedCopyBounds rejects if scanning [seq, *] throws so callers cannot treat un-voided routes as safe'
+		);
+
+		let concurrentPutInjected = false;
+		const racingDbis = {
+			...dbisDB,
+			getSync(key) {
+				if (!concurrentPutInjected && Array.isArray(key) && key[0] === Symbol.for('seq') && key[1] === 1) {
+					concurrentPutInjected = true;
+					const cur = dbisDB.getSync(key);
+					store.set(keyOf(key), {
+						...cur,
+						seqId: T + 1234,
+						nodes: [{ ...cur.nodes[0], originLogKey: T + 1234, hole: true }],
+					});
+				}
+				return dbisDB.getSync(key);
+			},
+		};
+		await dbisDB.put([Symbol.for('seq'), 1], {
+			seqId: T,
+			nodes: [{ id: 1, originLogKey: T + 100, certifiedFrom: T + 200, originGeneration: 'g1' }],
+		});
+		await persistMergedCopyBounds(racingDbis, new Map([[1, T + 960]]), 3, rootStore);
+		const racedRow = dbisDB.getSync([Symbol.for('seq'), 1]);
+		assert.strictEqual(racedRow.seqId, T + 1234, 'concurrent seqId advance is preserved when voiding certifiedFrom');
+		assert.strictEqual(racedRow.nodes[0].originLogKey, T + 1234, 'concurrent originLogKey advance is preserved');
+		assert.strictEqual(racedRow.nodes[0].hole, true, 'concurrent hole mark is preserved');
+		assert.strictEqual(racedRow.nodes[0].certifiedFrom, undefined, 'certifiedFrom <= bound is voided');
+	});
+
+	it('PendingRouteState verifyPersisted restores settled marks and revocations if the [seq, peer] write did not persist them', () => {
+		const settledEvents = [];
+		const routeState = new PendingRouteState((ev) => settledEvents.push(ev));
+		routeState.partialHistory(1, true, 'g1');
+		routeState.hole(2, 'g2');
+		routeState.revoke(3, 'g3');
+		const event = { remoteNodeIds: [1] };
+		routeState.takeInto(event);
+		assert.strictEqual(routeState.hasPending(), false);
+		assert.strictEqual(settledEvents.length, 1);
+		assert.strictEqual(routeState.hasUnverifiedBatches(), true);
+
+		const unpersistedNodes = [
+			{ id: 1, originGeneration: 'g1' },
+			{ id: 2, originGeneration: 'g2' },
+			{ id: 3, originGeneration: 'g3' },
+		];
+		assert.strictEqual(routeState.verifyPersisted(unpersistedNodes, event), false);
+		assert.strictEqual(routeState.hasPending(), true);
+		assert.strictEqual(routeState.hasPendingPartialHistory(1), true);
+		assert.strictEqual(routeState.hasPendingRevocation(3), true);
+
+		const retryEvent = { remoteNodeIds: [1] };
+		routeState.takeInto(retryEvent);
+		assert.deepStrictEqual(retryEvent.originRouteStates, [
+			[1, undefined, true, undefined, 'g1'],
+			[2, undefined, undefined, true, 'g2'],
+		]);
+		assert.deepStrictEqual(retryEvent.originFloorRevocations, [[3, 'g3']]);
+
+		const persistedNodes = [
+			{ id: 1, originGeneration: 'g1', partialHistory: true },
+			{ id: 2, originGeneration: 'g2', hole: true },
+			{ id: 3, originGeneration: 'g3', floorRevoked: true },
+		];
+		assert.strictEqual(routeState.verifyPersisted(persistedNodes, retryEvent), true);
+		assert.strictEqual(routeState.hasPending(), false);
 	});
 });

@@ -234,7 +234,6 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 		);
 		equal((await stateFor(E, A, A))?.originGeneration ?? null, null, 'E stores no certificate');
 
-		// a reconnect on a level-2 route resumes exactly below the floor and records where its complete prefix begins
 		await restartNode(B);
 		await waitForState(B, A, A, (state) => state?.certifiedFrom > 0, "B's route to A marked certified-from");
 		await waitForState(B, C, C, (state) => state?.certifiedFrom > 0, "B's route to C marked certified-from");
@@ -347,18 +346,8 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			await endMqtt(onB.client);
 		}
 	});
-	test('a route widened from partial coverage marks partialHistory and clears it once a base copy completes', async () => {
+	test('a route widened from partial coverage runs a full base copy and clears partialHistory without certifying audit-less copyApply history', async () => {
 		const { A, B } = ctx;
-		await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
-		await restartNode(B);
-		await waitForState(
-			B,
-			A,
-			A,
-			(state) => state?.partialHistory === true && state?.certifiedFrom === null,
-			'widened route on B marks partialHistory and clears certifiedFrom'
-		);
-
 		await postToFixture(A, 'HoldTransaction', { id: 'held-copy-bound' });
 		try {
 			await upsert(A, 'copied-above-pinned-floor');
@@ -371,9 +360,8 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 				copiedVersions['copied-above-pinned-floor'] ?? 0,
 				copiedVersions['copy-anchor-record'] ?? 0
 			);
-			await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, clearSeq: true });
+			await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
 			await restartNode(B);
-			await waitForRecord(B, 'copied-above-pinned-floor');
 			await upsert(A, 'after-widening-copy');
 			await waitForRecord(B, 'after-widening-copy');
 			await waitForState(
@@ -385,7 +373,7 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 					state?.fullCoverage === true &&
 					state?.closedFloor > 0 &&
 					state?.certifiedFrom === null,
-				'base copy completion clears partialHistory without certifying audit-less copyApply history'
+				'widening to full coverage triggers a full base copy that clears partialHistory without certifying audit-less copyApply history'
 			);
 
 			const logKeyBeforePinnedRestart = (await stateFor(B, A, A))?.originLogKey ?? 0;
@@ -460,8 +448,8 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 	});
 	test('a peer that stops certifying at level 2 is revoked on its direct receiver and one hop beyond', async () => {
 		const { A, B, C } = ctx;
-		// A comes back without a capability bag: an older binary that may write below the floor it certified
-		A.testEnv = { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' };
+		// A comes back at level 1: it still advertises originFloors: 1, not level 2
+		A.testEnv = { HARPER_TEST_FORCE_ORIGIN_FLOORS_LEVEL_1: '1' };
 		await restartNode(A);
 		await waitForState(B, A, A, (state) => state?.floorRevoked === true, "A revoked on B after A's downgrade");
 		await waitForState(C, B, A, (state) => state?.floorRevoked === true, 'the revocation relayed to C');
@@ -494,5 +482,16 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			"B's floor certificate to advance on C after A's upgrade"
 		);
 		equal((await stateFor(B, A, A)).floorRevoked, true, 'a revocation is sticky within the generation');
+
+		// a peer that comes back without a capability bag at all (2 -> 0) is also revoked
+		C.testEnv = { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' };
+		await restartNode(C);
+		await waitForState(
+			B,
+			C,
+			C,
+			(state) => state?.floorRevoked === true && state?.closedFloor === null,
+			'C revoked on B after C restarts without a capability bag'
+		);
 	});
 });

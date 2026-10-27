@@ -119,9 +119,8 @@ export class ClosedFloors extends Resource {
 
 /**
  * POST /SetRouteCoverage with `{ table: '<table name>', peer: '<remote node name>', fullCoverage?: boolean, clearSeq?: boolean }`
- * mutates `[Symbol.for('seq'), peerId]` and `[Symbol.for('copyCursor'), peerId]` on `data`'s `dbisDB`
- * (and bumps `origin-state-epoch` when `clearSeq` is true) so integration tests can exercise
- * partial-to-full coverage widening and base-copy recovery.
+ * mutates `[Symbol.for('seq'), peerId]`, `[Symbol.for('copyCursor'), peerId]`, and `[Symbol.for('copyBound'), *]`
+ * on `data`'s `dbisDB` so integration tests can exercise partial-to-full coverage widening and base-copy recovery.
  */
 export class SetRouteCoverage extends Resource {
 	static loadAsInstance = false;
@@ -159,6 +158,8 @@ export class SetRouteCoverage extends Resource {
 			})) {
 				await Table.dbisDB.remove(entry.key);
 			}
+			const epochBuf = Table.auditStore?.rootStore?.sharedBuffers?.get('origin-state-epoch');
+			if (epochBuf) Atomics.add(new Int32Array(epochBuf), 0, 1);
 			return { cleared: true };
 		}
 		if (!row?.nodes) return { updated: false };
