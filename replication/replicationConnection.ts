@@ -9081,9 +9081,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								: `Blob ${blobId} for record ${id} is unrecoverable at source ${remoteNodeName} (${errorToString(err)}); ` +
 										`advancing the resume cursor past it — the record's blob stays diverged until backfilled (harper-pro#388).`
 						);
-						// Missing is the unambiguous backfill signal. This also unlinks a damaged in-place repair
-						// target, but never healthy bytes: this branch only follows a failed write to that target.
-						deleteBlob(localBlob);
+						// Missing is the unambiguous backfill signal for a freshly minted file. An in-place repair
+						// target is the file the stored record already referenced, left as it was by the failed
+						// repair: one peer lacking the bytes does not make it ours to destroy (it may be the
+						// origin's own file, or fillable from another peer).
+						if (!inPlaceRepairedBlobs.has(localBlob)) deleteBlob(localBlob);
 					} else {
 						logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err);
 						// A local/transient save fault. Mark a blob gap so onCommit and the sequence-update branch
