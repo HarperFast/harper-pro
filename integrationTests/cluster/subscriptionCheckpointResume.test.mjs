@@ -438,10 +438,13 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			"A's floor on B to advance past firstCertifiedFrom"
 		);
 		await postToFixture(A, 'HoldTransaction', { id: 'held-second-certified-resume' });
-		await upsert(A, 'above-held-second-resume');
-		await waitForRecord(B, 'above-held-second-resume');
-		await stopNodeProcess(B);
-		await postToFixture(A, 'ReleaseTransaction', {});
+		try {
+			await upsert(A, 'above-held-second-resume');
+			await waitForRecord(B, 'above-held-second-resume');
+			await stopNodeProcess(B);
+		} finally {
+			await postToFixture(A, 'ReleaseTransaction', {}).catch(() => {});
+		}
 		await startNode(B);
 		await waitForRecord(B, 'held-second-certified-resume');
 		await upsert(A, 'after-second-certified-resume');

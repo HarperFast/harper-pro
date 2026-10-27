@@ -966,6 +966,20 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			true
 		);
 		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
+
+		// When a copyBound void clears certifiedFrom between settle and read-back, verifyPersisted accepts
+		// certifiedFrom === undefined without re-queuing the positive S.
+		routeState.partialHistory(1, true, 'g1');
+		routeState.partialHistory(1, false, 'g1');
+		routeState.certifiedFrom(1, 200, 'g1');
+		const voidedEvent = { remoteNodeIds: [1] };
+		routeState.takeInto(voidedEvent);
+		assert.strictEqual(
+			routeState.verifyPersisted([{ id: 1, originGeneration: 'g1', partialHistory: false }], voidedEvent),
+			true
+		);
+		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
+		assert.strictEqual(routeState.hasPending(), false);
 	});
 
 	it('clearGenlessClosedFloorOnSeqRow awaits [seq, peer] put and clears closedFloor and relayable only on genless nodes', async () => {

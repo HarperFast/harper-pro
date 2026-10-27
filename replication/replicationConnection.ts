@@ -3425,7 +3425,7 @@ export class PendingRouteState {
 			(safetyMarks ??= new Map()).set(originId, {
 				mark: [
 					entry.mark[0],
-					!isPartialTrue && isClear ? entry.mark[1] : undefined,
+					undefined,
 					isPartialTrue ? true : isClear ? false : undefined,
 					isHole ? true : undefined,
 					entry.mark[4],
@@ -3497,12 +3497,10 @@ export class PendingRouteState {
 							(gen === undefined || recert.generation === undefined || recert.generation === gen)
 								? recert.start
 								: certifiedFrom;
-						if (typeof expectedCertified === 'number') {
-							if (node.certifiedFrom !== expectedCertified) {
-								batchPersisted = false;
-								break;
-							}
-						} else if (typeof node.certifiedFrom === 'number') {
+						if (
+							typeof node.certifiedFrom === 'number' &&
+							(typeof expectedCertified !== 'number' || node.certifiedFrom !== expectedCertified)
+						) {
 							batchPersisted = false;
 							break;
 						}
@@ -5099,6 +5097,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (dbisDB) {
 			const seqEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
 			if (Array.isArray(seqEntry?.nodes)) {
+				const peerNode = seqEntry.nodes.find((n: any) => n?.id === nodeId);
+				if (peerNode?.fullCoverage === false) {
+					return false;
+				}
 				for (const [originId, gen] of currentCopyPass.originGenerations ?? []) {
 					if (partialMarked.has(originId)) return false;
 					const nodeState = seqEntry.nodes.find((n: any) => n?.id === originId);
@@ -5163,6 +5165,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!verifySettledRouteState()) {
 				scheduleRouteStateFlushRetry();
 			}
+			try {
+				await ensureFullCoverageRestoredOnSeqRow(nodeId);
+			} catch (error) {
+				logger.warn?.(connectionId, 'could not restore fullCoverage for', databaseName, error);
+				deferCopyCursorRemoval(nodeId);
+				return;
+			}
+			if (connectionSuperseded()) return;
 			if (!isCopyPassRouteRestoredDurable(nodeId)) {
 				deferCopyCursorRemoval(nodeId);
 				return;
@@ -5286,11 +5296,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 				} else {
 					void persistCopyBounds()
-						.then(async (ok) => {
+						.then((ok) => {
 							if (connectionSuperseded()) return;
 							if (ok && isCopyPassRouteRestoredDurable(copyNodeId)) {
-								await ensureFullCoverageRestoredOnSeqRow(copyNodeId);
-								if (connectionSuperseded()) return;
 								return getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), copyNodeId]);
 							}
 							deferCopyCursorRemoval(copyNodeId);
@@ -6485,7 +6493,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (node && typeof node.id === 'number') {
 								const bound = maxCopiedVersionByOrigin.get(node.id);
 								if (bound !== undefined) {
-									clearCopyBoundedCertification(node.id, bound, node);
+									clearCopyBoundedCertification(node.id, bound, { ...node });
 								}
 							}
 						}
