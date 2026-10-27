@@ -31,13 +31,21 @@ RUN <<-EOF
   rm -rf /home/node
   chown -R harperdb:harperdb /home/harperdb
   apt-get update
-  apt-get install -y --no-install-recommends zstd
+  apt-get install -y --no-install-recommends libjemalloc2 zstd
   rm -rf /var/lib/apt/lists/*
 EOF
 
 WORKDIR /home/harperdb
 
 USER harperdb
+
+# jemalloc for every process in the image: RocksDB's fragmentation under glibc
+# malloc costs RSS and throughput (see build-tools/DESIGN.md). Default settings,
+# no MALLOC_CONF. Opt out per deployment with `-e LD_PRELOAD=`. The bare soname
+# resolves per architecture through ld.so.cache; a preload the loader cannot
+# resolve only warns and falls back to glibc, so assert node's malloc binds to it.
+ENV LD_PRELOAD=libjemalloc.so.2
+RUN LD_DEBUG=bindings node -e 0 2>&1 | grep -q 'binding file node .*/libjemalloc\.so\.2 .*normal symbol .malloc. '
 
 # Install pnpm
 RUN <<EOF

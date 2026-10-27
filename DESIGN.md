@@ -13,6 +13,7 @@
 - [A marker-free PR is green only if every submodule pointer it moves is settled (`workflows/companion-check.yaml`)](.github/DESIGN.md#a-marker-free-pr-is-green-only-if-every-submodule-pointer-it-moves-is-settled-workflowscompanion-checkyaml): settle branch is the base-named submodule branch else its default; patchless file entries are decided by the head tree; unreadable is pending.
 - [Release-candidate CI gate](scripts/DESIGN.md#release-candidate-ci-gate): pinned candidate SHAs, per-job workflow evidence, and the override.
 - [Startup dependencies](#startup-dependencies): packages the built-in components load only on first use.
+- [The default, `-pc` and GPU images run every process on jemalloc](build-tools/DESIGN.md#the-default--pc-and-gpu-images-run-every-process-on-jemalloc-dockerfile-dockerfile-gpu): distro `libjemalloc2` preloaded by soname with default settings; the build fails unless node's `malloc` binds to it; opt out with `-e LD_PRELOAD=`; OpenShift stays on glibc (UBI10 has no package).
 
 ## Startup dependencies
 

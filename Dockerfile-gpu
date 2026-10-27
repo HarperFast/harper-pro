@@ -40,7 +40,7 @@ USER root
 RUN <<-EOF
     set -e
     apt-get update
-    apt-get install -y --no-install-recommends ca-certificates curl git gnupg libatomic1 wget zstd
+    apt-get install -y --no-install-recommends ca-certificates curl git gnupg libatomic1 libjemalloc2 wget zstd
     mkdir -p /etc/apt/keyrings
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
@@ -74,6 +74,10 @@ EOF
 WORKDIR /home/harperdb
 
 USER harperdb
+
+# jemalloc preload; see the note in ./Dockerfile.
+ENV LD_PRELOAD=libjemalloc.so.2
+RUN LD_DEBUG=bindings node -e 0 2>&1 | grep -q 'binding file node .*/libjemalloc\.so\.2 .*normal symbol .malloc. '
 
 # Install pnpm
 RUN <<EOF
