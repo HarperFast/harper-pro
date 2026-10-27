@@ -1,26 +1,20 @@
 /**
- * In-place blob repair on a cursorless copy re-delivery.
+ * A first base copy closed mid-blob before it banks a copy cursor leaves the record's row committed
+ * on a PENDING blob stub. The reconnect has no cursor, so it is another full copy that re-sends the
+ * record at the same version from the same node; core's copy-apply skips that write, so only the
+ * receiver's in-place repair can stream the re-sent bytes into the stub, so it must run on a copy
+ * with no resume cursor too.
  *
- * A first base copy closed mid-blob before it banks any copy cursor leaves the record's row committed
- * and its blob file stamped PENDING (the close path aborts the in-flight receive). The reconnect has
- * no cursor, so it is another full copy, which re-sends the record at the same version from the same
- * node. Core's copy-apply skips that same-version write, so only the receiver's in-place repair can
- * stream the re-sent bytes into the stub; before this fix it ran only on a cursor resume or a
- * same-socket copy restart, and the blob stayed PENDING forever.
- *
- * Setup: A seeds file-backed blob records, then B joins (add_node → cursorless base copy A→B). B's
- * injector holds record 0's first blob save open, so the copy cannot bank a cursor (nothing below
- * record 0 is durable). The test then restarts A, which closes the link with that receive in flight.
- *
- * Oracles: every reconnect requested a full copy and none resumed from a cursor (the precondition),
- * the stub was repaired in place, and every record on B serves its exact bytes.
+ * A's fixture stalls the send of record 0's blob after its first payload KiB, so B's receive of the
+ * lowest walk position stays in flight and nothing can bank. Stopping A closes the link mid-receive.
  */
 
 import { suite, test, before, after } from 'node:test';
-import { ok } from 'node:assert';
-import { setTimeout as delay } from 'node:timers/promises';
+import { ok, equal } from 'node:assert';
 import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { writeFileSync } from 'node:fs';
 import {
 	startHarper,
 	teardownHarper,
@@ -30,7 +24,7 @@ import {
 } from '@harperfast/integration-testing';
 import {
 	sendOperation,
-	fetchWithRetry,
+	postOperation,
 	readLog,
 	replicationPoolOffEnv,
 	restartNode,
@@ -42,7 +36,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 
 const BLOB_RECORDS = 10; // /LargeLocation/{n} on A — each a deterministic ~50 KB file-backed blob
 const BLOB_BYTES = 50 * 1024;
-const HELD_SAVE = '0:1';
+const STALL_FIXTURE = join(import.meta.dirname, 'fixture-blob-stall-source');
 
 // Mirrors fixture-large-blob-deterministic/resources.js.
 function expectedPayloadHash(id) {
@@ -56,22 +50,21 @@ function expectedPayloadHash(id) {
 	return hash.digest('hex');
 }
 
-async function damagedPayloadIds(node) {
+async function readImage(node, id, signal) {
+	const response = await fetch(node.httpURL + '/LargeLocationImage/' + id, { signal });
+	return { status: response.status, bytes: Buffer.from(await response.arrayBuffer()) };
+}
+
+async function damagedPayloadIds(node, signal) {
 	const damaged = [];
 	for (let id = 0; id < BLOB_RECORDS; id++) {
-		try {
-			const response = await fetchWithRetry(node.httpURL + '/LargeLocationImage/' + id, { retries: 3 });
-			if (!response.ok) {
-				damaged.push(`${id}:status=${response.status}`);
-				continue;
-			}
-			const bytes = Buffer.from(await response.arrayBuffer());
-			if (bytes.length !== BLOB_BYTES || createHash('sha1').update(bytes).digest('hex') !== expectedPayloadHash(id)) {
-				damaged.push(`${id}:bytes=${bytes.length}`);
-			}
-		} catch (error) {
-			damaged.push(`${id}:error=${error?.message ?? error}`);
-		}
+		const { status, bytes } = await readImage(node, id, signal).catch((error) => {
+			if (signal.aborted) throw error;
+			return { status: `error ${error.message}`, bytes: Buffer.alloc(0) };
+		});
+		if (status !== 200) damaged.push(`${id}:status=${status}`);
+		else if (bytes.length !== BLOB_BYTES || createHash('sha1').update(bytes).digest('hex') !== expectedPayloadHash(id))
+			damaged.push(`${id}:bytes=${bytes.length}`);
 	}
 	return damaged;
 }
@@ -83,28 +76,31 @@ const sharedConfig = (host) => ({
 });
 
 suite('Cursorless copy re-delivery repairs a blob aborted mid-receive', { timeout: 600000 }, (ctx) => {
+	const armFile = join(tmpdir(), `blob-stall-arm-${process.pid}-${Date.now()}`);
+	// Pool off on A: the stalled read must be on the thread that sends the copy, where the fixture is loaded.
+	const sourceOptions = (host) => ({
+		config: sharedConfig(host),
+		env: { ...replicationPoolOffEnv(), HARPER_TEST_BLOB_STALL_ARM_FILE: armFile, HARPER_TEST_BLOB_STALL_RECORD: '0' },
+	});
+
 	before(async () => {
 		const nodeA = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		const nodeB = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
-		await startHarper(nodeA, { config: sharedConfig(nodeA.harper.hostname) });
-		await setupHarperWithFixture(nodeB, join(import.meta.dirname, 'fixture-blob-fail-slow-injector'), {
-			config: sharedConfig(nodeB.harper.hostname),
-			// Pool off on B: its receiving sockets must be on the HTTP workers, where the injector is loaded.
-			env: { ...replicationPoolOffEnv(), HARPER_TEST_BLOB_HOLD_SAVES: HELD_SAVE },
-		});
+		// A deploys the stall fixture rather than starting from it: a node started from a fixture does not
+		// listen on its replication port.
+		await startHarper(nodeA, sourceOptions(nodeA.harper.hostname));
+		await setupHarperWithFixture(nodeB, STALL_FIXTURE, { config: sharedConfig(nodeB.harper.hostname) });
 		ctx.nodes = [nodeA.harper, nodeB.harper];
 
-		const payload = await targz(join(import.meta.dirname, 'fixture-large-blob-deterministic'));
-		await sendOperation(ctx.nodes[0], {
-			operation: 'deploy_component',
-			project: 'large-blob-deterministic',
-			payload,
-			restart: false,
-		});
-		await restartNode(ctx.nodes[0]);
+		const [A] = ctx.nodes;
+		for (const [project, path] of [
+			['large-blob-deterministic', join(import.meta.dirname, 'fixture-large-blob-deterministic')],
+			['blob-stall-source', STALL_FIXTURE],
+		])
+			await sendOperation(A, { operation: 'deploy_component', project, payload: await targz(path), restart: false });
+		await restartNode(A);
 		// Seeded in commit order, one GET per id, so the copy's post-walk log tail re-delivers nothing
 		// (see copyGapCursorBanking.test.mjs).
-		const [A] = ctx.nodes;
 		const seededCount = async (signal) =>
 			(
 				await sendOperation(
@@ -135,10 +131,9 @@ suite('Cursorless copy re-delivery repairs a blob aborted mid-receive', { timeou
 				description: `the seed of LargeLocation/${id} to commit`,
 			});
 		}
-
 		ok(
-			(await readLog(ctx.nodes[1])).includes('[blob-fail-slow-injector] installed'),
-			'fault injector did not load on B — the test would not exercise the failure path'
+			(await readLog(A)).includes('[blob-stall-source] installed'),
+			'stall fixture did not load on A — the test would not exercise the failure path'
 		);
 	});
 
@@ -152,16 +147,28 @@ suite('Cursorless copy re-delivery repairs a blob aborted mid-receive', { timeou
 	test('the reconnect full copy heals the PENDING stub in place', async () => {
 		const [A, B] = ctx.nodes;
 		const tokenResp = await sendOperation(A, { operation: 'create_authentication_tokens', authorization: A.admin });
-		const armResponse = await fetchWithRetry(B.httpURL + '/ArmBlobFaultInjector');
-		ok(armResponse.ok, `fault injector did not arm: HTTP ${armResponse.status}`);
-		await sendOperation(B, {
-			operation: 'add_node',
-			rejectUnauthorized: false,
-			hostname: A.hostname,
-			authorization: 'Bearer ' + tokenResp.operation_token,
-		});
+		writeFileSync(armFile, '');
+		let addNode;
+		// A's replication listener can come up after its operations API following the deploy restart.
+		await waitForCondition(
+			async (signal) =>
+				(addNode = await postOperation(
+					B,
+					{
+						operation: 'add_node',
+						rejectUnauthorized: false,
+						hostname: A.hostname,
+						authorization: 'Bearer ' + tokenResp.operation_token,
+					},
+					{ signal }
+				)).status === 200,
+			{
+				timeoutMs: 60000,
+				pollMs: 1000,
+				description: () => `add_node to succeed (last: ${JSON.stringify(addNode?.body)})`,
+			}
+		);
 
-		// The first copy walks every row while record 0's blob receive stays in flight.
 		let bCount = 0;
 		await waitForCondition(
 			async (signal) => {
@@ -171,37 +178,41 @@ suite('Cursorless copy re-delivery repairs a blob aborted mid-receive', { timeou
 							() => ({})
 						)
 					).record_count ?? 0;
-				return bCount >= BLOB_RECORDS && (await readLog(B)).includes(`holding save ${HELD_SAVE}`);
+				return bCount >= BLOB_RECORDS && (await readLog(A)).includes('[blob-stall-source] stall engaged for record 0');
 			},
-			{ timeoutMs: 120000, description: () => `B's first copy to deliver every row (${bCount}) with the held save` }
-		);
-		const firstCopyLog = await readLog(B);
-		ok(
-			!/Resuming interrupted copy of database data /.test(firstCopyLog),
-			'B resumed from a copy cursor before the close — the first copy was not cursorless'
+			{ timeoutMs: 120000, description: () => `B's first copy to deliver every row (${bCount}) with record 0 stalled` }
 		);
 
-		await restartNode(A);
+		await stopNodeProcess(A);
+		let stub;
+		await waitForCondition(
+			async (signal) => {
+				stub = await readImage(B, 0, signal);
+				return stub.status === 503 && /pending replication/.test(stub.bytes.toString());
+			},
+			{
+				timeoutMs: 60000,
+				description: () => `record 0 on B to read as a PENDING stub (last: ${stub?.status} ${stub?.bytes})`,
+			}
+		);
 
+		ctx.nodes[0] = (await startHarper({ name: ctx.name, harper: A }, sourceOptions(A.hostname))).harper;
 		let damaged = [];
-		let bLog = '';
-		const deadline = Date.now() + 180000;
-		while (Date.now() < deadline) {
-			bLog = await readLog(B);
-			if ((damaged = await damagedPayloadIds(B)).length === 0) break;
-			await delay(2000);
-		}
-		const fullCopyRequests = (bLog.match(/Requesting full copy of database data /g) ?? []).length;
-		const cursorResumes = (bLog.match(/Resuming interrupted copy of database data /g) ?? []).length;
-		const inPlaceRepairs = (bLog.match(/Repaired blob file in place/g) ?? []).length;
-		console.log(
-			`cursorless repair test: fullCopyRequests=${fullCopyRequests} cursorResumes=${cursorResumes} ` +
-				`inPlaceRepairs=${inPlaceRepairs} damaged=[${damaged}]`
-		);
+		await waitForCondition(async (signal) => (damaged = await damagedPayloadIds(B, signal)).length === 0, {
+			timeoutMs: 180000,
+			pollMs: 2000,
+			description: () =>
+				`every record's blob to read in full on B after the cursorless re-copy (damaged: [${damaged}])`,
+		});
 
+		const bLog = await readLog(B);
+		const fullCopyRequests = (bLog.match(/Requesting full copy of database data /g) ?? []).length;
 		ok(fullCopyRequests >= 2, `the reconnect did not request a second full copy (${fullCopyRequests} requests)`);
-		ok(cursorResumes === 0, `a reconnect resumed from a copy cursor (${cursorResumes}) — the copy was not cursorless`);
-		ok(damaged.length === 0, `records whose blob never healed after the cursorless re-copy: [${damaged}]`);
-		ok(inPlaceRepairs >= 1, 'the healed blob was not repaired in place');
+		equal(
+			(bLog.match(/Resuming interrupted copy of database data /g) ?? []).length,
+			0,
+			'a reconnect resumed from a copy cursor — the copy was not cursorless'
+		);
+		ok(bLog.includes('Repaired blob file in place'), 'the stub was not repaired in place');
 	});
 });

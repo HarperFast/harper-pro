@@ -2,9 +2,7 @@
 // /blobs/ saves so every save is SLOW (each write callback deferred by
 // HARPER_TEST_BLOB_SLOW_MS) and selected saves FAIL asynchronously with ENOENT
 // (HARPER_TEST_BLOB_FAIL_SAVES: `<record>:<n>` fails that record's n-th fresh save,
-// `<record>:repair` fails its first in-place repair save) and selected saves HANG
-// (HARPER_TEST_BLOB_HOLD_SAVES, same `<record>:<n>` form: no payload byte is written and the write
-// never completes, so the receive stays in flight until the connection closes and aborts it).
+// `<record>:repair` fails its first in-place repair save).
 //
 // The slowness keeps blob saves continuously in flight during a base copy — the field condition
 // copyGapCursorBanking.test.mjs (harper-pro#699) needs: fast local saves drain between frames,
@@ -27,16 +25,10 @@ const failSaves = new Set(
 		.map((value) => value.trim())
 		.filter(Boolean)
 );
-const holdSaves = new Set(
-	(process.env.HARPER_TEST_BLOB_HOLD_SAVES || '')
-		.split(',')
-		.map((value) => value.trim())
-		.filter(Boolean)
-);
 const slowMs = Number.parseInt(process.env.HARPER_TEST_BLOB_SLOW_MS || '0', 10);
 let armed = false;
 let attempts = new Map();
-if (failSaves.size > 0 || holdSaves.size > 0 || (Number.isFinite(slowMs) && slowMs > 0)) {
+if (failSaves.size > 0 || (Number.isFinite(slowMs) && slowMs > 0)) {
 	const require = createRequire(import.meta.url);
 	const fs = require('node:fs');
 	const realCreateWriteStream = fs.createWriteStream;
@@ -91,10 +83,6 @@ if (failSaves.size > 0 || holdSaves.size > 0 || (Number.isFinite(slowMs) && slow
 						});
 						return false;
 					}
-					if (attempt && holdSaves.has(attempt)) {
-						console.log('[blob-fail-slow-injector] holding save ' + attempt + ' ' + path);
-						return false;
-					}
 					console.log('[blob-save-start] ' + path + ' record=' + recordSeed);
 					flushHeader();
 					const accepted = realWrite(chunk, enc, cb);
@@ -120,9 +108,7 @@ if (failSaves.size > 0 || holdSaves.size > 0 || (Number.isFinite(slowMs) && slow
 		'[blob-fail-slow-injector] installed; waiting to arm; slowMs=' +
 			slowMs +
 			' failing data /blobs/ saves ' +
-			[...failSaves].join(',') +
-			' holding ' +
-			[...holdSaves].join(',')
+			[...failSaves].join(',')
 	);
 }
 
@@ -134,7 +120,7 @@ export class ArmBlobFaultInjector extends Resource {
 		attempts = new Map();
 		armed = true;
 		console.log('[blob-fail-slow-injector] armed');
-		return { armed, failSaves: [...failSaves], holdSaves: [...holdSaves] };
+		return { armed, failSaves: [...failSaves] };
 	}
 }
 
