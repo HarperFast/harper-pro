@@ -2113,6 +2113,9 @@ export async function collectBlobRepairTargets(
 	}
 }
 
+const COPY_FRAME_NOT_TIED = Object.freeze({ tie: false, repairTargets: null });
+const COPY_FRAME_TIED = Object.freeze({ tie: true, repairTargets: null });
+
 /**
  * The stored-state decision for a blob-carrying copy frame, from one stored-entry read: `tie` when the
  * frame may be skipped as a durable identity tie, else the in-place repair targets for a same-version,
@@ -2128,31 +2131,28 @@ export async function resolveCopyFrameStoredBlobs(
 	blobFileDamaged: (blob: any) => Promise<boolean | undefined> | boolean | undefined,
 	declines: Record<string, number>,
 	verifyBlobs?: (value: unknown) => Promise<boolean>
-): Promise<{ tie: boolean; repairTargets: any[] | null }> {
+): Promise<{ readonly tie: boolean; readonly repairTargets: any[] | null }> {
 	let entry: any;
 	try {
 		entry = tableDecoder?.getEntry?.(id);
 		if (entry && typeof entry.then === 'function') entry = await entry;
 	} catch {
 		declines['entry-read-error'] = (declines['entry-read-error'] ?? 0) + 1;
-		return { tie: false, repairTargets: null };
+		return COPY_FRAME_NOT_TIED;
 	}
 	if (entry == null || entry.version !== incomingVersion || (entry.nodeId ?? 0) !== sourceNodeId)
-		return { tie: false, repairTargets: null };
-	if (await isDurableIdentityTie(entry, incomingVersion, sourceNodeId, true, verifyBlobs))
-		return { tie: true, repairTargets: null };
-	return {
-		tie: false,
-		repairTargets: await collectBlobRepairTargets(
-			tableDecoder,
-			id,
-			incomingVersion,
-			sourceNodeId,
-			blobFileDamaged,
-			declines,
-			entry
-		),
-	};
+		return COPY_FRAME_NOT_TIED;
+	if (await isDurableIdentityTie(entry, incomingVersion, sourceNodeId, true, verifyBlobs)) return COPY_FRAME_TIED;
+	const repairTargets = await collectBlobRepairTargets(
+		tableDecoder,
+		id,
+		incomingVersion,
+		sourceNodeId,
+		blobFileDamaged,
+		declines,
+		entry
+	);
+	return repairTargets ? { tie: false, repairTargets } : COPY_FRAME_NOT_TIED;
 }
 
 /**
