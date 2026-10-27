@@ -437,7 +437,13 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			(state) => (state?.closedFloor ?? 0) > floorBeforeSecondRestart,
 			"A's floor on B to advance past firstCertifiedFrom"
 		);
-		await restartNode(B);
+		await postToFixture(A, 'HoldTransaction', { id: 'held-second-certified-resume' });
+		await upsert(A, 'above-held-second-resume');
+		await waitForRecord(B, 'above-held-second-resume');
+		await stopNodeProcess(B);
+		await postToFixture(A, 'ReleaseTransaction', {});
+		await startNode(B);
+		await waitForRecord(B, 'held-second-certified-resume');
 		await upsert(A, 'after-second-certified-resume');
 		await waitForRecord(B, 'after-second-certified-resume');
 		const floorAfterSecondRestart = (await stateFor(B, A, A))?.closedFloor ?? 0;

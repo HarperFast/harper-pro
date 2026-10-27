@@ -3069,6 +3069,7 @@ type SettledRouteStateVersions = {
 	marks: Map<number, number | undefined>;
 	clears: Map<number, number | undefined>;
 	revocations: Map<number, number | undefined>;
+	certifiedSinceClear: Map<number, { clearVersion: number; start: number; generation?: string } | undefined>;
 };
 type UnverifiedRouteStateBatch = {
 	event: any;
@@ -3087,6 +3088,7 @@ export class PendingRouteState {
 	private settledMarkVersion = new Map<number, number>();
 	private settledClearVersion = new Map<number, number>();
 	private settledRevokeVersion = new Map<number, number>();
+	private settledCertifiedSinceClear = new Map<number, { clearVersion: number; start: number; generation?: string }>();
 	private takenEvents = new WeakSet<object>();
 	private unverifiedBatches: UnverifiedRouteStateBatch[] = [];
 	private onSettled?: (event: any) => void;
@@ -3097,6 +3099,11 @@ export class PendingRouteState {
 		this.onSettled = onSettled;
 	}
 	retainOnlySafetyMarks(): void {
+		for (const batch of this.unverifiedBatches) {
+			for (const [, entry] of batch.marks ?? []) {
+				entry.mark[1] = undefined;
+			}
+		}
 		if (!this.marks) return;
 		for (const [originId, entry] of this.marks) {
 			const isPartialTrue = entry.mark[2] === true;
@@ -3106,7 +3113,7 @@ export class PendingRouteState {
 				this.marks.delete(originId);
 			} else {
 				entry.mark[1] = undefined;
-				if (!isPartialTrue) entry.mark[2] = undefined;
+				if (!isPartialTrue) entry.mark[2] = isClear ? false : undefined;
 			}
 		}
 	}
@@ -3174,10 +3181,14 @@ export class PendingRouteState {
 		if (marks?.size) {
 			const states: OriginRouteState[] = [];
 			for (const [, entry] of marks) {
-				if (entry.clearCertifiedFirst && entry.mark[2] === false) {
+				if (entry.clearCertifiedFirst && entry.mark[2] !== true) {
 					states.push([entry.mark[0], undefined, true, undefined, entry.mark[4]]);
+					const markCopy = [...entry.mark] as OriginRouteState;
+					if (markCopy[2] === undefined) markCopy[2] = false;
+					states.push(markCopy);
+				} else {
+					states.push([...entry.mark] as OriginRouteState);
 				}
-				states.push([...entry.mark] as OriginRouteState);
 			}
 			event.originRouteStates = states;
 		} else if ('originRouteStates' in event) {
@@ -3253,8 +3264,13 @@ export class PendingRouteState {
 		const prevMarks = new Map<number, number | undefined>();
 		const prevClears = new Map<number, number | undefined>();
 		const prevRevocations = new Map<number, number | undefined>();
+		const prevCertifiedSinceClear = new Map<
+			number,
+			{ clearVersion: number; start: number; generation?: string } | undefined
+		>();
 		for (const [originId, sent] of marks ?? []) {
 			prevMarks.set(originId, this.settledMarkVersion.get(originId));
+			prevCertifiedSinceClear.set(originId, this.settledCertifiedSinceClear.get(originId));
 			if (sent.version > (this.settledMarkVersion.get(originId) ?? 0)) {
 				this.settledMarkVersion.set(originId, sent.version);
 			}
@@ -3263,6 +3279,35 @@ export class PendingRouteState {
 				const clearVer = sent.clearVersion || sent.version;
 				if (clearVer > (this.settledClearVersion.get(originId) ?? 0)) {
 					this.settledClearVersion.set(originId, clearVer);
+				}
+				if (sent.mark[2] !== true && typeof sent.mark[1] === 'number') {
+					this.settledCertifiedSinceClear.set(originId, {
+						clearVersion: clearVer,
+						start: sent.mark[1],
+						generation: sent.mark[4],
+					});
+				} else {
+					this.settledCertifiedSinceClear.delete(originId);
+				}
+			} else if (typeof sent.mark[1] === 'number') {
+				const existing = this.settledCertifiedSinceClear.get(originId);
+				const clearVer = this.settledClearVersion.get(originId) ?? 0;
+				if (
+					existing &&
+					existing.clearVersion === clearVer &&
+					(existing.generation === sent.mark[4] || existing.generation === undefined || sent.mark[4] === undefined)
+				) {
+					this.settledCertifiedSinceClear.set(originId, {
+						clearVersion: clearVer,
+						start: Math.min(existing.start, sent.mark[1]),
+						generation: sent.mark[4] ?? existing.generation,
+					});
+				} else {
+					this.settledCertifiedSinceClear.set(originId, {
+						clearVersion: clearVer,
+						start: sent.mark[1],
+						generation: sent.mark[4],
+					});
 				}
 			}
 			const current = this.marks?.get(originId);
@@ -3295,7 +3340,12 @@ export class PendingRouteState {
 				this.revocations!.delete(originId);
 			}
 		}
-		return { marks: prevMarks, clears: prevClears, revocations: prevRevocations };
+		return {
+			marks: prevMarks,
+			clears: prevClears,
+			revocations: prevRevocations,
+			certifiedSinceClear: prevCertifiedSinceClear,
+		};
 	}
 	private restore(
 		marks: Map<number, PendingRouteMarkEntry> | undefined,
@@ -3315,6 +3365,10 @@ export class PendingRouteState {
 				if (prev === undefined) this.settledRevokeVersion.delete(originId);
 				else this.settledRevokeVersion.set(originId, prev);
 			}
+			for (const [originId, prev] of settled.certifiedSinceClear) {
+				if (prev === undefined) this.settledCertifiedSinceClear.delete(originId);
+				else this.settledCertifiedSinceClear.set(originId, prev);
+			}
 		}
 		for (const [originId, sent] of marks ?? []) {
 			const current = this.marks?.get(originId);
@@ -3330,15 +3384,19 @@ export class PendingRouteState {
 				if (sent.mark[2] === true || sent.clearCertifiedFirst) {
 					current.clearCertifiedFirst = true;
 					if (!current.clearVersion) current.clearVersion = sent.clearVersion || sent.version;
-					if (current.mark[2] === undefined && sent.mark[2] === true) {
-						current.mark[2] = true;
-						current.mark[1] = undefined;
+					if (current.mark[2] === undefined) {
+						if (sent.mark[2] === true) {
+							current.mark[2] = true;
+							current.mark[1] = undefined;
+						} else {
+							current.mark[2] = false;
+						}
 					}
 				} else if (sent.mark[2] === false && current.mark[2] === undefined) {
 					current.mark[2] = false;
 				}
 				if (sent.mark[3] === true) current.mark[3] = true;
-				if (typeof sent.mark[1] === 'number' && current.mark[2] !== true && !current.clearCertifiedFirst) {
+				if (typeof sent.mark[1] === 'number' && current.mark[2] !== true && sent.mark[2] !== true) {
 					if (!(current.mark[1] <= sent.mark[1])) current.mark[1] = sent.mark[1];
 				}
 			}
@@ -3365,7 +3423,13 @@ export class PendingRouteState {
 			const isHole = entry.mark[3] === true;
 			if (!isPartialTrue && !isClear && !isHole) continue;
 			(safetyMarks ??= new Map()).set(originId, {
-				mark: [entry.mark[0], undefined, isPartialTrue ? true : undefined, isHole ? true : undefined, entry.mark[4]],
+				mark: [
+					entry.mark[0],
+					!isPartialTrue && isClear ? entry.mark[1] : undefined,
+					isPartialTrue ? true : isClear ? false : undefined,
+					isHole ? true : undefined,
+					entry.mark[4],
+				],
 				clearCertifiedFirst: isClear || isPartialTrue ? true : undefined,
 				version: entry.version,
 				clearVersion: entry.clearVersion,
@@ -3422,13 +3486,27 @@ export class PendingRouteState {
 					batchPersisted = false;
 					break;
 				}
-				if (
-					(entry.clearCertifiedFirst || partialHistory === true) &&
-					typeof certifiedFrom !== 'number' &&
-					typeof node.certifiedFrom === 'number'
-				) {
-					batchPersisted = false;
-					break;
+				if (entry.clearCertifiedFirst || partialHistory === true) {
+					const batchClearVer = entry.clearVersion || entry.version;
+					const newerClearSettled = (this.settledClearVersion.get(originId) ?? 0) > batchClearVer;
+					if (!newerClearSettled) {
+						const recert = partialHistory === true ? undefined : this.settledCertifiedSinceClear.get(originId);
+						const expectedCertified =
+							recert &&
+							recert.clearVersion === batchClearVer &&
+							(gen === undefined || recert.generation === undefined || recert.generation === gen)
+								? recert.start
+								: certifiedFrom;
+						if (typeof expectedCertified === 'number') {
+							if (node.certifiedFrom !== expectedCertified) {
+								batchPersisted = false;
+								break;
+							}
+						} else if (typeof node.certifiedFrom === 'number') {
+							batchPersisted = false;
+							break;
+						}
+					}
 				}
 			}
 			if (batchPersisted) {
@@ -3583,6 +3661,7 @@ type CopyPassState = {
 	startTime: number;
 	resumed: boolean;
 	resumedWithWidening: boolean;
+	fullCoverage?: boolean;
 	seqDurableAtCopyStart: boolean;
 	completeReceived: boolean;
 	restored: boolean;
@@ -3604,7 +3683,7 @@ export function restoreCompletedCopyPass(
 	if (!pass || pass.restored || !pass.completeReceived || !pass.seqDurableAtCopyStart) return false;
 	if (pass.passId !== currentPass) return false;
 	pass.restored = true;
-	if (!pass.resumedWithWidening) {
+	if (!pass.resumedWithWidening && pass.fullCoverage !== false) {
 		for (const entry of partialMarked) {
 			const id = Array.isArray(entry) ? entry[0] : entry;
 			const markedGen = Array.isArray(entry) ? entry[1] : undefined;
@@ -3652,15 +3731,15 @@ function notifyLiveRouteBoundListeners(dbisDB: DbisStore | undefined, rootStore?
 	}
 }
 
-function clearGenlessClosedFloorOnSeqRow(
+async function clearGenlessClosedFloorOnSeqRow(
 	dbisDB: DbisStore | undefined,
 	peerNodeId: number | undefined,
 	originId: number,
 	rootStore?: any
-): void {
-	if (!dbisDB?.put || peerNodeId === undefined) return;
+): Promise<boolean> {
+	if (!dbisDB?.put || peerNodeId === undefined) return false;
 	const row = readDbisCursorSync(dbisDB, 'seq', peerNodeId);
-	if (!Array.isArray(row?.nodes)) return;
+	if (!Array.isArray(row?.nodes)) return false;
 	let changed = false;
 	const nodes = row.nodes.map((node: any) => {
 		if (
@@ -3675,20 +3754,20 @@ function clearGenlessClosedFloorOnSeqRow(
 		return node;
 	});
 	if (changed) {
-		void Promise.resolve(dbisDB.put([SEQ_KEY, peerNodeId], { ...row, nodes })).catch(() => {});
+		await Promise.resolve(dbisDB.put([SEQ_KEY, peerNodeId], { ...row, nodes }));
 		bumpCopyBoundEpoch(dbisDB, rootStore, true);
 	}
+	return true;
 }
 
 function bumpCopyBoundEpoch(dbisDB: DbisStore | undefined, rootStore?: any, bumpShared = true): void {
+	if (!bumpShared) return;
 	const resolvedRoot = rootStore ?? (dbisDB as any)?.rootStore;
 	const keyObj = resolvedRoot && typeof resolvedRoot === 'object' ? resolvedRoot : (dbisDB as any);
 	if (keyObj && typeof keyObj === 'object') {
 		fallbackOriginStateEpochs.set(keyObj, (fallbackOriginStateEpochs.get(keyObj) ?? 0) + 1);
 	}
-	if (bumpShared) {
-		bumpOriginStateEpoch(resolvedRoot);
-	}
+	bumpOriginStateEpoch(resolvedRoot);
 }
 
 function readCopyBoundEpoch(dbisDB: DbisStore | undefined, rootStore?: any): number {
@@ -3839,7 +3918,7 @@ export function persistMergedCopyBounds(
 	let issuedAnyWrite = false;
 	const bumpEpoch = () => {
 		if (issuedAnyWrite || clearedAnySeqCertification) {
-			bumpCopyBoundEpoch(dbisDB, rootStore, boundAdvanced || clearedAnySeqCertification);
+			bumpCopyBoundEpoch(dbisDB, rootStore, clearedAnySeqCertification);
 			notifyLiveRouteBoundListeners(dbisDB, rootStore);
 		}
 	};
@@ -5009,10 +5088,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	function isCopyPassRouteRestoredDurable(nodeId: number): boolean {
 		if (pendingRouteState.size > 0 || pendingRouteState.hasUnverifiedBatches()) return false;
-		if (!currentCopyPass || currentCopyPass.startTime <= 0 || currentCopyPass.resumedWithWidening) {
-			return partialMarked.size === 0;
+		if (!currentCopyPass || currentCopyPass.startTime <= 0) {
+			return true;
 		}
 		if (!currentCopyPass.restored) return false;
+		if (currentCopyPass.resumedWithWidening || currentCopyPass.fullCoverage === false) {
+			return true;
+		}
 		const { dbisDB } = getDatabaseStores();
 		if (dbisDB) {
 			const seqEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
@@ -5037,6 +5119,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 		}
 		return true;
+	}
+	async function ensureFullCoverageRestoredOnSeqRow(nodeId: number): Promise<void> {
+		if (!currentCopyPass || currentCopyPass.resumedWithWidening || currentCopyPass.fullCoverage === false) {
+			return;
+		}
+		const { dbisDB } = getDatabaseStores();
+		if (!dbisDB?.put) return;
+		const seqEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
+		if (!Array.isArray(seqEntry?.nodes)) return;
+		let changed = false;
+		const nodes = seqEntry.nodes.map((n: any) => {
+			if (n && n.id === nodeId && n.fullCoverage === false) {
+				changed = true;
+				return { ...n, fullCoverage: true };
+			}
+			return n;
+		});
+		if (changed) {
+			await Promise.resolve(dbisDB.put([SEQ_KEY, nodeId], { ...seqEntry, nodes }));
+		}
 	}
 	function attachCopyCursorRemoval(event: any, nodeId: number | undefined, afterSeqWrite = false): void {
 		if (nodeId === undefined) return;
@@ -5069,6 +5171,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!connectionSuperseded() && isCopyPassRouteRestoredDurable(nodeId)) {
 				if (persisted) {
 					try {
+						await ensureFullCoverageRestoredOnSeqRow(nodeId);
+						if (connectionSuperseded()) return;
 						await getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
 					} catch (error) {
 						logger.warn?.(connectionId, 'could not remove copy cursor for', databaseName, error);
@@ -5182,9 +5286,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 				} else {
 					void persistCopyBounds()
-						.then((ok) => {
+						.then(async (ok) => {
 							if (connectionSuperseded()) return;
 							if (ok && isCopyPassRouteRestoredDurable(copyNodeId)) {
+								await ensureFullCoverageRestoredOnSeqRow(copyNodeId);
+								if (connectionSuperseded()) return;
 								return getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), copyNodeId]);
 							}
 							deferCopyCursorRemoval(copyNodeId);
@@ -6346,11 +6452,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (wsClosed || connectionSuperseded()) return;
 			if (pendingRouteState.hasPending() && !frameOpen) {
 				flushRouteState();
+			} else if (pendingRouteState.hasUnverifiedBatches() || bareFloorClearedOrigins.size > 0) {
+				enqueuePostSeqWriteBarrier();
 			}
 		}, 250);
 		routeStateRetryTimer.unref?.();
 	}
-	function runPostSeqWriteChecks(): void {
+	async function runPostSeqWriteChecks(): Promise<void> {
 		if (wsClosed || connectionSuperseded()) {
 			if (!boundSharedRouteSafety || boundSharedRouteSafety.ownerConnectionId === connectionId) {
 				pendingRouteState.retainOnlySafetyMarks();
@@ -6364,8 +6472,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const peerId = remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined;
 			if (peerId !== undefined) {
 				if (bareFloorClearedOrigins.size > 0) {
-					for (const originId of bareFloorClearedOrigins) {
-						clearGenlessClosedFloorOnSeqRow(dbisDB, peerId, originId, store?.rootStore);
+					for (const originId of Array.from(bareFloorClearedOrigins)) {
+						const cleared = await clearGenlessClosedFloorOnSeqRow(dbisDB, peerId, originId, store?.rootStore);
+						if (cleared) bareFloorClearedOrigins.delete(originId);
 					}
 				}
 				loadPersistedCopyBounds();
@@ -6382,7 +6491,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 						const { merged, changed } = mergeSeqRowVoidingCopyBounds(latestRow, latestRow, maxCopiedVersionByOrigin);
 						if (changed) {
-							void Promise.resolve(dbisDB.put([SEQ_KEY, peerId], merged)).catch(() => {});
+							await Promise.resolve(dbisDB.put([SEQ_KEY, peerId], merged));
 							bumpCopyBoundEpoch(dbisDB, store?.rootStore, true);
 						}
 					}
@@ -6392,9 +6501,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// Ignore transient store lookup errors; retry timer handles unverified route state.
 		}
 		const verified = verifySettledRouteState();
-		if (!verified && pendingRouteState.hasPending()) {
+		if (pendingRouteState.hasPending()) {
 			if (!frameOpen) flushRouteState();
 			else scheduleRouteStateFlushRetry();
+		} else if (!verified || pendingRouteState.hasUnverifiedBatches() || bareFloorClearedOrigins.size > 0) {
+			scheduleRouteStateFlushRetry();
 		}
 	}
 	function enqueuePostSeqWriteBarrier(): void {
@@ -6421,15 +6532,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				type: 'end_txn',
 				remoteNodeIds: [],
 				txnStream,
-				onFailure() {
+				async onFailure() {
 					postSeqWriteBarrierInFlight = false;
-					runPostSeqWriteChecks();
+					await runPostSeqWriteChecks();
 					return false;
 				},
-				onCommit() {
+				async onCommit() {
 					postSeqWriteBarrierInFlight = false;
-					runPostSeqWriteChecks();
-					if (postSeqWriteNeedsAnotherPass || pendingRouteState.hasUnverifiedBatches()) {
+					await runPostSeqWriteChecks();
+					if (postSeqWriteNeedsAnotherPass) {
 						postSeqWriteNeedsAnotherPass = false;
 						enqueuePostSeqWriteBarrier();
 					}
@@ -6437,7 +6548,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			};
 			tableSubscriptionToReplicator.send(barrierEvent);
 		} else {
-			setImmediate(() => runPostSeqWriteChecks());
+			setImmediate(() => void runPostSeqWriteChecks());
 		}
 	}
 	function scheduleRouteStateVerification(_event?: any): void {
@@ -6511,7 +6622,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	async function persistCopyBounds(): Promise<boolean> {
-		if (!supportsCheckpointFloors() || maxCopiedVersionByOrigin.size === 0 || connectionSuperseded()) return true;
+		if (connectionSuperseded() || wsClosed) return false;
+		if (!supportsCheckpointFloors() || maxCopiedVersionByOrigin.size === 0) return true;
 		try {
 			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? dbAuditStore;
@@ -6523,7 +6635,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				peerId,
 				store?.rootStore ?? (dbisDB as any)?.rootStore
 			);
-			return true;
+			return !connectionSuperseded() && !wsClosed;
 		} catch (error) {
 			const now = Date.now();
 			if (now - lastCopyBoundWarnAt >= 60_000) {
@@ -6658,7 +6770,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						pendingRouteState.revoke(id, gen);
 					} else {
 						bareFloorClearedOrigins.add(id);
-						clearGenlessClosedFloorOnSeqRow(dbisDB, peerId, id, store?.rootStore);
 						scheduleRouteStateVerification();
 					}
 					continue;
@@ -7422,7 +7533,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							passId: copyWatermark.currentPass,
 							startTime: data,
 							resumed: copyWasResumed,
-							resumedWithWidening: copyResumedWithWidening || options.connection?.routeFullCoverage === false,
+							resumedWithWidening: copyResumedWithWidening,
+							fullCoverage: options.connection?.routeFullCoverage !== false,
 							seqDurableAtCopyStart: false,
 							completeReceived: false,
 							restored: false,
@@ -8579,7 +8691,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								let floorEmissionLatchedRange: unknown;
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
-								// the level the origin's own socket to this node certifies at now: 0, 1 or 2
 								const originCertifies = (name: string): number => {
 									const level = getReplicationSharedStatus(auditStore, databaseName, name)[
 										PEER_CERTIFIES_FLOORS_POSITION
@@ -9930,9 +10041,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							batchCrossedOtherPeerCertifiedFrom = true;
 						}
 						if (batchCrossedOtherPeerCertifiedFrom) {
-							if (!(await persistCopyBounds())) {
-								wsClosed = true;
-								ws.close(1011, 'Copy bound persistence failed before applying snapshot row');
+							if (!(await persistCopyBounds()) || wsClosed || connectionSuperseded()) {
+								if (!connectionSuperseded()) {
+									wsClosed = true;
+									ws.close(1011, 'Copy bound persistence failed before applying snapshot row');
+								} else {
+									wsClosed = true;
+								}
 								return;
 							}
 							for (const [originId, thresholds] of otherPeerCertifiedFroms) {

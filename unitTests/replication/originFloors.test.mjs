@@ -908,5 +908,44 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		];
 		assert.strictEqual(routeState.verifyPersisted(persistedNodes, retryEvent), true);
 		assert.strictEqual(routeState.hasPending(), false);
+
+		// A pure certifiedFrom clear (partialHistory(true) + partialHistory(false)) whose [seq, peer] write did not
+		// clear certifiedFrom restores a two-step clear + restore, and a clear followed by a new certifiedFrom(200)
+		// verifies against certifiedFrom: 200 without looping.
+		routeState.partialHistory(1, true, 'g1');
+		routeState.partialHistory(1, false, 'g1');
+		const clearEvent = { remoteNodeIds: [1] };
+		routeState.takeInto(clearEvent);
+		assert.strictEqual(
+			routeState.verifyPersisted(
+				[{ id: 1, originGeneration: 'g1', partialHistory: false, certifiedFrom: 100 }],
+				clearEvent
+			),
+			false
+		);
+		const retryClearEvent = { remoteNodeIds: [1] };
+		routeState.takeInto(retryClearEvent);
+		assert.deepStrictEqual(retryClearEvent.originRouteStates, [
+			[1, undefined, true, undefined, 'g1'],
+			[1, undefined, false, undefined, 'g1'],
+		]);
+		assert.strictEqual(
+			routeState.verifyPersisted([{ id: 1, originGeneration: 'g1', partialHistory: false }], retryClearEvent),
+			true
+		);
+
+		routeState.partialHistory(1, true, 'g1');
+		routeState.partialHistory(1, false, 'g1');
+		routeState.certifiedFrom(1, 200, 'g1');
+		const recertEvent = { remoteNodeIds: [1] };
+		routeState.takeInto(recertEvent);
+		assert.strictEqual(
+			routeState.verifyPersisted(
+				[{ id: 1, originGeneration: 'g1', partialHistory: false, certifiedFrom: 200 }],
+				recertEvent
+			),
+			true
+		);
+		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
 	});
 });
