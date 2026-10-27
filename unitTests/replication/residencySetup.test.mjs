@@ -155,7 +155,7 @@ describe('sharding setup authority', function () {
 				)
 			);
 			await loadGQLSchema(
-				`type RollingRows @table(database: "${database}") { id: ID @primaryKey tag: String @indexed }`
+				`type RollingRows @table(database: "${database}", audit: true) { id: ID @primaryKey tag: String @indexed }`
 			);
 			const Records = databases[database].RollingRows;
 			Records.setResidencyById((id) => Number(id));
@@ -180,7 +180,7 @@ describe('sharding setup authority', function () {
 			);
 			assert.equal(Records.residency, undefined);
 			await loadGQLSchema(
-				`type RollingRows @table(database: "${database}") @sharded(slots: 2, slotFrom: "Number(id)") { id: ID @primaryKey tag: String @indexed }`
+				`type RollingRows @table(database: "${database}", audit: true) @sharded(slots: 2, slotFrom: "Number(id)") { id: ID @primaryKey tag: String @indexed }`
 			);
 			assert.deepEqual(Records.residency, policy, 'local reload must resolve its own missing declaration');
 			assert.equal(Records.primaryStore.getEntry('0').version, prior.version, 'equivalent conversion moves no records');

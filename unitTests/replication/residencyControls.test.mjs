@@ -1015,6 +1015,20 @@ describe('Declarative tables keep control and event traffic independent of place
 				const encodedRecord = Buffer.from(
 					encodeCopyRecordValue(Records.primaryStore, donor.value, (blob) => announced.push(blob))
 				);
+				const leadingRows = [];
+				if (!multiple)
+					for (let i = 0; i < 9; i++) {
+						const id = 'leading-' + i;
+						await Records.put('donor-' + i, { id, region: 0, body: createBlob(payload) });
+						leadingRows.push({
+							id,
+							encodedRecord: Buffer.from(
+								encodeCopyRecordValue(Records.primaryStore, Records.primaryStore.getEntry('donor-' + i).value, (blob) =>
+									announced.push(blob)
+								)
+							),
+						});
+					}
 				const version = Date.now() + 100;
 				const encoder = Records.primaryStore.encoder;
 				const sendRow = (socket, leading = false) => {
@@ -1053,10 +1067,10 @@ describe('Declarative tables keep control and event traffic independent of place
 					socket.emit('message', encode([130, [server.hostname], 42]));
 					socket.emit('message', encode([148, version + 1000, 1]));
 					if (leading)
-						for (let i = 0; i < 9; i++)
+						for (const { id, encodedRecord } of leadingRows)
 							socket.emit(
 								'message',
-								recordFrame(Records, 'put', 'leading-' + i, undefined, version, 42, {
+								recordFrame(Records, 'put', id, undefined, version, 42, {
 									encodedRecord,
 									extendedType: HAS_BLOBS | 512,
 								})
@@ -1083,6 +1097,7 @@ describe('Declarative tables keep control and event traffic independent of place
 					if (
 						event.type === 'end_txn' &&
 						event.remoteNodeIds?.length === 0 &&
+						event.localTime === undefined &&
 						event.onCommit?.constructor.name === 'AsyncFunction'
 					) {
 						const onCommit = event.onCommit;
@@ -1110,7 +1125,7 @@ describe('Declarative tables keep control and event traffic independent of place
 						encode([
 							146,
 							{ fileId: getFileId(blob), size: payload.length, finished: true },
-							Buffer.alloc(payload.length, index ? 83 : 79),
+							Buffer.alloc(payload.length, multiple && index ? 83 : 79),
 						])
 					);
 				second.emit('message', encode([149]));

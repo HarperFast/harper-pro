@@ -116,17 +116,6 @@ function records(socket, Records) {
 			{ name: 'body' },
 		],
 	});
-	for (const shard of [0, 1])
-		advanceShardingHistory(Records.dbisDB, shardingLayout(database, shard), {
-			initializer: server.hostname,
-			agreement: 'fixture',
-			run: 'fixture',
-			phase: 'began',
-			localFloor: 1,
-			localOrigin: server.hostname,
-		});
-	setReplicator(database, Records, {});
-	await until(() => databaseSubscriptions.get(database)?.auditStore);
 	if (mode === 'verify') {
 		writeFileSync(
 			output,
@@ -138,6 +127,18 @@ function records(socket, Records) {
 		);
 		process.exit(0);
 	}
+	for (const shard of [0, 1])
+		advanceShardingHistory(Records.dbisDB, shardingLayout(database, shard), {
+			initializer: server.hostname,
+			agreement: 'fixture',
+			run: 'fixture',
+			phase: 'began',
+			localFloor: 1,
+			localOrigin: server.hostname,
+		});
+	setReplicator(database, Records, {});
+	await until(() => databaseSubscriptions.get(database)?.auditStore);
+
 	const socket = new Socket();
 	const peer = mode === 'send' ? 'slot0-peer' : 'abort-source';
 	replicateOverWS(socket, {}, { name: peer, replicates: true });
