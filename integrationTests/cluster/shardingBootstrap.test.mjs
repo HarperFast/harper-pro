@@ -1,5 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
+import { createHash } from 'node:crypto';
 import { cp, mkdtemp, writeFile, appendFile, realpath, rm, readFile } from 'node:fs/promises';
 import { basename, join, relative, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -157,7 +158,7 @@ export class BootstrapBlob extends Resource {
  async get(target) {
   const bytes = Buffer.alloc(65536, 79);
   if (target.get('seed')) await tables.Rows.put('replacement-blob', { id: 'replacement-blob', region: 'asia', body: 'copy-blob', payload: createBlob(Readable.from([bytes]), {saveBeforeCommit: true}) });
-  const entry = tables.Rows.primaryStore.getEntry('replacement-blob');
+  const entry = await tables.Rows.primaryStore.getEntry('replacement-blob');
   if (!entry?.value?.payload) return { digest: null };
   const actual = Buffer.from(await entry.value.payload.arrayBuffer());
   return { digest: createHash('sha256').update(actual).digest('hex'), size: actual.length, version: entry.version };
@@ -415,6 +416,8 @@ export class BootstrapLocal extends Resource {
 	test('a lost origin refuses its old name, then a new name and the retired origin both converge', async () => {
 		const oldName = contexts[2].harper.hostname;
 		const expectedBlob = await blob(0, true);
+		assert.equal(expectedBlob.size, 65_536);
+		assert.equal(expectedBlob.digest, createHash('sha256').update(Buffer.alloc(65_536, 79)).digest('hex'));
 		await waitForCondition(async (signal) => (await blob(2, false, signal)).digest === expectedBlob.digest, {
 			description: 'co-owner receives the original blob before replacement',
 		});
