@@ -1,11 +1,13 @@
 import { expect } from 'chai';
 import {
 	appendFileSync,
+	closeSync,
 	cpSync,
 	existsSync,
 	linkSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
@@ -774,6 +776,92 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 
 		it('exits 2 on a usage error', () => {
 			expect(run().status).to.equal(2);
+		});
+	});
+
+	describe('aborted transactions', () => {
+		async function writeFlagged(transactions, { aborted = [], unclosed = [] }) {
+			const databasePath = newDatabase();
+			await writeTransactions(databasePath, transactions);
+			const file = join(logDir(databasePath), '1.txnlog');
+			const bytes = readFileSync(file);
+			const offsets = entryOffsets(file);
+			let entry = 0;
+			transactions.forEach(([, records], index) => {
+				if (aborted.includes(index)) bytes[offsets[entry] + 12] |= 2;
+				if (unclosed.includes(index)) bytes[offsets[entry + records.length - 1] + 12] &= ~1;
+				entry += records.length;
+			});
+			writeFileSync(file, bytes);
+			return file;
+		}
+
+		function compactToFlags(file) {
+			const outputPath = file + '.out';
+			const fd = openSync(outputPath, 'w');
+			let scan;
+			try {
+				scan = compactLogFile(file, { output: fd });
+			} finally {
+				closeSync(fd);
+			}
+			const bytes = readFileSync(outputPath);
+			return { scan, flags: entryOffsets(outputPath).map((offset) => bytes[offset + 12]) };
+		}
+
+		it('keeps a delete whose only earlier copy belongs to an aborted transaction', async () => {
+			const file = await writeFlagged(
+				[
+					[T, [firstDelete('z')]],
+					[T, [echoedDelete('z')]],
+				],
+				{ aborted: [0] }
+			);
+			const { scan, flags } = compactToFlags(file);
+			expect(scan.dropped).to.equal(0);
+			expect(flags).to.deep.equal([3, 1]);
+		});
+
+		it('copies an aborted transaction verbatim, with its flag, between echoes it does not interrupt', async () => {
+			const file = await writeFlagged(
+				[
+					[T, [firstDelete('z')]],
+					[T, [echoedDelete('z'), putOf('a', T)]],
+					[T, [echoedDelete('z')]],
+				],
+				{ aborted: [1] }
+			);
+			const { scan, flags } = compactToFlags(file);
+			expect(scan.dropped).to.equal(1);
+			expect(scan.aborted).to.equal(2);
+			expect(flags).to.deep.equal([1, 2, 1]);
+		});
+
+		it('ends an unclosed aborted transaction at a new timestamp', async () => {
+			const file = await writeFlagged(
+				[
+					[T, [firstDelete('z')]],
+					[T + 1, [firstDelete('q')]],
+					[T + 1, [echoedDelete('q')]],
+				],
+				{ aborted: [0], unclosed: [0] }
+			);
+			const { scan } = compactToFlags(file);
+			expect(scan.aborted).to.equal(1);
+			expect(scan.dropped).to.equal(1);
+		});
+
+		it('starts an aborted transaction at its flag even when the previous one is unclosed', async () => {
+			const file = await writeFlagged(
+				[
+					[T, [firstDelete('z')]],
+					[T, [echoedDelete('z')]],
+				],
+				{ aborted: [1], unclosed: [0] }
+			);
+			const { scan, flags } = compactToFlags(file);
+			expect(scan.dropped).to.equal(0);
+			expect(flags).to.deep.equal([0, 3]);
 		});
 	});
 
