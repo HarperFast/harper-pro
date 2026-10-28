@@ -180,7 +180,7 @@ import {
 	METADATA,
 	storedFieldsOnly,
 } from '../core/resources/RecordEncoder.ts';
-import { INVALIDATED, REPLICA } from '../core/resources/Table.ts';
+import { INVALIDATED, REPLICA, fullWriteHeadKey } from '../core/resources/Table.ts';
 import { server } from '../core/server/Server.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
@@ -6640,22 +6640,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										table.primaryStore.rootStore
 									);
 								}
-								responseData = encode([
-									GET_RECORD_RESPONSE,
-									requestId,
-									{
-										value: valueBuffer,
-										expiresAt: entry.expiresAt,
-										version: entry.version,
-										residencyId: entry.residencyId,
-										residencySlot: entry.residencySlot,
-										nodeId: entry.nodeId,
-										// the writer by name: the reader's retrieval socket has no map for this node's ids, and an
-										// id this node cannot name is left unnamed rather than claimed
-										originNode: entry.nodeId ? getNodeNameForId(table.auditStore, entry.nodeId, true) : server.hostname,
-										user: entry.user,
-									},
-								]);
+								const answer: any = {
+									value: valueBuffer,
+									expiresAt: entry.expiresAt,
+									version: entry.version,
+									residencyId: entry.residencyId,
+									residencySlot: entry.residencySlot,
+									nodeId: entry.nodeId,
+									// the writer by name: the reader's retrieval socket has no map for this node's ids, and an
+									// id this node cannot name is left unnamed rather than claimed
+									originNode: entry.nodeId ? getNodeNameForId(table.auditStore, entry.nodeId, true) : server.hostname,
+									user: entry.user,
+								};
+								// every uncertified answer encodes as before
+								const fullWriteHead = fullWriteHeadKey(entry[METADATA], entry);
+								if (fullWriteHead !== undefined) answer.fullWriteHead = fullWriteHead;
+								responseData = encode([GET_RECORD_RESPONSE, requestId, answer]);
 							} else {
 								responseData = encode([GET_RECORD_RESPONSE, requestId]);
 							}
@@ -8034,11 +8034,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;
 														if (isReplica) {
-															copyValue = residencyStubOf(table, entry.value) ?? {};
+															// in core's demotion order (`residencyStub`), so it encodes as the demoted stub does
+															copyValue = table.primaryKey ? { [table.primaryKey]: entry.key } : {};
+															Object.assign(copyValue, residencyStubOf(table, entry.value));
 															const createdTimeName = table.createdTimeProperty?.name;
 															if (createdTimeName && entry.value[createdTimeName] != null)
 																copyValue[createdTimeName] = entry.value[createdTimeName];
-															if (table.primaryKey) copyValue[table.primaryKey] = entry.key;
 														}
 														const copyExtendedType =
 															(entry.metadataFlags &
@@ -9020,6 +9021,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// Only writes before the replay boundary are audit-less snapshots. Strict `<` keeps the
 					// boundary transaction audited.
 					event.isCopyApply = isCopyApply;
+					// every copy frame, and a relayed entry of one (COPIED_RECORD), carries a copied body: never certified
 					event.copyFrame = messageIsCopyFrame || Boolean(auditRecord.extendedType & COPIED_RECORD);
 					// Record which tables actually received an audit-less snapshot row so only those get a
 					// reload marker at copy finalization (harper-pro#495). isCopyApply is exactly "invisible to
