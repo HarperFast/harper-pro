@@ -53,12 +53,10 @@ COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 ENV NPM_CONFIG_PREFIX=/home/harperdb/.npm-global
 ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 
-# Install Harper Pro globally with exactly the tree its npm-shrinkwrap.json records;
-# the install script fails the build on any drift from it. Without `set -e` a failed
-# install is masked by the exit status of the cleanup commands that follow it, and
-# `harper version` asserts the installed bin actually resolves and runs: v5.2.0-beta.4
-# published an image with no harper in it off a green build when npm install hit a
-# transient ETARGET.
+# Install Harper Pro globally. Without `set -e` a failed install is masked by the
+# exit status of the cleanup commands that follow it, and `harper version` asserts
+# the installed bin actually resolves and runs: v5.2.0-beta.4 published an image
+# with no harper in it off a green build when npm install hit a transient ETARGET.
 COPY --from=build /usr/src/harper-pro/build-tools/install-packed-harper-pro.sh /usr/src/harper-pro/build-tools/check-installed-shrinkwrap.mjs /usr/local/share/harper-pro-install/
 RUN <<-EOF
   set -e

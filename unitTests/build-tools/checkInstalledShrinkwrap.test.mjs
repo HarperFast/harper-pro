@@ -89,7 +89,7 @@ describe('check-installed-shrinkwrap', function () {
 		assert.match(result.stderr, /not a package directory: node_modules\/msgpackr/);
 	});
 
-	it('fails on an unreadable package manifest', async function () {
+	it('fails on a malformed package manifest', async function () {
 		await writeFile(join(packageDir, 'node_modules/msgpackr/package.json'), '{"version":');
 		assert.notStrictEqual(check().status, 0);
 	});

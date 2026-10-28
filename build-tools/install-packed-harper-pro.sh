@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 # Install a packed harper-pro tarball into the global npm prefix with exactly the dependency tree its
-# npm-shrinkwrap.json records, as an install of the published package from the registry would.
-#
-# `npm install --global <tgz>` ignores the shrinkwrap inside a local tarball and re-resolves every
-# range, so this extracts the package where a global install puts it and runs `npm ci` there. The
-# shrinkwrap has its devDependencies pruned (prune-shrinkwrap-dev.mjs) while the packed package.json
-# still lists them, which `npm ci` rejects, so they are dropped for the install and the published
-# manifest is restored afterwards.
-#
-# Usage: install-packed-harper-pro.sh <harperfast-harper-pro-*.tgz>
+# npm-shrinkwrap.json records. `npm install --global <tgz>` would ignore the shrinkwrap inside a local
+# tarball and re-resolve every range. The shrinkwrap has devDependencies pruned
+# (prune-shrinkwrap-dev.mjs) while the packed package.json still lists them, which `npm ci` rejects,
+# so they are dropped for the install and the published manifest is restored afterwards.
 set -euo pipefail
 
 tgz=$(realpath "$1")

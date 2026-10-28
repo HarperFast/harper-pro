@@ -1,14 +1,7 @@
 #!/usr/bin/env node
 // Fail unless the dependency tree installed in a package directory is exactly the one its
-// npm-shrinkwrap.json records: the same package paths at the same versions.
-//
-// npm ignores a dependency's shrinkwrap when installing it from a local tarball, so
-// `npm install --global <tgz>` re-resolved every range in the Docker images (5.1.30 shipped
-// msgpackr 2.1.2 against a 2.0.4 shrinkwrap). The images install with `npm ci` instead, and run
-// this so drift fails the image build. A lock entry marked optional may be absent: npm skips it on
-// an os/cpu/libc mismatch or a failed native build.
-//
-// Usage: node build-tools/check-installed-shrinkwrap.mjs <package dir>
+// npm-shrinkwrap.json records: the same package paths at the same versions. A lock entry marked
+// optional may be absent: npm skips it on an os/cpu/libc mismatch or a failed native build.
 import { lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
