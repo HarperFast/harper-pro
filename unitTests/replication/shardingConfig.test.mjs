@@ -127,7 +127,7 @@ describe('Sharding config projection on an existing worker', function () {
 		const watch = watchShardingConfiguration(watcher);
 		try {
 			await assert.rejects(watch.ready, /injected initial read failure/);
-			assert.doesNotThrow(() => watcher.emit('error', new Error('injected watch failure')));
+			for (const event of ['change', 'error', 'close']) assert.equal(watcher.listenerCount(event), 0);
 		} finally {
 			watch.stop();
 		}
