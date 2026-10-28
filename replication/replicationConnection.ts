@@ -5383,6 +5383,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							await flushCopyRowsDurable();
 							if (!stillCurrent()) return;
 							if (projection) {
+								// the attempt's reservation must not outlive a completed projection
+								if (!(await settlePassCopyBounds())) throw new Error('could not settle the projection copy bounds');
+								if (!stillCurrent()) return;
 								const { dbisDB } = getDatabaseStores();
 								await dbisDB.put([Symbol.for('shardingProjectionComplete'), source], {
 									anchor,
@@ -7037,7 +7040,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const nameToId = exportIdMapping(store);
 			const thisNodeName = getThisNodeName();
 			const directFullCoverage: string[] = options.connection?.exclusionOrigins ?? [];
-			const routeFullCoverage = directFullCoverage.includes(remoteNodeName);
+			const routeFullCoverage = !restrictedOrigins && directFullCoverage.includes(remoteNodeName);
 			loadPersistedCopyBounds();
 			const peerId = getIdOfRemoteNode(remoteNodeName, store);
 			const peerNodes: any[] | undefined =
@@ -12317,7 +12320,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					supportsCheckpointFloors() &&
 					certifiesCheckpointFloors()
 				) {
-					const fullCoverage = (options.connection.exclusionOrigins ?? []).includes(node.name);
+					const fullCoverage = !restrictedOrigins && (options.connection.exclusionOrigins ?? []).includes(node.name);
 					const previous = options.connection.routeFullCoverage;
 					options.connection.routeFullCoverage = fullCoverage;
 					const ownState = allNodes.find((state) => state.id === nodeId);
