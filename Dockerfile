@@ -36,9 +36,14 @@ COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 ENV NPM_CONFIG_PREFIX=/home/harperdb/.npm-global
 ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 
-# Install Harper Pro globally
+# Install Harper Pro globally. Without `set -e` a failed install is masked by the
+# exit status of the cleanup commands that follow it, and `harper version` asserts
+# the installed bin actually resolves and runs.
+COPY --from=build /usr/src/harper-pro/build-tools/install-packed-harper-pro.sh /usr/src/harper-pro/build-tools/check-installed-shrinkwrap.mjs /usr/local/share/harper-pro-install/
 RUN <<-EOF
-  npm install --global harperfast-harper-pro-*.tgz
+  set -e
+  bash /usr/local/share/harper-pro-install/install-packed-harper-pro.sh harperfast-harper-pro-*.tgz
+  harper version
   rm harperfast-harper-pro-*.tgz
   mkdir -p /home/harperdb/harper
   chown harperdb:harperdb /home/harperdb/harper
