@@ -12155,7 +12155,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		let directFloorOnlyNodeId: number | undefined;
 		let directFloorOnlyStart: number | undefined;
 		let directFloorOnlyGeneration: string | undefined;
-		copiedVersionByOrigin.clear();
+		// settlement retains these exact versions; an update during an unsettled pass must not erase them
+		if (copyPassToken === '' || settledPass === copyPassToken) copiedVersionByOrigin.clear();
 		const nodeSubscriptions = options.connection?.nodeSubscriptions
 			?.filter((node: any) => {
 				const admitted = !restrictedOrigins || node.name === remoteNodeName;
