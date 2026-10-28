@@ -120,13 +120,13 @@ describe('Sharding config projection on an existing worker', function () {
 		}
 	});
 
-	it('handles an initial read failure and removes its watcher listeners on stop', async () => {
+	it('rejects readiness on an initial read failure and removes its watcher listeners on stop', async () => {
 		const watcher = Object.assign(new EventEmitter(), {
 			ready: Promise.reject(new Error('injected initial read failure')),
 		});
 		const watch = watchShardingConfiguration(watcher);
 		try {
-			await watch.ready;
+			await assert.rejects(watch.ready, /injected initial read failure/);
 			assert.doesNotThrow(() => watcher.emit('error', new Error('injected watch failure')));
 		} finally {
 			watch.stop();

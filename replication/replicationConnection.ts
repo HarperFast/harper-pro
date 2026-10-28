@@ -29,6 +29,7 @@ import {
 	readResidencyMap,
 	installResidencyMap,
 	residencyOwners,
+	residencyIsLocal,
 	getResidencyConfiguration,
 	ResidencyPlacementError,
 	ResidencyConfigurationError,
@@ -4113,8 +4114,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let projectionRequested = false;
 	let copyCertification: { layout: string; scopes: ReturnType<typeof shardingRecoveryScopes> } | undefined;
 	let copyCertificationPending = false;
-	let incompleteCopyTies: { table: any; id: any }[] = [];
-	const copyCursorKey = () => Symbol.for(projectionCopy ? 'shardingProjectionCursor' : 'copyCursor');
+	let copyCertificateRevoked = false;
 	let copyModeStartTime = 0;
 	let copyModeOrderVersion; // copy-order version the leader announced in COPY_START; persisted in the cursor (#421)
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
@@ -4222,6 +4222,25 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// synchronously when COPY_COMPLETE is decoded while batches are still queued — would freeze the cursor
 	// and risk a crash that loses both the cursor and the not-yet-durable rows, leaving the next start to
 	// resume from seqId with gaps.
+	async function pendingOwnedCopyBlob(stillCurrent: () => boolean): Promise<{ table: any; id: any } | undefined> {
+		let scanned = 0;
+		for (const table of Object.values(getDatabases()[databaseName] ?? {}) as any[]) {
+			if (!table.residency || !tableReplicates(table)) continue;
+			for (const entry of table.primaryStore.getRange({ versions: true, snapshot: false, lazy: true })) {
+				if (!stillCurrent()) return;
+				if (entry.value && entry.metadataFlags & HAS_BLOBS) {
+					const slot = table.residency.byAttribute ? entry.residencySlot : table.getResidencySlot(entry.key);
+					if (
+						residencyIsLocal(databaseName, slot, table.residency.slots) &&
+						!(await storedBlobsAreComplete(entry.value))
+					)
+						return { table, id: entry.key };
+					if (!stillCurrent()) return;
+				}
+				if (++scanned % 256 === 0) await delay(0);
+			}
+		}
+	}
 	function maybeFinishCopy() {
 		// The removal below targets the same [copyCursor, nodeId] key the ownership guards in
 		// persistCopyCursor protect: a superseded closure's late flush `.finally` reaching here would
@@ -4253,6 +4272,61 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const anchor = copyModeStartTime;
 				const source = copyFromNodeId;
 				const stillCurrent = () => !connectionSuperseded() && copyWatermark.currentPass === pass;
+				const failCertification = (error: unknown) => {
+					if (!stillCurrent()) return;
+					wsClosed = true;
+					close(1011, 'Sharding copy could not establish a durable baseline');
+					logger.warn?.(connectionId, 'Sharding copy certification failed', error);
+				};
+				async function finishOwnedCopy() {
+					while (stillCurrent()) {
+						const incomplete = await pendingOwnedCopyBlob(stillCurrent);
+						if (!stillCurrent()) return;
+						if (!incomplete) break;
+						if (!copyCertificateRevoked) {
+							copyCertificateRevoked = true;
+							await revokeShardingCertificate(databaseName);
+							if (!stillCurrent()) return;
+						}
+						const { dbisDB } = getDatabaseStores();
+						if (source !== undefined && !dbisDB.getSync([Symbol.for('copyCursor'), source])) {
+							await dbisDB.put([Symbol.for('copyCursor'), source], {
+								copyStartTime: anchor,
+								currentTable: incomplete.table.tableName,
+								afterKey: incomplete.id,
+								copyOrder: copyModeOrderVersion,
+							});
+							if (!stillCurrent()) return;
+							await dbisDB.flush({ allowWriteStall: true });
+							if (!stillCurrent()) return;
+						}
+						logger.warn?.(
+							connectionId,
+							`Sharding recovery required for ${databaseName}.${incomplete.table.tableName} record ${String(incomplete.id).slice(0, 256)}: an owned blob is pending or incomplete; waiting for completion or repair_blob_data before certifying the copy`
+						);
+						while (stillCurrent()) {
+							await delay(1000, undefined, { ref: false });
+							if (!stillCurrent()) return;
+							const entry = await incomplete.table.primaryStore.getEntry(incomplete.id);
+							if (!stillCurrent()) return;
+							if (!entry?.value || !(entry.metadataFlags & HAS_BLOBS) || (await storedBlobsAreComplete(entry.value)))
+								break;
+						}
+					}
+					if (!stillCurrent()) return;
+					if (frameOpen || outstandingCommits || outstandingBlobsToFinish.length || hasBlobGap) {
+						copyCertificationPending = false;
+						copyFinalizeWatchdog?.reset();
+						maybeFinishCopy();
+						return;
+					}
+					await certifyShardingCopy(databaseName, certification.layout, certification.scopes);
+					if (!stillCurrent()) return;
+					copyCertification = undefined;
+					copyCertificationPending = false;
+					maybeFinishCopy();
+				}
+
 				tableSubscriptionToReplicator.send({
 					type: 'end_txn',
 					remoteNodeIds: [],
@@ -4275,36 +4349,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								close(1011, 'Sharding projection complete; resuming owned origins separately');
 								return;
 							}
-							for (const { table, id } of incompleteCopyTies) {
-								const entry = await table.getEntry(id);
-								if (!stillCurrent()) return;
-								if (entry?.value && entry.metadataFlags & HAS_BLOBS && !(await storedBlobsAreComplete(entry.value))) {
-									if (!stillCurrent()) return;
-									if (source !== undefined) {
-										const { dbisDB } = getDatabaseStores();
-										await dbisDB.remove([copyCursorKey(), source]);
-										await dbisDB.flush({ allowWriteStall: true });
-									}
-									if (!stillCurrent()) return;
-									copyFinalizeWatchdog?.stop();
-									logger.warn?.(
-										connectionId,
-										`Sharding recovery required for ${databaseName}.${table.name} record ${String(id).slice(0, 256)}: an owned blob is pending or incomplete; run repair_blob_data and reconnect before certifying the copy`
-									);
-									return;
-								}
-							}
-							if (!stillCurrent()) return;
-							await certifyShardingCopy(databaseName, certification.layout, certification.scopes);
-							if (!stillCurrent()) return;
-							copyCertification = undefined;
-							copyCertificationPending = false;
-							maybeFinishCopy();
+							copyFinalizeWatchdog?.stop();
+							void finishOwnedCopy().catch(failCertification);
 						} catch (error) {
-							if (!stillCurrent()) return;
-							wsClosed = true;
-							close(1011, 'Sharding copy could not establish a durable baseline');
-							logger.warn?.(connectionId, 'Sharding copy certification failed', error);
+							failCertification(error);
 						}
 					},
 				});
@@ -4326,7 +4374,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
-			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([copyCursorKey(), copyFromNodeId]);
+			if (!projectionCopy && copyFromNodeId !== undefined)
+				getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
 			if (copyOriginAnchors?.size && auditStore) {
 				try {
@@ -4453,7 +4502,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!copyApplyActive()) {
 				// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
 				// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
-				getDatabaseStores().dbisDB?.put([copyCursorKey(), copyFromNodeId], cursor);
+				if (!projectionCopy) getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursor);
 				if (pendingCopyCursor === cursor) pendingCopyCursor = null;
 				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
 				maybeFinishCopy();
@@ -4491,8 +4540,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// The ownership and pass checks mirror the entry guards: the flush may resolve after this
 					// closure died, or after a same-socket COPY_START replaced the walk.
 					if (connectionSuperseded() || passAtPersist !== copyWatermark.currentPass) return;
-					if (copyFromNodeId !== undefined)
-						getDatabaseStores().dbisDB?.put([copyCursorKey(), copyFromNodeId], cursorAtFlush);
+					if (!projectionCopy && copyFromNodeId !== undefined)
+						getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
 					copyFlushBackoffUntil = 0;
 					copyFlushBackoff?.reset();
 					if (copyCompleteReceived) noteCopyFinalizeProgress();
@@ -6169,11 +6218,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							layout && !projectionCopy ? { layout, scopes: shardingRecoveryScopes(databaseName) } : undefined;
 						// Revoke every old callback's pass before revocation itself can yield.
 						copyWatermark.beginPass();
-						incompleteCopyTies = [];
+						copyCertificateRevoked = false;
 						copyCertificationPending = false;
 						copyCompleteReceived = false;
 						pendingCopyCursor = null;
 						if (copyCertification && process.env.HARPER_CLONE_ATTEMPT) {
+							copyCertificateRevoked = true;
 							await revokeShardingCertificate(databaseName);
 							if (connectionSuperseded()) return;
 						}
@@ -8767,9 +8817,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					if (connectionSuperseded()) return;
 				}
-				if (messageIsCopyFrame && copyCertification && incompleteCopyTie) {
+				if (messageIsCopyFrame && copyCertification && incompleteCopyTie && !copyCertificateRevoked) {
+					copyCertificateRevoked = true;
 					await revokeShardingCertificate(databaseName);
-					if (!repairTargets) incompleteCopyTies.push({ table: tableDecoder, id });
 				}
 				// Async repair inspection may have outlived this socket; do not mint files after its close sweep.
 				if (connectionSuperseded()) return;
