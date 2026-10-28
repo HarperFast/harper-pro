@@ -107,11 +107,17 @@ RUN <<-EOF
   fi
 EOF
 
-# jemalloc for every runtime process, set after the install steps so the build
-# runs on glibc; see build-tools/DESIGN.md. A preload the loader cannot resolve
-# only warns and falls back to glibc, hence the binding check.
+# Set after the install steps so the build runs on glibc; see build-tools/DESIGN.md.
+# A preload the loader cannot resolve only warns and falls back to glibc, so check
+# that node's malloc binds to jemalloc, then that node and harper run under it.
 ENV LD_PRELOAD=libjemalloc.so.2
-RUN LD_DEBUG=bindings node -e 0 2>&1 | grep -q 'binding file node .*/libjemalloc\.so\.2 .*normal symbol .malloc. '
+RUN <<-EOF
+  set -e
+  LD_DEBUG=bindings LD_DEBUG_OUTPUT=/tmp/ld node -e 0
+  grep -q 'binding file node .*/libjemalloc\.so\.2 .*normal symbol .malloc. ' /tmp/ld.*
+  rm /tmp/ld.*
+  harper version
+EOF
 
 VOLUME /home/harperdb/harper
 

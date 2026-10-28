@@ -107,9 +107,15 @@ RUN --mount=type=bind,from=build,source=/usr/src/harper-pro,target=/tmp/harper-p
 COPY --from=build --chown=harperdb:harperdb /usr/src/harper-pro/node_modules/uWebSockets.js /home/harperdb/.npm-global/lib/node_modules/@harperfast/harper-pro/node_modules/uWebSockets.js/
 RUN (cd "$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro" && node -e "require('uWebSockets.js')")
 
-# jemalloc for every runtime process; see Dockerfile and build-tools/DESIGN.md.
+# Placement and check: see Dockerfile and build-tools/DESIGN.md.
 ENV LD_PRELOAD=libjemalloc.so.2
-RUN LD_DEBUG=bindings node -e 0 2>&1 | grep -q 'binding file node .*/libjemalloc\.so\.2 .*normal symbol .malloc. '
+RUN <<-EOF
+  set -e
+  LD_DEBUG=bindings LD_DEBUG_OUTPUT=/tmp/ld node -e 0
+  grep -q 'binding file node .*/libjemalloc\.so\.2 .*normal symbol .malloc. ' /tmp/ld.*
+  rm /tmp/ld.*
+  harper version
+EOF
 
 VOLUME /home/harperdb/harper
 
