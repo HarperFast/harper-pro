@@ -62,12 +62,14 @@ EOF
 
 WORKDIR /home/harperdb
 
-# Install Harper Pro globally from the tarball produced in the build stage.
+# Install Harper Pro globally from the tarball produced in the build stage, with
+# exactly the tree its npm-shrinkwrap.json records.
 COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
+COPY --from=build /usr/src/harper-pro/build-tools/install-packed-harper-pro.sh /usr/src/harper-pro/build-tools/check-installed-shrinkwrap.mjs /usr/local/share/harper-pro-install/
 # See Dockerfile for why `set -e` and the assertion are load-bearing here.
 RUN <<-EOF
     set -e
-    npm install --global harperfast-harper-pro-*.tgz
+    bash /usr/local/share/harper-pro-install/install-packed-harper-pro.sh harperfast-harper-pro-*.tgz
     harper version
     npm cache clean --force
     rm -f harperfast-harper-pro-*.tgz
