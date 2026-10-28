@@ -6,7 +6,11 @@ import { threadId } from 'node:worker_threads';
 import { table } from '#src/core/resources/databases';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
-import { initializeResidencySlots, getResidencyMapTable } from '#src/core/resources/residencyMaps';
+import {
+	initializeResidencySlots,
+	getResidencyMapTable,
+	getResidencyConfiguration,
+} from '#src/core/resources/residencyMaps';
 import { reserveLocalKey, releaseLocalKey } from '#src/core/resources/originClosedFloor';
 import { readOriginClosedFloor } from '#src/core/resources/auditStore';
 import {
@@ -16,6 +20,12 @@ import {
 } from '#src/replication/shardingBootstrap';
 import { originReadyWord, ORIGIN_READY, recoveryBoundKey } from '#src/replication/shardingOriginAdmission';
 import { createRequire } from 'node:module';
+import { EventEmitter } from 'node:events';
+import { decode, encode } from 'msgpackr';
+import { setReplicator } from '#src/replication/replicator';
+import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
+import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
+import { getHDBNodeTable } from '#src/replication/knownNodes';
 
 const child = process.env.HARPER_TEST_RESUME_BOUND_CHILD === '1';
 
@@ -30,7 +40,7 @@ describe('Sharding reconnect closed-prefix admission', function () {
 			).catch((error) => {
 				throw new Error(`${error.stdout}\n${error.stderr}`, { cause: error });
 			});
-			assert.match(result.stdout, /5 passing/);
+			assert.match(result.stdout, /7 passing/);
 		});
 		return;
 	}
@@ -148,6 +158,64 @@ describe('Sharding reconnect closed-prefix admission', function () {
 			release(next);
 		}
 	});
+	for (const denial of ['route', 'hdb_nodes'])
+		it(`leaves no recovery state for a subscriber its ${denial} does not send to`, async () => {
+			setReplicator(database, Rows, {});
+			const socket = Object.assign(new EventEmitter(), {
+				readyState: 1,
+				sent: [],
+				closes: [],
+				_socket: { bytesRead: 0, bytesWritten: 0, setMaxListeners() {} },
+				send(data) {
+					this.sent.push(data[0] > 127 ? decode(Buffer.from(data)) : data);
+				},
+				close(code = 1000, reason = '') {
+					if (this.readyState === 3) return;
+					this.readyState = 3;
+					this.closes.push({ code, reason });
+					this.emit('close', code, Buffer.from(reason));
+				},
+				terminate() {
+					this.close(1006);
+				},
+				ping() {},
+				pause() {},
+				resume() {},
+			});
+			const peer = `denied-${denial}-peer`;
+			const deadline = Date.now() + 10_000;
+			const until = async (predicate) => {
+				while (!predicate()) {
+					assert.ok(Date.now() < deadline, 'replication did not make progress');
+					await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+			};
+			await until(() => databaseSubscriptions.get(database)?.auditStore);
+			const routes = [{ name: peer, hostname: peer, replicates: { sendsTo: [], receivesFrom: [{ source: peer }] } }];
+			if (denial === 'hdb_nodes')
+				await getHDBNodeTable().put(peer, { name: peer, url: `wss://${peer}:9933`, replicates: false });
+			replicateOverWS(socket, denial === 'route' ? { routes } : {}, { name: peer, replicates: true });
+			socket.emit(
+				'message',
+				encode([
+					140,
+					peer,
+					database,
+					[],
+					buildLocalCapabilities(90_000, true, true),
+					{ shardsDigest: getResidencyConfiguration().digest },
+				])
+			);
+			await until(() => socket.sent.some((frame) => frame[0] === 140) || socket.closes.length);
+			const future = root.getMonotonicTimestamp() + 60_000;
+			socket.emit(
+				'message',
+				encode([129, [{ name: server.hostname, startTime: future, tables: [], replicateByDefault: true }], []])
+			);
+			await until(() => socket.closes.length);
+			assert.equal(socket.closes[0].code, 1008, socket.closes[0].reason);
+			assertReady();
+		});
 	it('retains the durable hold for a genuinely future recovery bound', async () => {
 		const future = root.getMonotonicTimestamp() + 60_000;
 		await assert.rejects(noteShardingResumeBound(database, future, 'future-peer'), (error) => error.statusCode === 503);

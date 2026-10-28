@@ -14,6 +14,7 @@ import {
 	shardingLayout,
 	shardingSourceAgreement,
 	shardingSourceCertificate,
+	shardingCertificate,
 	onShardingRecoveryChange,
 	shardingRecoveryScopes,
 	certifyShardingCopy,
@@ -281,6 +282,9 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // changes so a leader resuming a cursor stamped with a different (or absent) version recopies from
 // scratch instead of silently skipping tables the old order had not yet reached (#421).
 const COPY_ORDER_VERSION = 1;
+// `[OWNED_COPY_PENDING, sourceNodeId]` in __dbis__: an owned sharding copy from that source started and is
+// not yet certified, so the next subscription to it copies again.
+const OWNED_COPY_PENDING = Symbol.for('shardingOwnedCopyPending');
 export {
 	CONFIRMATION_STATUS_POSITION,
 	RECEIVED_VERSION_POSITION,
@@ -4381,8 +4385,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
-			if (!projectionCopy && copyFromNodeId !== undefined)
+			if (!projectionCopy && copyFromNodeId !== undefined) {
 				getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+				getDatabaseStores().dbisDB?.remove([OWNED_COPY_PENDING, copyFromNodeId]);
+			}
 			inCopyMode = false;
 			if (copyOriginAnchors?.size && auditStore) {
 				try {
@@ -5217,6 +5223,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let admissionMembership: unknown;
 	let admissionConfiguration: unknown;
 	let admittedLayout: string | undefined;
+	function databaseDeclaresResidency(): boolean {
+		const current = databases[databaseName];
+		for (const name in current) if (current[name].residency) return true;
+		return false;
+	}
+	// Shard maps cannot be deleted or cleared (Table.ts refuses both), so a seen map is latched. A database
+	// with no declared table skips the native map read that would otherwise run on every received frame.
+	let mapSeen = false;
+	function residencyMapInstalled(): boolean {
+		return mapSeen || (databaseDeclaresResidency() && (mapSeen = !!readResidencyMap(databaseName)));
+	}
 	function refreshShardingAdmission() {
 		const configuration = admittedLayout ? getResidencyConfiguration() : undefined;
 		if (!shardingAdmissionDirty && admissionMembership === server.nodes && admissionConfiguration === configuration)
@@ -6293,6 +6310,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								return;
 							}
 						}
+						if (copyCertification && copyFromNodeId !== undefined) {
+							// With no copied key there is no copy cursor, so an interrupted certification of an empty
+							// copy would otherwise resume incrementally from the copy's committed sequence.
+							try {
+								await getDatabaseStores().dbisDB?.put([OWNED_COPY_PENDING, copyFromNodeId], {
+									layout: copyCertification.layout,
+								});
+								if (connectionSuperseded()) return;
+							} catch (error) {
+								logger.error?.(connectionId, 'failed to record the owned sharding copy', databaseName, error);
+								wsClosed = true;
+								close(1011, 'Failed to record the owned sharding copy');
+								return;
+							}
+						}
 						logger.debug?.(
 							connectionId,
 							'bulk copy starting from',
@@ -6760,23 +6792,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities)
 								? Object.fromEntries(parseOriginKeyMap(message[4]))
 								: undefined;
-						if (residencyIdentityBound && !sendingProjection) {
-							const localName = getThisNodeName();
-							const requested = Math.max(
-								requestedOriginCursors?.[localName] ?? 0,
-								...nodeSubscriptions.filter((node) => node.name === localName).map((node) => node.startTime ?? 0)
-							);
-							try {
-								await noteShardingResumeBound(databaseName, requested, remoteNodeName);
-							} catch (error) {
-								if (!(error instanceof ResidencyPlacementError) || error.statusCode !== 503) throw error;
-								logger.debug?.(connectionId, error.message);
-								wsClosed = true;
-								close(1011, 'Sharding subscription is waiting for local origin certification');
-								return;
-							}
-							if (supersededOrClosed()) return;
-						}
 						// permission check to make sure that this node is allowed to subscribe to this database, that is that
 						// we have publish permission for this node/database
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
@@ -6906,6 +6921,38 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							ws.send(encode([DISCONNECT]));
 							close(1008, `Unauthorized database subscription to ${databaseName}`);
 							return;
+						}
+						// A recovery bound holds this node's sharded writes across restart, so only a subscriber
+						// that may receive this database can set one. The hdb_nodes watch above judges the current
+						// row asynchronously (an absent row emits nothing); judge it the same way before writing.
+						if (residencyIdentityBound && !sendingProjection) {
+							if (
+								whenSubscribedToHdbNodes &&
+								resolveNodeForSendAuth(authorization.name) !== undefined &&
+								(await shouldCloseSendAuthWatch({ type: 'put' }, authorization.name, databaseName, {
+									isClosed: () => closed || wsClosed,
+								}))
+							) {
+								closed = true;
+								close(1008, `Unauthorized database subscription to ${databaseName}`);
+								return;
+							}
+							if (closed || supersededOrClosed()) return;
+							const localName = getThisNodeName();
+							const requested = Math.max(
+								requestedOriginCursors?.[localName] ?? 0,
+								...nodeSubscriptions.filter((node) => node.name === localName).map((node) => node.startTime ?? 0)
+							);
+							try {
+								await noteShardingResumeBound(databaseName, requested, remoteNodeName);
+							} catch (error) {
+								if (!(error instanceof ResidencyPlacementError) || error.statusCode !== 503) throw error;
+								logger.debug?.(connectionId, error.message);
+								wsClosed = true;
+								close(1011, 'Sharding subscription is waiting for local origin certification');
+								return;
+							}
+							if (closed || supersededOrClosed()) return;
 						}
 
 						if (auditSubscription) {
@@ -8407,7 +8454,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			 * handles parsing and transacting these replication messages */
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
-			if (!residencyIdentityBound && Object.values(databases[databaseName] ?? {}).some((Table) => Table.residency))
+			if (!residencyIdentityBound && databaseDeclaresResidency())
 				throw new Error('Sharding requires a configured peer identity');
 			if (!(await whenSubscriptionResolved())) return;
 			if (connectionSuperseded()) return;
@@ -8434,7 +8481,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// A valid prefix must not commit the frame cursor past a later forbidden origin or owner projection.
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
 			let selfCopyBound = 0;
-			if (admittedLayout || readResidencyMap(databaseName)) {
+			if (admittedLayout || residencyMapInstalled()) {
 				decoder.position = 8;
 				while (decoder.position < body.byteLength) {
 					const length = decoder.readInt();
@@ -8453,7 +8500,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 						return;
 					}
-					const Table = tableDecoders[record.tableId]?.table;
+					const tableDecoder = tableDecoders[record.tableId];
+					// The apply loop skips a refused generation's records; holding the frame for one would
+					// re-send it on every reconnect.
+					if (tableDecoder && peerGenerationRefused(tableDecoder)) {
+						decoder.position = start + length;
+						continue;
+					}
+					const Table = tableDecoder?.table;
 					if (Table?.residency && origin === 0 && isResidencyRecord(record.type)) {
 						if (!messageIsCopyFrame || !isValidRecordVersion(record.version)) {
 							recordAction(true, DECODE_HOLD_METRIC, databaseName + '.self-origin');
@@ -10343,6 +10397,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						shardingProjection = true;
 						projectionRequested = true;
 					}
+				}
+				const ownedCopyPending =
+					nodeId === undefined || copyCursor || restrictedOrigins
+						? undefined
+						: (dbisDB?.getSync([OWNED_COPY_PENDING, nodeId]) as { layout: string } | undefined);
+				if (ownedCopyPending) {
+					if (
+						ownedCopyPending.layout === shardingLayout(databaseName) &&
+						shardingCertificate(databaseName) !== ownedCopyPending.layout
+					) {
+						startTime = 0;
+						logger.warn?.(
+							`Requesting full copy of database ${databaseName} from ${getNodeURL(node)}: its owned copy was not certified`
+						);
+					} else dbisDB.remove([OWNED_COPY_PENDING, nodeId]);
 				}
 				let copyResume;
 				if (copyCursor && !shardingProjection) {

@@ -17,7 +17,7 @@ import { transaction } from '#src/core/resources/transaction';
 import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { INVALIDATED, FULL_WRITE_HEAD } from '#src/core/resources/Table';
-import { table } from '#src/core/resources/databases';
+import { table, isDroppedPeerGeneration } from '#src/core/resources/databases';
 import { createAuditEntry, readAuditEntry, Decoder, HAS_BLOBS } from '#src/core/resources/auditStore';
 import {
 	createBlob,
@@ -2309,4 +2309,202 @@ describe('Declarative tables keep control and event traffic independent of place
 			assert.equal(Records.primaryStore.getEntry('after-control').value.body, 'complete');
 		});
 	}
+
+	it('reads no shard map per received frame for a database without sharded tables', async () => {
+		const database = 'slot_control_unsharded';
+		const Plain = table({
+			database,
+			table: 'Plain',
+			audit: true,
+			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'body' }],
+		});
+		setReplicator(database, Plain, {});
+		await until(() => databaseSubscriptions.get(database)?.auditStore);
+		const socket = new Socket();
+		sockets.push(socket);
+		replicateOverWS(socket, {}, { name: 'slot-control-peer', replicates: true });
+		socket.emit(
+			'message',
+			encode([
+				140,
+				'slot-control-peer',
+				database,
+				[],
+				buildLocalCapabilities(90_000, true, true),
+				{ shardsDigest: getResidencyConfiguration().digest },
+			])
+		);
+		await until(() => socket.sent.some((frame) => frame[0] === 140) || socket.closes.length);
+		const version = Date.now();
+		const frames = Array.from({ length: 20 }, (_, n) =>
+			recordFrame(Plain, 'put', 'row-' + n, { id: 'row-' + n, body: 'x' }, version + n)
+		);
+		const encoder = Plain.primaryStore.encoder;
+		socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+		socket.emit(
+			'message',
+			encode([
+				132,
+				{ structures: encoder.structures, typedStructs: encoder.typedStructs, attributes: Plain.attributes },
+				Plain.tableId,
+				Plain.tableName,
+			])
+		);
+		const store = getResidencyMapTable().primaryStore;
+		const getSync = store.getSync;
+		let mapReads = 0;
+		store.getSync = function (key, ...rest) {
+			if (key === database) mapReads++;
+			return getSync.call(this, key, ...rest);
+		};
+		try {
+			for (const frame of frames) socket.emit('message', frame);
+			await until(() => Plain.primaryStore.getEntry('row-19')?.value || socket.closes.length);
+		} finally {
+			store.getSync = getSync;
+		}
+		assert.deepEqual(socket.closes, []);
+		assert.equal(mapReads, 0);
+	});
+
+	it('skips an invalidation of a refused table generation without holding the stream', async () => {
+		const { Records, socket, database } = await connect(false, 'refused_generation_invalidate');
+		const Gone = table({ database, table: 'Gone', audit: true, attributes: [{ name: 'id', isPrimaryKey: true }] });
+		const createdTime = Date.now() - 60_000;
+		await Gone.dropTable();
+		assert.ok(isDroppedPeerGeneration(database, 'Gone', createdTime), 'premise: the peer generation is dead');
+		const version = Date.now() + 100;
+		const refused = recordFrame(Records, 'invalidate', 'gone', { id: 'gone' }, version, undefined, { tableId: 777 });
+		const after = recordFrame(
+			Records,
+			'put',
+			'after-refused',
+			{ id: 'after-refused', region: 0, body: 'complete' },
+			version + 1
+		);
+		const encoder = Records.primaryStore.encoder;
+		socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+		socket.emit(
+			'message',
+			encode([
+				132,
+				{
+					structures: encoder.structures,
+					typedStructs: encoder.typedStructs,
+					attributes: Records.attributes,
+					residency: Records.residency,
+					schemaDefined: true,
+				},
+				Records.tableId,
+				Records.tableName,
+			])
+		);
+		socket.emit(
+			'message',
+			encode([132, { structures: [], attributes: [{ name: 'id', isPrimaryKey: true }], createdTime }, 777, 'Gone'])
+		);
+		socket.emit('message', refused);
+		socket.emit('message', after);
+		await until(() => Records.primaryStore.getEntry('after-refused')?.value || socket.closes.length);
+		assert.deepEqual(socket.closes, []);
+	});
+
+	it('copies again after an empty owned copy is interrupted before certification', async () => {
+		const peer = 'slot-control-peer';
+		const Nodes = getHDBNodeTable();
+		const previous = Nodes.primaryStore.getSync(peer);
+		const connection = new EventEmitter();
+		connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+		const { Records, socket, database } = await connect(
+			false,
+			'empty_owned_copy_restart',
+			false,
+			undefined,
+			undefined,
+			connection
+		);
+		const announce = (target) =>
+			target.emit(
+				'message',
+				encode([
+					140,
+					peer,
+					database,
+					[],
+					buildLocalCapabilities(90_000, true, true),
+					{
+						shardsDigest: getResidencyConfiguration().digest,
+						shard: 0,
+						shardingCertificate: shardingSourceAgreement(database),
+					},
+				])
+			);
+		const subscription = databaseSubscriptions.get(database);
+		const send = subscription.send;
+		const root = Records.auditStore.rootStore;
+		const flush = root.flush;
+		const commits = [];
+		let releaseFlush, flushStarted, completion;
+		const gate = new Promise((resolve) => {
+			releaseFlush = resolve;
+		});
+		const reached = new Promise((resolve) => {
+			flushStarted = resolve;
+		});
+		try {
+			await Nodes.primaryStore.put(peer, { name: peer, shard: 0, replicates: true });
+			announce(socket);
+			subscription.send = function (event) {
+				if (event.type === 'end_txn' && event.remoteNodeIds?.length === 0 && event.onCommit) commits.push(event);
+				else return send.call(this, event);
+			};
+			const anchor = Date.now();
+			socket.emit('message', encode([148, anchor, 1]));
+			socket.emit('message', encode([149]));
+			await until(() => commits.length === 1 || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			// The empty copy's sequence anchor is committed; no copied key staged a copy cursor.
+			const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+			await Records.dbisDB.put([Symbol.for('seq'), peerId], { seqId: anchor, nodes: [] });
+			assert.equal(Records.dbisDB.getSync([Symbol.for('copyCursor'), peerId]), undefined);
+			root.flush = async function (...args) {
+				flushStarted();
+				await gate;
+				return flush.apply(this, args);
+			};
+			completion = commits[0].onCommit();
+			await Promise.race([
+				reached,
+				new Promise((_, reject) => setTimeout(() => reject(new Error('copy flush not reached')), 5000).unref()),
+			]);
+			socket.close(1006);
+			releaseFlush();
+			await completion;
+			root.flush = flush;
+			assert.equal(shardingCertificate(database), undefined, 'premise: the interrupted copy is uncertified');
+
+			subscription.send = send;
+			const retry = new Socket();
+			sockets.push(retry);
+			const reconnection = new EventEmitter();
+			reconnection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+			reconnection.socket = retry;
+			replicateOverWS(retry, { connection: reconnection }, { name: peer, replicates: true });
+			announce(retry);
+			await until(() => retry.sent.some((frame) => frame[0] === 129) || retry.closes.length);
+			assert.deepEqual(retry.closes, []);
+			assert.equal(
+				retry.sent.findLast((frame) => frame[0] === 129)[1][0].startTime,
+				0,
+				'the uncertified owned copy is requested again'
+			);
+		} finally {
+			releaseFlush();
+			await completion;
+			root.flush = flush;
+			subscription.send = send;
+			if (previous) await Nodes.primaryStore.put(peer, previous);
+			else await Nodes.primaryStore.remove(peer);
+		}
+	});
 });

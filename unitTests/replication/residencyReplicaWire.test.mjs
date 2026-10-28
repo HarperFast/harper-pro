@@ -69,7 +69,8 @@ function copiedRecords(socket, tableId) {
 			decoder.position += length;
 			if (length === 9 && frame[offset] === 11) continue;
 			const entry = readAuditEntry(frame, offset, offset + length);
-			if (entry.tableId === tableId) records.set(entry.recordId, { entry });
+			if (entry.tableId === tableId)
+				records.set(entry.recordId, { entry, bytes: Buffer.from(frame.subarray(offset, offset + length)) });
 		}
 	}
 	return records;
@@ -343,24 +344,7 @@ describe('local replicas on the replication wire', function () {
 				await RecordTable.evict(id, replica.value, replica.version);
 				await until(() => RecordTable.primaryStore.getEntry(id).metadataFlags & INVALIDATED, 'replica demotion');
 				const demoted = await copy();
-				const demotedEntry = demoted.get(id).entry;
-				// Field order can select a different encoding structure for the same stored projection.
-				assert.deepStrictEqual({ ...demotedEntry.getValue(RecordTable.primaryStore) }, { ...value });
-				for (const field of [
-					'recordId',
-					'tableId',
-					'nodeId',
-					'version',
-					'previousVersion',
-					'type',
-					'extendedType',
-					'residencyId',
-					'previousResidencyId',
-					'residencySlot',
-					'previousResidencySlot',
-					'expiresAt',
-				])
-					assert.strictEqual(demotedEntry[field], copied[field], `replica copy must preserve ${field}`);
+				assert.deepEqual(records.get(id).bytes, demoted.get(id).bytes, 'replica copy must match its demoted stub');
 			});
 		}
 	}
