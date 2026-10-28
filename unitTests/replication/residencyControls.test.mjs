@@ -12,6 +12,7 @@ import { decode, encode } from 'msgpackr';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
 import { DatabaseTransaction } from '#src/core/resources/DatabaseTransaction';
+const { Transaction: NativeTransaction } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
 import { transaction } from '#src/core/resources/transaction';
 import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
@@ -131,8 +132,23 @@ function recordFrame(Table, type, recordId, value, version, residencyId, overrid
 }
 
 describe('Declarative tables keep control and event traffic independent of placement', function () {
+	let priorExperimental, priorMarkers;
+	before(() => {
+		priorExperimental = env.get('replication_experimentalAttributeSlots');
+		priorMarkers = env.get('storage_rocks_transactionLogAbortMarkers');
+		env.setProperty('replication_experimentalAttributeSlots', true);
+		env.setProperty('storage_rocks_transactionLogAbortMarkers', true);
+	});
+	after(() => {
+		env.setProperty('replication_experimentalAttributeSlots', priorExperimental);
+		env.setProperty('storage_rocks_transactionLogAbortMarkers', priorMarkers);
+	});
 	this.timeout(15_000);
 	let oldShards, oldList, oldShard;
+	let testContext;
+	beforeEach(function () {
+		testContext = this;
+	});
 	const sockets = [];
 	before(() => {
 		env.setHdbBasePath(process.env.STORAGE_PATH);
@@ -161,15 +177,21 @@ describe('Declarative tables keep control and event traffic independent of place
 		capabilities = buildLocalCapabilities(90_000, true, true),
 		beforeConnect,
 		connection,
-		ranges = [{ start: 0, end: 2, shard: 0 }]
+		ranges = [{ start: 0, end: 2, shard: 0 }],
+		keyHash = false
 	) {
+		if (byAttribute && typeof NativeTransaction.prototype.usesAbortMarkers !== 'function') testContext.skip();
 		const database = `slot_control_${direction}_${byAttribute}`;
 		await initializeResidencySlots({ database, slots: 2, ranges });
 		const Records = table({
 			database,
 			table: 'Records',
 			audit: true,
-			residency: legacy ? undefined : { slots: 2, byAttribute, slotFrom: byAttribute ? 'region' : 'id.length % 2' },
+			residency: legacy
+				? undefined
+				: keyHash
+					? { slots: 2, byAttribute: false }
+					: { slots: 2, byAttribute, slotFrom: byAttribute ? 'region' : 'id.length % 2' },
 			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'region', indexed: true }, { name: 'body' }],
 		});
 		if (!legacy)
@@ -605,7 +627,7 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.deepEqual(socket.closes, []);
 				assert.equal(commits.length, 2, 'the replacement owns a fresh certification attempt');
 				await commits[1].onCommit();
-				assert.equal(shardingCertificate(database), shardingLayout(database));
+				await until(() => shardingCertificate(database) === shardingLayout(database));
 			} finally {
 				releaseRevoke();
 				Records.dbisDB.remove = remove;
@@ -1588,6 +1610,191 @@ describe('Declarative tables keep control and event traffic independent of place
 					env.setProperty('replication_shards', priorList);
 				}
 			});
+
+	for (const liveMode of ['blobless', 'blob-success', 'blob-source-failure'])
+		it(`retains a completed owned-blob walk while a live commit drains (${liveMode})`, async () => {
+			const peer = 'slot-control-peer';
+			const previousFlushBytes = env.get('replication_copyCursorFlushBytes');
+			env.setProperty('replication_copyCursorFlushBytes', 1);
+			const Nodes = getHDBNodeTable();
+			const previous = Nodes.primaryStore.getSync(peer);
+			await Nodes.primaryStore.put(peer, { name: peer, shard: 0, replicates: true });
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+			const { Records, socket, database } = await connect(
+				false,
+				`busy_owned_copy_${liveMode}`,
+				false,
+				undefined,
+				undefined,
+				connection,
+				undefined,
+				true
+			);
+			let releaseLive;
+			const liveGate = new Promise((resolve) => (releaseLive = resolve));
+			const originalCommit = NativeTransaction.prototype.commit;
+			let holdNextCommit = false;
+			const originalRange = Records.primaryStore.getRange;
+			let held = false;
+			let scans = 0;
+			try {
+				await Records.put('owned-blob', { id: 'owned-blob', region: 0, body: createBlob(Buffer.alloc(65_536, 91)) });
+				const version = Date.now() + 100;
+				const blobs = [];
+				const liveValue = { ...Records.primaryStore.getEntry('owned-blob').value, id: 'aaa-live' };
+				const encodedLive = Buffer.from(
+					encodeCopyRecordValue(Records.primaryStore, liveValue, (blob) => blobs.push(blob))
+				);
+				socket.emit(
+					'message',
+					encode([
+						140,
+						peer,
+						database,
+						[],
+						buildLocalCapabilities(90_000, true, true),
+						{
+							shardsDigest: getResidencyConfiguration().digest,
+							shard: 0,
+							shardingCertificate: shardingSourceAgreement(database),
+						},
+					])
+				);
+				socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+				const encoder = Records.primaryStore.encoder;
+				socket.emit(
+					'message',
+					encode([
+						132,
+						{
+							structures: encoder.structures,
+							typedStructs: encoder.typedStructs,
+							attributes: Records.attributes,
+							schemaDefined: true,
+							residency: Records.residency,
+						},
+						Records.tableId,
+						Records.tableName,
+					])
+				);
+				socket.emit('message', encode([130, [server.hostname], 42]));
+				socket.emit('message', encode([148, version + 1000, 1]));
+				socket.emit(
+					'message',
+					recordFrame(Records, 'put', 'base', { id: 'base', region: 0, body: 'copied' }, version, 42)
+				);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				await until(() => Records.dbisDB.getSync([Symbol.for('copyCursor'), peerId])?.afterKey === 'base');
+				NativeTransaction.prototype.commit = function (...args) {
+					const shouldHold = holdNextCommit && this.store?.db === Records.primaryStore.store.db;
+					if (shouldHold) holdNextCommit = false;
+					const committed = originalCommit.apply(this, args);
+					if (!shouldHold) return committed;
+					return Promise.resolve(committed).then(async (result) => {
+						held = true;
+						await liveGate;
+						return result;
+					});
+				};
+				Records.primaryStore.getRange = function (options) {
+					const entries = originalRange.call(this, options);
+					if (!options?.versions || !options.lazy || options.snapshot !== false) return entries;
+					const scan = ++scans;
+					return {
+						*[Symbol.iterator]() {
+							let injected = false;
+							for (const entry of entries) {
+								yield entry;
+								if (scan !== 1 || injected) continue;
+								injected = true;
+								holdNextCommit = true;
+								socket.emit(
+									'message',
+									liveMode === 'blobless'
+										? recordFrame(
+												Records,
+												'put',
+												'aaa-live',
+												{ id: 'aaa-live', region: 0, body: 'live' },
+												version + 2000,
+												42
+											)
+										: recordFrame(Records, 'put', 'aaa-live', undefined, version + 2000, 42, {
+												encodedRecord: encodedLive,
+												extendedType: HAS_BLOBS | 512,
+											})
+								);
+							}
+						},
+					};
+				};
+				const frame = new FrameWriter();
+				frame.writeFloat64(version + 1000);
+				frame.writeInt(9);
+				frame.writeInt(11);
+				frame.writeFloat64(version + 1000);
+				socket.emit('message', Buffer.from(frame.encodingBuffer.subarray(frame.encodingStart, frame.position)));
+				socket.emit('message', encode([149]));
+				await until(() => held || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(scans, 1);
+				if (liveMode !== 'blobless') {
+					assert.equal(shardingCertificate(database), undefined, 'wait for the captured in-flight blob');
+					for (const blob of blobs)
+						socket.emit(
+							'message',
+							encode([
+								146,
+								{
+									fileId: getFileId(blob),
+									size: 65_536,
+									finished: true,
+									...(liveMode === 'blob-source-failure'
+										? { error: 'source file missing', errorCode: 'ENOENT', errorStatus: 404 }
+										: {}),
+								},
+								Buffer.alloc(65_536, 91),
+							])
+						);
+					if (liveMode === 'blob-source-failure') {
+						releaseLive();
+						await until(() => scans > 1);
+						assert.equal(
+							shardingCertificate(database),
+							undefined,
+							'a failed owned save behind the iterator invalidates its proof'
+						);
+						assert.equal(blobFileMissingOrIncomplete(Records.primaryStore.getEntry('aaa-live').value.body), true);
+						assert.ok(Records.dbisDB.getSync([Symbol.for('copyCursor'), peerId]));
+						return;
+					}
+				}
+
+				await until(() => shardingCertificate(database) === shardingLayout(database));
+				assert.ok(Records.dbisDB.getSync([Symbol.for('copyCursor'), peerId]), 'live work still gates cursor removal');
+				releaseLive();
+				assert.equal(
+					scans,
+					1,
+					'do not discard the completed validation walk because a blob-less live frame was in flight'
+				);
+				await until(() => !Records.dbisDB.getSync([Symbol.for('copyCursor'), peerId]));
+				if (liveMode === 'blobless') assert.equal(Records.primaryStore.getEntry('aaa-live').value.body, 'live');
+				else
+					assert.equal(
+						await blobFileMissingOrIncompleteAsync(Records.primaryStore.getEntry('aaa-live').value.body),
+						false
+					);
+			} finally {
+				releaseLive();
+				NativeTransaction.prototype.commit = originalCommit;
+				Records.primaryStore.getRange = originalRange;
+				env.setProperty('replication_copyCursorFlushBytes', previousFlushBytes);
+				if (previous) await Nodes.primaryStore.put(peer, previous);
+				else await Nodes.primaryStore.remove(peer);
+			}
+		});
 
 	it('copies an owner blob and a non-owner replica projection in the same walk', async () => {
 		const priorShards = server.shards;

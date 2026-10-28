@@ -43,6 +43,7 @@ for (const engine of ['rocksdb']) {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, stdStreams: false, level: 'warn' },
 					replication: {
+						experimentalAttributeSlots: true,
 						threads: 0,
 						securePort: context.harper.hostname + ':9933',
 						shard: i,

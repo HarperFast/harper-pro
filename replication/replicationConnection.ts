@@ -4115,6 +4115,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let copyCertification: { layout: string; scopes: ReturnType<typeof shardingRecoveryScopes> } | undefined;
 	let copyCertificationPending = false;
 	let copyCertificateRevoked = false;
+	let failedOwnedBlobSaves = 0;
 	let copyModeStartTime = 0;
 	let copyModeOrderVersion; // copy-order version the leader announced in COPY_START; persisted in the cursor (#421)
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
@@ -4271,6 +4272,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const pass = copyWatermark.currentPass;
 				const anchor = copyModeStartTime;
 				const source = copyFromNodeId;
+				const failedBlobsAtSentinel = failedOwnedBlobSaves;
 				const stillCurrent = () => !connectionSuperseded() && copyWatermark.currentPass === pass;
 				const failCertification = (error: unknown) => {
 					if (!stillCurrent()) return;
@@ -4314,7 +4316,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 					if (!stillCurrent()) return;
-					if (frameOpen || outstandingCommits || outstandingBlobsToFinish.length || hasBlobGap) {
+					if (outstandingBlobsToFinish.length) await Promise.allSettled(outstandingBlobsToFinish.slice());
+					if (!stillCurrent()) return;
+					if (failedOwnedBlobSaves !== failedBlobsAtSentinel || hasBlobGap) {
 						copyCertificationPending = false;
 						copyFinalizeWatchdog?.reset();
 						maybeFinishCopy();
@@ -4324,6 +4328,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (!stillCurrent()) return;
 					copyCertification = undefined;
 					copyCertificationPending = false;
+					copyCompleteAt = performance.now();
+					copyFinalizeWatchdog?.reset();
 					maybeFinishCopy();
 				}
 
@@ -9985,6 +9991,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 				})
 				.finally(() => {
+					if (saveFailed && !copyBlobGapped && copyCertification) {
+						const table = getDatabases()[databaseName]?.[tableName];
+						if (
+							table?.residency &&
+							(table.residency.byAttribute ||
+								residencyIsLocal(databaseName, table.getResidencySlot(id), table.residency.slots))
+						)
+							failedOwnedBlobSaves++;
+					}
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
 					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
 					if (!saveFailed) {

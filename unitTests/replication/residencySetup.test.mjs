@@ -1,3 +1,6 @@
+import { createRequire } from 'node:module';
+const { Transaction: NativeTransaction } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
+import * as env from '#src/core/utility/environment/environmentManager';
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
 import { decode, encode } from 'msgpackr';
@@ -87,6 +90,17 @@ async function processed(socket, allowClose = false) {
 }
 
 describe('sharding setup authority', function () {
+	let priorExperimental, priorMarkers;
+	before(() => {
+		priorExperimental = env.get('replication_experimentalAttributeSlots');
+		priorMarkers = env.get('storage_rocks_transactionLogAbortMarkers');
+		env.setProperty('replication_experimentalAttributeSlots', true);
+		env.setProperty('storage_rocks_transactionLogAbortMarkers', true);
+	});
+	after(() => {
+		env.setProperty('replication_experimentalAttributeSlots', priorExperimental);
+		env.setProperty('storage_rocks_transactionLogAbortMarkers', priorMarkers);
+	});
 	this.timeout(10_000);
 	before(() => setHdbBasePath(process.env.STORAGE_PATH));
 	afterEach(() => {
@@ -1055,11 +1069,12 @@ describe('sharding setup authority', function () {
 		[0, 1],
 		[1, 0],
 	])
-		it(`carries the explicit expression in setup and refuses disagreement ${localSlot} -> ${remoteSlot}`, async () => {
+		it(`carries the explicit expression in setup and refuses disagreement ${localSlot} -> ${remoteSlot}`, async function () {
 			const database = `sharded_expression_agreement_${localSlot}`;
 			const map = snapshot(database);
 			await installResidencyMap(map);
 			const expression = (slot) => `region === 'asia' ? ${slot} : ${1 - slot}`;
+			if (typeof NativeTransaction.prototype.usesAbortMarkers !== 'function') this.skip();
 			const policy = { slots: 2, by: 'region', byAttribute: true, slotFrom: expression(localSlot) };
 			const Records = table({
 				database,

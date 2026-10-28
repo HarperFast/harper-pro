@@ -1,3 +1,4 @@
+import { attributeSlotsSkip, attributeSlotsAvailable, prepareSlotFixture } from './experimentalSharding.mjs';
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { basename, join } from 'node:path';
@@ -88,11 +89,14 @@ suite(`Sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 600_000 }
 					join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-')
 				);
 				await cp(FIXTURE, join(context.harper.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
+				await prepareSlotFixture(join(context.harper.dataRootDir, 'components', basename(FIXTURE)));
 				await startHarper(context, {
 					config: {
+						storage: { rocks: { transactionLogAbortMarkers: true } },
 						analytics: { aggregatePeriod: -1 },
 						logging: { colors: false, stdStreams: false, level: 'warn' },
 						replication: {
+							experimentalAttributeSlots: true,
 							securePort: context.harper.hostname + ':9933',
 							shard: SHARDS[i],
 							shards: [1, 0],
@@ -167,50 +171,58 @@ suite(`Sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 600_000 }
 		}
 	}
 
-	test('hashes string and numeric tenant values identically on every node and preserves affinity', async () => {
-		for (const value of ['tenant-a', 42]) {
-			const placement = await Promise.all(
-				nodes().map((node) =>
-					get(node, `SlotPolicy/?table=SlotTenant&id=probe&value=${encodeURIComponent(JSON.stringify(value))}`)
-				)
-			);
-			const slot = placement[0].slot;
-			assert.ok(placement.every((entry) => entry.slot === slot && entry.policy.slots === 10));
-			if (typeof value === 'string') {
-				const keyPlacement = await Promise.all(
-					nodes().map((node) => get(node, `SlotPolicy/?table=SlotHash&id=${encodeURIComponent(value)}`))
+	test(
+		'hashes string and numeric tenant values identically on every node and preserves affinity',
+		{ skip: attributeSlotsSkip },
+		async () => {
+			for (const value of ['tenant-a', 42]) {
+				const placement = await Promise.all(
+					nodes().map((node) =>
+						get(node, `SlotPolicy/?table=SlotTenant&id=probe&value=${encodeURIComponent(JSON.stringify(value))}`)
+					)
 				);
-				assert.ok(
-					keyPlacement.every((entry) => entry.slot === slot),
-					'key and attribute values use the same hash'
-				);
-			}
-			for (const [index, writer] of nodes().entries()) {
-				const id = `tenant-${value}-${index}`;
-				await put(writer, 'SlotTenant', { id, tenantId: value, body: id });
-				await checkPlacement('SlotTenant', id, slot, id);
+				const slot = placement[0].slot;
+				assert.ok(placement.every((entry) => entry.slot === slot && entry.policy.slots === 10));
+				if (typeof value === 'string') {
+					const keyPlacement = await Promise.all(
+						nodes().map((node) => get(node, `SlotPolicy/?table=SlotHash&id=${encodeURIComponent(value)}`))
+					);
+					assert.ok(
+						keyPlacement.every((entry) => entry.slot === slot),
+						'key and attribute values use the same hash'
+					);
+				}
+				for (const [index, writer] of nodes().entries()) {
+					const id = `tenant-${value}-${index}`;
+					await put(writer, 'SlotTenant', { id, tenantId: value, body: id });
+					await checkPlacement('SlotTenant', id, slot, id);
+				}
 			}
 		}
-	});
+	);
 
-	test('compiled region expressions select separate logical slots and shards on every node', async () => {
-		for (const [region, slot] of [
-			['asia', 1],
-			['europe', 2],
-		]) {
-			const placement = await Promise.all(
-				nodes().map((node) =>
-					get(node, `SlotPolicy/?table=SlotRegional&id=probe&value=${encodeURIComponent(JSON.stringify(region))}`)
-				)
-			);
-			assert.ok(placement.every((entry) => entry.slot === slot));
-			for (const [index, writer] of nodes().entries()) {
-				const id = `region-${region}-${index}`;
-				await put(writer, 'SlotRegional', { id, region, body: id });
-				await checkPlacement('SlotRegional', id, slot, id);
+	test(
+		'compiled region expressions select separate logical slots and shards on every node',
+		{ skip: attributeSlotsSkip },
+		async () => {
+			for (const [region, slot] of [
+				['asia', 1],
+				['europe', 2],
+			]) {
+				const placement = await Promise.all(
+					nodes().map((node) =>
+						get(node, `SlotPolicy/?table=SlotRegional&id=probe&value=${encodeURIComponent(JSON.stringify(region))}`)
+					)
+				);
+				assert.ok(placement.every((entry) => entry.slot === slot));
+				for (const [index, writer] of nodes().entries()) {
+					const id = `region-${region}-${index}`;
+					await put(writer, 'SlotRegional', { id, region, body: id });
+					await checkPlacement('SlotRegional', id, slot, id);
+				}
 			}
 		}
-	});
+	);
 
 	test('initialization retries and legacy placement comparison work through the operations API', async () => {
 		const ranges = Array.from({ length: 10 }, (_, start) => ({ start, end: start + 1, shard: start % 2 }));
@@ -244,122 +256,130 @@ suite(`Sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 600_000 }
 		}
 	});
 
-	test('attribute puts and confirmed handoffs transfer file-backed blob contents', async () => {
-		const id = 'file-backed-handoff';
-		const expected = await get(nodes()[0], `SlotBlobSeed/${id}`);
-		async function verify(node, region, signal) {
-			const actual = await get(node, `SlotBlobLocalDigest/${id}`, signal);
-			return actual.digest === expected.digest && actual.region === region;
-		}
-		await waitForCondition((signal) => verify(nodes()[1], 0, signal), {
-			description: 'original owner has the actual replicated blob bytes',
-		});
-		const response = await request(nodes()[0], `SlotBlob/${id}`, { method: 'PATCH', body: { region: 1 } });
-		if (response.status >= 300)
-			console.error('Blob handoff failed', {
-				response,
-				owners: await Promise.all(
-					nodes()
-						.slice(2)
-						.map((node) => get(node, `SlotBlobLocalDigest/${id}`))
-				),
+	test(
+		'attribute puts and confirmed handoffs transfer file-backed blob contents',
+		{ skip: attributeSlotsSkip },
+		async () => {
+			const id = 'file-backed-handoff';
+			const expected = await get(nodes()[0], `SlotBlobSeed/${id}`);
+			async function verify(node, region, signal) {
+				const actual = await get(node, `SlotBlobLocalDigest/${id}`, signal);
+				return actual.digest === expected.digest && actual.region === region;
+			}
+			await waitForCondition((signal) => verify(nodes()[1], 0, signal), {
+				description: 'original owner has the actual replicated blob bytes',
 			});
-		assert.ok(response.status >= 200 && response.status < 300, JSON.stringify(response));
-		await waitForCondition(
-			async (signal) =>
-				(
-					await Promise.all(
+			const response = await request(nodes()[0], `SlotBlob/${id}`, { method: 'PATCH', body: { region: 1 } });
+			if (response.status >= 300)
+				console.error('Blob handoff failed', {
+					response,
+					owners: await Promise.all(
 						nodes()
 							.slice(2)
-							.map((node) => verify(node, 1, signal))
-					)
-				).every(Boolean),
-			{
-				description: 'new owners have the confirmed blob bytes',
-			}
-		);
-	});
-
-	test('a frozen new owner is refused before commit and a local replica does not confirm a committed move', async () => {
-		const writer = nodes()[0];
-		const owners = nodes().slice(2);
-		const pids = await Promise.all(owners.map(readNodePid));
-		for (const pid of pids) assert.ok(Number.isInteger(pid));
-		const id = 'bounded-move';
-		await put(writer, 'SlotAttributes', { id, region: 0, tag: 'before', body: 'must reach the owner' });
-		await barriers();
-		try {
-			for (const pid of pids) process.kill(pid, 'SIGSTOP');
+							.map((node) => get(node, `SlotBlobLocalDigest/${id}`))
+					),
+				});
+			assert.ok(response.status >= 200 && response.status < 300, JSON.stringify(response));
 			await waitForCondition(
-				async (signal) => {
-					const status = await sendOperation(writer, { operation: 'cluster_status' }, { signal });
-					const ownerConnections = status.connections.filter((connection) =>
-						owners.some((owner) => owner.hostname === connection.node_name || owner.hostname === connection.name)
-					);
-					return (
-						ownerConnections.length === owners.length &&
-						ownerConnections.every(
-							(connection) =>
-								!connection.database_sockets.some((socket) => socket.database === 'data' && socket.connected)
+				async (signal) =>
+					(
+						await Promise.all(
+							nodes()
+								.slice(2)
+								.map((node) => verify(node, 1, signal))
 						)
-					);
-				},
-				{ timeoutMs: 15000, description: 'frozen owners lose their data subscriptions' }
+					).every(Boolean),
+				{
+					description: 'new owners have the confirmed blob bytes',
+				}
 			);
-			const refused = await request(writer, `SlotAttributes/${id}`, {
-				method: 'PATCH',
-				body: { region: 1 },
-				signal: AbortSignal.timeout(8000),
-			});
-			assert.equal(refused.status, 503, JSON.stringify(refused));
-			assert.equal((await rawRows(writer, 'SlotAttributes')).find((row) => row.id === id).record.region, 0);
-		} finally {
-			for (const pid of pids) process.kill(pid, 'SIGCONT');
 		}
-		await barriers();
-		const armed = await request(writer, 'SlotFreezeOnCommit/', { method: 'POST', body: { id, pids } });
-		assert.equal(armed.status, 200, JSON.stringify(armed));
-		assert.deepEqual(armed.data, { armed: true, id, pids });
-		const started = Date.now();
-		try {
-			const uncertain = await request(writer, `SlotAttributes/${id}`, {
-				method: 'PATCH',
-				body: { region: 1 },
-				signal: AbortSignal.timeout(25000),
-			});
-			assert.equal(
-				uncertain.status,
-				504,
-				JSON.stringify({ uncertain, freeze: await get(writer, 'SlotFreezeOnCommit/') })
+	);
+
+	test(
+		'a frozen new owner is refused before commit and a local replica does not confirm a committed move',
+		{ skip: attributeSlotsSkip },
+		async () => {
+			const writer = nodes()[0];
+			const owners = nodes().slice(2);
+			const pids = await Promise.all(owners.map(readNodePid));
+			for (const pid of pids) assert.ok(Number.isInteger(pid));
+			const id = 'bounded-move';
+			await put(writer, 'SlotAttributes', { id, region: 0, tag: 'before', body: 'must reach the owner' });
+			await barriers();
+			try {
+				for (const pid of pids) process.kill(pid, 'SIGSTOP');
+				await waitForCondition(
+					async (signal) => {
+						const status = await sendOperation(writer, { operation: 'cluster_status' }, { signal });
+						const ownerConnections = status.connections.filter((connection) =>
+							owners.some((owner) => owner.hostname === connection.node_name || owner.hostname === connection.name)
+						);
+						return (
+							ownerConnections.length === owners.length &&
+							ownerConnections.every(
+								(connection) =>
+									!connection.database_sockets.some((socket) => socket.database === 'data' && socket.connected)
+							)
+						);
+					},
+					{ timeoutMs: 15000, description: 'frozen owners lose their data subscriptions' }
+				);
+				const refused = await request(writer, `SlotAttributes/${id}`, {
+					method: 'PATCH',
+					body: { region: 1 },
+					signal: AbortSignal.timeout(8000),
+				});
+				assert.equal(refused.status, 503, JSON.stringify(refused));
+				assert.equal((await rawRows(writer, 'SlotAttributes')).find((row) => row.id === id).record.region, 0);
+			} finally {
+				for (const pid of pids) process.kill(pid, 'SIGCONT');
+			}
+			await barriers();
+			const armed = await request(writer, 'SlotFreezeOnCommit/', { method: 'POST', body: { id, pids } });
+			assert.equal(armed.status, 200, JSON.stringify(armed));
+			assert.deepEqual(armed.data, { armed: true, id, pids });
+			const started = Date.now();
+			try {
+				const uncertain = await request(writer, `SlotAttributes/${id}`, {
+					method: 'PATCH',
+					body: { region: 1 },
+					signal: AbortSignal.timeout(25000),
+				});
+				assert.equal(
+					uncertain.status,
+					504,
+					JSON.stringify({ uncertain, freeze: await get(writer, 'SlotFreezeOnCommit/') })
+				);
+				assert.equal(uncertain.data.replicationUnconfirmed, true);
+				assert.equal(uncertain.data.retryable, false);
+				assert.match(uncertain.data.title, /15000ms/);
+				assert.ok(Date.now() - started < 22000);
+				const local = (await rawRows(writer, 'SlotAttributes')).find((row) => row.id === id);
+				assert.ok(local.flags & 4, 'committed writer body is a replica');
+				assert.equal((await get(writer, `SlotAttributes/${id}`)).body, 'must reach the owner');
+			} finally {
+				for (const pid of pids) process.kill(pid, 'SIGCONT');
+			}
+			await waitForCondition(
+				async (signal) =>
+					(await Promise.all(owners.map((node) => rawRows(node, 'SlotAttributes', signal)))).every((rows) =>
+						rows.some((row) => row.id === id && row.record?.region === 1 && row.record?.body === 'must reach the owner')
+					),
+				{ description: 'recovered owners receive the complete committed body' }
 			);
-			assert.equal(uncertain.data.replicationUnconfirmed, true);
-			assert.equal(uncertain.data.retryable, false);
-			assert.match(uncertain.data.title, /15000ms/);
-			assert.ok(Date.now() - started < 22000);
-			const local = (await rawRows(writer, 'SlotAttributes')).find((row) => row.id === id);
-			assert.ok(local.flags & 4, 'committed writer body is a replica');
-			assert.equal((await get(writer, `SlotAttributes/${id}`)).body, 'must reach the owner');
-		} finally {
-			for (const pid of pids) process.kill(pid, 'SIGCONT');
-		}
-		await waitForCondition(
-			async (signal) =>
-				(await Promise.all(owners.map((node) => rawRows(node, 'SlotAttributes', signal)))).every((rows) =>
-					rows.some((row) => row.id === id && row.record?.region === 1 && row.record?.body === 'must reach the owner')
+			await put(writer, 'SlotAttributes', { id, region: 0, tag: 'reset', body: 'confirmed body' });
+			await barriers();
+			const confirmed = await request(writer, `SlotAttributes/${id}`, { method: 'PATCH', body: { region: 1 } });
+			assert.ok(confirmed.status >= 200 && confirmed.status < 300, JSON.stringify(confirmed));
+			assert.ok(
+				(await Promise.all(owners.map((node) => rawRows(node, 'SlotAttributes')))).some((rows) =>
+					rows.some((row) => row.id === id && row.record?.body === 'confirmed body' && row.record?.region === 1)
 				),
-			{ description: 'recovered owners receive the complete committed body' }
-		);
-		await put(writer, 'SlotAttributes', { id, region: 0, tag: 'reset', body: 'confirmed body' });
-		await barriers();
-		const confirmed = await request(writer, `SlotAttributes/${id}`, { method: 'PATCH', body: { region: 1 } });
-		assert.ok(confirmed.status >= 200 && confirmed.status < 300, JSON.stringify(confirmed));
-		assert.ok(
-			(await Promise.all(owners.map((node) => rawRows(node, 'SlotAttributes')))).some((rows) =>
-				rows.some((row) => row.id === id && row.record?.body === 'confirmed body' && row.record?.region === 1)
-			),
-			'2xx follows a real owner body'
-		);
-	});
+				'2xx follows a real owner body'
+			);
+		}
+	);
 
 	test('main-thread operations inserts obey declarative placement on non-owners', async () => {
 		const result = await sendOperation(nodes()[0], {
@@ -408,26 +428,30 @@ suite(`Sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 600_000 }
 		);
 	});
 
-	test('attribute-slot changes transfer the complete body and invalidate former owners', async () => {
-		await put(nodes()[0], 'SlotAttributes', { id: 'moving', region: 0, tag: 'before', body: 'complete body' });
-		await checkPlacement('SlotAttributes', 'moving', 0, 'complete body');
-		const response = await request(nodes()[0], 'SlotAttributes/moving', {
-			method: 'PATCH',
-			body: { region: 1, tag: 'after' },
-		});
-		assert.ok(response.status >= 200 && response.status < 300, JSON.stringify(response));
-		await checkPlacement('SlotAttributes', 'moving', 1, 'complete body');
-		const fromStub = await request(nodes()[1], 'SlotAttributes/moving', {
-			method: 'PATCH',
-			body: { region: 0, tag: 'back' },
-		});
-		assert.ok(fromStub.status >= 200 && fromStub.status < 300, JSON.stringify(fromStub));
-		await checkPlacement('SlotAttributes', 'moving', 0, 'complete body');
-		for (const node of nodes()) assert.equal((await get(node, 'SlotAttributes/moving')).body, 'complete body');
-	});
+	test(
+		'attribute-slot changes transfer the complete body and invalidate former owners',
+		{ skip: attributeSlotsSkip },
+		async () => {
+			await put(nodes()[0], 'SlotAttributes', { id: 'moving', region: 0, tag: 'before', body: 'complete body' });
+			await checkPlacement('SlotAttributes', 'moving', 0, 'complete body');
+			const response = await request(nodes()[0], 'SlotAttributes/moving', {
+				method: 'PATCH',
+				body: { region: 1, tag: 'after' },
+			});
+			assert.ok(response.status >= 200 && response.status < 300, JSON.stringify(response));
+			await checkPlacement('SlotAttributes', 'moving', 1, 'complete body');
+			const fromStub = await request(nodes()[1], 'SlotAttributes/moving', {
+				method: 'PATCH',
+				body: { region: 0, tag: 'back' },
+			});
+			assert.ok(fromStub.status >= 200 && fromStub.status < 300, JSON.stringify(fromStub));
+			await checkPlacement('SlotAttributes', 'moving', 0, 'complete body');
+			for (const node of nodes()) assert.equal((await get(node, 'SlotAttributes/moving')).body, 'complete body');
+		}
+	);
 
 	test('non-owner deletes reach owners with key, attribute, and index-free policies', async () => {
-		for (const table of ['SlotKeys', 'SlotAttributes', 'SlotNoIndex']) {
+		for (const table of ['SlotKeys', ...(attributeSlotsAvailable ? ['SlotAttributes'] : []), 'SlotNoIndex']) {
 			const id = 'delete1';
 			await put(nodes()[0], table, { id, region: 1, tag: 'deleted', body: 'remove everywhere' });
 			await checkPlacement(table, id, 1, 'remove everywhere');
@@ -454,11 +478,14 @@ suite('Sharding with mismatched shard lists', { timeout: 300_000 }, (ctx) => {
 				join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-')
 			);
 			await cp(FIXTURE, join(context.harper.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
+			await prepareSlotFixture(join(context.harper.dataRootDir, 'components', basename(FIXTURE)));
 			await startHarper(context, {
 				config: {
+					storage: { rocks: { transactionLogAbortMarkers: true } },
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, stdStreams: false, level: 'warn' },
 					replication: {
+						experimentalAttributeSlots: true,
 						securePort: context.harper.hostname + ':9933',
 						shard: i,
 						shards: i ? [0, 1, 2] : [0, 1],
@@ -505,7 +532,7 @@ suite('Sharding with mismatched shard lists', { timeout: 300_000 }, (ctx) => {
 	});
 });
 
-suite('Sharding quarantine on restart', { timeout: 300_000 }, (ctx) => {
+suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlotsSkip }, (ctx) => {
 	const context = { name: ctx.name };
 	const peerContext = { name: ctx.name };
 	async function prepare(target) {
@@ -514,13 +541,21 @@ suite('Sharding quarantine on restart', { timeout: 300_000 }, (ctx) => {
 			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-')
 		);
 		await cp(FIXTURE, join(target.harper.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
+		await prepareSlotFixture(join(target.harper.dataRootDir, 'components', basename(FIXTURE)));
 	}
 	async function start(shards, target = context, shard = 0) {
 		await startHarper(target, {
 			config: {
+				storage: { rocks: { transactionLogAbortMarkers: true } },
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false, stdStreams: false, level: 'warn' },
-				replication: { securePort: target.harper.hostname + ':9933', shard, shards, databases: '*' },
+				replication: {
+					experimentalAttributeSlots: true,
+					securePort: target.harper.hostname + ':9933',
+					shard,
+					shards,
+					databases: '*',
+				},
 			},
 		});
 	}

@@ -1,3 +1,4 @@
+import { attributeSlotsSkip } from './experimentalSharding.mjs';
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
@@ -16,13 +17,14 @@ import {
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 const fixture = join(import.meta.dirname, 'fixture-sharding-quarantine');
 
-suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
+suite('Native sharding bootstrap', { timeout: 600_000, skip: attributeSlotsSkip }, (ctx) => {
 	const contexts = [];
 	const retiredNodes = [];
 	let lastStatuses;
 	const start = (context, i) =>
 		startHarper(context, {
 			config: {
+				storage: { rocks: { transactionLogAbortMarkers: true } },
 				threads: { count: 1 },
 				analytics: { aggregatePeriod: -1 },
 				logging: {
@@ -32,6 +34,7 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 					level: process.env.HARPER_TEST_SHARDING_LOG_LEVEL || (i === 0 ? 'debug' : 'warn'),
 				},
 				replication: {
+					experimentalAttributeSlots: true,
 					failover: true,
 					threads: Number(process.env.HARPER_TEST_SHARDING_POOL || 0),
 					securePort: context.harper.hostname + ':9933',

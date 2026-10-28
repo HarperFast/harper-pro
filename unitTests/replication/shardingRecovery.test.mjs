@@ -65,6 +65,17 @@ describe('Sharding complete source admission', () => {
 });
 
 describe('Native sharding completeness certificates', () => {
+	let priorExperimental, priorMarkers;
+	before(() => {
+		priorExperimental = env.get('replication_experimentalAttributeSlots');
+		priorMarkers = env.get('storage_rocks_transactionLogAbortMarkers');
+		env.setProperty('replication_experimentalAttributeSlots', true);
+		env.setProperty('storage_rocks_transactionLogAbortMarkers', true);
+	});
+	after(() => {
+		env.setProperty('replication_experimentalAttributeSlots', priorExperimental);
+		env.setProperty('storage_rocks_transactionLogAbortMarkers', priorMarkers);
+	});
 	let Rows, Legacy, layout, priorShard;
 	const database = 'certificateScope';
 	before(async () => {

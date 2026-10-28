@@ -14,7 +14,7 @@ import {
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 const fixture = join(import.meta.dirname, 'fixture-sharding-quarantine');
-const shardedSchema = `type ShardedRows @table @export @sharded(by: "tenant", slotFrom: "0") {
+const shardedSchema = `type ShardedRows @table @export @sharded(slotFrom: "0") {
 	id: ID @primaryKey
 	tenant: String @indexed
 	body: String
@@ -57,7 +57,12 @@ for (const healthyFirst of [false, true]) {
 					threads: { count: threads },
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, stdStreams: false, level: 'warn' },
-					replication: { securePort: context.harper.hostname + ':9933', databases: '*', ...(shards ? { shards } : {}) },
+					replication: {
+						experimentalAttributeSlots: true,
+						securePort: context.harper.hostname + ':9933',
+						databases: '*',
+						...(shards ? { shards } : {}),
+					},
 					operationsApi: { network: { domainSocket: false } },
 				},
 			});

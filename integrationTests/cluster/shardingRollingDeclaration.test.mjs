@@ -42,6 +42,7 @@ suite('Rolling local sharding declaration', { timeout: 360_000 }, (ctx) => {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, stdStreams: false, level: 'warn' },
 					replication: {
+						experimentalAttributeSlots: true,
 						securePort: context.harper.hostname + ':9933',
 						shard,
 						shards: [0, 1],
