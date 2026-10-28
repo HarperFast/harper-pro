@@ -36,8 +36,9 @@ const BARRIER_MS = 10000;
 // minutes of that budget.
 const BOOTSTRAP_PHASE_MS = 60000;
 // Restages are budgeted for the whole suite, not per trial: one unstaged race (a barrier miss, or
-// an accidental version tie) is a scheduling accident worth retrying, but a race that can never be staged must fail inside the suite timeout
-// rather than spend TRIALS x attempts x the barrier window discovering it.
+// an accidental version tie) is a scheduling accident worth retrying, but a race that can never be
+// staged must fail inside the suite timeout rather than spend TRIALS x attempts x the barrier
+// window discovering it.
 const RESTAGE_BUDGET = 3;
 // The two race shapes the convergence claim has to hold for. They reach different arbiters, so a
 // regression in one is invisible to the other: `distinct` is settled by version ordering, while
