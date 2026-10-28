@@ -2318,6 +2318,7 @@ describe('Declarative tables keep control and event traffic independent of place
 			audit: true,
 			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'body' }],
 		});
+		const Idle = table({ database, table: 'Idle', audit: true, attributes: [{ name: 'id', isPrimaryKey: true }] });
 		setReplicator(database, Plain, {});
 		await until(() => databaseSubscriptions.get(database)?.auditStore);
 		const socket = new Socket();
@@ -2357,14 +2358,28 @@ describe('Declarative tables keep control and event traffic independent of place
 			if (key === database) mapReads++;
 			return getSync.call(this, key, ...rest);
 		};
+		// After setup, only a per-frame declaration scan would read a table that receives no records.
+		let idleScans = 0;
+		Object.defineProperty(Idle, 'residency', {
+			configurable: true,
+			get() {
+				idleScans++;
+				return undefined;
+			},
+		});
 		try {
-			for (const frame of frames) socket.emit('message', frame);
+			socket.emit('message', frames[0]);
+			await until(() => Plain.primaryStore.getEntry('row-0')?.value || socket.closes.length);
+			idleScans = 0;
+			for (const frame of frames.slice(1)) socket.emit('message', frame);
 			await until(() => Plain.primaryStore.getEntry('row-19')?.value || socket.closes.length);
 		} finally {
 			store.getSync = getSync;
+			delete Idle.residency;
 		}
 		assert.deepEqual(socket.closes, []);
 		assert.equal(mapReads, 0);
+		assert.equal(idleScans, 0, 'the declaration verdict is cached across frames');
 	});
 
 	it('skips an invalidation of a refused table generation without holding the stream', async () => {

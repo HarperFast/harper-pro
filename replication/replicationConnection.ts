@@ -5223,9 +5223,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let admissionMembership: unknown;
 	let admissionConfiguration: unknown;
 	let admittedLayout: string | undefined;
+	// Only "no table declares a policy" is cached: gaining one comes with an updateTable event (the listener
+	// below) or a structure message, while losing one (a drop) leaves the cache correct.
+	let declaresNoResidency = false;
 	function databaseDeclaresResidency(): boolean {
+		if (declaresNoResidency) return false;
 		const current = databases[databaseName];
 		for (const name in current) if (current[name].residency) return true;
+		declaresNoResidency = current !== undefined;
 		return false;
 	}
 	// Shard maps cannot be deleted or cleared (Table.ts refuses both), so a seen map is latched. A database
@@ -5351,6 +5356,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!databaseName || table?.databaseName === databaseName) {
 			receiveBlockedTables = undefined;
 			shardingAdmissionDirty = true;
+			declaresNoResidency = false;
 			if (
 				residencyIdentityBound &&
 				admittedLayout &&
@@ -6096,6 +6102,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					}
 					case TABLE_FIXED_STRUCTURE:
+						declaresNoResidency = false;
 						if (data.residency !== undefined) authorizeResidencySchema(databaseName);
 						const tableName = message[3];
 						if (!tables) {
