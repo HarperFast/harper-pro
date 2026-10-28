@@ -24,7 +24,7 @@ import {
 	shardingCursorAdmission,
 	recordShardingWait,
 } from './shardingRecovery.ts';
-import { HAS_RESIDENCY_SLOT } from '../core/resources/RecordEncoder.ts';
+import { HAS_RESIDENCY_SLOT, FULL_WRITE_HEAD } from '../core/resources/RecordEncoder.ts';
 import {
 	readResidencyMap,
 	installResidencyMap,
@@ -87,6 +87,7 @@ import {
 	HAS_PREVIOUS_RESIDENCY_ID,
 	REMOTE_SEQUENCE_UPDATE,
 	HAS_BLOBS,
+	COPIED_RECORD,
 	AuditRecord,
 	readAuditEntry,
 	ACTION_32_BIT,
@@ -8042,7 +8043,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														const copyExtendedType =
 															(entry.metadataFlags &
 																~0xff &
-																~HAS_RESIDENCY_SLOT &
+																~(HAS_RESIDENCY_SLOT | FULL_WRITE_HEAD) &
 																~(ACTION_32_BIT << 24) &
 																(isReplica ? ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS) : -1)) |
 															(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0);
@@ -9019,6 +9020,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// Only writes before the replay boundary are audit-less snapshots. Strict `<` keeps the
 					// boundary transaction audited.
 					event.isCopyApply = isCopyApply;
+					event.copyFrame = messageIsCopyFrame || Boolean(auditRecord.extendedType & COPIED_RECORD);
 					// Record which tables actually received an audit-less snapshot row so only those get a
 					// reload marker at copy finalization (harper-pro#495). isCopyApply is exactly "invisible to
 					// live subscribers" — a copy frame at or after copyStartTime carries a real audit entry

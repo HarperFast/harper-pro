@@ -1,4 +1,4 @@
-const assert = require('node:assert/strict');
+const assert = require('node:assert');
 const { createRequire } = require('node:module');
 const path = require('node:path');
 const req = createRequire(path.resolve(__dirname, '../../../../package.json'));

@@ -2,7 +2,7 @@
 // No source, dist file, native binding, sender, or receiver is modified on disk.
 const fs = require('node:fs');
 const Module = require('node:module');
-const assert = require('node:assert/strict');
+const assert = require('node:assert');
 const original = Module._extensions['.js'];
 Module._extensions['.js'] = function (module, filename) {
 	if (!filename.endsWith('/resources/Table.js')) return original(module, filename);

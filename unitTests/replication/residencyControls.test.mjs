@@ -16,7 +16,7 @@ const { Transaction: NativeTransaction } = createRequire(import.meta.url)('@harp
 import { transaction } from '#src/core/resources/transaction';
 import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
-import { INVALIDATED } from '#src/core/resources/Table';
+import { INVALIDATED, FULL_WRITE_HEAD } from '#src/core/resources/Table';
 import { table } from '#src/core/resources/databases';
 import { createAuditEntry, readAuditEntry, Decoder, HAS_BLOBS } from '#src/core/resources/auditStore';
 import {
@@ -1846,6 +1846,8 @@ describe('Declarative tables keep control and event traffic independent of place
 			assert.equal(projection.getValue(Blobs.primaryStore).tag, 'projected');
 			assert.equal(projection.getValue(Blobs.primaryStore).body, undefined);
 			const owner = copied.find((entry) => entry.recordId === 'bb');
+			assert.ok(Blobs.primaryStore.getEntry('bb').metadataFlags & FULL_WRITE_HEAD);
+			assert.equal(owner.extendedType & FULL_WRITE_HEAD, 0, 'primary full-write metadata is not a copied audit flag');
 			assert.equal(owner?.type, 'put');
 			const value = owner.getValue(Blobs.primaryStore);
 			assert.deepEqual(value.extra, { shape: 'new' });
