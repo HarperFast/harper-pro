@@ -9994,13 +9994,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				})
 				.finally(() => {
 					if (saveFailed && !copyBlobGapped && copyCertification) {
-						const table = getDatabases()[databaseName]?.[tableName];
-						if (
-							table?.residency &&
-							(table.residency.byAttribute ||
-								residencyIsLocal(databaseName, table.getResidencySlot(id), table.residency.slots))
-						)
+						try {
+							const table = getDatabases()[databaseName]?.[tableName];
+							if (
+								table?.residency &&
+								(table.residency.byAttribute ||
+									residencyIsLocal(databaseName, table.getResidencySlot(id), table.residency.slots))
+							)
+								failedOwnedBlobSaves++;
+						} catch (error) {
 							failedOwnedBlobSaves++;
+							logger.warn?.(`Could not classify failed blob for ${databaseName}.${tableName} record ${id}`, error);
+						}
 					}
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
 					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);

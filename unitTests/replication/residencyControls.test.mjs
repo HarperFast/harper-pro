@@ -26,6 +26,7 @@ import {
 	blobFileMissingOrIncomplete,
 	blobFileMissingOrIncompleteAsync,
 	repairBlobFile,
+	isBlobReceiveInFlight,
 } from '#src/core/resources/blob';
 import { writeLockBarrier } from '#src/core/resources/recordLockCoordinator';
 import {
@@ -1611,7 +1612,7 @@ describe('Declarative tables keep control and event traffic independent of place
 				}
 			});
 
-	for (const liveMode of ['blobless', 'blob-success', 'blob-source-failure'])
+	for (const liveMode of ['blobless', 'blob-success', 'blob-source-failure', 'blob-classification-failure'])
 		it(`retains a completed owned-blob walk while a live commit drains (${liveMode})`, async () => {
 			const peer = 'slot-control-peer';
 			const previousFlushBytes = env.get('replication_copyCursorFlushBytes');
@@ -1638,6 +1639,12 @@ describe('Declarative tables keep control and event traffic independent of place
 			const originalRange = Records.primaryStore.getRange;
 			let held = false;
 			let scans = 0;
+			let walkFinished = false;
+			const warnings = [];
+			const originalWarn = logger.warn;
+			logger.warn = (...args) => warnings.push(args.join(' '));
+			const originalSlot = Records.getResidencySlot;
+			const sourceFailed = liveMode === 'blob-source-failure' || liveMode === 'blob-classification-failure';
 			try {
 				await Records.put('owned-blob', { id: 'owned-blob', region: 0, body: createBlob(Buffer.alloc(65_536, 91)) });
 				const version = Date.now() + 100;
@@ -1726,6 +1733,7 @@ describe('Declarative tables keep control and event traffic independent of place
 											})
 								);
 							}
+							if (scan === 1) walkFinished = true;
 						},
 					};
 				};
@@ -1740,6 +1748,12 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.deepEqual(socket.closes, []);
 				assert.equal(scans, 1);
 				if (liveMode !== 'blobless') {
+					await until(() => walkFinished);
+					if (liveMode === 'blob-classification-failure')
+						Records.getResidencySlot = () => {
+							Records.getResidencySlot = originalSlot;
+							throw new Error('placement unavailable during blob settlement');
+						};
 					assert.equal(shardingCertificate(database), undefined, 'wait for the captured in-flight blob');
 					for (const blob of blobs)
 						socket.emit(
@@ -1750,16 +1764,17 @@ describe('Declarative tables keep control and event traffic independent of place
 									fileId: getFileId(blob),
 									size: 65_536,
 									finished: true,
-									...(liveMode === 'blob-source-failure'
-										? { error: 'source file missing', errorCode: 'ENOENT', errorStatus: 404 }
-										: {}),
+									...(sourceFailed ? { error: 'source file missing', errorCode: 'ENOENT', errorStatus: 404 } : {}),
 								},
 								Buffer.alloc(65_536, 91),
 							])
 						);
-					if (liveMode === 'blob-source-failure') {
+					if (sourceFailed) {
 						releaseLive();
-						await until(() => scans > 1);
+						await until(() => warnings.some((warning) => warning.includes('Sharding recovery required')));
+						assert.ok(scans > 1);
+						for (const blob of blobs)
+							assert.equal(isBlobReceiveInFlight(getFileId(blob), Records.auditStore.rootStore), false);
 						assert.equal(
 							shardingCertificate(database),
 							undefined,
@@ -1789,6 +1804,8 @@ describe('Declarative tables keep control and event traffic independent of place
 			} finally {
 				releaseLive();
 				NativeTransaction.prototype.commit = originalCommit;
+				Records.getResidencySlot = originalSlot;
+				logger.warn = originalWarn;
 				Records.primaryStore.getRange = originalRange;
 				env.setProperty('replication_copyCursorFlushBytes', previousFlushBytes);
 				if (previous) await Nodes.primaryStore.put(peer, previous);

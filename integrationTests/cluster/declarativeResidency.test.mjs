@@ -532,7 +532,7 @@ suite('Sharding with mismatched shard lists', { timeout: 300_000 }, (ctx) => {
 	});
 });
 
-suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlotsSkip }, (ctx) => {
+suite('Sharding quarantine on restart', { timeout: 300_000 }, (ctx) => {
 	const context = { name: ctx.name };
 	const peerContext = { name: ctx.name };
 	async function prepare(target) {
@@ -541,16 +541,14 @@ suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlots
 			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-')
 		);
 		await cp(FIXTURE, join(target.harper.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
-		await prepareSlotFixture(join(target.harper.dataRootDir, 'components', basename(FIXTURE)));
+		await prepareSlotFixture(join(target.harper.dataRootDir, 'components', basename(FIXTURE)), { keyOnly: true });
 	}
 	async function start(shards, target = context, shard = 0) {
 		await startHarper(target, {
 			config: {
-				storage: { rocks: { transactionLogAbortMarkers: true } },
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false, stdStreams: false, level: 'warn' },
 				replication: {
-					experimentalAttributeSlots: true,
 					securePort: target.harper.hostname + ':9933',
 					shard,
 					shards,
@@ -577,9 +575,9 @@ suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlots
 		await waitForCondition(
 			async (signal) =>
 				(
-					await request(context.harper, 'SlotAttributes/quarantine-ready', {
+					await request(context.harper, 'SlotHash/quarantine-ready1', {
 						method: 'PUT',
-						body: { id: 'quarantine-ready', region: 0 },
+						body: { id: 'quarantine-ready1', region: 0 },
 						signal,
 					})
 				).status === 204,
@@ -588,7 +586,7 @@ suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlots
 	});
 	after(() => stopAndTeardownNodes([context.harper, peerContext.harper]));
 	test('serves healthy data and operations while the invalid database stays fenced until repair and restart', async () => {
-		await put(context.harper, 'SlotAttributes', { id: 'quarantined', region: 0, body: 'preserved' });
+		await put(context.harper, 'SlotHash', { id: 'quarantined1', region: 0, body: 'preserved' });
 		await sendOperation(context.harper, { operation: 'create_database', database: 'healthy' });
 		await sendOperation(context.harper, {
 			operation: 'create_table',
@@ -604,22 +602,21 @@ suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlots
 		});
 		await waitForCondition(
 			async (signal) =>
-				(await rawRows(peerContext.harper, 'SlotAttributes', signal)).some((row) => row.id === 'quarantined'),
+				(await rawRows(peerContext.harper, 'SlotHash', signal)).some((row) => row.id === 'quarantined1'),
 			{ description: 'peer has the original slot projection' }
 		);
 		// Establish this direction's durable resume cursor before queuing the held write. Otherwise
 		// restart bootstraps a primary-store copy, which intentionally cannot promote a non-owner's
 		// replica to an authoritative body; this case exercises audit-tail resume through quarantine.
-		await put(peerContext.harper, 'SlotAttributes', { id: 'inbound-ready', region: 1, body: 'peer-owned' });
+		await put(peerContext.harper, 'SlotHash', { id: 'inbound-ready1', region: 1, body: 'peer-owned' });
 		await waitForCondition(
-			async (signal) =>
-				(await rawRows(context.harper, 'SlotAttributes', signal)).some((row) => row.id === 'inbound-ready'),
+			async (signal) => (await rawRows(context.harper, 'SlotHash', signal)).some((row) => row.id === 'inbound-ready1'),
 			{ description: 'writer has received the peer audit stream' }
 		);
 		// A copied row and a positive received watermark can precede copy finalization. Rewrite an
 		// already received key, then require its live tail and removal of the durable copy cursor.
-		await put(peerContext.harper, 'SlotAttributes', {
-			id: 'inbound-ready',
+		await put(peerContext.harper, 'SlotHash', {
+			id: 'inbound-ready1',
 			region: 1,
 			tag: 'live-tail',
 			body: 'peer-owned',
@@ -634,17 +631,17 @@ suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlots
 				return (
 					resume.seqId > 0 &&
 					!resume.copying &&
-					(await rawRows(context.harper, 'SlotAttributes', signal)).some(
-						(row) => row.id === 'inbound-ready' && row.record?.tag === 'live-tail'
+					(await rawRows(context.harper, 'SlotHash', signal)).some(
+						(row) => row.id === 'inbound-ready1' && row.record?.tag === 'live-tail'
 					)
 				);
 			},
 			{ description: 'writer has finished the initial copy and received the peer live tail' }
 		);
-		const before = (await rawRows(context.harper, 'SlotAttributes')).find((row) => row.id === 'quarantined');
+		const before = (await rawRows(context.harper, 'SlotHash')).find((row) => row.id === 'quarantined1');
 		const priorPid = await readNodePid(context.harper);
 		await stopNodeProcess(context.harper);
-		await put(peerContext.harper, 'SlotAttributes', { id: 'quarantined', region: 0, body: 'delayed peer write' });
+		await put(peerContext.harper, 'SlotHash', { id: 'quarantined1', region: 0, body: 'delayed peer write' });
 		const quarantineStarted = Date.now();
 		await start([1]);
 		assert.notEqual(await readNodePid(context.harper), priorPid);
@@ -670,15 +667,15 @@ suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlots
 			{
 				operation: 'search_by_id',
 				database: 'data',
-				table: 'SlotAttributes',
-				ids: ['quarantined'],
+				table: 'SlotHash',
+				ids: ['quarantined1'],
 				get_attributes: ['*'],
 			},
 			{
 				operation: 'update',
 				database: 'data',
-				table: 'SlotAttributes',
-				records: [{ id: 'quarantined', body: 'forbidden' }],
+				table: 'SlotHash',
+				records: [{ id: 'quarantined1', body: 'forbidden' }],
 			},
 		]) {
 			const response = await postOperation(node, operation);
@@ -686,7 +683,7 @@ suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlots
 			assert.match(JSON.stringify(response.body), /replication.shard/);
 		}
 		for (const method of ['GET', 'PATCH']) {
-			const response = await request(node, 'SlotAttributes/quarantined', {
+			const response = await request(node, 'SlotHash/quarantined1', {
 				method,
 				...(method === 'PATCH' ? { body: { body: 'forbidden' } } : {}),
 			});
@@ -708,7 +705,7 @@ suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlots
 			{ description: 'peer observes a refused data connection after the quarantined restart' }
 		);
 		assert.deepEqual(
-			(await rawRows(node, 'SlotAttributes')).find((row) => row.id === 'quarantined'),
+			(await rawRows(node, 'SlotHash')).find((row) => row.id === 'quarantined1'),
 			before,
 			'no apply while quarantined'
 		);
@@ -716,7 +713,7 @@ suite('Sharding quarantine on restart', { timeout: 300_000, skip: attributeSlots
 		await start([0, 1]);
 		await waitForCondition(
 			async (signal) => {
-				const response = await request(context.harper, 'SlotAttributes/quarantined', { signal });
+				const response = await request(context.harper, 'SlotHash/quarantined1', { signal });
 				assert.ok([200, 502, 503].includes(response.status), JSON.stringify(response));
 				return response.status === 200 && response.data.body === 'delayed peer write';
 			},

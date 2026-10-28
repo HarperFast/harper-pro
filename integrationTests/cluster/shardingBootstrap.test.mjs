@@ -1,4 +1,3 @@
-import { attributeSlotsSkip } from './experimentalSharding.mjs';
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
@@ -17,14 +16,13 @@ import {
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 const fixture = join(import.meta.dirname, 'fixture-sharding-quarantine');
 
-suite('Native sharding bootstrap', { timeout: 600_000, skip: attributeSlotsSkip }, (ctx) => {
+suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 	const contexts = [];
 	const retiredNodes = [];
 	let lastStatuses;
 	const start = (context, i) =>
 		startHarper(context, {
 			config: {
-				storage: { rocks: { transactionLogAbortMarkers: true } },
 				threads: { count: 1 },
 				analytics: { aggregatePeriod: -1 },
 				logging: {
@@ -34,7 +32,6 @@ suite('Native sharding bootstrap', { timeout: 600_000, skip: attributeSlotsSkip 
 					level: process.env.HARPER_TEST_SHARDING_LOG_LEVEL || (i === 0 ? 'debug' : 'warn'),
 				},
 				replication: {
-					experimentalAttributeSlots: true,
 					failover: true,
 					threads: Number(process.env.HARPER_TEST_SHARDING_POOL || 0),
 					securePort: context.harper.hostname + ':9933',
@@ -122,7 +119,7 @@ suite('Native sharding bootstrap', { timeout: 600_000, skip: attributeSlotsSkip 
 		await cp(fixture, component, { recursive: true });
 		await writeFile(
 			join(component, 'schema.graphql'),
-			`type Rows @table @export @sharded(slots: 2, by: "region", slotFrom: "region == 'asia' ? 0 : 1") {
+			`type Rows @table @export @sharded(slots: 2) {
 				id: ID @primaryKey
 				region: String @indexed
 				body: String
@@ -150,7 +147,7 @@ export class BootstrapReservation extends Resource {
   releaseReservation = hold.resolve;
   reservationTimer = setTimeout(hold.resolve, 120000).unref();
   reservationDone = transaction({}, async () => {
-   await tables.Rows.put('held-reservation', { id: 'held-reservation', region: 'asia', body: 'never-committed' });
+   await tables.Rows.put('held-reservation1', { id: 'held-reservation1', region: 'asia', body: 'never-committed' });
    started.resolve({ key: tables.Rows.primaryStore.rootStore.getMonotonicTimestamp(), threadId });
    await hold.promise;
    throw released;
@@ -165,10 +162,10 @@ export class BootstrapBlob extends Resource {
  async get(target) {
   const bytes = Buffer.alloc(65536, 79);
   if (target.get('seed')) {
-   await tables.Rows.put('replacement-blob', { id: 'replacement-blob', region: 'asia', body: 'copy-blob', payload: createBlob(Readable.from([bytes]), {saveBeforeCommit: true}) });
+   await tables.Rows.put('replacement-blob1', { id: 'replacement-blob1', region: 'asia', body: 'copy-blob', payload: createBlob(Readable.from([bytes]), {saveBeforeCommit: true}) });
    return { seeded: true };
   }
-  const entry = await tables.Rows.primaryStore.getEntry('replacement-blob');
+  const entry = await tables.Rows.primaryStore.getEntry('replacement-blob1');
   if (!entry?.value?.payload) return { digest: null };
   const actual = Buffer.from(await entry.value.payload.arrayBuffer());
   return { digest: createHash('sha256').update(actual).digest('hex'), size: actual.length, version: entry.version };
@@ -213,7 +210,7 @@ export class BootstrapLocal extends Resource {
 					operation: 'insert',
 					database: 'data',
 					table: 'Rows',
-					records: [{ id: 'before-join', region: 'asia', body: 'existing-before-late-origins' }],
+					records: [{ id: 'before-join1', region: 'asia', body: 'existing-before-late-origins' }],
 				});
 			}
 		}
@@ -299,13 +296,13 @@ export class BootstrapLocal extends Resource {
 					operation: 'insert',
 					database: 'data',
 					table: 'Rows',
-					records: [{ id: 'resume-cursor', region: 'asia', body: 'committed-above-reservation' }],
+					records: [{ id: 'resume-cursor1', region: 'asia', body: 'committed-above-reservation' }],
 				},
 				{ signal: AbortSignal.timeout(10_000) }
 			);
 			await waitForCondition(
 				async (signal) =>
-					(await local(2, signal)).rows.some((row) => row.id === 'resume-cursor' && row.version > held.key),
+					(await local(2, signal)).rows.some((row) => row.id === 'resume-cursor1' && row.version > held.key),
 				{ timeoutMs: 30_000, description: 'peer holds a committed cursor above the older reservation' }
 			);
 			await stopNodeProcess(contexts[2].harper);
@@ -329,7 +326,7 @@ export class BootstrapLocal extends Resource {
 					operation: 'insert',
 					database: 'data',
 					table: 'Rows',
-					records: [{ id: 'resume-independent', region: 'asia', body: 'writer-remains-live' }],
+					records: [{ id: 'resume-independent1', region: 'asia', body: 'writer-remains-live' }],
 				},
 				{ signal: AbortSignal.timeout(10_000) }
 			);
@@ -339,7 +336,7 @@ export class BootstrapLocal extends Resource {
 		await waitForCondition(
 			async (signal) =>
 				(await local(2, signal)).rows.some(
-					(row) => row.id === 'resume-independent' && row.body === 'writer-remains-live' && !(row.flags & 5)
+					(row) => row.id === 'resume-independent1' && row.body === 'writer-remains-live' && !(row.flags & 5)
 				),
 			{ timeoutMs: 60_000, description: 'reconnected peer receives writes after the reservation settles' }
 		);
@@ -390,10 +387,10 @@ export class BootstrapLocal extends Resource {
 				operation: 'insert',
 				database: 'data',
 				table: 'Rows',
-				records: [{ id: 'nonowner-live', region: 'europe', body: 'other-stream-progress' }],
+				records: [{ id: 'nonowner-live1', region: 'europe', body: 'other-stream-progress' }],
 			});
 			await waitForCondition(
-				async (signal) => (await local(2, signal)).rows.some((row) => row.id === 'nonowner-live'),
+				async (signal) => (await local(2, signal)).rows.some((row) => row.id === 'nonowner-live1'),
 				{ timeoutMs: 30_000, description: 'the non-owner remains live without advancing the waiting origin' }
 			);
 			assert.deepEqual((await local(2, AbortSignal.timeout(10_000))).originProgress, before);
@@ -481,12 +478,12 @@ export class BootstrapLocal extends Resource {
 		);
 		for (const operation of [
 			{ operation: 'sql', sql: 'SELECT * FROM `data`.`Rows`' },
-			{ operation: 'sql', sql: "SELECT * FROM `data`.`Rows` WHERE id = 'lost-key'" },
+			{ operation: 'sql', sql: "SELECT * FROM `data`.`Rows` WHERE id = 'lost-key1'" },
 			{
 				operation: 'search_by_hash',
 				database: 'data',
 				table: 'Rows',
-				hash_values: ['lost-key'],
+				hash_values: ['lost-key1'],
 				get_attributes: ['*'],
 			},
 		]) {
@@ -535,14 +532,14 @@ export class BootstrapLocal extends Resource {
 			operation: 'insert',
 			database: 'data',
 			table: 'Rows',
-			records: [{ id: 'after-rename', region: 'europe', body: 'new-origin-body' }],
+			records: [{ id: 'after-rename1', region: 'europe', body: 'new-origin-body' }],
 		});
 		await waitForCondition(
 			async (signal) => {
 				const state = await local(3, signal, oldName);
 				return (
 					state.rows.some((row) => row.id === 'pending-old-origin' && row.body === 'retired-origin-body') &&
-					state.rows.some((row) => row.id === 'after-rename' && row.body === 'new-origin-body')
+					state.rows.some((row) => row.id === 'after-rename1' && row.body === 'new-origin-body')
 				);
 			},
 			{
