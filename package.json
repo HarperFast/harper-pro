@@ -222,6 +222,7 @@
 	},
 	"devDependencies": {
 		"@harperfast/code-guidelines": "^0.1.2",
+		"@harperfast/fulltext-previous": "npm:@harperfast/fulltext@0.5.0",
 		"@harperfast/integration-testing": "^1.0.0",
 		"@modelcontextprotocol/sdk": "^1.29.0",
 		"@types/busboy": "^1.5.4",
