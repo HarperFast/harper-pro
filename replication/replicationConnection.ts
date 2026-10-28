@@ -12048,7 +12048,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				certifiesOriginFloors(),
 				shardingCursorAdmission(databaseName, store),
 				// a copy's rows carry no audit entries, so its request proves no prefix for anyone
-				recordOptimistic && certifiesCheckpointFloors() && !requestIsCopy
+				recordOptimistic && certifiesCheckpointFloors() && !requestIsCopy && !restrictedOrigins
 					? (originId, start, generation) => {
 							if (partialMarked.has(originId) || pendingRouteState.hasPendingPartialHistory(originId)) return;
 							if (allowedOptimisticNames) {
@@ -12381,6 +12381,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (
 						nodeId !== undefined &&
 						!copyCursor &&
+						// a sharded route certifies no coverage, and its completed-projection resume picks its own start
+						!restrictedOrigins &&
 						certifiesCheckpointFloors() &&
 						checkpointGradeRow(ownState) &&
 						!partialMarked.has(nodeId) &&
