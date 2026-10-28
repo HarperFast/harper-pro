@@ -39,11 +39,6 @@ WORKDIR /home/harperdb
 
 USER harperdb
 
-# jemalloc for every process; see build-tools/DESIGN.md. A preload the loader
-# cannot resolve only warns and falls back to glibc, hence the binding check.
-ENV LD_PRELOAD=libjemalloc.so.2
-RUN LD_DEBUG=bindings node -e 0 2>&1 | grep -q 'binding file node .*/libjemalloc\.so\.2 .*normal symbol .malloc. '
-
 # Install pnpm
 RUN <<EOF
   set -e
@@ -111,6 +106,12 @@ RUN <<-EOF
     node /usr/local/share/check-native-abi-pointer-compression.js "$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro"
   fi
 EOF
+
+# jemalloc for every runtime process, set after the install steps so the build
+# runs on glibc; see build-tools/DESIGN.md. A preload the loader cannot resolve
+# only warns and falls back to glibc, hence the binding check.
+ENV LD_PRELOAD=libjemalloc.so.2
+RUN LD_DEBUG=bindings node -e 0 2>&1 | grep -q 'binding file node .*/libjemalloc\.so\.2 .*normal symbol .malloc. '
 
 VOLUME /home/harperdb/harper
 
