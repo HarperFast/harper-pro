@@ -14,6 +14,7 @@
 - [Release-candidate CI gate](scripts/DESIGN.md#release-candidate-ci-gate): pinned candidate SHAs, per-job workflow evidence, and the override.
 - [Sharding agreement and wire references](replication/DESIGN.md#sharding-agreement-and-wire-references) — Shard-list/map agreement, capability fallback, and owner confirmation.
 - [Startup dependencies](#startup-dependencies): packages the built-in components load only on first use.
+- [The default, `-pc` and GPU images run every process on jemalloc](build-tools/DESIGN.md#the-default--pc-and-gpu-images-run-every-process-on-jemalloc-dockerfile-dockerfile-gpu): distro `libjemalloc2` preloaded by soname with default settings; the build fails unless node's `malloc` binds to it; opt out with `-e LD_PRELOAD=`; OpenShift stays on glibc (UBI10 has no package).
 
 ## Startup dependencies
 
