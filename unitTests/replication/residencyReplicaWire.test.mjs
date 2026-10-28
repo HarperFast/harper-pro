@@ -5,7 +5,7 @@ import { setHdbBasePath } from '#src/core/utility/environment/environmentManager
 import { table } from '#src/core/resources/databases';
 import { transaction } from '#src/core/resources/transaction';
 import { Decoder, readAuditEntry } from '#src/core/resources/auditStore';
-import { INVALIDATED, REPLICA } from '#src/core/resources/Table';
+import { INVALIDATED, REPLICA, FULL_WRITE_HEAD } from '#src/core/resources/Table';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
 import { setReplicator } from '#src/replication/replicator';
@@ -152,7 +152,11 @@ describe('local replicas on the replication wire', function () {
 		await new Promise((resolve) => setImmediate(resolve));
 		const pending = session.getRecord({ table: RecordTable, id, entry: existing });
 		const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
-		socket.emit('message', encode([GET_RECORD_RESPONSE, request[1], { ...response, version: stubVersion }]));
+		const fullWriteHead = stubVersion;
+		socket.emit(
+			'message',
+			encode([GET_RECORD_RESPONSE, request[1], { ...response, version: stubVersion, fullWriteHead }])
+		);
 		const found = await pending;
 		assert.equal(found.value.body, 'complete');
 		return found;
@@ -183,6 +187,19 @@ describe('local replicas on the replication wire', function () {
 			);
 		}
 	);
+
+	replicaTest('reports the head log key only while the head is a full write', async () => {
+		const answer = async (requestId) => {
+			socket.emit('message', encode([GET_RECORD, requestId, Records.tableId, 'head-kind', Records.tableName]));
+			await until(() => socket.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === requestId));
+			return socket.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE && frame[1] === requestId)[2];
+		};
+		await Records.put('head-kind', { id: 'head-kind', name: 'indexed', body: 'put' });
+		const put = Records.primaryStore.getEntry('head-kind');
+		assert.equal((await answer(21)).fullWriteHead, put.additionalAuditRefs?.[0]?.version ?? put.version);
+		await Records.patch('head-kind', { body: 'patched' });
+		assert.ok(!('fullWriteHead' in (await answer(22))), 'a patch head adds no key');
+	});
 
 	it('names a row written by another node after that node', async () => {
 		const remoteId = getIdOfRemoteNode('other-resident', Records.auditStore);
@@ -299,6 +316,8 @@ describe('local replicas on the replication wire', function () {
 				};
 				const records = await copy();
 				const copied = records.get(id).entry;
+				assert.ok(replica.metadataFlags & FULL_WRITE_HEAD, 'premise: a certified replica');
+				assert.equal(copied.extendedType & FULL_WRITE_HEAD, 0, 'a record-only bit must not reach the audit flags');
 				assert.equal(copied.type, peer === 'capable' ? 'invalidate' : 'put');
 				assert.equal(copied.residencyId, peer === 'capable' ? residencyId : undefined);
 				const value = copied.getValue(RecordTable.primaryStore);

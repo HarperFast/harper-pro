@@ -229,6 +229,53 @@ suite('local replicas of residency stubs', { timeout: 900_000 }, (ctx) => {
 		assert.equal(absent.status, 404, JSON.stringify(absent));
 	});
 
+	replicaTest('keeps a replica only while the resident head is a full write, and renews it while hot', async () => {
+		const id = 'head-kind';
+		const { full, reader } = await placedRecord(id, 'put body');
+		// every node, so whichever resident the reader asks answers with this write
+		const reachedReader = async (description) => {
+			const { version } = await state(nodes[full[0]], id);
+			const states = await waitForCondition(
+				async (signal) => {
+					const all = await Promise.all(nodes.map((node) => state(node, id, signal)));
+					return all.every((current) => current.version === version) && all;
+				},
+				{ timeoutMs: 30_000, description }
+			);
+			return states[reader];
+		};
+		const patched = await request(nodes[full[0]], `Open/${id}`, {
+			method: 'PATCH',
+			headers: { 'X-Replicate-To': '1' },
+			body: JSON.stringify({ body: 'patched body' }),
+		});
+		assert.ok(patched.status < 300, JSON.stringify(patched));
+		const patchedStub = await reachedReader('the patch to reach the reader as a stub');
+		assert.ok(patchedStub.invalidated, JSON.stringify(patchedStub));
+		const served = await request(nodes[reader], `Open/${id}`);
+		assert.equal(served.body.body, 'patched body');
+		const declined = await waitForCondition(
+			async (signal) => {
+				const current = await state(nodes[reader], id, signal);
+				return current.storeAttempts > patchedStub.storeAttempts && current;
+			},
+			{ timeoutMs: 30_000, description: 'the store attempt for the patch head to settle' }
+		);
+		assert.ok(declined.invalidated && !declined.replica, `a patch head was kept: ${JSON.stringify(declined)}`);
+
+		await put(nodes[full[0]], id, { name: id, body: 'put again' });
+		assert.ok((await reachedReader('the put to reach the reader as a stub')).invalidated);
+		assert.equal((await request(nodes[reader], `Open/${id}`)).body.body, 'put again');
+		await replicaOn(reader, id);
+		const hotUntil = Date.now() + OPEN_REPLICA_EXPIRATION_MS * 2.5;
+		while (Date.now() < hotUntil) {
+			await new Promise((resolve) => setTimeout(resolve, 1000));
+			const current = await state(nodes[reader], id);
+			assert.ok(current.replica, `the hot replica was demoted: ${JSON.stringify(current)}`);
+			await request(nodes[reader], `Open/${id}`);
+		}
+	});
+
 	replicaTest('a non-resident query materializes rows as replicas', async () => {
 		const { reader } = await placedRecord('queried', 'complete query');
 		const result = await request(nodes[reader], 'Open/?name==queried&select(id,body)');
