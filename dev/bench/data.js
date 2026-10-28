@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793091347592,
+  "lastUpdate": 1793184843928,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -6863,6 +6863,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2358.99,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "ba49f3fdbcf818ea525f41b5858e6afaf0cf8325",
+          "message": "Repair a blob left PENDING when a first copy is cut off before it saves a cursor (#1140)\n\n* Test that a cursorless copy re-delivery repairs a blob aborted mid-receive\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-copy-blob-repair-cursorless\n\n* Repair an incomplete blob on any copy re-delivery, not only cursor resumes\n\nA first copy closed mid-blob before it banks a copy cursor reconnects as\nanother full copy. The in-place repair gate required a resume cursor or a\nsame-socket copy restart, so the re-sent bytes were orphaned and the\nrecord's blob stayed PENDING. Every blob-carrying copy frame now makes one\nstored-entry read shared by the identity-tie skip and repair selection,\nwith no miss cutoff.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-copy-blob-repair-cursorless\n\n* Skip version and node mismatches before the copy tie check, recheck close after it\n\nAlso filter the stall fixture to blob descriptors and fix the DESIGN.md\nsentence the earlier edit broke.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-copy-blob-repair-cursorless\n\n* Recheck connection ownership after the copy stored-state await\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-copy-blob-repair-cursorless\n\n* Recheck ownership after the leading-duplicate repair await; trim comments\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-copy-blob-repair-cursorless\n\n* Tear down the source when the peer's setup throws; trim a comment\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-copy-blob-repair-cursorless\n\n* Return shared results for the common copy-frame outcomes\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-copy-blob-repair-cursorless\n\n* Keep an in-place repair target when the source cannot supply its bytes\n\nA reverse copy from a peer that lacks a record's blob now reaches the\nstored stub as a repair target; unlinking it on the peer's permanent error\ndestroyed the origin's own file (blobGapEscalationBudget). Only a freshly\nminted file is unlinked.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-copy-blob-repair-cursorless\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-27T19:27:01Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/ba49f3fdbcf818ea525f41b5858e6afaf0cf8325"
+        },
+        "date": 1793184842244,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 6089.15,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 15358.32,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 12680.98,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 6204.14,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 4263.39,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2300.77,
             "unit": "ops/sec"
           }
         ]
