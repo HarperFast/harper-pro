@@ -46,8 +46,9 @@ const RESTAGE_BUDGET = 3;
 // A third shape — both fills concurrent AND at an equal version, so each node commits its own
 // record before its peer's arrives — is deliberately absent: it does not converge, on either
 // engine. The replicas settle holding each other's record at the same version, which is an open
-// defect rather than a property this regression can assert. Adding
-// `{ id: 'tied', stagger: false, tied: true }` here reproduces it.
+// defect (harper-pro#888) rather than a property this regression can assert. Adding
+// `{ id: 'tied', stagger: false, tied: true }` here reproduces it. `distinct` can land in that shape
+// by accident, when both nodes' clocks mint the same version, so such a trial is restaged.
 const SHAPES = [
 	{ id: 'distinct', stagger: false, tied: false },
 	{ id: 'tied-late', stagger: true, tied: true },
@@ -211,7 +212,8 @@ function requestJson(url, agent, options = {}) {
 						reject(new Error(url + ' returned ' + res.statusCode + ': ' + responseBody));
 					else {
 						try {
-							resolve(responseBody ? JSON.parse(responseBody) : null);
+							const body = responseBody ? JSON.parse(responseBody) : null;
+							resolve(options.withEtag ? { body, etag: res.headers.etag } : body);
 						} catch (error) {
 							reject(error);
 						}
@@ -384,13 +386,16 @@ async function releaseLateFill(ctx, id) {
 /**
  * Races one key across both nodes and asserts the whole cluster settles on a single write.
  * Returns false when the barrier never held two concurrent fills — one node learned the key by
- * replication before issuing its own, so nothing about convergence was demonstrated.
+ * replication before issuing its own, so nothing about convergence was demonstrated — or when a
+ * shape meant to race distinct versions minted the same version on both nodes.
  */
 async function raceTrial(ctx, id, shape) {
 	ctx.origin.stage(id, shape);
 	const fillAgents = ctx.agentsByNode.map((agents) => agents.values().next().value);
 	const pendingFills = Promise.all(
-		ctx.nodes.map((node, index) => requestJson(`${node.httpURL}/PairRecord/${id}`, fillAgents[index]))
+		ctx.nodes.map((node, index) =>
+			requestJson(`${node.httpURL}/PairRecord/${id}`, fillAgents[index], { withEtag: true })
+		)
 	);
 	// releaseLateFill awaits before this is, so an unhandled rejection here would kill the runner
 	pendingFills.catch(() => {});
@@ -405,7 +410,10 @@ async function raceTrial(ctx, id, shape) {
 		2,
 		`${id} both source fills came from the same node — this did not race two nodes`
 	);
-	notEqual(fills[0].token, fills[1].token, `${id} source fills must be distinguishable`);
+	notEqual(fills[0].body.token, fills[1].body.token, `${id} source fills must be distinguishable`);
+	for (const fill of fills) ok(fill.etag, `${id} source fill response carried no ETag`);
+	// the ETag encodes the version each node minted for its own fill
+	if (!shape.tied && fills[0].etag === fills[1].etag) return false;
 
 	await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 	await waitForAllWorkers(ctx.nodes, id, ctx.agentsByNode, 'PairPointProbe');
@@ -524,7 +532,10 @@ function sourcedBlobPairing(ctx) {
 				restagesLeft--;
 				staged = await raceTrial(ctx, `${id}-${trial}-restage${restage}`, shape);
 			}
-			ok(staged, `${id}-${trial} never staged two concurrent source fills; suite restage budget exhausted`);
+			ok(
+				staged,
+				`${id}-${trial} never staged two concurrent source fills (at distinct versions, for an untied shape); suite restage budget exhausted`
+			);
 		}
 	});
 }
