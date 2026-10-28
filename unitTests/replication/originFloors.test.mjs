@@ -287,7 +287,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			],
 		]);
 		const reported = [];
-		const vector = buildOriginCursorVector(rows, 1, nameForId, isMember, true, (id, start, generation) =>
+		const vector = buildOriginCursorVector(rows, 1, nameForId, isMember, true, undefined, (id, start, generation) =>
 			reported.push([id, start, generation])
 		);
 		assert.deepStrictEqual(vector, { peer: cursorBelowFloor(T - 10), relayed: T, other: T });
@@ -621,6 +621,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			nameForId,
 			isMember,
 			true,
+			undefined,
 			(id, start, gen) => certified.push([id, start, gen]),
 			new Map([[2, T + 10]])
 		);
@@ -863,6 +864,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			nameForId,
 			isMember,
 			true,
+			undefined,
 			(id, start) => certified.push([id, start]),
 			loaded
 		);
@@ -1018,6 +1020,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			nameForId,
 			(name) => name === 'peer',
 			true,
+			undefined,
 			(id, start, generation) => reported.push([id, start, generation])
 		);
 		assert.deepStrictEqual(vector, {

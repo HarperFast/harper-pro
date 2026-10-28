@@ -1,0 +1,12 @@
+type Converted @table(replicaExpiration: 3600) @export {
+	id: ID @primaryKey
+	tag: String @indexed
+	body: String
+}
+type ConversionBarrier @table @export {
+	id: ID @primaryKey
+}
+type Plain @table @export {
+	id: ID @primaryKey
+	body: String
+}

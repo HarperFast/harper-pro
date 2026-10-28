@@ -1,6 +1,6 @@
 # Design notes
 
-- [Send-side residency](replication/DESIGN.md#send-side-residency): every non-resident receives current stubs unless residency is by id; capability-gated copy frames preserve stubs, and GET_RECORD distinguishes not resident from absence, and RocksDB reads keep a local replica instead of relocating (never on a by-id table, nor with `replicaExpiration: 0`); LMDB reads remain proxies.
+- [Send-side residency](replication/DESIGN.md#send-side-residency): indexed declarative non-owners receive invalidations; index-free declarative tables omit them. Legacy by-id placement still omits non-owners. Declarative stubs are never copied as complete rows, and GET_RECORD refuses declarative non-owner rows. RocksDB can retain temporary replicas when enabled; LMDB reads remain proxies.
 - [A clone copies filesystem-only applications as the leader packaged them](cloneNode/DESIGN.md#a-clone-copies-filesystem-only-applications-as-the-leader-packaged-them): `node_modules` included from a leader that streams it (5.2.3+ over HTTP); an application it cannot copy keeps the clone Unavailable and uncloned.
 - [Removed-origin history](replication/DESIGN.md#removed-origin-history): membership removal preserves audit history, origin mappings and resume cursors; retention purges eligible segments independently.
 - [Replication base-copy compatibility](replication/DESIGN.md#base-copy-peer-safety): reported 5.x peers receive historical copies; v4 and unidentified peers retain baseline verification.
@@ -13,6 +13,7 @@
 - [A marker-free PR is green only if every submodule pointer it moves is settled (`workflows/companion-check.yaml`)](.github/DESIGN.md#a-marker-free-pr-is-green-only-if-every-submodule-pointer-it-moves-is-settled-workflowscompanion-checkyaml): settle branch is the base-named submodule branch else its default; patchless file entries are decided by the head tree; unreadable is pending.
 - [Release-candidate CI gate](scripts/DESIGN.md#release-candidate-ci-gate): pinned candidate SHAs, per-job workflow evidence, and the override.
 - [Checkpoint-grade certificates, floor-only resume and revocation](replication/DESIGN.md#non-obvious-behaviors): level-2 `originFloors` carry the origin generation and coverage, resume exactly below a stored floor, record where a route's complete prefix begins, and revoke on downgrade (harper-pro#922 items 3–4).
+- [Sharding agreement and wire references](replication/DESIGN.md#sharding-agreement-and-wire-references) — Shard-list/map agreement, capability fallback, and owner confirmation.
 - [Startup dependencies](#startup-dependencies): packages the built-in components load only on first use.
 
 ## Startup dependencies

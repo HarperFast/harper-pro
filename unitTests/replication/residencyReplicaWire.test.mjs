@@ -144,7 +144,7 @@ describe('local replicas on the replication wire', function () {
 		return { response, structure };
 	}
 
-	async function fetchedRecord(id, existing, RecordTable = Records) {
+	async function fetchedRecord(id, existing, RecordTable = Records, certified = true) {
 		existing ??= await stub(id, RecordTable);
 		stubVersion = existing.version;
 		const { response, structure } = await fullRecordFrame(RecordTable);
@@ -152,10 +152,13 @@ describe('local replicas on the replication wire', function () {
 		await new Promise((resolve) => setImmediate(resolve));
 		const pending = session.getRecord({ table: RecordTable, id, entry: existing });
 		const request = socket.sent.filter((frame) => frame[0] === GET_RECORD).at(-1);
-		const fullWriteHead = stubVersion;
 		socket.emit(
 			'message',
-			encode([GET_RECORD_RESPONSE, request[1], { ...response, version: stubVersion, fullWriteHead }])
+			encode([
+				GET_RECORD_RESPONSE,
+				request[1],
+				{ ...response, version: stubVersion, ...(certified ? { fullWriteHead: stubVersion } : {}) },
+			])
 		);
 		const found = await pending;
 		assert.equal(found.value.body, 'complete');
@@ -168,6 +171,17 @@ describe('local replicas on the replication wire', function () {
 			RecordTable.primaryStore.getEntry(id)
 		);
 	}
+
+	replicaTest('returns an uncertified owner answer without keeping a replica', async () => {
+		const existing = await stub('uncertified');
+		await fetchedRecord('uncertified', existing, Records, false);
+		await Records.primaryStore.flushed;
+		const stored = Records.primaryStore.getEntry('uncertified');
+		assert.ok(stored.metadataFlags & INVALIDATED);
+		assert.equal(stored.metadataFlags & REPLICA, 0);
+		assert.equal(stored.value.body, undefined);
+		assert.equal(socket.readyState, 1);
+	});
 
 	replicaTest(
 		'keeps a GET_RECORD answer as a replica of the stub, without an audit entry, and keeps the socket open',

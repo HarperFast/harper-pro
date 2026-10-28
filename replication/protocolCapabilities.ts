@@ -62,6 +62,8 @@ export const TABLE_LIFECYCLE_CAPABILITY = 1;
  * an older receiver would turn its full row into a stub, so it gets the stub as a `put` it skips.
  */
 export const RESIDENCY_STUB_COPY_CAPABILITY = 1;
+export const RESIDENCY_SLOTS_CAPABILITY = 1;
+export const SHARDING_RECOVERY_CAPABILITY = 2;
 
 export const RESIDENCY_NOT_RESIDENT_CAPABILITY = 1;
 
@@ -77,6 +79,8 @@ export interface ResolvedPeerCapabilities {
 	tableLifecycle: number;
 	residencyStubCopy: number;
 	residencyNotResident: number;
+	residencySlots: number;
+	shardingRecovery: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -128,6 +132,8 @@ export function resolvePeerCapabilities(
 		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
 		residencyStubCopy: resolveLevel(bag?.residencyStubCopy, RESIDENCY_STUB_COPY_CAPABILITY, 0),
 		residencyNotResident: resolveLevel(bag?.residencyNotResident, RESIDENCY_NOT_RESIDENT_CAPABILITY, 0),
+		residencySlots: resolveLevel(bag?.residencySlots, RESIDENCY_SLOTS_CAPABILITY, 0),
+		shardingRecovery: resolveLevel(bag?.shardingRecovery, SHARDING_RECOVERY_CAPABILITY, 0),
 	});
 }
 
@@ -141,6 +147,14 @@ export function peerSupportsResidencyStubCopy(resolved: ResolvedPeerCapabilities
 
 export function peerSupportsResidencyNotResident(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.residencyNotResident >= RESIDENCY_NOT_RESIDENT_CAPABILITY;
+}
+
+export function peerSupportsResidencySlots(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.residencySlots >= RESIDENCY_SLOTS_CAPABILITY;
+}
+
+export function peerSupportsShardingRecovery(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.shardingRecovery >= SHARDING_RECOVERY_CAPABILITY;
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
@@ -200,6 +214,8 @@ export function buildLocalCapabilities(
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 		residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 		residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
+		residencySlots: RESIDENCY_SLOTS_CAPABILITY,
+		shardingRecovery: perOriginLogs ? SHARDING_RECOVERY_CAPABILITY : 0,
 	});
 }
 
@@ -216,7 +232,9 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.originFloors === b.originFloors &&
 		a.tableLifecycle === b.tableLifecycle &&
 		a.residencyStubCopy === b.residencyStubCopy &&
-		a.residencyNotResident === b.residencyNotResident
+		a.residencyNotResident === b.residencyNotResident &&
+		a.residencySlots === b.residencySlots &&
+		a.shardingRecovery === b.shardingRecovery
 	);
 }
 

@@ -1,9 +1,68 @@
+import { shardingNativeRoots, shardingBaselineState } from '../core/resources/shardingCompleteness.ts';
+import {
+	shardingInitialFloor,
+	noteShardingOriginStart,
+	shardingOriginStarts,
+	noteShardingResumeBound,
+	noteShardingCopyBound,
+	missingShardingOriginStart,
+	canResumeShardingHistory,
+} from './shardingBootstrap.ts';
+import { databaseBaselineHoldReason } from '../core/resources/databaseLiveGuard.ts';
+import { SHARDING_BOOTSTRAP_OPERATION, receiveShardingBootstrap } from './shardingBootstrapRpc.ts';
+import {
+	shardingLayout,
+	shardingSourceAgreement,
+	shardingSourceCertificate,
+	shardingCertificate,
+	onShardingRecoveryChange,
+	shardingRecoveryScopes,
+	certifyShardingCopy,
+	revokeShardingCertificate,
+	agreedPeerShard,
+	admitsShardedCopy,
+	publishShardingCertificate,
+	shardingCursorAdmission,
+	recordShardingWait,
+} from './shardingRecovery.ts';
+import { HAS_RESIDENCY_SLOT, FULL_WRITE_HEAD } from '../core/resources/RecordEncoder.ts';
+import {
+	readResidencyMap,
+	installResidencyMap,
+	residencyOwners,
+	residencyIsLocal,
+	getResidencyConfiguration,
+	ResidencyPlacementError,
+	ResidencyConfigurationError,
+} from '../core/resources/residencyMaps.ts';
+import {
+	sameResidencyPolicy,
+	validateResidencyMap,
+	type ResidencyMapSnapshot,
+} from '../core/resources/residencyPolicy.ts';
+import {
+	recordResidencyConfiguration,
+	recordShardingRecoveryCapability,
+	recordResidencyMapAgreement,
+	recordResidencyPolicyAgreement,
+	residencyConfigurationDigest,
+	registerResidencySender,
+} from './residencyTopology.ts';
+import {
+	ResidencyWireReferences,
+	encodeResidencyWireRecord,
+	resolveSlotReference,
+	isResidencyRecord,
+} from './residencyWire.ts';
+import { peerSupportsResidencySlots } from './protocolCapabilities.ts';
+import { onShardingConfigurationChange } from '../core/config/shardingConfiguration.ts';
 import type { Logger } from '../core/utility/logging/logger.ts';
 import { createHash, randomUUID, type Hash } from 'node:crypto';
 import { toBufferKey } from 'ordered-binary';
 import {
 	getDatabases,
 	databases,
+	databaseResidencyBlockReason,
 	table as ensureTable,
 	onUpdatedTable,
 	onRemovedDB,
@@ -18,7 +77,7 @@ import {
 	stampTableCreatedTime,
 	tableLifecycleTime,
 } from '../core/resources/databases.ts';
-import { TableGenerationDroppedError } from '../core/utility/errors/hdbError.ts';
+import { TableGenerationDroppedError, DatabaseShardingHeldError } from '../core/utility/errors/hdbError.ts';
 import { validateDropMarkers, mergeDropMarkers, rowsAround, MAX_DROP_MARKERS_PER_FRAME } from './tableLifecycle.ts';
 import type { TableDropMarker } from '../core/resources/databases.ts';
 import {
@@ -29,12 +88,12 @@ import {
 	HAS_PREVIOUS_RESIDENCY_ID,
 	REMOTE_SEQUENCE_UPDATE,
 	HAS_BLOBS,
+	COPIED_RECORD,
 	AuditRecord,
 	readAuditEntry,
 	ACTION_32_BIT,
 	auditRetention,
 	LOCAL_ONLY,
-	COPIED_RECORD,
 	isLockControlType,
 	readOriginClosedFloor,
 	getDatabaseGeneration,
@@ -75,6 +134,7 @@ import {
 	BLOB_FAILURE_COUNT_POSITION,
 	LAST_BLOB_FAILURE_TIME_POSITION,
 	CONNECTION_STATE_POSITION,
+	CONNECTION_STATE_CONNECTED,
 	LAST_LIVENESS_TIME_POSITION,
 	LAST_ERROR_CODE_POSITION,
 	LAST_ERROR_TIME_POSITION,
@@ -131,7 +191,7 @@ import {
 	METADATA,
 	storedFieldsOnly,
 } from '../core/resources/RecordEncoder.ts';
-import { INVALIDATED, REPLICA, FULL_WRITE_HEAD, fullWriteHeadKey } from '../core/resources/Table.ts';
+import { INVALIDATED, REPLICA, fullWriteHeadKey } from '../core/resources/Table.ts';
 import { server } from '../core/server/Server.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
@@ -151,6 +211,7 @@ import {
 	getReplicationSharedStatus,
 	getExcludedTablesForRouteEntries,
 	getConfigRouteReplicates,
+	iterateRoutes,
 	routeEntriesIncludePeer,
 	resolveNodeForSendAuth,
 	isGenuineNodeDeletion,
@@ -183,7 +244,7 @@ import {
 import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
 import { createInflate } from 'node:zlib';
 import { FrameWriter } from './frameWriter.ts';
-import { tableReplicates } from './replicatedDatabases.ts';
+import { isExplicitDatabaseSubscription, tableReplicates } from './replicatedDatabases.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
 import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 
@@ -231,6 +292,9 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // changes so a leader resuming a cursor stamped with a different (or absent) version recopies from
 // scratch instead of silently skipping tables the old order had not yet reached (#421).
 const COPY_ORDER_VERSION = 1;
+// `[OWNED_COPY_PENDING, sourceNodeId]` in __dbis__: an owned sharding copy from that source started and is
+// not yet certified, so the next subscription to it copies again.
+const OWNED_COPY_PENDING = Symbol.for('shardingOwnedCopyPending');
 export {
 	CONFIRMATION_STATUS_POSITION,
 	RECEIVED_VERSION_POSITION,
@@ -256,7 +320,7 @@ export const RECEIVING_STATUS_RECEIVING = 1;
 // SENDING_TIME_POSITION while a bulk copy is sending records; a real sending time is an audit key, never 1.
 export const SENDING_TIME_COPYING = 1;
 export const CONNECTION_STATE_DOWN = 0;
-export const CONNECTION_STATE_CONNECTED = 2;
+export { CONNECTION_STATE_CONNECTED } from './sharedStatusSlots.ts';
 // LAST_ERROR_CODE for a disconnect this node INFERRED rather than observed on the wire: the worker thread
 // that owned the (db, peer) subscription is gone, so no close frame or socket error ever reported a code.
 // Deliberately outside the 16-bit WebSocket close-code space so it can never collide with a real one, and
@@ -492,8 +556,13 @@ export function holdFailedFrame(
 	attemptsByPeer: Map<string, { position: number; attempts: number }>,
 	peerKey: string,
 	position: number,
-	maxReplays: number
+	maxReplays: number,
+	error?: unknown,
+	requiresCompleteHistory = false
 ): boolean {
+	// Placement can recover without changing the frame; skipping it would permanently lose a valid write.
+	if (requiresCompleteHistory || error instanceof ResidencyPlacementError || error instanceof DatabaseShardingHeldError)
+		return true;
 	const prior = attemptsByPeer.get(peerKey);
 	const attempts = prior?.position === position ? prior.attempts + 1 : 1;
 	attemptsByPeer.set(peerKey, { position, attempts });
@@ -726,7 +795,7 @@ const SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY = 300;
 const COMMITTED_UPDATE_DELAY = 2;
 const PING_INTERVAL = env.get(CONFIG_PARAMS.REPLICATION_PINGINTERVAL) ?? 30000;
 // Time (ms) without any socket activity before a connection is treated as dead.
-const PING_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_PINGTIMEOUT) ?? PING_INTERVAL * 2;
+export const PING_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_PINGTIMEOUT) ?? PING_INTERVAL * 2;
 // During an initial base copy of a large table the *sender* can be stuck in writableNeedDrain
 // backpressure for a long stretch, so no socket bytes reach the receiver for well over PING_TIMEOUT
 // (default 60s) even though the copy is healthy and will resume. Timing the receiver out on that gap
@@ -3888,6 +3957,7 @@ export function buildOriginCursorVector(
 	nameForId: (id: number) => string | undefined,
 	isMember: (name: string) => boolean,
 	useFloors = false,
+	admits?: (source: number, origin: number) => boolean,
 	/** Called with each origin resumed floor-only (a level-2 row on a level-2 route), its start and generation. */
 	floorOnly?: (originId: number, start: number, generation: string) => void,
 	/** Highest copied record version per origin from an audit-less base copy; a floor at or below it must not resume floor-only. */
@@ -3913,14 +3983,14 @@ export function buildOriginCursorVector(
 	const cursors = new Map<string, number>();
 	const peerNodes = seqRows.get(peerId)?.nodes;
 	for (const node of Array.isArray(peerNodes) ? peerNodes : []) {
-		if (!node || typeof node !== 'object' || node.id === 0) continue;
+		if (!node || typeof node !== 'object' || node.id === 0 || (admits && !admits(peerId, node.id))) continue;
 		const name = nameForId(node.id);
 		if (name === undefined) continue;
 		const cursor = cursorOf(node, true);
 		if (cursor !== undefined) cursors.set(name, cursor);
 	}
 	for (const [id, row] of seqRows) {
-		if (id === peerId || id === 0) continue;
+		if (id === peerId || id === 0 || (admits && !admits(id, id))) continue;
 		const name = nameForId(id);
 		if (name === undefined || cursors.has(name) || isMember(name)) continue;
 		const ownNodes = Array.isArray(row.nodes) ? row.nodes : [];
@@ -4459,6 +4529,8 @@ export class NodeReplicationConnection extends EventEmitter {
 	nodeName?: string;
 	authorization?: string;
 	tentativeNode?: any;
+	// The node actually dialed, independent of an origin subscribed through a failover peer.
+	configuredNodeName?: string;
 	// The subscription half of this connection's key; differs from `url` only for a proxied failover subscription.
 	subscriptionUrl?: string;
 	// Shared-memory connection-health buffer for this outbound (db, peer) link, stashed by replicateOverWS
@@ -4480,7 +4552,8 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.subscription = subscription;
 		this.databaseName = databaseName;
 		this.authorization = authorization;
-		this.nodeName = this.nodeName ?? urlToNodeName(url);
+		this.configuredNodeName = nodeName ?? urlToNodeName(url);
+		this.nodeName = this.configuredNodeName;
 	}
 
 	async connect() {
@@ -4809,6 +4882,66 @@ export class NodeReplicationConnection extends EventEmitter {
 	}
 }
 
+function configuredPeerIdentity(
+	authorization: any,
+	options: any,
+	announced: string,
+	configuredName?: string
+): string | undefined {
+	const subscription = options.connection?.nodeSubscriptions?.[0];
+	const expected = authorization?.name ?? configuredName;
+	if (!expected) return undefined;
+	let discoveryHost: string;
+	if (!authorization?.name && subscription?.name === expected && subscription.url) {
+		const endpoint = new URL(subscription.url);
+		if (expected === endpoint.hostname || expected === endpoint.host) discoveryHost = endpoint.hostname;
+	}
+	// A dialed address is a legacy discovery label, not a second canonical node record.
+	// Only explicit configured records may bind that connection for residency metadata.
+	const configured = [authorization, ...iterateRoutes(options), ...(server.nodes ?? [])];
+	if (subscription && !discoveryHost) configured.push(subscription);
+	if (expected === announced && configured.some((record) => record?.name === expected)) return expected;
+	// URL.hostname brackets/compresses IPv6, while authenticated socket addresses are bare.
+	// Normalize only host aliases; canonical node names remain exact identifiers.
+	const hostAlias = (name: string): string => {
+		if (isIP(name) !== 6) return name;
+		try {
+			return new URL(`https://[${name}]`).hostname;
+		} catch {
+			return name;
+		}
+	};
+	const expectedHost = discoveryHost ?? hostAlias(expected);
+	const announcedHost = hostAlias(announced);
+	const aliases = (record: any): string[] => {
+		if (!record?.name || !record.url) return [];
+		try {
+			return [new URL(record.url).hostname];
+		} catch {
+			return [];
+		}
+	};
+	// Resolve the authenticated alias before looking at the claim. Otherwise two nodes on one
+	// host could select either identity just by announcing it, even though the IP proves neither.
+	const candidates = configured.filter(
+		(record) => aliases(record).length && (record.name === expected || aliases(record).includes(expectedHost))
+	);
+	const names = new Set(candidates.map((record) => record.name));
+	if (
+		!names.size &&
+		!configured.some((record) => record?.name === expected) &&
+		!(server.nodes ?? []).some((node) => node.name === announced)
+	)
+		return undefined;
+	if (names.size !== 1) throw new Error('Node name mismatch');
+	const canonical = candidates[0].name;
+	if (!candidates.some((record) => record.name === announced || aliases(record).includes(announcedHost)))
+		throw new Error('Node name mismatch');
+	if (announced !== canonical && (server.nodes ?? []).some((node) => node.name === announced))
+		throw new Error('Node name belongs to another known node');
+	return canonical;
+}
+
 /**
  * This handles both incoming and outgoing WS allowing either one to issue a subscription and get replication and/or handle subscription requests
  */
@@ -4823,18 +4956,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		Math.random().toString().slice(2, 3);
 	const sessionOrdinal = ++nextConnectionSessionOrdinal;
 	logger.debug?.(connectionId, 'Initializing replication connection', authorization);
-	const frame = new FrameWriter();
 	let databaseName = options.database;
 	const dbSubscriptions = options.databaseSubscriptions || databaseSubscriptions;
 	let auditStore: any;
-	let auditLogIterable: Iterable<AuditRecord> & { removeLog?: (name: string) => void; addLog?: (name: string) => void }; // reusable iterator for a subscription
-	// The log whose boundary `auditLogIterable` was built to resume PAST, when it was built as an
-	// append-order range; undefined for an ordinary timestamp range. Needed because
-	// `exactStartFailures` is NOT a boundary-health signal on its own: the aggregate iterator records
-	// an expected start for every log named in `startByLog`, `exactStart` or not, and reports
-	// `missing` whenever the first entry's key differs from the cursor — which is the ordinary,
-	// healthy case for a plain resume. Only a log we actually asked to resume past can fail closed.
-	let boundaryLogName: string | undefined;
 	let replicationSharedStatus: Float64Array;
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
@@ -4871,6 +4995,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		);
 	}
 	let remoteNodeName: string;
+	let residencyIdentityBound = false;
+	const configuredPeerName = options.connection?.tentativeNode
+		? undefined
+		: (options.connection?.configuredNodeName ??
+			options.connection?.nodeName ??
+			options.connection?.nodeSubscriptions?.[0]?.name);
 	const awaitingResponse = new Map();
 	let receivingDataFromNodeIds = [];
 	remoteNodeName = authorization.name;
@@ -4881,6 +5011,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Bulk-copy resume state (receiver side). While inCopyMode, each committed batch persists a cursor
 	// (copyStartTime + last committed table/key) so an interrupted copy can resume instead of restarting.
 	let inCopyMode = false;
+	let projectionCopy = false;
+	let projectionRequested = false;
+	let copyCertification: { layout: string; scopes: ReturnType<typeof shardingRecoveryScopes> } | undefined;
+	let copyCertificationPending = false;
+	let copyCertificateRevoked = false;
+	let failedOwnedBlobSaves = 0;
 	let copyModeStartTime = 0;
 	let copyModeOrderVersion; // copy-order version the leader announced in COPY_START; persisted in the cursor (#421)
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
@@ -4995,10 +5131,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// synchronously when COPY_COMPLETE is decoded while batches are still queued — would freeze the cursor
 	// and risk a crash that loses both the cursor and the not-yet-durable rows, leaving the next start to
 	// resume from seqId with gaps.
-	const txnStream = {};
-	// true while a frame's records are queued without its end_txn; an end_txn queued meanwhile would close it
-	let frameOpen = false;
-	let drainEndTxnDeferred = false;
 	let pendingCopyCursorRemovalNodeId: number | undefined;
 	let copyCursorRemovalRetryTimer: NodeJS.Timeout | undefined;
 	function deferCopyCursorRemoval(nodeId: number): void {
@@ -5131,6 +5263,25 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		copyOriginAnchors = undefined;
 	}
+	async function pendingOwnedCopyBlob(stillCurrent: () => boolean): Promise<{ table: any; id: any } | undefined> {
+		let scanned = 0;
+		for (const table of Object.values(getDatabases()[databaseName] ?? {}) as any[]) {
+			if (!table.residency || !tableReplicates(table)) continue;
+			for (const entry of table.primaryStore.getRange({ versions: true, snapshot: false, lazy: true })) {
+				if (!stillCurrent()) return;
+				if (entry.value && entry.metadataFlags & HAS_BLOBS) {
+					const slot = table.residency.byAttribute ? entry.residencySlot : table.getResidencySlot(entry.key);
+					if (
+						residencyIsLocal(databaseName, slot, table.residency.slots) &&
+						!(await storedBlobsAreComplete(entry.value))
+					)
+						return { table, id: entry.key };
+					if (!stillCurrent()) return;
+				}
+				if (++scanned % 256 === 0) await delay(0);
+			}
+		}
+	}
 	function maybeFinishCopy() {
 		// The removal below targets the same [copyCursor, nodeId] key the ownership guards in
 		// persistCopyCursor protect: a superseded closure's late flush `.finally` reaching here would
@@ -5150,6 +5301,109 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				return;
 			}
 			if (copyFlushInFlight) return; // a flush is persisting the final cursor; finish on its completion
+			if (projectionCopy || copyCertification) {
+				// A yielded live frame has queued its prefix but not its own end_txn yet.
+				// Its commit re-enters finalization after the complete frame is queued.
+				if (frameOpen) return;
+				if (copyCertificationPending) return;
+				copyCertificationPending = true;
+				const certification = copyCertification;
+				const projection = projectionCopy;
+				const pass = copyWatermark.currentPass;
+				const anchor = copyModeStartTime;
+				const source = copyFromNodeId;
+				const failedBlobsAtSentinel = failedOwnedBlobSaves;
+				const stillCurrent = () => !connectionSuperseded() && copyWatermark.currentPass === pass;
+				const failCertification = (error: unknown) => {
+					if (!stillCurrent()) return;
+					wsClosed = true;
+					close(1011, 'Sharding copy could not establish a durable baseline');
+					logger.warn?.(connectionId, 'Sharding copy certification failed', error);
+				};
+				async function finishOwnedCopy() {
+					while (stillCurrent()) {
+						const incomplete = await pendingOwnedCopyBlob(stillCurrent);
+						if (!stillCurrent()) return;
+						if (!incomplete) break;
+						if (!copyCertificateRevoked) {
+							copyCertificateRevoked = true;
+							await revokeShardingCertificate(databaseName);
+							if (!stillCurrent()) return;
+						}
+						const { dbisDB } = getDatabaseStores();
+						if (source !== undefined && !dbisDB.getSync([Symbol.for('copyCursor'), source])) {
+							await dbisDB.put([Symbol.for('copyCursor'), source], {
+								copyStartTime: anchor,
+								currentTable: incomplete.table.tableName,
+								afterKey: incomplete.id,
+								copyOrder: copyModeOrderVersion,
+							});
+							if (!stillCurrent()) return;
+							await dbisDB.flush({ allowWriteStall: true });
+							if (!stillCurrent()) return;
+						}
+						logger.warn?.(
+							connectionId,
+							`Sharding recovery required for ${databaseName}.${incomplete.table.tableName} record ${String(incomplete.id).slice(0, 256)}: an owned blob is pending or incomplete; waiting for completion or repair_blob_data before certifying the copy`
+						);
+						while (stillCurrent()) {
+							await delay(1000, undefined, { ref: false });
+							if (!stillCurrent()) return;
+							const entry = await incomplete.table.primaryStore.getEntry(incomplete.id);
+							if (!stillCurrent()) return;
+							if (!entry?.value || !(entry.metadataFlags & HAS_BLOBS) || (await storedBlobsAreComplete(entry.value)))
+								break;
+						}
+					}
+					if (!stillCurrent()) return;
+					if (outstandingBlobsToFinish.length) await Promise.allSettled(outstandingBlobsToFinish.slice());
+					if (!stillCurrent()) return;
+					if (failedOwnedBlobSaves !== failedBlobsAtSentinel || hasBlobGap) {
+						copyCertificationPending = false;
+						copyFinalizeWatchdog?.reset();
+						maybeFinishCopy();
+						return;
+					}
+					await certifyShardingCopy(databaseName, certification.layout, certification.scopes);
+					if (!stillCurrent()) return;
+					copyCertification = undefined;
+					copyCertificationPending = false;
+					copyCompleteAt = performance.now();
+					copyFinalizeWatchdog?.reset();
+					maybeFinishCopy();
+				}
+
+				tableSubscriptionToReplicator.send({
+					type: 'end_txn',
+					remoteNodeIds: [],
+					txnStream,
+					onFailure: onFrameFailure,
+					async onCommit() {
+						try {
+							await flushCopyRowsDurable();
+							if (!stillCurrent()) return;
+							if (projection) {
+								const { dbisDB } = getDatabaseStores();
+								await dbisDB.put([Symbol.for('shardingProjectionComplete'), source], {
+									anchor,
+									agreement: shardingSourceAgreement(databaseName),
+								});
+								if (!stillCurrent()) return;
+								await dbisDB.flush({ allowWriteStall: true });
+								if (!stillCurrent()) return;
+								wsClosed = true;
+								close(1011, 'Sharding projection complete; resuming owned origins separately');
+								return;
+							}
+							copyFinalizeWatchdog?.stop();
+							void finishOwnedCopy().catch(failCertification);
+						} catch (error) {
+							failCertification(error);
+						}
+					},
+				});
+				return;
+			}
 			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 			if (cloneAttempt && copyFromNodeId !== undefined) {
 				try {
@@ -5166,6 +5420,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
+			if (!projectionCopy && copyFromNodeId !== undefined)
+				getDatabaseStores().dbisDB?.remove([OWNED_COPY_PENDING, copyFromNodeId]);
 			const hadCopyOriginAnchors = Boolean(copyOriginAnchors?.size && (auditStore ?? getDatabaseStores().auditStore));
 			const copyPassPendingRestore = Boolean(
 				currentCopyPass && currentCopyPass.startTime > 0 && !currentCopyPass.restored
@@ -5326,7 +5582,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!copyApplyActive()) {
 				// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
 				// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
-				getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursor);
+				if (!projectionCopy) getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursor);
 				void persistCopyBounds();
 				if (pendingCopyCursor === cursor) pendingCopyCursor = null;
 				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
@@ -5366,7 +5622,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// closure died, or after a same-socket COPY_START replaced the walk.
 					if (connectionSuperseded() || passAtPersist !== copyWatermark.currentPass) return;
 					if (copyFromNodeId !== undefined) {
-						getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
+						if (!projectionCopy)
+							getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
 						void persistCopyBounds();
 					}
 					copyFlushBackoffUntil = 0;
@@ -5466,8 +5723,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (seqId >=
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
-	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn with no flush gate. (harper-pro#480)
+	// audited/durable), mid-copy updates below copyStartTime, and projections that publish no cursor — is a plain end_txn with no flush gate. (harper-pro#480)
 	function seqUpdateEndTxn(seqId: number, originFloors?: ReceivedOriginFloor[], releasePending = false): any {
+		if (projectionCopy)
+			return {
+				type: 'end_txn',
+				remoteNodeIds: [],
+				txnStream,
+				onFailure: onFrameFailure,
+			};
 		const originCursors = takeDurableOriginCursors();
 		const copyPassForSeq =
 			currentCopyPass &&
@@ -5499,13 +5763,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						pendingOriginFloors.note(originFloors);
 						pendingOriginFloors.takeForCommit(event, cursorBlockedByBlob());
 					}
+					if (releasePending) queueCommitConfirmation(seqId);
 				},
 			};
 			pendingRouteState.attachTo(event);
 			return event;
 		}
-		// only an update that carries floors, or a blob drain releasing held ones, pays for a commit callback
-		if (!originFloors && !(releasePending && pendingOriginFloors.size > 0)) {
+		// Blob drain must refresh a receipt that the earlier record commit clamped below its blob.
+		if (!originFloors && !releasePending) {
 			const event: any = {
 				type: 'end_txn',
 				localTime: seqId,
@@ -5529,6 +5794,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			onCommit() {
 				pendingOriginFloors.note(originFloors);
 				pendingOriginFloors.takeForCommit(event, cursorBlockedByBlob());
+				if (releasePending) queueCommitConfirmation(seqId);
 			},
 		};
 		pendingRouteState.attachTo(event);
@@ -5587,7 +5853,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	// Returns true to hold: core then records no cursor for this connection's later frames either.
 	function onFrameFailure(error: unknown, position: number): boolean {
-		if (holdFailedFrame(failedFrameAttempts, `${remoteNodeName}/${databaseName}`, position, FAILED_FRAME_REPLAYS)) {
+		if (
+			holdFailedFrame(
+				failedFrameAttempts,
+				`${remoteNodeName}/${databaseName}`,
+				position,
+				FAILED_FRAME_REPLAYS,
+				error,
+				Boolean(admittedLayout)
+			)
+		) {
 			logger.warn?.(connectionId, 'Replicated transaction failed; reconnecting to replay it', position, error);
 			close(1011, 'Replicated transaction failed');
 			return true;
@@ -5602,7 +5877,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return false;
 		}
 	}
-	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
+	const txnStream = {};
+	// true while a frame's records are queued without its end_txn; an end_txn queued meanwhile would close it
+	let frameOpen = false;
+	let drainEndTxnDeferred = false;
+	let sendPingInterval, lastPingTime;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	// Re-learned from every NODE_NAME and never carried across sockets: the peer may have been upgraded or
 	// downgraded between reconnects, and the persistent NodeReplicationConnection outlives the socket.
@@ -5665,6 +5944,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const DELAY_CLOSE_TIME = 60000; // amount of time to wait before closing the connection if we haven't any activity and there are no subscriptions
 	let delayedClose: NodeJS.Timeout;
 	let lastMessageTime = 0;
+	let lastReceivedTime = 0;
+	let residencySender: ReturnType<typeof registerResidencySender>;
 	// track bytes read and written so we can verify if a connection is really dead on pings
 	let bytesRead = 0;
 	let bytesWritten = 0;
@@ -5875,6 +6156,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// pauseStallWatchdog} armed while paused" invariant. While paused the pause-stall watchdog is the
 	// liveness guard; removePauseReason re-arms the byte watchdog on resume. (harper-pro#466 review)
 	const resetPingTimer = () => {
+		lastReceivedTime = Date.now();
+		if (residencySender && !connectionSuperseded()) residencySender.touch(lastReceivedTime);
 		if (pauseReasons === 0) receiveWatchdog?.reset();
 	};
 	resetPingTimer();
@@ -5987,7 +6270,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const BACK_PRESSURE_INTERVAL = 30_000;
 	function updateBackPressureRatio() {
 		// we only want to track/record backpressure for sending data for incoming subscriptions
-		if (nodeSubscriptions?.length > 0) {
+		if (activeNodeSubscriptions?.length > 0) {
 			const now = performance.now();
 			const durationSinceCheck = now - lastBackPressureCheck;
 			// calculate the running average ratio of back-pressure time, logarithmically decaying towards 1 if paused, towards 0 if not paused
@@ -6032,6 +6315,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// a store that cannot take the poison row holds the frame instead of advancing the cursor over an unrecorded hole.
 	// One closure per connection, not per frame: an ordinary frame never touches it.
 	async function recordReplicationHole(originId: number | undefined, tableName: string, reason: string) {
+		if (admittedLayout && tables?.[tableName]?.residency) {
+			wsClosed = true;
+			close(1011, 'Sharded record was not applied; recovery cursor held: ' + reason);
+			return false;
+		}
 		const origin = getNodeNameForId(auditStore, originId, true);
 		try {
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
@@ -6083,7 +6371,79 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let receivingDataFromNodeNames;
 	const residencyMap = [];
 	const sentResidencyLists = [];
-	const receivedResidencyLists = [];
+	const receivedResidencyLists = new Map<number, any>();
+	const receivedResidencyMaps = new Map<string, ResidencyMapSnapshot>();
+	const referenceSnapshots = new WeakMap<object, ResidencyMapSnapshot>();
+	const sentResidencyMaps = new Map<string, string>();
+	let receiverMembership: typeof server.shards;
+	let receiverShardKnown = false;
+	let peerExplicitlyUnsharded = false;
+	let peerShardAnnounced = false;
+	let announcedPeerShard: unknown;
+	let peerShardingStarts: unknown;
+	let peerShardingCertificate: unknown;
+	let restrictedOrigins = false;
+	let directShardingOriginId: number | undefined;
+	let shardingAdmissionDirty = true;
+	let admissionMembership: unknown;
+	let admissionConfiguration: unknown;
+	let admittedLayout: string | undefined;
+	// Only "no table declares a policy" is cached: gaining one comes with an updateTable event (the listener
+	// below) or a structure message, while losing one (a drop) leaves the cache correct.
+	let declaresNoResidency = false;
+	function databaseDeclaresResidency(): boolean {
+		if (declaresNoResidency) return false;
+		const current = databases[databaseName];
+		for (const name in current) if (current[name].residency) return true;
+		declaresNoResidency = current !== undefined;
+		return false;
+	}
+	// Shard maps cannot be deleted or cleared (Table.ts refuses both), so a seen map is latched. A database
+	// with no declared table skips the native map read that would otherwise run on every received frame.
+	let mapSeen = false;
+	function residencyMapInstalled(): boolean {
+		return mapSeen || (databaseDeclaresResidency() && (mapSeen = !!readResidencyMap(databaseName)));
+	}
+	function refreshShardingAdmission() {
+		const configuration = admittedLayout ? getResidencyConfiguration() : undefined;
+		if (!shardingAdmissionDirty && admissionMembership === server.nodes && admissionConfiguration === configuration)
+			return admittedLayout;
+		const layout = shardingSourceAgreement(databaseName);
+		admittedLayout = layout;
+		admissionMembership = server.nodes;
+		admissionConfiguration = layout ? getResidencyConfiguration() : undefined;
+		shardingAdmissionDirty = false;
+		const peerShard = residencyIdentityBound ? agreedPeerShard(remoteNodeName, announcedPeerShard) : undefined;
+		directShardingOriginId = layout && auditStore ? getIdOfRemoteNode(remoteNodeName, auditStore) : undefined;
+		restrictedOrigins =
+			!!layout && !admitsShardedCopy(layout, getResidencyConfiguration().shard, peerShard, peerShardingCertificate);
+		if (ownsPeerCertifiesFloorsSlot() && !connectionSuperseded()) {
+			const status = getSharedStatus();
+			if (status) publishShardingCertificate(status, peerShard, peerShardingCertificate);
+		}
+		return layout;
+	}
+	function refuseShardingSource(origin: string, copying = false) {
+		recordShardingWait(databaseName, origin, true);
+		wsClosed = true;
+		close(
+			1011,
+			copying
+				? 'Owned sharding slots require a complete co-owner or backup restore'
+				: `Sharded origin ${origin} requires its origin or a complete co-owner`
+		);
+	}
+	function admitsIncomingOrigins(value: unknown): boolean {
+		if (!restrictedOrigins || value == null) return true;
+		for (const name of Object.keys(value))
+			if (name !== remoteNodeName) {
+				refuseShardingSource(name);
+				return false;
+			}
+		return true;
+	}
+	const sendResidencyReference = (value, id) => ws.send(encode([RESIDENCY_LIST, value, id]));
+	const slotWireReferences = new ResidencyWireReferences();
 	const MAX_OUTSTANDING_COMMITS = env.get(CONFIG_PARAMS.REPLICATION_RECORDCONCURRENCY) ?? 150; // maximum before requesting that other nodes pause
 	const MAX_OUTSTANDING_BLOBS_BEING_SENT = env.get(CONFIG_PARAMS.REPLICATION_BLOBCONCURRENCY) ?? 5;
 	let outstandingCommits = 0;
@@ -6149,25 +6509,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			refreshBlobStreamsOnResume(blobsInFlight, Date.now() - pauseStartTime);
 		}
 	}
-	let subscriptionRequest, auditSubscription;
-	let nodeSubscriptions;
-	let excludedNodes: string[]; // list of nodes to exclude from this subscription
+	let auditSubscription;
+	let activeNodeSubscriptions;
+	let updateSendingSubscription: ((data: any) => void) | undefined;
 	// undefined = not yet computed; null = nothing blocked; Map = table name -> why it is dropped.
 	let receiveBlockedTables: Map<string, string> | null | undefined;
 	// Discarded on a table replacement, or a pre-fix sender keeps writing into a table that has left
 	// the live map for the life of the socket. Per connection: the receive path also runs on
 	// inbound-only sockets, which never reach the sender-side listener below.
 	const blockedTablesInvalidator = onUpdatedTable((table) => {
-		if (!databaseName || table?.databaseName === databaseName) receiveBlockedTables = undefined;
+		if (!databaseName || table?.databaseName === databaseName) {
+			receiveBlockedTables = undefined;
+			shardingAdmissionDirty = true;
+			declaresNoResidency = false;
+			if (
+				residencyIdentityBound &&
+				admittedLayout &&
+				shardingSourceAgreement(databaseName) !== admittedLayout &&
+				!wsClosed
+			) {
+				wsClosed = true;
+				close(1011, 'Sharding policy changed; refreshing source agreement');
+			}
+		}
 	});
 	ws.on('close', () => blockedTablesInvalidator.remove());
 	let remoteShortIdToLocalId: Map<number, number>;
-	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
-	// `liveStartByLog` is the live incremental range's own map, so an `includeNodes` update reaches the range
-	let requestedOriginCursors: Record<string, number> | undefined;
-	let originFloors: Map<string, number> | undefined;
-	let originFloorById: number[] | undefined;
-	let liveStartByLog: Map<string, number> | undefined;
 	let wakeSender: (() => void) | undefined;
 	let lastFloorCaptureAt = 0;
 	let certifiedFloors: Map<string, number> | undefined;
@@ -6179,6 +6546,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
 	let wsClosed = false;
+	const stopShardingRecoveryWatch = onShardingRecoveryChange((database) => {
+		if (database !== databaseName || wsClosed || !residencyIdentityBound) return;
+		wsClosed = true;
+		close(1011, 'Sharding completeness changed; refreshing source agreement');
+	});
+	ws.on('close', stopShardingRecoveryWatch);
+	const stopShardingConfigurationWatch = onShardingConfigurationChange(() => {
+		if (wsClosed || !residencyIdentityBound) return;
+		wsClosed = true;
+		residencySender?.close();
+		close(1011, 'Sharding configuration changed; refreshing peer agreement');
+	});
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
@@ -6208,12 +6587,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let committedSequence = 0;
 	function creditDurableProgress() {
 		// Copy-apply rows are not durable until the copy's final flush, so they are not progress yet.
-		if (!(copyApplyActive() && inCopyMode) && !supersededOrClosed())
+		if (!projectionCopy && !(copyApplyActive() && inCopyMode) && !supersededOrClosed())
 			options.connection?.onDurableProgress?.(lastDurableSequenceId);
 	}
 	function advanceDurableWatermark() {
 		lastDurableSequenceId = committedSequence;
 		creditDurableProgress();
+	}
+	function queueCommitConfirmation(sequence: number) {
+		if (projectionCopy || !sequence || connectionSuperseded()) return;
+		if (!lastSequenceIdCommitted) {
+			setTimeout(() => {
+				// Never confirm past the durable resume cursor: a record can commit before its blobs.
+				const confirmed = Math.min(lastSequenceIdCommitted, lastDurableSequenceId);
+				lastSequenceIdCommitted = null;
+				if (connectionSuperseded()) return;
+				ws.send(encode([COMMITTED_UPDATE, confirmed]));
+				logger.trace?.(connectionId, 'sent confirmation of a commit at', confirmed);
+			}, COMMITTED_UPDATE_DELAY);
+		}
+		lastSequenceIdCommitted = Math.max(lastSequenceIdCommitted ?? 0, sequence);
 	}
 	// Blob-divergence escalation (harper-pro#386). Each blob save failure already logs at `error`, but a
 	// sustained failing link emits that per-blob spam without a single line naming it as ongoing
@@ -6236,6 +6629,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const recordsOriginCursors = () =>
 		STORAGE_IS_ROCKSDB && peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities);
 	function noteOriginProgress(originId: number, logKey: number) {
+		if (projectionCopy) return;
 		pendingOriginCursors ??= new Map();
 		if (!(pendingOriginCursors.get(originId) >= logKey)) pendingOriginCursors.set(originId, logKey);
 	}
@@ -6629,7 +7023,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * exclusion-origin set), which is what lets a relay forward the floor to its own subscribers.
 	 */
 	function receivedOriginFloors(value: unknown): ReceivedOriginFloor[] | undefined {
-		if (value == null || !certifiesOriginFloors()) return undefined;
+		if (projectionCopy || value == null || !certifiesOriginFloors()) return undefined;
 		const certificates = parseOriginCertificates(value);
 		if (certificates.size === 0) return undefined;
 		const checkpointGrade = certifiesCheckpointFloors();
@@ -6975,6 +7369,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			close(1008, 'Unauthorized');
 			return false;
 		}
+		remoteNodeName ??= authorization.name;
 		return true;
 	}
 	/**
@@ -7027,6 +7422,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (authorization?.then) {
 				try {
 					authorization = await authorization;
+					if (connectionSuperseded()) return;
 				} catch (error) {
 					authorizationFinished = true;
 					logger.error?.(connectionId, 'Authorization failed', error);
@@ -7043,6 +7439,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!authorization) return;
 		// A replication header should begin with either a transaction timestamp or messagepack message of
 		// of an array that begins with the command code
+		if (databaseName && databaseResidencyBlockReason(databaseName)) {
+			wsClosed = true;
+			close(1011, 'Database sharding configuration is quarantined; restart after repair');
+			return;
+		}
 		lastMessageTime = performance.now();
 		try {
 			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
@@ -7053,6 +7454,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				switch (command) {
 					case NODE_NAME: {
 						if (data) {
+							const announcedDatabase = databaseName ?? message[2];
+							if (databaseResidencyBlockReason(announcedDatabase)) {
+								wsClosed = true;
+								close(1011, 'Database sharding configuration is quarantined; restart after repair');
+								return;
+							}
 							peerCapabilities = resolvePeerCapabilities(
 								message[4],
 								getLocalCapabilities(auditStore ?? getDatabaseStores().auditStore).originFloors
@@ -7069,31 +7476,44 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// The slot must stay replaceable — this object outlives the socket and is re-mirrored
 							// on every handshake.
 							if (options.connection) options.connection.peerCapabilities = peerCapabilities;
-							// this is the node name
-							if (remoteNodeName) {
-								if (remoteNodeName !== data) {
-									logger.error?.(
-										connectionId,
-										`Node name mismatch, expecting to connect to ${remoteNodeName}, but peer reported name as ${data}, disconnecting`
-									);
-									ws.send(encode([DISCONNECT]));
-									close(1008, 'Node name mismatch');
-									return;
-								}
-							} else {
-								remoteNodeName = data;
-								if (options.connection?.tentativeNode) {
-									// if this was a tentative node, we need to update the node name
-									const nodeToAdd = options.connection.tentativeNode;
-									nodeToAdd.name = remoteNodeName;
-									options.connection.tentativeNode = null;
-									ensureNode(remoteNodeName, nodeToAdd);
-								}
+							let canonical: string;
+							try {
+								canonical = configuredPeerIdentity(authorization, options, data, configuredPeerName);
+								if (remoteNodeName && !canonical) throw new Error('Node name mismatch');
+							} catch (error) {
+								logger.warn?.(connectionId, 'Replication peer identity mismatch', (error as Error)?.message);
+								ws.send(encode([DISCONNECT]));
+								close(1008, 'Node name mismatch');
+								return;
+							}
+							residencyIdentityBound = Boolean(canonical);
+							recordShardingRecoveryCapability(canonical ?? data, peerCapabilities, residencyIdentityBound);
+
+							remoteNodeName = canonical ?? data;
+							if (options.connection?.tentativeNode) {
+								const nodeToAdd = options.connection.tentativeNode;
+								nodeToAdd.name = remoteNodeName;
+								options.connection.tentativeNode = null;
+								ensureNode(remoteNodeName, nodeToAdd);
 							}
 							if (options.connection) options.connection.nodeName = remoteNodeName;
 							bindSharedRouteSafety();
+							if (hasResidencySchemaAuthority(databaseName ?? message[2])) {
+								recordResidencyConfiguration(remoteNodeName, message[5]?.shardsDigest);
+								peerExplicitlyUnsharded = message[5]?.shard === null;
+								peerShardAnnounced = message[5]?.shard !== undefined;
+								announcedPeerShard = message[5]?.shard;
+								peerShardingCertificate = message[5]?.shardingCertificate;
+								peerShardingStarts = message[5]?.shardingStarts;
+								if (residencyIdentityBound)
+									await noteShardingOriginStart(announcedDatabase, remoteNodeName, peerShardingStarts);
+								if (connectionSuperseded()) return;
+								shardingAdmissionDirty = true;
+								receiverMembership = undefined;
+							}
 							// After the peer is identified, so the post carries the same node name every other
 							// connected-to-node message does.
+							if (databaseName) refreshShardingAdmission();
 							postConnectionMetadata();
 							// Mark the link connected as soon as the handshake identifies the peer, so the main thread's
 							// connection truth (W1 / #431) reflects an established-but-idle link immediately rather than
@@ -7109,7 +7529,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!databaseName) {
 								// this means we are the server
 								try {
-									setDatabase((databaseName = message[2]));
+									databaseName = message[2];
+									if (databaseResidencyBlockReason(databaseName)) {
+										wsClosed = true;
+										close(1011, 'Database sharding configuration is quarantined; restart after repair');
+										return;
+									}
+									setDatabase(databaseName);
 									if (databaseName === 'system') {
 										schemaUpdateListener = forEachReplicatedDatabase(options, (database, databaseName) => {
 											if (checkDatabaseAccess(databaseName)) sendDBSchema(databaseName);
@@ -7168,6 +7594,36 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							data.map((t) => t.table)
 						);
 						const schemaDatabaseName = message[2];
+						const incomingMarkers = validateDropMarkers(message[4]);
+						const hasResidencyMetadata =
+							message[5] ||
+							incomingMarkers.some((marker) => databases[schemaDatabaseName]?.[marker.table]?.residency) ||
+							data.some(
+								(definition) =>
+									definition.residency !== undefined || databases[schemaDatabaseName]?.[definition.table]?.residency
+							);
+						const residencyAuthorized =
+							!hasResidencyMetadata ||
+							(databaseName === 'system'
+								? hasResidencySchemaAuthority(schemaDatabaseName)
+								: authorizeResidencySchema(schemaDatabaseName));
+						if (message[5] && residencyAuthorized) {
+							recordResidencyConfiguration(remoteNodeName, message[5].shardsDigest);
+							try {
+								const snapshot = validateResidencyMap(message[5].snapshot, schemaDatabaseName);
+								await installResidencyMap(snapshot);
+								if (connectionSuperseded()) return;
+								receivedResidencyMaps.set(schemaDatabaseName, snapshot);
+								recordResidencyMapAgreement(schemaDatabaseName, remoteNodeName);
+							} catch (error) {
+								if (connectionSuperseded()) return;
+								recordResidencyMapAgreement(schemaDatabaseName, remoteNodeName, error);
+								wsClosed = true;
+								close(1011, 'shard map setup failed');
+								throw error;
+							}
+						}
+						if (databaseResidencyBlockReason(schemaDatabaseName)) break;
 						// Markers drop tables, so they need the authority the subscription path requires to receive.
 						const markersAuthorized =
 							authorization?.name || authorization?.replicates || authorization?.role?.permission?.super_user;
@@ -7175,7 +7631,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const routeExcluded = excludedTablesFromPeer(schemaDatabaseName);
 						const peerDropMarkers =
 							markersAuthorized && checkDatabaseAccess(schemaDatabaseName)
-								? validateDropMarkers(message[4]).filter((marker) => !routeExcluded?.has(marker.table))
+								? incomingMarkers.filter(
+										(marker) =>
+											!routeExcluded?.has(marker.table) &&
+											(residencyAuthorized || !databases[schemaDatabaseName]?.[marker.table]?.residency)
+									)
 								: [];
 						// A stale local generation goes before this frame's definitions are compared. Markers for a database
 						// not open here wait, refusing what they retire, until a definition opens it.
@@ -7191,6 +7651,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							pendingMarkers = [];
 						}
 						for (const tableDefinition of data) {
+							if (
+								!residencyAuthorized &&
+								(tableDefinition.residency !== undefined ||
+									databases[schemaDatabaseName]?.[tableDefinition.table]?.residency)
+							)
+								continue;
 							const newDatabaseName = schemaDatabaseName;
 							tableDefinition.database = newDatabaseName;
 							let table: any;
@@ -7205,7 +7671,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								try {
 									if (databaseName === 'system') {
 										// the system connection allows us to create new databases (which wouldn't otherwise have an existing connection)
-										if (!databases[newDatabaseName]?.[tableDefinition.table]) {
+										if (
+											!databases[newDatabaseName]?.[tableDefinition.table] ||
+											tableDefinition.residency ||
+											databases[newDatabaseName]?.[tableDefinition.table]?.residency
+										) {
 											table = ensureTableIfChanged(
 												tableDefinition,
 												databases[newDatabaseName]?.[tableDefinition.table]
@@ -7220,6 +7690,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										table = ensureTableIfChanged(tableDefinition, databases[newDatabaseName]?.[tableDefinition.table]);
 									}
 								} catch (error) {
+									if (
+										databaseName === 'system' &&
+										(error.code === 'DATABASE_SHARDING_HELD' || error instanceof ResidencyConfigurationError)
+									) {
+										recordResidencyPolicyAgreement(newDatabaseName, remoteNodeName, error);
+										continue;
+									}
 									if (!(error instanceof TableGenerationDroppedError)) throw error;
 									refuseDeadDefinition(newDatabaseName, tableDefinition, 'DB_SCHEMA');
 									continue;
@@ -7232,6 +7709,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
 							if (!connectionSuperseded()) releaseHeldMarkers(schemaDatabaseName, pendingMarkers);
 						}
+						const declaredTables = Object.values(databases[schemaDatabaseName] ?? {}).filter(
+							(table) => table.residency && tableReplicates(table) && !routeExcluded?.has(table.tableName)
+						);
+						if (
+							!connectionSuperseded() &&
+							hasResidencySchemaAuthority(schemaDatabaseName) &&
+							declaredTables.every((table) =>
+								data.some(
+									(definition) =>
+										definition.table === table.tableName &&
+										definition.residency &&
+										sameResidencyPolicy(table.residency, definition.residency)
+								)
+							)
+						)
+							recordResidencyPolicyAgreement(schemaDatabaseName, remoteNodeName);
 						break;
 					}
 					case DISCONNECT:
@@ -7239,6 +7732,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					case OPERATION_REQUEST:
 						try {
+							if (data?.operation === SHARDING_BOOTSTRAP_OPERATION) {
+								receiveShardingBootstrap(data, authorization)
+									.then(
+										(response) => answerOperation(data, { ...response, requestId: data.requestId }),
+										(error) => answerOperation(data, { requestId: data.requestId, error: errorToString(error) })
+									)
+									.catch((error) => logger.warn?.('Could not answer private sharding bootstrap request', error));
+								break;
+							}
 							const isAuthorizedNode = authorization?.replicates || authorization?.subscribers || authorization?.name;
 							// data may carry a secret (registry token / ssh key / password); redact before
 							// logging. The conditional logger skips arg evaluation when debug is inactive.
@@ -7283,6 +7785,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					}
 					case TABLE_FIXED_STRUCTURE:
+						declaresNoResidency = false;
+						if (data.residency !== undefined) authorizeResidencySchema(databaseName);
 						const tableName = message[3];
 						if (!tables) {
 							if (databaseName) logger.error?.(connectionId, 'No database found for', databaseName);
@@ -7309,6 +7813,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										database: databaseName,
 										attributes: data.attributes,
 										schemaDefined: data.schemaDefined,
+										residency: data.residency,
 										createdTime: data.createdTime,
 									},
 									table
@@ -7376,7 +7881,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					case RESIDENCY_LIST:
 						// we need to keep track of the remote node's residency list by id
 						const residencyId = tableId;
-						receivedResidencyLists[residencyId] = data;
+						if (!Number.isInteger(residencyId) || residencyId < 1 || residencyId > 0xffffffff)
+							throw new Error('Invalid connection sharding reference');
+						receivedResidencyLists.set(residencyId, data);
+						if (data && typeof data === 'object' && !Array.isArray(data)) {
+							const snapshot = receivedResidencyMaps.get(databaseName);
+							if (snapshot?.digest === data.mapDigest && snapshot.version === data.mapVersion)
+								referenceSnapshots.set(data, snapshot);
+						}
 						break;
 					case COMMITTED_UPDATE:
 						// we need to record the sequence number that the remote node has received
@@ -7399,6 +7911,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						(getSharedStatus().buffer as any).notify();
 						break;
 					case COPY_START: {
+						shardingAdmissionDirty = true;
+						refreshShardingAdmission();
+						projectionCopy = message[4]?.shardingProjection === true;
+						if ((projectionCopy && !projectionRequested) || (restrictedOrigins && !projectionCopy)) {
+							refuseShardingSource(remoteNodeName, true);
+							return;
+						}
 						if (!isValidFrameTxnLogKey(data)) {
 							// The anchor becomes this node's persisted copy cursor and its resume seqId. A non-finite or
 							// non-positive value would be echoed back on every reconnect and wedge the link on the same
@@ -7408,18 +7927,24 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							return;
 						}
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
+						const layout = shardingLayout(databaseName);
+						copyCertification =
+							layout && !projectionCopy ? { layout, scopes: shardingRecoveryScopes(databaseName) } : undefined;
+						// Revoke every old callback's pass before revocation itself can yield.
+						copyWatermark.beginPass();
+						copyCertificateRevoked = false;
+						copyCertificationPending = false;
+						copyCompleteReceived = false;
+						pendingCopyCursor = null;
+						if (copyCertification && process.env.HARPER_CLONE_ATTEMPT) {
+							copyCertificateRevoked = true;
+							await revokeShardingCertificate(databaseName);
+							if (connectionSuperseded()) return;
+						}
 						const copyWasAlreadyActive = inCopyMode;
 						repairWindowMissRunByNode.clear();
 						inCopyMode = true;
 						if (!copyWasAlreadyActive) subscriptionSetupWatchdog?.pause();
-						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
-						// A prior pass's staged cursors (and its in-flight persists — see passAtPersist) must not
-						// be persisted under this pass: they claim delivery this pass's walk has not made (#699).
-						copyWatermark.beginPass();
-						// A COPY_COMPLETE from the prior pass must not finalize this one: with the flag left set,
-						// the first commit/blob drain that found nothing outstanding would remove the cursor and
-						// exit copy mode mid-walk, advertising a partial copy as caught-up.
-						copyCompleteReceived = false;
 						copiedTablesThisPass.clear(); // reset per-pass reload-marker tracking (harper-pro#495)
 						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)
 						lastCopyFlushTime = performance.now();
@@ -7438,8 +7963,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						copyPassToken = `${data}:${randomUUID()}`;
 						const copyMarkOrigins = new Map<number, string | undefined>();
-						// only an engine that can certify a checkpoint has a route history to mark partial
-						if (supportsCheckpointFloors()) {
+						// only an engine that can certify a checkpoint has a route history to mark partial; a sharding
+						// projection publishes no route state (its end_txn carries no remote ids), so there is nothing to mark
+						if (!projectionCopy && supportsCheckpointFloors()) {
 							const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
 							const store = auditStore ?? databaseAuditStore;
 							const peerIdForCopy = remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined;
@@ -7486,20 +8012,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
-						copyOriginAnchors = recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
+						copyOriginAnchors = !projectionCopy && recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						loadPersistedCopyBounds();
 						if (copyApplyActive() && supportsCheckpointFloors()) reserveCopyStartBounds(copyModeStartTime);
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
 						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
-						if (cloneAttempt && databaseName) {
+						if (databaseName && (cloneAttempt || missingShardingOriginStart(databaseName))) {
 							// Durable before the first copied row: a clone replaces this node's own history with
 							// rows that carry no local log entry, and the record-lock barrier must know that.
 							try {
 								await markRecloned(databaseName);
+								if (connectionSuperseded()) return;
+								for (const { catalog } of shardingNativeRoots(databaseName)) {
+									if (typeof catalog.flush === 'function') await catalog.flush({ allowWriteStall: true });
+									else await catalog.flushed; // LMDB exposes its durability barrier as a promise.
+									if (connectionSuperseded()) return;
+								}
 							} catch (error) {
 								logger.error?.(connectionId, 'failed to record the clone for record locks', databaseName, error);
+								wsClosed = true;
 								close(1011, 'Failed to record the clone for record locks');
 								return;
 							}
@@ -7514,6 +8047,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									markInboundClosed: () => (wsClosed = true),
 									close,
 								});
+								return;
+							}
+						}
+						if (copyCertification && copyFromNodeId !== undefined) {
+							// With no copied key there is no copy cursor, so an interrupted certification of an empty
+							// copy would otherwise resume incrementally from the copy's committed sequence.
+							try {
+								await getDatabaseStores().dbisDB?.put([OWNED_COPY_PENDING, copyFromNodeId], {
+									layout: copyCertification.layout,
+								});
+								if (connectionSuperseded()) return;
+							} catch (error) {
+								logger.error?.(connectionId, 'failed to record the owned sharding copy', databaseName, error);
+								wsClosed = true;
+								close(1011, 'Failed to record the owned sharding copy');
 								return;
 							}
 						}
@@ -7541,6 +8089,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
 						break;
 					case SEQUENCE_ID_UPDATE:
+						refreshShardingAdmission();
+						if (!admitsIncomingOrigins(message[2])) return;
 						// we need to record the sequence number that the remote node has received
 						lastSequenceIdReceived = data;
 						// The resume cursor is persisted by the subscription queue, so this needs the resolved
@@ -7745,7 +8295,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const table = tables && Object.hasOwn(tables, tableName) ? tables[tableName] : undefined;
 							// A subscription uses this sender's ids. An older repair client may send
 							// its own id; announcing under it could replace another streamed table's decoder.
-							if (!table || !tableReplicates(table) || (nodeSubscriptions && tableId !== table.tableId)) {
+							if (!table || !tableReplicates(table) || (activeNodeSubscriptions && tableId !== table.tableId)) {
 								// One wording for every case, so a guessing peer cannot tell them apart.
 								logger.warn?.(
 									connectionId,
@@ -7761,6 +8311,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										requestId,
 										{ error: `Table ${databaseName}.${tableName} is not available for replication` },
 									])
+								);
+								break;
+							}
+							if (
+								table.residency &&
+								(missingShardingOriginStart(databaseName) || databaseBaselineHoldReason(table.primaryStore.rootStore))
+							) {
+								ws.send(
+									encode(
+										peerCapabilitiesLearned && peerSupportsResidencyNotResident(peerCapabilities)
+											? [GET_RECORD_RESPONSE, requestId, false]
+											: [GET_RECORD_RESPONSE, requestId, { error: 'Owned sharding data is not certified on this node' }]
+									)
 								);
 								break;
 							}
@@ -7796,6 +8359,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											structures: encoder.structures,
 											attributes: table.attributes,
 											schemaDefined: table.schemaDefined,
+											...(peerSupportsResidencySlots(peerCapabilities) && table.residency
+												? { residency: table.residency }
+												: {}),
 											createdTime: advertisedCreatedTime(table),
 										},
 										tableId,
@@ -7814,7 +8380,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (binaryEntry) {
 								let valueBuffer = table.primaryStore.decoder.decode(binaryEntry, { valueAsBuffer: true });
 								const entry: any = lastMetadata || {};
-								if (entry[METADATA] & (INVALIDATED | REPLICA)) {
+								if (
+									entry[METADATA] & (INVALIDATED | REPLICA) ||
+									(table.residency &&
+										!table
+											.getRecordResidency({ key: recordId, residencySlot: entry.residencySlot })
+											.includes(server.hostname))
+								) {
 									ws.send(
 										encode(
 											peerCapabilitiesLearned && peerSupportsResidencyNotResident(peerCapabilities)
@@ -7826,8 +8398,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 								// RocksDB carries the version inline; unwrap its metadata's value bytes.
 								if (encoder.isRocksDB) {
-									if (valueBuffer === lastMetadata && lastMetadata != null) {
-										valueBuffer = lastMetadata.value;
+									if (valueBuffer === entry) {
+										valueBuffer = entry.value;
 									}
 								} else {
 									entry.version = recordVersion;
@@ -7847,6 +8419,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									expiresAt: entry.expiresAt,
 									version: entry.version,
 									residencyId: entry.residencyId,
+									residencySlot: entry.residencySlot,
 									nodeId: entry.nodeId,
 									// the writer by name: the reader's retrieval socket has no map for this node's ids, and an
 									// id this node cannot name is left unnamed rather than claimed
@@ -7925,110 +8498,66 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					}
 					case SUBSCRIPTION_UPDATE: {
-						// Handle dynamic updates to subscription exclusion list
-						const nodesToExclude = data?.excludeNodes || [];
-						const nodesToInclude = data?.includeNodes || [];
-
-						logger.debug?.(
-							connectionId,
-							'received subscription update, excluding:',
-							nodesToExclude,
-							'including:',
-							nodesToInclude
-						);
-
-						if (!excludedNodes) excludedNodes = [];
-
-						// Add new excluded nodes (remove their logs from the iterator)
-						for (const nodeName of nodesToExclude) {
-							if (!excludedNodes.includes(nodeName)) {
-								excludedNodes.push(nodeName);
-								delete requestedOriginCursors?.[nodeName];
-								// Update the subscribedNodeIds to mark this node as excluded
-								if (auditStore && subscribedNodeIds) {
-									const localId = getIdOfRemoteNode(nodeName, auditStore);
-									subscribedNodeIds[localId] = false;
-								}
-								// Remove this log from the iterator
-								auditLogIterable?.removeLog?.(nodeName);
-								logger.debug?.(connectionId, 'removed log from iterator:', nodeName);
-							}
-						}
-
-						// Remove nodes from exclusion list (add their logs to the iterator)
-						const acceptIncludeCursors =
-							auditStore?.reusableIterable === true &&
-							peerCapabilitiesLearned &&
-							peerSupportsOriginCursors(peerCapabilities);
-						const includeCursors = acceptIncludeCursors ? parseOriginKeyMap(data?.originCursors) : undefined;
-						const includeFloors = acceptIncludeCursors
-							? resolveOriginFloors(data?.originCursors, exportIdMapping(auditStore))
-							: undefined;
-						for (const nodeName of nodesToInclude) {
-							const index = excludedNodes.indexOf(nodeName);
-							if (index !== -1) {
-								excludedNodes.splice(index, 1);
-								const requestedCursor = includeCursors?.get(nodeName);
-								if (requestedCursor === undefined) delete requestedOriginCursors?.[nodeName];
-								else (requestedOriginCursors ??= {})[nodeName] = requestedCursor;
-								// Update the subscribedNodeIds to remove the exclusion
-								if (auditStore && subscribedNodeIds) {
-									const localId = getIdOfRemoteNode(nodeName, auditStore);
-									delete subscribedNodeIds[localId];
-									// Bound the log before addLog re-admits it: the live range reads its start from this map.
-									const floor = includeFloors?.get(nodeName);
-									if (floor === undefined) {
-										originFloors?.delete(nodeName);
-										if (originFloorById) delete originFloorById[localId];
-										liveStartByLog?.delete(nodeName);
-									} else {
-										(originFloors ??= new Map()).set(nodeName, floor);
-										(originFloorById ??= [])[localId] = floor;
-										liveStartByLog?.set(nodeName, floor);
-									}
-								}
-								// Add this log back to the iterator
-								auditLogIterable?.addLog(nodeName);
-								wakeSender?.();
-								logger.debug?.(connectionId, 'added log to iterator:', nodeName);
-							}
-						}
-						if (includeCursors?.size) {
-							let advancedBareOrigin = false;
-							for (const [nodeName, requestedCursor] of includeCursors) {
-								if (excludedNodes?.includes(nodeName) || nodesToInclude.includes(nodeName)) continue;
-								const prevCursor = requestedOriginCursors?.[nodeName] ?? 0;
-								if (requestedCursor > prevCursor) {
-									(requestedOriginCursors ??= {})[nodeName] = requestedCursor;
-									if (certifiedFloors?.has(nodeName) && certifiedGenerations?.get(nodeName) === undefined) {
-										advancedBareOrigin = true;
-									}
-								}
-							}
-							if (advancedBareOrigin) {
-								lastFloorCaptureAt = 0;
-								wakeSender?.();
-							}
-						}
-
+						updateSendingSubscription?.(data);
 						break;
 					}
 					case SUBSCRIPTION_REQUEST: {
-						nodeSubscriptions = data;
-						excludedNodes = message[2]; // use the third argument for exclusion list
+						if (missingShardingOriginStart(databaseName)) {
+							wsClosed = true;
+							close(
+								1011,
+								'Sharding source has no frozen origin start; restore its complete audit or use a new node name'
+							);
+							return;
+						}
+						if (
+							!residencyIdentityBound &&
+							Object.values(databases[databaseName] ?? {}).some((Table) => Table.residency)
+						)
+							throw new Error('Sharding requires a configured peer identity');
+						const receiverShard = residencyIdentityBound
+							? agreedPeerShard(remoteNodeName, announcedPeerShard)
+							: undefined;
+						const receiverLayout =
+							receiverShard === undefined ? undefined : shardingSourceAgreement(databaseName, receiverShard);
+						const restrictedSendingOrigins =
+							!!receiverLayout && shardingSourceCertificate(databaseName) !== receiverLayout;
+						const sendingProjection = data.some((node) => node.shardingProjection === true);
+						if (sendingProjection && !receiverLayout)
+							throw new Error('Sharding projection requires authenticated owned slots');
+						const nodeSubscriptions = restrictedSendingOrigins
+							? data.filter((node) => node.name === getThisNodeName())
+							: data;
+						const excludedNodes: string[] | undefined = restrictedSendingOrigins ? undefined : message[2]; // use the third argument for exclusion list
 						const subscriptionSetupRequestId = message[3];
-						requestedOriginCursors =
+						let requestedOriginCursors: Record<string, number> | undefined =
 							peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities)
 								? Object.fromEntries(parseOriginKeyMap(message[4]))
 								: undefined;
-						originFloors = undefined;
-						originFloorById = undefined;
-						liveStartByLog = undefined;
 						// permission check to make sure that this node is allowed to subscribe to this database, that is that
 						// we have publish permission for this node/database
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
 						let sentNodeIds = new Set<number>();
 						let closed = false;
+						let auditLogIterable: Iterable<AuditRecord> & {
+							removeLog?: (name: string) => void;
+							addLog?: (name: string) => void;
+						}; // reusable iterator for a subscription
+						// The log whose boundary `auditLogIterable` was built to resume PAST, when it was built as an
+						// append-order range; undefined for an ordinary timestamp range. Needed because
+						// `exactStartFailures` is NOT a boundary-health signal on its own: the aggregate iterator records
+						// an expected start for every log named in `startByLog`, `exactStart` or not, and reports
+						// `missing` whenever the first entry's key differs from the cursor — which is the ordinary,
+						// healthy case for a plain resume. Only a log we actually asked to resume past can fail closed.
+						let boundaryLogName: string | undefined;
+						let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
+						// `liveStartByLog` is the live incremental range's own map, so an `includeNodes` update reaches the range
+						let originFloors: Map<string, number> | undefined;
+						let originFloorById: number[] | undefined;
+						let liveStartByLog: Map<string, number> | undefined;
+						const frame = new FrameWriter();
+						let skippedMessageSequenceUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+						let copying = false;
 						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
 						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
 						tableSubscriptionToReplicator = subscriptionForConnection(
@@ -8135,12 +8664,46 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							close(1008, `Unauthorized database subscription to ${databaseName}`);
 							return;
 						}
+						// A recovery bound holds this node's sharded writes across restart, so only a subscriber
+						// that may receive this database can set one. The hdb_nodes watch above judges the current
+						// row asynchronously (an absent row emits nothing); judge it the same way before writing.
+						if (residencyIdentityBound && !sendingProjection) {
+							if (
+								whenSubscribedToHdbNodes &&
+								resolveNodeForSendAuth(authorization.name) !== undefined &&
+								(await shouldCloseSendAuthWatch({ type: 'put' }, authorization.name, databaseName, {
+									isClosed: () => closed || wsClosed,
+								}))
+							) {
+								closed = true;
+								close(1008, `Unauthorized database subscription to ${databaseName}`);
+								return;
+							}
+							if (closed || supersededOrClosed()) return;
+							const localName = getThisNodeName();
+							const requested = Math.max(
+								requestedOriginCursors?.[localName] ?? 0,
+								...nodeSubscriptions.filter((node) => node.name === localName).map((node) => node.startTime ?? 0)
+							);
+							try {
+								await noteShardingResumeBound(databaseName, requested, remoteNodeName);
+							} catch (error) {
+								if (!(error instanceof ResidencyPlacementError) || error.statusCode !== 503) throw error;
+								logger.debug?.(connectionId, error.message);
+								wsClosed = true;
+								close(1011, 'Sharding subscription is waiting for local origin certification');
+								return;
+							}
+							if (closed || supersededOrClosed()) return;
+						}
 
 						if (auditSubscription) {
 							// any subscription will supersede the previous subscription, so end that one
 							logger.debug?.(connectionId, 'stopping previous subscription', databaseName);
 							auditSubscription.emit('close');
 						}
+						activeNodeSubscriptions = nodeSubscriptions;
+						updateSendingSubscription = undefined;
 						if (nodeSubscriptions.length === 0)
 							// this means we are unsubscribing
 							return;
@@ -8174,11 +8737,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								return { table };
 							}
 						};
+						const sourceReadiness =
+							receiverLayout && !restrictedSendingOrigins
+								? shardingNativeRoots(databaseName).map(({ root }) => shardingBaselineState(root, databaseName))
+								: [];
+						const sourceNotReady = (word: Int32Array) => Atomics.load(word, 0) !== 1;
 						const currentTransaction = { txnLogKey: 0 };
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
-						const sendAuditRecord = (auditRecord, cursor, subscriptionNodeId = auditRecord.nodeId) => {
+						const sendAuditRecord = (
+							auditRecord,
+							cursor,
+							subscriptionNodeId = auditRecord.nodeId,
+							encodeCopy?: () => Buffer
+						) => {
+							if (closed || wsClosed) return;
+							if (sourceReadiness.some(sourceNotReady)) throw new Error('Sharding source completeness was revoked');
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnLogKey) {
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
@@ -8294,12 +8869,80 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									'subscribed:',
 									subscribedNodeIds
 								);
-							const residencyId = auditRecord.residencyId;
-							const residency = getResidence(residencyId, table);
+							let residencyId = auditRecord.residencyId;
+							const hasSlot = table.residency && isResidencyRecord(auditRecord.type);
+							const slot = hasSlot
+								? table.residency.byAttribute
+									? auditRecord.residencySlot
+									: table.getResidencySlot(auditRecord.recordId)
+								: undefined;
+							const residency = hasSlot
+								? residencyOwners(table.databaseName, slot, table.residency.slots)
+								: getResidence(residencyId, table);
+							if (hasSlot) {
+								if (receiverMembership !== server.shards) {
+									receiverMembership = server.shards;
+									receiverShardKnown = Array.from(server.shards?.values() ?? []).some((members) =>
+										members.some((node: any) => (typeof node === 'string' ? node : node.name) === remoteNodeName)
+									);
+									receiverShardKnown ||= peerExplicitlyUnsharded;
+									if (!receiverShardKnown && !peerShardAnnounced) {
+										const Nodes = getHDBNodeTable();
+										const peer = Nodes.primaryStore.getEntry(remoteNodeName);
+										receiverShardKnown = Boolean(
+											peer?.value?.url &&
+											peer.value.shard === undefined &&
+											peer.nodeId &&
+											getNodeNameForId(Nodes.auditStore, peer.nodeId, true) === remoteNodeName
+										);
+									}
+								}
+								if (!receiverShardKnown)
+									throw new Error(`Unknown shard for peer ${remoteNodeName}; holding replication`);
+								if (!residency.includes(remoteNodeName) && !hasStoredIndexes(table)) return skipAuditRecord();
+								const snapshot = readResidencyMap(table.databaseName);
+								if (
+									peerSupportsResidencySlots(peerCapabilities) &&
+									sentResidencyMaps.get(table.databaseName) !== snapshot.digest
+								)
+									sendDBSchema(table.databaseName);
+							}
+							if (hasSlot && residency.includes(remoteNodeName) && auditRecord.type === 'invalidate')
+								throw new Error(`A projection cannot fill owned sharding slots on ${remoteNodeName}`);
+							let wireRecord = auditRecord;
+							let reframe = false;
+							if (hasSlot) {
+								residencyId = slotWireReferences.reference(
+									table,
+									slot,
+									peerSupportsResidencySlots(peerCapabilities),
+									sendResidencyReference
+								);
+								const previousResidencyId =
+									auditRecord.previousResidencySlot === undefined
+										? undefined
+										: slotWireReferences.reference(
+												table,
+												auditRecord.previousResidencySlot,
+												peerSupportsResidencySlots(peerCapabilities),
+												sendResidencyReference
+											);
+								wireRecord = {
+									...auditRecord,
+									residencyId,
+									previousResidencyId,
+								};
+								reframe = true;
+							} else if (
+								table.residency &&
+								(auditRecord.residencySlot !== undefined || auditRecord.previousResidencySlot !== undefined)
+							) {
+								reframe = true;
+							}
 							let invalidationEntry;
 							if (residency && !residency.includes(remoteNodeName)) {
 								// If this node won't have residency, we need to send out invalidation messages
-								if (table.getResidencyById) {
+								if (table.residency ? !hasStoredIndexes(table) : table.getResidencyById) {
 									return skipAuditRecord();
 								}
 								const recordId = auditRecord.recordId;
@@ -8307,14 +8950,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								logger.trace?.(connectionId, 'sending invalidation', recordId, remoteNodeName, 'from', nodeId);
 								let extendedType = 0;
 								if (residencyId) extendedType |= HAS_CURRENT_RESIDENCY_ID;
-								if (auditRecord.previousResidencyId) extendedType |= HAS_PREVIOUS_RESIDENCY_ID;
+								if (wireRecord.previousResidencyId) extendedType |= HAS_PREVIOUS_RESIDENCY_ID;
 								let partialRecord = null;
 								if (hasStoredIndexes(table)) {
 									const fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore, txnLogKey);
 									if (fullRecord) partialRecord = residencyStubOf(table, fullRecord);
 								}
 								invalidationEntry = createAuditEntry({
-									...auditRecord,
+									...wireRecord,
 									tableId,
 									recordId,
 									previousVersion: null,
@@ -8332,7 +8975,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								logger.trace?.(connectionId, 'skipping audit record', auditRecord.recordId);
 								if (!skippedMessageSequenceUpdateTimer) {
 									skippedMessageSequenceUpdateTimer = setTimeout(() => {
-										skippedMessageSequenceUpdateTimer = null;
+										skippedMessageSequenceUpdateTimer = undefined;
+										if (closed || wsClosed || copying || currentTransaction.txnLogKey) return;
 										// check to see if we are too far behind, but if so, send a sequence update
 										if ((sentSequenceId || 0) + SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY / 2 < currentSequenceId) {
 											if (DEBUG_MODE)
@@ -8357,6 +9001,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								);
 							}
 
+							// Copy encoding starts blob transfers and may add encoder structures. Do it only
+							// after placement selects a complete body, before advertising those structures.
+							if (!invalidationEntry && encodeCopy) wireRecord.encoded = encodeCopy();
 							const typedStructs = encoder.typedStructs;
 							const structures = encoder.structures;
 							if (
@@ -8378,6 +9025,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											structures,
 											attributes: table.attributes,
 											schemaDefined: table.schemaDefined,
+											...(peerSupportsResidencySlots(peerCapabilities) && table.residency
+												? { residency: table.residency }
+												: {}),
 											createdTime: advertisedCreatedTime(table),
 										},
 										tableId,
@@ -8385,7 +9035,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									])
 								);
 							}
-							if (residencyId && !sentResidencyLists[residencyId]) {
+							if (!hasSlot && residencyId && !sentResidencyLists[residencyId]) {
 								ws.send(encode([RESIDENCY_LIST, residency, residencyId]));
 								sentResidencyLists[residencyId] = true;
 							}
@@ -8413,7 +9063,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								frame.writeBytes(invalidationEntry);
 							} else {
 								// directly write the audit record.
-								const encoded = auditRecord.encoded;
+								const encoded = reframe
+									? encodeResidencyWireRecord(wireRecord, residencyId, wireRecord.previousResidencyId)
+									: wireRecord.encoded;
 								if (auditRecord.extendedType & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
 									decodeWithBlobCallback(
@@ -8471,6 +9123,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							} else return yieldSendLoop();
 						};
 						const sendQueuedData = () => {
+							if (closed || wsClosed) return;
 							if (frame.position - frame.encodingStart > 8) {
 								// if we have more than just a txn time, send it
 								// Throw, don't return: a silent return skips this transaction while later ones
@@ -8495,12 +9148,102 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							} else logger.debug?.(connectionId, 'skipping empty transaction');
 						};
 
+						let subscriptionResidencySender: ReturnType<typeof registerResidencySender>;
 						auditSubscription = new EventEmitter();
 						auditSubscription.once('close', () => {
 							closed = true;
+							clearTimeout(skippedMessageSequenceUpdateTimer);
+							subscriptionResidencySender?.close();
 							subscriptionToHdbNodes?.end();
 							wakeSender?.(); // an idle sender settles now rather than at the next transaction
 						});
+						updateSendingSubscription = (data) => {
+							// Handle dynamic updates to subscription exclusion list
+							const nodesToExclude = data?.excludeNodes || [];
+							const nodesToInclude = data?.includeNodes || [];
+
+							logger.debug?.(
+								connectionId,
+								'received subscription update, excluding:',
+								nodesToExclude,
+								'including:',
+								nodesToInclude
+							);
+
+							if (closed || wsClosed || restrictedSendingOrigins || excludedNodes === undefined) return;
+
+							// Add new excluded nodes (remove their logs from the iterator)
+							for (const nodeName of nodesToExclude) {
+								if (!excludedNodes.includes(nodeName)) {
+									excludedNodes.push(nodeName);
+									delete requestedOriginCursors?.[nodeName];
+									// Update the subscribedNodeIds to mark this node as excluded
+									if (auditStore && subscribedNodeIds) {
+										const localId = getIdOfRemoteNode(nodeName, auditStore);
+										subscribedNodeIds[localId] = false;
+									}
+									// Remove this log from the iterator
+									auditLogIterable?.removeLog?.(nodeName);
+									logger.debug?.(connectionId, 'removed log from iterator:', nodeName);
+								}
+							}
+
+							// Remove nodes from exclusion list (add their logs to the iterator)
+							const acceptIncludeCursors =
+								auditStore?.reusableIterable === true &&
+								peerCapabilitiesLearned &&
+								peerSupportsOriginCursors(peerCapabilities);
+							const includeCursors = acceptIncludeCursors ? parseOriginKeyMap(data?.originCursors) : undefined;
+							const includeFloors = acceptIncludeCursors
+								? resolveOriginFloors(data?.originCursors, exportIdMapping(auditStore))
+								: undefined;
+							for (const nodeName of nodesToInclude) {
+								const index = excludedNodes.indexOf(nodeName);
+								if (index !== -1) {
+									excludedNodes.splice(index, 1);
+									const requestedCursor = includeCursors?.get(nodeName);
+									if (requestedCursor === undefined) delete requestedOriginCursors?.[nodeName];
+									else (requestedOriginCursors ??= {})[nodeName] = requestedCursor;
+									// Update the subscribedNodeIds to remove the exclusion
+									if (auditStore && subscribedNodeIds) {
+										const localId = getIdOfRemoteNode(nodeName, auditStore);
+										delete subscribedNodeIds[localId];
+										// Bound the log before addLog re-admits it: the live range reads its start from this map.
+										const floor = includeFloors?.get(nodeName);
+										if (floor === undefined) {
+											originFloors?.delete(nodeName);
+											if (originFloorById) delete originFloorById[localId];
+											liveStartByLog?.delete(nodeName);
+										} else {
+											(originFloors ??= new Map()).set(nodeName, floor);
+											(originFloorById ??= [])[localId] = floor;
+											liveStartByLog?.set(nodeName, floor);
+										}
+									}
+									// Add this log back to the iterator
+									auditLogIterable?.addLog(nodeName);
+									wakeSender?.();
+									logger.debug?.(connectionId, 'added log to iterator:', nodeName);
+								}
+							}
+							if (includeCursors?.size) {
+								let advancedBareOrigin = false;
+								for (const [nodeName, requestedCursor] of includeCursors) {
+									if (excludedNodes?.includes(nodeName) || nodesToInclude.includes(nodeName)) continue;
+									const prevCursor = requestedOriginCursors?.[nodeName] ?? 0;
+									if (requestedCursor > prevCursor) {
+										(requestedOriginCursors ??= {})[nodeName] = requestedCursor;
+										if (certifiedFloors?.has(nodeName) && certifiedGenerations?.get(nodeName) === undefined) {
+											advancedBareOrigin = true;
+										}
+									}
+								}
+								if (advancedBareOrigin) {
+									lastFloorCaptureAt = 0;
+									wakeSender?.();
+								}
+							}
+						};
 						// find the earliest start time of the subscriptions
 						let copyResume:
 							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
@@ -8545,10 +9288,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										close(1011, `Replication ${gate} setup ${reason === 'timeout' ? 'timed out' : 'unavailable'}`);
 									}
 								);
-								if (!resolvedDatabaseSubscription) return;
+								if (!resolvedDatabaseSubscription || closed || wsClosed || connectionSuperseded()) return;
 								tableSubscriptionToReplicator = resolvedDatabaseSubscription;
-								if (closed || wsClosed) return;
 								auditStore = tableSubscriptionToReplicator.auditStore;
+								residencySender = subscriptionResidencySender = registerResidencySender(
+									auditStore,
+									databaseName,
+									remoteNodeName,
+									lastReceivedTime
+								);
 								recordPeerLockCapabilityFromHandshake();
 								sendRecordLockHomesDigestFrame();
 								tableById = tableSubscriptionToReplicator.tableById.map(tableToTableEntry);
@@ -8786,6 +9534,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													break;
 												}
 												if (
+													!(
+														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
+													) &&
 													shouldForceBaseCopyForRetention(
 														currentSequenceId,
 														oldestRetainedTime,
@@ -8799,6 +9550,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												}
 											}
 											if (currentSequenceId === 0) {
+												copying = true;
 												const legacyCopy = await requiresLegacyCopyVerification(
 													peerCapabilities.safeCopyAudit,
 													sendOperation,
@@ -8816,7 +9568,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// that aggregate applies `exactStart` only to the logs named in `startByLog`. Gated on the store
 												// itself, not STORAGE_IS_ROCKSDB: that is a config snapshot that can misreport the engine in a
 												// worker, and an LMDB audit store would read these range options as a scan from its start.
-												const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+												const logName =
+													auditStore.reusableIterable === true && excludedNodes
+														? 'local'
+														: subscribedNodeName === getThisNodeName()
+															? 'local'
+															: subscribedNodeName;
 												const canResumePastAnchor = auditStore.reusableIterable === true && logName === 'local';
 												// If resuming, the follower already committed every table before currentTable (records commit
 												// in stable iteration order), so skip to currentTable and continue after its last committed key.
@@ -8881,10 +9638,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
 												const relayedAnchors =
 													!copyResume && canResumePastAnchor && excludedNodes
-														? collectRelayedLogAnchors(
-																auditStore,
-																new Set([...excludedNodes, ...nodeSubscriptions.map(({ name }) => name)])
-															)
+														? collectRelayedLogAnchors(auditStore, new Set(excludedNodes))
 														: undefined;
 												const boundaryFailure = (rangeOptions: any) => rangeBoundaryFailure(auditStore, rangeOptions);
 												// Relayed logs whose boundary probe succeeded and therefore resume in append order.
@@ -9004,8 +9758,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														relayedAnchors?.size &&
 															peerCapabilitiesLearned &&
 															peerSupportsOriginCursors(peerCapabilities)
-															? [COPY_START, copyStartTime, COPY_ORDER_VERSION, Object.fromEntries(relayedAnchors)]
-															: [COPY_START, copyStartTime, COPY_ORDER_VERSION]
+															? [
+																	COPY_START,
+																	copyStartTime,
+																	COPY_ORDER_VERSION,
+																	Object.fromEntries(relayedAnchors),
+																	sendingProjection ? { shardingProjection: true } : undefined,
+																]
+															: [
+																	COPY_START,
+																	copyStartTime,
+																	COPY_ORDER_VERSION,
+																	undefined,
+																	sendingProjection ? { shardingProjection: true } : undefined,
+																]
 													)
 												);
 												// Test-only (#453): one-shot stall here leaves the follower in copy mode with no
@@ -9097,6 +9863,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// already-available record metadata integer from the range entry — a pure bitmask
 														// test, no record value decode added to this send path.
 														if (entry.metadataFlags & LOCAL_ONLY) continue;
+														if (
+															sendingProjection &&
+															liveCopyTable.residency &&
+															liveCopyTable
+																.getRecordResidency({ key: entry.key, residencySlot: entry.residencySlot })
+																.includes(remoteNodeName)
+														)
+															continue;
 														// same origin normalization as recordNodeId below: undefined means we authored it
 														if (
 															withheldOriginNodeId !== undefined &&
@@ -9121,12 +9895,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														const recordNodeId = entry.nodeId ?? nodeId;
 														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
 														const isReplica = Boolean(entry.metadataFlags & REPLICA);
-														// the extendedType mirrors record flags above 0xff; FULL_WRITE_HEAD is a record-only bit
-														const copiedFlags = entry.metadataFlags & ~FULL_WRITE_HEAD;
 														const isStub = Boolean(entry.metadataFlags & (INVALIDATED | REPLICA));
 														const stubAsInvalidation =
 															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
 														const legacyStubCopy = isStub && !stubAsInvalidation;
+														if (legacyStubCopy && table.residency) continue;
 														const copyType = stubAsInvalidation ? 'invalidate' : 'put';
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;
@@ -9138,6 +9911,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															if (createdTimeName && entry.value[createdTimeName] != null)
 																copyValue[createdTimeName] = entry.value[createdTimeName];
 														}
+														const copyExtendedType =
+															(entry.metadataFlags &
+																~0xff &
+																~(HAS_RESIDENCY_SLOT | FULL_WRITE_HEAD) &
+																~(ACTION_32_BIT << 24) &
+																(isReplica ? ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS) : -1)) |
+															(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0);
 														const encodeCopyRecord = () =>
 															createAuditEntry({
 																version: entry.version,
@@ -9149,20 +9929,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																encodedRecord: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
 																	sendBlobs(blob, entry.key)
 																),
-																extendedType:
-																	(copiedFlags &
-																		~0xff &
-																		~(ACTION_32_BIT << 24) &
-																		(isReplica ? ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS) : -1)) |
-																	(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0),
+																extendedType: copyExtendedType,
 																residencyId: entry.residencyId,
+																residencySlot: entry.residencySlot,
 																previousResidencyId: null,
 																expiresAt: isReplica ? undefined : entry.expiresAt,
 															} as any);
-														const encoded =
-															entry.metadataFlags & HAS_BLOBS && copyValue === entry.value
-																? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
-																: encodeCopyRecord();
+														let encoded: Buffer | undefined;
+														const encodeCopy = () =>
+															(encoded =
+																entry.metadataFlags & HAS_BLOBS && copyValue === entry.value
+																	? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
+																	: encodeCopyRecord());
 														await sendAuditRecord(
 															{
 																// make it look like an audit record
@@ -9175,20 +9953,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																encoded,
 																version: entry.version,
 																residencyId: entry.residencyId,
+																residencySlot: entry.residencySlot,
 																nodeId: recordNodeId,
-																extendedType: isReplica
-																	? copiedFlags & ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS)
-																	: copiedFlags,
+																extendedType: copyExtendedType,
+																expiresAt: isReplica ? undefined : entry.expiresAt,
 															},
 															copyTxnLogKey,
-															nodeId
+															nodeId,
+															encodeCopy
 														);
+														if (closed || wsClosed) return;
 														logger.debug?.(
 															'sent record from table',
 															entry.key,
 															'length:',
-															encoded.length,
-															encoded.slice(0, 10)
+															encoded?.length,
+															encoded?.slice(0, 10)
 														);
 														// Periodically flush the accumulated records as a message so the follower commits this
 														// batch and advances its resume cursor. This is a plain flush with NO sequence update:
@@ -9238,6 +10018,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// The full copy is done — tell the follower to clear its resume cursor and fall back to
 												// normal audit-log replication from the persisted seqId (which is copyStartTime).
 												ws.send(encode([COPY_COMPLETE]));
+												copying = false;
+												if (sendingProjection) return;
 												getSharedStatus()[SENDING_TIME_POSITION] = 0;
 												currentSequenceId = copyStartTime;
 											}
@@ -9293,6 +10075,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// late-committed older entry would otherwise drag the resume point back over records sent.
 											if (key > currentSequenceId) currentSequenceId = key;
 											await sendAuditRecord(auditRecord, key);
+											if (closed || wsClosed) return;
 											if (key > auditSubscription.startTime) auditSubscription.startTime = key; // don't double send
 										}
 										if (closed || wsClosed) return;
@@ -9494,7 +10277,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			 * handles parsing and transacting these replication messages */
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
+			if (!residencyIdentityBound && databaseDeclaresResidency())
+				throw new Error('Sharding requires a configured peer identity');
 			if (!(await whenSubscriptionResolved())) return;
+			if (connectionSuperseded()) return;
+			refreshShardingAdmission();
 			// The origin's log key for every record in this body, read once. It is what the apply
 			// transaction commits under, so the destination's log for this origin keeps the origin's clock
 			// and a downstream peer's resume cursor stays comparable with it (harper-pro#790).
@@ -9513,6 +10300,81 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				wsClosed = true;
 				close(1011, 'invalid replication frame log key');
 				return;
+			}
+			// A valid prefix must not commit the frame cursor past a later forbidden origin or owner projection.
+			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
+			let selfCopyBound = 0;
+			if (admittedLayout || residencyMapInstalled()) {
+				decoder.position = 8;
+				while (decoder.position < body.byteLength) {
+					const length = decoder.readInt();
+					const start = decoder.position;
+					if (length === 9 && decoder.getUint8(start) === REMOTE_SEQUENCE_UPDATE) break;
+					if (!(length > 0) || start + length > body.byteLength) {
+						wsClosed = true;
+						close(1011, 'Invalid sharded replication frame');
+						return;
+					}
+					const record = readAuditEntry(body, start, start + length);
+					const origin = remoteShortIdToLocalId.get(record.nodeId);
+					if (!projectionCopy && restrictedOrigins && (origin === undefined || origin !== directShardingOriginId)) {
+						refuseShardingSource(
+							origin === undefined ? String(record.nodeId) : getNodeNameForId(auditStore, origin, true)
+						);
+						return;
+					}
+					const tableDecoder = tableDecoders[record.tableId];
+					// The apply loop skips a refused generation's records; holding the frame for one would
+					// re-send it on every reconnect.
+					if (tableDecoder && peerGenerationRefused(tableDecoder)) {
+						decoder.position = start + length;
+						continue;
+					}
+					const Table = tableDecoder?.table;
+					if (Table?.residency && origin === 0 && isResidencyRecord(record.type)) {
+						if (!messageIsCopyFrame || !isValidRecordVersion(record.version)) {
+							recordAction(true, DECODE_HOLD_METRIC, databaseName + '.self-origin');
+							recordShardingWait(databaseName, getThisNodeName(), true);
+							wsClosed = true;
+							close(1011, 'Sharded self-origin recovery requires a valid snapshot');
+							return;
+						}
+						selfCopyBound = Math.max(selfCopyBound, record.version, frameTxnLogKey);
+					}
+					if (record.type === 'invalidate' && !Table) {
+						wsClosed = true;
+						close(1011, 'Missing sharding table structure');
+						return;
+					}
+					if ((projectionCopy || record.type === 'invalidate') && Table?.residency) {
+						const reference = receivedResidencyLists.get(record.residencyId);
+						const slot =
+							reference && !Array.isArray(reference)
+								? resolveSlotReference(Table, record.recordId, reference, referenceSnapshots.get(reference))
+								: undefined;
+						if (
+							(Table.residency.byAttribute && slot === undefined) ||
+							Table.getRecordResidency({ key: record.recordId, residencySlot: slot }).includes(server.hostname)
+						) {
+							recordShardingWait(databaseName, remoteNodeName, true);
+							wsClosed = true;
+							close(1011, 'An owned sharding slot requires a complete record body');
+							return;
+						}
+					}
+					decoder.position = start + length;
+				}
+			}
+			if (selfCopyBound) {
+				try {
+					await noteShardingCopyBound(databaseName, selfCopyBound, remoteNodeName);
+				} catch (error) {
+					logger.warn?.(connectionId, 'Holding sharding copy until its origin bound is durable', error);
+					wsClosed = true;
+					close(1011, 'Sharding copy origin bound is not durable');
+					return;
+				}
+				if (connectionSuperseded()) return;
 			}
 			decoder.position = 8;
 			let beginTxn = true;
@@ -9535,7 +10397,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// (waitForDrain / setImmediate) and ws does not serialize async message handlers, so a later
 			// COPY_COMPLETE could otherwise flip copyCompleteReceived mid-body and make trailing rows fall back to
 			// the audited/resequencing path — reintroducing the O(n) copy-time work this avoids. (harper-pro#480)
-			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
 			// a copy frame's key is a walk position, not a log key
 			const recordFrameOrigins = !messageIsCopyFrame && recordsOriginCursors();
 			// almost every frame holds one origin; a second one allocates
@@ -9588,6 +10449,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					);
 					wsClosed = true;
 					close(1011, 'invalid replication record version');
+					return;
+				}
+				const localSourceNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
+				if (localSourceNodeId === undefined) throw new Error(`No node name mapped for origin id ${auditRecord.nodeId}`);
+				if (!projectionCopy && restrictedOrigins && localSourceNodeId !== directShardingOriginId) {
+					refuseShardingSource(getNodeNameForId(auditStore, localSourceNodeId, true));
 					return;
 				}
 				const tableDecoder = tableDecoders[auditRecord.tableId];
@@ -9692,7 +10559,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				let residencyList;
 				if (auditRecord.residencyId) {
-					residencyList = receivedResidencyLists[auditRecord.residencyId];
+					residencyList = receivedResidencyLists.get(auditRecord.residencyId);
+					if (
+						residencyList === undefined &&
+						(tableDecoder.table?.residency ||
+							auditRecord.residencyId >= 0x80000000 ||
+							!receivedResidencyLists.has(auditRecord.residencyId))
+					) {
+						wsClosed = true;
+						close(1011, 'unknown sharding reference');
+						throw new Error('Unknown connection sharding reference; holding replication cursor');
+					}
 					logger.trace?.(
 						connectionId,
 						'received residency list',
@@ -9702,6 +10579,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					);
 				}
 				const id = auditRecord.recordId;
+				let residencySlot: number | undefined;
+				if (
+					residencyList &&
+					!Array.isArray(residencyList) &&
+					(!tableDecoder.table?.residency || !isResidencyRecord(auditRecord.type))
+				) {
+					if (connectionSuperseded()) return;
+					const error = new Error('Received a slot reference without its table policy');
+					recordResidencyPolicyAgreement(databaseName, remoteNodeName, error);
+					throw error;
+				}
+
+				let incompleteCopyTie = false;
 				const copyStored =
 					messageIsCopyFrame && auditRecord.extendedType & HAS_BLOBS
 						? await resolveCopyFrameStoredBlobs(
@@ -9710,7 +10600,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								auditRecord.version,
 								remoteShortIdToLocalId?.get(auditRecord.nodeId),
 								blobFileMissingOrIncompleteAsync,
-								repairDeclines
+								repairDeclines,
+								copyCertification
+									? async (value) => {
+											const complete = await storedBlobsAreComplete(value);
+											incompleteCopyTie = !complete;
+											return complete;
+										}
+									: undefined
 							)
 						: undefined;
 				if (connectionSuperseded()) return;
@@ -9740,7 +10637,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						continue;
 					}
 				}
-				const isCopyApply = messageIsCopyFrame && copyApplyActive() && frameTxnLogKey < copyModeStartTime;
+				const isCopyApply =
+					messageIsCopyFrame &&
+					copyApplyActive() &&
+					(frameTxnLogKey < copyModeStartTime ||
+						(tableDecoder.table?.residency && localSourceNodeId === 0) ||
+						(STORAGE_IS_ROCKSDB && auditRecord.type === 'invalidate'));
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
 				// Dangling-blob repair pairing (#699): computed only for blob-carrying records in the windows
@@ -9751,8 +10653,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// decodeBlobsWithWrites: getEntry decodes the stored value, and doing that while this
 				// record's blob callback is installed re-enters the callback on the stored record's own blob
 				// references (unbounded recursion).
-				const localSourceNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
-				if (localSourceNodeId === undefined) throw new Error(`No node name mapped for origin id ${auditRecord.nodeId}`);
+
 				if (recordFrameOrigins) {
 					if (frameOrigin === undefined) frameOrigin = localSourceNodeId;
 					else if (frameOrigin !== localSourceNodeId && !frameMoreOrigins?.includes(localSourceNodeId))
@@ -9806,6 +10707,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					if (connectionSuperseded()) return;
 				}
+				if (messageIsCopyFrame && copyCertification && incompleteCopyTie && !copyCertificateRevoked) {
+					copyCertificateRevoked = true;
+					await revokeShardingCertificate(databaseName);
+				}
+				// Async repair inspection may have outlived this socket; do not mint files after its close sweep.
+				if (connectionSuperseded()) return;
 				let repairIndex = 0;
 				try {
 					maybeInjectDecodeFailureForTest(id);
@@ -9818,6 +10725,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								nodeId: localSourceNodeId,
 								viaNodeId: receivingDataFromNodeIds[0],
 								residencyList,
+								residencySlot,
 								timestamp: STORAGE_IS_ROCKSDB ? frameTxnLogKey : auditRecord.version,
 								version: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
@@ -9878,6 +10786,37 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							auditRecord,
 							error
 						);
+					}
+				}
+				if (event && tableDecoder.table?.residency && isResidencyRecord(auditRecord.type)) {
+					const Table = tableDecoder.table;
+					try {
+						if (residencyList && !Array.isArray(residencyList)) {
+							const slot = resolveSlotReference(Table, id, residencyList, referenceSnapshots.get(residencyList));
+							if (Table.residency.byAttribute) residencySlot = slot;
+						} else if (Table.residency.byAttribute) {
+							if (auditRecord.type !== 'put')
+								throw new Error('An attribute sharding update requires a slot-capable sender or a complete record');
+							residencySlot = Table.getResidencySlot(id, event.value);
+						}
+						if (
+							Table.residency.byAttribute &&
+							residencyList &&
+							!Array.isArray(residencyList) &&
+							auditRecord.type === 'put' &&
+							Table.getResidencySlot(id, event.value) !== residencySlot
+						)
+							throw new Error(`Peer sent an incorrect attribute-derived slot for ${databaseName}.${Table.tableName}`);
+						Table.getRecordResidency({ key: id, residencySlot });
+						event.residencyList = undefined;
+						event.residencySlot = residencySlot;
+					} catch (error) {
+						if (receivedBlobs) setTimeout(() => receivedBlobs.forEach(deleteBlob), 60000).unref();
+						if (connectionSuperseded()) return;
+						if (error.statusCode !== 503) recordResidencyMapAgreement(databaseName, remoteNodeName, error);
+						wsClosed = true;
+						close(1011, 'sharding agreement failed');
+						throw error;
 					}
 				}
 				if (!event && !(await recordReplicationHole(localSourceNodeId, tableDecoder.name, 'undecodable record')))
@@ -9965,7 +10904,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// boundary transaction audited.
 					event.isCopyApply = isCopyApply;
 					// every copy frame, and a relayed entry of one (COPIED_RECORD), carries a copied body: never certified
-					if (messageIsCopyFrame || auditRecord.extendedType & COPIED_RECORD) event.copyFrame = true;
+					event.copyFrame = messageIsCopyFrame || Boolean(auditRecord.extendedType & COPIED_RECORD);
 					// Record which tables actually received an audit-less snapshot row so only those get a
 					// reload marker at copy finalization (harper-pro#495). isCopyApply is exactly "invisible to
 					// live subscribers" — a copy frame at or after copyStartTime carries a real audit entry
@@ -10055,7 +10994,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					isCopyFrame || maxBatchTxnLogKey == null
 						? lastSequenceIdReceived
 						: Math.max(lastSequenceIdReceived ?? 0, maxBatchTxnLogKey), // resume cursor from the batch even without a sequence-update
-				remoteNodeIds: receivingDataFromNodeIds,
+				remoteNodeIds: projectionCopy ? [] : receivingDataFromNodeIds,
 				txnStream,
 				// core skips this frame's onCommit when the transaction fails, so release what onCommit would have;
 				// a failed sequence-row write comes after onCommit already did
@@ -10121,14 +11060,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (frameOrigin !== undefined) noteOriginProgress(frameOrigin, frameTxnLogKey);
 					if (frameMoreOrigins) for (const originId of frameMoreOrigins) noteOriginProgress(originId, frameTxnLogKey);
 					endTxnEvent.originCursors = takeDurableOriginCursors();
-					pendingOriginFloors.takeForCommit(endTxnEvent, cursorBlockedByBlob());
+					if (!projectionCopy) pendingOriginFloors.takeForCommit(endTxnEvent, cursorBlockedByBlob());
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
 					// (frameTxnLogKey < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
 					// core persists [seq] = copyStartTime. Otherwise a small copy that finished before the cadence
 					// flush persists the cursor with rows still in the memtable and no copyCursor, and a crash loses
 					// them (resume-from-seq skips pre-copyStartTime rows). core awaits this onCommit, then calls
 					// updateRecordedSequenceId, so awaiting the flush here orders flush-before-seq. (harper-pro#480)
-					if (inCopyMode && copyModeStartTime > 0 && lastDurableSequenceId >= copyModeStartTime) {
+					if (!projectionCopy && inCopyMode && copyModeStartTime > 0 && lastDurableSequenceId >= copyModeStartTime) {
 						if (copyApplyActive()) await flushCopyRowsDurable();
 						if (
 							currentCopyPass &&
@@ -10170,24 +11109,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// This restores the original unconditional maybeFinishCopy() call; the blob-durability gate
 					// now lives inside flushDurableCopyCursor()/maybeFinishCopy().
 					flushDurableCopyCursor();
-					if (!lastSequenceIdCommitted && sequenceIdReceived) {
-						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
-						setTimeout(() => {
-							// Gate the receipt on the durable watermark. Now that onCommit no longer awaits the
-							// blob saves, a commit's blobs may still be in flight at send time; confirming the raw
-							// committed sequence would tell the sender we durably hold past `lastDurableSequenceId`
-							// and let it discard a blob we haven't yet saved. Clamp to the watermark so we never
-							// claim durability beyond what we'd actually resume from after a crash. (Copy frames
-							// already awaited their blobs above, so the watermark covers them too.)
-							const confirmed = Math.min(lastSequenceIdCommitted, lastDurableSequenceId);
-							ws.send(encode([COMMITTED_UPDATE, confirmed]));
-							logger.trace?.(connectionId, 'sent confirmation of a commit at', confirmed);
-							lastSequenceIdCommitted = null;
-						}, COMMITTED_UPDATE_DELAY);
-					}
-					if (sequenceIdReceived) {
-						lastSequenceIdCommitted = sequenceIdReceived;
-					}
+					queueCommitConfirmation(sequenceIdReceived);
 					logger.debug?.(
 						'last sequence committed',
 						lastSequenceIdCommitted ? new Date(lastSequenceIdCommitted) : 'none',
@@ -10339,12 +11261,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (instanceRetired) return;
 		instanceRetired = true;
 		wsClosed = true;
+		stopShardingConfigurationWatch();
+		residencySender?.close();
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
 		if (options.connection?.peerCapabilities === peerCapabilities) {
 			options.connection.peerCapabilities = undefined;
 			// the peer's floor capability describes this socket; the replacement writes its own
-			if (replicationSharedStatus && ownsPeerCertifiesFloorsSlot())
+			if (replicationSharedStatus && ownsPeerCertifiesFloorsSlot()) {
 				replicationSharedStatus[PEER_CERTIFIES_FLOORS_POSITION] = 0;
+				publishShardingCertificate(replicationSharedStatus, undefined, undefined);
+			}
 		}
 		pendingSubscriptionSetupRequestId = undefined;
 		clearInterval(sendPingInterval);
@@ -10377,7 +11303,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`);
 		}
 		if (auditSubscription) auditSubscription.emit('close');
-		if (subscriptionRequest) subscriptionRequest.end();
 		// Wake queued blob senders and writer waits so they observe wsClosed instead of parking forever
 		while (blobSentCallbacks.length > 0) blobSentCallbacks.shift()?.();
 		for (const callbacks of blobFileSentCallbacks.values()) {
@@ -11011,6 +11936,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 				})
 				.finally(() => {
+					if (saveFailed && !copyBlobGapped && copyCertification) {
+						try {
+							const table = getDatabases()[databaseName]?.[tableName];
+							if (
+								table?.residency &&
+								(table.residency.byAttribute ||
+									residencyIsLocal(databaseName, table.getResidencySlot(id), table.residency.slots))
+							)
+								failedOwnedBlobSaves++;
+						} catch (error) {
+							failedOwnedBlobSaves++;
+							logger.warn?.(`Could not classify failed blob for ${databaseName}.${tableName} record ${id}`, error);
+						}
+					}
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
 					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
 					if (!saveFailed) {
@@ -11107,6 +12046,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// a removed node leaves a tombstone, which reads as a clean null; an undecodable row stays a member
 				(name) => probeNodeRow(getHDBNodeTable().primaryStore, name).outcome !== 'deleted',
 				certifiesOriginFloors(),
+				shardingCursorAdmission(databaseName, store),
 				// a copy's rows carry no audit entries, so its request proves no prefix for anyone
 				recordOptimistic && certifiesCheckpointFloors() && !requestIsCopy
 					? (originId, start, generation) => {
@@ -11137,6 +12077,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	function sendSubscriptionRequestUpdate() {
+		refreshShardingAdmission();
 		// once we have received the node name, and we know the database name that this connection is for,
 		// we can send a subscription request, if no other threads have subscribed.
 		if (!subscribed) {
@@ -11150,6 +12091,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// config (harper-pro#498).
 			if (options.connection) {
 				options.connection.on('exclusion-origins-updated', (origins: string[]) => {
+					refreshShardingAdmission();
+					if (restrictedOrigins) return;
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
 							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
@@ -11195,7 +12138,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				start: Symbol.for('seq'),
 				end: [Symbol.for('seq'), Buffer.from([0xff])],
 			});
-			if (seqEntries) lastTxnTimes = collectLastTxnTimes(seqEntries);
+			if (seqEntries && !shardingLayout(databaseName)) lastTxnTimes = collectLastTxnTimes(seqEntries);
 		} catch (error) {
 			// if the database is closed, just proceed (matches multiple error messages)
 			if (!error.message.includes('Can not re')) throw error;
@@ -11210,416 +12153,459 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		let directFloorOnlyStart: number | undefined;
 		let directFloorOnlyGeneration: string | undefined;
 		copiedVersionByOrigin.clear();
-		const nodeSubscriptions = options.connection?.nodeSubscriptions?.map((node: any) => {
-			const tableSubs = [];
-			let { replicateByDefault } = node;
-			// Tables excluded by this node's receivesFrom config for this peer+database
-			const receiverExcludedTables = getExcludedTablesForRouteEntries(
-				node.routeReplicates?.receivesFrom,
-				node.name,
-				databaseName
-			);
-			if (node.subscriptions) {
-				// if the node has explicit subscriptions, we need to use that to determine subscriptions
-				for (const subscription of node.subscriptions) {
-					// if there is an explicit subscription listed
-					if (subscription.subscribe && (subscription.schema || subscription.database) === databaseName) {
-						const tableName = subscription.table;
-						if (tableReplicates(tables?.[tableName]) && !receiverExcludedTables?.has(tableName))
-							// if replication is enabled for this table and not excluded
+		const nodeSubscriptions = options.connection?.nodeSubscriptions
+			?.filter((node: any) => {
+				const admitted = !restrictedOrigins || node.name === remoteNodeName;
+				if (!admitted) recordShardingWait(databaseName, node.name, true);
+				return admitted;
+			})
+			?.map((node: any) => {
+				const tableSubs = [];
+				let { replicateByDefault } = node;
+				// Tables excluded by this node's receivesFrom config for this peer+database
+				const receiverExcludedTables = getExcludedTablesForRouteEntries(
+					node.routeReplicates?.receivesFrom,
+					node.name,
+					databaseName
+				);
+				if (node.subscriptions) {
+					// if the node has explicit subscriptions, we need to use that to determine subscriptions
+					for (const subscription of node.subscriptions) {
+						// if there is an explicit subscription listed
+						if (subscription.subscribe && (subscription.schema || subscription.database) === databaseName) {
+							const tableName = subscription.table;
+							if (tableReplicates(tables?.[tableName]) && !receiverExcludedTables?.has(tableName))
+								// if replication is enabled for this table and not excluded
+								tableSubs.push(tableName);
+						}
+					}
+					replicateByDefault = false; // now turn off the default replication because it was an explicit list of subscriptions
+				} else {
+					// note that if replicateByDefault is enabled, we are listing the *excluded* tables
+					for (const tableName in tables) {
+						if (
+							replicateByDefault
+								? !tableReplicates(tables[tableName]) || receiverExcludedTables?.has(tableName)
+								: tables[tableName].replicate && !receiverExcludedTables?.has(tableName)
+						) {
 							tableSubs.push(tableName);
+						}
 					}
 				}
-				replicateByDefault = false; // now turn off the default replication because it was an explicit list of subscriptions
-			} else {
-				// note that if replicateByDefault is enabled, we are listing the *excluded* tables
-				for (const tableName in tables) {
-					if (
-						replicateByDefault
-							? !tableReplicates(tables[tableName]) || receiverExcludedTables?.has(tableName)
-							: tables[tableName].replicate && !receiverExcludedTables?.has(tableName)
-					) {
-						tableSubs.push(tableName);
-					}
-				}
-			}
 
-			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
-			auditStore?.ensureLogExists?.(node.name);
-			const sequenceEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
-			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
-			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
-			// data predates copyStartTime and would never be delivered by an audit-log resume).
-			let copyCursor = maybeInjectCopyCursorForTest(
-				discardMalformedCopyCursor(
-					nodeId === undefined ? undefined : readDbisCursorSync(dbisDB, 'copyCursor', nodeId),
-					dbisDB,
-					nodeId,
-					() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
-				),
-				databaseName
-			);
-			loadPersistedCopyBounds(copyCursor);
-			mergeCopyBoundRecordInto(copiedVersionByOrigin, copyCursor?.maxCopiedVersionByOrigin);
-			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
-			const copyCompletion = cloneAttempt ? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId) : undefined;
-			if (!copyCursor && matchesCloneCopyCompletion(copyCompletion, cloneAttempt)) {
-				const sharedStatus = getSharedStatus();
-				if (sharedStatus)
-					sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
-						sharedStatus[RECEIVED_VERSION_POSITION],
-						copyCompletion.copyStartTime!
-					);
-			}
-			// if we are connected directly to the node, we start from the last sequence number we received at the top level
-			// setNode persists the operator's start point as `start_time` (snake); routes/the Node type use
-			// `startTime` (camel). Read both, else an add_node start point is dropped and the join full-copies.
-			const nodeStartTime = node.startTime ?? (node as any).start_time;
-			const parsedStartTime = typeof nodeStartTime === 'string' ? new Date(nodeStartTime).getTime() : nodeStartTime;
-			// setNode validates start_time at the boundary, so a non-finite value here is a legacy/corrupt
-			// stored row: warn and ignore it rather than letting NaN poison the resume bound.
-			if (nodeStartTime != null && !Number.isFinite(parsedStartTime))
-				logger.warn?.('Ignoring unparseable stored start_time for node', node.name, nodeStartTime);
-			// Never apply the operator's data cutoff to the system database: a joining node needs its cluster
-			// metadata (auth, roles, membership, schema) in full, so only user databases honor start_time.
-			const startCutoff = databaseName === 'system' || !Number.isFinite(parsedStartTime) ? undefined : parsedStartTime;
-			let startTime = Math.max(sequenceEntry?.seqId ?? 1, startCutoff ?? 1);
-			// A genuine resume = we have a persisted last-received sequence id (>1) for this node. Only then
-			// does the leader re-stream an already-applied tail worth fast-skipping. A fresh subscription
-			// (no persisted seqId, which later falls back to a full copy, startTime 0) has no such tail, so we
-			// must NOT arm the latch from that synthetic start point. This checks the DIRECT sequence cursor;
-			// a proxied/indirect subscription has no direct cursor and instead arms from `proxiedSkipCursor`
-			// (set in the indirect block below).
-			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
-			let floorOnlyStart: number | undefined;
-			let floorOnlyGeneration: string | undefined;
-			if (copyCursor) requestIsCopy = true;
-			const allNodes: any[] = (sequenceEntry?.nodes ?? [])
-				.filter((state: any) => state && typeof state.id === 'number')
-				.map((state: any) => ({ ...state }));
-			const level2Rows: any[] = allNodes.filter((state: any) => typeof state.originGeneration === 'string');
-			const downgradedInPass = new Set<number>();
-			if (nodeId !== undefined && connectedNode === node && peerCapabilitiesLearned && !certifiesCheckpointFloors()) {
-				// the peer stopped certifying at level 2 (a rollback, or a downgrade to none): it may write below
-				// the floor it certified, and nothing it relayed is checkpoint-grade any more
-				for (const state of level2Rows) {
-					revokedOrigins.set(state.id, state.originGeneration);
-					if (state.floorRevoked !== true) downgradedInPass.add(state.id);
-					pendingRouteState.revoke(state.id, state.originGeneration);
-					state.floorRevoked = true;
-					state.closedFloor = undefined;
+				const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
+				auditStore?.ensureLogExists?.(node.name);
+				const sequenceEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
+				// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
+				// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
+				// data predates copyStartTime and would never be delivered by an audit-log resume).
+				let copyCursor = maybeInjectCopyCursorForTest(
+					discardMalformedCopyCursor(
+						nodeId === undefined ? undefined : readDbisCursorSync(dbisDB, 'copyCursor', nodeId),
+						dbisDB,
+						nodeId,
+						() =>
+							logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
+					),
+					databaseName
+				);
+				loadPersistedCopyBounds(copyCursor);
+				mergeCopyBoundRecordInto(copiedVersionByOrigin, copyCursor?.maxCopiedVersionByOrigin);
+				const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
+				const copyCompletion = cloneAttempt ? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId) : undefined;
+				if (!copyCursor && matchesCloneCopyCompletion(copyCompletion, cloneAttempt)) {
+					const sharedStatus = getSharedStatus();
+					if (sharedStatus)
+						sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+							sharedStatus[RECEIVED_VERSION_POSITION],
+							copyCompletion.copyStartTime!
+						);
 				}
-			}
-			optimisticCertifiedOrigins.clear();
-			for (const state of allNodes) {
-				const stateGen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
-				if (stateGen === undefined && pendingRouteState.hasPendingRevocation(state.id)) {
-					state.closedFloor = undefined;
-					state.relayable = false;
-				}
-				if (state.partialHistory === true) {
-					partialMarked.set(state.id, stateGen);
-				} else if (partialMarked.has(state.id)) {
-					const partialGen = partialMarked.get(state.id);
-					if (partialGen !== undefined && stateGen !== undefined && stateGen !== partialGen) {
-						partialMarked.delete(state.id);
-					} else if (stateGen !== undefined || partialGen === undefined) {
-						pendingRouteState.partialHistory(state.id, true, stateGen !== undefined ? partialGen : undefined);
-						state.partialHistory = true;
-						state.certifiedFrom = undefined;
-					}
-				}
-				if (state.hole === true) {
-					holedOrigins.set(state.id, stateGen);
-				} else if (holedOrigins.has(state.id)) {
-					const holedGen = holedOrigins.get(state.id);
-					if (holedGen !== undefined && stateGen !== undefined && stateGen !== holedGen) {
-						holedOrigins.delete(state.id);
-					} else if (stateGen !== undefined || holedGen === undefined) {
-						pendingRouteState.hole(state.id, stateGen !== undefined ? holedGen : undefined);
-						state.hole = true;
-					}
-				}
-				if (revokedOrigins.has(state.id) && !downgradedInPass.has(state.id)) {
-					const revokedGen = revokedOrigins.get(state.id);
-					if (
-						state.floorRevoked === true ||
-						(revokedGen !== undefined && stateGen !== undefined && stateGen !== revokedGen)
-					) {
-						revokedOrigins.delete(state.id);
-					} else if (stateGen !== undefined) {
-						pendingRouteState.revoke(state.id, revokedGen ?? stateGen);
+				// if we are connected directly to the node, we start from the last sequence number we received at the top level
+				// setNode persists the operator's start point as `start_time` (snake); routes/the Node type use
+				// `startTime` (camel). Read both, else an add_node start point is dropped and the join full-copies.
+				const nodeStartTime = node.startTime ?? (node as any).start_time;
+				const parsedStartTime = typeof nodeStartTime === 'string' ? new Date(nodeStartTime).getTime() : nodeStartTime;
+				// setNode validates start_time at the boundary, so a non-finite value here is a legacy/corrupt
+				// stored row: warn and ignore it rather than letting NaN poison the resume bound.
+				if (nodeStartTime != null && !Number.isFinite(parsedStartTime))
+					logger.warn?.('Ignoring unparseable stored start_time for node', node.name, nodeStartTime);
+				// Never apply the operator's data cutoff to the system database: a joining node needs its cluster
+				// metadata (auth, roles, membership, schema) in full, so only user databases honor start_time.
+				const startCutoff =
+					databaseName === 'system' || !Number.isFinite(parsedStartTime) ? undefined : parsedStartTime;
+				let startTime = Math.max(sequenceEntry?.seqId ?? 1, startCutoff ?? 1);
+				// A genuine resume = we have a persisted last-received sequence id (>1) for this node. Only then
+				// does the leader re-stream an already-applied tail worth fast-skipping. A fresh subscription
+				// (no persisted seqId, which later falls back to a full copy, startTime 0) has no such tail, so we
+				// must NOT arm the latch from that synthetic start point. This checks the DIRECT sequence cursor;
+				// a proxied/indirect subscription has no direct cursor and instead arms from `proxiedSkipCursor`
+				// (set in the indirect block below).
+				const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
+				let floorOnlyStart: number | undefined;
+				let floorOnlyGeneration: string | undefined;
+				if (copyCursor) requestIsCopy = true;
+				const allNodes: any[] = (sequenceEntry?.nodes ?? [])
+					.filter((state: any) => state && typeof state.id === 'number')
+					.map((state: any) => ({ ...state }));
+				const level2Rows: any[] = allNodes.filter((state: any) => typeof state.originGeneration === 'string');
+				const downgradedInPass = new Set<number>();
+				if (nodeId !== undefined && connectedNode === node && peerCapabilitiesLearned && !certifiesCheckpointFloors()) {
+					// the peer stopped certifying at level 2 (a rollback, or a downgrade to none): it may write below
+					// the floor it certified, and nothing it relayed is checkpoint-grade any more
+					for (const state of level2Rows) {
+						revokedOrigins.set(state.id, state.originGeneration);
+						if (state.floorRevoked !== true) downgradedInPass.add(state.id);
+						pendingRouteState.revoke(state.id, state.originGeneration);
 						state.floorRevoked = true;
 						state.closedFloor = undefined;
 					}
 				}
-				const copyBound = maxCopiedVersionByOrigin.get(state.id);
-				if (copyBound !== undefined) {
-					clearCopyBoundedCertification(state.id, copyBound, state);
-				}
-			}
-			let forceFullCopyOnWidening = false;
-			if (
-				nodeId !== undefined &&
-				connectedNode === node &&
-				options.connection &&
-				supportsCheckpointFloors() &&
-				certifiesCheckpointFloors()
-			) {
-				const fullCoverage = (options.connection.exclusionOrigins ?? []).includes(node.name);
-				const previous = options.connection.routeFullCoverage;
-				options.connection.routeFullCoverage = fullCoverage;
-				const ownState = allNodes.find((state) => state.id === nodeId);
-				const copyFromPartialCoverage =
-					copyCursor?.fullCoverage === true
-						? Boolean(copyCursor.widened === true || previous === false)
-						: Boolean(
-								copyCursor?.widened === true ||
-								copyCursor?.fullCoverage === false ||
-								previous === false ||
-								ownState?.fullCoverage === false
-							);
-				const persistedPartial = ownState?.partialHistory === true;
-				const narrowedFromFullCoverage =
-					!fullCoverage &&
-					(previous === true ||
-						allNodes.some((state) => state.fullCoverage === true || typeof state.certifiedFrom === 'number'));
-				if (
-					(fullCoverage && (copyFromPartialCoverage || persistedPartial)) ||
-					copyCursor?.widened === true ||
-					narrowedFromFullCoverage
-				) {
-					for (const state of allNodes) {
-						const gen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
-						pendingRouteState.partialHistory(state.id, true, gen);
-						partialMarked.set(state.id, gen);
+				optimisticCertifiedOrigins.clear();
+				for (const state of allNodes) {
+					const stateGen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
+					if (stateGen === undefined && pendingRouteState.hasPendingRevocation(state.id)) {
+						state.closedFloor = undefined;
+						state.relayable = false;
 					}
-					if (!allNodes.some((state) => state.id === nodeId)) {
-						pendingRouteState.partialHistory(nodeId, true);
-						partialMarked.set(nodeId, undefined);
-					}
-					if (fullCoverage && copyCursor && copyFromPartialCoverage) {
-						copyCursor = { ...copyCursor, widened: undefined, fullCoverage: true, restartFullCopy: true };
-						try {
-							dbisDB
-								?.put?.([Symbol.for('copyCursor'), nodeId], copyCursor)
-								?.catch?.((error: unknown) =>
-									logger.warn?.(connectionId, 'could not persist restarted full-copy cursor for', databaseName, error)
-								);
-						} catch (error) {
-							logger.warn?.(connectionId, 'could not persist restarted full-copy cursor for', databaseName, error);
+					if (state.partialHistory === true) {
+						partialMarked.set(state.id, stateGen);
+					} else if (partialMarked.has(state.id)) {
+						const partialGen = partialMarked.get(state.id);
+						if (partialGen !== undefined && stateGen !== undefined && stateGen !== partialGen) {
+							partialMarked.delete(state.id);
+						} else if (stateGen !== undefined || partialGen === undefined) {
+							pendingRouteState.partialHistory(state.id, true, stateGen !== undefined ? partialGen : undefined);
+							state.partialHistory = true;
+							state.certifiedFrom = undefined;
 						}
-					} else if (
-						fullCoverage &&
-						(previous === false || ownState?.fullCoverage === false || ownState?.partialHistory === true) &&
-						!copyCursor
-					) {
-						forceFullCopyOnWidening = true;
-						requestIsCopy = true;
-						logger.warn?.(
-							connectionId,
-							`Route coverage widened to full for ${node.name} on database ${databaseName} without an active copy; requesting a full copy to populate newly covered tables`
-						);
+					}
+					if (state.hole === true) {
+						holedOrigins.set(state.id, stateGen);
+					} else if (holedOrigins.has(state.id)) {
+						const holedGen = holedOrigins.get(state.id);
+						if (holedGen !== undefined && stateGen !== undefined && stateGen !== holedGen) {
+							holedOrigins.delete(state.id);
+						} else if (stateGen !== undefined || holedGen === undefined) {
+							pendingRouteState.hole(state.id, stateGen !== undefined ? holedGen : undefined);
+							state.hole = true;
+						}
+					}
+					if (revokedOrigins.has(state.id) && !downgradedInPass.has(state.id)) {
+						const revokedGen = revokedOrigins.get(state.id);
+						if (
+							state.floorRevoked === true ||
+							(revokedGen !== undefined && stateGen !== undefined && stateGen !== revokedGen)
+						) {
+							revokedOrigins.delete(state.id);
+						} else if (stateGen !== undefined) {
+							pendingRouteState.revoke(state.id, revokedGen ?? stateGen);
+							state.floorRevoked = true;
+							state.closedFloor = undefined;
+						}
+					}
+					const copyBound = maxCopiedVersionByOrigin.get(state.id);
+					if (copyBound !== undefined) {
+						clearCopyBoundedCertification(state.id, copyBound, state);
 					}
 				}
-			}
-			// A floor the peer certified is a proven start, used only while the peer still certifies: a
-			// downgraded peer may write below a floor it saved.
-			if (!forceFullCopyOnWidening && hasPersistedResumeCursor && connectedNode === node && certifiesOriginFloors()) {
-				const ownState = allNodes.find((state: any) => state?.id === nodeId);
+				let forceFullCopyOnWidening = false;
 				if (
 					nodeId !== undefined &&
-					!copyCursor &&
-					certifiesCheckpointFloors() &&
-					checkpointGradeRow(ownState) &&
-					!partialMarked.has(nodeId) &&
-					!pendingRouteState.hasPendingPartialHistory(nodeId) &&
-					!pendingRouteState.hasPendingRevocation(nodeId)
+					connectedNode === node &&
+					options.connection &&
+					supportsCheckpointFloors() &&
+					certifiesCheckpointFloors()
 				) {
-					// exactly below the floor, never the higher position — a transaction reserved below the
-					// position and committed during the disconnect is re-sent instead of filtered by the sender
-					const ownFloorStart = cursorBelowFloor(ownState.closedFloor);
-					const minDirectFloorStart = maxCopiedVersionByOrigin.get(nodeId);
-					if (!(minDirectFloorStart !== undefined && ownFloorStart <= minDirectFloorStart)) {
-						startTime = ownFloorStart;
-						floorOnlyStart = startTime;
-						floorOnlyGeneration = ownState.originGeneration;
-					} else {
+					const fullCoverage = (options.connection.exclusionOrigins ?? []).includes(node.name);
+					const previous = options.connection.routeFullCoverage;
+					options.connection.routeFullCoverage = fullCoverage;
+					const ownState = allNodes.find((state) => state.id === nodeId);
+					const copyFromPartialCoverage =
+						copyCursor?.fullCoverage === true
+							? Boolean(copyCursor.widened === true || previous === false)
+							: Boolean(
+									copyCursor?.widened === true ||
+									copyCursor?.fullCoverage === false ||
+									previous === false ||
+									ownState?.fullCoverage === false
+								);
+					const persistedPartial = ownState?.partialHistory === true;
+					const narrowedFromFullCoverage =
+						!fullCoverage &&
+						(previous === true ||
+							allNodes.some((state) => state.fullCoverage === true || typeof state.certifiedFrom === 'number'));
+					if (
+						(fullCoverage && (copyFromPartialCoverage || persistedPartial)) ||
+						copyCursor?.widened === true ||
+						narrowedFromFullCoverage
+					) {
+						for (const state of allNodes) {
+							const gen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
+							pendingRouteState.partialHistory(state.id, true, gen);
+							partialMarked.set(state.id, gen);
+						}
+						if (!allNodes.some((state) => state.id === nodeId)) {
+							pendingRouteState.partialHistory(nodeId, true);
+							partialMarked.set(nodeId, undefined);
+						}
+						if (fullCoverage && copyCursor && copyFromPartialCoverage) {
+							copyCursor = { ...copyCursor, widened: undefined, fullCoverage: true, restartFullCopy: true };
+							try {
+								dbisDB
+									?.put?.([Symbol.for('copyCursor'), nodeId], copyCursor)
+									?.catch?.((error: unknown) =>
+										logger.warn?.(connectionId, 'could not persist restarted full-copy cursor for', databaseName, error)
+									);
+							} catch (error) {
+								logger.warn?.(connectionId, 'could not persist restarted full-copy cursor for', databaseName, error);
+							}
+						} else if (
+							fullCoverage &&
+							(previous === false || ownState?.fullCoverage === false || ownState?.partialHistory === true) &&
+							!copyCursor
+						) {
+							forceFullCopyOnWidening = true;
+							requestIsCopy = true;
+							logger.warn?.(
+								connectionId,
+								`Route coverage widened to full for ${node.name} on database ${databaseName} without an active copy; requesting a full copy to populate newly covered tables`
+							);
+						}
+					}
+				}
+				// A floor the peer certified is a proven start, used only while the peer still certifies: a
+				// downgraded peer may write below a floor it saved.
+				if (!forceFullCopyOnWidening && hasPersistedResumeCursor && connectedNode === node && certifiesOriginFloors()) {
+					const ownState = allNodes.find((state: any) => state?.id === nodeId);
+					if (
+						nodeId !== undefined &&
+						!copyCursor &&
+						certifiesCheckpointFloors() &&
+						checkpointGradeRow(ownState) &&
+						!partialMarked.has(nodeId) &&
+						!pendingRouteState.hasPendingPartialHistory(nodeId) &&
+						!pendingRouteState.hasPendingRevocation(nodeId)
+					) {
+						// exactly below the floor, never the higher position — a transaction reserved below the
+						// position and committed during the disconnect is re-sent instead of filtered by the sender
+						const ownFloorStart = cursorBelowFloor(ownState.closedFloor);
+						const minDirectFloorStart = maxCopiedVersionByOrigin.get(nodeId);
+						if (!(minDirectFloorStart !== undefined && ownFloorStart <= minDirectFloorStart)) {
+							startTime = ownFloorStart;
+							floorOnlyStart = startTime;
+							floorOnlyGeneration = ownState.originGeneration;
+						} else {
+							startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
+						}
+					} else if (nodeId === undefined || !pendingRouteState.hasPendingRevocation(nodeId)) {
 						startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
 					}
-				} else if (nodeId === undefined || !pendingRouteState.hasPendingRevocation(nodeId)) {
-					startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
 				}
-			}
-			if (copyCursor) {
-				copyWasResumed = !copyCursor.restartFullCopy;
-				copyResumedWithWidening = Boolean(copyCursor.widened && !copyCursor.restartFullCopy);
-			}
-			// For a proxied/indirect subscription: the relayed per-source resume cursor, used ONLY to arm the
-			// leading-duplicate fast-skip (it does not move `startTime` — see the indirect block for why).
-			let proxiedSkipCursor: number | undefined;
-			logger.debug?.(
-				'Starting time recorded in db',
-				node.name,
-				nodeId,
-				databaseName,
-				sequenceEntry?.seqId,
-				'start time:',
-				startTime,
-				new Date(startTime)
-			);
-			if (connectedNode !== node) {
-				// Indirect (proxied) subscription: this source node's writes reach us relayed through
-				// `connectedNode`. The relayed per-source resume cursor lives in the proxy connection's seq
-				// node-states, which are keyed by node *id* (see Table.ts `updateRecordedSequenceId`, which
-				// builds `{ id, seqId, lastTxnTime }` and never sets a `name`).
-				const connectedNodeId = auditStore && getIdOfRemoteNode(connectedNode.name, auditStore);
-				// getSync via readDbisCursorSync: a get() Promise on a cache miss has no `.nodes`, silently
-				// disarming the proxied leading-duplicate fast-skip (#399) and forcing the per-record walk.
-				const proxySeqEntry = readDbisCursorSync(dbisDB, 'seq', connectedNodeId);
-				for (const seqNode of proxySeqEntry?.nodes || []) {
-					// Guard `nodeId !== undefined` first: if both `nodeId` and a malformed `seqNode.id` were
-					// undefined the `===` would spuriously match an unrelated entry. (Arming is gated on a
-					// defined nodeId downstream too, but match it here so intent is explicit.)
-					const proxiedAppliedKey = Math.max(seqNode.seqId ?? 0, seqNode.originLogKey ?? 0);
-					if (nodeId !== undefined && seqNode.id === nodeId && proxiedAppliedKey > 1) {
-						// Arm the leading-duplicate fast-skip from this relayed cursor so the proxy's re-streamed
-						// already-applied tail (the high-volume out-of-order re-delivery in #399) is dropped
-						// cheaply at the receive layer instead of driving the core resequencing walk per record.
-						// We deliberately do NOT raise `startTime` from this value: the relayed seqId is the proxy
-						// connection's local time, which for an out-of-order source can sit ahead of what we have
-						// actually applied for this source, so using it as the leader's resume lower bound could
-						// skip un-applied writes. (Tightening the proxied resume start itself is #399 direction 1
-						// and needs the `lastTxnTime` overlap as a data-loss floor.) The skip stays safe regardless
-						// of this cursor's precision — it only ever elides a TRUE identity tie against the stored
-						// record, so an imprecise cursor at worst skips nothing.
-						proxiedSkipCursor = proxiedAppliedKey;
-						logger.debug?.(
-							'Proxied leading-dup-skip cursor from proxy node',
-							connectedNode.name,
-							node.name,
-							proxiedSkipCursor
-						);
-					}
+				if (copyCursor) {
+					copyWasResumed = !copyCursor.restartFullCopy;
+					copyResumedWithWidening = Boolean(copyCursor.widened && !copyCursor.restartFullCopy);
 				}
-			}
-			if (nodeId === undefined) {
-				logger.warn('Starting subscription request from node', node, 'but no node id found');
-			} else receivingDataFromNodeIds.push(nodeId);
-			// if another node had previously acted as a proxy, it may not have the same sequence ids, but we can use the last
-			// originating txn time, and sequence ids should always be higher than their originating txn time, and starting from them should overlap
-			// a floor-only start is the proven one; a recorded transaction time above it would let the sender filter
-			// what committed between them, the gap the floor exists to close
-			if (!forceFullCopyOnWidening && floorOnlyStart === undefined && lastTxnTimes.get(nodeId) > startTime) {
-				startTime = lastTxnTimes.get(nodeId);
-				logger.debug?.('Updating start time from more recent txn recorded', connectedNode.name, startTime);
-			}
-			if (
-				!forceFullCopyOnWidening &&
-				floorOnlyStart !== undefined &&
-				startTime === floorOnlyStart &&
-				nodeId !== undefined
-			) {
-				directFloorOnlyNodeId = nodeId;
-				directFloorOnlyStart = startTime;
-				directFloorOnlyGeneration = floorOnlyGeneration;
-			}
-			if (forceFullCopyOnWidening) {
-				startTime = 0;
-			} else if (startTime === 1) {
-				// We resolved no resume cursor for this source (no direct seqId, no recorded lastTxnTime).
-				// That means we have no proven baseline for it, so we must fully copy: a `Date.now() - 60000`
-				// incremental start would silently claim "I already hold everything older than a minute" and
-				// drop the un-acquired backlog. That assumption breaks when an initial copy never completed
-				// (e.g. interrupted by restart churn) — the node then resumes from now-60s and permanently
-				// loses the gap, even though it never lost the connection (harper-pro#426). A full copy is
-				// idempotent, and the leader collapses redundant requests via the per-connection
-				// min(startTime); the cost of an occasional extra copy is acceptable versus silent data loss.
-				const legacyStartForTest = maybeLegacyCursorlessResumeStartForTest(node.isLeader);
-				if (legacyStartForTest !== undefined) {
-					startTime = legacyStartForTest;
-					logger.warn?.(
-						`HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY: resuming database ${databaseName} from ${getNodeURL(node)} at ${new Date(startTime).toISOString()} with no resume cursor for this source`
-					);
-				} else {
-					if (node.isLeader) {
-						logger.warn?.(`Requesting full copy of database ${databaseName} from ${getNodeURL(node)}`);
-					} else {
-						logger.warn?.(
-							`Requesting full copy of database ${databaseName} from ${getNodeURL(node)} (no resume cursor for this source)`
-						);
-					}
-					startTime = 0; // use this to indicate that we want to fully copy
-				}
-			}
-			let copyResume;
-			if (copyCursor) {
-				startTime = 0; // request a copy; the cursor tells the leader where to resume
-				if (!copyCursor.restartFullCopy) {
-					copyResume = {
-						copyStartTime: copyCursor.copyStartTime,
-						currentTable: copyCursor.currentTable,
-						afterKey: copyCursor.afterKey,
-						copyOrder: copyCursor.copyOrder, // leader rejects the resume if this != its current COPY_ORDER_VERSION (#421)
-					};
-					logger.warn?.(
-						`Resuming interrupted copy of database ${databaseName} from ${getNodeURL(node)} at table ${copyCursor.currentTable} after key ${copyCursor.afterKey}`
-					);
-				} else {
-					logger.warn?.(
-						`Restarting full copy of database ${databaseName} from ${getNodeURL(node)} because route coverage widened during an interrupted copy`
-					);
-				}
-			}
-			logger.trace?.(connectionId, 'defining subscription request', node.name, databaseName, new Date(startTime));
-			// Arm the leading-duplicate fast-skip for this source node. Incoming records from this node with
-			// version <= the arming cursor are the already-applied tail the leader re-streams on resume.
-			//   - DIRECT resume → arm from `startTime` (the persisted direct cursor we asked to resume from).
-			//   - PROXIED resume → arm from `proxiedSkipCursor` (the relayed per-source cursor; startTime is
-			//     left conservative, so the skip absorbs the re-streamed tail #399 produces).
-			// Only arm for a genuine incremental resume from a real prior cursor:
-			//   - copyResume / startTime === 0  → a bulk copy re-streams in key order carrying original
-			//     (possibly newest) versions, so "version <= cursor" is NOT a duplicate signal there.
-			//   - no direct or proxied cursor / a fresh "now - 60s" start → no prior applied tail to dedupe.
-			// Keyed by local node id so a proxied multi-node subscription gets an independent latch.
-			// Branch on the connection type rather than falling back: a node that previously had a DIRECT
-			// subscription leaves a persisted direct cursor (`hasPersistedResumeCursor`) on disk, so once it
-			// fails over to a PROXIED subscription we must still arm from the live `proxiedSkipCursor` — a
-			// fallback that preferred the stale direct `startTime` would dedupe against an old, narrower window.
-			const leadingDupArmCursor =
-				connectedNode === node
-					? hasPersistedResumeCursor && startTime > 1
-						? Math.max(sequenceEntry?.seqId ?? 0, startTime)
-						: undefined
-					: proxiedSkipCursor;
-			if (nodeId !== undefined && !copyResume && leadingDupArmCursor !== undefined && leadingDupArmCursor > 1) {
-				leadingDupCursorByNode.set(nodeId, leadingDupArmCursor);
+				// For a proxied/indirect subscription: the relayed per-source resume cursor, used ONLY to arm the
+				// leading-duplicate fast-skip (it does not move `startTime` — see the indirect block for why).
+				let proxiedSkipCursor: number | undefined;
 				logger.debug?.(
-					connectionId,
-					'armed leading-duplicate fast-skip',
+					'Starting time recorded in db',
 					node.name,
 					nodeId,
 					databaseName,
-					connectedNode === node ? 'direct resume cursor' : 'proxied resume cursor',
-					leadingDupArmCursor
+					sequenceEntry?.seqId,
+					'start time:',
+					startTime,
+					new Date(startTime)
 				);
-			} else if (nodeId !== undefined) {
-				// Re-subscription without a resumable cursor (or a copy): clear any stale latch so we never
-				// dedupe against an old window.
-				leadingDupCursorByNode.delete(nodeId);
-			}
-			// a full copy's rows carry no audit entries either, so its request proves no prefix for anyone
-			if (startTime === 0) requestIsCopy = true;
-			return {
-				name: node.name,
-				replicateByDefault,
-				tables: tableSubs, // omitted or included based on flag above
-				startTime,
-				isLeader: node.isLeader,
-				endTime: node.endTime,
-				copyResume, // present only when resuming an interrupted bulk copy
-			};
-		});
+				if (connectedNode !== node) {
+					// Indirect (proxied) subscription: this source node's writes reach us relayed through
+					// `connectedNode`. The relayed per-source resume cursor lives in the proxy connection's seq
+					// node-states, which are keyed by node *id* (see Table.ts `updateRecordedSequenceId`, which
+					// builds `{ id, seqId, lastTxnTime }` and never sets a `name`).
+					const connectedNodeId = auditStore && getIdOfRemoteNode(connectedNode.name, auditStore);
+					// getSync via readDbisCursorSync: a get() Promise on a cache miss has no `.nodes`, silently
+					// disarming the proxied leading-duplicate fast-skip (#399) and forcing the per-record walk.
+					const proxySeqEntry = readDbisCursorSync(dbisDB, 'seq', connectedNodeId);
+					for (const seqNode of proxySeqEntry?.nodes || []) {
+						// Guard `nodeId !== undefined` first: if both `nodeId` and a malformed `seqNode.id` were
+						// undefined the `===` would spuriously match an unrelated entry. (Arming is gated on a
+						// defined nodeId downstream too, but match it here so intent is explicit.)
+						const proxiedAppliedKey = Math.max(seqNode.seqId ?? 0, seqNode.originLogKey ?? 0);
+						if (nodeId !== undefined && seqNode.id === nodeId && proxiedAppliedKey > 1) {
+							// Arm the leading-duplicate fast-skip from this relayed cursor so the proxy's re-streamed
+							// already-applied tail (the high-volume out-of-order re-delivery in #399) is dropped
+							// cheaply at the receive layer instead of driving the core resequencing walk per record.
+							// We deliberately do NOT raise `startTime` from this value: the relayed seqId is the proxy
+							// connection's local time, which for an out-of-order source can sit ahead of what we have
+							// actually applied for this source, so using it as the leader's resume lower bound could
+							// skip un-applied writes. (Tightening the proxied resume start itself is #399 direction 1
+							// and needs the `lastTxnTime` overlap as a data-loss floor.) The skip stays safe regardless
+							// of this cursor's precision — it only ever elides a TRUE identity tie against the stored
+							// record, so an imprecise cursor at worst skips nothing.
+							proxiedSkipCursor = proxiedAppliedKey;
+							logger.debug?.(
+								'Proxied leading-dup-skip cursor from proxy node',
+								connectedNode.name,
+								node.name,
+								proxiedSkipCursor
+							);
+						}
+					}
+				}
+				if (nodeId === undefined) {
+					logger.warn('Starting subscription request from node', node, 'but no node id found');
+				} else receivingDataFromNodeIds.push(nodeId);
+				// if another node had previously acted as a proxy, it may not have the same sequence ids, but we can use the last
+				// originating txn time, and sequence ids should always be higher than their originating txn time, and starting from them should overlap
+				// a floor-only start is the proven one; a recorded transaction time above it would let the sender filter
+				// what committed between them, the gap the floor exists to close
+				if (!forceFullCopyOnWidening && floorOnlyStart === undefined && lastTxnTimes.get(nodeId) > startTime) {
+					startTime = lastTxnTimes.get(nodeId);
+					logger.debug?.('Updating start time from more recent txn recorded', connectedNode.name, startTime);
+				}
+				if (
+					!forceFullCopyOnWidening &&
+					floorOnlyStart !== undefined &&
+					startTime === floorOnlyStart &&
+					nodeId !== undefined
+				) {
+					directFloorOnlyNodeId = nodeId;
+					directFloorOnlyStart = startTime;
+					directFloorOnlyGeneration = floorOnlyGeneration;
+				}
+				if (forceFullCopyOnWidening) {
+					startTime = 0;
+				} else if (startTime === 1) {
+					// We resolved no resume cursor for this source (no direct seqId, no recorded lastTxnTime).
+					// That means we have no proven baseline for it, so we must fully copy: a `Date.now() - 60000`
+					// incremental start would silently claim "I already hold everything older than a minute" and
+					// drop the un-acquired backlog. That assumption breaks when an initial copy never completed
+					// (e.g. interrupted by restart churn) — the node then resumes from now-60s and permanently
+					// loses the gap, even though it never lost the connection (harper-pro#426). A full copy is
+					// idempotent, and the leader collapses redundant requests via the per-connection
+					// min(startTime); the cost of an occasional extra copy is acceptable versus silent data loss.
+					const legacyStartForTest = maybeLegacyCursorlessResumeStartForTest(node.isLeader);
+					if (legacyStartForTest !== undefined) {
+						startTime = legacyStartForTest;
+						logger.warn?.(
+							`HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY: resuming database ${databaseName} from ${getNodeURL(node)} at ${new Date(startTime).toISOString()} with no resume cursor for this source`
+						);
+					} else {
+						if (node.isLeader) {
+							logger.warn?.(`Requesting full copy of database ${databaseName} from ${getNodeURL(node)}`);
+						} else {
+							logger.warn?.(
+								`Requesting full copy of database ${databaseName} from ${getNodeURL(node)} (no resume cursor for this source)`
+							);
+						}
+						startTime = 0; // use this to indicate that we want to fully copy
+					}
+				}
+				let shardingProjection = false;
+				if (admittedLayout && restrictedOrigins) {
+					const complete = (nodeId === undefined
+						? undefined
+						: dbisDB?.getSync([Symbol.for('shardingProjectionComplete'), nodeId])) as unknown as
+						{ agreement: string; anchor: number } | undefined;
+					const floor = shardingInitialFloor(databaseName, node.name);
+					if (complete?.agreement === admittedLayout && floor !== undefined) {
+						startTime = Math.max(
+							sequenceEntry?.seqId ?? 0,
+							Math.min(floor, complete.anchor),
+							lastTxnTimes.get(nodeId) ?? 0
+						);
+					} else {
+						startTime = 0;
+						shardingProjection = true;
+						projectionRequested = true;
+					}
+				}
+				const ownedCopyPending =
+					nodeId === undefined || copyCursor || restrictedOrigins
+						? undefined
+						: (dbisDB?.getSync([OWNED_COPY_PENDING, nodeId]) as { layout: string } | undefined);
+				if (ownedCopyPending) {
+					if (
+						ownedCopyPending.layout === shardingLayout(databaseName) &&
+						shardingCertificate(databaseName) !== ownedCopyPending.layout
+					) {
+						startTime = 0;
+						logger.warn?.(
+							`Requesting full copy of database ${databaseName} from ${getNodeURL(node)}: its owned copy was not certified`
+						);
+					} else dbisDB.remove([OWNED_COPY_PENDING, nodeId]);
+				}
+				let copyResume;
+				if (copyCursor && !shardingProjection) {
+					startTime = 0; // request a copy; the cursor tells the leader where to resume
+					if (!copyCursor.restartFullCopy) {
+						copyResume = {
+							copyStartTime: copyCursor.copyStartTime,
+							currentTable: copyCursor.currentTable,
+							afterKey: copyCursor.afterKey,
+							copyOrder: copyCursor.copyOrder, // leader rejects the resume if this != its current COPY_ORDER_VERSION (#421)
+						};
+						logger.warn?.(
+							`Resuming interrupted copy of database ${databaseName} from ${getNodeURL(node)} at table ${copyCursor.currentTable} after key ${copyCursor.afterKey}`
+						);
+					} else {
+						logger.warn?.(
+							`Restarting full copy of database ${databaseName} from ${getNodeURL(node)} because route coverage widened during an interrupted copy`
+						);
+					}
+				}
+				logger.trace?.(connectionId, 'defining subscription request', node.name, databaseName, new Date(startTime));
+				// Arm the leading-duplicate fast-skip for this source node. Incoming records from this node with
+				// version <= the arming cursor are the already-applied tail the leader re-streams on resume.
+				//   - DIRECT resume → arm from `startTime` (the persisted direct cursor we asked to resume from).
+				//   - PROXIED resume → arm from `proxiedSkipCursor` (the relayed per-source cursor; startTime is
+				//     left conservative, so the skip absorbs the re-streamed tail #399 produces).
+				// Only arm for a genuine incremental resume from a real prior cursor:
+				//   - copyResume / startTime === 0  → a bulk copy re-streams in key order carrying original
+				//     (possibly newest) versions, so "version <= cursor" is NOT a duplicate signal there.
+				//   - no direct or proxied cursor / a fresh "now - 60s" start → no prior applied tail to dedupe.
+				// Keyed by local node id so a proxied multi-node subscription gets an independent latch.
+				// Branch on the connection type rather than falling back: a node that previously had a DIRECT
+				// subscription leaves a persisted direct cursor (`hasPersistedResumeCursor`) on disk, so once it
+				// fails over to a PROXIED subscription we must still arm from the live `proxiedSkipCursor` — a
+				// fallback that preferred the stale direct `startTime` would dedupe against an old, narrower window.
+				const leadingDupArmCursor =
+					connectedNode === node
+						? hasPersistedResumeCursor && startTime > 1
+							? Math.max(sequenceEntry?.seqId ?? 0, startTime)
+							: undefined
+						: proxiedSkipCursor;
+				if (nodeId !== undefined && !copyResume && leadingDupArmCursor !== undefined && leadingDupArmCursor > 1) {
+					leadingDupCursorByNode.set(nodeId, leadingDupArmCursor);
+					logger.debug?.(
+						connectionId,
+						'armed leading-duplicate fast-skip',
+						node.name,
+						nodeId,
+						databaseName,
+						connectedNode === node ? 'direct resume cursor' : 'proxied resume cursor',
+						leadingDupArmCursor
+					);
+				} else if (nodeId !== undefined) {
+					// Re-subscription without a resumable cursor (or a copy): clear any stale latch so we never
+					// dedupe against an old window.
+					leadingDupCursorByNode.delete(nodeId);
+				}
+				// a full copy's rows carry no audit entries either, so its request proves no prefix for anyone
+				if (startTime === 0) requestIsCopy = true;
+				return {
+					name: node.name,
+					replicateByDefault,
+					tables: tableSubs, // omitted or included based on flag above
+					startTime,
+					isLeader: node.isLeader,
+					endTime: node.endTime,
+					shardingProjection,
+					copyResume, // present only when resuming an interrupted bulk copy
+				};
+			});
 		if (
 			!requestIsCopy &&
 			directFloorOnlyNodeId !== undefined &&
@@ -11641,7 +12627,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// needs the config routes only the main thread has (harper-pro#498). With no set supplied we
 		// exclude nothing beyond ourselves: redundant relay delivery is recoverable, a wrong exclusion
 		// silently drops the origin's records.
-		if (nodeSubscriptions) {
+		if (nodeSubscriptions && !restrictedOrigins) {
 			const exclusionOrigins: string[] = options.connection?.exclusionOrigins || [];
 			excluded = [...new Set([getThisNodeName(), ...exclusionOrigins])].filter(
 				(nodeName) => nodeName && !nodeSubscriptions.some((subscription) => nodeName === subscription.name)
@@ -11713,6 +12699,47 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return residency;
 	}
 
+	function hasResidencySchemaAuthority(targetDatabase: string): boolean {
+		try {
+			authorizeResidencySchema(targetDatabase);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+	function authorizeResidencySchema(targetDatabase: string): boolean {
+		if (!residencyIdentityBound)
+			throw new Error('Sharding metadata requires an authenticated or configured node identity');
+		if (databaseName && databaseName !== 'system' && databaseName !== targetDatabase)
+			throw new Error('Sharding metadata does not belong to an authorized database frame');
+		const superUser = authorization?.role?.permission?.super_user;
+		if (!superUser && !(authorization?.name || authorization?.replicates))
+			throw new Error('Only an authorized replication peer may declare sharding policies');
+		const subscription = options.connection?.nodeSubscriptions?.[0];
+		const configuredRoute = Array.from(iterateRoutes(options)).find((route) => route.name === remoteNodeName);
+		const route = subscription?.configRouteReplicates ?? configuredRoute?.replicates;
+		const selective = isExplicitDatabaseSubscription(
+			subscription?.subscriptions ?? configuredRoute?.subscription,
+			targetDatabase
+		);
+		// A peer's hdb_nodes grant describes its sends; a local configured route describes our receives.
+		const grant = authorization?.replicates;
+		const receives =
+			route === undefined
+				? superUser ||
+					(typeof grant === 'object'
+						? grant?.sends || routeEntriesIncludePeer(grant.sendsTo, getThisNodeName(), targetDatabase)
+						: !!grant)
+				: selective ||
+					(typeof route === 'object'
+						? route.receives || routeEntriesIncludePeer(route.receivesFrom, remoteNodeName, targetDatabase)
+						: route);
+		if (!checkDatabaseAccess(targetDatabase) || !receives) {
+			throw new Error('The receive route does not authorize this sharded database');
+		}
+		return true;
+	}
+
 	function checkDatabaseAccess(databaseName: string) {
 		if (
 			enabledDatabases &&
@@ -11761,10 +12788,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			definitions.push({
 				table: tableName,
 				schemaDefined: table.schemaDefined,
+				...(peerSupportsResidencySlots(peerCapabilities) && table.residency ? { residency: table.residency } : {}),
 				attributes: table.attributes.map((attr) => ({
 					name: attr.name,
 					type: attr.type,
 					isPrimaryKey: attr.isPrimaryKey,
+					...(table.residency ? { indexed: attr.indexed } : {}),
 				})),
 			});
 		}
@@ -11786,6 +12815,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					{
 						...getLocalCapabilities(auditStore ?? getDatabaseStores().auditStore),
 						acceptBlobCodecs: acceptedBlobCodecs(),
+					},
+					{
+						shardsDigest: residencyConfigurationDigest(),
+						shard: env.get('replication_shard') ?? null,
+						shardingCertificate: shardingSourceCertificate(databaseName),
+						shardingStarts: shardingOriginStarts(databaseName),
 					},
 				])
 			);
@@ -11825,16 +12860,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						.sort((a, b) => b.droppedTime - a.droppedTime)
 						.slice(0, MAX_DROP_MARKERS_PER_FRAME)
 				: [];
-		ws.send(
-			dropMarkers.length > 0
-				? encode([DB_SCHEMA, tableDefinitions, databaseName, subscriptionSetupRequestId, dropMarkers])
-				: encode([DB_SCHEMA, tableDefinitions, databaseName, subscriptionSetupRequestId])
-		);
+		const frame: any[] = [DB_SCHEMA, tableDefinitions, databaseName, subscriptionSetupRequestId];
+		const snapshot = peerSupportsResidencySlots(peerCapabilities) && readResidencyMap(databaseName);
+		if (dropMarkers.length || snapshot) frame[4] = dropMarkers;
+		if (snapshot) frame[5] = { shardsDigest: residencyConfigurationDigest(), snapshot };
+		ws.send(encode(frame));
+		if (snapshot) sentResidencyMaps.set(databaseName, snapshot.digest);
 	}
 	function tableSentToPeer(tableName: string): boolean {
 		return (
-			!nodeSubscriptions ||
-			nodeSubscriptions.some((node) =>
+			!activeNodeSubscriptions ||
+			activeNodeSubscriptions.some((node) =>
 				node.replicateByDefault ? !node.tables.includes(tableName) : node.tables.includes(tableName)
 			)
 		);
@@ -12014,7 +13050,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	return {
 		end() {
 			// cleanup
-			if (subscriptionRequest) subscriptionRequest.end();
 			if (auditSubscription) auditSubscription.emit('close');
 		},
 		// Full teardown for a session whose socket is being replaced without a delivered 'close'
@@ -12092,10 +13127,40 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	// Check the attributes in the msg vs the table and if they dont match call ensureTable to create them
 	function ensureTableIfChanged(tableDefinition: any, existingTable: any) {
+		if (tableDefinition.residency || existingTable?.residency) authorizeResidencySchema(tableDefinition.database);
+		try {
+			return updateTableDefinition(tableDefinition, existingTable);
+		} catch (error) {
+			if (
+				!connectionSuperseded() &&
+				error.code !== 'DATABASE_SHARDING_HELD' &&
+				!(error instanceof TableGenerationDroppedError) &&
+				(tableDefinition.residency || existingTable?.residency)
+			)
+				recordResidencyPolicyAgreement(tableDefinition.database, remoteNodeName, error);
+			throw error;
+		}
+	}
+	function updateTableDefinition(tableDefinition: any, existingTable: any) {
 		if (existingTable && !tableReplicates(existingTable)) return existingTable;
 		if (!existingTable) existingTable = {};
 		const wasSchemaDefined = existingTable.schemaDefined;
 		let hasChanges = false;
+		if (
+			existingTable.residency &&
+			tableDefinition.residency === undefined &&
+			peerSupportsResidencySlots(peerCapabilities)
+		)
+			throw new Error(`Missing sharding policy for ${tableDefinition.database}.${tableDefinition.table}`);
+		if (tableDefinition.residency !== undefined) {
+			if (wasSchemaDefined && !existingTable.residency)
+				throw new Error(
+					`Local schema does not declare sharding for ${tableDefinition.database}.${tableDefinition.table}`
+				);
+			if (existingTable.residency && !sameResidencyPolicy(existingTable.residency, tableDefinition.residency))
+				throw new Error(`Conflicting sharding policy for ${tableDefinition.database}.${tableDefinition.table}`);
+			if (!existingTable.residency) hasChanges = true;
+		}
 		const schemaDefined = tableDefinition.schemaDefined;
 		const attributes = existingTable.attributes?.slice() || [];
 		for (let i = 0; i < tableDefinition.attributes?.length; i++) {
@@ -12128,6 +13193,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// keep after the spread — a live Table's own attributes/origin/createdTime would otherwise override
 				// the merge; the stamp only matters on a create, where there is no live Table to spread
 				attributes,
+				residency: tableDefinition.residency ?? existingTable.residency,
 				origin: 'cluster',
 				createdTime: typeof tableDefinition.createdTime === 'number' ? tableDefinition.createdTime : undefined,
 			});

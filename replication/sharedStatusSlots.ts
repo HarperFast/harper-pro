@@ -50,6 +50,10 @@ export const PEER_CERTIFIES_FLOORS_POSITION = allocate();
 // `Date.now()` of this (database, peer)'s last send-log-break reconnect, read by every worker so an
 // accepted session that redials onto another worker cannot skip the floor.
 export const LAST_SEND_LOG_BREAK_RECONNECT_TIME_POSITION = allocate();
+export const SHARDING_CERTIFICATE_GENERATION_POSITION = allocate();
+export const SHARDING_CERTIFICATE_POSITION = allocate(4);
+export const SHARDING_PEER_SHARD_POSITION = allocate();
+export const SHARDING_WAIT_POSITION = allocate();
 
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
 export const ALLOCATED_SLOTS = cursor;
@@ -63,3 +67,5 @@ export function assertAllocationFits(allocated: number, capacity: number): void 
 	}
 }
 assertAllocationFits(ALLOCATED_SLOTS, REPLICATION_SHARED_STATUS_SLOTS);
+
+export const CONNECTION_STATE_CONNECTED = 2;

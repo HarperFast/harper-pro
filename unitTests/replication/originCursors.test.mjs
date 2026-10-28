@@ -29,6 +29,22 @@ const nameForId = (id) => names.get(id);
 
 describe('buildOriginCursorVector', () => {
 	const isMember = (name) => name !== 'removed';
+	it('does not send a foreign-origin position or floor learned from an inadmissible source', () => {
+		const rows = new Map([
+			[
+				1,
+				{
+					seqId: T,
+					nodes: [
+						{ id: 1, originLogKey: T - 1 },
+						{ id: 2, originLogKey: T + 1000, closedFloor: T + 2000 },
+					],
+				},
+			],
+		]);
+		const directOnly = (source, origin) => source === origin;
+		assert.deepStrictEqual(buildOriginCursorVector(rows, 1, nameForId, isMember, true, directOnly), { peer: T - 1 });
+	});
 
 	it("sends the peer row's origin cursors, and never another peer's", () => {
 		const rows = new Map([
