@@ -35,8 +35,8 @@ const BARRIER_MS = 10000;
 // phases at this budget, twice over because this file bootstraps once per storage engine, is 8
 // minutes of that budget.
 const BOOTSTRAP_PHASE_MS = 60000;
-// Restages are budgeted for the whole suite, not per trial: one unstaged race is a scheduling
-// accident worth retrying, but a race that can never be staged must fail inside the suite timeout
+// Restages are budgeted for the whole suite, not per trial: one unstaged race (a barrier miss, or
+// an accidental version tie) is a scheduling accident worth retrying, but a race that can never be staged must fail inside the suite timeout
 // rather than spend TRIALS x attempts x the barrier window discovering it.
 const RESTAGE_BUDGET = 3;
 // The two race shapes the convergence claim has to hold for. They reach different arbiters, so a
@@ -385,9 +385,9 @@ async function releaseLateFill(ctx, id) {
 
 /**
  * Races one key across both nodes and asserts the whole cluster settles on a single write.
- * Returns false when the barrier never held two concurrent fills — one node learned the key by
- * replication before issuing its own, so nothing about convergence was demonstrated — or when a
- * shape meant to race distinct versions minted the same version on both nodes.
+ * Returns why the trial was not staged, or undefined once convergence is demonstrated: the barrier
+ * never held two concurrent fills (one node learned the key by replication before issuing its own),
+ * or a shape meant to race distinct versions minted the same version on both nodes.
  */
 async function raceTrial(ctx, id, shape) {
 	ctx.origin.stage(id, shape);
@@ -403,7 +403,8 @@ async function raceTrial(ctx, id, shape) {
 	const fills = await pendingFills;
 	const originTrial = ctx.origin.trial(id);
 	ok(originTrial, `${id} performed no source fills`);
-	if (originTrial.timedOut || originTrial.calls.length < 2 || !lateFillRacedAPeer) return false;
+	if (originTrial.timedOut || originTrial.calls.length < 2 || !lateFillRacedAPeer)
+		return 'never staged two concurrent source fills';
 	equal(originTrial.calls.length, 2, `${id} must perform exactly two independent source fills`);
 	equal(
 		new Set(originTrial.calls.map((call) => call.node)).size,
@@ -413,7 +414,7 @@ async function raceTrial(ctx, id, shape) {
 	notEqual(fills[0].body.token, fills[1].body.token, `${id} source fills must be distinguishable`);
 	for (const fill of fills) ok(fill.etag, `${id} source fill response carried no ETag`);
 	// the ETag encodes the version each node minted for its own fill
-	if (!shape.tied && fills[0].etag === fills[1].etag) return false;
+	if (!shape.tied && fills[0].etag === fills[1].etag) return 'source fills minted the same version';
 
 	await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 	await waitForAllWorkers(ctx.nodes, id, ctx.agentsByNode, 'PairPointProbe');
@@ -454,7 +455,6 @@ async function raceTrial(ctx, id, shape) {
 		}
 	}
 	equal(ctx.origin.trial(id).calls.length, 2, `${id} performed extra source fills during probing`);
-	return true;
 }
 
 function sourcedBlobPairing(ctx) {
@@ -527,15 +527,12 @@ function sourcedBlobPairing(ctx) {
 		for (let trial = 0; trial < TRIALS; trial++) {
 			const { id, ...rest } = SHAPES[trial % SHAPES.length];
 			const shape = { ...rest, lastModified: rest.tied ? Date.now() - TIE_BACKDATE_MS : undefined };
-			let staged = await raceTrial(ctx, `${id}-${trial}`, shape);
-			for (let restage = 1; !staged && restagesLeft > 0; restage++) {
+			let unstaged = await raceTrial(ctx, `${id}-${trial}`, shape);
+			for (let restage = 1; unstaged && restagesLeft > 0; restage++) {
 				restagesLeft--;
-				staged = await raceTrial(ctx, `${id}-${trial}-restage${restage}`, shape);
+				unstaged = await raceTrial(ctx, `${id}-${trial}-restage${restage}`, shape);
 			}
-			ok(
-				staged,
-				`${id}-${trial} never staged two concurrent source fills (at distinct versions, for an untied shape); suite restage budget exhausted`
-			);
+			ok(!unstaged, `${id}-${trial} ${unstaged}; suite restage budget exhausted`);
 		}
 	});
 }
