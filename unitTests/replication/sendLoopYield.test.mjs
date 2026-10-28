@@ -38,6 +38,9 @@ function createSender() {
 		outstandingBlobsBeingSent: 0,
 		blobSentCallbacks: [],
 		wsClosed: false,
+		closed: false,
+		copying: false,
+		currentTransaction: { txnLogKey: 0 },
 		isPausedForBackPressure: false,
 		currentSequenceId: 1000,
 		sentSequenceId: 0,
@@ -138,6 +141,21 @@ describe('replication sender yield budget on the main-thread fallback', function
 		assert.equal(sender.sent.length, 1);
 		assert.equal(sender.sent[0][0], sender.state.SEQUENCE_ID_UPDATE);
 		assert(sender.sent[0][1] > 1000 && sender.sent[0][1] < sender.state.currentSequenceId);
+	});
+
+	for (const state of ['closed', 'wsClosed'])
+		it(`does not publish skipped progress after ${state}`, async () => {
+			sender.skipAuditRecord();
+			sender.state[state] = true;
+			await clock.tickAsync(300);
+			assert.deepEqual(sender.sent, []);
+		});
+
+	it('does not publish skipped progress past an unsent transaction', async () => {
+		sender.skipAuditRecord();
+		sender.state.currentTransaction.txnLogKey = sender.state.currentSequenceId;
+		await clock.tickAsync(300);
+		assert.deepEqual(sender.sent, []);
 	});
 
 	it('waits for socket drain even below the fairness budget', async () => {

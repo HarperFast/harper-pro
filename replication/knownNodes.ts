@@ -819,21 +819,35 @@ export function countAlreadyConfirmedPeers(
 // that never applies this specific write, a peer that drops its connection mid-wait, or any other
 // gap between the requested count and what actually gets acked) hangs the request forever — the
 // promise below had no reject path at all (harper-pro#213).
-//
-// Own default (900000ms), independent of REPLICATION_BLOBTIMEOUT: confirmation and blob transfer are
-// unrelated concerns, and this must not shrink just because an operator tunes blob timeout down for
-// reasons that have nothing to do with confirmation (e.g. failing fast on stalled blob transfers).
-// Not independently user-configurable yet — that needs a dedicated CONFIG_PARAMS entry in core
-// (getConfigValue only resolves keys registered in CONFIG_PARAM_MAP), left as a follow-up; see the
-// dispatch Findings for this fix.
-const REPLICATION_CONFIRMATION_DEFAULT_TIMEOUT_MS = 900000;
-// Still raised (never lowered) to at least the configured blob timeout: a confirmation can legitimately
-// be waiting on a large blob that is still within its own supported transfer window, and rejecting
-// sooner than that would fail a healthy, merely-slow write as if it had timed out.
-const REPLICATION_CONFIRMATION_TIMEOUT_MS = Math.max(
-	REPLICATION_CONFIRMATION_DEFAULT_TIMEOUT_MS,
-	env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 0
-);
+// An unset explicit timeout covers the blob transfer window; automatic handoffs have their own bound.
+const confirmationTimeouts = new Map<boolean, { raw: unknown; fallback: number; value: number }>();
+const warnedConfirmationTimeouts = new Set<string>();
+function replicationConfirmationTimeout(automatic = false): number {
+	const key = automatic
+		? CONFIG_PARAMS.REPLICATION_SHARDINGCONFIRMATIONTIMEOUT
+		: CONFIG_PARAMS.REPLICATION_CONFIRMATIONTIMEOUT;
+	const raw = env.get(key);
+	const blobTimeout = automatic ? 0 : Number(env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT));
+	const fallback = automatic ? 30000 : Math.max(900000, blobTimeout > 0 && blobTimeout <= 2147483647 ? blobTimeout : 0);
+	const cached = confirmationTimeouts.get(automatic);
+	if (cached && Object.is(cached.raw, raw) && cached.fallback === fallback) return cached.value;
+	let value = raw === undefined ? fallback : Number(raw);
+	if (
+		!Number.isInteger(value) ||
+		value <= 0 ||
+		value > 2147483647 ||
+		(raw !== undefined && typeof raw !== 'number' && typeof raw !== 'string')
+	) {
+		const warning = `${key}:${String(raw)}`;
+		if (!warnedConfirmationTimeouts.has(warning)) {
+			warnedConfirmationTimeouts.add(warning);
+			logger.warn?.(`Invalid ${key}; using ${fallback}ms`);
+		}
+		value = fallback;
+	}
+	confirmationTimeouts.set(automatic, { raw, fallback, value });
+	return value;
+}
 
 /**
  * Fire `onConfirm(nodeName)` for every waiter in `awaiting` whose `txnTime` falls in
@@ -875,7 +889,7 @@ export function createConfirmationWaiter(
 	databaseName: string,
 	txnTime: number,
 	confirmationCount: number,
-	timeoutMs: number = REPLICATION_CONFIRMATION_TIMEOUT_MS,
+	timeoutMs: number = replicationConfirmationTimeout(),
 	alreadyConfirmedPeers: Set<string> = new Set(),
 	residentPeerLists?: string[][]
 ): Promise<void> {
@@ -964,7 +978,7 @@ export function filterReplicationRecipients(nodes: any[], selfReplicates: any, d
  * legacy full-mesh self-record (`true`, or an absent/unset one) — the common, non-directional case this
  * previously handled correctly.
  */
-function getReplicationRecipients(databaseName: string) {
+export function getReplicationRecipients(databaseName: string) {
 	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
 	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
 }
@@ -1011,26 +1025,29 @@ function assertConfirmationFeasible(databaseName: string, confirmationCount: num
 	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);
 }
 
-replicationConfirmation((databaseName, txnTime, confirmationCount, residentPeerLists?: string[][]): Promise<void> => {
-	if (!commitsAwaitingReplication) {
-		commitsAwaitingReplication = new Map();
-		startSubscriptionToReplications();
-	}
-	let awaiting: Set<AwaitingReplication> = commitsAwaitingReplication.get(databaseName);
-	if (!awaiting) {
-		awaiting = new Set();
-		commitsAwaitingReplication.set(databaseName, awaiting);
-	}
-	return createConfirmationWaiter(
-		awaiting,
-		databaseName,
-		txnTime,
-		confirmationCount,
-		undefined,
-		countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime),
-		residentPeerLists
-	);
-}, assertConfirmationFeasible);
+replicationConfirmation(
+	(databaseName, txnTime, confirmationCount, residentPeerLists?: string[][], automatic = false): Promise<void> => {
+		if (!commitsAwaitingReplication) {
+			commitsAwaitingReplication = new Map();
+			startSubscriptionToReplications();
+		}
+		let awaiting: Set<AwaitingReplication> = commitsAwaitingReplication.get(databaseName);
+		if (!awaiting) {
+			awaiting = new Set();
+			commitsAwaitingReplication.set(databaseName, awaiting);
+		}
+		return createConfirmationWaiter(
+			awaiting,
+			databaseName,
+			txnTime,
+			confirmationCount,
+			replicationConfirmationTimeout(automatic),
+			countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime),
+			residentPeerLists
+		);
+	},
+	assertConfirmationFeasible
+);
 // Per-node confirmation watchers. Previously the per-node-update callback below called
 // forEachReplicatedDatabase and discarded the returned remove handle, so every hdb_nodes
 // update added two listeners (updateTable + dropDatabase) on the global databaseEventsEmitter

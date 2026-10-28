@@ -1,3 +1,8 @@
+import { startShardingBootstrap } from './shardingBootstrap.ts';
+import { registerResidencyConversion } from './residencyTopology.ts';
+import { SHARDING_CERTIFICATE_PRINCIPAL } from './shardingBootstrapRpc.ts';
+import { getResidencyMapTable, residencyDeclarationDatabases } from '../core/resources/residencyMaps.ts';
+import { ensureShardingConfiguration } from '../core/config/shardingConfiguration.ts';
 /**
  * This is the entry module is responsible for replicating data between nodes. It is a source for tables that are replicated
  * A typical exchange should look like:
@@ -11,6 +16,8 @@
 
 import {
 	databases,
+	databaseResidencyBlockReason,
+	assertDatabaseResidencyAvailable,
 	databaseEventsEmitter,
 	getDatabases,
 	pendingOrRecordedDropTime,
@@ -106,15 +113,25 @@ export function buildReplicationMtlsConfig(replicationOptions: any) {
 }
 
 export async function startOnMainThread(options) {
+	const configuration = ensureShardingConfiguration();
+	getResidencyMapTable();
+	if (env.get(CONFIG_PARAMS.REPLICATION_SHARDS) !== undefined || residencyDeclarationDatabases().length)
+		await configuration;
 	await migrateSSHConfigOnce();
-	return startSubscriptionsOnMainThread(options);
+	await startSubscriptionsOnMainThread(options);
+	startShardingBootstrap();
 }
 
 /**
  * Start the replication server. This will start a WebSocket server that will accept replication requests from other nodes.
  * @param options
  */
-export function start(options) {
+export async function start(options) {
+	const configuration = ensureShardingConfiguration();
+	getResidencyMapTable();
+	if (env.get(CONFIG_PARAMS.REPLICATION_SHARDS) !== undefined || residencyDeclarationDatabases().length)
+		await configuration;
+	registerResidencyConversion();
 	logger.notify('Starting replication server');
 	// Installed here, not at module load: knownNodes → replicator → recordLockTransport is an import
 	// cycle, and assigning recordLockTransport's `downSinceReader` while that module is still evaluating
@@ -145,6 +162,7 @@ export function start(options) {
 		routeByHostname.set(node.name, node);
 	}
 	assignReplicationSource(options);
+	startShardingBootstrap();
 	if (isDedicatedPoolWorker() && poolMemberIndex() === 0) warnOfUnresolvedComputedIndexes();
 
 	// Build mTLS configuration with certificate verification support
@@ -196,7 +214,10 @@ export function start(options) {
 				}
 				return undefined;
 			}
-			return request?.user;
+			const certificatePrincipal = request?.[SHARDING_CERTIFICATE_PRINCIPAL];
+			return certificatePrincipal && request?.user
+				? { ...request.user, [SHARDING_CERTIFICATE_PRINCIPAL]: certificatePrincipal }
+				: request?.user;
 		});
 		replicateOverWS(ws, options, authPromise);
 		ws.on('error', (error) => {
@@ -270,6 +291,7 @@ export function start(options) {
 						return;
 					} else {
 						request.user = node;
+						request[SHARDING_CERTIFICATE_PRINCIPAL] = node.name;
 					}
 				} else {
 					// technically if there are credentials, we could still allow the connection, but give a warning, because we don't usually do that
@@ -442,6 +464,7 @@ export function setReplicator(dbName: string, table: any, options: any) {
 			static connection: NodeReplicationConnection;
 			static subscription: IterableEventQueue;
 			static async subscribe() {
+				assertDatabaseResidencyAvailable(dbName);
 				const dbSubscriptions = options.databaseSubscriptions || databaseSubscriptions;
 				let subscription = dbSubscriptions.get(dbName);
 				const tableById = subscription?.tableById || [];
@@ -481,8 +504,9 @@ export function setReplicator(dbName: string, table: any, options: any) {
 					// await the get(): dbisDB is the raw __dbis__ RocksDB store, so get() returns a Promise on a
 					// block-cache miss. Without awaiting, a miss would make `residency` a Promise (truthy) and the
 					// `for...of` below would throw. We're already async here, so await rather than block with getSync.
-					const residency: string[] =
-						entry.residency || (await table.dbisDB.get([Symbol.for('residency_by_id'), residencyId]));
+					const residency: readonly string[] = table.residency
+						? table.getRecordResidency(entry)
+						: entry.residency || (await table.dbisDB.get([Symbol.for('residency_by_id'), residencyId]));
 					if (residency) {
 						let firstError: Error;
 						let reportedAbsence = false;
@@ -690,8 +714,8 @@ export async function sendOperationToNode(node, operation, options?) {
 		Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
 			? Math.min(options.timeoutMs, MAX_TIMER_DELAY_MS)
 			: undefined;
-	const socket = await createWebSocket(nodeUrl, options);
-	const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), {});
+	let socket;
+	let settled = false;
 	let timer: NodeJS.Timeout | undefined;
 	return new Promise((resolve, reject) => {
 		if (timeoutMs)
@@ -704,34 +728,49 @@ export async function sendOperationToNode(node, operation, options?) {
 					),
 				timeoutMs
 			).unref();
-		socket.on('open', () => {
-			// operation may carry a secret (registry token / ssh key / password); redact before
-			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
-			if (logger.logsAtLevel('debug'))
-				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(forwarded));
-			// A throw inside this listener is an uncaught exception, and leaves this promise pending.
-			try {
-				// Not `resolve(promise)`: adopting the session's promise would disarm the deadline and close below.
-				session.sendOperation(forwarded).then(resolve, reject);
-			} catch (error) {
-				reject(error);
-			}
-		});
-		socket.on('error', (error) => {
-			reject(error);
-		});
-		socket.on('close', (code, reason) => {
-			logger.info('Sending operation connection to ' + nodeUrl + ' closed', code);
-			const closedFirst = new Error(
-				`The connection to ${nodeUrl} closed (${code}${reason?.length ? ` ${reason}` : ''}) before ${forwarded.operation} was answered; its outcome there is unknown`
-			);
-			// After this turn's microtasks: an answer read in the same turn as the close has queued its
-			// settlement already, and must win.
-			setImmediate(() => reject(closedFirst));
-		});
+		Promise.resolve()
+			.then(() => createWebSocket(nodeUrl, options))
+			.then((connected) => {
+				socket = connected;
+				if (settled) {
+					socket.on('error', () => {});
+					socket.close();
+					return;
+				}
+				const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), {});
+				const send = () => {
+					// operation may carry a secret (registry token / ssh key / password); redact before
+					// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
+					if (logger.logsAtLevel('debug'))
+						logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(forwarded));
+					// A throw inside this listener is an uncaught exception, and leaves this promise pending.
+					try {
+						// Not `resolve(promise)`: adopting the session's promise would disarm the deadline and close below.
+						session.sendOperation(forwarded).then(resolve, reject);
+					} catch (error) {
+						reject(error);
+					}
+				};
+				socket.on('open', send);
+				socket.on('error', (error) => {
+					reject(error);
+				});
+				socket.on('close', (code, reason) => {
+					logger.info('Sending operation connection to ' + nodeUrl + ' closed', code);
+					const closedFirst = new Error(
+						`The connection to ${nodeUrl} closed (${code}${reason?.length ? ` ${reason}` : ''}) before ${forwarded.operation} was answered; its outcome there is unknown`
+					);
+					// After this turn's microtasks: an answer read in the same turn as the close has queued its
+					// settlement already, and must win.
+					setImmediate(() => reject(closedFirst));
+				});
+				if (socket.readyState === 1) send();
+			})
+			.catch(reject);
 	}).finally(() => {
+		settled = true;
 		clearTimeout(timer);
-		socket.close();
+		socket?.close();
 	});
 }
 
@@ -918,6 +957,7 @@ export function forEachReplicatedDatabase(options, callback) {
 }
 
 function forReplicatedDatabase(databaseName, options, callback) {
+	if (databaseResidencyBlockReason(databaseName)) return;
 	const database = databases[databaseName];
 	logger.trace('Checking replication status of ', databaseName, options?.databases);
 	if (
