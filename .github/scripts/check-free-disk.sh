@@ -2,8 +2,6 @@
 # Fails unless <path> has at least <multiplier> x <data-gib> GiB free. The large-data stress
 # tests run in a container on the shared harper-bench host, so a full host disk otherwise
 # surfaces minutes later as a replication-wedge assertion instead of naming the cause.
-#
-# Usage: check-free-disk.sh <path> <data-gib> <multiplier>
 set -uo pipefail
 
 if [ "$#" -ne 3 ]; then
@@ -14,7 +12,6 @@ path=$1
 data_gib=$2
 multiplier=$3
 
-# The decimal subset of JavaScript Number(), which the tests parse the dataset size with.
 number='^[[:space:]]*[+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
 if ! [[ "$data_gib" =~ $number && "$multiplier" =~ $number ]] \
   || ! required=$(awk -v gib="$data_gib" -v times="$multiplier" 'BEGIN {
