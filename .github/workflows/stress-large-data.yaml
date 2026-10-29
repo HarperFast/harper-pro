@@ -77,6 +77,9 @@ jobs:
     needs: build
     runs-on: [self-hosted, harper-bench]
     timeout-minutes: 180
+    env:
+      HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR: /home/runner
+      HARPER_STRESS_LARGE_DATA_GB: ${{ inputs.data-gb || '10' }}
     strategy:
       fail-fast: false
       matrix:
@@ -114,12 +117,13 @@ jobs:
       # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
       - name: Build re2 native binary
         run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
+      # Both tests document a >= 3x-dataset disk requirement (a 2 GiB catch-up measured a 2.2x peak).
+      - name: Check free disk
+        run: .github/scripts/check-free-disk.sh "$HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR" "$HARPER_STRESS_LARGE_DATA_GB" 3
       - name: Run ${{ matrix.test.name }}
         env:
           HARPER_RUN_STRESS_TESTS: '1'
           HARPER_INTEGRATION_TEST_LOG_DIR: /home/runner/harper-large-stress-logs
-          HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR: /home/runner
-          HARPER_STRESS_LARGE_DATA_GB: ${{ inputs.data-gb || '10' }}
         run: |
           # No coverage: run.mjs's run() defaults coverage off, and passing
           # --experimental-test-coverage (even =false) actually ENABLES collection —
