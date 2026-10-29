@@ -46,6 +46,16 @@ describe('NodeReplicationConnection session settlement (harper-pro#1189)', () =>
 		assert.strictEqual(connection.reconnectScheduled, true);
 	});
 
+	it('a superseded attempt whose createWebSocket rejects leaves its successor alone', async () => {
+		const connection = withoutRetries(new NodeReplicationConnection(null, null, 'db', 'peer'));
+		const superseded = connection.connect();
+		connection.forceReconnect();
+		const successor = settlement(connection.getRecord({ id: 'a' }));
+		await superseded;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.strictEqual(successor.outcome, 'pending', "the successor's session belongs to the next attempt");
+	});
+
 	describe('against a peer that accepts TCP and never answers', () => {
 		let server;
 		let url;
@@ -64,6 +74,17 @@ describe('NodeReplicationConnection session settlement (harper-pro#1189)', () =>
 		after(() => {
 			for (const socket of sockets) socket.destroy();
 			server.close();
+		});
+
+		it('a superseded or unsubscribed attempt does not install the socket it opened', async () => {
+			for (const supersede of [(connection) => connection.forceReconnect(), (connection) => connection.unsubscribe()]) {
+				const connection = withoutRetries(new NodeReplicationConnection(url, null, 'db', 'peer'));
+				const attempt = connection.connect();
+				supersede(connection);
+				await attempt;
+				assert.strictEqual(connection.socket, undefined);
+				connection.intentionallyUnsubscribed = true;
+			}
 		});
 
 		it('rejects a read waiting across forceReconnect, and the superseded socket cannot reject its successor', async () => {

@@ -3465,8 +3465,57 @@ export function createCopyFinalizeWatchdog(opts: {
 		onSilence: opts.onStall,
 	});
 }
-let replicationTLSSelector: any;
+/**
+ * Wait for a TLS selector's certificate state, each caller for at most `timeoutMs`. A selector stays pending
+ * while its thread has no usable certificate, so per-caller races on its `.ready` would each stay attached to
+ * it; this attaches one reaction per `.ready` promise however many callers time out on it. Returns undefined
+ * once the state is known.
+ */
+export function createBoundedTLSWait(
+	getSelector: () => { initialize(target: object): Promise<unknown> },
+	target: object,
+	timeoutMs: number
+): (description: string) => Promise<void> | undefined {
+	let ready: Promise<unknown> | undefined;
+	let watched: Promise<unknown> | undefined;
+	const waiters = new Set<(error?: Error) => void>();
+	const wake = (error?: Error) => {
+		for (const settle of waiters) settle(error);
+	};
+	return (description) => {
+		const current = getSelector().initialize(target);
+		if (current === ready) return;
+		if (current !== watched) {
+			watched = current;
+			current.then(() => {
+				ready = current;
+				wake();
+			}, wake);
+		}
+		return new Promise((resolve, reject) => {
+			const settle = (error?: Error) => {
+				clearTimeout(timer);
+				waiters.delete(settle);
+				if (error) reject(error);
+				else resolve();
+			};
+			const timer = setTimeout(
+				() => settle(new Error(`Certificates are not available yet for ${description}`)),
+				timeoutMs
+			);
+			timer.unref?.();
+			waiters.add(settle);
+		});
+	};
+}
+
+let replicationTLSSelector: ReturnType<typeof createTLSSelector>;
 const replicationTLS: { secureContexts: Map<string, tls.SecureContext> | null } = { secureContexts: null };
+const waitForReplicationTLS = createBoundedTLSWait(
+	() => (replicationTLSSelector ??= createTLSSelector('replication')),
+	replicationTLS,
+	PING_TIMEOUT
+);
 /**
  * Handles reconnection, and requesting catch-up
  */
@@ -3508,14 +3557,8 @@ export async function createWebSocket(
 		throw new TypeError(`Invalid URL: Expected a string URL for node "${node_name}" but received ${url}`);
 	}
 	if (url.includes('wss://')) {
-		replicationTLSSelector ??= createTLSSelector('replication');
-		// The selector stays pending while this thread has no usable certificate state yet; an attempt must
-		// still fail in bounded time so its waiting reads do.
-		await rejectIfUnsettled(
-			replicationTLSSelector.initialize(replicationTLS),
-			PING_TIMEOUT,
-			new Error(`Replication certificates are not available yet to connect to ${url}`)
-		);
+		const waiting = waitForReplicationTLS(`a replication connection to ${url}`);
+		if (waiting) await waiting;
 		const secureContexts = replicationTLS.secureContexts;
 		secureContext = secureContexts.get(node_name);
 		if (secureContext) {
@@ -3671,15 +3714,20 @@ export class NodeReplicationConnection extends EventEmitter {
 		// must not run as that request.
 		if (contextStorage.getStore() !== undefined) return contextStorage.exit(() => this.connect());
 		if (!this.session) this.resetSession();
-		// this attempt settles only its own session; a replacement belongs to the next attempt
-		const { sessionResolve, sessionReject } = this;
+		// This attempt owns the session it started with; resetSession() replaces it only when a newer attempt
+		// takes the connection over.
+		const { session: attemptSession, sessionResolve, sessionReject } = this;
+		// The handlers below compare this attempt's socket with this.socket: forceReconnect can install a newer
+		// one before this socket's (possibly delayed) terminate() fires close. See harper-pro#420.
+		let socket: ReplicationWebSocket;
 		// TODO: Need to do this specifically for each node
 		try {
-			this.socket = await createWebSocket(this.url, {
+			socket = await createWebSocket(this.url, {
 				serverName: this.nodeName,
 				authorization: this.authorization,
 			});
 		} catch (error) {
+			if (this.session !== attemptSession) return;
 			// createWebSocket can reject before any socket exists or any open/error/close listener is
 			// attached — e.g. no valid replication certificate yet, or SNICallback.initialize() failing
 			// while a freshly-restarted peer rebuilds its TLS secure contexts. This connect() is invoked
@@ -3698,6 +3746,13 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.scheduleReconnect(error);
 			return;
 		}
+		if (this.session !== attemptSession || this.intentionallyUnsubscribed) {
+			// terminating a socket that is still opening emits 'error' on the next tick
+			socket.on('error', () => {});
+			socket.terminate();
+			return;
+		}
+		this.socket = socket;
 		// The socket this connection owns has just been replaced, so the session bound to the previous one
 		// is superseded by definition: retire it here rather than relying on that socket's 'close', which
 		// for an open-but-idle/paused wedge may arrive late or never. Without this, the old instance's
@@ -3711,10 +3766,6 @@ export class NodeReplicationConnection extends EventEmitter {
 		// createWebSocket await window. Only on the success path: a createWebSocket rejection takes the
 		// catch above, which leaves reconnectScheduled true for its own pending retry. See harper-pro#420.
 		this.reconnectScheduled = false;
-		// Capture this attempt's socket so its close handler can tell whether it is still the live socket:
-		// forceReconnect can schedule a fresh connect() that replaces this.socket before this socket's
-		// (possibly delayed) terminate() finally fires close. See the close handler / harper-pro#420.
-		const socket = this.socket;
 
 		let session;
 		logger.debug?.(`Connecting to ${this.url}, db: ${this.databaseName}, process ${process.pid}`);

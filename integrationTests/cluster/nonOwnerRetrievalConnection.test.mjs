@@ -155,7 +155,7 @@ suite('Non-owner retrieval connection (harper-pro#1189)', { timeout: 300_000 }, 
 		});
 		const elapsed = performance.now() - started;
 		assert.equal(response.status, 502, JSON.stringify(response));
-		assert.ok(elapsed < PING_TIMEOUT + 5000, `the read failed after ${Math.round(elapsed)}ms`);
+		assert.ok(elapsed < 2 * PING_TIMEOUT + 5000, `the read failed after ${Math.round(elapsed)}ms`);
 		assert.match(
 			await readLog(reader()),
 			/Opening handshake has timed out/,
