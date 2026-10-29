@@ -3603,7 +3603,6 @@ export async function createWebSocket(
 		maxPayload: 10 * 1024 * 1024 * 1024,
 		rejectUnauthorized: rejectUnauthorized !== false,
 		secureContext: undefined,
-		// bounds a peer that accepts the TCP connection but never completes TLS or the upgrade
 		handshakeTimeout: PING_TIMEOUT,
 	};
 	if (secureContext) {
@@ -3720,8 +3719,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		// must not run as that request.
 		if (contextStorage.getStore() !== undefined) return contextStorage.exit(() => this.connect());
 		if (!this.session) this.resetSession();
-		// This attempt owns the session it started with; resetSession() replaces it only when a newer attempt
-		// takes the connection over.
+		// a newer attempt takes over this.session and its resolvers through resetSession()
 		const { session: attemptSession, sessionResolve, sessionReject } = this;
 		// The handlers below compare this attempt's socket with this.socket: forceReconnect can install a newer
 		// one before this socket's (possibly delayed) terminate() fires close. See harper-pro#420.
@@ -3978,8 +3976,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		}
 	}
 	resetSession(reason?: Error) {
-		// Reads already waiting on the outgoing session would otherwise wait on a promise nothing settles;
-		// a no-op when that session opened or failed.
+		// reads already waiting on the outgoing session would otherwise wait on a promise nothing settles
 		this.sessionReject?.(
 			reason ?? new Error(`Replication connection to ${this.url} (db: "${this.databaseName}") was reset`)
 		);

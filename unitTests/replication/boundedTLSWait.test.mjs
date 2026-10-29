@@ -3,7 +3,6 @@ import { createBoundedTLSWait } from '#src/replication/replicationConnection';
 
 const BOUND = 50;
 
-// a selector whose `.ready` the test settles, counting the reactions attached to it
 function controlledSelector() {
 	const selector = { reactions: 0, attempts: 0 };
 	selector.reset = () => {

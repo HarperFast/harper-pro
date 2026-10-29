@@ -1,9 +1,3 @@
-/**
- * harper-pro#1189: a read waits on `NodeReplicationConnection.session` (getRecord). Every attempt that
- * fails, and every replacement of that promise, must settle what readers already wait on, and an attempt
- * must settle only its own session.
- */
-
 import assert from 'node:assert';
 import { createServer } from 'node:net';
 import { once } from 'node:events';

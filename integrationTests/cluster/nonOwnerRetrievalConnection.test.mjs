@@ -1,9 +1,3 @@
-/**
- * harper-pro#1189: a non-owner read of a sharded table on an HTTP worker opens that worker's retrieval
- * connection to the owner. The replication pool is on, so the HTTP worker holds no subscriptions and the
- * read is the first thing on it to open a replication connection. Authentication is not local-implied, so
- * the read below is anonymous; the resource allows it.
- */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { basename, join } from 'node:path';
@@ -63,10 +57,12 @@ suite('Non-owner retrieval connection (harper-pro#1189)', { timeout: 300_000 }, 
 				await cp(FIXTURE, join(context.harper.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
 				await startHarper(context, {
 					config: {
+						// keeps the loopback reads below anonymous
 						authentication: { authorizeLocal: false },
 						analytics: { aggregatePeriod: -1 },
 						logging: { colors: false, stdStreams: false, level: 'warn' },
 						replication: {
+							// leaves the HTTP worker without subscriptions: the read opens its first replication connection
 							threads: 1,
 							securePort: context.harper.hostname + ':9933',
 							shard,
