@@ -149,7 +149,14 @@ describe('fenced apply: authority a fenced node exercised under generation g', (
 		const a = nodes.get('a').coordinator;
 		const late = { key, requester: 'c', generation: 1, leaseMs: LEASE };
 		harness.stage('a', 2, ['a', 'b']);
-		assert.deepStrictEqual(await a.onDelegationRequest(late), { granted: false, reason: 'generation' });
+		// A withheld map is answered as a home still coming up (record-locks.md §4.5): refused, and the
+		// requester may wait it out inside its own deadline rather than fail at once.
+		assert.deepStrictEqual(await a.onDelegationRequest(late), {
+			granted: false,
+			reason: 'generation',
+			recovering: true,
+			retryAfterMs: 250,
+		});
 		harness.activate('a', 2, ['a', 'b']);
 		assert.deepStrictEqual(await a.onDelegationRequest(late), {
 			granted: false,

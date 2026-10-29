@@ -32,6 +32,7 @@ import {
 	quiesceDelegations,
 	recallDelegationsFromHome,
 	releaseForRelay,
+	retireDelegateEpoch,
 	revokeRelayedAdmission,
 	writeLockBarrier,
 	type DelegationRecall,
@@ -78,7 +79,29 @@ export function relayTimeoutFor(kind: RelayKind, payload: any, hop: 'caller' | '
 }
 const NOT_HOME: DelegationReply = { granted: false, reason: 'not-home' };
 const GENERATION_MISMATCH: DelegationReply = Object.freeze({ granted: false as const, reason: 'generation' as const });
+/**
+ * This node is still booting (no incarnation yet) or has no coordinating thread assigned yet: a
+ * refusal the requester waits out inside its own deadline rather than fails on (record-locks.md §4.5).
+ */
+const RECOVERING: DelegationReply = Object.freeze({
+	granted: false as const,
+	reason: 'quarantine' as const,
+	recovering: true as const,
+	retryAfterMs: 250,
+});
 const RECALLED = Object.freeze({ recalled: true as const });
+/**
+ * Test-only: speak the wire of a build that predates §4.5 — send no `requestId`/`epoch`, ignore them
+ * on receipt, never retire, and answer `generation`/`not-home`/`recalled` where a current build answers
+ * `recovering` or fails. Stands in for an older peer in the mixed-version integration suite.
+ */
+export const LEGACY_WIRE = process.env.HARPER_TEST_RECORD_LOCK_LEGACY_WIRE === '1';
+/** Test-only: deliver every outbound delegation request twice, as a duplicating transport would (§5.2). */
+const DUPLICATE_DELEGATE = process.env.HARPER_TEST_RECORD_LOCK_DUPLICATE_DELEGATE === '1';
+
+function isEpoch(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) > 0;
+}
 /**
  * A barrier is a replicated write a peer can make this node perform, so each caller gets a token
  * bucket per database. One barrier is written per WAIT — nothing is merged across callers, since a
@@ -105,6 +128,8 @@ interface OwnershipReaders {
 	mainOwns(database: string): boolean;
 	/** The thread id of the worker that coordinates `database`, or undefined when not yet known here. */
 	ownerThreadId?(database: string): number | undefined;
+	/** This thread's delegate epoch for the database (§4.5), on the coordinating thread only. */
+	delegateEpoch?(database: string): number | undefined;
 	/** The generation of this node's agreed home map for the database, or undefined while withheld. */
 	activeGeneration?(database: string): number | undefined;
 	/** Whether `node` is in the database's current agreed home map, at this node's own level. */
@@ -137,6 +162,9 @@ export interface DelegateOperation {
 	key: unknown;
 	generation: number;
 	leaseMs: number;
+	/** Core's `DelegationRequest.requestId`, under a name the session's own request correlation never stamps. */
+	delegationRequestId?: number;
+	delegateEpoch?: number;
 }
 
 export interface RecallOperation {
@@ -145,6 +173,7 @@ export interface RecallOperation {
 	table: string;
 	key: unknown;
 	token: DelegationRecall['token'];
+	delegateEpoch?: number;
 }
 
 export interface BarrierOperation {
@@ -215,6 +244,8 @@ export async function sendRecordLockOperation(
 		const remaining = deadlineAt - outboundNow();
 		if (remaining <= 0) throw new Error(`${operation.operation} to ${nodeName} expired before it was sent`);
 		bucket.session++;
+		if (DUPLICATE_DELEGATE && operation.operation === DELEGATE_OPERATION)
+			Promise.resolve(session.sendOperation({ ...operation }, remaining)).catch(() => {});
 		return session.sendOperation({ ...operation }, remaining);
 	}
 	if (parentPort) {
@@ -410,14 +441,25 @@ export async function executeDelegate(request: any): Promise<DelegationReply> {
 		generation: request.generation,
 		leaseMs: request.leaseMs,
 	};
+	// Passed through as sent: core refuses a malformed tag rather than reading it as an untagged request.
+	if (!LEGACY_WIRE) {
+		if (request.delegationRequestId !== undefined) delegation.requestId = request.delegationRequestId;
+		if (request.delegateEpoch !== undefined) delegation.delegateEpoch = request.delegateEpoch;
+	}
+	// A fresh object: the session stamps its own `requestId` onto the reply, so core's echo travels
+	// under the wire name.
+	const answer = (reply: DelegationReply) => {
+		const { requestId, ...rest } = reply;
+		return requestId === undefined ? { ...rest } : { ...rest, delegationRequestId: requestId };
+	};
 	if (ownership.ownsDatabase(request.database)) {
 		// While homeIncarnation is 0, ownsCoordination() is false and no table coordinator can issue a
-		// token yet; answer 'generation' so the caller fails fast with 503 rather than polling 'not-home'
-		// every 25ms for its full lock timeout.
-		if (!ownerIncarnationReady()) return GENERATION_MISMATCH;
-		return deliverDelegationRequest(request.database, request.table, delegation);
+		// token yet. `recovering` lets the caller wait that out inside its own deadline (§4.5), where
+		// `generation` made it fail at once.
+		if (!ownerIncarnationReady()) return answer(LEGACY_WIRE ? GENERATION_MISMATCH : RECOVERING);
+		return answer(await deliverDelegationRequest(request.database, request.table, delegation));
 	}
-	return relay('delegate', request.database, request.table, delegation);
+	return answer(await relay('delegate', request.database, request.table, delegation));
 }
 
 export async function executeRecall(request: any): Promise<{ recalled: true }> {
@@ -427,9 +469,18 @@ export async function executeRecall(request: any): Promise<{ recalled: true }> {
 		throw new ClientError('database and table are required', 400);
 	if (!Array.isArray(request.token) || request.token.length !== 3) throw new ClientError('token is required', 400);
 	const recall: DelegationRecall = { key: request.key, token: request.token };
+	if (!LEGACY_WIRE && request.delegateEpoch !== undefined) recall.delegateEpoch = request.delegateEpoch;
 	if (ownership.ownsDatabase(request.database)) {
-		// Delegations do not survive a process restart and none can be acquired while homeIncarnation is 0.
-		if (!ownerIncarnationReady()) return RECALLED;
+		// No delegation can be acquired while homeIncarnation is 0, but confirming here would tell the
+		// home this incarnation drained a token it never held, and the home would then wait for a release
+		// nothing writes (§4.5). Fail instead; the home retries, and the restart round retires the grant.
+		if (!ownerIncarnationReady()) {
+			if (LEGACY_WIRE) return { ...RECALLED };
+			throw new ClientError(
+				`record lock coordination incarnation for ${request.database} is not yet initialized here`,
+				503
+			);
+		}
 		await deliverDelegationRecall(request.database, request.table, recall);
 		return { recalled: true };
 	}
@@ -441,7 +492,7 @@ export async function executeRecall(request: any): Promise<{ recalled: true }> {
 	// Structural, not identity: a relayed reply crosses postMessage and is a structured clone.
 	if (answer?.recalled !== true)
 		throw new ClientError('record lock recall did not reach the coordinating worker in time', 503);
-	return RECALLED;
+	return { ...RECALLED };
 }
 
 /**
@@ -449,7 +500,7 @@ export async function executeRecall(request: any): Promise<{ recalled: true }> {
  * it, while a request for a newer incarnation or generation starts its own, since the answer echoes
  * exactly what was asked and the home attests on that echo.
  */
-const incarnationRecallsInFlight = new Map<string, Promise<void>>();
+const incarnationRecallsInFlight = new Map<string, Promise<{ retired?: true; delegateEpoch?: number }>>();
 
 /**
  * A restarted home's recall by incarnation: drain and release every delegation this node holds from
@@ -460,9 +511,14 @@ const incarnationRecallsInFlight = new Map<string, Promise<void>>();
  * itself. A `probe` passes the same checks and answers without draining, so the home can tell whether
  * every member could serve the recall before it makes any of them give up a delegation.
  */
-export async function executeRecallIncarnation(
-	request: any
-): Promise<{ recalled?: true; probed?: true; incarnation: number; generation: number }> {
+export async function executeRecallIncarnation(request: any): Promise<{
+	recalled?: true;
+	probed?: true;
+	retired?: true;
+	incarnation: number;
+	generation: number;
+	delegateEpoch?: number;
+}> {
 	const home = principalNodeName(request);
 	if (!home) throw new ClientError('record lock recalls are accepted from cluster nodes only', 403);
 	if (typeof request.database !== 'string') throw new ClientError('database is required', 400);
@@ -473,6 +529,12 @@ export async function executeRecallIncarnation(
 		throw new ClientError(`${home} is not a member of the record lock home map for ${database}`, 403);
 	if (ownership.peerLevel?.(database, home) !== RECORD_LOCKS_CAPABILITY)
 		throw new ClientError(`${home} does not advertise record lock capability level ${RECORD_LOCKS_CAPABILITY}`, 403);
+	// The caller's delegate epoch (§4.5): in the recall phase its grants here from below it are retired,
+	// and `retired` says so. Every answer, probe included, echoes this node's own epoch so the caller can
+	// record it as our floor. A malformed epoch is refused rather than read as none.
+	const tagged = !LEGACY_WIRE && request.delegateEpoch !== undefined;
+	if (tagged && !isEpoch(request.delegateEpoch)) throw new ClientError('delegateEpoch must be a positive integer', 400);
+	const epoch: number | undefined = tagged ? request.delegateEpoch : undefined;
 	if (request.probe === true) {
 		if ((!ownership.ownsDatabase(database) && !ownership.ownerThreadId?.(database)) || !ownerIncarnationReady())
 			throw new ClientError(`no thread coordinates record locks for ${database} here yet`, 503);
@@ -482,13 +544,14 @@ export async function executeRecallIncarnation(
 				`This node holds record lock home map generation ${active ?? 'unknown'} for ${database}, not ${generation}`,
 				409
 			);
-		return { probed: true, incarnation, generation };
+		const own = await ownEpochFromOwner(database);
+		return { probed: true, incarnation, generation, ...own };
 	}
 	const deadlineMs =
 		typeof request.deadlineMs === 'number' && request.deadlineMs > 0
 			? Math.min(request.deadlineMs, INCARNATION_RECALL_BUDGET_MS)
 			: INCARNATION_RECALL_BUDGET_MS;
-	const key = `${database}\u0000${home}\u0000${generation}\u0000${incarnation}`;
+	const key = `${database}\u0000${home}\u0000${generation}\u0000${incarnation}\u0000${epoch ?? ''}`;
 	let sweep = incarnationRecallsInFlight.get(key);
 	if (!sweep) {
 		sweep = (async () => {
@@ -498,11 +561,23 @@ export async function executeRecallIncarnation(
 						`record lock coordination incarnation for ${database} is not yet initialized here`,
 						503
 					);
-				return recallDelegationsFromHome(database, home, generation, incarnation);
+				if (epoch !== undefined) await retireDelegateEpoch(database, home, epoch);
+				await recallDelegationsFromHome(database, home, generation, incarnation);
+				return { ...(epoch === undefined ? {} : { retired: true as const }), ...ownEpochOf(database) };
 			}
-			const answer = await relay('recall-incarnation', database, '', { home, generation, incarnation, deadlineMs });
+			const answer = await relay('recall-incarnation', database, '', {
+				home,
+				generation,
+				incarnation,
+				deadlineMs,
+				...(epoch === undefined ? {} : { epoch }),
+			});
 			if (answer?.recalled !== true)
 				throw new ClientError('record lock recall did not reach the coordinating worker in time', 503);
+			return {
+				...(answer.retired === true ? { retired: true as const } : {}),
+				...(isEpoch(answer.delegateEpoch) ? { delegateEpoch: answer.delegateEpoch } : {}),
+			};
 		})();
 		incarnationRecallsInFlight.set(key, sweep);
 		sweep.then(
@@ -510,8 +585,30 @@ export async function executeRecallIncarnation(
 			() => incarnationRecallsInFlight.delete(key)
 		);
 	}
-	await sweep;
-	return { recalled: true, incarnation, generation };
+	const own = await sweep;
+	return { recalled: true, incarnation, generation, ...own };
+}
+
+function ownEpochOf(database: string): { delegateEpoch?: number } {
+	if (LEGACY_WIRE) return {};
+	const delegateEpoch = ownership.delegateEpoch?.(database);
+	return isEpoch(delegateEpoch) ? { delegateEpoch } : {};
+}
+
+/** A probe's relay asks the owner for one number; well inside the home's own probe budget. */
+const PROBE_RELAY_BUDGET_MS = 3_000;
+
+/**
+ * This node's own delegate epoch for the probe's echo lives on the coordinating thread, so a probe
+ * served elsewhere asks there. A legacy wire echoes nothing, as the probe always did.
+ */
+async function ownEpochFromOwner(database: string): Promise<{ delegateEpoch?: number }> {
+	if (LEGACY_WIRE) return {};
+	if (ownership.ownsDatabase(database)) return ownEpochOf(database);
+	const answer = await relay('recall-incarnation', database, '', { probe: true, deadlineMs: PROBE_RELAY_BUDGET_MS });
+	if (answer?.probed !== true)
+		throw new ClientError(`no thread coordinates record locks for ${database} here yet`, 503);
+	return isEpoch(answer.delegateEpoch) ? { delegateEpoch: answer.delegateEpoch } : {};
 }
 
 // ---- the recovery / freshness fence: a lockBarrier written on request -------------------------
@@ -592,16 +689,21 @@ async function relay(kind: RelayKind, database: string, table: string, payload: 
 
 async function executeLocally(kind: RelayKind, database: string, table: string, payload: any): Promise<any> {
 	if (kind === 'delegate') {
-		if (!ownerIncarnationReady()) return GENERATION_MISMATCH;
+		if (!ownerIncarnationReady()) return LEGACY_WIRE ? GENERATION_MISMATCH : RECOVERING;
 		return deliverDelegationRequest(database, table, payload);
 	}
 	if (kind === 'quiesce') return quiesceDelegations(database, payload?.deadlineMs);
 	if (kind === 'recall-incarnation') {
 		if (!ownerIncarnationReady()) return undefined;
+		if (payload.probe === true) return { probed: true, ...ownEpochOf(database) };
+		const epoch = !LEGACY_WIRE && isEpoch(payload.epoch) ? payload.epoch : undefined;
+		if (epoch !== undefined) await retireDelegateEpoch(database, payload.home, epoch);
 		await recallDelegationsFromHome(database, payload.home, payload.generation, payload.incarnation);
-		return RECALLED;
+		return { ...RECALLED, ...(epoch === undefined ? {} : { retired: true }), ...ownEpochOf(database) };
 	}
-	if (!ownerIncarnationReady()) return RECALLED;
+	// A recall for a token this incarnation never held is not confirmed (§4.5); the relay's caller
+	// reads anything but `recalled` as a failure the home retries.
+	if (!ownerIncarnationReady()) return LEGACY_WIRE ? RECALLED : undefined;
 	await deliverDelegationRecall(database, table, payload);
 	return RECALLED;
 }
@@ -632,7 +734,8 @@ async function routeFromMain(message: any, fallback: any): Promise<any> {
 	const { kind, database, table, payload } = message;
 	if (ownership.mainOwns(database)) return executeLocally(kind, database, table, payload);
 	const owner = ownership.ownerFor(database);
-	if (!owner) return fallback;
+	// No owner yet, or one whose handoff bump is in flight: a delegation request waits that out (§4.5).
+	if (!owner) return kind === 'delegate' && !LEGACY_WIRE ? RECOVERING : fallback;
 	const hopId = nextRelayId++;
 	const answer = awaitRelay(hopId, fallback, relayTimeoutFor(kind, payload));
 	try {
@@ -735,7 +838,11 @@ const hopMargin = (waitMs: number) => Math.min(ACQUIRE_HOP_MS, Math.floor(waitMs
 // ---- caller side: obtain / release an admission from the owner worker ---------------------------
 
 interface PendingAcquire {
-	resolve: (answer: { round?: LockRound; session?: string; error?: { message: string; statusCode?: number } }) => void;
+	resolve: (answer: {
+		round?: LockRound;
+		session?: string;
+		error?: { message: string; statusCode?: number; ownerUnavailable?: boolean };
+	}) => void;
 	timer: ReturnType<typeof setTimeout>;
 	settled: boolean;
 	ownerThreadId: number;
@@ -751,7 +858,17 @@ const KEY_SEP = String.fromCharCode(0);
 const admissionSessionKey = (database: string, table: string, admissionId: number) =>
 	`${database}${KEY_SEP}${table}${KEY_SEP}${admissionId}`;
 
-/** Called by the transport (core's `acquireOnOwner`). Resolves with the owner-minted round. */
+/** The one refusal core retries inside the caller's wait (`ClusterLockTransport.acquireOnOwner`). */
+function ownerUnavailable(message: string): ClientError {
+	return Object.assign(new ClientError(message, 503), { ownerUnavailable: true });
+}
+
+/**
+ * Called by the transport (core's `acquireOnOwner`). Resolves with the owner-minted round. One attempt:
+ * an owner that is not known yet, or that departs while the acquire is in flight, is a retryable 503
+ * that core retries inside the caller's wait (record-locks.md §4.5) — there, because each attempt must
+ * sample core's relay-generation fence afresh.
+ */
 export async function acquireOnOwnerRelay(
 	database: string,
 	table: string,
@@ -761,15 +878,14 @@ export async function acquireOnOwnerRelay(
 ): Promise<LockRound> {
 	const ownerThreadId = ownership.ownerThreadId?.(database);
 	if (ownerThreadId === undefined)
-		throw new ClientError(
-			`No record lock coordinating worker is known yet for ${database}; retry once the owner is assigned`,
-			503
+		throw ownerUnavailable(
+			`No record lock coordinating worker is known yet for ${database}; retry once the owner is assigned`
 		);
 	const requestId = nextAcquireId++;
 	const answer = await new Promise<{
 		round?: LockRound;
 		session?: string;
-		error?: { message: string; statusCode?: number };
+		error?: { message: string; statusCode?: number; ownerUnavailable?: boolean };
 	}>((resolve) => {
 		const timer = setTimeout(() => {
 			const pending = pendingAcquires.get(requestId);
@@ -787,7 +903,13 @@ export async function acquireOnOwnerRelay(
 			pending.settled = true;
 			clearTimeout(timer);
 			pendingAcquires.delete(requestId);
-			resolve({ error: { message: `the record lock owner worker for ${database} is not reachable`, statusCode: 503 } });
+			resolve({
+				error: {
+					message: `the record lock owner worker for ${database} is not reachable`,
+					statusCode: 503,
+					ownerUnavailable: true,
+				},
+			});
 		};
 		// No origin field: the owner reads the sender identity from the port the harness stamped. A throw
 		// here (an exited or unknown thread id — the cached owner can be stale across a handoff) must
@@ -810,7 +932,10 @@ export async function acquireOnOwnerRelay(
 		}
 		if (!sent) unreachable();
 	});
-	if (answer.error) throw new ClientError(answer.error.message, answer.error.statusCode ?? 503);
+	if (answer.error) {
+		if (answer.error.ownerUnavailable) throw ownerUnavailable(answer.error.message);
+		throw new ClientError(answer.error.message, answer.error.statusCode ?? 503);
+	}
 	if (!answer.round || !answer.session)
 		throw new ClientError(`the record lock owner worker for ${database} returned no usable admission`, 503);
 	remoteAdmissionSessions.set(admissionSessionKey(database, table, answer.round.admissionId), answer.session);
@@ -849,7 +974,11 @@ export function failRelayAcquiresForDatabase(database: string): void {
 		clearTimeout(pending.timer);
 		pendingAcquires.delete(requestId);
 		pending.resolve({
-			error: { message: `the record lock owner for ${database} changed; retry against the successor`, statusCode: 503 },
+			error: {
+				message: `the record lock owner for ${database} changed; retry against the successor`,
+				statusCode: 503,
+				ownerUnavailable: true,
+			},
 		});
 	}
 }
@@ -997,7 +1126,9 @@ export async function handleAcquireRequest(message: any, port: any): Promise<voi
 	// This thread must actually coordinate the database. A misrouted request (an ownership change the
 	// caller had not yet learned) fails closed rather than relaying onward into a loop.
 	if (!ownership.ownsDatabase(database)) {
-		reply({ error: { message: `this worker does not coordinate ${database}`, statusCode: 503 } });
+		reply({
+			error: { message: `this worker does not coordinate ${database}`, statusCode: 503, ownerUnavailable: true },
+		});
 		return;
 	}
 	try {
@@ -1026,10 +1157,20 @@ export async function handleAcquireRequest(message: any, port: any): Promise<voi
 				releaseOwnerAdmission(admission);
 			}
 			if (lostOwnership)
-				reply({ error: { message: `this worker no longer coordinates ${database}`, statusCode: 503 } });
+				reply({
+					error: { message: `this worker no longer coordinates ${database}`, statusCode: 503, ownerUnavailable: true },
+				});
 		}
 	} catch (error: any) {
-		reply({ error: { message: error?.message ?? 'record lock acquire failed', statusCode: error?.statusCode ?? 503 } });
+		// A throw while this thread no longer coordinates (a handoff landed mid-acquire) is the owner going
+		// away, which the caller retries; anything else is the coordinator's own verdict.
+		reply({
+			error: {
+				message: error?.message ?? 'record lock acquire failed',
+				statusCode: error?.statusCode ?? 503,
+				...(ownership.ownsDatabase(database) ? {} : { ownerUnavailable: true }),
+			},
+		});
 	}
 }
 onMessageByType(ACQUIRE_REQUEST, handleAcquireRequest);
