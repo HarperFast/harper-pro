@@ -14,8 +14,8 @@ path=$1
 data_gib=$2
 multiplier=$3
 
-# Same number syntax for both the dataset (the tests parse it with Number()) and the multiplier.
-number='^([0-9]+\.?[0-9]*|\.[0-9]+)$'
+# The decimal subset of JavaScript Number(), which the tests parse the dataset size with.
+number='^[[:space:]]*[+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
 if ! [[ "$data_gib" =~ $number && "$multiplier" =~ $number ]] \
   || ! required=$(awk -v gib="$data_gib" -v times="$multiplier" 'BEGIN {
     bytes = gib * times * 1073741824
