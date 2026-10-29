@@ -3733,9 +3733,7 @@ export class NodeReplicationConnection extends EventEmitter {
 				authorization: this.authorization,
 			});
 		} catch (error) {
-			if (this.session !== attemptSession) return;
-			// an unsubscribed connection makes no further attempt, so nothing else would settle its readers
-			if (this.intentionallyUnsubscribed) return sessionReject(error);
+			if (this.session !== attemptSession || this.intentionallyUnsubscribed) return;
 			// createWebSocket can reject before any socket exists or any open/error/close listener is
 			// attached — e.g. no valid replication certificate yet, or SNICallback.initialize() failing
 			// while a freshly-restarted peer rebuilds its TLS secure contexts. This connect() is invoked
@@ -3758,8 +3756,6 @@ export class NodeReplicationConnection extends EventEmitter {
 			// terminating a socket that is still opening emits 'error' on the next tick
 			socket.on('error', () => {});
 			socket.terminate();
-			if (this.intentionallyUnsubscribed)
-				sessionReject(new Error(`Replication connection to ${this.url} was unsubscribed while opening`));
 			return;
 		}
 		this.socket = socket;
@@ -4005,6 +4001,12 @@ export class NodeReplicationConnection extends EventEmitter {
 	}
 	unsubscribe() {
 		this.intentionallyUnsubscribed = true;
+		// No later attempt will settle readers still waiting for a session. An open session is already settled,
+		// and its close handler still needs isConnected to report the disconnect.
+		if (!this.liveSession) {
+			this.isConnected = false;
+			this.sessionReject?.(new Error(`Replication connection to ${this.url} was unsubscribed`));
+		}
 		this.socket?.close(1008, 'No longer subscribed');
 	}
 	// Drive recovery when the receive watchdog detects a silent connection. The normal recovery path is

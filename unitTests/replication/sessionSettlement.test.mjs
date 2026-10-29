@@ -62,8 +62,19 @@ describe('NodeReplicationConnection session settlement (harper-pro#1189)', () =>
 		const reader = settlement(connection.getRecord({ id: 'a' }));
 		connection.unsubscribe();
 		await attempt;
-		assert.ok((await settled(reader, 'the read on an unsubscribed attempt')) instanceof TypeError);
+		assert.match((await settled(reader, 'the read on an unsubscribed attempt')).message, /unsubscribed/);
 		assert.strictEqual(connection.reconnectScheduled, false);
+		assert.strictEqual(connection.isConnected, false);
+	});
+
+	it('unsubscribing settles readers of a session that replaced the opening attempt', async () => {
+		const connection = withoutRetries(new NodeReplicationConnection(null, null, 'db', 'peer'));
+		const attempt = connection.connect();
+		connection.forceReconnect();
+		const reader = settlement(connection.getRecord({ id: 'a' }));
+		connection.unsubscribe();
+		await attempt;
+		assert.match((await settled(reader, 'the read on the replacement session')).message, /unsubscribed/);
 	});
 
 	describe('against a peer that accepts TCP and never answers', () => {
