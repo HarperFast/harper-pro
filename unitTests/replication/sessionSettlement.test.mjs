@@ -75,6 +75,7 @@ describe('NodeReplicationConnection session settlement (harper-pro#1189)', () =>
 		connection.unsubscribe();
 		await attempt;
 		assert.match((await settled(reader, 'the read on the replacement session')).message, /unsubscribed/);
+		assert.strictEqual(connection.isConnected, false);
 	});
 
 	describe('against a peer that accepts TCP and never answers', () => {
