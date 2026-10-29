@@ -1,0 +1,8 @@
+type Plain @table @export @sharded {
+	id: ID @primaryKey
+	body: String
+}
+type Other @table(database: "other") @export @sharded {
+	id: ID @primaryKey
+	body: String
+}

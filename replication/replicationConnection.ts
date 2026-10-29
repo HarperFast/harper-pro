@@ -106,6 +106,7 @@ import {
 	getThisNodeId,
 } from '../core/resources/nodeIdMapping.ts';
 import { whenNextTransaction } from '../core/resources/transactionBroadcast.ts';
+import { contextStorage } from '../core/resources/transaction.ts';
 import {
 	replicationCertificateAuthorities,
 	forEachReplicatedDatabase,
@@ -3464,7 +3465,8 @@ export function createCopyFinalizeWatchdog(opts: {
 		onSilence: opts.onStall,
 	});
 }
-let secureContexts: Map<string, tls.SecureContext>;
+let replicationTLSSelector: any;
+const replicationTLS: { secureContexts: Map<string, tls.SecureContext> | null } = { secureContexts: null };
 /**
  * Handles reconnection, and requesting catch-up
  */
@@ -3506,14 +3508,15 @@ export async function createWebSocket(
 		throw new TypeError(`Invalid URL: Expected a string URL for node "${node_name}" but received ${url}`);
 	}
 	if (url.includes('wss://')) {
-		if (!secureContexts) {
-			const SNICallback = createTLSSelector('replication');
-			const secureTarget = {
-				secureContexts: null,
-			};
-			await SNICallback.initialize(secureTarget);
-			secureContexts = secureTarget.secureContexts;
-		}
+		replicationTLSSelector ??= createTLSSelector('replication');
+		// The selector stays pending while this thread has no usable certificate state yet; an attempt must
+		// still fail in bounded time so its waiting reads do.
+		await rejectIfUnsettled(
+			replicationTLSSelector.initialize(replicationTLS),
+			PING_TIMEOUT,
+			new Error(`Replication certificates are not available yet to connect to ${url}`)
+		);
+		const secureContexts = replicationTLS.secureContexts;
 		secureContext = secureContexts.get(node_name);
 		if (secureContext) {
 			logger.debug?.(
@@ -3551,6 +3554,8 @@ export async function createWebSocket(
 		maxPayload: 10 * 1024 * 1024 * 1024,
 		rejectUnauthorized: rejectUnauthorized !== false,
 		secureContext: undefined,
+		// bounds a peer that accepts the TCP connection but never completes TLS or the upgrade
+		handshakeTimeout: PING_TIMEOUT,
 	};
 	if (secureContext) {
 		if (nodeCA) {
@@ -3662,7 +3667,12 @@ export class NodeReplicationConnection extends EventEmitter {
 
 	async connect() {
 		if (this.intentionallyUnsubscribed) return;
+		// The connection outlives the request that first needed it: its timers, socket callbacks and session
+		// must not run as that request.
+		if (contextStorage.getStore() !== undefined) return contextStorage.exit(() => this.connect());
 		if (!this.session) this.resetSession();
+		// this attempt settles only its own session; a replacement belongs to the next attempt
+		const { sessionResolve, sessionReject } = this;
 		// TODO: Need to do this specifically for each node
 		try {
 			this.socket = await createWebSocket(this.url, {
@@ -3683,7 +3693,9 @@ export class NodeReplicationConnection extends EventEmitter {
 				logger.warn?.(
 					`Failed to create web socket to ${this.url} (db: "${this.databaseName}"), retrying: ${error.message}`
 				);
-			this.scheduleReconnect();
+			// as for a socket that errors before 'open': Replicator.load skips the node rather than wait on a retry
+			this.isConnected = false;
+			this.scheduleReconnect(error);
 			return;
 		}
 		// The socket this connection owns has just been replaced, so the session bound to the previous one
@@ -3742,14 +3754,14 @@ export class NodeReplicationConnection extends EventEmitter {
 				);
 				// Only the instance on the current socket is live. If this open raced a replacement, the
 				// instance is born superseded: retire it immediately rather than leave it running, and do
-				// not resolve — `sessionResolve` now belongs to the replacement attempt's promise, so
-				// handing it this dead session would serve requests over a retired instance.
+				// not resolve — the replacement already rejected this attempt's session, and readers wait on
+				// the replacement's.
 				if (this.socket !== socket) {
 					session.retire?.('superseded before open');
 					return;
 				}
 				this.liveSession = session;
-				this.sessionResolve(session);
+				sessionResolve(session);
 			} catch (error) {
 				// replicateOverWS does a fair amount of synchronous setup (setDatabase, audit
 				// store wiring, ping bookkeeping) and any of it can throw — most worryingly,
@@ -3764,7 +3776,7 @@ export class NodeReplicationConnection extends EventEmitter {
 					`Error setting up replication session to ${this.url} (db: "${this.databaseName}"), terminating to retry`,
 					error
 				);
-				this.sessionReject(error);
+				sessionReject(error);
 				this.socket.terminate();
 			}
 		});
@@ -3781,7 +3793,7 @@ export class NodeReplicationConnection extends EventEmitter {
 					);
 				else logger.error?.(`Error in connection to ${this.url} due to ${error.message}`);
 			}
-			this.sessionReject(error);
+			sessionReject(error);
 		});
 		this.socket.on('close', (code, reasonBuffer) => {
 			// Ignore a late close from a socket we have already replaced — forceReconnect may have scheduled
@@ -3846,9 +3858,9 @@ export class NodeReplicationConnection extends EventEmitter {
 	// connect()'s success path clears reconnectScheduled once the new socket is installed; a
 	// createWebSocket rejection routes back through here, keeping the flag true with a fresh pending
 	// retry. Shared by the close handler, forceReconnect, and the connect()-reject path (harper-pro#466).
-	scheduleReconnect() {
+	scheduleReconnect(reason?: Error) {
 		this.reconnectScheduled = true;
-		this.resetSession();
+		this.resetSession(reason);
 		// The 500 ms floor preserves the TLS-state safety bound from #339; jitter decorrelates fleet redials.
 		this.retryBackoff ??= createBackoff({
 			initialMs: INITIAL_RETRY_TIME,
@@ -3908,7 +3920,12 @@ export class NodeReplicationConnection extends EventEmitter {
 			);
 		}
 	}
-	resetSession() {
+	resetSession(reason?: Error) {
+		// Reads already waiting on the outgoing session would otherwise wait on a promise nothing settles;
+		// a no-op when that session opened or failed.
+		this.sessionReject?.(
+			reason ?? new Error(`Replication connection to ${this.url} (db: "${this.databaseName}") was reset`)
+		);
 		this.session = new Promise((resolve, reject) => {
 			this.sessionResolve = resolve;
 			this.sessionReject = reject;
