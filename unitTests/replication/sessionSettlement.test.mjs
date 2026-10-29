@@ -56,6 +56,16 @@ describe('NodeReplicationConnection session settlement (harper-pro#1189)', () =>
 		assert.strictEqual(successor.outcome, 'pending', "the successor's session belongs to the next attempt");
 	});
 
+	it('an attempt unsubscribed before createWebSocket rejects settles its readers without a retry', async () => {
+		const connection = withoutRetries(new NodeReplicationConnection(null, null, 'db', 'peer'));
+		const attempt = connection.connect();
+		const reader = settlement(connection.getRecord({ id: 'a' }));
+		connection.unsubscribe();
+		await attempt;
+		assert.ok((await settled(reader, 'the read on an unsubscribed attempt')) instanceof TypeError);
+		assert.strictEqual(connection.reconnectScheduled, false);
+	});
+
 	describe('against a peer that accepts TCP and never answers', () => {
 		let server;
 		let url;
@@ -76,15 +86,23 @@ describe('NodeReplicationConnection session settlement (harper-pro#1189)', () =>
 			server.close();
 		});
 
-		it('a superseded or unsubscribed attempt does not install the socket it opened', async () => {
-			for (const supersede of [(connection) => connection.forceReconnect(), (connection) => connection.unsubscribe()]) {
-				const connection = withoutRetries(new NodeReplicationConnection(url, null, 'db', 'peer'));
-				const attempt = connection.connect();
-				supersede(connection);
-				await attempt;
-				assert.strictEqual(connection.socket, undefined);
-				connection.intentionallyUnsubscribed = true;
-			}
+		it('a superseded attempt does not install the socket it opened', async () => {
+			const connection = withoutRetries(new NodeReplicationConnection(url, null, 'db', 'peer'));
+			const attempt = connection.connect();
+			connection.forceReconnect();
+			await attempt;
+			assert.strictEqual(connection.socket, undefined);
+			connection.intentionallyUnsubscribed = true;
+		});
+
+		it('an attempt unsubscribed while opening rejects its readers and installs nothing', async () => {
+			const connection = withoutRetries(new NodeReplicationConnection(url, null, 'db', 'peer'));
+			const attempt = connection.connect();
+			const reader = settlement(connection.getRecord({ id: 'a' }));
+			connection.unsubscribe();
+			await attempt;
+			assert.match((await settled(reader, 'the read on an unsubscribed attempt')).message, /unsubscribed/);
+			assert.strictEqual(connection.socket, undefined);
 		});
 
 		it('rejects a read waiting across forceReconnect, and the superseded socket cannot reject its successor', async () => {

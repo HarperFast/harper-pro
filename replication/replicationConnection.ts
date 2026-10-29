@@ -3487,10 +3487,16 @@ export function createBoundedTLSWait(
 		if (current === ready) return;
 		if (current !== watched) {
 			watched = current;
-			current.then(() => {
-				ready = current;
-				wake();
-			}, wake);
+			current.then(
+				() => {
+					ready = current;
+					wake();
+				},
+				(error) => {
+					watched = undefined;
+					wake(error);
+				}
+			);
 		}
 		return new Promise((resolve, reject) => {
 			const settle = (error?: Error) => {
@@ -3728,6 +3734,8 @@ export class NodeReplicationConnection extends EventEmitter {
 			});
 		} catch (error) {
 			if (this.session !== attemptSession) return;
+			// an unsubscribed connection makes no further attempt, so nothing else would settle its readers
+			if (this.intentionallyUnsubscribed) return sessionReject(error);
 			// createWebSocket can reject before any socket exists or any open/error/close listener is
 			// attached — e.g. no valid replication certificate yet, or SNICallback.initialize() failing
 			// while a freshly-restarted peer rebuilds its TLS secure contexts. This connect() is invoked
@@ -3750,6 +3758,8 @@ export class NodeReplicationConnection extends EventEmitter {
 			// terminating a socket that is still opening emits 'error' on the next tick
 			socket.on('error', () => {});
 			socket.terminate();
+			if (this.intentionallyUnsubscribed)
+				sessionReject(new Error(`Replication connection to ${this.url} was unsubscribed while opening`));
 			return;
 		}
 		this.socket = socket;

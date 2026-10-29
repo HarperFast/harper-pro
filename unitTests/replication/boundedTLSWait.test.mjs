@@ -38,6 +38,15 @@ describe('createBoundedTLSWait (harper-pro#1189)', () => {
 		assert.strictEqual(wait('c'), undefined);
 	});
 
+	it('fails at once when the selector hands back an initialization that already failed', async () => {
+		const selector = controlledSelector();
+		const wait = createBoundedTLSWait(() => selector, {}, 5000);
+		const waiting = wait('a');
+		selector.reject(new Error('certificate table closing'));
+		await assert.rejects(waiting, /certificate table closing/);
+		await assert.rejects(wait('a'), /certificate table closing/);
+	});
+
 	it('rejects waiting callers with the initialization failure, and follows the next attempt', async () => {
 		const selector = controlledSelector();
 		const wait = createBoundedTLSWait(() => selector, {}, 5000);
