@@ -75,7 +75,6 @@ interface Waiter {
 }
 
 interface Outstanding {
-	/** The current attempt's: every attempt is a separate barrier entry, matched only on its own nonce. */
 	nonce: number;
 	origin: string;
 	table: string;
@@ -191,7 +190,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		}
 		request.then(
 			(position) => {
-				// A settled attempt, or one a retry superseded, decides nothing.
 				if (attempts.get(attemptNonce) !== entry) return;
 				if (!isValidLogPosition(position)) {
 					settleEntry(
