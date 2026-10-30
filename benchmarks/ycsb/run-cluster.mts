@@ -168,8 +168,17 @@ async function main(): Promise<void> {
 		await connectCluster(nodes);
 
 		const baseUrls = nodes.map((n) => n.httpURL);
+		let replicationThreads: number | undefined;
+		try {
+			const sysInfo = await sendOperation(nodes[0], { operation: 'system_information', attributes: ['threads'] });
+			replicationThreads = (sysInfo.threads ?? []).filter((t: any) => t.name === 'replication').length;
+		} catch {}
 		console.log(`Driving load round-robin across ${baseUrls.length} nodes.`);
-		const results = await runBenchmark(baseUrls, options, { topology: 'round-robin', nodeCount });
+		const results = await runBenchmark(baseUrls, options, {
+			topology: 'round-robin',
+			nodeCount,
+			replicationThreads,
+		});
 
 		// Fail loudly if any requested workload didn't produce a result — a partial run must never
 		// be treated as a clean nightly. (writeResults below would otherwise overwrite the

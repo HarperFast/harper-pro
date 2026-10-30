@@ -16,16 +16,16 @@ const FIXTURE = join(import.meta.dirname, 'fixture-record-locks');
 export const DB = 'data';
 export const CONVERGE_TIMEOUT_MS = 90_000;
 /**
- * With the replication pool on (the pool-on CI jobs set `replication.threads` for every node through
- * `HARPER_CONFIG`), the pool owns subscriptions and record-lock coordination, so a multi-worker node gets as
- * many pool workers as http workers. At 2 pool workers, round-robin over (peer, database) with two databases
- * would put every peer's `data` stream on one worker, never off the coordinating one.
+ * With the replication pool on, the pool owns subscriptions and record-lock coordination, so a multi-worker
+ * node gets as many pool workers as http workers. At 2 pool workers, round-robin over (peer, database) with two
+ * databases would put every peer's `data` stream on one worker, never off the coordinating one.
  */
 function poolEnv(threadsCount) {
+	if (threadsCount <= 1) return {};
 	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
-	if (threadsCount <= 1 || !(shared?.replication?.threads > 0)) return {};
+	if (shared?.replication?.threads <= 0) return {};
 	return {
-		HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared.replication, threads: threadsCount } }),
+		HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared?.replication, threads: threadsCount } }),
 	};
 }
 
