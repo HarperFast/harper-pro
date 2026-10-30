@@ -57,9 +57,10 @@ ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 # exit status of the cleanup commands that follow it, and `harper version` asserts
 # the installed bin actually resolves and runs: v5.2.0-beta.4 published an image
 # with no harper in it off a green build when npm install hit a transient ETARGET.
+COPY --from=build /usr/src/harper-pro/build-tools/install-packed-harper-pro.sh /usr/src/harper-pro/build-tools/check-installed-shrinkwrap.mjs /usr/local/share/harper-pro-install/
 RUN <<-EOF
   set -e
-  npm install --global harperfast-harper-pro-*.tgz
+  bash /usr/local/share/harper-pro-install/install-packed-harper-pro.sh harperfast-harper-pro-*.tgz
   harper version
   rm harperfast-harper-pro-*.tgz
   mkdir -p /home/harperdb/harper
