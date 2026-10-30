@@ -168,12 +168,15 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 		const restartedAt = Date.now();
 		await sendOperation(restarting, { operation: 'restart' }).catch(() => {});
 		// Issued while the node is going down, with the default-sized timeout and lease.
-		const onHeld = lockOnce(other, held);
+		const onHeld = lockOnce(other, held).then((result) => ({ ...result, atMs: Date.now() - restartedAt }));
 		await waitForNewPid(restarting, previousPid);
 		// Issued once the new process exists (its home is unreachable for less than the ride-through).
-		const onHomed = lockOnce(home, homed);
+		const onHomed = lockOnce(home, homed).then((result) => ({ ...result, atMs: Date.now() - restartedAt }));
 		const [heldResult, homedResult] = await Promise.all([onHeld, onHomed]);
 		const elapsed = Date.now() - restartedAt;
+		console.log(
+			`rolling restart: the held key granted ${heldResult.atMs}ms and the homed key ${homedResult.atMs}ms after the restart was issued`
+		);
 		assert.equal(heldResult.status, 200, `the key the node held: ${JSON.stringify(heldResult.body)}`);
 		assert.equal(homedResult.status, 200, `the key the node homes: ${JSON.stringify(homedResult.body)}`);
 		assert.ok(elapsed < LOCK_TIMEOUT_MS, `both locks landed ${elapsed}ms after the restart was issued`);
