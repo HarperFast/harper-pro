@@ -107,9 +107,10 @@ record of that origin and table this node dropped or failed to apply. Those are 
   never merged across callers — and `{ position }`. Client side: the nonce (53-bit random; members
   are mutually trusted, so a collision-resistant random suffices) is registered in the database's
   **outstanding barrier table** before the request is sent; the table is bounded by
-  `MAX_OUTSTANDING_BARRIERS` per database (excess rejects 503) and every entry carries its
-  deadline, which also bounds the request itself so a member that accepts the connection and never
-  answers cannot pin a response waiter or a fallback socket past the lock.
+  `MAX_OUTSTANDING_BARRIERS` per database (excess rejects 503, counted before any of a call's
+  waits starts) and every entry carries its deadline, which also bounds the request itself so a
+  member that accepts the connection and never answers cannot pin a response waiter or a fallback
+  socket past the lock.
 
   **One barrier per wait, not per wave.** Concurrent callers for the same `(database, table,
 origin)` sharing one request and one nonce is only sound for a caller whose dependency was known
@@ -148,14 +149,26 @@ origin)` sharing one request and one nonce is only sound for a caller whose depe
   only after the row is durable. A poisoned pair rejects every dependency and every barrier request
   for it, permanently: a base copy cannot repair it (fact 3), so the only clearance is a fresh
   clone of this node's database, which discards the `dbis` store with it.
-- **Waiting.** Per database, the outstanding barrier table is a `Map` keyed by nonce (origin,
-  table, position when known, waiters). A waiter's deadline is `min(deadlineMs, MAX_LOCK_LEASE_MS)`
-  from now on the monotonic clock. An applied barrier settles its waiters directly; a
-  `BARRIER_SWEEP_MS` (250 ms) sweep, armed only while entries exist, times out expired waiters and
-  deletes emptied entries. Every waiter settles exactly once (`ClientError(503)` on deadline, cap,
-  unregister or replacement); every timer, listener and emitter callback is a non-throwing shell;
-  synchronous `send`/`postMessage` are wrapped. `cluster_status.recordLocks` reports `freshness`
-  (outstanding, applied, timeouts, rejections by reason) and `poisoned`.
+- **Waiting.** Per database, every wait is in one set (origin, table, deadline, position when
+  known, waiters), and each in-flight attempt is indexed by its own nonce. A waiter's deadline is
+  `min(deadlineMs, MAX_LOCK_LEASE_MS)` from now on the monotonic clock. An applied barrier settles
+  its waiters directly; a `BARRIER_SWEEP_MS` (250 ms) sweep, armed only while waits exist, times out
+  expired waiters and deletes emptied entries. Every waiter settles exactly once (`ClientError(503)`
+  on deadline, cap, unregister or replacement); every timer, listener and emitter callback is a
+  non-throwing shell; synchronous `send`/`postMessage` are wrapped. `cluster_status.recordLocks`
+  reports `freshness` (outstanding, applied, timeouts, retried, rejections by reason) and
+  `poisoned`.
+- **A failed request is asked again (core `record-locks.md` §4.5 (2)).** A rejected request — a
+  socket closed under it, no connection, the origin's own refusal before its map agrees after a
+  restart — is what an origin restarting looks like. The wait drops that attempt's nonce, backs off
+  (250 ms doubling to 2 s, half-jittered) and asks again with a fresh nonce, re-passing every refusal
+  above against the current map, until `HOME_RESTART_RIDE_THROUGH_MS` after the first failure or
+  the deadline, whichever is first: at most 13 requests. A retry's request is bounded by that
+  window, and the sweep ends a retry still unanswered there; once a reply names a position, its
+  entry is waited on to the deadline. A wait between attempts stays in the set, so the cap, the
+  sweep and an unregister still see it. The proof is unchanged: only the current attempt's entry
+  settles the wait, and a restarted origin's barrier follows everything its log held, so an earlier
+  attempt committed with its reply lost proves nothing and harms nothing.
 - **Capability level 4, exact level recorded** (slot 33). A peer at another level withholds the
   home map, and a freshness refusal names the required level. **LMDB resolves the feature gate to
   `false`** with one error line (`recordLockConfig.ts`: level 0, the fail-closed transport,

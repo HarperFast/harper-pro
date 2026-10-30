@@ -17,7 +17,7 @@
  * exist for peers, and a human with `super_user` must not be able to mint or clear a delegation.
  */
 import { parentPort } from 'node:worker_threads';
-import { statSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { randomBytes } from 'node:crypto';
 import { onMessageByType, onThreadExit, sendToThread } from '../core/server/threads/manageThreads.js';
@@ -100,17 +100,17 @@ export const LEGACY_WIRE = process.env.HARPER_TEST_RECORD_LOCK_LEGACY_WIRE === '
 /** Test-only: deliver every outbound delegation request twice, as a duplicating transport would (§5.2). */
 const DUPLICATE_DELEGATE = process.env.HARPER_TEST_RECORD_LOCK_DUPLICATE_DELEGATE === '1';
 /**
- * Test-only: a path whose file, written after this thread started, makes the thread commit every
- * barrier it is asked for and never answer, touching `<path>.held` — a reply lost to the restart of
- * the process or worker that holds it. A thread started after the write answers as usual.
+ * Test-only: while the file at this path exists, the first barrier any thread of the node is asked
+ * for — the one that creates `<path>.held` — is committed and never answered: a reply lost to the
+ * restart of the process or worker holding it. Every other barrier is answered as usual.
  */
-const HOLD_BARRIER_ANSWERS = process.env.HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWERS;
-const THREAD_LOADED_AT = Date.now();
+const HOLD_BARRIER_ANSWER = process.env.HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWER;
 
-function holdingBarrierAnswers(): boolean {
-	if (!HOLD_BARRIER_ANSWERS) return false;
+function claimHeldBarrierAnswer(): boolean {
+	if (!HOLD_BARRIER_ANSWER || !existsSync(HOLD_BARRIER_ANSWER)) return false;
 	try {
-		return statSync(HOLD_BARRIER_ANSWERS).mtimeMs > THREAD_LOADED_AT;
+		writeFileSync(`${HOLD_BARRIER_ANSWER}.held`, '', { flag: 'wx' });
+		return true;
 	} catch {
 		return false;
 	}
@@ -668,10 +668,7 @@ async function executeBarrier(request: any): Promise<{ position: number }> {
 	if (!admitBarrierRequest(caller, request.database))
 		throw new ClientError(`too many record lock barrier requests from ${caller} for ${request.database}`, 429);
 	const position = await writeLockBarrier(request.database, request.table, request.nonce);
-	if (holdingBarrierAnswers()) {
-		writeFileSync(`${HOLD_BARRIER_ANSWERS}.held`, '');
-		await new Promise(() => {});
-	}
+	if (claimHeldBarrierAnswer()) await new Promise(() => {});
 	return { position };
 }
 

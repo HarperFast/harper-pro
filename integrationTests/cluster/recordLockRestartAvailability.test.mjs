@@ -121,45 +121,36 @@ function waitForPair(a, b) {
 }
 
 /**
- * Every thread of a node started with `HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWERS: file` commits the
- * barriers it is asked for from now on and never answers them (`recordLockRpc.ts`); a thread started
- * after this call answers as usual.
+ * A locked increment from `node`, whose barrier the origin — started with
+ * `HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWER: holdFile` — commits and never answers
+ * (`recordLockRpc.ts`); `restart` runs once the origin holds it.
  */
-async function holdBarrierAnswers(file) {
-	await rm(`${file}.held`, { force: true });
-	await writeFile(file, '');
-}
-
-function waitForHeldBarrier(file) {
-	return waitForCondition(
-		() =>
-			access(`${file}.held`).then(
-				() => true,
-				() => undefined
-			),
-		{
-			timeoutMs: 30_000,
-			pollMs: 50,
-			description: 'the origin to commit a barrier it will not answer',
-		}
-	);
-}
-
-/** A locked increment from `node`, issued now, with `restart` started once the origin is holding its barrier. */
 async function incrementAcrossHeldBarrier(node, id, holdFile, restart) {
-	await holdBarrierAnswers(holdFile);
-	const startedAt = Date.now();
-	const incremented = call(
-		node,
-		'LockedIncrement/',
-		{ id, timeout: LOCK_TIMEOUT_MS, lease: LOCK_LEASE_MS },
-		AbortSignal.timeout(LOCK_TIMEOUT_MS + 10_000)
-	);
-	await waitForHeldBarrier(holdFile);
-	await restart();
-	const result = await incremented;
-	await rm(holdFile, { force: true });
-	return { ...result, elapsedMs: Date.now() - startedAt };
+	await rm(`${holdFile}.held`, { force: true });
+	await writeFile(holdFile, '');
+	try {
+		const startedAt = Date.now();
+		const incremented = call(
+			node,
+			'LockedIncrement/',
+			{ id, timeout: LOCK_TIMEOUT_MS, lease: LOCK_LEASE_MS },
+			AbortSignal.timeout(LOCK_TIMEOUT_MS + 10_000)
+		);
+		incremented.catch(() => {});
+		await waitForCondition(
+			() =>
+				access(`${holdFile}.held`).then(
+					() => true,
+					() => undefined
+				),
+			{ timeoutMs: 30_000, pollMs: 50, description: 'the origin to commit a barrier it will not answer' }
+		);
+		await rm(holdFile, { force: true });
+		await restart();
+		return { ...(await incremented), elapsedMs: Date.now() - startedAt };
+	} finally {
+		await rm(holdFile, { force: true });
+	}
 }
 
 const lockOnce = (node, id, timeout = LOCK_TIMEOUT_MS) =>
@@ -189,7 +180,7 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 		// under every lock this suite takes from it, not only in the test that checks it.
 		firstNodeEnv = {
 			HARPER_TEST_RECORD_LOCK_DUPLICATE_DELEGATE: '1',
-			HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWERS: holdFile,
+			HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWER: holdFile,
 		};
 		const started = await Promise.allSettled([
 			startNode(ctx.name, firstNodeEnv),
@@ -414,7 +405,7 @@ suite('record locks across a rolling worker restart (harper#3768)', { timeout: 9
 	before(async () => {
 		holdFile = join(await mkdtemp(join(tmpdir(), 'record-lock-hold-')), 'hold');
 		const started = await Promise.allSettled([
-			startNode(ctx.name, { HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWERS: holdFile }, 3),
+			startNode(ctx.name, { HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWER: holdFile }, 3),
 			startNode(ctx.name),
 			startNode(ctx.name),
 		]);

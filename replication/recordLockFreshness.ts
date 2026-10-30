@@ -65,7 +65,6 @@ export interface FreshnessStats {
 	outstanding: number;
 	applied: number;
 	timeouts: number;
-	/** Requests asked again after one failed, while the origin had the ride-through left. */
 	retried: number;
 	rejected: Record<string, number>;
 }
@@ -108,9 +107,8 @@ function unavailable(message: string): ClientError {
 }
 
 export function createFreshnessBarrier(database: string, deps: FreshnessDeps): FreshnessBarrier {
-	/** Every wait, including one between attempts, so the cap, the deadline sweep and `close()` all see it. */
+	// A wait between attempts is in `waits` but not `attempts`, so the cap, the sweep and `close()` still see it.
 	const waits = new Set<Outstanding>();
-	/** The wait each in-flight attempt belongs to, by that attempt's nonce. */
 	const attempts = new Map<number, Outstanding>();
 	const setTimer = deps.setTimer ?? ((callback, ms) => setTimeout(callback, ms).unref());
 	const clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle as NodeJS.Timeout));
@@ -186,10 +184,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			`could not obtain a record lock barrier from ${entry.origin} for ${database}.${entry.table}: ${message}`
 		);
 
-	/**
-	 * One attempt: the request, then the reply matched against the entry the receive path reports. A
-	 * callback whose attempt is no longer current (settled, or superseded by a retry) does nothing.
-	 */
+	/** A callback whose attempt is no longer current (settled, or superseded by a retry) does nothing. */
 	const send = (entry: Outstanding, timeoutMs: number) => {
 		const attemptNonce = entry.nonce;
 		const current = () => attempts.get(attemptNonce) === entry;
@@ -288,9 +283,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 
 	/** Resolves to the barrier's position once the origin's entry has committed on this node. */
 	const awaitBarrier = (origin: string, table: string, deadlineMono: number): Promise<number> => {
-		if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
-		if (waits.size >= MAX_OUTSTANDING_BARRIERS)
-			reject('capacity', `too many record lock barriers are outstanding for ${database}`);
 		const entry: Outstanding = {
 			nonce: nonce(),
 			origin,
@@ -332,7 +324,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			);
 	};
 
-	/** A retry passes every refusal a first request does, against the map as it is now. */
 	const checkRequest = (origin: string, table: string) => {
 		const homeMap = deps.homeMap();
 		if (!homeMap) reject('no-home-map', `no agreed record lock home map for ${database}`);
@@ -350,29 +341,29 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				reject('unreplicated', `${database}.${table} does not replicate, so a cluster lock cannot be made fresh on it`);
 			const deadlineMono = deps.monotonicNow() + Math.min(Math.max(deadlineMs, 0), MAX_LOCK_LEASE_MS);
 			const self = deps.thisNodeName();
+			const origins: string[] = [];
 			if (dependencies === null) {
-				const members = homeMap.homes.filter((member) => member !== self);
-				for (const member of members) checkOrigin(member, table, homeMap);
-				const positions = await Promise.all(members.map((member) => awaitBarrier(member, table, deadlineMono)));
-				return members.map((member, index) => [member, positions[index]] as const);
-			}
-			const pending: Promise<number>[] = [];
-			for (const [origin, position] of dependencies) {
-				if (!isValidLogPosition(position))
-					reject('invalid-position', `a record lock dependency on ${origin} names an invalid log position`);
-				if (origin === self) {
+				for (const member of homeMap.homes) if (member !== self) origins.push(member);
+			} else {
+				for (const [origin, position] of dependencies) {
+					if (!isValidLogPosition(position))
+						reject('invalid-position', `a record lock dependency on ${origin} names an invalid log position`);
+					if (origin !== self) origins.push(origin);
 					// Own history is provable only while the local log is the one that wrote it.
-					if (deps.everRecloned())
+					else if (deps.everRecloned())
 						reject(
 							'recloned',
 							`${database} on this node was recloned, so its own earlier record lock lineage cannot be proven`
 						);
-					continue;
 				}
-				checkOrigin(origin, table, homeMap);
-				pending.push(awaitBarrier(origin, table, deadlineMono));
 			}
-			await Promise.all(pending);
+			// Every refusal before the first wait starts: a wait started for an earlier origin would be
+			// left asking on its own, holding a slot, with nothing to settle its rejection.
+			for (const origin of origins) checkOrigin(origin, table, homeMap);
+			if (waits.size + origins.length > MAX_OUTSTANDING_BARRIERS)
+				reject('capacity', `too many record lock barriers are outstanding for ${database}`);
+			const positions = await Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono)));
+			if (dependencies === null) return origins.map((origin, index) => [origin, positions[index]] as const);
 		},
 		noteBarrierApplied(origin, position, nonce) {
 			const entry = attempts.get(nonce);

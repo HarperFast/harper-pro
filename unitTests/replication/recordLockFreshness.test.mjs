@@ -51,7 +51,6 @@ function harness(overrides = {}) {
 		requests,
 		timers,
 		now: () => now,
-		/** Moves the clock and fires every timer that has come due, earliest first. */
 		advance(ms) {
 			now += ms;
 			for (;;) {
@@ -119,6 +118,35 @@ describe('createFreshnessBarrier: refusals before any request', () => {
 		const invalid = harness();
 		assert.match((await rejection(invalid.barrier.establish('t', [['a', -1]], 1_000))).message, /invalid log position/);
 		for (const h of [level, poisoned, unreplicated, invalid]) assert.strictEqual(h.requests.length, 0);
+	});
+	it('refuses every dependency before it starts any wait, so a later refusal leaves nothing asking', async () => {
+		const poisoned = harness({ isPoisoned: (origin) => origin === 'b' });
+		const error = await rejection(
+			poisoned.barrier.establish(
+				't',
+				[
+					['a', 5],
+					['b', 6],
+				],
+				1_000
+			)
+		);
+		assert.match(error.message, /replication hole/);
+		assert.strictEqual(poisoned.requests.length, 0);
+		assert.strictEqual(poisoned.barrier.stats().outstanding, 0);
+		const invalid = harness();
+		const error2 = await rejection(
+			invalid.barrier.establish(
+				't',
+				[
+					['a', 5],
+					['b', -1],
+				],
+				1_000
+			)
+		);
+		assert.match(error2.message, /invalid log position/);
+		assert.strictEqual(invalid.requests.length, 0);
 	});
 	it('refuses everything while the home map is withheld', async () => {
 		const { barrier } = harness({ homeMap: () => undefined });
@@ -279,6 +307,25 @@ describe('createFreshnessBarrier: every wait ends exactly once', () => {
 		for (let i = 0; i < MAX_OUTSTANDING_BARRIERS; i++) h.barrier.establish('t', [['a', 5]], 1_000).catch(() => {});
 		assert.match((await rejection(h.barrier.establish('t', [['a', 5]], 1_000))).message, /too many/);
 		assert.strictEqual(h.barrier.stats().rejected.capacity, 1);
+		h.barrier.close();
+	});
+	it('the cap counts every wait a call would start, and starts none past it', async () => {
+		const h = harness();
+		for (let i = 0; i < MAX_OUTSTANDING_BARRIERS - 1; i++) h.barrier.establish('t', [['a', 5]], 1_000).catch(() => {});
+		const sent = h.requests.length;
+		const error = await rejection(
+			h.barrier.establish(
+				't',
+				[
+					['a', 5],
+					['b', 6],
+				],
+				1_000
+			)
+		);
+		assert.match(error.message, /too many/);
+		assert.strictEqual(h.requests.length, sent);
+		assert.strictEqual(h.barrier.stats().outstanding, MAX_OUTSTANDING_BARRIERS - 1);
 		h.barrier.close();
 	});
 	it('close settles everything and refuses new waits', async () => {
