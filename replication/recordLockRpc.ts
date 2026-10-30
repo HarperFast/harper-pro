@@ -17,6 +17,7 @@
  * exist for peers, and a human with `super_user` must not be able to mint or clear a delegation.
  */
 import { parentPort } from 'node:worker_threads';
+import { existsSync, writeFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { randomBytes } from 'node:crypto';
 import { onMessageByType, onThreadExit, sendToThread } from '../core/server/threads/manageThreads.js';
@@ -98,6 +99,22 @@ const RECALLED = Object.freeze({ recalled: true as const });
 export const LEGACY_WIRE = process.env.HARPER_TEST_RECORD_LOCK_LEGACY_WIRE === '1';
 /** Test-only: deliver every outbound delegation request twice, as a duplicating transport would (§5.2). */
 const DUPLICATE_DELEGATE = process.env.HARPER_TEST_RECORD_LOCK_DUPLICATE_DELEGATE === '1';
+/**
+ * Test-only: while the file at this path exists, the first barrier any thread of the node is asked
+ * for — the one that creates `<path>.held` — is committed and never answered: a reply lost to the
+ * restart of the process or worker holding it. Every other barrier is answered as usual.
+ */
+const HOLD_BARRIER_ANSWER = process.env.HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWER;
+
+function claimHeldBarrierAnswer(): boolean {
+	if (!HOLD_BARRIER_ANSWER || !existsSync(HOLD_BARRIER_ANSWER)) return false;
+	try {
+		writeFileSync(`${HOLD_BARRIER_ANSWER}.held`, '', { flag: 'wx' });
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 function isEpoch(value: unknown): value is number {
 	return Number.isSafeInteger(value) && (value as number) > 0;
@@ -651,6 +668,7 @@ async function executeBarrier(request: any): Promise<{ position: number }> {
 	if (!admitBarrierRequest(caller, request.database))
 		throw new ClientError(`too many record lock barrier requests from ${caller} for ${request.database}`, 429);
 	const position = await writeLockBarrier(request.database, request.table, request.nonce);
+	if (claimHeldBarrierAnswer()) await new Promise(() => {});
 	return { position };
 }
 

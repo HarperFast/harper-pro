@@ -13,7 +13,11 @@
  * `(origin, table)`, self-origin after a reclone), when a barrier is requested, and how a wait ends.
  */
 import { ClientError } from '../core/utility/errors/hdbError.ts';
-import type { LockDependencySet, LockHomeMap } from '../core/resources/recordLockCoordinator.ts';
+import {
+	HOME_RESTART_RIDE_THROUGH_MS,
+	type LockDependencySet,
+	type LockHomeMap,
+} from '../core/resources/recordLockCoordinator.ts';
 import { MAX_LOCK_LEASE_MS } from '../core/resources/recordLock.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
 
@@ -21,6 +25,12 @@ import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
 export const MAX_OUTSTANDING_BARRIERS = 10_000;
 /** Deadline sweep cadence while anything is outstanding. Waits settle on the applied entry, not on this. */
 export const BARRIER_SWEEP_MS = 250;
+/**
+ * A barrier whose request failed is asked again on core's restart backoff (record-locks.md §4.5 (2)):
+ * jittered between half and all of a step that doubles from the minimum to the maximum.
+ */
+export const BARRIER_RETRY_MIN_MS = 250;
+export const BARRIER_RETRY_MAX_MS = 2_000;
 const NONCE_BOUND = Number.MAX_SAFE_INTEGER;
 /** The replication clock domain (`isValidFrameTxnLogKey` in replicationConnection.ts): finite, positive, a date. */
 const MAX_DATE_TIMESTAMP = 8.64e15;
@@ -38,14 +48,15 @@ export interface FreshnessDeps {
 	everRecloned(): boolean;
 	/**
 	 * Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position.
-	 * `timeoutMs` is what is left of the lock's own deadline: the deadline sweep below only settles the
-	 * WAIT, so without bounding the request too, a member that accepts the connection and never answers
-	 * leaves a response waiter (and, on the per-call fallback connection, a socket) pinned for the life
-	 * of that connection — one per failed handoff.
+	 * `timeoutMs` is what is left of the lock's own deadline or, for a retry, of the restart ride-through
+	 * window: the deadline sweep below only settles the WAIT, so without bounding the request too, a
+	 * member that accepts the connection and never answers leaves a response waiter (and, on the per-call
+	 * fallback connection, a socket) pinned for the life of that connection — one per failed handoff.
 	 */
 	requestBarrier(origin: string, table: string, nonce: number, timeoutMs: number): Promise<number>;
 	monotonicNow(): number;
 	nonce?(): number;
+	random?(): number;
 	setTimer?(callback: () => void, ms: number): unknown;
 	clearTimer?(handle: unknown): void;
 }
@@ -54,6 +65,7 @@ export interface FreshnessStats {
 	outstanding: number;
 	applied: number;
 	timeouts: number;
+	retried: number;
 	rejected: Record<string, number>;
 }
 
@@ -66,11 +78,14 @@ interface Outstanding {
 	nonce: number;
 	origin: string;
 	table: string;
+	deadlineMono: number;
 	/** From the origin's reply, once it arrives. */
 	position: number | undefined;
 	/** From the receive path, once the entry commits here — can precede the reply. */
 	appliedPosition: number | undefined;
 	waiters: Waiter[];
+	/** Set by the first failed request: no attempt is sent past `untilMono`, and each is bounded by it. */
+	retry?: { untilMono: number; stepMs: number; timer?: unknown; lastError: string };
 }
 
 export interface FreshnessBarrier {
@@ -91,13 +106,17 @@ function unavailable(message: string): ClientError {
 }
 
 export function createFreshnessBarrier(database: string, deps: FreshnessDeps): FreshnessBarrier {
-	const outstanding = new Map<number, Outstanding>();
+	// A wait between attempts is in `waits` but not `attempts`, so the cap, the sweep and `close()` still see it.
+	const waits = new Set<Outstanding>();
+	const attempts = new Map<number, Outstanding>();
 	const setTimer = deps.setTimer ?? ((callback, ms) => setTimeout(callback, ms).unref());
 	const clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle as NodeJS.Timeout));
 	const nonce = deps.nonce ?? (() => Math.floor(Math.random() * NONCE_BOUND));
+	const random = deps.random ?? Math.random;
 	const rejected: Record<string, number> = {};
 	let applied = 0;
 	let timeouts = 0;
+	let retried = 0;
 	let sweep: unknown;
 	let closed = false;
 
@@ -116,7 +135,12 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	};
 
 	const settleEntry = (entry: Outstanding, error?: Error) => {
-		outstanding.delete(entry.nonce);
+		waits.delete(entry);
+		if (attempts.get(entry.nonce) === entry) attempts.delete(entry.nonce);
+		if (entry.retry?.timer !== undefined) {
+			clearTimer(entry.retry.timer);
+			entry.retry.timer = undefined;
+		}
 		const waiters = entry.waiters;
 		entry.waiters = [];
 		for (const waiter of waiters) waiter.settle(error);
@@ -125,7 +149,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	const sweepDeadlines = () => {
 		sweep = undefined;
 		const now = deps.monotonicNow();
-		for (const entry of outstanding.values()) {
+		for (const entry of waits) {
 			const live: Waiter[] = [];
 			for (const waiter of entry.waiters) {
 				if (waiter.deadlineMono > now) {
@@ -140,30 +164,135 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				);
 			}
 			entry.waiters = live;
-			if (live.length === 0) outstanding.delete(entry.nonce);
+			if (live.length === 0) settleEntry(entry);
 		}
-		if (outstanding.size > 0) sweep = setTimer(sweepDeadlines, BARRIER_SWEEP_MS);
+		if (waits.size > 0) sweep = setTimer(sweepDeadlines, BARRIER_SWEEP_MS);
 	};
 
 	const armSweep = () => {
 		if (sweep === undefined && !closed) sweep = setTimer(sweepDeadlines, BARRIER_SWEEP_MS);
 	};
 
+	const requestFailed = (entry: Outstanding, message: string) =>
+		unavailable(
+			`could not obtain a record lock barrier from ${entry.origin} for ${database}.${entry.table}: ${message}`
+		);
+
+	const send = (entry: Outstanding, timeoutMs: number) => {
+		const attemptNonce = entry.nonce;
+		let request: Promise<number>;
+		try {
+			// At least 1ms: `sendOperation` reads 0 as "no bound" on the fallback path, and a wait whose
+			// deadline has already elapsed is the sweep's business, not an unbounded request's.
+			request = deps.requestBarrier(entry.origin, entry.table, attemptNonce, Math.max(1, timeoutMs));
+		} catch (error) {
+			request = Promise.reject(error);
+		}
+		request.then(
+			(position) => {
+				if (attempts.get(attemptNonce) !== entry) return;
+				if (!isValidLogPosition(position)) {
+					settleEntry(
+						entry,
+						unavailable(`${entry.origin} answered the barrier for ${database}.${entry.table} without a usable position`)
+					);
+					return;
+				}
+				entry.position = position;
+				if (entry.appliedPosition === position) {
+					if (poisonedPair(entry.origin, entry.table)) {
+						rejected.poisoned = (rejected.poisoned ?? 0) + 1;
+						settleEntry(
+							entry,
+							unavailable(
+								`${database}.${entry.table} from ${entry.origin} recorded a replication hole while its barrier was in flight`
+							)
+						);
+						return;
+					}
+					applied++;
+					settleEntry(entry);
+				} else if (entry.appliedPosition !== undefined) {
+					settleEntry(
+						entry,
+						unavailable(
+							`${entry.origin} applied a barrier for ${database}.${entry.table} at a different position than it answered`
+						)
+					);
+				}
+			},
+			(error) => {
+				if (attempts.get(attemptNonce) === entry) retryLater(entry, (error as Error)?.message ?? String(error));
+			}
+		);
+	};
+
+	/**
+	 * A failed request — a socket closed under it, no connection, the origin's refusal while it boots —
+	 * is what an origin restarting looks like, so it is asked again for at most the ride-through from
+	 * the first failure, as core waits out an unreachable home (record-locks.md §4.5 (2)). A restarted
+	 * origin's barrier still follows everything its log held before the restart.
+	 */
+	const retryLater = (entry: Outstanding, message: string) => {
+		const now = deps.monotonicNow();
+		const retry = (entry.retry ??= {
+			untilMono: Math.min(entry.deadlineMono, now + HOME_RESTART_RIDE_THROUGH_MS),
+			stepMs: BARRIER_RETRY_MIN_MS,
+			lastError: '',
+		});
+		retry.lastError = message;
+		// The last attempt is fitted into the window, as core fits its last wait, with a step of its own.
+		const leftMs = retry.untilMono - now - BARRIER_RETRY_MIN_MS;
+		if (!(leftMs > 0)) {
+			settleEntry(entry, requestFailed(entry, message));
+			return;
+		}
+		const delayMs = Math.min(leftMs, retry.stepMs / 2 + random() * (retry.stepMs / 2));
+		retry.stepMs = Math.min(BARRIER_RETRY_MAX_MS, retry.stepMs * 2);
+		attempts.delete(entry.nonce);
+		retry.timer = setTimer(() => reissue(entry), delayMs);
+	};
+
+	const reissue = (entry: Outstanding) => {
+		const retry = entry.retry!;
+		retry.timer = undefined;
+		if (!waits.has(entry)) return;
+		const now = deps.monotonicNow();
+		if (now >= retry.untilMono) {
+			settleEntry(entry, requestFailed(entry, retry.lastError));
+			return;
+		}
+		try {
+			checkRequest(entry.origin, entry.table);
+		} catch (error) {
+			settleEntry(
+				entry,
+				error instanceof ClientError ? error : requestFailed(entry, (error as Error)?.message ?? String(error))
+			);
+			return;
+		}
+		retried++;
+		entry.nonce = nonce();
+		entry.position = undefined;
+		entry.appliedPosition = undefined;
+		attempts.set(entry.nonce, entry);
+		send(entry, retry.untilMono - now);
+	};
+
 	/** Resolves to the barrier's position once the origin's entry has committed on this node. */
 	const awaitBarrier = (origin: string, table: string, deadlineMono: number): Promise<number> => {
-		if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
-		if (outstanding.size >= MAX_OUTSTANDING_BARRIERS)
-			reject('capacity', `too many record lock barriers are outstanding for ${database}`);
 		const entry: Outstanding = {
 			nonce: nonce(),
 			origin,
 			table,
+			deadlineMono,
 			position: undefined,
 			appliedPosition: undefined,
 			waiters: [],
 		};
 		// Registered before the request leaves, so the applied entry cannot arrive unmatched.
-		outstanding.set(entry.nonce, entry);
+		waits.add(entry);
+		attempts.set(entry.nonce, entry);
 		const wait = new Promise<number>((resolve, rejectWait) => {
 			let settled = false;
 			entry.waiters.push({
@@ -177,47 +306,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			});
 		});
 		armSweep();
-		// At least 1ms: `sendOperation` reads 0 as "no bound" on the fallback path, and a wait whose
-		// deadline has already elapsed is the sweep's business, not an unbounded request's.
-		deps.requestBarrier(origin, table, entry.nonce, Math.max(1, deadlineMono - deps.monotonicNow())).then(
-			(position) => {
-				if (!isValidLogPosition(position)) {
-					settleEntry(
-						entry,
-						unavailable(`${origin} answered the barrier for ${database}.${table} without a usable position`)
-					);
-					return;
-				}
-				entry.position = position;
-				if (entry.appliedPosition === position) {
-					if (poisonedPair(origin, table)) {
-						rejected.poisoned = (rejected.poisoned ?? 0) + 1;
-						settleEntry(
-							entry,
-							unavailable(
-								`${database}.${table} from ${origin} recorded a replication hole while its barrier was in flight`
-							)
-						);
-						return;
-					}
-					applied++;
-					settleEntry(entry);
-				} else if (entry.appliedPosition !== undefined) {
-					settleEntry(
-						entry,
-						unavailable(`${origin} applied a barrier for ${database}.${table} at a different position than it answered`)
-					);
-				}
-			},
-			(error) => {
-				settleEntry(
-					entry,
-					unavailable(
-						`could not obtain a record lock barrier from ${origin} for ${database}.${table}: ${(error as Error)?.message ?? error}`
-					)
-				);
-			}
-		);
+		send(entry, deadlineMono - deps.monotonicNow());
 		return wait;
 	};
 
@@ -233,6 +322,14 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			);
 	};
 
+	const checkRequest = (origin: string, table: string) => {
+		const homeMap = deps.homeMap();
+		if (!homeMap) reject('no-home-map', `no agreed record lock home map for ${database}`);
+		if (!deps.tableReplicates(table))
+			reject('unreplicated', `${database}.${table} does not replicate, so a cluster lock cannot be made fresh on it`);
+		checkOrigin(origin, table, homeMap);
+	};
+
 	return {
 		async establish(table, dependencies, deadlineMs) {
 			if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
@@ -242,32 +339,32 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				reject('unreplicated', `${database}.${table} does not replicate, so a cluster lock cannot be made fresh on it`);
 			const deadlineMono = deps.monotonicNow() + Math.min(Math.max(deadlineMs, 0), MAX_LOCK_LEASE_MS);
 			const self = deps.thisNodeName();
+			const origins: string[] = [];
 			if (dependencies === null) {
-				const members = homeMap.homes.filter((member) => member !== self);
-				for (const member of members) checkOrigin(member, table, homeMap);
-				const positions = await Promise.all(members.map((member) => awaitBarrier(member, table, deadlineMono)));
-				return members.map((member, index) => [member, positions[index]] as const);
-			}
-			const waits: Promise<number>[] = [];
-			for (const [origin, position] of dependencies) {
-				if (!isValidLogPosition(position))
-					reject('invalid-position', `a record lock dependency on ${origin} names an invalid log position`);
-				if (origin === self) {
+				for (const member of homeMap.homes) if (member !== self) origins.push(member);
+			} else {
+				for (const [origin, position] of dependencies) {
+					if (!isValidLogPosition(position))
+						reject('invalid-position', `a record lock dependency on ${origin} names an invalid log position`);
+					if (origin !== self) origins.push(origin);
 					// Own history is provable only while the local log is the one that wrote it.
-					if (deps.everRecloned())
+					else if (deps.everRecloned())
 						reject(
 							'recloned',
 							`${database} on this node was recloned, so its own earlier record lock lineage cannot be proven`
 						);
-					continue;
 				}
-				checkOrigin(origin, table, homeMap);
-				waits.push(awaitBarrier(origin, table, deadlineMono));
 			}
-			await Promise.all(waits);
+			// Every refusal before the first wait starts: a wait started for an earlier origin would be
+			// left asking on its own, holding a slot, with nothing to settle its rejection.
+			for (const origin of origins) checkOrigin(origin, table, homeMap);
+			if (waits.size + origins.length > MAX_OUTSTANDING_BARRIERS)
+				reject('capacity', `too many record lock barriers are outstanding for ${database}`);
+			const positions = await Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono)));
+			if (dependencies === null) return origins.map((origin, index) => [origin, positions[index]] as const);
 		},
 		noteBarrierApplied(origin, position, nonce) {
-			const entry = outstanding.get(nonce);
+			const entry = attempts.get(nonce);
 			if (!entry || entry.origin !== origin) return false;
 			entry.appliedPosition = position;
 			if (entry.position === undefined) return true;
@@ -296,7 +393,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			return true;
 		},
 		stats() {
-			return { outstanding: outstanding.size, applied, timeouts, rejected: { ...rejected } };
+			return { outstanding: waits.size, applied, timeouts, retried, rejected: { ...rejected } };
 		},
 		close() {
 			closed = true;
@@ -304,9 +401,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				clearTimer(sweep);
 				sweep = undefined;
 			}
-			// Settling deletes from the map, so iterate a snapshot.
-			const entries = Array.from(outstanding.values());
-			for (const entry of entries)
+			for (const entry of Array.from(waits))
 				settleEntry(
 					entry,
 					unavailable(`record lock freshness for ${database} was closed while waiting on ${entry.origin}`)
