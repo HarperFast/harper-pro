@@ -67,13 +67,12 @@ export function deferSubscribeUntilSessionForTest(
 	// Release has to land in the same microtask batch as the open handler's sessionResolve, ahead of the
 	// peer's first frame: the handshake's shared-truth CONNECTED stamp is gated on nodeSubscriptions, and
 	// missing it leaves nothing to write CONNECTED until a pong up to a ping interval later. So follow the
-	// session promise, and re-follow it whenever a failed attempt replaces it — resetSession() abandons the
-	// old one (connect()'s createWebSocket rejection leaves it pending for good), so watching only the
-	// first would strand the payload.
+	// session promise, and re-follow it whenever a failed attempt replaces it — resetSession() rejects the
+	// old one, so watching only the first would strand the payload.
 	let watched: Promise<unknown> | undefined;
 	const followSession = () => {
-		// Abandonment is checked here, not only in release: a connection whose every attempt fails inside
-		// createWebSocket never settles a session promise, so release is not reachable to do the cleanup.
+		// Abandonment is checked here, not only in release: an unsubscribed connection makes no further
+		// attempt, so no later session settles to reach release.
 		if (connection.intentionallyUnsubscribed || connection.isFinished) connection.deferredSubscribeForTest = undefined;
 		if (!connection.deferredSubscribeForTest) return clearInterval(retry);
 		if (watched === connection.session) return;

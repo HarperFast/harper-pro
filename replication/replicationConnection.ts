@@ -106,6 +106,7 @@ import {
 	getThisNodeId,
 } from '../core/resources/nodeIdMapping.ts';
 import { whenNextTransaction } from '../core/resources/transactionBroadcast.ts';
+import { contextStorage } from '../core/resources/transaction.ts';
 import {
 	replicationCertificateAuthorities,
 	forEachReplicatedDatabase,
@@ -3464,7 +3465,63 @@ export function createCopyFinalizeWatchdog(opts: {
 		onSilence: opts.onStall,
 	});
 }
-let secureContexts: Map<string, tls.SecureContext>;
+/**
+ * Wait for a TLS selector's certificate state, each caller for at most `timeoutMs`. A selector stays pending
+ * while its thread has no usable certificate, so per-caller races on its `.ready` would each stay attached to
+ * it; this attaches one reaction per `.ready` promise however many callers time out on it. Returns undefined
+ * once the state is known.
+ */
+export function createBoundedTLSWait(
+	getSelector: () => { initialize(target: object): Promise<unknown> },
+	target: object,
+	timeoutMs: number
+): (description: string) => Promise<void> | undefined {
+	let ready: Promise<unknown> | undefined;
+	let watched: Promise<unknown> | undefined;
+	const waiters = new Set<(error?: Error) => void>();
+	const wake = (error?: Error) => {
+		for (const settle of waiters) settle(error);
+	};
+	return (description) => {
+		const current = getSelector().initialize(target);
+		if (current === ready) return;
+		if (current !== watched) {
+			watched = current;
+			current.then(
+				() => {
+					ready = current;
+					wake();
+				},
+				(error) => {
+					watched = undefined;
+					wake(error);
+				}
+			);
+		}
+		return new Promise((resolve, reject) => {
+			const settle = (error?: Error) => {
+				clearTimeout(timer);
+				waiters.delete(settle);
+				if (error) reject(error);
+				else resolve();
+			};
+			const timer = setTimeout(
+				() => settle(new Error(`Certificates are not available yet for ${description}`)),
+				timeoutMs
+			);
+			timer.unref?.();
+			waiters.add(settle);
+		});
+	};
+}
+
+let replicationTLSSelector: ReturnType<typeof createTLSSelector>;
+const replicationTLS: { secureContexts: Map<string, tls.SecureContext> | null } = { secureContexts: null };
+const waitForReplicationTLS = createBoundedTLSWait(
+	() => (replicationTLSSelector ??= createTLSSelector('replication')),
+	replicationTLS,
+	PING_TIMEOUT
+);
 /**
  * Handles reconnection, and requesting catch-up
  */
@@ -3506,14 +3563,9 @@ export async function createWebSocket(
 		throw new TypeError(`Invalid URL: Expected a string URL for node "${node_name}" but received ${url}`);
 	}
 	if (url.includes('wss://')) {
-		if (!secureContexts) {
-			const SNICallback = createTLSSelector('replication');
-			const secureTarget = {
-				secureContexts: null,
-			};
-			await SNICallback.initialize(secureTarget);
-			secureContexts = secureTarget.secureContexts;
-		}
+		const waiting = waitForReplicationTLS(`a replication connection to ${url}`);
+		if (waiting) await waiting;
+		const secureContexts = replicationTLS.secureContexts;
 		secureContext = secureContexts.get(node_name);
 		if (secureContext) {
 			logger.debug?.(
@@ -3551,6 +3603,7 @@ export async function createWebSocket(
 		maxPayload: 10 * 1024 * 1024 * 1024,
 		rejectUnauthorized: rejectUnauthorized !== false,
 		secureContext: undefined,
+		handshakeTimeout: PING_TIMEOUT,
 	};
 	if (secureContext) {
 		if (nodeCA) {
@@ -3662,14 +3715,23 @@ export class NodeReplicationConnection extends EventEmitter {
 
 	async connect() {
 		if (this.intentionallyUnsubscribed) return;
+		// The connection outlives the request that first needed it: its timers, socket callbacks and session
+		// must not run as that request.
+		if (contextStorage.getStore() !== undefined) return contextStorage.exit(() => this.connect());
 		if (!this.session) this.resetSession();
+		// a newer attempt takes over this.session and its resolvers through resetSession()
+		const { session: attemptSession, sessionResolve, sessionReject } = this;
+		// The handlers below compare this attempt's socket with this.socket: forceReconnect can install a newer
+		// one before this socket's (possibly delayed) terminate() fires close. See harper-pro#420.
+		let socket: ReplicationWebSocket;
 		// TODO: Need to do this specifically for each node
 		try {
-			this.socket = await createWebSocket(this.url, {
+			socket = await createWebSocket(this.url, {
 				serverName: this.nodeName,
 				authorization: this.authorization,
 			});
 		} catch (error) {
+			if (this.session !== attemptSession || this.intentionallyUnsubscribed) return;
 			// createWebSocket can reject before any socket exists or any open/error/close listener is
 			// attached — e.g. no valid replication certificate yet, or SNICallback.initialize() failing
 			// while a freshly-restarted peer rebuilds its TLS secure contexts. This connect() is invoked
@@ -3683,9 +3745,18 @@ export class NodeReplicationConnection extends EventEmitter {
 				logger.warn?.(
 					`Failed to create web socket to ${this.url} (db: "${this.databaseName}"), retrying: ${error.message}`
 				);
-			this.scheduleReconnect();
+			// as for a socket that errors before 'open': Replicator.load skips the node rather than wait on a retry
+			this.reportDisconnected(false, 0);
+			this.scheduleReconnect(error);
 			return;
 		}
+		if (this.session !== attemptSession || this.intentionallyUnsubscribed) {
+			// terminating a socket that is still opening emits 'error' on the next tick
+			socket.on('error', () => {});
+			socket.terminate();
+			return;
+		}
+		this.socket = socket;
 		// The socket this connection owns has just been replaced, so the session bound to the previous one
 		// is superseded by definition: retire it here rather than relying on that socket's 'close', which
 		// for an open-but-idle/paused wedge may arrive late or never. Without this, the old instance's
@@ -3699,10 +3770,6 @@ export class NodeReplicationConnection extends EventEmitter {
 		// createWebSocket await window. Only on the success path: a createWebSocket rejection takes the
 		// catch above, which leaves reconnectScheduled true for its own pending retry. See harper-pro#420.
 		this.reconnectScheduled = false;
-		// Capture this attempt's socket so its close handler can tell whether it is still the live socket:
-		// forceReconnect can schedule a fresh connect() that replaces this.socket before this socket's
-		// (possibly delayed) terminate() finally fires close. See the close handler / harper-pro#420.
-		const socket = this.socket;
 
 		let session;
 		logger.debug?.(`Connecting to ${this.url}, db: ${this.databaseName}, process ${process.pid}`);
@@ -3742,14 +3809,14 @@ export class NodeReplicationConnection extends EventEmitter {
 				);
 				// Only the instance on the current socket is live. If this open raced a replacement, the
 				// instance is born superseded: retire it immediately rather than leave it running, and do
-				// not resolve — `sessionResolve` now belongs to the replacement attempt's promise, so
-				// handing it this dead session would serve requests over a retired instance.
+				// not resolve — the replacement already rejected this attempt's session, and readers wait on
+				// the replacement's.
 				if (this.socket !== socket) {
 					session.retire?.('superseded before open');
 					return;
 				}
 				this.liveSession = session;
-				this.sessionResolve(session);
+				sessionResolve(session);
 			} catch (error) {
 				// replicateOverWS does a fair amount of synchronous setup (setDatabase, audit
 				// store wiring, ping bookkeeping) and any of it can throw — most worryingly,
@@ -3764,7 +3831,7 @@ export class NodeReplicationConnection extends EventEmitter {
 					`Error setting up replication session to ${this.url} (db: "${this.databaseName}"), terminating to retry`,
 					error
 				);
-				this.sessionReject(error);
+				sessionReject(error);
 				this.socket.terminate();
 			}
 		});
@@ -3781,7 +3848,7 @@ export class NodeReplicationConnection extends EventEmitter {
 					);
 				else logger.error?.(`Error in connection to ${this.url} due to ${error.message}`);
 			}
-			this.sessionReject(error);
+			sessionReject(error);
 		});
 		this.socket.on('close', (code, reasonBuffer) => {
 			// Ignore a late close from a socket we have already replaced — forceReconnect may have scheduled
@@ -3798,25 +3865,7 @@ export class NodeReplicationConnection extends EventEmitter {
 			// helper, which left the connection silently dead and required hdb_nodes churn to
 			// recover. Those now fall through to the retry path below.
 			const intentional = this.intentionallyUnsubscribed;
-			if (this.isConnected) {
-				if (this.nodeSubscriptions) {
-					disconnectedFromNode({
-						name: this.nodeName,
-						database: this.databaseName,
-						url: this.url,
-						finished: intentional,
-					});
-				}
-				this.isConnected = false;
-				// Record the disconnect in shared memory so the main thread sees the link is down even if the
-				// disconnect message is never processed (W1 / harper-pro#431). The reconcile staleness net
-				// covers the case where even this doesn't run (worker died).
-				if (this.sharedStatus && this.nodeSubscriptions !== undefined) {
-					this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
-					this.sharedStatus[LAST_ERROR_CODE_POSITION] = code ?? 0;
-					this.sharedStatus[LAST_ERROR_TIME_POSITION] = Date.now();
-				}
-			}
+			this.reportDisconnected(intentional, code ?? 0);
 			this.removeAllListeners('subscriptions-updated');
 			this.removeAllListeners('exclusion-origins-updated');
 
@@ -3846,9 +3895,9 @@ export class NodeReplicationConnection extends EventEmitter {
 	// connect()'s success path clears reconnectScheduled once the new socket is installed; a
 	// createWebSocket rejection routes back through here, keeping the flag true with a fresh pending
 	// retry. Shared by the close handler, forceReconnect, and the connect()-reject path (harper-pro#466).
-	scheduleReconnect() {
+	scheduleReconnect(reason?: Error) {
 		this.reconnectScheduled = true;
-		this.resetSession();
+		this.resetSession(reason);
 		// The 500 ms floor preserves the TLS-state safety bound from #339; jitter decorrelates fleet redials.
 		this.retryBackoff ??= createBackoff({
 			initialMs: INITIAL_RETRY_TIME,
@@ -3908,7 +3957,11 @@ export class NodeReplicationConnection extends EventEmitter {
 			);
 		}
 	}
-	resetSession() {
+	resetSession(reason?: Error) {
+		// reads already waiting on the outgoing session would otherwise wait on a promise nothing settles
+		this.sessionReject?.(
+			reason ?? new Error(`Replication connection to ${this.url} (db: "${this.databaseName}") was reset`)
+		);
 		this.session = new Promise((resolve, reject) => {
 			this.sessionResolve = resolve;
 			this.sessionReject = reject;
@@ -3925,8 +3978,37 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.replicateTablesByDefault = replicateTablesByDefault;
 		this.emit('subscriptions-updated', nodeSubscriptions);
 	}
+	// Every isConnected true -> false transition goes through here: the main thread's failover and wedge
+	// reconcile only learn of a down link from this report. The shared-memory DOWN stamp covers a disconnect
+	// message that is never processed (W1 / harper-pro#431). 0 is a failure with no close code; forceReconnect
+	// passes none because the socket it tears down has not closed.
+	reportDisconnected(finished: boolean, closeCode?: number) {
+		if (!this.isConnected) return;
+		if (this.nodeSubscriptions) {
+			disconnectedFromNode({
+				name: this.nodeName,
+				database: this.databaseName,
+				url: this.url,
+				finished,
+			});
+		}
+		this.isConnected = false;
+		if (this.sharedStatus && this.nodeSubscriptions !== undefined) {
+			this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+			if (closeCode !== undefined) {
+				this.sharedStatus[LAST_ERROR_CODE_POSITION] = closeCode;
+				this.sharedStatus[LAST_ERROR_TIME_POSITION] = Date.now();
+			}
+		}
+	}
 	unsubscribe() {
 		this.intentionallyUnsubscribed = true;
+		// No later attempt will settle readers still waiting for a session. An open session is already settled,
+		// and its close handler still needs isConnected to report the disconnect.
+		if (!this.liveSession) {
+			this.reportDisconnected(true, 1008);
+			this.sessionReject?.(new Error(`Replication connection to ${this.url} was unsubscribed`));
+		}
 		this.socket?.close(1008, 'No longer subscribed');
 	}
 	// Drive recovery when the receive watchdog detects a silent connection. The normal recovery path is
@@ -3939,20 +4021,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	// connect. See harper-pro#420.
 	forceReconnect() {
 		if (this.intentionallyUnsubscribed || this.isFinished || this.reconnectScheduled) return;
-		if (this.isConnected) {
-			if (this.nodeSubscriptions) {
-				disconnectedFromNode({
-					name: this.nodeName,
-					database: this.databaseName,
-					url: this.url,
-					finished: false,
-				});
-			}
-			this.isConnected = false;
-			// Watchdog-forced teardown of a wedged link: mark down in shared memory (W1 / harper-pro#431).
-			if (this.sharedStatus && this.nodeSubscriptions !== undefined)
-				this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
-		}
+		this.reportDisconnected(false);
 		// Drop this connection's stale subscription listener before reconnecting. The close handler
 		// normally does this (removeAllListeners), but its socket-identity guard early-returns for a
 		// superseded socket, so an open-but-idle wedge — whose old socket never fires a timely close —
