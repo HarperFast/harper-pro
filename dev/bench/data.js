@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793374486293,
+  "lastUpdate": 1793374490437,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -15880,6 +15880,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 50.41,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "b82cae2ec1efa9f0d09ca543a32c7324ef50c08d",
+          "message": "ci(companion-check): retry transient GitHub 5xx so one blip does not turn main red (#1104)\n\n* ci(companion-check): retry transient GitHub 5xx in the sweep\n\nRun 39681971584 failed main on two 503s from the GitHub API; the same\nSHA was green on the 299 preceding scheduled runs. actions/github-script\ndefaults to retries: 0, so one blip fails the whole sweep.\n\nDispatch-Task: main-red-kriszyp_harper-pro_c9ab56b95_c787a03e\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* ci(companion-check): keep the sweep's guarded status write single-shot\n\nA retried write lands seconds after the sweep's freshness check and can\noverwrite a newer verdict from a pull_request_target run. Opt that one\nwrite out of retries; its failure path already posts pending.\n\nDispatch-Task: main-red-kriszyp_harper-pro_c9ab56b95_c787a03e\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* test(companion-check): assert on request.retries, not the request key\n\nDispatch-Task: main-red-kriszyp_harper-pro_c9ab56b95_c787a03e\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-30T13:13:13Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/b82cae2ec1efa9f0d09ca543a32c7324ef50c08d"
+        },
+        "date": 1793374490353,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 27.01,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 56.3,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 62.81,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 222.21,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 271.41,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 109.97,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 233.03,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 298.22,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 176.55,
             "unit": "ms"
           }
         ]
