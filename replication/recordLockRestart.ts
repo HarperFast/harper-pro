@@ -46,6 +46,15 @@ export interface RestartRecallDeps {
 	send(node: string, database: string, operation: RecallIncarnationOperation, timeoutMs: number): Promise<any>;
 	/** This node's own sweep; the home is a ring member too. */
 	recallLocally(database: string, home: string, generation: number, belowIncarnation: number): Promise<void>;
+	/** This thread's delegate epoch for the database (§4.5), or undefined while unknown. */
+	delegateEpoch?(database: string): number | undefined;
+	/**
+	 * Record a member's echoed epoch as that member's floor here, and retire its older grants
+	 * (`retireDelegateEpoch`): a home whose owner thread was replaced rebuilds the floors it lost from the
+	 * members' own answers. Awaited before the answer counts; a failure leaves the member unanswered and
+	 * the round retries (§4.5).
+	 */
+	retireLocally?(database: string, delegate: string, belowEpoch: number): void | Promise<unknown>;
 	setTimer?(callback: () => void, ms: number): unknown;
 	clearTimer?(handle: unknown): void;
 	random?(): number;
@@ -62,6 +71,12 @@ export interface RecallIncarnationOperation {
 	deadlineMs: number;
 	/** Answer whether the recall could be served, without serving it. */
 	probe?: true;
+	/**
+	 * The caller's delegate epoch for the database (§4.5). In the recall phase the member retires the
+	 * caller's grants below it and answers `retired`; the probe carries it too, so a member can refuse a
+	 * malformed one before anything is drained.
+	 */
+	delegateEpoch?: number;
 }
 
 export interface RestartRecallStatus {
@@ -80,6 +95,11 @@ export interface RestartRecall {
 	cancel(database: string): void;
 	/** `ClusterLockTransport.quiescedIncarnation` for the database. */
 	quiescedIncarnation(database: string): number | undefined;
+	/**
+	 * `ClusterLockTransport.restartRecovering` for the database: this incarnation's round is in flight,
+	 * or waiting to run again with nobody having refused it, so its quarantine may end at any moment.
+	 */
+	recovering(database: string): boolean;
 	status(database: string): RestartRecallStatus | undefined;
 }
 
@@ -112,6 +132,10 @@ export function isCompleteAnswer(
 		(reply as any).incarnation === incarnation &&
 		(reply as any).generation === generation
 	);
+}
+
+function isEpoch(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) > 0;
 }
 
 export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
@@ -186,6 +210,7 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 			return;
 		}
 		const homeMap = deps.homeMap(database);
+		const epoch = deps.delegateEpoch?.(database);
 		if (!homeMap) {
 			round.lastError = 'no agreed home map yet';
 			return retryLater(database, round);
@@ -207,7 +232,18 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 			incarnation,
 			deadlineMs: INCARNATION_RECALL_BUDGET_MS,
 			...(probe ? { probe: true as const } : {}),
+			...(isEpoch(epoch) ? { delegateEpoch: epoch } : {}),
 		});
+		// A member's answer carries its own epoch; recorded as its floor here whether or not the round
+		// completes, since the fact it states does not depend on the other members.
+		const recorded = new Set<string>();
+		const noteEpoch = async (member: string, reply: any) => {
+			if (!isEpoch(reply?.delegateEpoch) || recorded.has(`${member}:${reply.delegateEpoch}`)) return;
+			// A floor that could not be recorded leaves the member unanswered: attesting past it would let a
+			// delayed request from that member's dead epoch be admitted here.
+			await deps.retireLocally?.(database, member, reply.delegateEpoch);
+			recorded.add(`${member}:${reply.delegateEpoch}`);
+		};
 		round.running = { incarnation, generation };
 		round.rerun = false;
 		round.attempts++;
@@ -215,6 +251,7 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 			const reply = await deps.send(member, database, operation(true), PROBE_BUDGET_MS);
 			if (!isCompleteAnswer(reply, incarnation, generation, 'probed'))
 				throw new Error(`${member} cannot serve a recall for incarnation ${incarnation}`);
+			await noteEpoch(member, reply);
 		});
 		// The question must still be live between the two phases: a round cancelled, replaced or moved on
 		// during the probes must not drain anybody for answers it is about to throw away.
@@ -230,6 +267,7 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 				const reply = await deps.send(member, database, operation(false), INCARNATION_RECALL_BUDGET_MS);
 				if (!isCompleteAnswer(reply, incarnation, generation))
 					throw new Error(`${member} did not confirm the recall for incarnation ${incarnation}`);
+				await noteEpoch(member, reply);
 			});
 		round.running = undefined;
 		// Cancelled, or replaced by a later round, while the answers were in flight: they belong to nobody.
@@ -269,6 +307,14 @@ export function createRestartRecall(deps: RestartRecallDeps): RestartRecall {
 			const round = rounds.get(database);
 			if (!round || round.attested === undefined || !deps.ownsDatabase(database)) return undefined;
 			return round.attested === deps.homeIncarnation() ? round.attested : undefined;
+		},
+		recovering(database) {
+			const round = rounds.get(database);
+			if (!round || !deps.ownsDatabase(database)) return false;
+			if (round.attested === deps.homeIncarnation()) return false;
+			// Running, or between attempts that no member has refused: a mapless first attempt, or a
+			// transient error, is retried shortly. A member that could not answer is not "soon".
+			return round.running !== undefined || round.unanswered.length === 0;
 		},
 		status(database) {
 			const round = rounds.get(database);

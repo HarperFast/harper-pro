@@ -113,9 +113,20 @@ describe('relaying a lock() to the coordinating worker', () => {
 		releaseRecordLockOwner('rpc-handoff');
 		await assert.rejects(
 			acquiring,
-			(error) => error.statusCode === 503 && /retry against the successor/.test(error.message),
+			(error) =>
+				error.statusCode === 503 &&
+				/retry against the successor/.test(error.message) &&
+				error.ownerUnavailable === true,
 			'a caller retries against the successor rather than waiting out its whole timeout'
 		);
+	});
+
+	it('fails at once while no owner is known, marked for core to retry inside the caller’s wait (§4.5)', async () => {
+		await assert.rejects(
+			() => acquireOnOwnerRelay('rpc-no-owner-yet', 'Counter', 'k', 1_000, WAIT_MS),
+			(error) => error.statusCode === 503 && /known yet/.test(error.message) && error.ownerUnavailable === true
+		);
+		assert.strictEqual(port.acquires().length, 0);
 	});
 
 	it('hands a grant that lands after the handoff back to the thread that minted it', async () => {

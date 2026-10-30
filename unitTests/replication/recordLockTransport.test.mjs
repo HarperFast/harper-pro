@@ -30,6 +30,8 @@ import {
 	nextIncarnation,
 	UNKNOWN_HISTORY_INCARNATION_FLOOR,
 	setHomeIncarnation,
+	delegateEpochOf,
+	coordinationStartedMonoOf,
 	isFirstIncarnation,
 	currentHomeIncarnation,
 	ownsRecordLockCoordination,
@@ -229,6 +231,47 @@ describe('createRecordLockTransport().homeMap', () => {
 		return { transport: createRecordLockTransport('data', deps, () => cached), auditStore, sent };
 	}
 
+	it('carries the request id and epoch on a delegation request, and the epoch on a recall (§4.5)', async () => {
+		const { transport, sent } = transportFor({ agreements: { 'peer-a': true } });
+		await transport.requestDelegation('peer-a', 'data', 'Counter', {
+			key: 'k',
+			requester: 'self',
+			generation: 1,
+			leaseMs: 1000,
+			requestId: 42,
+			delegateEpoch: 5,
+		});
+		assert.strictEqual(sent[0].operation.delegationRequestId, 42, 'under a name the session never stamps');
+		assert.ok(!('requestId' in sent[0].operation));
+		assert.strictEqual(sent[0].operation.delegateEpoch, 5);
+		await transport.requestDelegation('peer-a', 'data', 'Counter', {
+			key: 'k',
+			requester: 'self',
+			generation: 1,
+			leaseMs: 1000,
+		});
+		const { transport: echoing } = transportFor({
+			agreements: { 'peer-a': true },
+			reply: { granted: false, reason: 'contended', requestId: 999, delegationRequestId: 42 },
+		});
+		const echoed = await echoing.requestDelegation('peer-a', 'data', 'Counter', {
+			key: 'k',
+			requester: 'self',
+			generation: 1,
+			leaseMs: 1000,
+			requestId: 42,
+		});
+		assert.strictEqual(echoed.requestId, 42, 'core sees its own echo, not the session’s correlation id');
+		assert.ok(
+			!('delegationRequestId' in sent[1].operation) && !('delegateEpoch' in sent[1].operation),
+			'absent stays absent on the wire'
+		);
+		await transport.recallDelegation('peer-a', 'data', 'Counter', { key: 'k', token: [1, 3, 1], delegateEpoch: 5 });
+		assert.strictEqual(sent[2].operation.delegateEpoch, 5);
+		assert.strictEqual(transport.delegateEpoch(), undefined, 'no epoch dependency, no epoch');
+		assert.strictEqual(transport.coordinationStartedMono(), undefined);
+	});
+
 	it('returns the cached generation and homes once every peer agrees', () => {
 		const { transport } = transportFor({ agreements: { 'peer-a': true } });
 		const homeMap = transport.homeMap('data');
@@ -374,6 +417,9 @@ describe('createRecordLockTransport().homeMap', () => {
 		server.nodes = [{ name: 'peer-supported' }];
 		setRecordLockOwnership('pre-incarnation-owner', true);
 		try {
+			// Ownership conferred before the incarnation: the interval has begun, its epoch is not known yet.
+			assert.strictEqual(delegateEpochOf('pre-incarnation-owner'), undefined);
+			assert.ok(coordinationStartedMonoOf('pre-incarnation-owner') > 0);
 			previousReaders = setRecordLockOwnershipReaders({
 				ownsDatabase: ownsRecordLockCoordination,
 				homeIncarnation: currentHomeIncarnation,
@@ -390,17 +436,21 @@ describe('createRecordLockTransport().homeMap', () => {
 					leaseMs: 5000,
 					hdb_user: { name: 'peer-supported' },
 				}),
-				{ granted: false, reason: 'generation' }
+				// `recovering`, so the requester waits the boot out inside its own deadline (§4.5).
+				{ granted: false, reason: 'quarantine', recovering: true, retryAfterMs: 250 }
 			);
-			assert.deepStrictEqual(
-				await executeRecall({
-					database: 'pre-incarnation-owner',
-					table: 'Counter',
-					key: 'k1',
-					token: [1, 1, 1],
-					hdb_user: { name: 'peer-supported' },
-				}),
-				{ recalled: true }
+			// A recall is not confirmed for a token this incarnation never held: the home keeps retrying
+			// and the restart round's retire is what frees the key.
+			await assert.rejects(
+				() =>
+					executeRecall({
+						database: 'pre-incarnation-owner',
+						table: 'Counter',
+						key: 'k1',
+						token: [1, 1, 1],
+						hdb_user: { name: 'peer-supported' },
+					}),
+				(error) => error.statusCode === 503
 			);
 			for (const probe of [true, false]) {
 				await assert.rejects(
@@ -763,7 +813,10 @@ describe('recordLockOwnerFor (main thread)', () => {
 		const first = recordLockOwnerFor('owner-a', workers);
 		assert.ok(workers.includes(first));
 		assert.strictEqual(recordLockOwnerFor('owner-a', workers), first, 'stable across calls');
-		assert.deepStrictEqual(first.posted, [{ type: 'record-lock-owner', database: 'owner-a', owned: true }]);
+		assert.deepStrictEqual(
+			first.posted.map(({ first: _first, ...message }) => message),
+			[{ type: 'record-lock-owner', database: 'owner-a', owned: true, incarnation: currentHomeIncarnation() }]
+		);
 		const second = recordLockOwnerFor('owner-b', workers);
 		assert.notStrictEqual(second, first, 'the next database goes to the other worker');
 		assert.deepStrictEqual(recordLockOwnerThreadIds()['owner-a'], first.threadId);
@@ -812,7 +865,12 @@ describe('recordLockOwnerFor (main thread)', () => {
 		resolveBump(1);
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-d'], 32);
-		assert.deepStrictEqual(live.posted.at(-1), { type: 'record-lock-owner', database: 'owner-d', owned: true });
+		assert.deepStrictEqual((({ first: _first, ...message }) => message)(live.posted.at(-1)), {
+			type: 'record-lock-owner',
+			database: 'owner-d',
+			owned: true,
+			incarnation: currentHomeIncarnation(),
+		});
 		releaseRecordLockOwner('owner-d');
 	});
 
@@ -881,7 +939,12 @@ describe('recordLockOwnerFor (main thread)', () => {
 		assert.strictEqual(duringHandoff, undefined);
 		assert.deepStrictEqual(dead.posted.at(-1), { type: 'record-lock-owner', database: 'owner-g', owned: false });
 		await new Promise((resolve) => setImmediate(resolve));
-		assert.deepStrictEqual(live.posted.at(-1), { type: 'record-lock-owner', database: 'owner-g', owned: true });
+		assert.deepStrictEqual((({ first: _first, ...message }) => message)(live.posted.at(-1)), {
+			type: 'record-lock-owner',
+			database: 'owner-g',
+			owned: true,
+			incarnation: currentHomeIncarnation(),
+		});
 		releaseRecordLockOwner('owner-g');
 	});
 
@@ -1332,5 +1395,36 @@ describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
 		await oldFailure;
 		assert.strictEqual(cachedActiveGeneration('refresh-lifetime'), 3, 'the old lifetime cleared nothing');
 		forgetRecordLockHomesCache('refresh-lifetime');
+	});
+});
+
+describe('the per-database coordination epoch (record-locks.md §4.5)', () => {
+	afterEach(() => {
+		setRecordLockOwnership('epoch-a', false);
+		setRecordLockOwnership('epoch-b', false);
+	});
+
+	it('is the incarnation ownership was assigned under, untouched by a later bump for another database', () => {
+		setHomeIncarnation(500);
+		const before = performance.now();
+		setRecordLockOwnership('epoch-a', true);
+		assert.strictEqual(delegateEpochOf('epoch-a'), 500);
+		assert.ok(coordinationStartedMonoOf('epoch-a') >= before);
+		// Another database's handoff bumps the node-wide counter; epoch-a's owner is still coordinating.
+		setHomeIncarnation(501);
+		setRecordLockOwnership('epoch-b', true);
+		assert.strictEqual(delegateEpochOf('epoch-a'), 500);
+		assert.strictEqual(delegateEpochOf('epoch-b'), 501);
+		// A repeated ownership notice is not a new interval.
+		const started = coordinationStartedMonoOf('epoch-a');
+		setRecordLockOwnership('epoch-a', true);
+		assert.strictEqual(coordinationStartedMonoOf('epoch-a'), started);
+		// Losing ownership ends the interval; regaining it starts a new one under the current counter.
+		setRecordLockOwnership('epoch-a', false);
+		assert.strictEqual(delegateEpochOf('epoch-a'), undefined);
+		assert.strictEqual(coordinationStartedMonoOf('epoch-a'), undefined);
+		setRecordLockOwnership('epoch-a', true);
+		assert.strictEqual(delegateEpochOf('epoch-a'), 501);
+		assert.ok(coordinationStartedMonoOf('epoch-a') > started);
 	});
 });

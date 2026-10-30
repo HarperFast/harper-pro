@@ -82,6 +82,7 @@ import {
 import {
 	BARRIER_OPERATION,
 	DELEGATE_OPERATION,
+	LEGACY_WIRE,
 	RECALL_OPERATION,
 	acquireOnOwnerRelay,
 	clearRelaySessionsForDatabase,
@@ -93,11 +94,13 @@ import {
 	releaseOnOwnerRelay,
 	sendRecordLockOperation,
 	setRecordLockOwnershipReaders,
+	type DelegateOperation,
 	type OutboundOperationStats,
+	type RecallOperation,
 } from './recordLockRpc.ts';
 import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
 import { createRestartRecall, type RestartRecallStatus } from './recordLockRestart.ts';
-import { recallDelegationsFromHome } from '../core/resources/recordLockCoordinator.ts';
+import { recallDelegationsFromHome, retireDelegateEpoch } from '../core/resources/recordLockCoordinator.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
 import { ANY_TABLE, everRecloned, forgetPoisonState, isPoisoned, poison, poisonedPairs } from './recordLockPoison.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
@@ -299,6 +302,12 @@ export interface RecordLockTransportDeps {
 	releaseOnOwner(database: string, table: string, key: unknown, admissionId: number): void;
 	/** The incarnation every ring member has recalled below, or undefined (`recordLockRestart.ts`). */
 	quiescedIncarnation?(database: string): number | undefined;
+	/** This thread's delegate epoch for the database (record-locks.md §4.5), or undefined. */
+	delegateEpoch?(database: string): number | undefined;
+	/** `monotonicNow()` at which this thread's current coordination of the database began, or undefined. */
+	coordinationStartedMono?(database: string): number | undefined;
+	/** Whether this incarnation's restart round for the database is in flight (`recordLockRestart.ts`). */
+	restartRecovering?(database: string): boolean;
 }
 
 /**
@@ -340,6 +349,15 @@ export function createRecordLockTransport(
 		quiescedIncarnation() {
 			return deps.quiescedIncarnation?.(database);
 		},
+		delegateEpoch() {
+			return LEGACY_WIRE ? undefined : deps.delegateEpoch?.(database);
+		},
+		coordinationStartedMono() {
+			return deps.coordinationStartedMono?.(database);
+		},
+		restartRecovering() {
+			return deps.restartRecovering?.(database) === true;
+		},
 		establishLockFreshness(db: string, table: string, _key: unknown, dependencies, deadlineMs: number) {
 			freshness ??= deps.freshness(db, () => transport.homeMap(db));
 			return freshness.establish(table, dependencies, deadlineMs);
@@ -371,23 +389,35 @@ export function createRecordLockTransport(
 			return deps.ownsDatabase(database) && transport.coordinationIncarnation() !== undefined;
 		},
 		requestDelegation(node: string, db: string, table: string, request: DelegationRequest): Promise<DelegationReply> {
-			return deps.send(node, db, {
+			const operation: DelegateOperation = {
 				operation: DELEGATE_OPERATION,
 				database: db,
 				table,
 				key: request.key,
 				generation: request.generation,
 				leaseMs: request.leaseMs,
+			};
+			if (!LEGACY_WIRE) {
+				if (request.requestId !== undefined) operation.delegationRequestId = request.requestId;
+				if (request.delegateEpoch !== undefined) operation.delegateEpoch = request.delegateEpoch;
+			}
+			return deps.send(node, db, operation).then((reply) => {
+				// The session stamped its own `requestId`; core's echo rides under the wire name.
+				if (reply === null || typeof reply !== 'object') return reply;
+				const { requestId: _sessionId, delegationRequestId, ...rest } = reply;
+				return delegationRequestId === undefined ? rest : { ...rest, requestId: delegationRequestId };
 			});
 		},
 		async recallDelegation(node: string, db: string, table: string, recall: DelegationRecall): Promise<void> {
-			await deps.send(node, db, {
+			const operation: RecallOperation = {
 				operation: RECALL_OPERATION,
 				database: db,
 				table,
 				key: recall.key,
 				token: recall.token,
-			});
+			};
+			if (!LEGACY_WIRE && recall.delegateEpoch !== undefined) operation.delegateEpoch = recall.delegateEpoch;
+			await deps.send(node, db, operation);
 		},
 		// harper-pro#852: a `lock()` served on a non-owner worker gets its admission from the owner
 		// worker over the port mesh. Core installs the returned round as a remote admission and drives
@@ -672,10 +702,12 @@ function reconcilePeerHomesAgreement(database: string, peer: string): void {
 	const auditStore = auditStoreFor(database);
 	if (!auditStore) return;
 	const ours = currentHomesDigest(database);
-	recordPeerHomesAgreement(
-		getReplicationSharedStatus(auditStore, database, peer),
-		ours !== undefined && ours === theirs
-	);
+	const matches = ours !== undefined && ours === theirs;
+	recordPeerHomesAgreement(getReplicationSharedStatus(auditStore, database, peer), matches);
+	// Agreement arriving is what makes `homeMap()` answerable: run the restart round now rather than
+	// at its next backoff, which after a few mapless attempts can be most of a lock's timeout away.
+	if (matches && CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF && ownedDatabases.has(database))
+		restartRecall.schedule(database);
 }
 
 /** Our own digest just changed (a fresh activation): every peer we have EVER heard a digest from for
@@ -747,15 +779,37 @@ export function ownsRecordLockCoordination(database: string): boolean {
 	return ownedDatabases.has(database);
 }
 
+/**
+ * This thread's coordination interval per database (record-locks.md §4.5): the delegate epoch, which
+ * a later bump for another database's handoff does not move, and when it began on this thread's clock.
+ * An epoch of 0 (ownership conferred before main's incarnation landed) is filled in by `setHomeIncarnation`.
+ */
+interface CoordinationInterval {
+	epoch: number;
+	startedMono: number;
+}
+const coordinationIntervals = new Map<string, CoordinationInterval>();
+
+export function delegateEpochOf(database: string): number | undefined {
+	const epoch = coordinationIntervals.get(database)?.epoch;
+	return epoch !== undefined && epoch > 0 ? epoch : undefined;
+}
+
+export function coordinationStartedMonoOf(database: string): number | undefined {
+	return coordinationIntervals.get(database)?.startedMono;
+}
+
 export function setRecordLockOwnership(database: string, owned: boolean): void {
 	const wasOwned = ownedDatabases.has(database);
 	if (owned) ownedDatabases.add(database);
 	else ownedDatabases.delete(database);
 	logger.debug?.(`Record lock coordination for ${database} is ${owned ? 'owned' : 'not owned'} by this thread`);
 	if (owned && !wasOwned) {
+		coordinationIntervals.set(database, { epoch: homeIncarnation, startedMono: performance.now() });
 		recreateRecordLockTransport(database);
 		if (CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF) restartRecall.schedule(database);
 	} else if (!owned && wasOwned) {
+		coordinationIntervals.delete(database);
 		onRecordLockOwnershipLost(database);
 		restartRecall.cancel(database);
 	}
@@ -874,6 +928,8 @@ export function setHomeIncarnation(value: unknown, first?: boolean): void {
 	if (!(typeof value === 'number' && Number.isFinite(value) && value > homeIncarnation)) return;
 	const wasUnset = homeIncarnation === 0;
 	homeIncarnation = value;
+	// Ownership conferred before the startup incarnation landed: that database's epoch is this one.
+	if (wasUnset) for (const interval of coordinationIntervals.values()) if (interval.epoch === 0) interval.epoch = value;
 	// Transition undefined→true (fresh node), undefined→false (restarted node), or true→false (a
 	// handoff bump revokes the waiver). Never false→true: once cleared, a later bump cannot make
 	// this incarnation first-ever again.
@@ -910,6 +966,8 @@ const restartRecall = createRestartRecall({
 	},
 	send: sendRecordLockOperation,
 	recallLocally: recallDelegationsFromHome,
+	delegateEpoch: delegateEpochOf,
+	retireLocally: retireDelegateEpoch,
 	warn: (message, detail) => logger.warn?.(message, detail),
 	debug: (message, detail) => logger.debug?.(message, detail),
 });
@@ -925,6 +983,9 @@ const productionDeps: RecordLockTransportDeps = {
 	acquireOnOwner: acquireOnOwnerRelay,
 	releaseOnOwner: releaseOnOwnerRelay,
 	quiescedIncarnation: (database) => restartRecall.quiescedIncarnation(database),
+	delegateEpoch: delegateEpochOf,
+	coordinationStartedMono: coordinationStartedMonoOf,
+	restartRecovering: (database) => restartRecall.recovering(database),
 	freshness(database, homeMap) {
 		const barrier = createFreshnessBarrier(database, {
 			thisNodeName: getThisNodeName,
@@ -1113,6 +1174,8 @@ export interface RecordLockDatabaseStats {
 	unprovenMs?: number;
 	/** The restart recall round for this incarnation, from the coordinating thread only. */
 	restartRecall?: RestartRecallStatus;
+	/** The coordinating thread's delegate epoch for the database (record-locks.md §4.5), once known. */
+	delegateEpoch?: number;
 }
 
 /** Summed `LockCoordinator.stats` over the database's tables on this thread. */
@@ -1148,7 +1211,10 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 	}
 	total.relayedControlEntries = relayedControlEntries.get(database) ?? 0;
 	total.outbound = outboundOperationStats(database);
-	if (ownedDatabases.has(database)) total.restartRecall = restartRecall.status(database);
+	if (ownedDatabases.has(database)) {
+		total.restartRecall = restartRecall.status(database);
+		total.delegateEpoch = delegateEpochOf(database);
+	}
 	try {
 		total.members = transports.get(database)?.homeMap(database)?.homes;
 		total.freshness = freshnessBarriers.get(database)?.stats();
@@ -1164,7 +1230,10 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 }
 
 if (parentPort) {
-	onMessageByType('record-lock-owner', (message) => setRecordLockOwnership(message.database, message.owned === true));
+	onMessageByType('record-lock-owner', (message) => {
+		if (message.owned === true) setHomeIncarnation(message.incarnation, message.first);
+		setRecordLockOwnership(message.database, message.owned === true);
+	});
 	// harper-pro#852: main tells this worker which thread coordinates a database, so a relayed acquire
 	// can reach the owner directly. `undefined` clears it (no owner, or owner in an in-flight handoff).
 	onMessageByType('record-lock-owner-thread', (message) => {
@@ -1251,7 +1320,19 @@ function confer(worker: any, databaseOrType: string, ownedOrValue: boolean | num
 		return;
 	}
 	try {
-		worker.postMessage({ type: 'record-lock-owner', database, owned });
+		// The incarnation ownership is conferred under rides along: a worker that started after the
+		// bump's broadcast would otherwise record its epoch from the value it learned before it.
+		worker.postMessage(
+			owned
+				? {
+						type: 'record-lock-owner',
+						database,
+						owned,
+						incarnation: homeIncarnation,
+						...(typeof firstIncarnation === 'boolean' ? { first: firstIncarnation } : {}),
+					}
+				: { type: 'record-lock-owner', database, owned }
+		);
 	} catch (error) {
 		// An exited worker: there is nothing left to inform, and its replacement is assigned separately.
 		logger.debug?.(`Could not post record lock ownership of ${database} to a worker`, error);
@@ -1602,6 +1683,7 @@ export async function collectRecordLockStatus(
 				entry.poisoned = stats.poisoned;
 				entry.unprovenMs = stats.unprovenMs;
 				entry.restartRecall = stats.restartRecall;
+				entry.delegateEpoch = stats.delegateEpoch;
 				entry.relayedControlEntries = stats.relayedControlEntries;
 				entry.outbound = stats.outbound;
 			}
@@ -1665,6 +1747,7 @@ setRecordLockOwnershipReaders({
 	},
 	mainOwns: (database) => recordLockOwners.get(database) === MAIN_OWNER,
 	ownerThreadId: (database) => ownerThreadByDatabase.get(database),
+	delegateEpoch: delegateEpochOf,
 	activeGeneration: (database) => {
 		try {
 			return transports.get(database)?.homeMap(database)?.generation;
