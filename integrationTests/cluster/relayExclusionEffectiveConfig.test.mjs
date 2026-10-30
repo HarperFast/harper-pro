@@ -236,10 +236,7 @@ suite('relay exclusion follows effective receive config', { timeout: 240000 }, (
 		// Delivery-only assertion: with partial coverage B keeps BOTH the direct A subscription and
 		// relay delivery from C, and a black-box arrival check cannot tell the two apart. This pins
 		// that narrowing DB2's direct subscription did not lose the unexcluded table.
-		ok(
-			await probeUntilArrival(DB2, T_INCLUDED, 'direct-db2', { viaRelay: false }),
-			'unexcluded table should reach B'
-		);
+		ok(await probeUntilArrival(DB2, T_INCLUDED, 'direct-db2', { viaRelay: false }), 'unexcluded table should reach B');
 	});
 
 	test('a receive-side excluded table keeps relay delivery', async () => {

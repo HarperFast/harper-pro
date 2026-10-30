@@ -147,7 +147,9 @@ suite('Copy-mode blob deadlock (base copy)', { timeout: 240000 }, (ctx) => {
 		let last = -1;
 		let converged = false;
 		while (Date.now() < deadline) {
-			const d = await sendOperation(ctx.nodes[1], { operation: 'describe_table', table: 'Prerender' }).catch(() => null);
+			const d = await sendOperation(ctx.nodes[1], { operation: 'describe_table', table: 'Prerender' }).catch(
+				() => null
+			);
 			const c = d?.record_count ?? -1;
 			if (c !== last) last = c;
 			if (c >= RECORDS) {

@@ -230,8 +230,8 @@ suite('Selective table subscription', { timeout: 120000 }, (ctx) => {
 					get_attributes: ['id'],
 				}),
 			]);
-			equal(crossOnB.length, 0, "Table2 record from A leaked to B (excludeTables should block it)");
-			equal(crossOnA.length, 0, "Table2 record from B leaked to A (excludeTables should block it)");
+			equal(crossOnB.length, 0, 'Table2 record from A leaked to B (excludeTables should block it)');
+			equal(crossOnA.length, 0, 'Table2 record from B leaked to A (excludeTables should block it)');
 			await delay(LOCALITY_POLL_MS);
 		}
 	});
