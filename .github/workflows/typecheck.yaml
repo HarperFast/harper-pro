@@ -34,6 +34,7 @@ jobs:
           submodules: 'recursive'
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
+          node-version-file: '.node-version'
           package-manager-cache: false
       # Type-only check: no native postinstall output is read, so skip the scripts.
       # A registry blip must not red a required check.
