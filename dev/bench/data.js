@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793184847195,
+  "lastUpdate": 1793374486293,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -6915,6 +6915,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2300.77,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "b82cae2ec1efa9f0d09ca543a32c7324ef50c08d",
+          "message": "ci(companion-check): retry transient GitHub 5xx so one blip does not turn main red (#1104)\n\n* ci(companion-check): retry transient GitHub 5xx in the sweep\n\nRun 39681971584 failed main on two 503s from the GitHub API; the same\nSHA was green on the 299 preceding scheduled runs. actions/github-script\ndefaults to retries: 0, so one blip fails the whole sweep.\n\nDispatch-Task: main-red-kriszyp_harper-pro_c9ab56b95_c787a03e\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* ci(companion-check): keep the sweep's guarded status write single-shot\n\nA retried write lands seconds after the sweep's freshness check and can\noverwrite a newer verdict from a pull_request_target run. Opt that one\nwrite out of retries; its failure path already posts pending.\n\nDispatch-Task: main-red-kriszyp_harper-pro_c9ab56b95_c787a03e\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* test(companion-check): assert on request.retries, not the request key\n\nDispatch-Task: main-red-kriszyp_harper-pro_c9ab56b95_c787a03e\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-30T13:13:13Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/b82cae2ec1efa9f0d09ca543a32c7324ef50c08d"
+        },
+        "date": 1793374484761,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 5684.39,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 7835.83,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 4222.24,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 3182.79,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 2408.94,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 1274.38,
             "unit": "ops/sec"
           }
         ]
