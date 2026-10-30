@@ -48,10 +48,10 @@ export interface FreshnessDeps {
 	everRecloned(): boolean;
 	/**
 	 * Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position.
-	 * `timeoutMs` is what is left of the lock's own deadline, or for a retry of the restart ride-through:
-	 * the deadline sweep below only settles the WAIT, so without bounding the request too, a member that
-	 * accepts the connection and never answers leaves a response waiter (and, on the per-call fallback
-	 * connection, a socket) pinned for the life of that connection — one per failed handoff.
+	 * `timeoutMs` is what is left of the lock's own deadline or, for a retry, of the restart ride-through
+	 * window: the deadline sweep below only settles the WAIT, so without bounding the request too, a
+	 * member that accepts the connection and never answers leaves a response waiter (and, on the per-call
+	 * fallback connection, a socket) pinned for the life of that connection — one per failed handoff.
 	 */
 	requestBarrier(origin: string, table: string, nonce: number, timeoutMs: number): Promise<number>;
 	monotonicNow(): number;

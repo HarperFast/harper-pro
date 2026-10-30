@@ -475,7 +475,8 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		assert.strictEqual(short.requests.length, 1);
 	});
 	it('keeps asking until the window ends, however the last backoff is drawn', async () => {
-		const h = harness();
+		// A draw whose last full step would overshoot the window: stopping there ends at 8,531 ms.
+		const h = harness({ random: () => 0.75 });
 		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
 		let settled;
 		wait.catch((error) => (settled = error));
