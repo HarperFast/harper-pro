@@ -453,18 +453,35 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		assert.strictEqual(h.barrier.noteBarrierApplied('a', 800, 2), true);
 		await wait;
 	});
-	it('never waits past the lock deadline, and bounds each retry by what is left of it', async () => {
+	it('fits the last attempt into what is left of the lock deadline, and waits no further', async () => {
 		const h = harness();
-		const wait = h.barrier.establish('t', [['a', 5]], 300);
+		const wait = h.barrier.establish('t', [['a', 5]], 400);
 		h.requests[0].reject(closedSocket());
 		await flush();
-		h.advance(BARRIER_RETRY_MIN_MS);
+		h.advance(400 - BARRIER_RETRY_MIN_MS - 1);
 		await flush();
-		assert.strictEqual(h.requests.length, 2);
-		assert.strictEqual(h.requests[1].timeoutMs, 300 - BARRIER_RETRY_MIN_MS);
+		assert.strictEqual(h.requests.length, 1);
+		h.advance(1);
+		await flush();
+		assert.strictEqual(h.requests.length, 2, 'the backoff is shortened to leave the attempt a step');
+		assert.strictEqual(h.requests[1].timeoutMs, BARRIER_RETRY_MIN_MS);
 		h.requests[1].reject(closedSocket());
 		assert.match((await rejection(wait)).message, /Connection closed/);
 		assert.strictEqual(h.requests.length, 2);
+		const short = harness();
+		const wait2 = short.barrier.establish('t', [['a', 5]], BARRIER_RETRY_MIN_MS - 1);
+		short.requests[0].reject(closedSocket());
+		assert.match((await rejection(wait2)).message, /Connection closed/, 'no room left for an attempt');
+		assert.strictEqual(short.requests.length, 1);
+	});
+	it('keeps asking until the window ends, however the last backoff is drawn', async () => {
+		const h = harness();
+		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
+		let settled;
+		wait.catch((error) => (settled = error));
+		const firstFailureAt = h.now();
+		const sentAt = await failUntilSettled(h, 'a', () => settled);
+		assert.strictEqual(sentAt.at(-1) - firstFailureAt, HOME_RESTART_RIDE_THROUGH_MS - BARRIER_RETRY_MIN_MS);
 	});
 	it('a retry still answered keeps waiting for its entry until the lock deadline', async () => {
 		const h = harness();

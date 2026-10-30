@@ -48,10 +48,10 @@ export interface FreshnessDeps {
 	everRecloned(): boolean;
 	/**
 	 * Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position.
-	 * `timeoutMs` is what is left of the lock's own deadline: the deadline sweep below only settles the
-	 * WAIT, so without bounding the request too, a member that accepts the connection and never answers
-	 * leaves a response waiter (and, on the per-call fallback connection, a socket) pinned for the life
-	 * of that connection — one per failed handoff.
+	 * `timeoutMs` is what is left of the lock's own deadline, or for a retry of the restart ride-through:
+	 * the deadline sweep below only settles the WAIT, so without bounding the request too, a member that
+	 * accepts the connection and never answers leaves a response waiter (and, on the per-call fallback
+	 * connection, a socket) pinned for the life of that connection — one per failed handoff.
 	 */
 	requestBarrier(origin: string, table: string, nonce: number, timeoutMs: number): Promise<number>;
 	monotonicNow(): number;
@@ -179,17 +179,20 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			`could not obtain a record lock barrier from ${entry.origin} for ${database}.${entry.table}: ${message}`
 		);
 
-	/** A callback whose attempt is no longer current (settled, or superseded by a retry) does nothing. */
 	const send = (entry: Outstanding, timeoutMs: number) => {
 		const attemptNonce = entry.nonce;
-		const current = () => attempts.get(attemptNonce) === entry;
-		// At least 1ms: `sendOperation` reads 0 as "no bound" on the fallback path, and a wait whose
-		// deadline has already elapsed is the sweep's business, not an unbounded request's.
-		new Promise<number>((resolve) =>
-			resolve(deps.requestBarrier(entry.origin, entry.table, attemptNonce, Math.max(1, timeoutMs)))
-		).then(
+		let request: Promise<number>;
+		try {
+			// At least 1ms: `sendOperation` reads 0 as "no bound" on the fallback path, and a wait whose
+			// deadline has already elapsed is the sweep's business, not an unbounded request's.
+			request = deps.requestBarrier(entry.origin, entry.table, attemptNonce, Math.max(1, timeoutMs));
+		} catch (error) {
+			request = Promise.reject(error);
+		}
+		request.then(
 			(position) => {
-				if (!current()) return;
+				// A settled attempt, or one a retry superseded, decides nothing.
+				if (attempts.get(attemptNonce) !== entry) return;
 				if (!isValidLogPosition(position)) {
 					settleEntry(
 						entry,
@@ -221,7 +224,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				}
 			},
 			(error) => {
-				if (current()) retryLater(entry, (error as Error)?.message ?? String(error));
+				if (attempts.get(attemptNonce) === entry) retryLater(entry, (error as Error)?.message ?? String(error));
 			}
 		);
 	};
@@ -240,11 +243,13 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			lastError: '',
 		});
 		retry.lastError = message;
-		const delayMs = retry.stepMs / 2 + random() * (retry.stepMs / 2);
-		if (now + delayMs >= retry.untilMono) {
+		// The last attempt is fitted into the window, as core fits its last wait, with a step of its own.
+		const leftMs = retry.untilMono - now - BARRIER_RETRY_MIN_MS;
+		if (!(leftMs > 0)) {
 			settleEntry(entry, requestFailed(entry, message));
 			return;
 		}
+		const delayMs = Math.min(leftMs, retry.stepMs / 2 + random() * (retry.stepMs / 2));
 		retry.stepMs = Math.min(BARRIER_RETRY_MAX_MS, retry.stepMs * 2);
 		attempts.delete(entry.nonce);
 		retry.timer = setTimer(() => reissue(entry), delayMs);
@@ -398,7 +403,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				clearTimer(sweep);
 				sweep = undefined;
 			}
-			// Settling deletes from the set, so iterate a snapshot.
 			for (const entry of Array.from(waits))
 				settleEntry(
 					entry,
