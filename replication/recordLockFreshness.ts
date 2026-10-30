@@ -85,7 +85,7 @@ interface Outstanding {
 	/** From the receive path, once the entry commits here — can precede the reply. */
 	appliedPosition: number | undefined;
 	waiters: Waiter[];
-	/** Set by the first failed request: no attempt is sent, or waited on, past `untilMono`. */
+	/** Set by the first failed request: no attempt is sent past `untilMono`, and each is bounded by it. */
 	retry?: { untilMono: number; stepMs: number; timer?: unknown; lastError: string };
 }
 
@@ -151,11 +151,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		sweep = undefined;
 		const now = deps.monotonicNow();
 		for (const entry of waits) {
-			// A retry is never waited on past the ride-through, answered or not; a reply's entry is.
-			if (entry.retry !== undefined && entry.position === undefined && now >= entry.retry.untilMono) {
-				settleEntry(entry, requestFailed(entry, entry.retry.lastError));
-				continue;
-			}
 			const live: Waiter[] = [];
 			for (const waiter of entry.waiters) {
 				if (waiter.deadlineMono > now) {

@@ -163,9 +163,9 @@ origin)` sharing one request and one nonce is only sound for a caller whose depe
   restart — is what an origin restarting looks like. The wait drops that attempt's nonce, backs off
   (250 ms doubling to 2 s, half-jittered) and asks again with a fresh nonce, re-passing every refusal
   above against the current map, until `HOME_RESTART_RIDE_THROUGH_MS` after the first failure or
-  the deadline, whichever is first: at most 13 requests. A retry's request is bounded by that
-  window, and the sweep ends a retry still unanswered there; once a reply names a position, its
-  entry is waited on to the deadline. A wait between attempts stays in the set, so the cap, the
+  the deadline, whichever is first: at most 13 requests. A retry's request is bounded by what is
+  left of that window, so an origin that accepts it and never answers costs no more; once a reply
+  names a position, its entry is waited on to the deadline. A wait between attempts stays in the set, so the cap, the
   sweep and an unregister still see it. The proof is unchanged: only the current attempt's entry
   settles the wait, and a restarted origin's barrier follows everything its log held, so an earlier
   attempt committed with its reply lost proves nothing and harms nothing.

@@ -424,7 +424,7 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		assert.ok(settled);
 		assert.ok(sentAt.length <= 13, `${sentAt.length} requests`);
 	});
-	it('bounds a retry’s request by what is left of the ride-through, and ends one never answered there', async () => {
+	it('bounds a retry’s request by what is left of the ride-through, and asks no more once it times out', async () => {
 		const h = harness();
 		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
 		h.requests[0].reject(closedSocket());
@@ -432,11 +432,26 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		h.advance(BARRIER_RETRY_MIN_MS);
 		await flush();
 		assert.strictEqual(h.requests[1].timeoutMs, HOME_RESTART_RIDE_THROUGH_MS - BARRIER_RETRY_MIN_MS);
-		// The origin accepts the retry and never answers it.
-		h.advance(HOME_RESTART_RIDE_THROUGH_MS - BARRIER_RETRY_MIN_MS + BARRIER_SWEEP_MS);
-		assert.match((await rejection(wait)).message, /Connection closed/);
+		// The origin accepts the retry and never answers; the transport gives up at that bound.
+		h.advance(HOME_RESTART_RIDE_THROUGH_MS - BARRIER_RETRY_MIN_MS);
+		h.requests[1].reject(new Error('record_lock_barrier to a did not answer within 9750ms'));
+		assert.match((await rejection(wait)).message, /did not answer within/);
 		assert.strictEqual(h.requests.length, 2);
 		assert.strictEqual(h.barrier.stats().outstanding, 0);
+	});
+	it('takes a retry’s reply that arrives at the end of the ride-through', async () => {
+		const h = harness();
+		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
+		h.requests[0].reject(closedSocket());
+		await flush();
+		h.advance(BARRIER_RETRY_MIN_MS);
+		await flush();
+		// Forwarded through a sibling worker, the reply crosses one more hop after the bound.
+		h.advance(HOME_RESTART_RIDE_THROUGH_MS);
+		h.requests[1].resolve(800);
+		await flush();
+		assert.strictEqual(h.barrier.noteBarrierApplied('a', 800, 2), true);
+		await wait;
 	});
 	it('never waits past the lock deadline, and bounds each retry by what is left of it', async () => {
 		const h = harness();
