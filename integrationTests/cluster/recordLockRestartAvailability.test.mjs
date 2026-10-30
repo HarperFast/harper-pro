@@ -47,6 +47,11 @@ const LOCK_TIMEOUT_MS = 30_000;
 const LOCK_LEASE_MS = 30_000;
 /** Far below the delegation lease (365 s), which is what a held key used to cost after a restart. */
 const AVAILABLE_BOUND_MS = 120_000;
+/**
+ * A rolling worker restart replaces every http and replication thread in turn, and the one holding a
+ * barrier can be last; the promise holds only for a lock whose timeout and lease outlast that.
+ */
+const ROLLING_RESTART_LOCK_MS = 120_000;
 
 async function lockStats(node, signal) {
 	return (await clusterStatusOf(node, signal)).recordLocks?.[DB];
@@ -125,7 +130,7 @@ function waitForPair(a, b) {
  * `HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWER: holdFile` — commits and never answers
  * (`recordLockRpc.ts`); `restart` runs once the origin holds it.
  */
-async function incrementAcrossHeldBarrier(node, id, holdFile, restart) {
+async function incrementAcrossHeldBarrier(node, id, holdFile, restart, timeout = LOCK_TIMEOUT_MS) {
 	await rm(`${holdFile}.held`, { force: true });
 	await writeFile(holdFile, '');
 	try {
@@ -133,8 +138,8 @@ async function incrementAcrossHeldBarrier(node, id, holdFile, restart) {
 		const incremented = call(
 			node,
 			'LockedIncrement/',
-			{ id, timeout: LOCK_TIMEOUT_MS, lease: LOCK_LEASE_MS },
-			AbortSignal.timeout(LOCK_TIMEOUT_MS + 10_000)
+			{ id, timeout, lease: timeout },
+			AbortSignal.timeout(timeout + 10_000)
 		);
 		incremented.catch(() => {});
 		await waitForCondition(
@@ -484,9 +489,15 @@ suite('record locks across a rolling worker restart (harper#3768)', { timeout: 9
 		assert.equal(written.status, 200, JSON.stringify(written.body));
 		const retriedBefore = (await lockStats(other)).freshness?.retried ?? 0;
 		let restart;
-		const result = await incrementAcrossHeldBarrier(other, id, holdFile, async () => {
-			restart = await sendOperation(multi, { operation: 'restart_service', service: 'http_workers' });
-		});
+		const result = await incrementAcrossHeldBarrier(
+			other,
+			id,
+			holdFile,
+			async () => {
+				restart = await sendOperation(multi, { operation: 'restart_service', service: 'http_workers' });
+			},
+			ROLLING_RESTART_LOCK_MS
+		);
 		await waitForRestartJob(multi, restart);
 		await waitForMesh(nodes);
 		console.log(`held barrier, worker restart: the successor locked ${result.elapsedMs}ms after asking`);
