@@ -3746,7 +3746,7 @@ export class NodeReplicationConnection extends EventEmitter {
 					`Failed to create web socket to ${this.url} (db: "${this.databaseName}"), retrying: ${error.message}`
 				);
 			// as for a socket that errors before 'open': Replicator.load skips the node rather than wait on a retry
-			this.isConnected = false;
+			this.reportDisconnected(false, 0);
 			this.scheduleReconnect(error);
 			return;
 		}
@@ -3865,25 +3865,7 @@ export class NodeReplicationConnection extends EventEmitter {
 			// helper, which left the connection silently dead and required hdb_nodes churn to
 			// recover. Those now fall through to the retry path below.
 			const intentional = this.intentionallyUnsubscribed;
-			if (this.isConnected) {
-				if (this.nodeSubscriptions) {
-					disconnectedFromNode({
-						name: this.nodeName,
-						database: this.databaseName,
-						url: this.url,
-						finished: intentional,
-					});
-				}
-				this.isConnected = false;
-				// Record the disconnect in shared memory so the main thread sees the link is down even if the
-				// disconnect message is never processed (W1 / harper-pro#431). The reconcile staleness net
-				// covers the case where even this doesn't run (worker died).
-				if (this.sharedStatus && this.nodeSubscriptions !== undefined) {
-					this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
-					this.sharedStatus[LAST_ERROR_CODE_POSITION] = code ?? 0;
-					this.sharedStatus[LAST_ERROR_TIME_POSITION] = Date.now();
-				}
-			}
+			this.reportDisconnected(intentional, code ?? 0);
 			this.removeAllListeners('subscriptions-updated');
 			this.removeAllListeners('exclusion-origins-updated');
 
@@ -3996,12 +3978,35 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.replicateTablesByDefault = replicateTablesByDefault;
 		this.emit('subscriptions-updated', nodeSubscriptions);
 	}
+	// Every isConnected true -> false transition goes through here: the main thread's failover and wedge
+	// reconcile only learn of a down link from this report. The shared-memory DOWN stamp covers a disconnect
+	// message that is never processed (W1 / harper-pro#431). 0 is a failure with no close code; forceReconnect
+	// passes none because the socket it tears down has not closed.
+	reportDisconnected(finished: boolean, closeCode?: number) {
+		if (!this.isConnected) return;
+		if (this.nodeSubscriptions) {
+			disconnectedFromNode({
+				name: this.nodeName,
+				database: this.databaseName,
+				url: this.url,
+				finished,
+			});
+		}
+		this.isConnected = false;
+		if (this.sharedStatus && this.nodeSubscriptions !== undefined) {
+			this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+			if (closeCode !== undefined) {
+				this.sharedStatus[LAST_ERROR_CODE_POSITION] = closeCode;
+				this.sharedStatus[LAST_ERROR_TIME_POSITION] = Date.now();
+			}
+		}
+	}
 	unsubscribe() {
 		this.intentionallyUnsubscribed = true;
 		// No later attempt will settle readers still waiting for a session. An open session is already settled,
 		// and its close handler still needs isConnected to report the disconnect.
 		if (!this.liveSession) {
-			this.isConnected = false;
+			this.reportDisconnected(true, 1008);
 			this.sessionReject?.(new Error(`Replication connection to ${this.url} was unsubscribed`));
 		}
 		this.socket?.close(1008, 'No longer subscribed');
@@ -4016,20 +4021,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	// connect. See harper-pro#420.
 	forceReconnect() {
 		if (this.intentionallyUnsubscribed || this.isFinished || this.reconnectScheduled) return;
-		if (this.isConnected) {
-			if (this.nodeSubscriptions) {
-				disconnectedFromNode({
-					name: this.nodeName,
-					database: this.databaseName,
-					url: this.url,
-					finished: false,
-				});
-			}
-			this.isConnected = false;
-			// Watchdog-forced teardown of a wedged link: mark down in shared memory (W1 / harper-pro#431).
-			if (this.sharedStatus && this.nodeSubscriptions !== undefined)
-				this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
-		}
+		this.reportDisconnected(false);
 		// Drop this connection's stale subscription listener before reconnecting. The close handler
 		// normally does this (removeAllListeners), but its socket-identity guard early-returns for a
 		// superseded socket, so an open-but-idle wedge — whose old socket never fires a timely close —

@@ -1,7 +1,18 @@
 import assert from 'node:assert';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
-import { NodeReplicationConnection } from '#src/replication/replicationConnection';
+import { createRequire } from 'node:module';
+import {
+	NodeReplicationConnection,
+	CONNECTION_STATE_POSITION,
+	CONNECTION_STATE_CONNECTED,
+	CONNECTION_STATE_DOWN,
+	LAST_ERROR_CODE_POSITION,
+	LAST_ERROR_TIME_POSITION,
+} from '#src/replication/replicationConnection';
+
+// the dist module object, whose disconnectedFromNode the connection reads at call time
+const subscriptionManager = createRequire(import.meta.url)('#src/replication/subscriptionManager');
 
 const BOUND = 2000;
 
@@ -70,6 +81,49 @@ describe('NodeReplicationConnection session settlement (harper-pro#1189)', () =>
 		await attempt;
 		assert.match((await settled(reader, 'the read on the replacement session')).message, /unsubscribed/);
 		assert.strictEqual(connection.isConnected, false);
+	});
+
+	describe('reporting the disconnect of a subscribed connection', () => {
+		let original;
+		let reports;
+		beforeEach(() => {
+			original = subscriptionManager.disconnectedFromNode;
+			reports = [];
+			subscriptionManager.disconnectedFromNode = (report) => reports.push(report);
+		});
+		afterEach(() => {
+			subscriptionManager.disconnectedFromNode = original;
+		});
+
+		function subscribedConnection() {
+			const connection = withoutRetries(new NodeReplicationConnection(null, null, 'db', 'peer'));
+			connection.nodeSubscriptions = [];
+			connection.sharedStatus = new Float64Array(LAST_ERROR_TIME_POSITION + 1);
+			connection.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+			return connection;
+		}
+
+		it('reports a first dial whose createWebSocket rejects, once across later failed attempts', async () => {
+			const connection = subscribedConnection();
+			await connection.connect();
+			assert.deepStrictEqual(reports, [{ name: 'peer', database: 'db', url: null, finished: false }]);
+			assert.strictEqual(connection.sharedStatus[CONNECTION_STATE_POSITION], CONNECTION_STATE_DOWN);
+			assert.strictEqual(connection.sharedStatus[LAST_ERROR_CODE_POSITION], 0);
+			assert.ok(connection.sharedStatus[LAST_ERROR_TIME_POSITION] > 0);
+			await connection.connect();
+			assert.strictEqual(reports.length, 1);
+		});
+
+		it('reports an unsubscribe before the session opens as finished', async () => {
+			const connection = subscribedConnection();
+			const attempt = connection.connect();
+			connection.getRecord({ id: 'a' }).catch(() => {});
+			connection.unsubscribe();
+			await attempt;
+			assert.deepStrictEqual(reports, [{ name: 'peer', database: 'db', url: null, finished: true }]);
+			assert.strictEqual(connection.sharedStatus[CONNECTION_STATE_POSITION], CONNECTION_STATE_DOWN);
+			assert.strictEqual(connection.sharedStatus[LAST_ERROR_CODE_POSITION], 1008);
+		});
 	});
 
 	describe('against a peer that accepts TCP and never answers', () => {
