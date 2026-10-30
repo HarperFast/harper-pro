@@ -153,6 +153,21 @@ async function incrementAcrossHeldBarrier(node, id, holdFile, restart) {
 	}
 }
 
+/** A `restart_service` keeps replacing workers after it answers; resolves once its job has finished. */
+async function waitForRestartJob(node, restart) {
+	assert.ok(restart?.job_id, `restart_service returned no job id: ${JSON.stringify(restart)}`);
+	const job = await waitForCondition(
+		async (signal) => {
+			const [current] = await sendOperation(node, { operation: 'get_job', id: restart.job_id }, { signal }).catch(
+				() => []
+			);
+			return current?.status === 'COMPLETE' || current?.status === 'ERROR' ? current : undefined;
+		},
+		{ timeoutMs: 120_000, pollMs: 500, description: 'the rolling worker restart to finish' }
+	);
+	assert.equal(job.status, 'COMPLETE', JSON.stringify(job));
+}
+
 const lockOnce = (node, id, timeout = LOCK_TIMEOUT_MS) =>
 	call(node, 'LockOnce/', { id, timeout, lease: LOCK_LEASE_MS }, AbortSignal.timeout(timeout + 10_000));
 
@@ -401,6 +416,7 @@ suite('record locks across a rolling worker restart (harper#3768)', { timeout: 9
 	let other;
 	let nodes;
 	let holdFile;
+	let previousRestart;
 
 	before(async () => {
 		holdFile = join(await mkdtemp(join(tmpdir(), 'record-lock-hold-')), 'hold');
@@ -429,7 +445,7 @@ suite('record locks across a rolling worker restart (harper#3768)', { timeout: 9
 		const homed = await keyHomedOn(nodes, multi, other, 'worker-homed');
 		const before = await lockStats(multi);
 		const restartedAt = Date.now();
-		await sendOperation(multi, { operation: 'restart_service', service: 'http_workers' });
+		previousRestart = await sendOperation(multi, { operation: 'restart_service', service: 'http_workers' });
 		const onHeld = lockOnce(other, held);
 		const onHomed = lockOnce(peer, homed);
 		const [heldResult, homedResult] = await Promise.all([onHeld, onHomed]);
@@ -461,13 +477,17 @@ suite('record locks across a rolling worker restart (harper#3768)', { timeout: 9
 	});
 
 	test('a barrier a replaced worker committed but never answered is asked again of its successor', async () => {
+		if (previousRestart) await waitForRestartJob(multi, previousRestart);
+		await waitForMesh(nodes);
 		const id = await keyHomedOn(nodes, peer, multi, 'worker-unanswered');
 		const written = await call(multi, 'LockedIncrement/', { id, timeout: LOCK_TIMEOUT_MS, lease: LOCK_LEASE_MS });
 		assert.equal(written.status, 200, JSON.stringify(written.body));
 		const retriedBefore = (await lockStats(other)).freshness?.retried ?? 0;
-		const result = await incrementAcrossHeldBarrier(other, id, holdFile, () =>
-			sendOperation(multi, { operation: 'restart_service', service: 'http_workers' })
-		);
+		let restart;
+		const result = await incrementAcrossHeldBarrier(other, id, holdFile, async () => {
+			restart = await sendOperation(multi, { operation: 'restart_service', service: 'http_workers' });
+		});
+		await waitForRestartJob(multi, restart);
 		await waitForMesh(nodes);
 		console.log(`held barrier, worker restart: the successor locked ${result.elapsedMs}ms after asking`);
 		assert.equal(result.status, 200, `the successor across the worker restart: ${JSON.stringify(result.body)}`);
