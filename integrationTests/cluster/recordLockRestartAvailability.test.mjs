@@ -12,6 +12,8 @@
  * - with a member down, the restarted node's round cannot complete: its quarantine stays unprovable and
  *   the keys it held stay held until that member returns (record-locks.md §4.5, "what stays unavoidable");
  * - a delegation request the transport delivers twice does not hold the key past the holder's release;
+ * - a freshness barrier the restarting process or worker committed but never answered is asked again
+ *   of its successor, and the successor lock reads the write made under the old delegation;
  * - a peer speaking the previous wire keeps the lease-expiry behavior on its side and nothing else breaks.
  *
  * A restart is complete only once `cluster_status` reports a higher coordination incarnation: the
@@ -19,6 +21,9 @@
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readNodePid, restartNode, sendOperation, waitForCondition, waitForNewPid } from './clusterShared.mjs';
 import {
@@ -115,6 +120,48 @@ function waitForPair(a, b) {
 	);
 }
 
+/**
+ * Every thread of a node started with `HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWERS: file` commits the
+ * barriers it is asked for from now on and never answers them (`recordLockRpc.ts`); a thread started
+ * after this call answers as usual.
+ */
+async function holdBarrierAnswers(file) {
+	await rm(`${file}.held`, { force: true });
+	await writeFile(file, '');
+}
+
+function waitForHeldBarrier(file) {
+	return waitForCondition(
+		() =>
+			access(`${file}.held`).then(
+				() => true,
+				() => undefined
+			),
+		{
+			timeoutMs: 30_000,
+			pollMs: 50,
+			description: 'the origin to commit a barrier it will not answer',
+		}
+	);
+}
+
+/** A locked increment from `node`, issued now, with `restart` started once the origin is holding its barrier. */
+async function incrementAcrossHeldBarrier(node, id, holdFile, restart) {
+	await holdBarrierAnswers(holdFile);
+	const startedAt = Date.now();
+	const incremented = call(
+		node,
+		'LockedIncrement/',
+		{ id, timeout: LOCK_TIMEOUT_MS, lease: LOCK_LEASE_MS },
+		AbortSignal.timeout(LOCK_TIMEOUT_MS + 10_000)
+	);
+	await waitForHeldBarrier(holdFile);
+	await restart();
+	const result = await incremented;
+	await rm(holdFile, { force: true });
+	return { ...result, elapsedMs: Date.now() - startedAt };
+}
+
 const lockOnce = (node, id, timeout = LOCK_TIMEOUT_MS) =>
 	call(node, 'LockOnce/', { id, timeout, lease: LOCK_LEASE_MS }, AbortSignal.timeout(timeout + 10_000));
 
@@ -133,12 +180,19 @@ async function timeUntilGranted(node, id, bound = AVAILABLE_BOUND_MS) {
 suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, (ctx) => {
 	const contexts = [];
 	let nodes;
+	let holdFile;
+	let firstNodeEnv;
 
 	before(async () => {
+		holdFile = join(await mkdtemp(join(tmpdir(), 'record-lock-hold-')), 'hold');
+		// The first node's transport delivers every delegation request twice (§5.2): the dedupe runs
+		// under every lock this suite takes from it, not only in the test that checks it.
+		firstNodeEnv = {
+			HARPER_TEST_RECORD_LOCK_DUPLICATE_DELEGATE: '1',
+			HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWERS: holdFile,
+		};
 		const started = await Promise.allSettled([
-			// The first node's transport delivers every delegation request twice (§5.2): the dedupe runs
-			// under every lock this suite takes from it, not only in the test that checks it.
-			startNode(ctx.name, { HARPER_TEST_RECORD_LOCK_DUPLICATE_DELEGATE: '1' }),
+			startNode(ctx.name, firstNodeEnv),
 			startNode(ctx.name),
 			startNode(ctx.name),
 		]);
@@ -192,6 +246,27 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 			const own = await lockOnce(restarting, id);
 			assert.equal(own.status, 200, `${id} from the restarted node: ${JSON.stringify(own.body)}`);
 		}
+	});
+
+	test('a barrier the restarting process committed but never answered is asked again of the new process', async () => {
+		const [restarting, home, other] = nodes;
+		const id = await keyHomedOn(nodes, home, restarting, 'unanswered');
+		// Written under the restarting node's delegation: its successor's lineage names that node.
+		const written = await call(restarting, 'LockedIncrement/', { id, timeout: LOCK_TIMEOUT_MS, lease: LOCK_LEASE_MS });
+		assert.equal(written.status, 200, JSON.stringify(written.body));
+		const retriedBefore = (await lockStats(other)).freshness?.retried ?? 0;
+		const previous = await incarnationOf(restarting);
+		const result = await incrementAcrossHeldBarrier(other, id, holdFile, () =>
+			sendOperation(restarting, { operation: 'restart' }).catch(() => {})
+		);
+		// Back before asserting, so a failure here leaves the next test a whole cluster.
+		await waitForIncarnationAbove(restarting, previous, 'the restarted node to answer');
+		await waitForMesh(nodes);
+		console.log(`held barrier, process restart: the successor locked ${result.elapsedMs}ms after asking`);
+		assert.equal(result.status, 200, `the successor across the restart: ${JSON.stringify(result.body)}`);
+		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
+		const freshness = (await lockStats(other)).freshness;
+		assert.ok(freshness?.retried > retriedBefore, `the barrier was asked again: ${JSON.stringify(freshness)}`);
 	});
 
 	test('holders never overlap across a restart, and the final values match a serial run', async () => {
@@ -254,7 +329,7 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 			},
 			{ timeoutMs: 30_000, description: 'the killed process to be gone' }
 		);
-		await restartStoppedNode(contexts[0], { HARPER_TEST_RECORD_LOCK_DUPLICATE_DELEGATE: '1' });
+		await restartStoppedNode(contexts[0], firstNodeEnv);
 		nodes[0] = contexts[0].harper;
 		const restarted = nodes[0];
 		await waitForIncarnationAbove(restarted, previous, 'the killed node to come back');
@@ -334,9 +409,15 @@ suite('record locks across a rolling worker restart (harper#3768)', { timeout: 9
 	let peer;
 	let other;
 	let nodes;
+	let holdFile;
 
 	before(async () => {
-		const started = await Promise.allSettled([startNode(ctx.name, {}, 3), startNode(ctx.name), startNode(ctx.name)]);
+		holdFile = join(await mkdtemp(join(tmpdir(), 'record-lock-hold-')), 'hold');
+		const started = await Promise.allSettled([
+			startNode(ctx.name, { HARPER_TEST_RECORD_LOCK_HOLD_BARRIER_ANSWERS: holdFile }, 3),
+			startNode(ctx.name),
+			startNode(ctx.name),
+		]);
 		for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
 		const failed = started.find((result) => result.status === 'rejected');
 		if (failed) throw failed.reason;
@@ -386,6 +467,22 @@ suite('record locks across a rolling worker restart (harper#3768)', { timeout: 9
 		// owner's epoch retire, not through a recall the old worker could still answer.
 		const retired = await lockOnce(other, heldLater);
 		assert.equal(retired.status, 200, `the departed worker's grant was not retired: ${JSON.stringify(retired.body)}`);
+	});
+
+	test('a barrier a replaced worker committed but never answered is asked again of its successor', async () => {
+		const id = await keyHomedOn(nodes, peer, multi, 'worker-unanswered');
+		const written = await call(multi, 'LockedIncrement/', { id, timeout: LOCK_TIMEOUT_MS, lease: LOCK_LEASE_MS });
+		assert.equal(written.status, 200, JSON.stringify(written.body));
+		const retriedBefore = (await lockStats(other)).freshness?.retried ?? 0;
+		const result = await incrementAcrossHeldBarrier(other, id, holdFile, () =>
+			sendOperation(multi, { operation: 'restart_service', service: 'http_workers' })
+		);
+		await waitForMesh(nodes);
+		console.log(`held barrier, worker restart: the successor locked ${result.elapsedMs}ms after asking`);
+		assert.equal(result.status, 200, `the successor across the worker restart: ${JSON.stringify(result.body)}`);
+		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
+		const freshness = (await lockStats(other)).freshness;
+		assert.ok(freshness?.retried > retriedBefore, `the barrier was asked again: ${JSON.stringify(freshness)}`);
 	});
 });
 
