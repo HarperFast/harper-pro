@@ -76,6 +76,8 @@ jobs:
         env:
           COMPANION_CHECK_TOKEN: ${{ secrets.COMPANION_CHECK_TOKEN }}
         with:
+          # Per request, 1s/4s/9s backoff; github-script's default exempt list keeps 400/401/403/404/422 fatal.
+          retries: 3
           script: |
             const STATUS_CONTEXT = 'companion-check';
             const MAX_DEPS = 10;
@@ -355,7 +357,7 @@ jobs:
 
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
 
-            async function postStatus(sha, state, description) {
+            async function postStatus(sha, state, description, options) {
               await github.rest.repos.createCommitStatus({
                 owner,
                 repo,
@@ -364,6 +366,7 @@ jobs:
                 state,
                 description: description.slice(0, 140),
                 target_url: runUrl,
+                ...options,
               });
             }
 
@@ -392,7 +395,9 @@ jobs:
                 )
                   return;
               }
-              await postStatus(pr.head.sha, desired.state, description);
+              // A retried sweep write would land seconds after the freshness check and could
+              // overwrite a newer PR-event verdict; a failure here falls back to pending instead.
+              await postStatus(pr.head.sha, desired.state, description, isSweep && { request: { retries: 0 } });
               core.info(`${pr.number} -> ${desired.state}: ${description}`);
             }
 
@@ -435,7 +440,7 @@ jobs:
       # not trigger workflows.
       - name: Generate app token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.HARPERFAST_AI_CLIENT_ID }}
           private-key: ${{ secrets.HARPERFAST_AI_APP_PRIVATE_KEY }}

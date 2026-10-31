@@ -123,6 +123,43 @@ describe('record_lock_recall_incarnation (harper#3254)', () => {
 		await refuses({ probe: true, generation: 2 }, 409, 'a probe is refused for a generation this node does not hold');
 	});
 
+	it('retires the caller’s grants below its epoch in the recall phase, answers `retired`, and echoes this node’s epoch (§4.5)', async () => {
+		setRecordLockOwnershipReaders({
+			ownsDatabase: (database) => database === DB,
+			ownerFor: () => undefined,
+			mainOwns: () => false,
+			isMember: (database, node) => database === DB && node === 'home',
+			peerLevel: (database, node) => (node === 'home' ? RECORD_LOCKS_CAPABILITY : 3),
+			activeGeneration: (database) => (database === DB ? 1 : undefined),
+			delegateEpoch: (database) => (database === DB ? 9 : undefined),
+		});
+		// A probe drains and retires nothing; it echoes this node's epoch.
+		assert.deepStrictEqual(await executeRecallIncarnation(request({ probe: true, delegateEpoch: 2 })), {
+			probed: true,
+			incarnation: 2,
+			generation: 1,
+			delegateEpoch: 9,
+		});
+		assert.strictEqual(mapReads, 0);
+		// The recall retires (one map read to validate) and sweeps (one more), and says it retired.
+		assert.deepStrictEqual(await executeRecallIncarnation(request({ delegateEpoch: 2 })), {
+			recalled: true,
+			retired: true,
+			incarnation: 2,
+			generation: 1,
+			delegateEpoch: 9,
+		});
+		assert.strictEqual(mapReads, 2);
+		// A notice at the recorded floor is validated and then sweeps nothing; an untagged recall retires nothing.
+		await executeRecallIncarnation(request({ delegateEpoch: 2 }));
+		assert.strictEqual(mapReads, 4);
+		const untagged = await executeRecallIncarnation(request({ incarnation: 3 }));
+		assert.strictEqual(untagged.retired, undefined);
+		// A malformed epoch is refused before anything is drained.
+		await refuses({ delegateEpoch: 1.5 }, 400, 'a malformed epoch is not an untagged request');
+		await refuses({ probe: true, delegateEpoch: 0 }, 400, 'on a probe too');
+	});
+
 	it('does not let a request for a newer incarnation or generation join an older sweep', async () => {
 		const answers = await Promise.all([
 			executeRecallIncarnation(request({ incarnation: 2 })),

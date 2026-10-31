@@ -1,0 +1,9 @@
+# core is a separate repo (github.com/HarperFast/harper), vendored as a git
+# submodule; it owns its own formatting and CI.
+/core/
+
+# Prettier reads .gitignore but not .git/info/exclude; these two paths are
+# excluded only via the latter (per-clone, unversioned), so without entries
+# here a whole-tree format run recurses into them on a clone that has them.
+/.claude/
+/integrationTests/cluster/qa-scratch/

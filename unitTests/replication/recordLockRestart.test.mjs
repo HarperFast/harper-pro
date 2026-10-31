@@ -341,3 +341,86 @@ describe('the restart recall round', () => {
 		assert.strictEqual(isCompleteAnswer(null, 2, 1), false);
 	});
 });
+
+describe('the restart round carries the delegate epoch (record-locks.md §4.5)', () => {
+	it('sends the epoch on probes and recalls, and records each member’s echoed epoch before any drain', async () => {
+		const retired = [];
+		const timeline = [];
+		const { recall, state, settle, probes, recalls } = harness({
+			delegateEpoch: (database) => (database === 'data' ? 7 : undefined),
+			retireLocally(database, delegate, belowEpoch) {
+				retired.push({ database, delegate, belowEpoch });
+				timeline.push(`retire:${delegate}`);
+			},
+		});
+		state.answer = (node, operation) => {
+			timeline.push(`${operation.probe ? 'probe' : 'recall'}:${node}`);
+			// `a` is a current build and echoes its epoch; `b` is an older one and does not.
+			return { ...confirm(operation), ...(node === 'a' ? { delegateEpoch: 3 } : {}) };
+		};
+		recall.schedule('data');
+		await settle();
+		for (const { operation } of [...probes(), ...recalls()]) assert.strictEqual(operation.delegateEpoch, 7);
+		assert.deepStrictEqual(retired, [{ database: 'data', delegate: 'a', belowEpoch: 3 }], 'once per member per round');
+		assert.ok(
+			timeline.indexOf('retire:a') < timeline.indexOf('recall:a'),
+			`the member's epoch was not recorded before the drain: ${timeline}`
+		);
+		assert.strictEqual(recall.quiescedIncarnation('data'), 2);
+	});
+
+	it('still retires on a probe answer when another member cannot answer and nobody is drained', async () => {
+		const retired = [];
+		const { recall, state, settle, recalls, probes } = harness({
+			delegateEpoch: () => 7,
+			retireLocally: (database, delegate, belowEpoch) => retired.push({ database, delegate, belowEpoch }),
+		});
+		state.answer = (node, operation) => {
+			if (node === 'b') throw new Error('b is down');
+			return { ...confirm(operation), delegateEpoch: 4 };
+		};
+		recall.schedule('data');
+		await settle();
+		assert.strictEqual(probes().length, 2);
+		assert.strictEqual(recalls().length, 0, 'a round that cannot complete drains nobody');
+		assert.deepStrictEqual(retired, [{ database: 'data', delegate: 'a', belowEpoch: 4 }]);
+		assert.strictEqual(recall.quiescedIncarnation('data'), undefined);
+	});
+
+	it('ignores a malformed echoed epoch, and a floor that cannot be recorded leaves its member unanswered', async () => {
+		const retired = [];
+		const { recall, settle, state } = harness({
+			delegateEpoch: () => 7,
+			retireLocally(database, delegate) {
+				retired.push(delegate);
+				throw new Error('not the owner any more');
+			},
+		});
+		state.answer = (node, operation) => ({ ...confirm(operation), delegateEpoch: node === 'a' ? 1.5 : 2 });
+		recall.schedule('data');
+		await settle();
+		assert.deepStrictEqual(retired, ['b']);
+		assert.strictEqual(recall.quiescedIncarnation('data'), undefined, 'attested without b’s floor');
+		assert.deepStrictEqual(recall.status('data').unanswered, ['b']);
+	});
+
+	it('reports recovering while the round runs or waits to run with nobody having refused it', async () => {
+		const { recall, state, settle, fireTimers } = harness({ delegateEpoch: () => 7 });
+		assert.strictEqual(recall.recovering('data'), false, 'no round yet');
+		state.homeMap = undefined;
+		recall.schedule('data');
+		await settle();
+		assert.strictEqual(recall.recovering('data'), true, 'a mapless first attempt is retried shortly');
+		state.answer = (node, operation) => {
+			if (node === 'b') throw new Error('b is down');
+			return confirm(operation);
+		};
+		state.homeMap = { generation: 1, homes: ['self', 'a', 'b'], homeIncarnation: 2 };
+		await fireTimers();
+		assert.strictEqual(recall.recovering('data'), false, 'a member that could not answer is not "soon"');
+		state.answer = (node, operation) => confirm(operation);
+		await fireTimers();
+		assert.strictEqual(recall.quiescedIncarnation('data'), 2);
+		assert.strictEqual(recall.recovering('data'), false, 'attested');
+	});
+});

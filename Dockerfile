@@ -31,7 +31,7 @@ RUN <<-EOF
   rm -rf /home/node
   chown -R harperdb:harperdb /home/harperdb
   apt-get update
-  apt-get install -y --no-install-recommends zstd
+  apt-get install -y --no-install-recommends libjemalloc2 zstd
   rm -rf /var/lib/apt/lists/*
 EOF
 
@@ -105,6 +105,18 @@ RUN <<-EOF
 
     node /usr/local/share/check-native-abi-pointer-compression.js "$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro"
   fi
+EOF
+
+# Set after the install steps so the build runs on glibc; see build-tools/DESIGN.md.
+# A preload the loader cannot resolve only warns and falls back to glibc, so check
+# that node's malloc binds to jemalloc, then that node and harper run under it.
+ENV LD_PRELOAD=libjemalloc.so.2
+RUN <<-EOF
+  set -e
+  LD_DEBUG=bindings LD_DEBUG_OUTPUT=/tmp/ld node -e 0
+  grep -q 'binding file node .*/libjemalloc\.so\.2 .*normal symbol .malloc. ' /tmp/ld.*
+  rm /tmp/ld.*
+  harper version
 EOF
 
 VOLUME /home/harperdb/harper

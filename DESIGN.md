@@ -5,6 +5,7 @@
 - [Removed-origin history](replication/DESIGN.md#removed-origin-history): membership removal preserves audit history, origin mappings and resume cursors; retention purges eligible segments independently.
 - [Replication base-copy compatibility](replication/DESIGN.md#base-copy-peer-safety): reported 5.x peers receive historical copies; v4 and unidentified peers retain baseline verification.
 - [A release cherry-pick skips a change its branch already has (`workflows/cherry-pick-patch.yml`, `.github/scripts/change-landed.sh`)](.github/DESIGN.md#a-release-cherry-pick-skips-a-change-its-branch-already-has-workflowscherry-pick-patchyml-scriptschange-landedsh) — skip only when one pick of the PR's whole net change would be empty; replaying a landed PR commit by commit conflicts instead.
+- [Production dist emit](build-tools/DESIGN.md#production-dist-emit): why `npm run build` goes through core's `build-dist.mjs`.
 - [Release backport verification](scripts/DESIGN.md#release-backport-verification): milestone targeting and the publication gate.
 - [Analytics CPU profiling: one-period sampling window before each capture, and the `profiler-sampling` marker for the `utilization` samples it inflates](analytics/DESIGN.md)
 - [The release tarball bundles the locked JavaScript tree, never a host binary](build-tools/DESIGN.md#the-release-tarball-bundles-the-locked-javascript-tree-never-a-host-binary-build-prosh): core's bundler with pro's native roots unbundled, the dev/prod declaration rule, and what still floats.
@@ -15,6 +16,7 @@
 - [Checkpoint-grade certificates, floor-only resume and revocation](replication/DESIGN.md#non-obvious-behaviors): level-2 `originFloors` carry the origin generation and coverage, resume exactly below a stored floor, record where a route's complete prefix begins, and revoke on downgrade (harper-pro#922 items 3–4).
 - [Sharding agreement and wire references](replication/DESIGN.md#sharding-agreement-and-wire-references) — Shard-list/map agreement, capability fallback, and owner confirmation.
 - [Startup dependencies](#startup-dependencies): packages the built-in components load only on first use.
+- [The default, `-pc` and GPU images run every process on jemalloc](build-tools/DESIGN.md#the-default--pc-and-gpu-images-run-every-process-on-jemalloc-dockerfile-dockerfile-gpu): distro `libjemalloc2` preloaded by soname with default settings; the build fails unless node's `malloc` binds to it; opt out with `-e LD_PRELOAD=`; OpenShift stays on glibc (UBI10 has no package).
 
 ## Startup dependencies
 

@@ -31,6 +31,7 @@ suite('a replication pool refuses a table with application-resolved computed ind
 							logging: { colors: false, console: true, level: 'warn' },
 							replication: { securePort: hostname + ':9933', threads: 2 },
 						},
+						env: { HARPER_CONFIG: '' },
 					});
 					return node.harper;
 				} catch (error) {

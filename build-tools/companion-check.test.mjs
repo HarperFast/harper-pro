@@ -258,6 +258,10 @@ assert.equal(sweep.core.failed, undefined, 'no PR-level failures expected');
 assert.deepEqual(sweep.calls.listFiles, [700, 712], 'only no-marker PRs list files; marker evaluation unchanged');
 assert.equal(sweep.calls.getContent.length + sweep.calls.compare.length, 0, 'no gitlink, no submodule lookups');
 assert.ok(sweep.posted.every((s) => s.context === 'companion-check' && s.description.length <= 140));
+assert.ok(
+	sweep.posted.every((s) => s.request?.retries === 0),
+	'sweep verdict writes opt out of retries: a retry lands after the freshness check'
+);
 
 // --- no marker: submodule pointer moves ---
 const pageTwo = Array.from({ length: 150 }, (_, i) => textFile(`src/f${i}.js`));
@@ -441,6 +445,7 @@ const evt = makeEnv('pull_request_target', [], pr(700, 'plain', 'bbb'));
 const evtBySha = await run(evt);
 assert.equal(evtBySha.bbb.state, 'success');
 assert.equal(evtBySha.bbb.description, 'No companion dependencies');
+assert.equal(evtBySha.bbb.request?.retries, undefined, 'event writes keep the client retry defaults');
 
 // --- sweep race guard: body changed between list and post -> skip ---
 const stale = pr(720, 'Depends-on: HarperFast/harper#2147', 'kkk');
@@ -460,6 +465,18 @@ const errBySha = await run(errEnv);
 assert.equal(errBySha.err1.state, 'pending', 'failed refresh posts pending, not silence');
 assert.match(errBySha.err1.description, /errored/);
 assert.match(errEnv.core.failed, /1 PR/);
+
+// --- sweep: a failed verdict write falls back to a retried pending ---
+const writeErr = makeEnv('schedule', [pr(722, 'plain', 'err2')]);
+const writes = writeErr.posted;
+writeErr.github.rest.repos.createCommitStatus = async (s) => {
+	if (s.state !== 'pending') throw Object.assign(new Error('Service Unavailable'), { status: 503 });
+	writes.push(s);
+};
+const writeErrBySha = await run(writeErr);
+assert.equal(writeErrBySha.err2.state, 'pending', 'failed sweep write must not leave the old verdict');
+assert.equal(writeErrBySha.err2.request?.retries, undefined, 'pending fallback keeps the client retries');
+assert.match(writeErr.core.failed, /1 PR/);
 
 // --- secret guards ---
 process.env.COMPANION_CHECK_TOKEN = 'tok';
