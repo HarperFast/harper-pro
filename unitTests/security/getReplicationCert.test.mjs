@@ -219,7 +219,9 @@ describe('getReplicationCert and getReplicationCertAuth (Pro security/certificat
 			assert.ok(target.secureContexts.has(nodeName), 'the selector must read the certificate table as the system');
 			assert.equal(anonymousRequest.authorize, true, "the request's authorization gate is left for the request");
 		} finally {
-			for (const subscription of subscribeSpy.returnValues) (await subscription)?.end?.();
+			for (const subscription of subscribeSpy.returnValues) {
+				await subscription.then((opened) => opened?.end?.()).catch(() => {});
+			}
 		}
 	});
 
