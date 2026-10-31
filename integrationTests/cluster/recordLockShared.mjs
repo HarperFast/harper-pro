@@ -125,13 +125,30 @@ export async function controlEntries(node, signal) {
 	return JSON.parse(text);
 }
 
+export async function increments(node, id, signal) {
+	const response = await fetch(`${node.httpURL}/CounterIncrement/?counter=${encodeURIComponent(id)}`, {
+		headers: { Accept: 'application/json' },
+		signal,
+	});
+	const text = await response.text();
+	assert.equal(response.status, 200, text);
+	return JSON.parse(text).map((row) => row.id);
+}
+
 export function waitForCounter(nodes, id, expected) {
+	let last;
 	return waitForCondition(
 		async (signal) => {
-			const values = await Promise.all(nodes.map((node) => counter(node, id, signal).then((record) => record?.n)));
-			return values.every((n) => n === expected) ? values : undefined;
+			last = await Promise.all(nodes.map((node) => counter(node, id, signal).then((record) => record?.n)));
+			return last.every((n) => n === expected) ? last : undefined;
 		},
-		{ timeoutMs: CONVERGE_TIMEOUT_MS, description: `Counter/${id} to read ${expected} on every node` }
+		{
+			timeoutMs: CONVERGE_TIMEOUT_MS,
+			description: () =>
+				`Counter/${id} to read ${expected} on every node; last read ${JSON.stringify(
+					Object.fromEntries(nodes.map((node, index) => [node.hostname, last?.[index]]))
+				)}`,
+		}
 	);
 }
 
