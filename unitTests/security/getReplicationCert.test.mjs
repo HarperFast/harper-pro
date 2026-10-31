@@ -193,6 +193,30 @@ describe('getReplicationCert and getReplicationCertAuth (Pro security/certificat
 		assert.equal(subscribeSpy.callCount, 0, 'one-shot replication cert lookup must not subscribe to hdb_certificate');
 	});
 
+	// A non-owner read opens the HTTP worker's first replication connection, so an anonymous request can be what
+	// initializes the replication TLS selector (harper-pro#1189). Node 22 is where this broke.
+	it('builds the replication TLS selector when an anonymous request initializes it', async () => {
+		coreKeys.getPrivateKeys().set(keyName, nodeCert.key);
+		await coreKeys.setCertTable({
+			name: nodeName,
+			uses: ['replication'],
+			certificate: nodeCert.cert,
+			private_key_name: keyName,
+			is_authority: false,
+			is_self_signed: false,
+		});
+		const anonymousRequest = { authorize: true, user: undefined };
+		const target = { secureContexts: null, secureContextsListeners: [] };
+		const selector = coreKeys.createTLSSelector('replication');
+		await withTimeout(
+			contextStorage.run(anonymousRequest, () => selector.initialize(target)),
+			10_000,
+			'replication TLS selector initialization'
+		);
+		assert.ok(target.secureContexts.has(nodeName), 'the selector must read the certificate table as the system');
+		assert.equal(anonymousRequest.authorize, true, "the request's authorization gate is left for the request");
+	});
+
 	for (const scenario of [
 		{
 			label: 'when hdb_certificate has no certificates',

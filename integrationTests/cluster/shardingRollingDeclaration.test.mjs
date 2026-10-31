@@ -4,7 +4,7 @@ import { cp, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, waitForCondition, stopAndTeardownNodes, readLog } from './clusterShared.mjs';
+import { sendOperation, postOperation, waitForCondition, stopAndTeardownNodes, readLog } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '../../dist/bin/harper.js');
 const fixture = join(import.meta.dirname, 'fixture-sharding-rolling');
@@ -12,6 +12,23 @@ const fixture = join(import.meta.dirname, 'fixture-sharding-rolling');
 suite('Rolling local sharding declaration', { timeout: 360_000 }, (ctx) => {
 	const contexts = [];
 	const nodes = () => contexts.map((context) => context.harper);
+	// A peer's replicated map activation holds the map lock briefly; that 503 is thrown before anything is written.
+	function initializeShardMap(node, operation) {
+		return waitForCondition(
+			async (signal) => {
+				const { status, body } = await postOperation(
+					node,
+					{ operation: 'initialize_shard_map', database: 'data', ...operation },
+					{ signal }
+				);
+				if (status === 503 && body?.error === 'Shard map update or activation is in progress for data; retry')
+					return false;
+				assert.equal(status, 200, JSON.stringify(body));
+				return body;
+			},
+			{ timeoutMs: 30_000, description: `initialize_shard_map on ${node.hostname}` }
+		);
+	}
 	async function local(node, signal) {
 		const response = await fetch(node.httpURL + '/RollingLocal', {
 			signal,
@@ -91,9 +108,7 @@ suite('Rolling local sharding declaration', { timeout: 360_000 }, (ctx) => {
 		}
 		let digest;
 		for (const node of nodes()) {
-			const map = await sendOperation(node, {
-				operation: 'initialize_shard_map',
-				database: 'data',
+			const map = await initializeShardMap(node, {
 				slots: 2,
 				ranges: [
 					{ start: 0, end: 1, shard: 0 },
@@ -144,12 +159,7 @@ suite('Rolling local sharding declaration', { timeout: 360_000 }, (ctx) => {
 				},
 				{ timeoutMs: 60_000, description: `node ${index} activates the local policy on all three HTTP workers` }
 			);
-			await sendOperation(node, {
-				operation: 'initialize_shard_map',
-				database: 'data',
-				existing_owner: true,
-				expected_digest: digest,
-			});
+			await initializeShardMap(node, { existing_owner: true, expected_digest: digest });
 			if (index === 1) {
 				await waitForCondition(
 					async (signal) => {
