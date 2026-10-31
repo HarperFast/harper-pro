@@ -1,8 +1,8 @@
 /**
- * With `replication.threads` (explicitly set or defaulted to `Math.floor(threads.count / 2)` for
- * `threads.count >= 2`), every replication socket (the replication port's inbound listener and every
- * outbound subscription) is owned by a `replication` pool worker, never an HTTP worker. Also covers
- * the port-fallback to 0 pool workers and `setResidencyById` migration behavior vs explicit `0`.
+ * With `replication.threads` explicitly set, or defaulted to `Math.floor(threads.count / 2)` for
+ * `threads.count >= 2` and no deprecated hook registered, every replication socket (the replication
+ * port's inbound listener and every outbound subscription) is owned by a `replication` pool worker. Also covers
+ * the port-fallback to 0 pool workers and `setResidencyById` behavior per `replication.threads` setting.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, strictEqual } from 'node:assert';
@@ -292,22 +292,64 @@ async function putSharded(node, record) {
 	ok(response.status < 300, `PUT /Sharded/${record.id} failed with status ${response.status}`);
 }
 
-suite('setResidencyById migration when replication.threads is defaulted vs explicitly 0', (ctx) => {
-	test('logs a setResidencyById error and stores residency partials on non-resident peers when the pool is active', async () => {
+const SET_RESIDENCY_BY_ID_DEPRECATION =
+	"Table 'data.Sharded' registered setResidencyById, which is deprecated as of Harper 5.4";
+
+async function assertResidencyHookOmitsNonResidentPeer(nodes, tag) {
+	const [writer, peer] = nodes;
+	const { node_name: writerName } = await sendOperation(writer, { operation: 'cluster_status' });
+	const localOnlyId = `only-on-${writerName}`;
+	await putSharded(writer, { id: localOnlyId, tag, body: 'resident-only' });
+	await putSharded(writer, { id: `shared-after-${tag}`, tag: 'shared', body: 'everywhere' });
+
+	await waitForCondition(
+		async (signal) => {
+			const [record] = await sendOperation(
+				peer,
+				{
+					operation: 'search_by_id',
+					table: 'Sharded',
+					ids: [`shared-after-${tag}`],
+					get_attributes: ['id', 'body'],
+				},
+				{ signal }
+			);
+			return record?.body === 'everywhere';
+		},
+		{ timeoutMs: 30000, description: 'subsequent shared write to replicate to peer' }
+	);
+
+	const partials = await sendOperation(peer, {
+		operation: 'search_by_value',
+		table: 'Sharded',
+		search_attribute: 'id',
+		search_value: localOnlyId,
+		get_attributes: ['tag', 'body'],
+	});
+	strictEqual(partials.length, 0, 'the non-resident peer stores nothing for a record the hook excludes it from');
+	const byTag = await sendOperation(peer, {
+		operation: 'search_by_value',
+		table: 'Sharded',
+		search_attribute: 'tag',
+		search_value: tag,
+		get_attributes: ['id'],
+	});
+	strictEqual(byTag.length, 0, 'the indexed value of an excluded record never reaches the non-resident peer');
+}
+
+suite('setResidencyById with an explicit, defaulted, or explicitly 0 replication.threads', (ctx) => {
+	test('explicit replication.threads: 2 logs a setResidencyById error and stores residency partials on non-resident peers', async () => {
 		let nodes;
 		try {
-			nodes = await startResidencyCluster(`${ctx.name}-defaulted`, {});
+			nodes = await startResidencyCluster(`${ctx.name}-explicit`, { threads: POOL_SIZE });
 			const [writer, peer] = nodes;
 			const { node_name: writerName } = await sendOperation(writer, { operation: 'cluster_status' });
 			await waitForCondition(
 				async () => {
 					const log = await readLog(writer);
-					return (
-						log.includes("Table 'Sharded' registered setResidencyById while the replication worker pool is active") &&
-						log.includes('Set replication.threads: 0')
-					);
+					return log.includes(SET_RESIDENCY_BY_ID_DEPRECATION) && log.includes('set replication.threads: 0');
 				},
-				{ timeoutMs: 30000, description: 'setResidencyById pool error in writer log' }
+				{ timeoutMs: 30000, description: 'setResidencyById deprecation warning in writer log' }
 			);
 
 			const localOnlyId = `only-on-${writerName}`;
@@ -346,51 +388,40 @@ suite('setResidencyById migration when replication.threads is defaulted vs expli
 		}
 	});
 
+	test('omitted replication.threads at threads.count: 4 starts no pool and omits non-resident setResidencyById records', async () => {
+		let nodes;
+		try {
+			nodes = await startResidencyCluster(`${ctx.name}-defaulted`, {});
+			for (const node of nodes) {
+				strictEqual((await threadIds(node, 'http')).length, 4);
+				strictEqual((await threadIds(node, 'replication')).length, 0);
+				const log = await readLog(node);
+				ok(log.includes(SET_RESIDENCY_BY_ID_DEPRECATION), 'registering the hook logs its deprecation');
+				ok(
+					/Starting no replication pool: replication\.threads is not set and data\.Sharded/.test(log),
+					'the defaulted pool is declined, naming the table'
+				);
+			}
+			await assertResidencyHookOmitsNonResidentPeer(nodes, 'defaulted-omitted');
+		} finally {
+			if (nodes) await teardownResidencyCluster(nodes);
+		}
+	});
+
 	test('explicit replication.threads: 0 at threads.count: 4 runs on HTTP workers and omits non-resident setResidencyById records', async () => {
 		let nodes;
 		try {
 			nodes = await startResidencyCluster(`${ctx.name}-opt-out`, { threads: 0 });
-			const [writer, peer] = nodes;
+			const [writer] = nodes;
 			for (const node of nodes) {
 				strictEqual((await threadIds(node, 'http')).length, 4);
 				strictEqual((await threadIds(node, 'replication')).length, 0);
 			}
 			const writerLog = await readLog(writer);
-			ok(
-				!writerLog.includes("Table 'Sharded' registered setResidencyById while the replication worker pool is active"),
-				'no setResidencyById pool error when replication.threads is explicitly 0'
-			);
+			ok(writerLog.includes(SET_RESIDENCY_BY_ID_DEPRECATION), 'the deprecation is logged whether or not a pool runs');
+			ok(!writerLog.includes('Starting no replication pool'), 'an explicit 0 has no pool to decline');
 
-			const { node_name: writerName } = await sendOperation(writer, { operation: 'cluster_status' });
-			const localOnlyId = `only-on-${writerName}`;
-			await putSharded(writer, { id: localOnlyId, tag: 'opt-out-omitted', body: 'resident-only' });
-			await putSharded(writer, { id: 'shared-after-omitted', tag: 'shared', body: 'everywhere' });
-
-			await waitForCondition(
-				async (signal) => {
-					const [record] = await sendOperation(
-						peer,
-						{
-							operation: 'search_by_id',
-							table: 'Sharded',
-							ids: ['shared-after-omitted'],
-							get_attributes: ['id', 'body'],
-						},
-						{ signal }
-					);
-					return record?.body === 'everywhere';
-				},
-				{ timeoutMs: 30000, description: 'subsequent shared write to replicate to peer' }
-			);
-
-			const partials = await sendOperation(peer, {
-				operation: 'search_by_value',
-				table: 'Sharded',
-				search_attribute: 'id',
-				search_value: localOnlyId,
-				get_attributes: ['tag', 'body'],
-			});
-			strictEqual(partials.length, 0, 'non-resident peer stores no partial when replication.threads: 0');
+			await assertResidencyHookOmitsNonResidentPeer(nodes, 'opt-out-omitted');
 		} finally {
 			if (nodes) await teardownResidencyCluster(nodes);
 		}
