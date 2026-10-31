@@ -194,7 +194,7 @@ describe('getReplicationCert and getReplicationCertAuth (Pro security/certificat
 	});
 
 	// A non-owner read opens the HTTP worker's first replication connection, so an anonymous request can be what
-	// initializes the replication TLS selector (harper-pro#1189). Node 22 is where this broke.
+	// initializes the replication TLS selector.
 	it('builds the replication TLS selector when an anonymous request initializes it', async () => {
 		coreKeys.getPrivateKeys().set(keyName, nodeCert.key);
 		await coreKeys.setCertTable({
@@ -207,14 +207,20 @@ describe('getReplicationCert and getReplicationCertAuth (Pro security/certificat
 		});
 		const anonymousRequest = { authorize: true, user: undefined };
 		const target = { secureContexts: null, secureContextsListeners: [] };
+		// live reload: its certificate-table subscription is what nests a run() inside the selector's exit()
+		const subscribeSpy = sandbox.spy(databases.system.hdb_certificate, 'subscribe');
 		const selector = coreKeys.createTLSSelector('replication');
-		await withTimeout(
-			contextStorage.run(anonymousRequest, () => selector.initialize(target)),
-			10_000,
-			'replication TLS selector initialization'
-		);
-		assert.ok(target.secureContexts.has(nodeName), 'the selector must read the certificate table as the system');
-		assert.equal(anonymousRequest.authorize, true, "the request's authorization gate is left for the request");
+		try {
+			await withTimeout(
+				contextStorage.run(anonymousRequest, () => selector.initialize(target)),
+				10_000,
+				'replication TLS selector initialization'
+			);
+			assert.ok(target.secureContexts.has(nodeName), 'the selector must read the certificate table as the system');
+			assert.equal(anonymousRequest.authorize, true, "the request's authorization gate is left for the request");
+		} finally {
+			for (const subscription of subscribeSpy.returnValues) (await subscription)?.end?.();
+		}
 	});
 
 	for (const scenario of [
