@@ -2,3 +2,11 @@ type Counter @table @export {
 	id: ID @primaryKey
 	n: Int
 }
+
+"""
+One row per LockedIncrement that carried an `op`, committed with the increment it records.
+"""
+type CounterIncrement @table @export {
+	id: ID @primaryKey
+	counter: ID @indexed
+}

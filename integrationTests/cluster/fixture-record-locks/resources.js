@@ -23,13 +23,18 @@ function lockOptions(data) {
 	return options;
 }
 
-/** POST { id, scope? }: lock inside the request transaction, read, increment, save; released at commit. */
+/**
+ * POST { id, op?, scope? }: lock inside the request transaction, read, increment, save; released at
+ * commit. An `op` is recorded in CounterIncrement in the same transaction, so a test can count the
+ * increments that committed even when a response was lost.
+ */
 export class LockedIncrement extends Resource {
 	async post(data) {
 		const record = await tables.Counter.lock(data.id, lockOptions(data));
 		const n = (record.getProperty('n') ?? 0) + 1;
 		record.set('n', n);
 		await record.save();
+		if (data.op !== undefined) await tables.CounterIncrement.put(data.op, { id: data.op, counter: data.id });
 		return { n };
 	}
 }

@@ -14,7 +14,7 @@
  */
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import {
-	HOME_RESTART_RIDE_THROUGH_MS,
+	RESTART_ATTEMPT_MS,
 	type LockDependencySet,
 	type LockHomeMap,
 } from '../core/resources/recordLockCoordinator.ts';
@@ -48,8 +48,8 @@ export interface FreshnessDeps {
 	everRecloned(): boolean;
 	/**
 	 * Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position.
-	 * `timeoutMs` is what is left of the lock's own deadline or, for a retry, of the restart ride-through
-	 * window: the deadline sweep below only settles the WAIT, so without bounding the request too, a
+	 * `timeoutMs` is what is left of the lock's own deadline, and for a retry at most `RESTART_ATTEMPT_MS`:
+	 * the deadline sweep below only settles the WAIT, so without bounding the request too, a
 	 * member that accepts the connection and never answers leaves a response waiter (and, on the per-call
 	 * fallback connection, a socket) pinned for the life of that connection — one per failed handoff.
 	 */
@@ -84,8 +84,8 @@ interface Outstanding {
 	/** From the receive path, once the entry commits here — can precede the reply. */
 	appliedPosition: number | undefined;
 	waiters: Waiter[];
-	/** Set by the first failed request: no attempt is sent past `untilMono`, and each is bounded by it. */
-	retry?: { untilMono: number; stepMs: number; timer?: unknown; lastError: string };
+	/** Set by the first failed request. */
+	retry?: { stepMs: number; timer?: unknown; lastError: string };
 }
 
 export interface FreshnessBarrier {
@@ -229,20 +229,17 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 
 	/**
 	 * A failed request — a socket closed under it, no connection, the origin's refusal while it boots —
-	 * is what an origin restarting looks like, so it is asked again for at most the ride-through from
-	 * the first failure, as core waits out an unreachable home (record-locks.md §4.5 (2)). A restarted
-	 * origin's barrier still follows everything its log held before the restart.
+	 * is what an origin restarting looks like, so it is asked again until the lock's own deadline: a
+	 * process restart outlasts core's 10 s home ride-through under load, and an origin down for good
+	 * costs only the handoffs whose lineage names it. A restarted origin's barrier still follows
+	 * everything its log held before the restart.
 	 */
 	const retryLater = (entry: Outstanding, message: string) => {
 		const now = deps.monotonicNow();
-		const retry = (entry.retry ??= {
-			untilMono: Math.min(entry.deadlineMono, now + HOME_RESTART_RIDE_THROUGH_MS),
-			stepMs: BARRIER_RETRY_MIN_MS,
-			lastError: '',
-		});
+		const retry = (entry.retry ??= { stepMs: BARRIER_RETRY_MIN_MS, lastError: '' });
 		retry.lastError = message;
-		// The last attempt is fitted into the window, as core fits its last wait, with a step of its own.
-		const leftMs = retry.untilMono - now - BARRIER_RETRY_MIN_MS;
+		// The last attempt is fitted into the deadline, as core fits its last wait, with a step of its own.
+		const leftMs = entry.deadlineMono - now - BARRIER_RETRY_MIN_MS;
 		if (!(leftMs > 0)) {
 			settleEntry(entry, requestFailed(entry, message));
 			return;
@@ -258,7 +255,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		retry.timer = undefined;
 		if (!waits.has(entry)) return;
 		const now = deps.monotonicNow();
-		if (now >= retry.untilMono) {
+		if (now >= entry.deadlineMono) {
 			settleEntry(entry, requestFailed(entry, retry.lastError));
 			return;
 		}
@@ -276,7 +273,9 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		entry.position = undefined;
 		entry.appliedPosition = undefined;
 		attempts.set(entry.nonce, entry);
-		send(entry, retry.untilMono - now);
+		// A retry accepted on a connection that never answers is asked again on a fresh nonce, as core
+		// re-asks an unreachable home per attempt.
+		send(entry, Math.min(entry.deadlineMono - now, RESTART_ATTEMPT_MS));
 	};
 
 	/** Resolves to the barrier's position once the origin's entry has committed on this node. */

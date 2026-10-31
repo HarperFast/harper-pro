@@ -162,11 +162,16 @@ origin)` sharing one request and one nonce is only sound for a caller whose depe
   socket closed under it, no connection, the origin's own refusal before its map agrees after a
   restart — is what an origin restarting looks like. The wait drops that attempt's nonce, backs off
   (250 ms doubling to 2 s, half-jittered) and asks again with a fresh nonce, re-passing every refusal
-  above against the current map, until `HOME_RESTART_RIDE_THROUGH_MS` after the first failure or
-  the deadline, whichever is first — the last backoff is shortened so a final attempt still gets a
-  250 ms step inside it, as core fits its last wait: at most 13 requests. A retry's request is bounded by what is
-  left of that window, so an origin that accepts it and never answers costs no more; once a reply
-  names a position, its entry is waited on to the deadline. A wait between attempts stays in the set, so the cap, the
+  above against the current map, until the lock's own deadline (`min(timeout, remaining lease)`) —
+  the last backoff is shortened so a final attempt still gets a 250 ms step inside it, as core fits
+  its last wait: at most 33 requests in a 30 s wait. Not core's 10 s `HOME_RESTART_RIDE_THROUGH_MS`:
+  a process restart under load takes 10–19 s, and a failed barrier stalls only the handoffs whose
+  lineage names that origin, where an unreachable home stalls every key it homes. A retry's request
+  is bounded by `RESTART_ATTEMPT_MS` (3 s) or what is left of the deadline, so an origin that
+  accepts it and never answers is asked again on a fresh nonce; once a reply names a position, its
+  entry is waited on to the deadline. Core does not cancel a wait it abandoned (a recall of the
+  pending delegation, its own deadline race): such a wait keeps its slot and retries until its
+  deadline, within the `MAX_OUTSTANDING_BARRIERS` cap. A wait between attempts stays in the set, so the cap, the
   sweep and an unregister still see it. The proof is unchanged: only the current attempt's entry
   settles the wait, and a restarted origin's barrier follows everything its log held, so an earlier
   attempt committed with its reply lost proves nothing and harms nothing.

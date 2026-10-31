@@ -14,7 +14,7 @@ import {
 	isValidLogPosition,
 } from '#src/replication/recordLockFreshness';
 import { RECORD_LOCKS_CAPABILITY } from '#src/replication/protocolCapabilities';
-import { HOME_RESTART_RIDE_THROUGH_MS } from '#src/core/resources/recordLockCoordinator';
+import { HOME_RESTART_RIDE_THROUGH_MS, RESTART_ATTEMPT_MS } from '#src/core/resources/recordLockCoordinator';
 
 function harness(overrides = {}) {
 	const requests = [];
@@ -73,7 +73,8 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
  */
 async function failUntilSettled(h, origin, settled) {
 	const sentAt = [];
-	for (let i = 0; i < 1_000 && !settled(); i++) {
+	// Steps past the longest lock lease, so any deadline ends the loop by settling.
+	for (let i = 0; i < 13_000 && !settled(); i++) {
 		const sent = h.requests.filter((request) => request.origin === origin);
 		for (const request of sent.slice(sentAt.length)) {
 			sentAt.push(h.now());
@@ -256,8 +257,9 @@ describe('createFreshnessBarrier: recovery probes every other member', () => {
 			['b', 800],
 		]);
 	});
-	it('fails when any member cannot be drained within the ride-through', async () => {
+	it('fails when any member cannot be drained within the lock deadline', async () => {
 		const h = harness();
+		const startedAt = h.now();
 		const wait = h.barrier.establish('t', null, 30_000);
 		let settled;
 		wait.then(
@@ -268,6 +270,7 @@ describe('createFreshnessBarrier: recovery probes every other member', () => {
 		h.barrier.noteBarrierApplied('a', 700, 1);
 		await failUntilSettled(h, 'b', () => settled);
 		assert.match(settled.message, /from b/);
+		assert.ok(h.now() - startedAt <= 30_000, `settled after ${h.now() - startedAt}ms`);
 	});
 	it('refuses recovery outright when a member is poisoned or at another level', async () => {
 		const { barrier, requests } = harness({ isPoisoned: (origin) => origin === 'b' });
@@ -394,20 +397,21 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		assert.strictEqual(h.barrier.stats().retried, 2);
 		assert.strictEqual(h.barrier.stats().outstanding, 0);
 	});
-	it('stops sending within the ride-through from the first failure and ends with the last failure', async () => {
+	it('stops sending at the lock deadline and ends with the last failure', async () => {
 		const h = harness();
+		const startedAt = h.now();
 		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
 		let settled;
 		wait.then(
 			() => (settled = 'resolved'),
 			(error) => (settled = error)
 		);
-		const firstFailureAt = h.now();
 		const sentAt = await failUntilSettled(h, 'a', () => settled);
 		assert.match(settled.message, /could not obtain a record lock barrier from a for data\.t: Connection closed/);
 		assert.strictEqual(settled.statusCode, 503);
-		assert.ok(h.now() - firstFailureAt <= HOME_RESTART_RIDE_THROUGH_MS, `settled after ${h.now() - firstFailureAt}ms`);
-		for (const at of sentAt) assert.ok(at - firstFailureAt < HOME_RESTART_RIDE_THROUGH_MS, `${at - firstFailureAt}ms`);
+		assert.ok(h.now() - startedAt <= 60_000, `settled after ${h.now() - startedAt}ms`);
+		assert.ok(sentAt.at(-1) - startedAt > HOME_RESTART_RIDE_THROUGH_MS, 'asks past core’s home ride-through');
+		for (const at of sentAt) assert.ok(at - startedAt < 60_000, `${at - startedAt}ms`);
 		const gaps = sentAt.slice(1).map((at, index) => at - sentAt[index]);
 		for (const [index, gap] of gaps.entries()) {
 			const step = Math.min(BARRIER_RETRY_MAX_MS, BARRIER_RETRY_MIN_MS * 2 ** index);
@@ -415,31 +419,59 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		}
 		assert.strictEqual(h.barrier.stats().outstanding, 0);
 	});
-	it('sends at most 13 requests per wait, even when every jittered delay is the shortest', async () => {
+	it('sends at most 33 requests in a 30 s wait, even when every jittered delay is the shortest', async () => {
 		const h = harness({ random: () => 0 });
-		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
+		const wait = h.barrier.establish('t', [['a', 5]], 30_000);
 		let settled;
 		wait.catch((error) => (settled = error));
 		const sentAt = await failUntilSettled(h, 'a', () => settled);
 		assert.ok(settled);
-		assert.ok(sentAt.length <= 13, `${sentAt.length} requests`);
+		assert.ok(sentAt.length <= 33, `${sentAt.length} requests`);
 	});
-	it('bounds a retry’s request by what is left of the ride-through, and asks no more once it times out', async () => {
+	it('an origin unreachable for 20 s inside a 30 s deadline is asked again until it answers', async () => {
+		const h = harness();
+		const wait = h.barrier.establish('t', [['a', 5]], 30_000);
+		let settled = false;
+		wait.then(
+			() => (settled = true),
+			() => (settled = true)
+		);
+		const startedAt = h.now();
+		await failUntilSettled(h, 'a', () => settled || h.now() - startedAt >= 20_000);
+		assert.strictEqual(settled, false, 'still asking after 20 s of refused connections');
+		h.advance(BARRIER_RETRY_MAX_MS);
+		await flush();
+		const retry = h.requests.at(-1);
+		retry.resolve(900);
+		await flush();
+		assert.strictEqual(h.barrier.noteBarrierApplied('a', 900, retry.nonce), true);
+		await wait;
+		assert.ok(h.now() - startedAt > 20_000);
+	});
+	it('bounds a retry’s request by one restart attempt, and asks again on a fresh nonce once it times out', async () => {
 		const h = harness();
 		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
 		h.requests[0].reject(closedSocket());
 		await flush();
+		assert.strictEqual(h.requests[0].timeoutMs, 60_000, 'the first request has the whole deadline');
 		h.advance(BARRIER_RETRY_MIN_MS);
 		await flush();
-		assert.strictEqual(h.requests[1].timeoutMs, HOME_RESTART_RIDE_THROUGH_MS - BARRIER_RETRY_MIN_MS);
+		assert.strictEqual(h.requests[1].timeoutMs, RESTART_ATTEMPT_MS);
 		// The origin accepts the retry and never answers; the transport gives up at that bound.
-		h.advance(HOME_RESTART_RIDE_THROUGH_MS - BARRIER_RETRY_MIN_MS);
-		h.requests[1].reject(new Error('record_lock_barrier to a did not answer within 9750ms'));
-		assert.match((await rejection(wait)).message, /did not answer within/);
-		assert.strictEqual(h.requests.length, 2);
+		h.advance(RESTART_ATTEMPT_MS);
+		h.requests[1].reject(new Error(`record_lock_barrier to a did not answer within ${RESTART_ATTEMPT_MS}ms`));
+		await flush();
+		h.advance(BARRIER_RETRY_MIN_MS * 2);
+		await flush();
+		assert.strictEqual(h.requests.length, 3);
+		assert.strictEqual(h.requests[2].nonce, 3);
+		h.requests[2].resolve(800);
+		await flush();
+		assert.strictEqual(h.barrier.noteBarrierApplied('a', 800, 3), true);
+		await wait;
 		assert.strictEqual(h.barrier.stats().outstanding, 0);
 	});
-	it('takes a retry’s reply that arrives at the end of the ride-through', async () => {
+	it('takes a retry’s reply that arrives at the end of its attempt', async () => {
 		const h = harness();
 		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
 		h.requests[0].reject(closedSocket());
@@ -447,7 +479,7 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		h.advance(BARRIER_RETRY_MIN_MS);
 		await flush();
 		// Forwarded through a sibling worker, the reply crosses one more hop after the bound.
-		h.advance(HOME_RESTART_RIDE_THROUGH_MS);
+		h.advance(RESTART_ATTEMPT_MS);
 		h.requests[1].resolve(800);
 		await flush();
 		assert.strictEqual(h.barrier.noteBarrierApplied('a', 800, 2), true);
@@ -474,15 +506,15 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		assert.match((await rejection(wait2)).message, /Connection closed/, 'no room left for an attempt');
 		assert.strictEqual(short.requests.length, 1);
 	});
-	it('keeps asking until the window ends, however the last backoff is drawn', async () => {
-		// A draw whose last full step would overshoot the window: stopping there ends at 8,531 ms.
+	it('keeps asking until the deadline, however the last backoff is drawn', async () => {
+		// A draw whose last full step would overshoot the deadline.
 		const h = harness({ random: () => 0.75 });
-		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
+		const startedAt = h.now();
+		const wait = h.barrier.establish('t', [['a', 5]], 20_000);
 		let settled;
 		wait.catch((error) => (settled = error));
-		const firstFailureAt = h.now();
 		const sentAt = await failUntilSettled(h, 'a', () => settled);
-		assert.strictEqual(sentAt.at(-1) - firstFailureAt, HOME_RESTART_RIDE_THROUGH_MS - BARRIER_RETRY_MIN_MS);
+		assert.strictEqual(sentAt.at(-1) - startedAt, 20_000 - BARRIER_RETRY_MIN_MS);
 	});
 	it('a retry still answered keeps waiting for its entry until the lock deadline', async () => {
 		const h = harness();
@@ -493,8 +525,8 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		await flush();
 		h.requests[1].resolve(800);
 		await flush();
-		// The entry is behind the origin's replication backlog: the ride-through bounds asking, not applying.
-		h.advance(HOME_RESTART_RIDE_THROUGH_MS + BARRIER_SWEEP_MS);
+		// The entry is behind the origin's replication backlog: the attempt bound limits asking, not applying.
+		h.advance(RESTART_ATTEMPT_MS + BARRIER_SWEEP_MS);
 		assert.strictEqual(h.barrier.stats().outstanding, 1);
 		assert.strictEqual(h.barrier.noteBarrierApplied('a', 800, 2), true);
 		await wait;
