@@ -48,8 +48,8 @@ export interface FreshnessDeps {
 	everRecloned(): boolean;
 	/**
 	 * Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position.
-	 * `timeoutMs` is what is left of the lock's own deadline, and for a retry at most `RESTART_ATTEMPT_MS`:
-	 * the deadline sweep below only settles the WAIT, so without bounding the request too, a
+	 * `timeoutMs` is the attempt's bound, never more than what is left of the lock's own deadline: the
+	 * deadline sweep below only settles the WAIT, so without bounding the request too, a
 	 * member that accepts the connection and never answers leaves a response waiter (and, on the per-call
 	 * fallback connection, a socket) pinned for the life of that connection — one per failed handoff.
 	 */
@@ -84,7 +84,13 @@ interface Outstanding {
 	/** From the receive path, once the entry commits here — can precede the reply. */
 	appliedPosition: number | undefined;
 	waiters: Waiter[];
-	/** Set by the first failed request. */
+	/**
+	 * Each attempt is bounded like core's request to a home, so one sent on a connection that never
+	 * answers is asked again on a fresh nonce; doubled after an attempt that used it all, so an origin
+	 * that is slow rather than gone is still given the time to answer.
+	 */
+	attemptMs: number;
+	sentAt: number;
 	retry?: { stepMs: number; timer?: unknown; lastError: string };
 }
 
@@ -178,8 +184,10 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			`could not obtain a record lock barrier from ${entry.origin} for ${database}.${entry.table}: ${message}`
 		);
 
-	const send = (entry: Outstanding, timeoutMs: number) => {
+	const send = (entry: Outstanding) => {
 		const attemptNonce = entry.nonce;
+		entry.sentAt = deps.monotonicNow();
+		const timeoutMs = Math.min(entry.deadlineMono - entry.sentAt, entry.attemptMs);
 		let request: Promise<number>;
 		try {
 			// At least 1ms: `sendOperation` reads 0 as "no bound" on the fallback path, and a wait whose
@@ -231,13 +239,15 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	 * A failed request — a socket closed under it, no connection, the origin's refusal while it boots —
 	 * is what an origin restarting looks like, so it is asked again until the lock's own deadline: a
 	 * process restart outlasts core's 10 s home ride-through under load, and an origin down for good
-	 * costs only the handoffs whose lineage names it. A restarted origin's barrier still follows
-	 * everything its log held before the restart.
+	 * fails only the handoffs whose lineage names it (their waits hold `MAX_OUTSTANDING_BARRIERS` slots
+	 * until their deadlines). A restarted origin's barrier still follows everything its log held before
+	 * the restart.
 	 */
 	const retryLater = (entry: Outstanding, message: string) => {
 		const now = deps.monotonicNow();
 		const retry = (entry.retry ??= { stepMs: BARRIER_RETRY_MIN_MS, lastError: '' });
 		retry.lastError = message;
+		if (now - entry.sentAt >= entry.attemptMs) entry.attemptMs *= 2;
 		// The last attempt is fitted into the deadline, as core fits its last wait, with a step of its own.
 		const leftMs = entry.deadlineMono - now - BARRIER_RETRY_MIN_MS;
 		if (!(leftMs > 0)) {
@@ -273,9 +283,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		entry.position = undefined;
 		entry.appliedPosition = undefined;
 		attempts.set(entry.nonce, entry);
-		// A retry accepted on a connection that never answers is asked again on a fresh nonce, as core
-		// re-asks an unreachable home per attempt.
-		send(entry, Math.min(entry.deadlineMono - now, RESTART_ATTEMPT_MS));
+		send(entry);
 	};
 
 	/** Resolves to the barrier's position once the origin's entry has committed on this node. */
@@ -288,6 +296,8 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			position: undefined,
 			appliedPosition: undefined,
 			waiters: [],
+			attemptMs: RESTART_ATTEMPT_MS,
+			sentAt: 0,
 		};
 		// Registered before the request leaves, so the applied entry cannot arrive unmatched.
 		waits.add(entry);
@@ -305,7 +315,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			});
 		});
 		armSweep();
-		send(entry, deadlineMono - deps.monotonicNow());
+		send(entry);
 		return wait;
 	};
 

@@ -339,16 +339,16 @@ describe('createFreshnessBarrier: every wait ends exactly once', () => {
 		assert.strictEqual(h.timers.size, 0);
 		assert.match((await rejection(h.barrier.establish('t', [['a', 5]], 1_000))).message, /is closed/);
 	});
-	it('the request itself is bounded by what is left of the lock deadline, never unbounded', async () => {
+	it('the request itself is bounded by one attempt or what is left of the lock deadline, never unbounded', async () => {
 		// The sweep settles the WAIT; only this bound retires the response waiter and closes the
 		// per-call fallback socket when a member accepts the connection and never answers.
 		const h = harness();
 		h.barrier.establish('t', [['a', 5]], 1_000).catch(() => {});
 		assert.strictEqual(h.requests[0].timeoutMs, 1_000);
-		// Clamped to the longest lease, and never zero — `sendOperation` reads 0 as "no bound".
+		// One attempt's bound under a longer deadline, and never zero — `sendOperation` reads 0 as "no bound".
 		const capped = harness();
 		capped.barrier.establish('t', [['a', 5]], Number.MAX_SAFE_INTEGER).catch(() => {});
-		assert.strictEqual(capped.requests[0].timeoutMs, 300_000);
+		assert.strictEqual(capped.requests[0].timeoutMs, RESTART_ATTEMPT_MS);
 		const elapsed = harness();
 		elapsed.barrier.establish('t', [['a', 5]], 0).catch(() => {});
 		assert.strictEqual(elapsed.requests[0].timeoutMs, 1);
@@ -448,28 +448,34 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		await wait;
 		assert.ok(h.now() - startedAt > 20_000);
 	});
-	it('bounds a retry’s request by one restart attempt, and asks again on a fresh nonce once it times out', async () => {
+	it('asks again on a fresh nonce when an attempt goes unanswered, doubling the next attempt’s bound', async () => {
 		const h = harness();
 		const wait = h.barrier.establish('t', [['a', 5]], 60_000);
+		assert.strictEqual(h.requests[0].timeoutMs, RESTART_ATTEMPT_MS);
+		// The origin accepts the request and never answers; the transport gives up at that bound.
+		h.advance(RESTART_ATTEMPT_MS);
+		h.requests[0].reject(new Error(`record_lock_barrier to a did not answer within ${RESTART_ATTEMPT_MS}ms`));
+		await flush();
+		h.advance(BARRIER_RETRY_MIN_MS);
+		await flush();
+		assert.deepStrictEqual([h.requests[1].nonce, h.requests[1].timeoutMs], [2, RESTART_ATTEMPT_MS * 2]);
+		// Slow rather than gone: the doubled bound leaves it time to answer.
+		h.advance(RESTART_ATTEMPT_MS + 1_000);
+		h.requests[1].resolve(800);
+		await flush();
+		assert.strictEqual(h.barrier.noteBarrierApplied('a', 800, 2), true);
+		await wait;
+		assert.strictEqual(h.barrier.stats().outstanding, 0);
+	});
+	it('keeps one attempt’s bound after a refused connection', async () => {
+		const h = harness();
+		h.barrier.establish('t', [['a', 5]], 60_000).catch(() => {});
 		h.requests[0].reject(closedSocket());
 		await flush();
-		assert.strictEqual(h.requests[0].timeoutMs, 60_000, 'the first request has the whole deadline');
 		h.advance(BARRIER_RETRY_MIN_MS);
 		await flush();
 		assert.strictEqual(h.requests[1].timeoutMs, RESTART_ATTEMPT_MS);
-		// The origin accepts the retry and never answers; the transport gives up at that bound.
-		h.advance(RESTART_ATTEMPT_MS);
-		h.requests[1].reject(new Error(`record_lock_barrier to a did not answer within ${RESTART_ATTEMPT_MS}ms`));
-		await flush();
-		h.advance(BARRIER_RETRY_MIN_MS * 2);
-		await flush();
-		assert.strictEqual(h.requests.length, 3);
-		assert.strictEqual(h.requests[2].nonce, 3);
-		h.requests[2].resolve(800);
-		await flush();
-		assert.strictEqual(h.barrier.noteBarrierApplied('a', 800, 3), true);
-		await wait;
-		assert.strictEqual(h.barrier.stats().outstanding, 0);
+		h.barrier.close();
 	});
 	it('takes a retry’s reply that arrives at the end of its attempt', async () => {
 		const h = harness();

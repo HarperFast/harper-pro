@@ -176,8 +176,9 @@ async function waitForRestartJob(node, restart) {
 }
 
 /**
- * Every node reads the same `n` for `id`, holds the same CounterIncrement rows, and holds every op in
- * `confirmed`, on two polls in a row. A confirmed op that never arrives times out naming the nodes.
+ * Every node reads the same `n` for `id` and holds the same CounterIncrement rows, including every op in
+ * `confirmed`, and that agreed snapshot is unchanged from the previous poll. A confirmed op that never
+ * arrives times out naming the nodes.
  */
 function waitForIncrementsSettled(nodes, id, confirmed) {
 	let last;
@@ -378,8 +379,8 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 					})()
 				);
 		const counts = () => new Map(keys.map((id) => [id, confirmed.get(id).size]));
-		// Gated on progress rather than fixed sleeps, so a slow runner still increments both keys on both
-		// sides of the restart, and a key that stops granting fails here with its failures named.
+		// Both keys must be incremented on both sides of the restart however slow the runner; a key that
+		// stops granting fails here with its failures named.
 		const progressed = (since) =>
 			waitForCondition(() => keys.every((id) => confirmed.get(id).size - since.get(id) >= 10) || undefined, {
 				timeoutMs: 60_000,
@@ -391,7 +392,9 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 						)
 						.join('; ')}`,
 			}).catch(async (error) => {
-				const stats = await Promise.all(nodes.map((node) => lockStats(node).catch((statsError) => String(statsError))));
+				const stats = await Promise.all(
+					nodes.map((node) => lockStats(node, AbortSignal.timeout(5_000)).catch((statsError) => String(statsError)))
+				);
 				error.message += `; record lock stats ${JSON.stringify(stats)}`;
 				throw error;
 			});
@@ -410,6 +413,12 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 			const errorCommitted = final.ops.filter((op) => !ok.has(op) && !unanswered.get(id).has(op));
 			console.log(
 				`overlap ${id}: ${ok.size} answered 200, ${unansweredCommitted} of ${unanswered.get(id).size} unanswered committed, ${errorCommitted.length} answered with an error committed, n=${final.n}; failures ${summarizeFailures(failures, id)}`
+			);
+			// A non-200 answer from LockedIncrement means it failed before commit.
+			assert.deepEqual(
+				errorCommitted,
+				[],
+				`committed increments answered with an error: ${JSON.stringify(failures.filter((failure) => errorCommitted.includes(failure.op)))}`
 			);
 			// Every committed increment read the value its predecessor wrote; a lost update leaves n below the rows.
 			assert.equal(
