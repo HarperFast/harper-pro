@@ -390,6 +390,10 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 							(id) => `${id} +${confirmed.get(id).size - since.get(id)} (failures ${summarizeFailures(failures, id)})`
 						)
 						.join('; ')}`,
+			}).catch(async (error) => {
+				const stats = await Promise.all(nodes.map((node) => lockStats(node).catch((statsError) => String(statsError))));
+				error.message += `; record lock stats ${JSON.stringify(stats)}`;
+				throw error;
 			});
 		try {
 			await progressed(counts());
