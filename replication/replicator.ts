@@ -61,7 +61,7 @@ import {
 	readNodeForAuth,
 } from './knownNodes.ts';
 import { CONFIG_PARAMS, THREAD_TYPES } from '../core/utility/hdbTerms.ts';
-import { isWorkerPoolActive, isDedicatedPoolWorker, poolMemberIndex } from '../core/server/threads/workerPools.ts';
+import { isWorkerPoolActive, isWorkerPoolPending } from '../core/server/threads/workerPools.ts';
 import { exportIdMapping, getIdOfRemoteNode } from '../core/resources/nodeIdMapping.ts';
 import * as tls from 'node:tls';
 import { ServerError } from '../core/utility/errors/hdbError.js';
@@ -163,7 +163,6 @@ export async function start(options) {
 	}
 	assignReplicationSource(options);
 	startShardingBootstrap();
-	if (isDedicatedPoolWorker() && poolMemberIndex() === 0) warnOfUnresolvedComputedIndexes();
 
 	// Build mTLS configuration with certificate verification support
 	// mTLS is always enabled for replication (required for security)
@@ -177,7 +176,11 @@ export async function start(options) {
 		mtls: mtlsConfig, // mTLS with optional certificate verification (always overrides)
 		// With the dedicated pool running, only its workers bind the replication port, so every inbound
 		// replication socket lands there; HTTP workers still run the rest of start() for cache-miss retrieval.
-		threadType: isWorkerPoolActive(THREAD_TYPES.REPLICATION) ? THREAD_TYPES.REPLICATION : undefined,
+		// A pending (defaulted) pool claims too: an owned listener binds as an ordinary one if the pool is declined.
+		threadType:
+			isWorkerPoolActive(THREAD_TYPES.REPLICATION) || isWorkerPoolPending(THREAD_TYPES.REPLICATION)
+				? THREAD_TYPES.REPLICATION
+				: undefined,
 	};
 	// noinspection JSVoidFunctionReturnValueUsed
 	// @ts-expect-error
@@ -369,19 +372,6 @@ export async function start(options) {
 		for (const updateContexts of contextUpdaters) updateContexts();
 	});
 }
-function warnOfUnresolvedComputedIndexes() {
-	const databases = getDatabases();
-	for (const databaseName in databases) {
-		for (const tableName in databases[databaseName]) {
-			const unresolved = databases[databaseName][tableName]?.unresolvedComputedIndexes?.();
-			if (unresolved?.length)
-				logger.error(
-					`${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code while the replication worker pool is active (replication.threads > 0, or defaulted for threads.count >= 2); replication pool workers will refuse to replicate any table of ${databaseName}, set replication.threads: 0 to run replication on HTTP workers`
-				);
-		}
-	}
-}
-
 export function monitorNodeCAs(listener: () => void) {
 	let lastCaCount = 0;
 	// keyed 'ca-monitor' so this watcher runs concurrently with the subscription-manager and
