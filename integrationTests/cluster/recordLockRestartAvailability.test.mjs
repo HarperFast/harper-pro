@@ -330,9 +330,13 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 		await waitForIncarnationAbove(restarting, previous, 'the restarted node to answer');
 		await waitForMesh(nodes);
 		console.log(`held barrier, process restart: the successor locked ${result.elapsedMs}ms after asking`);
-		assert.equal(result.status, 200, `the successor across the restart: ${JSON.stringify(result.body)}`);
-		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
 		const freshness = (await lockStats(other)).freshness;
+		assert.equal(
+			result.status,
+			200,
+			`the successor across the restart: ${JSON.stringify({ body: result.body, freshness })}`
+		);
+		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
 		assert.ok(freshness?.retried > retriedBefore, `the barrier was asked again: ${JSON.stringify(freshness)}`);
 	});
 
@@ -592,9 +596,13 @@ suite('record locks across a rolling worker restart (harper#3768)', { timeout: 9
 		await waitForRestartJob(multi, restart);
 		await waitForMesh(nodes);
 		console.log(`held barrier, worker restart: the successor locked ${result.elapsedMs}ms after asking`);
-		assert.equal(result.status, 200, `the successor across the worker restart: ${JSON.stringify(result.body)}`);
-		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
 		const freshness = (await lockStats(other)).freshness;
+		assert.equal(
+			result.status,
+			200,
+			`the successor across the worker restart: ${JSON.stringify({ body: result.body, freshness })}`
+		);
+		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
 		assert.ok(freshness?.retried > retriedBefore, `the barrier was asked again: ${JSON.stringify(freshness)}`);
 	});
 });
