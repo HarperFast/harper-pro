@@ -27,12 +27,14 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readNodePid, restartNode, sendOperation, waitForCondition, waitForNewPid } from './clusterShared.mjs';
 import {
+	CONVERGE_TIMEOUT_MS,
 	DB,
 	bootstrapHomeMap,
 	call,
 	clusterStatusOf,
 	connectMesh,
 	counter,
+	increments,
 	putCounter,
 	restartStoppedNode,
 	startNode,
@@ -173,6 +175,60 @@ async function waitForRestartJob(node, restart) {
 	assert.equal(job.status, 'COMPLETE', JSON.stringify(job));
 }
 
+/**
+ * Every node reads the same `n` for `id` and holds the same CounterIncrement rows, including every op in
+ * `confirmed`, and that agreed snapshot is unchanged from the previous poll. A confirmed op that never
+ * arrives times out naming the nodes.
+ */
+function waitForIncrementsSettled(nodes, id, confirmed) {
+	let last;
+	let previous;
+	return waitForCondition(
+		async (signal) => {
+			previous = last;
+			last = await Promise.all(
+				nodes.map(async (node) => ({
+					n: (await counter(node, id, signal))?.n,
+					ops: (await increments(node, id, signal)).sort(),
+				}))
+			);
+			const snapshot = JSON.stringify(last[0]);
+			const settled =
+				last.every((read) => JSON.stringify(read) === snapshot) &&
+				JSON.stringify(previous) === JSON.stringify(last) &&
+				[...confirmed].every((op) => last[0].ops.includes(op));
+			return settled ? last[0] : undefined;
+		},
+		{
+			timeoutMs: CONVERGE_TIMEOUT_MS,
+			description: () =>
+				`Counter/${id} to settle on every node with all ${confirmed.size} confirmed increments; last read ${JSON.stringify(
+					last?.map((read, index) => ({
+						node: nodes[index].hostname,
+						n: read.n,
+						committed: read.ops.length,
+						missingConfirmed: [...confirmed].filter((op) => !read.ops.includes(op)).slice(0, 10),
+					}))
+				)}`,
+		}
+	);
+}
+
+function summarizeFailures(failures, id) {
+	const groups = new Map();
+	for (const failure of failures) {
+		if (failure.id !== id) continue;
+		const message =
+			typeof failure.body === 'string' ? failure.body : (failure.body?.error ?? JSON.stringify(failure.body));
+		const key = `${failure.node} ${failure.status} ${String(message).slice(0, 400)}`;
+		const group = groups.get(key) ?? { count: 0, maxMs: 0 };
+		group.count++;
+		group.maxMs = Math.max(group.maxMs, failure.ms);
+		groups.set(key, group);
+	}
+	return JSON.stringify(Object.fromEntries(groups));
+}
+
 const lockOnce = (node, id, timeout = LOCK_TIMEOUT_MS) =>
 	call(node, 'LockOnce/', { id, timeout, lease: LOCK_LEASE_MS }, AbortSignal.timeout(timeout + 10_000));
 
@@ -274,9 +330,13 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 		await waitForIncarnationAbove(restarting, previous, 'the restarted node to answer');
 		await waitForMesh(nodes);
 		console.log(`held barrier, process restart: the successor locked ${result.elapsedMs}ms after asking`);
-		assert.equal(result.status, 200, `the successor across the restart: ${JSON.stringify(result.body)}`);
-		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
 		const freshness = (await lockStats(other)).freshness;
+		assert.equal(
+			result.status,
+			200,
+			`the successor across the restart: ${JSON.stringify({ body: result.body, freshness })}`
+		);
+		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
 		assert.ok(freshness?.retried > retriedBefore, `the barrier was asked again: ${JSON.stringify(freshness)}`);
 	});
 
@@ -286,38 +346,85 @@ suite('record locks across a node restart (harper#3768)', { timeout: 900_000 }, 
 			await keyHomedOn(nodes, home, restarting, 'inc-held'),
 			await keyHomedOn(nodes, restarting, other, 'inc-homed'),
 		];
-		const successes = new Map(keys.map((id) => [id, 0]));
+		// Each increment carries an op id and commits a CounterIncrement row with it. A request to the
+		// restarting node can commit and lose its response, so the count of 200s is not the serial result;
+		// the committed rows are.
+		const confirmed = new Map(keys.map((id) => [id, new Set()]));
+		const unanswered = new Map(keys.map((id) => [id, new Set()]));
 		const failures = [];
 		let stop = false;
+		let sequence = 0;
 		const workers = [];
 		for (const node of nodes)
 			for (const id of keys)
 				workers.push(
 					(async () => {
 						while (!stop) {
+							const op = `${node.hostname}-${sequence++}`;
+							const sentAt = Date.now();
 							const result = await call(
 								node,
 								'LockedIncrement/',
-								{ id, timeout: LOCK_TIMEOUT_MS, lease: LOCK_LEASE_MS },
+								{ id, op, timeout: LOCK_TIMEOUT_MS, lease: LOCK_LEASE_MS },
 								AbortSignal.timeout(LOCK_TIMEOUT_MS + 10_000)
 							).catch((error) => ({ status: 0, body: String(error) }));
-							if (result.status === 200) successes.set(id, successes.get(id) + 1);
-							else failures.push({ node: node.hostname, id, ...result });
+							if (result.status === 200) confirmed.get(id).add(op);
+							else {
+								if (result.status === 0) unanswered.get(id).add(op);
+								failures.push({ node: node.hostname, id, op, ms: Date.now() - sentAt, ...result });
+							}
 							await delay(20);
 						}
 					})()
 				);
-		await delay(2_000);
-		await restartHome(restarting, nodes);
-		await delay(5_000);
-		stop = true;
-		await Promise.all(workers);
+		const counts = () => new Map(keys.map((id) => [id, confirmed.get(id).size]));
+		// Both keys must be incremented on both sides of the restart however slow the runner; a key that
+		// stops granting fails here with its failures named.
+		const progressed = (since) =>
+			waitForCondition(() => keys.every((id) => confirmed.get(id).size - since.get(id) >= 10) || undefined, {
+				timeoutMs: 60_000,
+				pollMs: 100,
+				description: () =>
+					`10 more increments on each key: ${keys
+						.map(
+							(id) => `${id} +${confirmed.get(id).size - since.get(id)} (failures ${summarizeFailures(failures, id)})`
+						)
+						.join('; ')}`,
+			}).catch(async (error) => {
+				const stats = await Promise.all(
+					nodes.map((node) => lockStats(node, AbortSignal.timeout(5_000)).catch((statsError) => String(statsError)))
+				);
+				error.message += `; record lock stats ${JSON.stringify(stats)}`;
+				throw error;
+			});
+		try {
+			await progressed(counts());
+			await restartHome(restarting, nodes);
+			await progressed(counts());
+		} finally {
+			stop = true;
+			await Promise.all(workers);
+		}
 		for (const id of keys) {
-			assert.ok(successes.get(id) > 20, `${id}: ${successes.get(id)} increments`);
-			await waitForCounter(nodes, id, successes.get(id));
-			const final = await counter(home, id);
-			// Every increment read the value its predecessor wrote: a lost update means two holders ran at once.
-			assert.equal(final.n, successes.get(id), `${id}: ${JSON.stringify({ final, failures: failures.slice(0, 5) })}`);
+			const ok = confirmed.get(id);
+			const final = await waitForIncrementsSettled(nodes, id, ok);
+			const unansweredCommitted = final.ops.filter((op) => unanswered.get(id).has(op)).length;
+			const errorCommitted = final.ops.filter((op) => !ok.has(op) && !unanswered.get(id).has(op));
+			console.log(
+				`overlap ${id}: ${ok.size} answered 200, ${unansweredCommitted} of ${unanswered.get(id).size} unanswered committed, ${errorCommitted.length} answered with an error committed, n=${final.n}; failures ${summarizeFailures(failures, id)}`
+			);
+			// A non-200 answer from LockedIncrement means it failed before commit.
+			assert.deepEqual(
+				errorCommitted,
+				[],
+				`committed increments answered with an error: ${JSON.stringify(failures.filter((failure) => errorCommitted.includes(failure.op)))}`
+			);
+			// Every committed increment read the value its predecessor wrote; a lost update leaves n below the rows.
+			assert.equal(
+				final.n,
+				final.ops.length,
+				`${id}: n=${final.n}, ${final.ops.length} committed; failures ${summarizeFailures(failures, id)}`
+			);
 		}
 	});
 
@@ -501,9 +608,13 @@ suite('record locks across a rolling worker restart (harper#3768)', { timeout: 9
 		await waitForRestartJob(multi, restart);
 		await waitForMesh(nodes);
 		console.log(`held barrier, worker restart: the successor locked ${result.elapsedMs}ms after asking`);
-		assert.equal(result.status, 200, `the successor across the worker restart: ${JSON.stringify(result.body)}`);
-		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
 		const freshness = (await lockStats(other)).freshness;
+		assert.equal(
+			result.status,
+			200,
+			`the successor across the worker restart: ${JSON.stringify({ body: result.body, freshness })}`
+		);
+		assert.equal(result.body.n, written.body.n + 1, 'the successor read the write made under the old delegation');
 		assert.ok(freshness?.retried > retriedBefore, `the barrier was asked again: ${JSON.stringify(freshness)}`);
 	});
 });

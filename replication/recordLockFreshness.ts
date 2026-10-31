@@ -14,7 +14,7 @@
  */
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import {
-	HOME_RESTART_RIDE_THROUGH_MS,
+	RESTART_ATTEMPT_MS,
 	type LockDependencySet,
 	type LockHomeMap,
 } from '../core/resources/recordLockCoordinator.ts';
@@ -48,8 +48,8 @@ export interface FreshnessDeps {
 	everRecloned(): boolean;
 	/**
 	 * Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position.
-	 * `timeoutMs` is what is left of the lock's own deadline or, for a retry, of the restart ride-through
-	 * window: the deadline sweep below only settles the WAIT, so without bounding the request too, a
+	 * `timeoutMs` is the attempt's bound, never more than what is left of the lock's own deadline: the
+	 * deadline sweep below only settles the WAIT, so without bounding the request too, a
 	 * member that accepts the connection and never answers leaves a response waiter (and, on the per-call
 	 * fallback connection, a socket) pinned for the life of that connection — one per failed handoff.
 	 */
@@ -84,8 +84,14 @@ interface Outstanding {
 	/** From the receive path, once the entry commits here — can precede the reply. */
 	appliedPosition: number | undefined;
 	waiters: Waiter[];
-	/** Set by the first failed request: no attempt is sent past `untilMono`, and each is bounded by it. */
-	retry?: { untilMono: number; stepMs: number; timer?: unknown; lastError: string };
+	/**
+	 * Each attempt is bounded like core's request to a home, so one sent on a connection that never
+	 * answers is asked again on a fresh nonce; doubled after an attempt that used it all, so an origin
+	 * that is slow rather than gone is still given the time to answer.
+	 */
+	attemptMs: number;
+	sentAt: number;
+	retry?: { stepMs: number; timer?: unknown; lastError: string };
 }
 
 export interface FreshnessBarrier {
@@ -178,8 +184,10 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			`could not obtain a record lock barrier from ${entry.origin} for ${database}.${entry.table}: ${message}`
 		);
 
-	const send = (entry: Outstanding, timeoutMs: number) => {
+	const send = (entry: Outstanding) => {
 		const attemptNonce = entry.nonce;
+		entry.sentAt = deps.monotonicNow();
+		const timeoutMs = Math.min(entry.deadlineMono - entry.sentAt, entry.attemptMs);
 		let request: Promise<number>;
 		try {
 			// At least 1ms: `sendOperation` reads 0 as "no bound" on the fallback path, and a wait whose
@@ -229,20 +237,21 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 
 	/**
 	 * A failed request — a socket closed under it, no connection, the origin's refusal while it boots —
-	 * is what an origin restarting looks like, so it is asked again for at most the ride-through from
-	 * the first failure, as core waits out an unreachable home (record-locks.md §4.5 (2)). A restarted
-	 * origin's barrier still follows everything its log held before the restart.
+	 * is what an origin restarting looks like, so it is asked again until the lock's own deadline: a
+	 * process restart outlasts core's 10 s home ride-through under load. An origin down for good fails
+	 * the handoffs whose lineage names it (every recovery handoff, which asks all members), and their
+	 * waits hold `MAX_OUTSTANDING_BARRIERS` slots until their deadlines, so a burst of them can fill the
+	 * database's cap for handoffs that name only live origins. A restarted origin's barrier still
+	 * follows everything its log held before the restart.
 	 */
 	const retryLater = (entry: Outstanding, message: string) => {
 		const now = deps.monotonicNow();
-		const retry = (entry.retry ??= {
-			untilMono: Math.min(entry.deadlineMono, now + HOME_RESTART_RIDE_THROUGH_MS),
-			stepMs: BARRIER_RETRY_MIN_MS,
-			lastError: '',
-		});
+		const retry = (entry.retry ??= { stepMs: BARRIER_RETRY_MIN_MS, lastError: '' });
 		retry.lastError = message;
-		// The last attempt is fitted into the window, as core fits its last wait, with a step of its own.
-		const leftMs = retry.untilMono - now - BARRIER_RETRY_MIN_MS;
+		// The transport's timer runs on whole milliseconds and can fire just short of the bound.
+		if (now - entry.sentAt >= entry.attemptMs - BARRIER_RETRY_MIN_MS) entry.attemptMs *= 2;
+		// The last attempt is fitted into the deadline, as core fits its last wait, with a step of its own.
+		const leftMs = entry.deadlineMono - now - BARRIER_RETRY_MIN_MS;
 		if (!(leftMs > 0)) {
 			settleEntry(entry, requestFailed(entry, message));
 			return;
@@ -258,7 +267,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		retry.timer = undefined;
 		if (!waits.has(entry)) return;
 		const now = deps.monotonicNow();
-		if (now >= retry.untilMono) {
+		if (now >= entry.deadlineMono) {
 			settleEntry(entry, requestFailed(entry, retry.lastError));
 			return;
 		}
@@ -276,7 +285,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		entry.position = undefined;
 		entry.appliedPosition = undefined;
 		attempts.set(entry.nonce, entry);
-		send(entry, retry.untilMono - now);
+		send(entry);
 	};
 
 	/** Resolves to the barrier's position once the origin's entry has committed on this node. */
@@ -289,6 +298,8 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			position: undefined,
 			appliedPosition: undefined,
 			waiters: [],
+			attemptMs: RESTART_ATTEMPT_MS,
+			sentAt: 0,
 		};
 		// Registered before the request leaves, so the applied entry cannot arrive unmatched.
 		waits.add(entry);
@@ -306,7 +317,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			});
 		});
 		armSweep();
-		send(entry, deadlineMono - deps.monotonicNow());
+		send(entry);
 		return wait;
 	};
 
