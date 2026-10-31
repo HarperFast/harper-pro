@@ -195,7 +195,7 @@ function waitForIncrementsSettled(nodes, id, confirmed) {
 			const snapshot = JSON.stringify(last[0]);
 			const settled =
 				last.every((read) => JSON.stringify(read) === snapshot) &&
-				JSON.stringify(previous?.[0]) === snapshot &&
+				JSON.stringify(previous) === JSON.stringify(last) &&
 				[...confirmed].every((op) => last[0].ops.includes(op));
 			return settled ? last[0] : undefined;
 		},
@@ -214,7 +214,6 @@ function waitForIncrementsSettled(nodes, id, confirmed) {
 	);
 }
 
-/** `failures` for `id`, grouped by node, status and message: count, and the longest a request took. */
 function summarizeFailures(failures, id) {
 	const groups = new Map();
 	for (const failure of failures) {

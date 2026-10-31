@@ -467,6 +467,17 @@ describe('createFreshnessBarrier: a failed request rides through its origin rest
 		await wait;
 		assert.strictEqual(h.barrier.stats().outstanding, 0);
 	});
+	it('doubles the bound after an attempt whose timer fired a millisecond short of it', async () => {
+		const h = harness();
+		h.barrier.establish('t', [['a', 5]], 60_000).catch(() => {});
+		h.advance(RESTART_ATTEMPT_MS - 1);
+		h.requests[0].reject(new Error(`record_lock_barrier to a did not answer within ${RESTART_ATTEMPT_MS}ms`));
+		await flush();
+		h.advance(BARRIER_RETRY_MIN_MS);
+		await flush();
+		assert.strictEqual(h.requests[1].timeoutMs, RESTART_ATTEMPT_MS * 2);
+		h.barrier.close();
+	});
 	it('keeps one attempt’s bound after a refused connection', async () => {
 		const h = harness();
 		h.barrier.establish('t', [['a', 5]], 60_000).catch(() => {});

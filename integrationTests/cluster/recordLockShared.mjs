@@ -125,7 +125,6 @@ export async function controlEntries(node, signal) {
 	return JSON.parse(text);
 }
 
-/** The ids of the CounterIncrement rows `node` holds for counter `id` (fixture `LockedIncrement` with an `op`). */
 export async function increments(node, id, signal) {
 	const response = await fetch(`${node.httpURL}/CounterIncrement/?counter=${encodeURIComponent(id)}`, {
 		headers: { Accept: 'application/json' },

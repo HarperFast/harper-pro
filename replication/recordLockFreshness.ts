@@ -238,16 +238,18 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	/**
 	 * A failed request — a socket closed under it, no connection, the origin's refusal while it boots —
 	 * is what an origin restarting looks like, so it is asked again until the lock's own deadline: a
-	 * process restart outlasts core's 10 s home ride-through under load, and an origin down for good
-	 * fails only the handoffs whose lineage names it (their waits hold `MAX_OUTSTANDING_BARRIERS` slots
-	 * until their deadlines). A restarted origin's barrier still follows everything its log held before
-	 * the restart.
+	 * process restart outlasts core's 10 s home ride-through under load. An origin down for good fails
+	 * the handoffs whose lineage names it (every recovery handoff, which asks all members), and their
+	 * waits hold `MAX_OUTSTANDING_BARRIERS` slots until their deadlines, so a burst of them can fill the
+	 * database's cap for handoffs that name only live origins. A restarted origin's barrier still
+	 * follows everything its log held before the restart.
 	 */
 	const retryLater = (entry: Outstanding, message: string) => {
 		const now = deps.monotonicNow();
 		const retry = (entry.retry ??= { stepMs: BARRIER_RETRY_MIN_MS, lastError: '' });
 		retry.lastError = message;
-		if (now - entry.sentAt >= entry.attemptMs) entry.attemptMs *= 2;
+		// The transport's timer runs on whole milliseconds and can fire just short of the bound.
+		if (now - entry.sentAt >= entry.attemptMs - BARRIER_RETRY_MIN_MS) entry.attemptMs *= 2;
 		// The last attempt is fitted into the deadline, as core fits its last wait, with a step of its own.
 		const leftMs = entry.deadlineMono - now - BARRIER_RETRY_MIN_MS;
 		if (!(leftMs > 0)) {
