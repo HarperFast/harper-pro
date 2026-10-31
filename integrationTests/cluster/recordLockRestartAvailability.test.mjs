@@ -220,7 +220,7 @@ function summarizeFailures(failures, id) {
 		if (failure.id !== id) continue;
 		const message =
 			typeof failure.body === 'string' ? failure.body : (failure.body?.error ?? JSON.stringify(failure.body));
-		const key = `${failure.node} ${failure.status} ${String(message).slice(0, 160)}`;
+		const key = `${failure.node} ${failure.status} ${String(message).slice(0, 400)}`;
 		const group = groups.get(key) ?? { count: 0, maxMs: 0 };
 		group.count++;
 		group.maxMs = Math.max(group.maxMs, failure.ms);
