@@ -308,28 +308,22 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			timeoutMs: CONVERGE_TIMEOUT_MS,
 			description: 'm1 delivered on C',
 		});
-		// A session adopts its first checkpoint only at a save, once the floors have passed everything it acknowledged:
-		// a floor that has not moved past m1 would leave a replay from it resending m1 with no receipt. Replacing the
-		// subscription saves without a newer acknowledgement, so it is the save that adopts the first checkpoint.
-		await new Promise((resolve) => setTimeout(resolve, 3 * FLOOR_INTERVAL_MS));
-		await subscribeMqtt(onC.client, topic);
+		// the session adopts its first checkpoint only at a save after the floors pass everything it acknowledged, and
+		// an acknowledgement's own save never qualifies, so a replacing SUBSCRIBE is retried until one does
+		await waitForCondition(
+			async () => {
+				await subscribeMqtt(onC.client, topic);
+				const { record } = await postToFixture(C, 'DurableSessionRecord', { id: clientId });
+				return record?.subscriptions?.[0]?.checkpoint !== undefined;
+			},
+			{ timeoutMs: CONVERGE_TIMEOUT_MS, description: 'the durable session to adopt its first checkpoint on C' }
+		);
 		await postToFixture(A, 'HoldTransaction', { id: 'held2' });
 		await upsert(A, 'early2');
 		await waitForCondition(() => topicIds(onC.received).includes('early2'), {
 			timeoutMs: CONVERGE_TIMEOUT_MS,
 			description: 'early2 delivered on C',
 		});
-		// the session persists its checkpoint beside the scalar position once the floors certify it
-		let record;
-		await waitForCondition(
-			async () => {
-				({ record } = await postToFixture(C, 'DurableSessionRecord', { id: clientId }));
-				return record?.subscriptions?.[0]?.checkpoint !== undefined;
-			},
-			{ timeoutMs: CONVERGE_TIMEOUT_MS, description: 'the durable session to carry a checkpoint on C' }
-		);
-		const saved = record.subscriptions[0];
-		ok(saved.startTime !== undefined, 'the scalar shadow is kept beside the checkpoint');
 		await endMqtt(onC.client);
 		await postToFixture(A, 'ReleaseTransaction', {});
 		await waitForRecord(B, 'held2');
@@ -338,6 +332,7 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 		// the row reaches B as it would through system-database replication, which this topology does not run
 		const { record: final } = await postToFixture(C, 'DurableSessionRecord', { id: clientId });
 		ok(final.subscriptions[0].checkpoint, 'the final save keeps the checkpoint');
+		ok(final.subscriptions[0].startTime !== undefined, 'the scalar shadow is kept beside the checkpoint');
 		await postToFixture(B, 'DurableSessionRecord', { record: final });
 		const onB = await connectMqtt(B, clientId);
 		try {
