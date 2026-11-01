@@ -565,7 +565,7 @@ export function holdFailedFrame(
 	if (requiresCompleteHistory || error instanceof ResidencyPlacementError || error instanceof DatabaseShardingHeldError)
 		return true;
 	const prior = attemptsByPeer.get(peerKey);
-	const attempts = prior?.position === position ? prior.attempts + 1 : 1;
+	const attempts = prior && prior.position === position ? prior.attempts + 1 : 1;
 	attemptsByPeer.set(peerKey, { position, attempts });
 	return attempts <= maxReplays;
 }
