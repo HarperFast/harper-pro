@@ -99,14 +99,14 @@ import {
 	getDatabaseGeneration,
 } from '../core/resources/auditStore.ts';
 import { isValidFloor, originFloorsDurable } from '../core/resources/originClosedFloor.ts';
-import { commitTrackedRocksTransaction } from '../core/resources/DatabaseTransaction.ts';
 import {
 	COPY_BOUND_KEY,
-	bumpOriginStateEpoch,
+	type CopyBoundChange,
 	readCopyBounds,
 	readOriginStateEpoch,
+	writeCopyBounds,
 } from '../core/resources/subscriptionCheckpoint.ts';
-import { RocksDatabase, Transaction as RocksTransaction } from '@harperfast/rocksdb-js';
+import { RocksDatabase } from '@harperfast/rocksdb-js';
 import {
 	exportIdMapping,
 	getIdOfRemoteNode,
@@ -3831,15 +3831,12 @@ export function mergePersistedCopyBounds(
 /**
  * The rows a copy from `peerId` owns, which no other writer touches: `[copyBound, peerId]` holds the exact highest
  * version each completed pass copied per origin, and `[copyBound, peerId, 'reserved', pass]` the bounds the pass
- * that started at `pass` reserved ahead of its rows. Core's admission reads them all (`readCopyBounds` in core
- * `resources/subscriptionCheckpoint.ts`); route `[seq, *]` rows are never written here. A pass that never settles
- * leaves its reservation, which only voids route starts at or below its own copy start.
+ * that started at `pass` reserved ahead of its rows. Core's admission reads them all and core's `writeCopyBounds`
+ * writes them; route `[seq, *]` rows are never written here. A pass that never settles leaves its reservation,
+ * which only voids route starts at or below its own copy start.
+ *
+ * The bounds that stay committed: every settled row, and this pass's own reservation (others' can be dropped).
  */
-function copyBoundKeys(peerId: number, pass: number | string): { settled: any[]; reserved: any[] } {
-	return { settled: [COPY_BOUND_KEY, peerId], reserved: [COPY_BOUND_KEY, peerId, 'reserved', pass] };
-}
-
-/** The bounds that stay committed: every settled row, and this pass's own reservation (others' can be dropped). */
 export function readCommittedCopyBounds(dbisDB: DbisStore, peerId: number, pass: number | string): Map<number, number> {
 	readCopyBounds(dbisDB);
 	const committed = new Map<number, number>();
@@ -3854,65 +3851,29 @@ export function readCommittedCopyBounds(dbisDB: DbisStore, peerId: number, pass:
 	return committed;
 }
 
+/** The bounds core accepts; a malformed one is dropped here, as it always was, rather than refusing the write. */
+function validBounds(bounds: ReadonlyMap<number, number>): Map<number, number> {
+	const valid = new Map<number, number>();
+	for (const [originId, bound] of bounds) {
+		if (Number.isInteger(originId) && originId >= 0 && Number.isFinite(bound) && bound >= 0) valid.set(originId, bound);
+	}
+	return valid;
+}
+
 /**
- * Applies `change` to this peer's two bound rows under `withLock` on its settled key, so a superseded connection
- * cannot lower a bound, staged into one transaction so a RocksDB write stall is absorbed off the event loop, then
- * bumps the origin-state epoch so admission and every captured checkpoint see it. A malformed bound row anywhere
- * fails the write: admission refuses on it, and rewriting it from what parses would reopen that.
+ * Core's `writeCopyBounds` is the one writer of these rows. It merges past an unrelated malformed row and releases a
+ * malformed reservation unread, so the refusal admission makes on one is kept here: a malformed row anywhere fails the
+ * write, and the rejection (never a `false`, which means unchanged) leaves the pass's reservation in place.
  */
 async function writeCopyBoundRows(
 	dbisDB: DbisStore,
 	peerId: number,
-	pass: number | string,
 	rootStore: any,
-	change: (
-		settled: Map<number, number>,
-		reserved: Map<number, number>
-	) => { settled?: boolean; reserved?: boolean | 'remove' }
+	change: CopyBoundChange
 ): Promise<boolean> {
-	const keys = copyBoundKeys(peerId, pass);
-	let wrote = false;
-	const write = async () => {
-		readCopyBounds(dbisDB);
-		const settled = new Map<number, number>();
-		const reserved = new Map<number, number>();
-		mergeCopyBoundRecordInto(settled, (dbisDB as any).getSync(keys.settled));
-		const reservedRow = (dbisDB as any).getSync(keys.reserved);
-		mergeCopyBoundRecordInto(reserved, reservedRow);
-		const changed = change(settled, reserved);
-		const removeReserved = changed.reserved === 'remove' && reservedRow != null;
-		if (!changed.settled && changed.reserved !== true && !removeReserved) return;
-		const store = (dbisDB as any).store;
-		const transaction = store ? new RocksTransaction(store) : undefined;
-		const options = transaction ? { transaction } : undefined;
-		try {
-			if (changed.settled) (dbisDB as any).putSync(keys.settled, Object.fromEntries(settled), options);
-			if (changed.reserved === true) (dbisDB as any).putSync(keys.reserved, Object.fromEntries(reserved), options);
-			if (removeReserved) (dbisDB as any).removeSync(keys.reserved, options);
-			if (transaction) await commitTrackedRocksTransaction(transaction, dbisDB, rootStore ?? (dbisDB as any).rootStore);
-		} catch (error) {
-			try {
-				transaction?.abort();
-			} catch {}
-			throw error;
-		}
-		wrote = true;
-		bumpOriginStateEpoch(rootStore ?? (dbisDB as any).rootStore);
-	};
-	if (typeof (dbisDB as any).withLock === 'function') await (dbisDB as any).withLock(keys.settled, write);
-	else await write();
-	return wrote;
-}
-
-function maxMergeInto(target: Map<number, number>, bounds: ReadonlyMap<number, number>): boolean {
-	let advanced = false;
-	for (const [originId, bound] of bounds) {
-		if (Number.isInteger(originId) && Number.isFinite(bound) && !(target.get(originId)! >= bound)) {
-			target.set(originId, bound);
-			advanced = true;
-		}
-	}
-	return advanced;
+	const root = rootStore ?? (dbisDB as any).rootStore;
+	readCopyBounds(root?.dbisDb ?? dbisDB);
+	return writeCopyBounds(root, peerId, change);
 }
 
 /** Reserves `bounds` for a pass in progress; resolves true once a raised reservation is committed. */
@@ -3924,9 +3885,7 @@ export function persistMergedCopyBounds(
 	pass: number | string = 0
 ): Promise<boolean> {
 	if (!dbisDB?.put || bounds.size === 0) return Promise.resolve(false);
-	return writeCopyBoundRows(dbisDB, peerId, pass, rootStore, (_settled, reserved) => ({
-		reserved: maxMergeInto(reserved, bounds),
-	}));
+	return writeCopyBoundRows(dbisDB, peerId, rootStore, { raise: validBounds(bounds), at: ['reserved', pass] });
 }
 
 /**
@@ -3941,10 +3900,11 @@ export function settleCopyBounds(
 	pass: number | string = 0
 ): Promise<boolean> {
 	if (!dbisDB?.put) return Promise.resolve(false);
-	return writeCopyBoundRows(dbisDB, peerId, pass, rootStore, (settled) => ({
-		settled: maxMergeInto(settled, copied),
-		reserved: 'remove',
-	}));
+	const raise = validBounds(copied);
+	return writeCopyBoundRows(dbisDB, peerId, rootStore, {
+		raise: raise.size > 0 ? raise : undefined,
+		release: [['reserved', pass]],
+	});
 }
 
 /**

@@ -778,6 +778,9 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 				return out;
 			},
 		};
+		// core's writeCopyBounds reaches the store through the root and commits a non-RocksDB root in one transaction
+		rootStore.dbisDb = dbisDB;
+		rootStore.transactionAsync = async (work) => work();
 		const seqRow2 = {
 			seqId: T,
 			nodes: [
@@ -798,9 +801,10 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(await persistMergedCopyBounds(dbisDB, new Map([[1, T + 500]]), 3, rootStore), true);
 		assert.strictEqual(epochWord(), 2, 'each committed advance bumps the origin-state epoch');
 		assert.strictEqual(dbisDB.getSync([Symbol.for('seq'), 2]), seqRow2, 'no route row is written');
-		// never lowered, and an unchanged bound writes nothing
+		// never lowered, and an unchanged bound writes nothing, though it still publishes the epoch for a writer that
+		// committed and stopped before doing so
 		assert.strictEqual(await persistMergedCopyBounds(dbisDB, new Map([[2, T + 700]]), 1, rootStore), false);
-		assert.strictEqual(epochWord(), 2);
+		assert.strictEqual(epochWord(), 3);
 		// two writers of one peer's row serialize on its lock, so neither loses the other's bound
 		await Promise.all([
 			persistMergedCopyBounds(dbisDB, new Map([[2, T + 900]]), 1, rootStore),
@@ -833,10 +837,15 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 				throw new Error('simulated copy bound put failure');
 			},
 		};
-		await assert.rejects(
-			() => persistMergedCopyBounds(failingDbis, new Map([[2, T + 990]]), 1, rootStore),
-			/simulated copy bound put failure/
-		);
+		rootStore.dbisDb = failingDbis;
+		try {
+			await assert.rejects(
+				() => persistMergedCopyBounds(failingDbis, new Map([[2, T + 990]]), 1, rootStore),
+				/simulated copy bound put failure/
+			);
+		} finally {
+			rootStore.dbisDb = dbisDB;
+		}
 		assert.strictEqual(epochWord(), epochBeforeFailure, 'the epoch moves only after a commit');
 		// a malformed row is never rewritten from what parses, which would turn admission's refusal into a pass
 		store.set(keyOf([Symbol.for('copyBound'), 5]), { 2: 'x' });
@@ -845,7 +854,18 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			(error) => error.statusCode === 410
 		);
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 5]), { 2: 'x' });
+		// core's writer would merge past that row for another peer, and release a malformed reservation unread; neither
+		// is allowed to hide the corruption admission refuses on
+		const refused = (error) => error.statusCode === 410;
+		await assert.rejects(() => persistMergedCopyBounds(dbisDB, new Map([[2, T + 996]]), 6, rootStore), refused);
+		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 6, 'reserved', 0]), undefined);
 		store.delete(keyOf([Symbol.for('copyBound'), 5]));
+		store.set(keyOf([Symbol.for('copyBound'), 6, 'reserved', 0]), { 2: 'x' });
+		await assert.rejects(() => settleCopyBounds(dbisDB, new Map([[2, T + 997]]), 6, rootStore), refused);
+		await assert.rejects(() => settleCopyBounds(dbisDB, new Map(), 6, rootStore), refused);
+		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 6, 'reserved', 0]), { 2: 'x' });
+		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 6]), undefined);
+		store.delete(keyOf([Symbol.for('copyBound'), 6, 'reserved', 0]));
 		const loaded = mergePersistedCopyBounds(new Map(), dbisDB);
 		assert.strictEqual(loaded.get(1), T + 500);
 		assert.strictEqual(loaded.get(2), T + 900);
