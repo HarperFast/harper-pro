@@ -1,0 +1,4 @@
+# Exported so MQTT clients can subscribe to `checkpoint_origin/#` (subscriptionCheckpointResume.test.mjs).
+type checkpoint_origin @table(database: "data") @export {
+	id: ID @primaryKey
+}

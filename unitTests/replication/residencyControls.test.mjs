@@ -12,7 +12,7 @@ import { decode, encode } from 'msgpackr';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
 import { DatabaseTransaction } from '#src/core/resources/DatabaseTransaction';
-const { Transaction: NativeTransaction } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
+const { Transaction: NativeTransaction, RocksDatabase } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
 import { transaction } from '#src/core/resources/transaction';
 import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
@@ -133,14 +133,20 @@ function recordFrame(Table, type, recordId, value, version, residencyId, overrid
 }
 
 describe('Declarative tables keep control and event traffic independent of placement', function () {
-	let priorExperimental, priorMarkers;
+	let priorExperimental, priorMarkers, priorSyncWal;
 	before(() => {
+		// These tests count the end_txn events of sharding traffic; an engine that syncs its WAL also sends the
+		// route-state updates of checkpoint certification, which originFloors.test.mjs covers.
+		priorSyncWal = Object.getOwnPropertyDescriptor(RocksDatabase.prototype, 'syncWal');
+		Object.defineProperty(RocksDatabase.prototype, 'syncWal', { value: undefined, configurable: true, writable: true });
 		priorExperimental = env.get('replication_experimentalAttributeSlots');
 		priorMarkers = env.get('storage_rocks_transactionLogAbortMarkers');
 		env.setProperty('replication_experimentalAttributeSlots', true);
 		env.setProperty('storage_rocks_transactionLogAbortMarkers', true);
 	});
 	after(() => {
+		if (priorSyncWal) Object.defineProperty(RocksDatabase.prototype, 'syncWal', priorSyncWal);
+		else delete RocksDatabase.prototype.syncWal;
 		env.setProperty('replication_experimentalAttributeSlots', priorExperimental);
 		env.setProperty('storage_rocks_transactionLogAbortMarkers', priorMarkers);
 	});
