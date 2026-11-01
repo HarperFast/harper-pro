@@ -308,6 +308,11 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			timeoutMs: CONVERGE_TIMEOUT_MS,
 			description: 'm1 delivered on C',
 		});
+		// A session adopts its first checkpoint only at a save, once the floors have passed everything it acknowledged:
+		// a floor that has not moved past m1 would leave a replay from it resending m1 with no receipt. Replacing the
+		// subscription saves without a newer acknowledgement, so it is the save that adopts the first checkpoint.
+		await new Promise((resolve) => setTimeout(resolve, 3 * FLOOR_INTERVAL_MS));
+		await subscribeMqtt(onC.client, topic);
 		await postToFixture(A, 'HoldTransaction', { id: 'held2' });
 		await upsert(A, 'early2');
 		await waitForCondition(() => topicIds(onC.received).includes('early2'), {
