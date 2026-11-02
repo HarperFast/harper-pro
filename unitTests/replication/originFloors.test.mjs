@@ -910,12 +910,45 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.deepStrictEqual(event.originRouteStates, [[1, undefined, undefined, undefined, 'g1', true]]);
 		assert.deepStrictEqual(event.originFloorRevocations, [[2, undefined]]);
 		// a cleared level-1 floor is never checked for a sticky revocation, and a later certificate may floor it again
-		assert.strictEqual(routeState.verifyPersisted([{ id: 2, closedFloor: T + 5 }], event), true);
+		assert.strictEqual(
+			routeState.verifyPersisted(() => [{ id: 2, closedFloor: T + 5 }], event),
+			true
+		);
 		assert.strictEqual(routeState.hasPending(), false);
 		// a closed connection keeps only safety marks: a coverage restore belongs to the copy that earned it
 		routeState.fullCoverage(1, 'g1');
 		routeState.retainOnlySafetyMarks();
 		assert.strictEqual(routeState.hasPending(), false);
+	});
+
+	it('PendingRouteState verifies each batch against the row its own event wrote, and keeps every batch when a read throws', () => {
+		const routeState = new PendingRouteState(() => {});
+		routeState.partialHistory(5, true);
+		const toRoute2 = { remoteNodeIds: [2] };
+		routeState.takeInto(toRoute2);
+		routeState.hole(6);
+		const toRoute3 = { remoteNodeIds: [3, 9] };
+		routeState.takeInto(toRoute3);
+		const rows = {
+			1: [{ id: 5, partialHistory: false }],
+			2: [{ id: 5, partialHistory: true }],
+			3: [{ id: 6, hole: true }],
+		};
+		const read = [];
+		const nodesFor = (event) => {
+			read.push(event.remoteNodeIds[0]);
+			return rows[event.remoteNodeIds[0]];
+		};
+		assert.throws(() =>
+			routeState.verifyPersisted(() => {
+				throw new Error('store closing');
+			})
+		);
+		assert.strictEqual(routeState.hasUnverifiedBatches(), true, 'a failed read consumes no batch');
+		assert.strictEqual(routeState.verifyPersisted(nodesFor), true);
+		assert.deepStrictEqual(read, [2, 3], 'never the socket peer row 1');
+		assert.strictEqual(routeState.hasPending(), false);
+		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
 	});
 
 	it('PendingRouteState verifyPersisted restores settled safety marks and revocations if the [seq, peer] write did not persist them', () => {
@@ -937,7 +970,10 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			{ id: 3, originGeneration: 'g3' },
 			{ id: 4, originGeneration: 'g4' },
 		];
-		assert.strictEqual(routeState.verifyPersisted(unpersistedNodes, event), false);
+		assert.strictEqual(
+			routeState.verifyPersisted(() => unpersistedNodes, event),
+			false
+		);
 		assert.strictEqual(routeState.hasPending(), true);
 		assert.strictEqual(routeState.hasPendingPartialHistory(1), true);
 		assert.strictEqual(routeState.hasPendingRevocation(3), true);
@@ -955,7 +991,10 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			{ id: 2, originGeneration: 'g2', hole: true },
 			{ id: 3, originGeneration: 'g3', floorRevoked: true },
 		];
-		assert.strictEqual(routeState.verifyPersisted(persistedNodes, retryEvent), true);
+		assert.strictEqual(
+			routeState.verifyPersisted(() => persistedNodes, retryEvent),
+			true
+		);
 		assert.strictEqual(routeState.hasPending(), false);
 
 		// A pure certifiedFrom clear (partialHistory(true) + partialHistory(false)) whose [seq, peer] write did not
@@ -967,7 +1006,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		routeState.takeInto(clearEvent);
 		assert.strictEqual(
 			routeState.verifyPersisted(
-				[{ id: 1, originGeneration: 'g1', partialHistory: false, certifiedFrom: 100 }],
+				() => [{ id: 1, originGeneration: 'g1', partialHistory: false, certifiedFrom: 100 }],
 				clearEvent
 			),
 			false
@@ -979,7 +1018,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			[1, undefined, false, undefined, 'g1'],
 		]);
 		assert.strictEqual(
-			routeState.verifyPersisted([{ id: 1, originGeneration: 'g1', partialHistory: false }], retryClearEvent),
+			routeState.verifyPersisted(() => [{ id: 1, originGeneration: 'g1', partialHistory: false }], retryClearEvent),
 			true
 		);
 
@@ -990,7 +1029,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		routeState.takeInto(recertEvent);
 		assert.strictEqual(
 			routeState.verifyPersisted(
-				[{ id: 1, originGeneration: 'g1', partialHistory: false, certifiedFrom: 200 }],
+				() => [{ id: 1, originGeneration: 'g1', partialHistory: false, certifiedFrom: 200 }],
 				recertEvent
 			),
 			true
@@ -1005,7 +1044,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		const voidedEvent = { remoteNodeIds: [1] };
 		routeState.takeInto(voidedEvent);
 		assert.strictEqual(
-			routeState.verifyPersisted([{ id: 1, originGeneration: 'g1', partialHistory: false }], voidedEvent),
+			routeState.verifyPersisted(() => [{ id: 1, originGeneration: 'g1', partialHistory: false }], voidedEvent),
 			true
 		);
 		assert.strictEqual(routeState.hasUnverifiedBatches(), false);

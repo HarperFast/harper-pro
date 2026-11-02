@@ -843,6 +843,8 @@ const STORAGE_IS_ROCKSDB = (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_
 // `RocksTransaction.setTimestamp`, the durable resume cursor and the status watermark, so a corrupt or
 // hostile peer's value must never get that far: the same bound core caps source-reported versions at.
 const MAX_DATE_TIMESTAMP = 8.64e15;
+/** A copy bound at or above every route start: the origin certifies nothing here, as with a route-row hole. */
+export const HOLE_COPY_BOUND = MAX_DATE_TIMESTAMP;
 function isValidReplicationClock(value: unknown): boolean {
 	return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= MAX_DATE_TIMESTAMP;
 }
@@ -3536,7 +3538,8 @@ export class PendingRouteState {
 	hasUnverifiedBatches(): boolean {
 		return this.unverifiedBatches.length > 0;
 	}
-	verifyPersisted(peerNodes: any[] | undefined, targetEvent?: any): boolean {
+	/** Checks each batch against the nodes of the `[seq, id]` row its own event wrote (`nodesFor(event)`). */
+	verifyPersisted(nodesFor: (event: any) => any[] | undefined, targetEvent?: any): boolean {
 		if (this.unverifiedBatches.length === 0) return true;
 		const matching: UnverifiedRouteStateBatch[] = [];
 		const remaining: UnverifiedRouteStateBatch[] = [];
@@ -3544,9 +3547,12 @@ export class PendingRouteState {
 			if (targetEvent === undefined || batch.event === targetEvent) matching.push(batch);
 			else remaining.push(batch);
 		}
+		// read before any batch is consumed: a reader that throws leaves them all for the next check
+		const rows = matching.map((batch) => nodesFor(batch.event));
 		this.unverifiedBatches = remaining;
 		let allPersisted = true;
-		for (const batch of matching) {
+		for (const [index, batch] of matching.entries()) {
+			const peerNodes = rows[index];
 			let batchPersisted = true;
 			for (const [originId, entry] of batch.marks ?? []) {
 				const [, certifiedFrom, partialHistory, hole, gen] = entry.mark;
@@ -3747,6 +3753,8 @@ type CopyPassState = {
 	restored: boolean;
 	originGenerations?: ReadonlyMap<number, string | undefined>;
 	holedOrigins?: ReadonlySet<number> | ReadonlyMap<number, string | undefined>;
+	/** The `[seq, id]` row this pass's marks were written to. */
+	routeId?: number;
 };
 
 /**
@@ -4992,6 +5000,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
+	/**
+	 * Set once this socket has sent a subscription request. Only its first request certifies a floor-only start: a later
+	 * one, or an include update, replaces a subscription the sender may still be streaming, whose certificates come
+	 * from a scan that never re-sent what the new start covers.
+	 */
+	let subscriptionRequestSent = false;
 	// Re-derive rather than trusting the cached reference: the connection seeds every reconnect from the
 	// subscription it was built with, which may since have been retired (expirePendingDatabaseSubscription).
 	let tableSubscriptionToReplicator: DatabaseSubscription = options.subscription
@@ -5032,6 +5046,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			options.connection?.nodeSubscriptions?.[0]?.name);
 	const awaitingResponse = new Map();
 	let receivingDataFromNodeIds = [];
+	/**
+	 * The `[seq, id]` row core writes for this connection's sequence updates (`remoteNodeIds[0]`): the first subscribed
+	 * node, which on a failover subscription is not the socket peer. Route state is read and marked there only.
+	 */
+	const routeRowId = (): number | undefined => receivingDataFromNodeIds[0];
 	remoteNodeName = authorization.name;
 	if (remoteNodeName && options.connection) options.connection.nodeName = remoteNodeName;
 	const blobGapGeneration: number = options.connection ? ++options.connection.blobGapGeneration : 0;
@@ -5174,7 +5193,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			copyCursorRemovalRetryTimer.unref?.();
 		}
 	}
-	function isCopyPassRouteRestoredDurable(nodeId: number): boolean {
+	function isCopyPassRouteRestoredDurable(): boolean {
 		if (pendingRouteState.size > 0 || pendingRouteState.hasUnverifiedBatches()) return false;
 		if (!currentCopyPass || currentCopyPass.startTime <= 0) {
 			return true;
@@ -5184,10 +5203,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return true;
 		}
 		const { dbisDB } = getDatabaseStores();
+		const routeId = currentCopyPass.routeId;
 		if (dbisDB) {
-			const seqEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
+			const seqEntry = readDbisCursorSync(dbisDB, 'seq', routeId);
 			if (Array.isArray(seqEntry?.nodes)) {
-				const peerNode = seqEntry.nodes.find((n: any) => n?.id === nodeId);
+				const peerNode = seqEntry.nodes.find((n: any) => n?.id === routeId);
 				if (peerNode?.fullCoverage === false) {
 					return false;
 				}
@@ -5213,13 +5233,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return true;
 	}
 	/** A copy run with full coverage makes the route whole again: the mark rides this route's next update. */
-	function restoreRouteFullCoverage(nodeId: number): void {
+	function restoreRouteFullCoverage(): void {
 		if (!currentCopyPass || currentCopyPass.resumedWithWidening || currentCopyPass.fullCoverage === false) return;
-		const node = readDbisCursorSync(getDatabaseStores().dbisDB, 'seq', nodeId)?.nodes?.find(
-			(state: any) => state?.id === nodeId
+		const routeId = currentCopyPass.routeId;
+		const node = readDbisCursorSync(getDatabaseStores().dbisDB, 'seq', routeId)?.nodes?.find(
+			(state: any) => state?.id === routeId
 		);
 		if (node?.fullCoverage === false && typeof node.originGeneration === 'string') {
-			pendingRouteState.fullCoverage(nodeId, node.originGeneration);
+			pendingRouteState.fullCoverage(routeId, node.originGeneration);
 		}
 	}
 	function attachCopyCursorRemoval(event: any, nodeId: number | undefined, afterSeqWrite = false): void {
@@ -5245,14 +5266,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!verifySettledRouteState()) {
 				scheduleRouteStateFlushRetry();
 			}
-			restoreRouteFullCoverage(nodeId);
+			restoreRouteFullCoverage();
 			if (connectionSuperseded()) return;
-			if (!isCopyPassRouteRestoredDurable(nodeId)) {
+			if (!isCopyPassRouteRestoredDurable()) {
 				deferCopyCursorRemoval(nodeId);
 				return;
 			}
 			const persisted = await settlePassCopyBounds();
-			if (!connectionSuperseded() && isCopyPassRouteRestoredDurable(nodeId)) {
+			if (!connectionSuperseded() && isCopyPassRouteRestoredDurable()) {
 				if (persisted) {
 					try {
 						await getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
@@ -5481,7 +5502,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					flushRouteState();
 				}
 			} else if (copyNodeId !== undefined) {
-				if (!isCopyPassRouteRestoredDurable(copyNodeId)) {
+				if (!isCopyPassRouteRestoredDurable()) {
 					if (!frameOpen && tableSubscriptionToReplicator?.send && !tableSubscriptionToReplicator?.then) {
 						const barrierEvent: any = {
 							type: 'end_txn',
@@ -5497,7 +5518,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					void settlePassCopyBounds()
 						.then((ok) => {
 							if (connectionSuperseded()) return;
-							if (ok && isCopyPassRouteRestoredDurable(copyNodeId)) {
+							if (ok && isCopyPassRouteRestoredDurable()) {
 								return getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), copyNodeId]);
 							}
 							deferCopyCursorRemoval(copyNodeId);
@@ -6356,13 +6377,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		try {
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
 			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
-			if (originId !== undefined) {
-				const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
-				const store = auditStore ?? databaseAuditStore;
-				const peerId =
-					receivingDataFromNodeIds?.[0] ??
-					(remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined);
-				const seqEntry = peerId !== undefined ? readDbisCursorSync(dbisDB, 'seq', peerId) : undefined;
+			if (originId !== undefined && projectionCopy) {
+				// a projection's end_txn names no route, so its hole is a copy bound no route start passes, durable
+				// before the frame moves on and so before the projection can complete
+				if (copyApplyActive() && !projectionHoles.has(originId)) {
+					const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
+					await writeCopyBoundRows(dbisDB, ownCopyPeerId(), (auditStore ?? databaseAuditStore)?.rootStore, {
+						raise: new Map([[originId, HOLE_COPY_BOUND]]),
+					});
+					projectionHoles.add(originId);
+				}
+			} else if (originId !== undefined) {
+				const routeId = routeRowId();
+				const seqEntry =
+					routeId !== undefined ? readDbisCursorSync(getDatabaseStores().dbisDB, 'seq', routeId) : undefined;
 				const existingGen = seqEntry?.nodes?.find?.((state: any) => state?.id === originId)?.originGeneration;
 				const gen = typeof existingGen === 'string' ? existingGen : undefined;
 				holedOrigins.set(originId, gen);
@@ -6690,19 +6718,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const optimisticCertifiedOrigins = new Map<number, { start: number; generation?: string }>();
 	let boundSharedRouteSafety: SharedRouteSafetyState | undefined;
 	function bindSharedRouteSafety(): void {
-		if (!remoteNodeName || !databaseName) return;
+		// keyed by route, not socket peer: a failover connection reaches another node's route through the same peer,
+		// and a socket with no subscription carries no route state to share
+		const routeName = options.connection?.nodeSubscriptions?.[0]?.name;
+		if (!routeName || !databaseName) return;
 		try {
 			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? dbAuditStore;
 			const rootObj = (store?.rootStore ?? (dbisDB as any)?.rootStore ?? dbisDB) as object | undefined;
 			if (!rootObj || typeof rootObj !== 'object') return;
 			if (boundSharedRouteSafety) return;
-			let byPeer = sharedRouteSafetyByDb.get(rootObj);
-			if (!byPeer) {
-				byPeer = new Map();
-				sharedRouteSafetyByDb.set(rootObj, byPeer);
+			let byRoute = sharedRouteSafetyByDb.get(rootObj);
+			if (!byRoute) {
+				byRoute = new Map();
+				sharedRouteSafetyByDb.set(rootObj, byRoute);
 			}
-			let shared = byPeer.get(remoteNodeName);
+			let shared = byRoute.get(routeName);
 			if (!shared) {
 				pendingRouteState.retainOnlySafetyMarks();
 				shared = {
@@ -6712,7 +6743,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					revokedOrigins,
 					ownerConnectionId: connectionId,
 				};
-				byPeer.set(remoteNodeName, shared);
+				byRoute.set(routeName, shared);
 			} else {
 				if (shared.ownerConnectionId !== connectionId) {
 					shared.pendingRouteState.retainOnlySafetyMarks();
@@ -6745,6 +6776,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			pendingRouteState.setOnSettled(undefined);
 		}
 	});
+	const nodesOfEventRow = (event: any): any[] | undefined =>
+		readDbisCursorSync(getDatabaseStores().dbisDB, 'seq', event.remoteNodeIds[0])?.nodes;
 	function verifySettledRouteState(targetEvent?: any): boolean {
 		bindSharedRouteSafety();
 		if (!pendingRouteState.hasUnverifiedBatches()) return true;
@@ -6755,12 +6788,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return true;
 		}
 		try {
-			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
-			const store = auditStore ?? dbAuditStore;
-			const peerId = remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined;
-			if (peerId === undefined) return false;
-			const peerNodes: any[] | undefined = readDbisCursorSync(dbisDB, 'seq', peerId)?.nodes;
-			return pendingRouteState.verifyPersisted(peerNodes, targetEvent);
+			return pendingRouteState.verifyPersisted(nodesOfEventRow, targetEvent);
 		} catch {
 			return false;
 		}
@@ -6787,13 +6815,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		bindSharedRouteSafety();
 		try {
-			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
-			const store = auditStore ?? dbAuditStore;
-			const peerId = remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined;
-			if (peerId !== undefined) {
+			const routeId = routeRowId();
+			if (routeId !== undefined) {
 				loadPersistedCopyBounds();
 				// a covered start is voided through this route's own end_txn; admission ignores it meanwhile
-				for (const node of readDbisCursorSync(dbisDB, 'seq', peerId)?.nodes ?? []) {
+				for (const node of readDbisCursorSync(getDatabaseStores().dbisDB, 'seq', routeId)?.nodes ?? []) {
 					const bound = node && typeof node.id === 'number' ? maxCopiedVersionByOrigin.get(node.id) : undefined;
 					if (bound !== undefined) clearCopyBoundedCertification(node.id, bound, { ...node });
 				}
@@ -6801,13 +6827,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		} catch {
 			// Ignore transient store lookup errors; retry timer handles unverified route state.
 		}
-		const verified = verifySettledRouteState();
-		if (pendingRouteState.hasPending()) {
-			if (!frameOpen) flushRouteState();
-			else scheduleRouteStateFlushRetry();
-		} else if (!verified || pendingRouteState.hasUnverifiedBatches()) {
-			scheduleRouteStateFlushRetry();
-		}
+		// a failed check restored its marks: retry them on the timer, so a check that cannot pass never holds the thread
+		if (!verifySettledRouteState()) scheduleRouteStateFlushRetry();
+		else if (pendingRouteState.hasPending() && !frameOpen) flushRouteState();
+		else if (pendingRouteState.hasPending() || pendingRouteState.hasUnverifiedBatches()) scheduleRouteStateFlushRetry();
 	}
 	function enqueuePostSeqWriteBarrier(): void {
 		if (wsClosed || connectionSuperseded()) {
@@ -6858,6 +6881,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let copyWasResumed = false;
 	let copyResumedWithWidening = false;
 	let requestIsCopy = false;
+	/** Origins this projection pass dropped a record of, already raised to `HOLE_COPY_BOUND`. */
+	const projectionHoles = new Set<number>();
 	/** Highest audit-less copyApply record version applied per origin, bounding floor-only resume. */
 	const maxCopiedVersionByOrigin = new Map<number, number>();
 	/** What is committed in a `[copyBound, *]` row; a copied row above it waits for `persistCopyBounds`. */
@@ -7071,9 +7096,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const directFullCoverage: string[] = options.connection?.exclusionOrigins ?? [];
 			const routeFullCoverage = !restrictedOrigins && directFullCoverage.includes(remoteNodeName);
 			loadPersistedCopyBounds();
-			const peerId = getIdOfRemoteNode(remoteNodeName, store);
+			const routeId = routeRowId();
 			const peerNodes: any[] | undefined =
-				peerId === undefined ? undefined : readDbisCursorSync(dbisDB, 'seq', peerId)?.nodes;
+				routeId === undefined ? undefined : readDbisCursorSync(dbisDB, 'seq', routeId)?.nodes;
 			for (const [name, certificate] of certificates) {
 				if (name === thisNodeName || !Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number') continue;
 				const id = nameToId[name];
@@ -7994,15 +8019,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (maybeLeakConnectionAfterCopyStartForTest(options.connection, ws, databaseName)) wedgedForTest = true;
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						copyPassToken = `${data}:${randomUUID()}`;
+						projectionHoles.clear();
 						const copyMarkOrigins = new Map<number, string | undefined>();
 						// only an engine that can certify a checkpoint has a route history to mark partial; a sharding
 						// projection publishes no route state (its end_txn carries no remote ids), so there is nothing to mark
 						if (!projectionCopy && supportsCheckpointFloors()) {
-							const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
-							const store = auditStore ?? databaseAuditStore;
-							const peerIdForCopy = remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined;
+							const routeIdForCopy = routeRowId();
 							const seqEntryForCopy =
-								peerIdForCopy !== undefined ? readDbisCursorSync(dbisDB, 'seq', peerIdForCopy) : undefined;
+								routeIdForCopy !== undefined
+									? readDbisCursorSync(getDatabaseStores().dbisDB, 'seq', routeIdForCopy)
+									: undefined;
 							for (const state of seqEntryForCopy?.nodes ?? []) {
 								if (state && typeof state.id === 'number') {
 									const gen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
@@ -8010,8 +8036,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									if (state.hole === true) holedOrigins.set(state.id, gen);
 								}
 							}
-							if (peerIdForCopy !== undefined && !copyMarkOrigins.has(peerIdForCopy)) {
-								copyMarkOrigins.set(peerIdForCopy, undefined);
+							if (routeIdForCopy !== undefined && !copyMarkOrigins.has(routeIdForCopy)) {
+								copyMarkOrigins.set(routeIdForCopy, undefined);
 							}
 							for (const [originId, gen] of partialMarked) {
 								if (!copyMarkOrigins.has(originId)) copyMarkOrigins.set(originId, gen);
@@ -8040,6 +8066,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							restored: false,
 							originGenerations: copyMarkOrigins,
 							holedOrigins,
+							routeId: routeRowId(),
 						};
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
@@ -12087,9 +12114,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								const name = getNodeNameForId(store, originId, true);
 								if (!name || !allowedOptimisticNames.has(name)) return;
 							}
-							if (originId === peerId) {
-								pendingRouteState.certifiedFrom(originId, start, generation);
-							} else {
+							if (originId !== peerId) {
 								const rowNode =
 									peerId !== undefined ? seqRows.get(peerId)?.nodes?.find((n: any) => n?.id === originId) : undefined;
 								const armKey = Math.max(rowNode?.originLogKey ?? 0, rowNode?.seqId ?? 0, start);
@@ -12097,6 +12122,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									leadingDupCursorByNode.set(originId, armKey);
 								}
 							}
+							if (subscriptionRequestSent) return;
+							if (originId === peerId) pendingRouteState.certifiedFrom(originId, start, generation);
 							optimisticCertifiedOrigins.set(originId, { start, generation });
 						}
 					: undefined,
@@ -12642,6 +12669,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				};
 			});
 		if (
+			!subscriptionRequestSent &&
 			!requestIsCopy &&
 			directFloorOnlyNodeId !== undefined &&
 			directFloorOnlyStart !== undefined &&
@@ -12685,6 +12713,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							: [SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded, requestId]
 					)
 				);
+				subscriptionRequestSent = true;
 				// Start a fresh request -> first application-response window on every non-empty request. This is
 				// intentionally after send(): a synchronous send failure must not leave an orphaned timer.
 				if (requestId === undefined) {
