@@ -1,0 +1,8 @@
+type Cache @table(table: "cache", audit: false) @export {
+	cacheControl: String
+}
+
+type Session @table @export {
+	id: ID @primaryKey
+	user: String
+}

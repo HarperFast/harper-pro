@@ -194,6 +194,14 @@ suite('Clone Node', (ctx) => {
 			records: [{ id: '1', name: 'test-clone' }],
 		});
 
+		// a clone pre-creates tables from the leader's schema, so the table-level expiration must come with it
+		await sendOperation(nodeCtx.harper, {
+			operation: 'create_table',
+			table: 'test_expiring',
+			primary_key: 'id',
+			expiration: 3600,
+		});
+
 		// Create authentication tokens to verify that they get cloned properly
 		await sendOperation(nodeCtx.harper, {
 			operation: 'create_authentication_tokens',
@@ -361,6 +369,8 @@ suite('Clone Node', (ctx) => {
 			await sleep(500);
 		}
 		equal(responseData[0].name, 'test-clone', 'Record name should match the original');
+		const expiringTable = await sendOperation(ctx.nodes[1], { operation: 'describe_table', table: 'test_expiring' });
+		equal(expiringTable.expiration, '3600s', 'The table-level expiration should be cloned');
 
 		const sshKeys = await sendOperation(ctx.nodes[1], {
 			operation: 'list_ssh_keys',

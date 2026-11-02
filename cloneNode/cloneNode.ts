@@ -1412,6 +1412,8 @@ async function cloneSchemas(shardedDatabases: readonly string[]): Promise<void> 
 				}));
 
 			const primaryKey = tableDesc.hash_attribute ?? attributes.find((a: any) => a.isPrimaryKey)?.name ?? 'id';
+			// describe_all reports it as `<seconds>s`; replication cannot add it once the table exists
+			const expiration = parseFloat(tableDesc.expiration);
 
 			try {
 				await createTable({
@@ -1419,6 +1421,7 @@ async function cloneSchemas(shardedDatabases: readonly string[]): Promise<void> 
 					table: tableName,
 					primary_key: primaryKey,
 					attributes,
+					...(expiration > 0 ? { expiration } : {}),
 					operation: OPERATIONS_ENUM.CREATE_TABLE,
 				});
 				log(`Pre-created table '${dbName}.${tableName}' from leader schema`);
