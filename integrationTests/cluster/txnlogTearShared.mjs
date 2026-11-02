@@ -23,7 +23,7 @@ import {
 } from '@harperfast/integration-testing';
 import { readLog, sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 
-export const engine = await import('@harperfast/rocksdb-js');
+const engine = await import('@harperfast/rocksdb-js');
 // An entry header is a big-endian float64 timestamp, a uint32 payload length, and a flag byte.
 const { TRANSACTION_LOG_FILE_HEADER_SIZE: FILE_HEADER_SIZE } = engine.constants;
 export const { TRANSACTION_LOG_ENTRY_HEADER_SIZE: ENTRY_HEADER_SIZE } = engine.constants;

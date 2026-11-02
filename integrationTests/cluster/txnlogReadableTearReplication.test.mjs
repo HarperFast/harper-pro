@@ -52,8 +52,10 @@ import {
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
-const INBOUND_CLOSE = /Error handling incoming replication message/g;
-const CLOSED_ON_TORN_ENTRY = 'B closed and resumed its inbound stream (Error handling incoming replication message)';
+// The receiver's close/resume paths for an unsharded record: a message that fails to apply, and a
+// replication hole it cannot record.
+const CLOSE_RESUME = /Error handling incoming replication message|could not record a replication hole/g;
+const CLOSED_ON_TORN_ENTRY = 'B closed its inbound stream to resume from its cursor';
 const QUARANTINED = `${QUARANTINE_SETTLE_MS}ms after A acknowledged a write behind the break`;
 
 suite(
@@ -76,7 +78,7 @@ suite(
 			assertExactRows(rows, [...rowIds(0, torn.index), ...behind, liveId], 'after B replicated past the torn entry');
 
 			const logB = await waitForLog([stoppedB, ctx.nodeB], [decodeDrop(tornId), hole(ctx.nodeA)], 'B');
-			strictEqual(countInboundCloses(logB), 0, CLOSED_ON_TORN_ENTRY);
+			strictEqual(countCloses(logB), 0, CLOSED_ON_TORN_ENTRY);
 			const logA = await readLogs([stoppedA, ctx.nodeA]);
 			ok(
 				!/Corrupt transaction log|stopped at a mid-log corrupt transaction-log frame/.test(logA),
@@ -104,7 +106,7 @@ suite(
 			const rows = await readRowsAfterQuarantine(ctx);
 			await assertNeverCopied(ctx.nodeB, QUARANTINED);
 			assertExactRows(rows, rowIds(0, torn.index), QUARANTINED);
-			strictEqual(countInboundCloses(await readLogs([stoppedB, ctx.nodeB])), 0, CLOSED_ON_TORN_ENTRY);
+			strictEqual(countCloses(await readLogs([stoppedB, ctx.nodeB])), 0, CLOSED_ON_TORN_ENTRY);
 			await recordStatus(ctx, rows);
 		});
 	}
@@ -142,7 +144,7 @@ suite(
 			const logB = await readLogs([stoppedB, ctx.nodeB]);
 			ok(!decodeDrop(tornId).test(logB), `B reported ${tornId} as undecodable`);
 			ok(!hole(ctx.nodeA).test(logB), 'B recorded a replication hole');
-			strictEqual(countInboundCloses(logB), 0, CLOSED_ON_TORN_ENTRY);
+			strictEqual(countCloses(logB), 0, CLOSED_ON_TORN_ENTRY);
 			console.log(`B stored ${tornId} as ${JSON.stringify(tornRow.payload)}`);
 			await recordStatus(ctx, rows);
 		});
@@ -202,8 +204,7 @@ function setDeclaredLength(buffer, frame, length) {
 	new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(frame.position + 8, length);
 }
 
-// The reader yields the torn frame whole, then finds no frame where its declared length ends. The
-// engine resumes framing at r41 (`resumesAt`), which A's break report is asserted against.
+// `resumesAt` is checked against A's break report rather than here.
 function assertBreaksAfter(buffer, target, index, declared, resumesAt) {
 	const walked = readFrames(buffer);
 	const breakAt = target.position + ENTRY_HEADER_SIZE + declared;
@@ -224,8 +225,8 @@ function hole(source) {
 	);
 }
 
-function countInboundCloses(log) {
-	return log.match(INBOUND_CLOSE)?.length ?? 0;
+function countCloses(log) {
+	return log.match(CLOSE_RESUME)?.length ?? 0;
 }
 
 function waitForRow(node, id) {
