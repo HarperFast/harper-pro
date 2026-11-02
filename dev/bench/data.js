@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793453201103,
+  "lastUpdate": 1793621912162,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -7019,6 +7019,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2508.83,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "9d8df2397d0aff627ca0d6fb2eb1893f44543c86",
+          "message": "Load AGENTS.md into Claude Code sessions by importing it from CLAUDE.md (#1208)\n\nCLAUDE.md held only a prose pointer, which Claude Code does not expand, so\na session saw AGENTS.md only if it chose to open it. `@AGENTS.md` is expanded\nat session start.\n\n\nDispatch-Task: harper-pro-claude-md-import-agents\n\nCo-authored-by: Claude Sonnet 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-02T03:46:36Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/9d8df2397d0aff627ca0d6fb2eb1893f44543c86"
+        },
+        "date": 1793621910658,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 6309.45,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 19837.1,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 14137.46,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 7236.13,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 5128.76,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2568.6,
             "unit": "ops/sec"
           }
         ]
