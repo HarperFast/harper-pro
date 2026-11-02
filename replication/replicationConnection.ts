@@ -3755,8 +3755,8 @@ type CopyPassState = {
 	holedOrigins?: ReadonlySet<number> | ReadonlyMap<number, string | undefined>;
 	/** The `[seq, id]` row this pass's marks were written to. */
 	routeId?: number;
-	/** The source's hole rows that stood when this pass began: the only ones its completion may fill. */
-	holes?: { slot: (string | number)[]; origins: number[] }[];
+	/** The hole rows that stood when this pass began: the only ones its completion may fill. */
+	holes?: CopyHole[];
 };
 
 /**
@@ -3832,12 +3832,12 @@ export function mergePersistedCopyBounds(
 	holes = true
 ): Map<number, number> {
 	if (typeof dbisDB?.getRange === 'function') {
-		const persisted = readCopyBounds(dbisDB);
 		if (holes) {
-			for (const [originId, bound] of persisted) {
+			for (const [originId, bound] of readCopyBounds(dbisDB)) {
 				if (!(target.get(originId)! >= bound)) target.set(originId, bound);
 			}
 		} else {
+			// a malformed row is skipped here rather than refused: admission refuses on its own read of it
 			for (const { key, value } of dbisDB.getRange({
 				start: COPY_BOUND_KEY,
 				end: [COPY_BOUND_KEY, Buffer.from([0xff])],
@@ -3911,37 +3911,47 @@ export function persistMergedCopyBounds(
 }
 
 const HOLE_ROW = 'hole';
+/** A copy pass's record of the records it dropped, as one `[copyBound, peerId, 'hole', pass, revision, lossKey]` row. */
+export type CopyHole = { peerId: number; slot: (string | number)[]; origins: number[]; lossKey: number };
+
 /**
- * Records that the copy pass `pass` from `peerId` dropped a record of each origin, so no route start of it certifies
- * here: `[copyBound, peerId, 'hole', pass]` at `HOLE_COPY_BOUND`, until a later complete pass from that peer releases it.
+ * Records that the copy pass `pass` from `peerId` dropped records of `origins`, the highest keyed at `lossKey`, at
+ * `HOLE_COPY_BOUND`, which no route start passes. A row is never rewritten: the pass's next drop writes the next
+ * revision, carrying every origin and the highest key so far, and releases `previous` in the same commit, so a pass
+ * that captured a revision when it began never releases a loss recorded after.
  */
-export function persistCopyHoles(
+export function persistCopyHole(
 	dbisDB: DbisStore | undefined,
+	peerId: number,
+	rootStore: any,
+	pass: string,
+	revision: number,
 	origins: Iterable<number>,
-	peerId = 0,
-	rootStore?: any,
-	pass: number | string = 0
+	lossKey: number,
+	previous?: (string | number)[]
 ): Promise<boolean> {
 	if (!dbisDB?.put) return Promise.resolve(false);
 	return writeCopyBoundRows(dbisDB, peerId, rootStore, {
 		raise: new Map(Array.from(origins, (originId) => [originId, HOLE_COPY_BOUND])),
-		at: [HOLE_ROW, pass],
+		at: [HOLE_ROW, pass, revision, lossKey],
+		release: previous ? [previous] : [],
 	});
 }
 
-/** The hole rows `peerId`'s copies have left: each one's slot under `[copyBound, peerId]` and the origins it holds. */
-export function readCopyHoles(
-	dbisDB: DbisStore | undefined,
-	peerId: number
-): { slot: (string | number)[]; origins: number[] }[] {
-	const holes: { slot: (string | number)[]; origins: number[] }[] = [];
+export function readCopyHoles(dbisDB: DbisStore | undefined): CopyHole[] {
+	const holes: CopyHole[] = [];
 	if (typeof dbisDB?.getRange !== 'function') return holes;
 	for (const { key, value } of dbisDB.getRange({
 		start: COPY_BOUND_KEY,
 		end: [COPY_BOUND_KEY, Buffer.from([0xff])],
 	}) as Iterable<{ key: any; value: unknown }>) {
-		if (key[1] !== peerId || key[2] !== HOLE_ROW) continue;
-		holes.push({ slot: key.slice(2), origins: Object.keys(value ?? {}).map(Number) });
+		if (key[2] !== HOLE_ROW || typeof key[1] !== 'number') continue;
+		holes.push({
+			peerId: key[1],
+			slot: key.slice(2),
+			origins: Object.keys(value ?? {}).map(Number),
+			lossKey: typeof key[5] === 'number' ? key[5] : HOLE_COPY_BOUND,
+		});
 	}
 	return holes;
 }
@@ -3949,9 +3959,10 @@ export function readCopyHoles(
 /**
  * Once a pass's rows are durable: merges the exact versions it copied into the settled row and drops its
  * reservation in the same commit, so a route can certify again from just above what was actually copied. A pass
- * that copied everything again and dropped nothing also drops the hole rows that stood when it began (`filled`); its
- * snapshot restored their records but not their audit entries, so each of their origins keeps a bound at the pass's
- * copy start (`filledFrom`), which voids every route start, and so every checkpoint, from before the hole was filled.
+ * that copied everything again and dropped nothing fills the holes that stood when it began (`filled`): its snapshot
+ * restored their records but not their audit entries, so each of their origins keeps a bound at the later of its loss
+ * key and the pass's copy start (`filledFrom`), voiding every route start and checkpoint from before. This peer's hole
+ * rows go in the same commit; the caller releases another peer's after it.
  */
 export function settleCopyBounds(
 	dbisDB: DbisStore | undefined,
@@ -3959,16 +3970,18 @@ export function settleCopyBounds(
 	peerId = 0,
 	rootStore?: any,
 	pass: number | string = 0,
-	filled: readonly { slot: (string | number)[]; origins: number[] }[] = [],
+	filled: readonly CopyHole[] = [],
 	filledFrom = 0
 ): Promise<boolean> {
 	if (!dbisDB?.put) return Promise.resolve(false);
 	const raise = validBounds(copied);
-	for (const { origins } of filled)
-		for (const originId of origins) if (!(raise.get(originId)! >= filledFrom)) raise.set(originId, filledFrom);
+	for (const { origins, lossKey } of filled) {
+		const bound = Math.max(lossKey, filledFrom);
+		for (const originId of origins) if (!(raise.get(originId)! >= bound)) raise.set(originId, bound);
+	}
 	return writeCopyBoundRows(dbisDB, peerId, rootStore, {
 		raise: raise.size > 0 ? raise : undefined,
-		release: [['reserved', pass], ...filled.map(({ slot }) => slot)],
+		release: [['reserved', pass], ...filled.filter((hole) => hole.peerId === peerId).map(({ slot }) => slot)],
 	});
 }
 
@@ -6424,7 +6437,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// poison entry is persisted BEFORE the drop completes, and the route hole mark is queued for `[seq, peer]`;
 	// a store that cannot take the poison row holds the frame instead of advancing the cursor over an unrecorded hole.
 	// One closure per connection, not per frame: an ordinary frame never touches it.
-	async function recordReplicationHole(originId: number | undefined, tableName: string, reason: string) {
+	async function recordReplicationHole(
+		originId: number | undefined,
+		tableName: string,
+		reason: string,
+		lossKey = Date.now()
+	) {
 		if (admittedLayout && tables?.[tableName]?.residency) {
 			wsClosed = true;
 			close(1011, 'Sharded record was not applied; recovery cursor held: ' + reason);
@@ -6435,22 +6453,39 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		try {
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
 			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
-			const currentPass = pass === copyPassToken;
-			if (currentPass) passHoles++;
-			if (originId !== undefined && projectionCopy) {
+			passHoles++;
+			if (projectionCopy) {
 				// a projection's end_txn names no route, so its hole is a copy bound no route start passes, durable
-				// before the frame moves on and so before the projection can complete; at any level, so a later
-				// engine that certifies still refuses it, and never for a pass this socket has replaced, which re-copies
-				if (currentPass && copyApplyActive() && !projectionHoles.has(originId)) {
+				// before the frame moves on and so before the projection can complete; at any level, so a later engine
+				// that certifies still refuses it, and for a pass this socket has since replaced too, whose replacement
+				// may resume past the record
+				if (copyApplyActive()) {
 					const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
-					await persistCopyHoles(
+					const store = auditStore ?? databaseAuditStore;
+					// an origin this node cannot name could be any it knows
+					const lost =
+						originId !== undefined
+							? [originId]
+							: [0, ...Object.values(exportIdMapping(store)).filter((id) => typeof id === 'number')];
+					const prior = holesByPass.get(pass);
+					const hole = {
+						revision: (prior?.revision ?? 0) + 1,
+						origins: new Set([...(prior?.origins ?? []), ...lost]),
+						lossKey: Math.max(prior?.lossKey ?? 0, lossKey),
+						slot: undefined as (string | number)[] | undefined,
+					};
+					await persistCopyHole(
 						dbisDB,
-						[originId],
 						ownCopyPeerId(),
-						(auditStore ?? databaseAuditStore)?.rootStore,
-						pass
+						store?.rootStore,
+						pass,
+						hole.revision,
+						hole.origins,
+						hole.lossKey,
+						prior?.slot
 					);
-					projectionHoles.add(originId);
+					hole.slot = [HOLE_ROW, pass, hole.revision, hole.lossKey];
+					holesByPass.set(pass, hole);
 				}
 			} else if (originId !== undefined) {
 				const routeId = routeRowId();
@@ -6952,9 +6987,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let copyWasResumed = false;
 	let copyResumedWithWidening = false;
 	let requestIsCopy = false;
-	/** Origins this projection pass dropped a record of, already raised to `HOLE_COPY_BOUND`. */
-	const projectionHoles = new Set<number>();
-	/** Records this connection dropped since the current copy pass started. */
+	/** Each projection pass's current hole row: its revision, every origin it dropped records of, its highest loss key. */
+	const holesByPass = new Map<
+		string,
+		{ revision: number; origins: Set<number>; lossKey: number; slot?: (string | number)[] }
+	>();
 	let passHoles = 0;
 	/** Highest audit-less copyApply record version applied per origin, bounding floor-only resume. */
 	const maxCopiedVersionByOrigin = new Map<number, number>();
@@ -7102,16 +7139,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				(projectionCopy || passState.fullCoverage !== false)
 					? (passState.holes ?? [])
 					: [];
-			await settleCopyBounds(
-				dbisDB,
-				copiedVersionByOrigin,
-				peerId,
-				store?.rootStore ?? (dbisDB as any)?.rootStore,
-				pass,
-				filled,
-				passState?.startTime ?? 0
-			);
+			const rootStore = store?.rootStore ?? (dbisDB as any)?.rootStore;
+			await settleCopyBounds(dbisDB, copiedVersionByOrigin, peerId, rootStore, pass, filled, passState?.startTime ?? 0);
 			settledPass = pass;
+			// the bounds that keep earlier starts void are committed above, so another peer's row can go now; a release
+			// that fails leaves its hole, which still refuses
+			const elsewhere = new Map<number, (string | number)[][]>();
+			for (const hole of filled)
+				if (hole.peerId !== peerId) elsewhere.set(hole.peerId, [...(elsewhere.get(hole.peerId) ?? []), hole.slot]);
+			for (const [otherPeer, slots] of elsewhere) {
+				try {
+					await writeCopyBoundRows(dbisDB, otherPeer, rootStore, { release: slots });
+				} catch (error) {
+					logger.warn?.(connectionId, 'could not release a filled copy hole for', databaseName, error);
+				}
+			}
 			// what stays committed is re-read, never assumed
 			if (copyPassToken === pass) {
 				committedCopyBounds.clear();
@@ -8105,7 +8147,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (maybeLeakConnectionAfterCopyStartForTest(options.connection, ws, databaseName)) wedgedForTest = true;
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						copyPassToken = `${data}:${randomUUID()}`;
-						projectionHoles.clear();
 						passHoles = 0;
 						const copyMarkOrigins = new Map<number, string | undefined>();
 						// only an engine that can certify a checkpoint has a route history to mark partial; a sharding
@@ -8160,9 +8201,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyModeOrderVersion = message[2];
 						copyOriginAnchors = !projectionCopy && recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
-						if (copyFromNodeId !== undefined && copyApplyActive() && supportsCheckpointFloors()) {
+						if (copyApplyActive() && supportsCheckpointFloors()) {
 							try {
-								currentCopyPass.holes = readCopyHoles(getDatabaseStores().dbisDB, copyFromNodeId);
+								// any complete pass refills an ordinary table, whichever peer's pass dropped the record
+								currentCopyPass.holes = readCopyHoles(getDatabaseStores().dbisDB);
 							} catch {
 								// none to fill: a hole this pass cannot read stays
 							}
@@ -10680,7 +10722,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						!(await recordReplicationHole(
 							remoteShortIdToLocalId.get(auditRecord.nodeId),
 							tableDecoder.name,
-							dropReason
+							dropReason,
+							Math.max(frameTxnLogKey, auditRecord.version || 0)
 						))
 					)
 						return;
@@ -10703,7 +10746,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						!(await recordReplicationHole(
 							remoteShortIdToLocalId.get(auditRecord.nodeId),
 							tableDecoder?.name ?? ANY_TABLE,
-							'local-only record forwarded by the peer'
+							'local-only record forwarded by the peer',
+							Math.max(frameTxnLogKey, auditRecord.version || 0)
 						))
 					)
 						return;
@@ -10972,7 +11016,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						throw error;
 					}
 				}
-				if (!event && !(await recordReplicationHole(localSourceNodeId, tableDecoder.name, 'undecodable record')))
+				if (
+					!event &&
+					!(await recordReplicationHole(
+						localSourceNodeId,
+						tableDecoder.name,
+						'undecodable record',
+						Math.max(frameTxnLogKey, auditRecord.version || 0)
+					))
+				)
 					return;
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
