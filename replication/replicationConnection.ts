@@ -5328,7 +5328,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						txnStream,
 					};
 					attachCopyCursorRemoval(barrierEvent, nodeId, true);
-					if (tableSubscriptionToReplicator.send(barrierEvent) === false) deferCopyCursorRemoval(nodeId);
+					if (tableSubscriptionToReplicator.send(barrierEvent) === false) afterRefusedSend(nodeId);
 				} else {
 					deferCopyCursorRemoval(nodeId);
 				}
@@ -5567,7 +5567,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						true
 					);
 					attachCopyCursorRemoval(finishEvent, copyNodeId);
-					if (tableSubscriptionToReplicator.send(finishEvent) === false) deferCopyCursorRemoval(copyNodeId);
+					if (tableSubscriptionToReplicator.send(finishEvent) === false) afterRefusedSend(copyNodeId);
 				} else {
 					pendingCopyCursorRemovalNodeId = copyNodeId;
 					flushRouteState();
@@ -5581,7 +5581,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							txnStream,
 						};
 						attachCopyCursorRemoval(barrierEvent, copyNodeId, true);
-						if (tableSubscriptionToReplicator.send(barrierEvent) === false) deferCopyCursorRemoval(copyNodeId);
+						if (tableSubscriptionToReplicator.send(barrierEvent) === false) afterRefusedSend(copyNodeId);
 					} else {
 						deferCopyCursorRemoval(copyNodeId);
 					}
@@ -5970,11 +5970,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				pendingCopyCursorRemovalNodeId = undefined;
 				attachCopyCursorRemoval(event, removalNodeId);
 			}
-			// a closed queue takes no event: its marks stay pending, and the cursor removal goes back in line
-			if (tableSubscriptionToReplicator.send(event) === false) {
-				if (removalNodeId !== undefined) deferCopyCursorRemoval(removalNodeId);
-				else scheduleRouteStateFlushRetry();
-			}
+			if (tableSubscriptionToReplicator.send(event) === false) afterRefusedSend(removalNodeId);
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not send the route marks for', databaseName, error);
 		}
@@ -6978,14 +6974,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 				},
 			};
-			// a closed queue calls neither callback: release the latch and retry once the subscription re-resolves
 			if (tableSubscriptionToReplicator.send(barrierEvent) === false) {
 				postSeqWriteBarrierInFlight = false;
-				scheduleRouteStateFlushRetry();
+				afterRefusedSend();
 			}
 		} else {
 			setImmediate(() => void runPostSeqWriteChecks());
 		}
+	}
+	/**
+	 * A closed queue takes an event without calling its onCommit or onFailure, so the event's marks stay pending and
+	 * a cursor removal it carried goes back in line. The cached subscription is not retired, so the replacement the
+	 * database now holds, if any, is taken explicitly.
+	 */
+	function afterRefusedSend(removalNodeId?: number): void {
+		tableSubscriptionToReplicator = subscriptionForDatabase(databaseName, dbSubscriptions);
+		if (removalNodeId !== undefined) deferCopyCursorRemoval(removalNodeId);
+		else scheduleRouteStateFlushRetry();
 	}
 	function scheduleRouteStateVerification(_event?: any): void {
 		enqueuePostSeqWriteBarrier();
@@ -11344,22 +11349,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					undefined,
 					true
 				);
-				if (pendingCopyCursorRemovalNodeId !== undefined) {
-					const removalNodeId = pendingCopyCursorRemovalNodeId;
+				const removalNodeId = pendingCopyCursorRemovalNodeId;
+				if (removalNodeId !== undefined) {
 					pendingCopyCursorRemovalNodeId = undefined;
 					attachCopyCursorRemoval(drainEvent, removalNodeId);
 				}
-				tableSubscriptionToReplicator.send(drainEvent);
+				if (tableSubscriptionToReplicator.send(drainEvent) === false) afterRefusedSend(removalNodeId);
 			}
 			if (routeStateDeferred) {
 				routeStateDeferred = false;
 				const routeEvent = seqUpdateEndTxn(clampedPosition());
-				if (pendingCopyCursorRemovalNodeId !== undefined) {
-					const removalNodeId = pendingCopyCursorRemovalNodeId;
+				const removalNodeId = pendingCopyCursorRemovalNodeId;
+				if (removalNodeId !== undefined) {
 					pendingCopyCursorRemovalNodeId = undefined;
 					attachCopyCursorRemoval(routeEvent, removalNodeId);
 				}
-				tableSubscriptionToReplicator.send(routeEvent);
+				if (tableSubscriptionToReplicator.send(routeEvent) === false) afterRefusedSend(removalNodeId);
 			}
 			if (postSeqWriteCheckDeferred) {
 				enqueuePostSeqWriteBarrier();
