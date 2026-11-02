@@ -73,6 +73,7 @@ import {
 	isDroppedPeerGeneration,
 	catalogCreatedBefore,
 	catalogCreatedTime,
+	catalogExpiration,
 	tableDropEpoch,
 	stampTableCreatedTime,
 	tableLifecycleTime,
@@ -910,6 +911,10 @@ export function heldDropMarkersFor(databaseName: string): readonly TableDropMark
  */
 function advertisedCreatedTime(table: any): number | undefined {
 	return TEST_OMIT_CAPABILITIES ? undefined : (table.createdTime ?? catalogCreatedTime(table));
+}
+/** A peer's table-level expiration or eviction, in seconds: anything but a positive finite number reads as unset. */
+function peerTableSeconds(value: unknown): number | undefined {
+	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 // Only 200-255: every allocated command code is below 200, so a mis-set value cannot make a real node
 // emit a live DISCONNECT or drive its peer into copy mode.
@@ -6201,6 +6206,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										schemaDefined: data.schemaDefined,
 										residency: data.residency,
 										createdTime: data.createdTime,
+										expiration: data.expiration,
+										eviction: data.eviction,
 									},
 									table
 								);
@@ -6693,6 +6700,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											structures: encoder.structures,
 											attributes: table.attributes,
 											schemaDefined: table.schemaDefined,
+											...catalogExpiration(table),
 											...(peerSupportsResidencySlots(peerCapabilities) && table.residency
 												? { residency: table.residency }
 												: {}),
@@ -7359,6 +7367,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											structures,
 											attributes: table.attributes,
 											schemaDefined: table.schemaDefined,
+											...catalogExpiration(table),
 											...(peerSupportsResidencySlots(peerCapabilities) && table.residency
 												? { residency: table.residency }
 												: {}),
@@ -10717,6 +10726,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			definitions.push({
 				table: tableName,
 				schemaDefined: table.schemaDefined,
+				...catalogExpiration(table),
 				...(peerSupportsResidencySlots(peerCapabilities) && table.residency ? { residency: table.residency } : {}),
 				attributes: table.attributes.map((attr) => ({
 					name: attr.name,
@@ -11122,6 +11132,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				residency: tableDefinition.residency ?? existingTable.residency,
 				origin: 'cluster',
 				createdTime: typeof tableDefinition.createdTime === 'number' ? tableDefinition.createdTime : undefined,
+				// like the stamp, these only take effect on a create
+				expiration: peerTableSeconds(tableDefinition.expiration),
+				eviction: peerTableSeconds(tableDefinition.eviction),
 			});
 		}
 		return existingTable;
