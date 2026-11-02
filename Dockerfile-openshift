@@ -16,7 +16,7 @@
 # NODE_VERSION must match an available `ubi10/nodejs-<v>-minimal` tag (UBI10
 # offers 22 and 24; 24 is newest). Keep NODE_BUILD_VERSION in step to avoid
 # native-addon ABI mismatches.
-ARG NODE_BUILD_VERSION=24
+ARG NODE_BUILD_VERSION=26
 ARG NODE_VERSION=24
 
 ############################
