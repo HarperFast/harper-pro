@@ -1109,9 +1109,9 @@ export function heldDropMarkersFor(databaseName: string): readonly TableDropMark
 function advertisedCreatedTime(table: any): number | undefined {
 	return TEST_OMIT_CAPABILITIES ? undefined : (table.createdTime ?? catalogCreatedTime(table));
 }
-/** A peer's table-level expiration or eviction, in seconds: anything but a positive finite number reads as unset. */
+/** A peer's table-level expiration or eviction, in seconds: unset unless positive and safe as milliseconds. */
 function peerTableSeconds(value: unknown): number | undefined {
-	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+	return typeof value === 'number' && value > 0 && value * 1000 <= Number.MAX_SAFE_INTEGER ? value : undefined;
 }
 // Only 200-255: every allocated command code is below 200, so a mis-set value cannot make a real node
 // emit a live DISCONNECT or drive its peer into copy mode.
