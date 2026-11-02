@@ -9,8 +9,8 @@
  *
  * - Overrun onto the next boundary: the reader yields r39 with r40's whole frame inside it, and
  *   framing resumes cleanly at r41. B drops r39 as undecodable, logs the drop and the replication
- *   hole without a close/resume, and receives every entry behind it. r40 is gone at the source, not
- *   dropped by B, and nothing reports it.
+ *   hole without a close/resume, and receives every entry behind it. r40 is not dropped by B: it is
+ *   gone from A's log, and nothing reports it.
  * - Overrun into the neighbour (the issue's construction): the same undecodable r39, but the reader
  *   lands mid-way through r40, so a mid-log break follows the torn entry. B drops r39 without a
  *   close/resume; A's fail-stop then holds back everything behind the break and reports it.
@@ -52,8 +52,8 @@ import {
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
-// The receiver's close/resume paths for an unsharded record: a message that fails to apply, and a
-// replication hole it cannot record.
+// The close/resume paths a torn entry B drops can take: the decode error re-thrown out of the message
+// handler (the pre-#545 loop the issue saw), and a replication hole B cannot record.
 const CLOSE_RESUME = /Error handling incoming replication message|could not record a replication hole/g;
 const CLOSED_ON_TORN_ENTRY = 'B closed its inbound stream to resume from its cursor';
 const QUARANTINED = `${QUARANTINE_SETTLE_MS}ms after A acknowledged a write behind the break`;
@@ -204,7 +204,6 @@ function setDeclaredLength(buffer, frame, length) {
 	new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(frame.position + 8, length);
 }
 
-// `resumesAt` is checked against A's break report rather than here.
 function assertBreaksAfter(buffer, target, index, declared, resumesAt) {
 	const walked = readFrames(buffer);
 	const breakAt = target.position + ENTRY_HEADER_SIZE + declared;
