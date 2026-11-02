@@ -171,6 +171,7 @@ suite('add_node keeps the sender table-level expiration (harper-pro#1179)', { ti
 			(signal) => readableCount(ctx.B, 'TtlCache', [...ids, 'local'], signal).then((count) => count === 0),
 			{ timeoutMs: (TTL_S + 40) * 1000, pollMs: 2000, description: 'rows on B to expire' }
 		);
+		// the reads above evict lazily; an unprompted scan on a thread that loaded the table runs daily (harper#2831)
 		let stored;
 		await waitForCondition(
 			async (signal) => {
