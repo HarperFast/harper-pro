@@ -2878,6 +2878,10 @@ describe('Declarative tables keep control and event traffic independent of place
 					const holeWarnings = warnings.filter((warning) => warning.includes('checkpoint admission is void'));
 					assert.equal(holeWarnings.length, 1, holeWarnings.join('\n'));
 					assert.match(holeWarnings[0], new RegExp(`${database}.*Plain.*void for slot-control-peer `));
+					assert.match(
+						holeWarnings[0],
+						/replacing this node fills it \(drain .* add_node an empty node under a new name\), but a multi-shard database admits no checkpoint across shards yet/
+					);
 					assert.deepEqual(residencyStatus()[database].checkpointHoles, [
 						{
 							source: 'slot-control-peer',

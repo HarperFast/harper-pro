@@ -801,11 +801,9 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(await persistMergedCopyBounds(dbisDB, new Map([[1, T + 500]]), 3, rootStore), true);
 		assert.strictEqual(epochWord(), 2, 'each committed advance bumps the origin-state epoch');
 		assert.strictEqual(dbisDB.getSync([Symbol.for('seq'), 2]), seqRow2, 'no route row is written');
-		// never lowered, and an unchanged bound writes nothing, though it still publishes the epoch for a writer that
-		// committed and stopped before doing so
+		// an unchanged bound still publishes the epoch, for a writer that committed and stopped before publishing
 		assert.strictEqual(await persistMergedCopyBounds(dbisDB, new Map([[2, T + 700]]), 1, rootStore), false);
 		assert.strictEqual(epochWord(), 3);
-		// two writers of one peer's row serialize on its lock, so neither loses the other's bound
 		await Promise.all([
 			persistMergedCopyBounds(dbisDB, new Map([[2, T + 900]]), 1, rootStore),
 			persistMergedCopyBounds(dbisDB, new Map([[3, T + 850]]), 1, rootStore),

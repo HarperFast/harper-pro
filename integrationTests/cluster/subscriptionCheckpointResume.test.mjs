@@ -58,7 +58,6 @@ async function restartNode(node) {
 async function startNewNode(suiteName, testEnv) {
 	const nodeCtx = { name: suiteName, harper: { hostname: await getNextAvailableLoopbackAddress(), testEnv } };
 	await startHarper(nodeCtx, nodeOptions(nodeCtx.harper, testEnv));
-	// the fixture's schema defines and exports the table, so it is an MQTT topic from the first boot
 	return Object.assign(nodeCtx.harper, { testEnv, name: nodeCtx.name });
 }
 

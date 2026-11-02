@@ -117,11 +117,7 @@ export class ClosedFloors extends Resource {
 	}
 }
 
-/**
- * POST /SetRouteCoverage with `{ table: '<table name>', peer: '<remote node name>', fullCoverage?: boolean, clearSeq?: boolean }`
- * mutates `[Symbol.for('seq'), peerId]`, `[Symbol.for('copyCursor'), peerId]`, and `[Symbol.for('copyBound'), *]`
- * on `data`'s `dbisDB` so integration tests can exercise partial-to-full coverage widening and base-copy recovery.
- */
+/** Rewrites `data`'s route, copy-cursor and copy-bound rows so a test can widen a route's coverage or force a base-copy recovery. */
 export class SetRouteCoverage extends Resource {
 	static loadAsInstance = false;
 

@@ -3130,12 +3130,15 @@ export function checkpointGradeRow(node: any): boolean {
 	);
 }
 
-/**
- * Route state core merges into the seq row (`originRouteStates`): `[id, certifiedFrom, partialHistory, hole,
- * generation?, fullCoverage?]`, where the generation names the origin generation the mark was derived under; a
- * revocation is `[id, generation]`. Core ignores a mark whose generation is no longer the row's.
- */
-type OriginRouteState = [number, number | undefined, boolean | undefined, boolean | undefined, string?, boolean?];
+/** Route state core merges into the seq row (`originRouteStates`); core ignores a mark whose generation is no longer the row's. */
+type OriginRouteState = [
+	id: number,
+	certifiedFrom: number | undefined,
+	partialHistory: boolean | undefined,
+	hole: boolean | undefined,
+	generation?: string,
+	fullCoverage?: boolean,
+];
 type PendingRouteMarkEntry = {
 	mark: OriginRouteState;
 	clearCertifiedFirst: boolean;
@@ -3143,7 +3146,7 @@ type PendingRouteMarkEntry = {
 	clearVersion: number;
 };
 type PendingRouteRevocationEntry = {
-	revocation: [number, string?];
+	revocation: [id: number, generation?: string];
 	version: number;
 };
 type SettledRouteStateVersions = {
@@ -6507,7 +6510,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (hole.origins.size > (prior?.origins.size ?? 0))
 						logger.warn?.(
 							connectionId,
-							`Sharding projection of ${databaseName} from ${remoteNodeName} dropped a record of ${tableName} (${reason}); checkpoint admission is void for ${copyHoleOriginNames(store, hole.origins).join(', ')} until a later pass from the beginning over every table, from any peer, drops nothing (cluster_status sharding.${databaseName}.checkpointHoles)`
+							`Sharding projection of ${databaseName} from ${remoteNodeName} dropped a record of ${tableName} (${reason}); checkpoint admission is void for ${copyHoleOriginNames(store, hole.origins).join(', ')} (cluster_status sharding.${databaseName}.checkpointHoles). Rebuilding or replacing this node fills it (drain its unreplicated writes, remove_node it on its peers, add_node an empty node under a new name), but a multi-shard database admits no checkpoint across shards yet (tracked separately), so that restores no admission today`
 						);
 				}
 			} else {
@@ -7020,7 +7023,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let copyWasResumed = false;
 	let copyResumedWithWidening = false;
 	let requestIsCopy = false;
-	/** Each projection pass's current hole row: its revision, every origin it dropped records of, its highest loss key. */
 	const holesByPass = new Map<
 		string,
 		{ revision: number; origins: Set<number>; lossKey: number; slot?: (string | number)[] }
@@ -7187,7 +7189,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					logger.warn?.(connectionId, 'could not release a filled copy hole for', databaseName, error);
 				}
 			}
-			// what stays committed is re-read, never assumed
 			if (copyPassToken === pass) {
 				committedCopyBounds.clear();
 				lastCopyBoundLoadEpoch = -1;
