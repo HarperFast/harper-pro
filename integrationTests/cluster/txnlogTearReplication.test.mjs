@@ -30,12 +30,12 @@ import {
 	CONVERGE_TIMEOUT_MS,
 	ENTRY_HEADER_SIZE,
 	FRAMES_AFTER_TEAR,
+	QUARANTINE_SETTLE_MS,
 	REPORT_TIMEOUT_MS,
 	TOTAL,
 	assertExactRows,
 	assertNeverCopied,
 	breakDiagnostic,
-	engine,
 	insertRows,
 	localLogPath,
 	locateTearTarget,
@@ -53,19 +53,8 @@ import {
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
-// Window in which a write behind the break may (wrongly) reach B before B is read: long enough to
-// span a replication reconnect cycle, since a reconnect restarts the drain from B's cursor.
-const QUARANTINE_SETTLE_MS = 10_000;
-
 suite('Mid-log txnlog tear: replication stops at the break and reports it', { timeout: 300_000 }, (ctx) => {
-	before(async () => {
-		ok(
-			typeof engine.CorruptFrameError === 'function',
-			'the engine must report where framing resumes (rocksdb-js >= 2.8.0 exports CorruptFrameError); ' +
-				'that diagnostic is part of the contract asserted here, so an older engine is a failure, not a skip'
-		);
-		await startTearPair(ctx);
-	});
+	before(() => startTearPair(ctx));
 
 	after(() => stopTearPair(ctx));
 

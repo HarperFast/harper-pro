@@ -25,10 +25,8 @@ import { readLog, sendOperation, stopNodeProcess, waitForCondition } from './clu
 
 export const engine = await import('@harperfast/rocksdb-js');
 // An entry header is a big-endian float64 timestamp, a uint32 payload length, and a flag byte.
-export const {
-	TRANSACTION_LOG_FILE_HEADER_SIZE: FILE_HEADER_SIZE,
-	TRANSACTION_LOG_ENTRY_HEADER_SIZE: ENTRY_HEADER_SIZE,
-} = engine.constants;
+const { TRANSACTION_LOG_FILE_HEADER_SIZE: FILE_HEADER_SIZE } = engine.constants;
+export const { TRANSACTION_LOG_ENTRY_HEADER_SIZE: ENTRY_HEADER_SIZE } = engine.constants;
 const LOG_FILE_MAGIC = 'WOOF';
 const LOG_ID = 1;
 
@@ -36,7 +34,7 @@ export const DATABASE = 'data';
 export const TABLE = 'torn';
 const SEED_TABLE = 'seed';
 const SEED_ID = 'seed';
-export const BATCH_ONE = 10;
+const BATCH_ONE = 10;
 const BATCH_TWO = 50;
 export const TOTAL = BATCH_ONE + BATCH_TWO;
 
@@ -49,8 +47,16 @@ export const REPORT_TIMEOUT_MS = 30_000;
 // Every direct operation is bounded, so a node that accepts the socket and never answers fails the
 // step it belongs to instead of hanging the file until the suite timeout.
 export const OPERATION_TIMEOUT_MS = 30_000;
+// Window in which a write behind a break may (wrongly) reach B before B is read: long enough to
+// span a replication reconnect cycle, since a reconnect restarts the drain from B's cursor.
+export const QUARANTINE_SETTLE_MS = 10_000;
 
 export async function startTearPair(ctx) {
+	ok(
+		typeof engine.CorruptFrameError === 'function',
+		'the engine must report where framing resumes (rocksdb-js >= 2.8.0 exports CorruptFrameError); ' +
+			'that diagnostic is part of the contract asserted here, so an older engine is a failure, not a skip'
+	);
 	const startNode = async () => {
 		const hostname = await getNextAvailableLoopbackAddress();
 		const nodeCtx = { name: ctx.name, harper: { hostname } };
@@ -187,7 +193,7 @@ export function breakDiagnostic(position, resumesAt) {
 	);
 }
 
-/** Walks frames from the file header with the reader's own framing rules, stopping at the first break. */
+// Applies the reader's framing checks, so the tear builders can predict where the reader breaks.
 export function readFrames(buffer) {
 	const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 	const frames = [];
@@ -254,7 +260,6 @@ export function localLogPath(dataRootDir) {
 	return join(dataRootDir, 'database', DATABASE, 'transaction_logs', 'local', `${LOG_ID}.txnlog`);
 }
 
-/** Both incarnations' hdb.log, deduplicated, as one string. */
 export async function readLogs(nodes) {
 	return [...new Set(await Promise.all(nodes.map((node) => readLog(node))))].join('\n');
 }
