@@ -47,6 +47,7 @@ import {
 	PING_TIMEOUT,
 	cursorBelowFloor,
 	HOLE_COPY_BOUND,
+	persistCopyHoles,
 } from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
@@ -2858,10 +2859,73 @@ describe('Declarative tables keep control and event traffic independent of place
 					assert.equal(boundsAtCompletion?.get(peerId), HOLE_COPY_BOUND, 'the hole is durable before completion');
 					// what a restart reads: the store, not this connection's memory
 					assert.equal(readCopyBounds(Records.dbisDB).get(peerId), HOLE_COPY_BOUND);
+					assert.equal(Records.dbisDB.getSync([Symbol.for('copyBound'), peerId, 'hole'])?.[peerId], HOLE_COPY_BOUND);
 					assert.equal(Plain.primaryStore.getEntry('dropped'), undefined);
 				} finally {
 					Records.dbisDB.put = put;
 					env.setProperty('replication_shards', [0]);
 				}
+			}));
+
+	for (const drops of [false, true])
+		it(`releases a peer's hole row only after a complete copy from it that drops nothing (drops=${drops})`, () =>
+			atCheckpointLevel(async () => {
+				const peer = 'slot-control-peer';
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+				connection.exclusionOrigins = [peer];
+				const { Records, socket } = await connect(
+					false,
+					`copy_hole_release_${drops}`,
+					true,
+					checkpointCapabilities(),
+					undefined,
+					connection
+				);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				const holeRow = () => Records.dbisDB.getSync([Symbol.for('copyBound'), peerId, 'hole']);
+				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				// an earlier projection from this peer dropped a record of its origin
+				await persistCopyHoles(Records.dbisDB, [peerId], peerId, Records.auditStore.rootStore);
+				assert.equal(holeRow()?.[peerId], HOLE_COPY_BOUND);
+				const anchor = Date.now() + 100;
+				const encoder = Records.primaryStore.encoder;
+				socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+				socket.emit(
+					'message',
+					encode([
+						132,
+						{
+							structures: encoder.structures,
+							typedStructs: encoder.typedStructs,
+							attributes: Records.attributes,
+							schemaDefined: true,
+						},
+						Records.tableId,
+						Records.tableName,
+					])
+				);
+				socket.emit('message', encode([148, anchor, 1]));
+				if (drops)
+					socket.emit(
+						'message',
+						recordFrame(Records, 'put', 'dropped', { id: 'dropped' }, anchor - 1, undefined, {
+							extendedType: LOCAL_ONLY,
+						})
+					);
+				const copyCursorKey = [Symbol.for('copyCursor'), peerId];
+				await Records.dbisDB.put(copyCursorKey, {
+					copyStartTime: anchor,
+					currentTable: Records.tableName,
+					afterKey: 'x',
+				});
+				socket.emit('message', encode([143, anchor + 1]));
+				await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId === anchor + 1 || socket.closes.length);
+				socket.emit('message', encode([149]));
+				await until(() => Records.dbisDB.getSync(copyCursorKey) === undefined || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				if (drops) assert.equal(holeRow()?.[peerId], HOLE_COPY_BOUND, 'a pass that drops a record fills no hole');
+				else assert.equal(holeRow(), undefined, 'a complete pass that dropped nothing fills the hole');
 			}));
 });

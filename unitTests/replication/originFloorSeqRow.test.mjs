@@ -19,7 +19,7 @@ import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { membersDigest } from '#src/core/resources/subscriptionCheckpoint';
 import { setOriginCaptureIntervalForTests } from '#src/core/resources/transactionBroadcast';
 import { getThisNodeName } from '#src/core/server/nodeName';
-import { persistMergedCopyBounds } from '#src/replication/replicationConnection';
+import { persistMergedCopyBounds, persistCopyHoles, settleCopyBounds } from '#src/replication/replicationConnection';
 import { PrimaryRocksDatabase } from '#src/core/resources/PrimaryRocksDatabase';
 import { OpenDBIObject } from '#src/core/utility/lmdb/OpenDBIObject';
 import { setMainIsWorker } from '#js/core/server/threads/manageThreads';
@@ -324,5 +324,76 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 			'the stale certification is refused'
 		);
 		subscription.end();
+	});
+
+	it('refuses an origin a copy dropped a record of until a later complete pass from the same peer settles', async function () {
+		this.timeout(30_000);
+		const T = table({
+			table: 'CopyHoleAdmission',
+			database: 'copy_hole_admission',
+			audit: true,
+			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'value' }],
+		});
+		const route = getIdOfRemoteNode('route-r', T.auditStore);
+		const origin = getIdOfRemoteNode('origin-x', T.auditStore);
+		const copier = getIdOfRemoteNode('copier-q', T.auditStore);
+		const listener = (event) => listener.values.push(event?.value?.value);
+		listener.values = [];
+		const subscription = await T.subscribe({ omitCurrent: true, reportProgress: true, listener });
+		let releaseSource;
+		const held = new Promise((resolve) => (releaseSource = resolve));
+		try {
+			await T.put('a', { value: 'a' });
+			await waitFor(() => listener.values.includes('a'), 'the live write');
+			await new Promise((resolve) => setTimeout(resolve, 2));
+			const floor = certify(T);
+			const certificate = {
+				type: 'end_txn',
+				localTime: floor,
+				remoteNodeIds: [route],
+				txnStream: {},
+				onFailure: () => false,
+				originRouteStates: [[origin, floor - 1000, undefined, undefined, 'origin-generation']],
+			};
+			certificate.onCommit = () => {
+				certificate.originFloors = [[origin, floor, true, 'origin-generation', true]];
+			};
+			T.sourcedFrom(
+				{
+					subscribeOnThisThread: () => true,
+					async *subscribe() {
+						yield certificate;
+						await held;
+					},
+				},
+				{ intermediateSource: true }
+			);
+			const members = membersDigest([
+				[getThisNodeName(), getDatabaseGeneration(T.auditStore).id],
+				['origin-x', 'origin-generation'],
+			]);
+			let token;
+			await waitFor(() => (token = subscription.checkpoint())?.members === members, "a checkpoint naming R's origin");
+			const admitted = await T.subscribe({ resume: token, omitCurrent: true, listener: () => {} });
+			assert.strictEqual(await admitted.resumeVerified, true, 'admitted before the drop');
+			admitted.end();
+
+			// a projection from Q dropped a record of the origin: what any later process reads from the store
+			await persistCopyHoles(T.dbisDB, [origin], copier, T.primaryStore.rootStore);
+			await assert.rejects(
+				T.subscribe({ resume: token, omitCurrent: true }),
+				(error) => error.statusCode === 410,
+				'no route certifies an origin missing a record'
+			);
+
+			// a later pass from Q copies everything again and drops nothing
+			await settleCopyBounds(T.dbisDB, new Map(), copier, T.primaryStore.rootStore, 'later-pass', true);
+			const readmitted = await T.subscribe({ resume: token, omitCurrent: true, listener: () => {} });
+			assert.strictEqual(await readmitted.resumeVerified, true, 'admitted again once the hole is filled');
+			readmitted.end();
+		} finally {
+			releaseSource();
+			subscription.end();
+		}
 	});
 });
