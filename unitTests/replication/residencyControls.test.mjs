@@ -12,13 +12,14 @@ import { decode, encode } from 'msgpackr';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { server } from '#src/core/server/Server';
 import { DatabaseTransaction } from '#src/core/resources/DatabaseTransaction';
-const { Transaction: NativeTransaction } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
+const { Transaction: NativeTransaction, RocksDatabase } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
 import { transaction } from '#src/core/resources/transaction';
 import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { INVALIDATED, FULL_WRITE_HEAD } from '#src/core/resources/Table';
 import { table, isDroppedPeerGeneration } from '#src/core/resources/databases';
-import { createAuditEntry, readAuditEntry, Decoder, HAS_BLOBS } from '#src/core/resources/auditStore';
+import { createAuditEntry, readAuditEntry, Decoder, HAS_BLOBS, LOCAL_ONLY } from '#src/core/resources/auditStore';
+import { readCopyBounds } from '#src/core/resources/subscriptionCheckpoint';
 import {
 	createBlob,
 	getFileId,
@@ -44,10 +45,15 @@ import {
 	encodeCopyRecordValue,
 	replicateOverWS,
 	PING_TIMEOUT,
+	cursorBelowFloor,
+	HOLE_COPY_BOUND,
+	persistCopyHole,
+	readCopyHoles,
+	copyHoleStatus,
 } from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
-import { residencyTopologyErrors, registerResidencySender } from '#src/replication/residencyTopology';
+import { residencyTopologyErrors, registerResidencySender, residencyStatus } from '#src/replication/residencyTopology';
 import { FrameWriter } from '#src/replication/frameWriter';
 import { advanceShardingHistory } from '#src/replication/shardingBootstrapState';
 import {
@@ -133,14 +139,20 @@ function recordFrame(Table, type, recordId, value, version, residencyId, overrid
 }
 
 describe('Declarative tables keep control and event traffic independent of placement', function () {
-	let priorExperimental, priorMarkers;
+	let priorExperimental, priorMarkers, priorSyncWal;
 	before(() => {
+		// These tests count the end_txn events of sharding traffic; an engine that syncs its WAL also sends the
+		// route-state updates of checkpoint certification, which originFloors.test.mjs covers.
+		priorSyncWal = Object.getOwnPropertyDescriptor(RocksDatabase.prototype, 'syncWal');
+		Object.defineProperty(RocksDatabase.prototype, 'syncWal', { value: undefined, configurable: true, writable: true });
 		priorExperimental = env.get('replication_experimentalAttributeSlots');
 		priorMarkers = env.get('storage_rocks_transactionLogAbortMarkers');
 		env.setProperty('replication_experimentalAttributeSlots', true);
 		env.setProperty('storage_rocks_transactionLogAbortMarkers', true);
 	});
 	after(() => {
+		if (priorSyncWal) Object.defineProperty(RocksDatabase.prototype, 'syncWal', priorSyncWal);
+		else delete RocksDatabase.prototype.syncWal;
 		env.setProperty('replication_experimentalAttributeSlots', priorExperimental);
 		env.setProperty('storage_rocks_transactionLogAbortMarkers', priorMarkers);
 	});
@@ -179,7 +191,8 @@ describe('Declarative tables keep control and event traffic independent of place
 		beforeConnect,
 		connection,
 		ranges = [{ start: 0, end: 2, shard: 0 }],
-		keyHash = false
+		keyHash = false,
+		handshake = () => ({})
 	) {
 		if (byAttribute && typeof NativeTransaction.prototype.usesAbortMarkers !== 'function') testContext.skip();
 		const database = `slot_control_${direction}_${byAttribute}`;
@@ -221,7 +234,7 @@ describe('Declarative tables keep control and event traffic independent of place
 				database,
 				[],
 				capabilities,
-				{ shardsDigest: getResidencyConfiguration().digest },
+				{ shardsDigest: getResidencyConfiguration().digest, ...handshake(database) },
 			])
 		);
 		await until(() => socket.sent.some((frame) => frame[0] === 140) || socket.closes.length);
@@ -2522,4 +2535,507 @@ describe('Declarative tables keep control and event traffic independent of place
 			else await Nodes.primaryStore.remove(peer);
 		}
 	});
+
+	// The engine syncs its WAL, so this node certifies checkpoint floors at level 2 (the describe hides `syncWal`).
+	async function atCheckpointLevel(run) {
+		Object.defineProperty(RocksDatabase.prototype, 'syncWal', {
+			value: priorSyncWal?.value ?? (() => Promise.resolve()),
+			configurable: true,
+			writable: true,
+		});
+		try {
+			return await run();
+		} finally {
+			Object.defineProperty(RocksDatabase.prototype, 'syncWal', {
+				value: undefined,
+				configurable: true,
+				writable: true,
+			});
+		}
+	}
+	const checkpointCapabilities = () => buildLocalCapabilities(90_000, true, true, true);
+	const SEQ = Symbol.for('seq');
+
+	for (const [sharded, failover] of [
+		[false, false],
+		[false, true],
+		[true, false],
+		[true, true],
+	])
+		it(`settles a level-2 copy's route marks on the row core writes for the route (sharded=${sharded}, failover=${failover})`, () =>
+			atCheckpointLevel(async () => {
+				const peer = 'slot-control-peer';
+				// a failover subscription reaches another node's data through this socket's peer
+				const routeNode = failover ? 'route-failover-origin' : peer;
+				const Nodes = getHDBNodeTable();
+				const previous = Nodes.primaryStore.getSync(peer);
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: routeNode, replicateByDefault: true }];
+				connection.exclusionOrigins = [routeNode];
+				let socketPeerRow, peerId;
+				const { Records, socket, database } = await connect(
+					false,
+					`level2_route_row_${sharded}_${failover}`,
+					!sharded,
+					checkpointCapabilities(),
+					async (_database, Records) => {
+						if (sharded) await Nodes.primaryStore.put(peer, { name: peer, shard: 0, replicates: true });
+						// the socket peer's own row names its origin under a generation: a route that does not own it must not mark it
+						peerId = getIdOfRemoteNode(peer, Records.auditStore);
+						socketPeerRow = {
+							seqId: 1,
+							nodes: [
+								{
+									id: peerId,
+									closedFloor: Date.now() - 60_000,
+									relayable: true,
+									originGeneration: 'socket-peer-generation',
+									fullCoverage: true,
+									partialHistory: false,
+								},
+							],
+						};
+						await Records.dbisDB.put([SEQ, peerId], socketPeerRow);
+					},
+					connection,
+					undefined,
+					false,
+					(database) => (sharded ? { shard: 0, shardingCertificate: shardingSourceAgreement(database) } : {})
+				);
+				const subscription = databaseSubscriptions.get(database);
+				const send = subscription.send;
+				let routeUpdates = 0;
+				try {
+					await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+					assert.deepEqual(socket.closes, []);
+					const routeId = getIdOfRemoteNode(routeNode, Records.auditStore);
+					subscription.send = function (event) {
+						// a verification that can never pass re-flushes forever and starves this thread's timers
+						if (event.type === 'end_txn' && event.originRouteStates?.length && ++routeUpdates > 200) return;
+						return send.call(this, event);
+					};
+					const anchor = Date.now() + 100;
+					socket.emit('message', encode([148, anchor, 1]));
+					const routeRow = () => Records.dbisDB.getSync([SEQ, routeId]);
+					await until(
+						() =>
+							routeRow()?.nodes?.some((node) => node.id === routeId && node.partialHistory === true) ||
+							socket.closes.length
+					);
+					assert.deepEqual(socket.closes, []);
+					const settled = routeUpdates;
+					await new Promise((resolve) => setTimeout(resolve, 500));
+					assert.ok(routeUpdates - settled <= 1, `route marks keep re-flushing (${routeUpdates - settled} more)`);
+					// finishing restores the route on its row, and only then drops the copy cursor (keyed by the copy's source)
+					const copyCursorKey = [Symbol.for('copyCursor'), peerId];
+					await Records.dbisDB.put(copyCursorKey, {
+						copyStartTime: anchor,
+						currentTable: Records.tableName,
+						afterKey: 'copied',
+					});
+					socket.emit('message', encode([143, anchor + 1]));
+					await until(() => routeRow()?.seqId === anchor + 1 || socket.closes.length);
+					socket.emit('message', encode([149]));
+					await until(
+						() =>
+							(routeRow()?.nodes?.some((node) => node.id === routeId && node.partialHistory === false) &&
+								Records.dbisDB.getSync(copyCursorKey) === undefined) ||
+							socket.closes.length
+					);
+					assert.deepEqual(socket.closes, []);
+					if (failover)
+						assert.deepEqual(
+							Records.dbisDB.getSync([SEQ, peerId]),
+							socketPeerRow,
+							'the socket peer’s row belongs to another route'
+						);
+				} finally {
+					subscription.send = send;
+					if (sharded) {
+						if (previous) await Nodes.primaryStore.put(peer, previous);
+						else await Nodes.primaryStore.remove(peer);
+					}
+				}
+			}));
+
+	it('delivers route marks a closed queue refused through a replacement that becomes ready later', () =>
+		atCheckpointLevel(async () => {
+			const peer = 'slot-control-peer';
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+			const { Records, socket, database } = await connect(
+				false,
+				'refused_route_marks',
+				true,
+				checkpointCapabilities(),
+				undefined,
+				connection
+			);
+			const subscription = databaseSubscriptions.get(database);
+			const send = subscription.send;
+			let resolvePlaceholder;
+			const placeholder = new Promise((resolve) => (resolvePlaceholder = resolve));
+			let refused = 0;
+			subscription.send = function (event) {
+				if (event.type === 'end_txn' && event.originRouteStates?.length && refused++ === 0) {
+					// the queue closed and the database now holds a placeholder for its replacement
+					databaseSubscriptions.set(database, placeholder);
+					setTimeout(() => {
+						databaseSubscriptions.set(database, subscription);
+						resolvePlaceholder(subscription);
+					}, 300);
+					return false;
+				}
+				return send.call(this, event);
+			};
+			try {
+				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				socket.emit('message', encode([148, Date.now() + 100, 1]));
+				await until(
+					() =>
+						Records.dbisDB
+							.getSync([SEQ, peerId])
+							?.nodes?.some((node) => node.id === peerId && node.partialHistory === true) || socket.closes.length
+				);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(refused > 1, true, 'the marks were sent again after the refusal');
+			} finally {
+				subscription.send = send;
+				databaseSubscriptions.set(database, subscription);
+			}
+		}));
+
+	it('certifies a floor-only start only from a socket’s first subscription request', () =>
+		atCheckpointLevel(async () => {
+			const peer = 'slot-control-peer';
+			const announce = (target, database) =>
+				target.emit(
+					'message',
+					encode([
+						140,
+						peer,
+						database,
+						[],
+						checkpointCapabilities(),
+						{ shardsDigest: getResidencyConfiguration().digest },
+					])
+				);
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+			connection.exclusionOrigins = [peer];
+			const { Records, socket, database } = await connect(
+				false,
+				'certify_first_request',
+				true,
+				checkpointCapabilities(),
+				undefined,
+				connection
+			);
+			const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+			const peerNode = () => Records.dbisDB.getSync([SEQ, peerId])?.nodes?.find((node) => node.id === peerId);
+			const subscription = databaseSubscriptions.get(database);
+			const send = subscription.send;
+			const certifiedMarks = [];
+			subscription.send = function (event) {
+				for (const state of (event.type === 'end_txn' && event.originRouteStates) || [])
+					if (typeof state[1] === 'number') certifiedMarks.push(state);
+				return send.call(this, event);
+			};
+			try {
+				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				// the first request had no floor to start below; a level-2 certificate then makes the row checkpoint-grade
+				const floor = Date.now() - 1000;
+				socket.emit('message', encode([143, floor + 500, { [peer]: [floor, 'peer-generation', true] }]));
+				await until(() => peerNode()?.closedFloor === floor || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(peerNode().originGeneration, 'peer-generation');
+				assert.equal(peerNode().certifiedFrom, undefined);
+
+				// a replacement on the same socket: the sender may still be streaming the old subscription
+				const relay = 'relay-origin';
+				connection.exclusionOrigins = [peer, relay];
+				connection.emit('subscriptions-updated');
+				await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(
+					socket.sent.findLast((frame) => frame[0] === 129)[1][0].startTime,
+					cursorBelowFloor(floor),
+					'the replacement still resumes below the floor'
+				);
+				socket.emit('message', encode([143, floor + 600]));
+				await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId === floor + 600 || socket.closes.length);
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				assert.deepEqual(certifiedMarks, [], 'a same-socket replacement certifies no start');
+				assert.equal(peerNode().certifiedFrom, undefined);
+
+				// including a relayed origin on the same socket is a replacement too, even once its certificate arrives
+				const relayId = getIdOfRemoteNode(relay, Records.auditStore);
+				const relayFloor = floor - 200;
+				const row = Records.dbisDB.getSync([SEQ, peerId]);
+				// what core's updater would hold for a relayed origin this route certified before excluding it
+				await Records.dbisDB.put([SEQ, peerId], {
+					...row,
+					nodes: [
+						...row.nodes,
+						{
+							id: relayId,
+							closedFloor: relayFloor,
+							relayable: true,
+							originGeneration: 'relay-generation',
+							fullCoverage: true,
+							partialHistory: false,
+						},
+					],
+				});
+				connection.exclusionOrigins = [peer];
+				connection.emit('exclusion-origins-updated', [peer]);
+				await until(
+					() =>
+						socket.sent.some((frame) => frame[0] === 147 && frame[1]?.includeNodes?.includes(relay)) ||
+						socket.closes.length
+				);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(
+					socket.sent.find((frame) => frame[0] === 147 && frame[1]?.includeNodes)[1].originCursors?.[relay],
+					cursorBelowFloor(relayFloor),
+					'the included origin still resumes below its floor'
+				);
+				socket.emit('message', encode([143, floor + 700, { [relay]: [relayFloor + 100, 'relay-generation', true] }]));
+				await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId === floor + 700 || socket.closes.length);
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				assert.deepEqual(certifiedMarks, [], 'an include update certifies no start');
+
+				// a fresh socket has no older subscription whose certificates could outrun its replay
+				socket.close();
+				const retry = new Socket();
+				sockets.push(retry);
+				const reconnection = new EventEmitter();
+				reconnection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+				reconnection.exclusionOrigins = [peer];
+				reconnection.socket = retry;
+				replicateOverWS(retry, { connection: reconnection }, { name: peer, replicates: true });
+				announce(retry, database);
+				await until(() => retry.sent.some((frame) => frame[0] === 129) || retry.closes.length);
+				assert.deepEqual(retry.closes, []);
+				assert.equal(retry.sent.find((frame) => frame[0] === 129)[1][0].startTime, cursorBelowFloor(floor));
+				await until(() => peerNode()?.certifiedFrom === cursorBelowFloor(floor));
+			} finally {
+				subscription.send = send;
+			}
+		}));
+
+	for (const [drop, certifies] of [
+		['local-only', true],
+		['undecodable', true],
+		['local-only', false],
+	])
+		it(`persists a projection's dropped record as a hole checkpoint admission reads, before completion (${drop}, syncWal=${certifies})`, () =>
+			// an engine that cannot certify yet still records it, so the same node refuses the origin once it can
+			(certifies ? atCheckpointLevel : (run) => run())(async () => {
+				env.setProperty('replication_shards', [0, 1]);
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: 'slot-control-peer', replicateByDefault: true }];
+				let Plain;
+				const { Records, socket, database } = await connect(
+					false,
+					'projection_hole_' + drop.replace('-', '_') + (certifies ? '' : '_uncertified'),
+					false,
+					checkpointCapabilities(),
+					(database) => {
+						Plain = table({
+							database,
+							table: 'Plain',
+							audit: true,
+							attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'body' }],
+						});
+					},
+					connection,
+					[
+						{ start: 0, end: 1, shard: 0 },
+						{ start: 1, end: 2, shard: 1 },
+					]
+				);
+				const peerId = getIdOfRemoteNode('slot-control-peer', Records.auditStore);
+				const marker = () => Records.dbisDB.getSync([Symbol.for('shardingProjectionComplete'), peerId]);
+				const put = Records.dbisDB.put;
+				let boundsAtCompletion;
+				Records.dbisDB.put = function (key, ...args) {
+					if (Array.isArray(key) && key[0] === Symbol.for('shardingProjectionComplete'))
+						boundsAtCompletion = readCopyBounds(Records.dbisDB);
+					return put.call(this, key, ...args);
+				};
+				const warnings = [];
+				const originalWarn = logger.warn;
+				logger.warn = (...args) => warnings.push(args.join(' '));
+				try {
+					await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+					assert.equal(socket.sent.find((frame) => frame[0] === 129)[1][0].shardingProjection, true);
+					const anchor = Date.now() + 100;
+					const encoder = Plain.primaryStore.encoder;
+					socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+					socket.emit(
+						'message',
+						encode([
+							132,
+							{
+								structures: encoder.structures,
+								typedStructs: encoder.typedStructs,
+								attributes: Plain.attributes,
+								schemaDefined: true,
+							},
+							Plain.tableId,
+							Plain.tableName,
+						])
+					);
+					socket.emit('message', encode([148, anchor, 1, undefined, { shardingProjection: true }]));
+					socket.emit('message', encode([133, 'projection-hole-started', 0, 'absent', 'MissingTable']));
+					await until(
+						() =>
+							socket.sent.some((frame) => frame[0] === 134 && frame[1] === 'projection-hole-started') ||
+							socket.closes.length
+					);
+					assert.deepEqual(socket.closes, []);
+					// an ordinary table in a sharded database: no residency close applies, the record is skipped
+					socket.emit(
+						'message',
+						recordFrame(
+							Plain,
+							'put',
+							'dropped',
+							{ id: 'dropped', body: 'never applied' },
+							anchor + 1,
+							undefined,
+							drop === 'local-only' ? { extendedType: LOCAL_ONLY } : { encodedRecord: Buffer.from([0xc1, 0xc1]) }
+						)
+					);
+					socket.emit('message', encode([149]));
+					await until(() => marker() || socket.closes.length);
+					assert.equal(marker()?.anchor, anchor);
+					assert.ok(HOLE_COPY_BOUND >= 8.64e15, 'the bound covers every valid log key');
+					assert.equal(boundsAtCompletion?.get(peerId), HOLE_COPY_BOUND, 'the hole is durable before completion');
+					// what a restart reads: the store, not this connection's memory
+					assert.equal(readCopyBounds(Records.dbisDB).get(peerId), HOLE_COPY_BOUND);
+					const [hole, ...others] = readCopyHoles(Records.dbisDB);
+					assert.deepEqual(others, [], 'one hole row for the pass');
+					assert.deepEqual([hole.peerId, hole.origins], [peerId, [peerId]], 'in a hole row of its own');
+					assert.ok(hole.lossKey >= anchor + 1, 'keyed at the dropped entry');
+					assert.equal(Plain.primaryStore.getEntry('dropped'), undefined);
+					// an operator sees it: one warning for the newly holed origin, and the row in cluster_status
+					const holeWarnings = warnings.filter((warning) => warning.includes('checkpoint admission is void'));
+					assert.equal(holeWarnings.length, 1, holeWarnings.join('\n'));
+					assert.match(holeWarnings[0], new RegExp(`${database}.*Plain.*void for slot-control-peer `));
+					assert.match(
+						holeWarnings[0],
+						/replacing this node fills it \(drain .* add_node an empty node under a new name\), but a multi-shard database admits no checkpoint across shards yet/
+					);
+					assert.deepEqual(residencyStatus()[database].checkpointHoles, [
+						{
+							source: 'slot-control-peer',
+							origins: ['slot-control-peer'],
+							lostAt: new Date(hole.lossKey).toISOString(),
+						},
+					]);
+				} finally {
+					logger.warn = originalWarn;
+					Records.dbisDB.put = put;
+					env.setProperty('replication_shards', [0]);
+				}
+			}));
+
+	for (const drops of [false, true])
+		it(`releases the hole rows that stood only after a complete copy that drops nothing (drops=${drops})`, () =>
+			atCheckpointLevel(async () => {
+				const peer = 'slot-control-peer';
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+				connection.exclusionOrigins = [peer];
+				const { Records, socket } = await connect(
+					false,
+					`copy_hole_release_${drops}`,
+					true,
+					checkpointCapabilities(),
+					undefined,
+					connection
+				);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				const holes = () => readCopyHoles(Records.dbisDB);
+				// a peer that has since left the cluster; a complete pass from any peer refills the table it dropped from
+				const departed = getIdOfRemoteNode('departed-peer', Records.auditStore);
+				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				// earlier projections from this peer and from the departed one dropped records of their origins
+				const lossKey = Date.now() + 5_000;
+				const rootStore = Records.auditStore.rootStore;
+				await persistCopyHole(Records.dbisDB, peerId, rootStore, 'earlier-pass', 1, [peerId], lossKey);
+				await persistCopyHole(Records.dbisDB, departed, rootStore, 'departed-pass', 1, [departed], 1);
+				assert.deepEqual(
+					copyHoleStatus(Records.dbisDB, Records.auditStore)
+						.map(({ source, origins }) => [source, origins])
+						.sort(),
+					[
+						['departed-peer', ['departed-peer']],
+						[peer, [peer]],
+					]
+				);
+				// what this pass reserves: an abandoned reservation outlives the hole's release, so it must not carry it
+				const reserved = [];
+				const boundStore = Records.auditStore.rootStore.dbisDb;
+				const putSync = boundStore.putSync;
+				boundStore.putSync = function (key, value, ...rest) {
+					if (Array.isArray(key) && key[0] === Symbol.for('copyBound') && key[2] === 'reserved') reserved.push(value);
+					return putSync.call(this, key, value, ...rest);
+				};
+				const anchor = Date.now() + 100;
+				const encoder = Records.primaryStore.encoder;
+				socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+				socket.emit(
+					'message',
+					encode([
+						132,
+						{
+							structures: encoder.structures,
+							typedStructs: encoder.typedStructs,
+							attributes: Records.attributes,
+							schemaDefined: true,
+						},
+						Records.tableId,
+						Records.tableName,
+					])
+				);
+				socket.emit('message', encode([148, anchor, 1]));
+				if (drops)
+					socket.emit(
+						'message',
+						recordFrame(Records, 'put', 'dropped', { id: 'dropped' }, anchor - 1, undefined, {
+							extendedType: LOCAL_ONLY,
+						})
+					);
+				const copyCursorKey = [Symbol.for('copyCursor'), peerId];
+				await Records.dbisDB.put(copyCursorKey, {
+					copyStartTime: anchor,
+					currentTable: Records.tableName,
+					afterKey: 'x',
+				});
+				socket.emit('message', encode([143, anchor + 1]));
+				await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId === anchor + 1 || socket.closes.length);
+				socket.emit('message', encode([149]));
+				await until(() => Records.dbisDB.getSync(copyCursorKey) === undefined || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				boundStore.putSync = putSync;
+				assert.ok(reserved.length > 0, 'the pass reserved its copy start');
+				for (const row of reserved)
+					assert.ok(!Object.values(row).includes(HOLE_COPY_BOUND), 'a reservation never carries a hole');
+				if (drops) assert.equal(holes().length, 2, 'a pass that drops a record fills no hole');
+				else {
+					assert.deepEqual(holes(), [], 'a complete pass that dropped nothing fills every hole that stood');
+					assert.deepEqual(copyHoleStatus(Records.dbisDB, Records.auditStore), []);
+					// its snapshot restored no audit entries: starts from before it, or before the loss, stay void
+					const bounds = readCopyBounds(Records.dbisDB);
+					assert.equal(bounds.get(peerId), lossKey, 'a loss keyed after the copy start keeps its key');
+					assert.ok(bounds.get(departed) >= anchor, 'otherwise the copy start');
+					assert.ok(bounds.get(departed) < HOLE_COPY_BOUND);
+				}
+			}));
 });

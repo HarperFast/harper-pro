@@ -207,7 +207,12 @@ suite('Cursorless copy re-delivery repairs a blob aborted mid-receive', { timeou
 		});
 
 		const bLog = await readLog(B);
-		const fullCopyRequests = (bLog.match(/Requesting full copy of database data /g) ?? []).length;
+		// a level-2 route that stopped mid-copy is marked partial, so its reconnect takes the widening path, which
+		// logs its own line for the same full copy
+		const fullCopyRequests = (
+			bLog.match(/Requesting full copy of database data |Route coverage widened to full for \S+ on database data /g) ??
+			[]
+		).length;
 		ok(fullCopyRequests >= 2, `the reconnect did not request a second full copy (${fullCopyRequests} requests)`);
 		equal(
 			(bLog.match(/Resuming interrupted copy of database data /g) ?? []).length,

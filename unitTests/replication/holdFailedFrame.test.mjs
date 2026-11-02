@@ -25,6 +25,12 @@ describe('holdFailedFrame', () => {
 		expect(decisions).to.deep.equal([true, true, false, false]);
 	});
 
+	it('counts a failure that names no position, as a failed sequence update does', () => {
+		const attempts = new Map();
+		const decisions = [1, 2, 3].map(() => holdFailedFrame(attempts, 'peer/db', undefined, 2));
+		expect(decisions).to.deep.equal([true, true, false]);
+	});
+
 	it('holds placement refusals beyond the poison-frame limit without consuming that budget', () => {
 		const attempts = new Map();
 		const error = new ResidencyConfigurationError('placement temporarily unavailable', 503);
