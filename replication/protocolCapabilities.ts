@@ -40,12 +40,14 @@ export const RECORD_LOCKS_CAPABILITY = 4;
 export const ORIGIN_CURSORS_CAPABILITY = 1;
 
 /**
- * Level at which a peer sends and applies origin-closed floor certificates (harper-pro#922 item 2): the optional
- * per-origin floor vector on `SEQUENCE_ID_UPDATE[2]`, stored as `nodes[].closedFloor`, and a resume request that
- * starts at a stored floor. Advertised only by a build whose transaction logs are per origin (RocksDB), since only
- * core's RocksDB store certifies a floor.
+ * Level at which a peer sends and applies origin-closed floor certificates on `SEQUENCE_ID_UPDATE[2]`, stored as
+ * `nodes[].closedFloor`, and resumes at a stored floor. Level 1: `{ origin: floor }`. Level 2: checkpoint-grade
+ * certificates `{ origin: [floor, generation, fullCoverage] | 0 }` behind a power-loss durable advertisement,
+ * floor-only resume and sticky revocation. Advertised only by a build whose transaction logs are per origin
+ * (RocksDB), at level 2 only when its engine can sync the floor record (`syncWal`).
  */
-export const ORIGIN_FLOORS_CAPABILITY = 1;
+export const ORIGIN_FLOORS_CAPABILITY = 2;
+const CHECKPOINT_FLOORS_LEVEL = 2;
 
 /**
  * Table lifecycle stamps: a peer at this level reads `createdTime` on definitions and structure frames and
@@ -111,8 +113,14 @@ function resolveBudget(value: unknown): number | undefined {
 	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
-/** Keys this build does not know are dropped, so nothing downstream can consult one by accident. */
-export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
+/**
+ * Keys this build does not know are dropped, so nothing downstream can consult one by accident.
+ * `localOriginFloors`: the level this build advertises (`buildLocalCapabilities`), the ceiling of the resolved one.
+ */
+export function resolvePeerCapabilities(
+	bag: any,
+	localOriginFloors: number = ORIGIN_FLOORS_CAPABILITY
+): ResolvedPeerCapabilities {
 	return Object.freeze({
 		safeCopyAudit: bag?.safeCopyAudit === 1 ? 1 : 0,
 		protocolVersion: resolveLevel(bag?.protocolVersion, LOCAL_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION),
@@ -120,7 +128,7 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
 		recordLocks: resolveExactLevel(bag?.recordLocks, 0),
 		originCursors: resolveLevel(bag?.originCursors, ORIGIN_CURSORS_CAPABILITY, 0),
-		originFloors: resolveLevel(bag?.originFloors, ORIGIN_FLOORS_CAPABILITY, 0),
+		originFloors: resolveLevel(bag?.originFloors, localOriginFloors, 0),
 		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
 		residencyStubCopy: resolveLevel(bag?.residencyStubCopy, RESIDENCY_STUB_COPY_CAPABILITY, 0),
 		residencyNotResident: resolveLevel(bag?.residencyNotResident, RESIDENCY_NOT_RESIDENT_CAPABILITY, 0),
@@ -159,17 +167,17 @@ export function peerSupportsOriginCursors(resolved: ResolvedPeerCapabilities): b
 }
 
 export function peerSupportsOriginFloors(resolved: ResolvedPeerCapabilities): boolean {
-	return resolved.originFloors >= ORIGIN_FLOORS_CAPABILITY;
+	return resolved.originFloors >= 1;
+}
+
+/** Both sides certify at level 2: durable floors, floor-only resume, revocation. */
+export function peerCertifiesCheckpointFloors(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.originFloors >= CHECKPOINT_FLOORS_LEVEL;
 }
 
 /** A peer that advertised nothing — the pre-registry baseline. */
 export const ABSENT_PEER_CAPABILITIES: ResolvedPeerCapabilities = resolvePeerCapabilities(undefined);
 
-/**
- * The budget is passed in, not derived here: it comes from `PING_INTERVAL`, an `env.get` read evaluated
- * when `replicationConnection.ts` loads. Deriving it behind this module's import graph would let an
- * earlier importer evaluate it before config loads and silently advertise a default-derived budget.
- */
 /**
  * The `recordLocks` level this node ADVERTISES — the only thing a peer can act on. A node whose bag
  * is suppressed (the test's `HARPER_TEST_OMIT_REPLICATION_CAPABILITIES`, or any future path that sends
@@ -182,10 +190,16 @@ export function advertisedRecordLocksLevel(recordLocksEnabled: boolean, bagOmitt
 	return recordLocksEnabled && !bagOmitted ? RECORD_LOCKS_CAPABILITY : 0;
 }
 
+/**
+ * The budget is passed in, not derived here: it comes from `PING_INTERVAL`, an `env.get` read evaluated
+ * when `replicationConnection.ts` loads. Deriving it behind this module's import graph would let an
+ * earlier importer evaluate it before config loads and silently advertise a default-derived budget.
+ */
 export function buildLocalCapabilities(
 	subscriptionSetupBudgetMs: number,
 	recordLocksEnabled: boolean,
-	perOriginLogs: boolean
+	perOriginLogs: boolean,
+	durableFloors = false
 ): Readonly<Record<string, number>> {
 	return Object.freeze({
 		safeCopyAudit: 1,
@@ -196,7 +210,7 @@ export function buildLocalCapabilities(
 		recordLocks: advertisedRecordLocksLevel(recordLocksEnabled, false),
 		// LMDB keys one shared audit log by local time, so it has no origin cursor to send or apply.
 		originCursors: perOriginLogs ? ORIGIN_CURSORS_CAPABILITY : 0,
-		originFloors: perOriginLogs ? ORIGIN_FLOORS_CAPABILITY : 0,
+		originFloors: perOriginLogs ? (durableFloors ? ORIGIN_FLOORS_CAPABILITY : 1) : 0,
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 		residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
 		residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,

@@ -23,6 +23,9 @@ export interface CopyCursorValue {
 	currentTable: any;
 	afterKey: any;
 	copyOrder: any;
+	widened?: boolean;
+	fullCoverage?: boolean;
+	maxCopiedVersionByOrigin?: Record<number, number>;
 }
 
 interface BlobTagNode {
