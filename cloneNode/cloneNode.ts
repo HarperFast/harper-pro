@@ -1421,7 +1421,9 @@ async function cloneSchemas(shardedDatabases: readonly string[]): Promise<void> 
 					table: tableName,
 					primary_key: primaryKey,
 					attributes,
-					...(expiration > 0 && Number.isFinite(expiration) ? { expiration } : {}),
+					...(expiration > 0 && !Number.isNaN(new Date(Date.now() + expiration * 1000).getTime())
+						? { expiration }
+						: {}),
 					operation: OPERATIONS_ENUM.CREATE_TABLE,
 				});
 				log(`Pre-created table '${dbName}.${tableName}' from leader schema`);

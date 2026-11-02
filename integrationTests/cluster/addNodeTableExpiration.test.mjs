@@ -160,7 +160,6 @@ suite('add_node keeps the sender table-level expiration (harper-pro#1179)', { ti
 		equal(described.expiration, `${TTL_S}s`);
 		equal((await describeTable(ctx.B, 'TtlCache')).expiration, described.expiration);
 
-		// B assigns this row's deadline itself, from its own table's expiration
 		await sendOperation(ctx.B, {
 			operation: 'upsert',
 			database: DATABASE,
