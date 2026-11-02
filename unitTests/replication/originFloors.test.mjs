@@ -713,6 +713,17 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(partialRouteState.hasPending(), false);
 	});
 
+	it("counts a fence as committed for every pass, unlike another pass's reservation", () => {
+		const rows = [
+			{ key: [Symbol.for('copyBound'), 0, 'fence', 'generation'], value: { 2: T + 5000 } },
+			{ key: [Symbol.for('copyBound'), 1, 'reserved', 'other-pass'], value: { 2: T + 9000, 3: T + 9000 } },
+		];
+		const dbisDB = { getRange: () => rows };
+		const committed = readCommittedCopyBounds(dbisDB, 1, 'this-pass');
+		assert.strictEqual(committed.get(2), T + 5000);
+		assert.strictEqual(committed.has(3), false);
+	});
+
 	it('a copy pass commits a logarithmic number of bounds for explicit versions above the copy start', () => {
 		const copyStart = T;
 		assert.strictEqual(copyBoundReservation(T - 5, copyStart), copyStart);

@@ -36,6 +36,7 @@ import {
 	tableUpdateListeners,
 	LATENCY_POSITION,
 	deriveConnectionTruth,
+	ensureCopyFencesAtStartup,
 } from './replicationConnection.ts';
 import {
 	ensureRecordLockTransport,
@@ -118,6 +119,7 @@ export async function startOnMainThread(options) {
 	if (env.get(CONFIG_PARAMS.REPLICATION_SHARDS) !== undefined || residencyDeclarationDatabases().length)
 		await configuration;
 	await migrateSSHConfigOnce();
+	await ensureCopyFencesAtStartup();
 	await startSubscriptionsOnMainThread(options);
 	startShardingBootstrap();
 }

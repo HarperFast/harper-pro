@@ -102,6 +102,7 @@ import { isValidFloor, originFloorsDurable } from '../core/resources/originClose
 import {
 	COPY_BOUND_KEY,
 	type CopyBoundChange,
+	bumpOriginStateEpoch,
 	readCopyBounds,
 	readOriginStateEpoch,
 	writeCopyBounds,
@@ -3803,6 +3804,7 @@ type SharedRouteSafetyState = {
 };
 const sharedRouteSafetyByDb = new WeakMap<object, Map<string, SharedRouteSafetyState>>();
 const COPY_BOUND_HEADROOM_MS = 60_000;
+const COPY_FENCE_TAG = 'fence';
 /**
  * The bound a copy-applied row reserves: the copy start covers every row below it, and past the start the
  * reservation reaches ahead by at least the row's distance, so any series of explicit versions above the start
@@ -3860,7 +3862,8 @@ export function mergePersistedCopyBounds(
  * writes them; route `[seq, *]` rows are never written here. A pass that never settles leaves its reservation,
  * which keeps voiding the starts it covers.
  *
- * The bounds that stay committed: every settled row, and this pass's own reservation (others' can be dropped).
+ * The bounds that stay committed: every settled row, every fence (`ensureCopyFence`), and this pass's own
+ * reservation (others' can be dropped).
  */
 export function readCommittedCopyBounds(dbisDB: DbisStore, peerId: number, pass: number | string): Map<number, number> {
 	readCopyBounds(dbisDB);
@@ -3869,7 +3872,11 @@ export function readCommittedCopyBounds(dbisDB: DbisStore, peerId: number, pass:
 		start: COPY_BOUND_KEY,
 		end: [COPY_BOUND_KEY, Buffer.from([0xff])],
 	}) as Iterable<{ key: any; value: unknown }>) {
-		if (key.length === 2 || (key[1] === peerId && key[2] === 'reserved' && key[3] === pass)) {
+		if (
+			key.length === 2 ||
+			key[2] === COPY_FENCE_TAG ||
+			(key[1] === peerId && key[2] === 'reserved' && key[3] === pass)
+		) {
 			mergeCopyBoundRecordInto(committed, value);
 		}
 	}
@@ -4003,6 +4010,115 @@ export function settleCopyBounds(
 		raise: raise.size > 0 ? raise : undefined,
 		release: [['reserved', pass], ...filled.filter((hole) => hole.peerId === peerId).map(({ slot }) => slot)],
 	});
+}
+
+const COPY_FENCE_KEY = Symbol.for('copyFence');
+const copyFenceWrites = new WeakMap<object, Promise<void>>();
+const adoptedCopyFences = new WeakMap<object, string>();
+const COPY_FENCE_STARTUP_BUFFER = 'copy-fence-present-at-startup';
+/** Set on the main thread for a database it saw at startup, so a retry on any thread after a failed fence still bounds it. */
+function presentAtStartupWord(rootStore: any): Int32Array | undefined {
+	if (typeof rootStore?.getUserSharedBuffer !== 'function') return;
+	return new Int32Array(rootStore.getUserSharedBuffer(COPY_FENCE_STARTUP_BUFFER, new ArrayBuffer(4)));
+}
+/**
+ * Copies applied before this generation recorded copy bounds left rows with no audit entry and no bound. Those copies
+ * all predate this process, so a bound past now, with headroom for an origin clock running ahead, covers them for every
+ * origin mapped now; an origin mapped later arrived through its log or through a copy that bounds itself, since a copy
+ * maps every origin its sender knows (`remoteToLocalNodeId`). Only a database present at startup with replication
+ * history can hold such copies; any other gets the marker alone, so a standalone node keeps its own checkpoints when it
+ * joins and a database created at runtime is not fenced at the next restart.
+ */
+export async function ensureCopyFence(auditStore: any, dbisDB: DbisStore, presentAtStartup = false): Promise<void> {
+	const rootStore = auditStore.rootStore;
+	if (presentAtStartup) {
+		const word = presentAtStartupWord(rootStore);
+		if (word) Atomics.store(word, 0, 1);
+	}
+	const generation = getDatabaseGeneration(auditStore)?.id;
+	// admission and capture refuse a database with no generation, so nothing certifies against it
+	if (generation === undefined) return;
+	if (adoptedCopyFences.get(rootStore) === generation) return;
+	const startupWord = presentAtStartupWord(rootStore);
+	let write = copyFenceWrites.get(rootStore);
+	if (!write) {
+		write = (async () => {
+			const markerKey = [COPY_FENCE_KEY, generation];
+			if (dbisDB.getSync(markerKey) === undefined) {
+				const bounded =
+					(presentAtStartup || (startupWord !== undefined && Atomics.load(startupWord, 0) === 1)) &&
+					hasReplicationHistory(auditStore, dbisDB);
+				if (bounded) {
+					const fence = Math.max(Date.now(), rootStore.getMonotonicTimestamp?.() ?? 0) + COPY_BOUND_HEADROOM_MS;
+					const raise = new Map<number, number>([[0, fence]]);
+					for (const id of Object.values(exportIdMapping(auditStore))) {
+						if (typeof id === 'number') raise.set(id, fence);
+					}
+					await writeCopyBoundRows(dbisDB, 0, rootStore, { raise, at: [COPY_FENCE_TAG, generation] });
+				}
+				await dbisDB.put(markerKey, { bounded });
+			}
+			// a writer can commit and stop before publishing the epoch, so the first adopter on each thread publishes it
+			bumpOriginStateEpoch(rootStore);
+			adoptedCopyFences.set(rootStore, generation);
+		})();
+		copyFenceWrites.set(rootStore, write);
+		const settled = () => copyFenceWrites.delete(rootStore);
+		write.then(settled, settled);
+	}
+	await write;
+}
+
+/** A copy's rows can be durable before its progress rows, but it maps its sender's origins before applying any. */
+function hasReplicationHistory(auditStore: any, dbisDB: DbisStore): boolean {
+	if (Object.values(exportIdMapping(auditStore)).some((id) => id !== 0)) return true;
+	for (const prefix of [Symbol.for('seq'), Symbol.for('copyCursor')]) {
+		for (const _entry of dbisDB.getRange({ start: prefix, end: [prefix, Buffer.from([0xff])] })) return true;
+	}
+	return false;
+}
+
+const COPY_FENCE_STARTUP_ATTEMPTS = 3;
+/**
+ * Runs before any worker starts, so neither admission nor a route runs ahead of a database's fence. A transient failure
+ * is retried here; a malformed `[copyBound]` row fails every attempt, and core admission refuses on that row anyway.
+ */
+export async function ensureCopyFencesAtStartup(): Promise<void> {
+	if (!STORAGE_IS_ROCKSDB) return;
+	const markFence = async (table: any, presentAtStartup: boolean, attempts: number) => {
+		if (!table?.auditStore || !originFloorsDurable(table.auditStore.rootStore)) return;
+		const backoff = createBackoff({ initialMs: 400, maxMs: 2000, maxAttempts: attempts - 1 });
+		for (;;) {
+			try {
+				return await ensureCopyFence(table.auditStore, table.dbisDB, presentAtStartup);
+			} catch (error) {
+				const delay = backoff.nextDelay();
+				if (delay === undefined) {
+					logger.error?.('Could not fence copies made before copy bounds for', table.databaseName, error);
+					return;
+				}
+				await new Promise((resolve) => setTimeout(resolve, delay));
+			}
+		}
+	};
+	const startupTables: any[] = [];
+	const databases = getDatabases();
+	for (const databaseName of Object.getOwnPropertyNames(databases)) {
+		const database = databases[databaseName];
+		for (const tableName in database) {
+			if (database[tableName]?.auditStore) {
+				startupTables.push(database[tableName]);
+				break;
+			}
+		}
+	}
+	// every startup database is flagged before the first await, so no thread can classify one as created at runtime
+	for (const table of startupTables) {
+		const word = presentAtStartupWord(table.auditStore.rootStore);
+		if (word) Atomics.store(word, 0, 1);
+	}
+	for (const table of startupTables) await markFence(table, true, COPY_FENCE_STARTUP_ATTEMPTS);
+	onUpdatedTable((table) => void markFence(table, false, 1));
 }
 
 /**
@@ -6833,6 +6949,31 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const supportsCheckpointFloors = () =>
 		STORAGE_IS_ROCKSDB &&
 		originFloorsDurable((auditStore ?? getDatabaseStores().auditStore)?.rootStore ?? RocksDatabase.prototype);
+	// only a socket's first request certifies (see DESIGN), so a failed fence costs this socket its certification
+	let copyFenceCommitted = false;
+	let copyFenceAwaitsDatabase = false;
+	let lastCopyFenceWarnAt = 0;
+	async function fenceUnboundedCopies(): Promise<boolean> {
+		if (!supportsCheckpointFloors()) return true;
+		const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
+		const store = auditStore ?? dbAuditStore;
+		if (!store || !dbisDB) {
+			copyFenceAwaitsDatabase = true;
+			return true;
+		}
+		try {
+			await ensureCopyFence(store, dbisDB);
+			return true;
+		} catch (error) {
+			// data still replicates; only this connection's routes go without floor-only certification
+			const now = Date.now();
+			if (now - lastCopyFenceWarnAt >= 60_000) {
+				lastCopyFenceWarnAt = now;
+				logger.warn?.(connectionId, 'could not fence copies made before copy bounds for', databaseName, error);
+			}
+			return false;
+		}
+	}
 	const pendingOriginFloors = new PendingOriginFloors();
 	let pendingRouteState = new PendingRouteState((event) => scheduleRouteStateVerification(event));
 	/** Origins marked partial on this route (`originId -> generation`), cleared only by a copy begun after the mark. */
@@ -7799,6 +7940,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// frame can finally pass — nothing else re-triggers this send once databaseName was
 							// already set before this NODE_NAME arrived.
 							sendRecordLockHomesDigestFrame();
+							if (options.connection) {
+								copyFenceCommitted = await fenceUnboundedCopies();
+								if (connectionSuperseded() || wsClosed) return;
+							}
 							sendSubscriptionRequestUpdate();
 						}
 						break;
@@ -8254,6 +8399,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 						loadPersistedCopyBounds();
 						if (copyApplyActive() && supportsCheckpointFloors()) reserveCopyStartBounds(copyModeStartTime);
+						if (copyFenceAwaitsDatabase) {
+							copyFenceAwaitsDatabase = false;
+							// created under this build, so nothing unbounded precedes it: marked now, not at a later
+							// connection, where the fence would void every route start until a further reconnect
+							void fenceUnboundedCopies();
+						}
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
 						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
@@ -12296,7 +12447,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				certifiesOriginFloors(),
 				shardingCursorAdmission(databaseName, store),
 				// a copy's rows carry no audit entries, so its request proves no prefix for anyone
-				recordOptimistic && certifiesCheckpointFloors() && !requestIsCopy && !restrictedOrigins
+				recordOptimistic && copyFenceCommitted && certifiesCheckpointFloors() && !requestIsCopy && !restrictedOrigins
 					? (originId, start, generation) => {
 							if (partialMarked.has(originId) || pendingRouteState.hasPendingPartialHistory(originId)) return;
 							if (allowedOptimisticNames) {
@@ -12632,6 +12783,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						!copyCursor &&
 						// a sharded route certifies no coverage, and its completed-projection resume picks its own start
 						!restrictedOrigins &&
+						copyFenceCommitted &&
 						certifiesCheckpointFloors() &&
 						checkpointGradeRow(ownState) &&
 						!partialMarked.has(nodeId) &&
