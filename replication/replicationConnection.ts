@@ -3930,7 +3930,8 @@ export function persistCopyHole(
 	lossKey: number,
 	previous?: (string | number)[]
 ): Promise<boolean> {
-	if (!dbisDB?.put) return Promise.resolve(false);
+	// no store must not read as "unchanged": a hole that is not written would let the projection complete
+	if (!dbisDB?.put) return Promise.reject(new Error('No store to record a copy hole in'));
 	return writeCopyBoundRows(dbisDB, peerId, rootStore, {
 		raise: new Map(Array.from(origins, (originId) => [originId, HOLE_COPY_BOUND])),
 		at: [HOLE_ROW, pass, revision, lossKey],
@@ -5327,7 +5328,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						txnStream,
 					};
 					attachCopyCursorRemoval(barrierEvent, nodeId, true);
-					tableSubscriptionToReplicator.send(barrierEvent);
+					if (tableSubscriptionToReplicator.send(barrierEvent) === false) deferCopyCursorRemoval(nodeId);
 				} else {
 					deferCopyCursorRemoval(nodeId);
 				}
@@ -5566,7 +5567,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						true
 					);
 					attachCopyCursorRemoval(finishEvent, copyNodeId);
-					tableSubscriptionToReplicator.send(finishEvent);
+					if (tableSubscriptionToReplicator.send(finishEvent) === false) deferCopyCursorRemoval(copyNodeId);
 				} else {
 					pendingCopyCursorRemovalNodeId = copyNodeId;
 					flushRouteState();
@@ -5580,7 +5581,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							txnStream,
 						};
 						attachCopyCursorRemoval(barrierEvent, copyNodeId, true);
-						tableSubscriptionToReplicator.send(barrierEvent);
+						if (tableSubscriptionToReplicator.send(barrierEvent) === false) deferCopyCursorRemoval(copyNodeId);
 					} else {
 						deferCopyCursorRemoval(copyNodeId);
 					}
@@ -5964,12 +5965,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				return;
 			}
 			const event = seqUpdateEndTxn(clampedPosition());
-			if (pendingCopyCursorRemovalNodeId !== undefined) {
-				const removalNodeId = pendingCopyCursorRemovalNodeId;
+			const removalNodeId = pendingCopyCursorRemovalNodeId;
+			if (removalNodeId !== undefined) {
 				pendingCopyCursorRemovalNodeId = undefined;
 				attachCopyCursorRemoval(event, removalNodeId);
 			}
-			tableSubscriptionToReplicator.send(event);
+			// a closed queue takes no event: its marks stay pending, and the cursor removal goes back in line
+			if (tableSubscriptionToReplicator.send(event) === false) {
+				if (removalNodeId !== undefined) deferCopyCursorRemoval(removalNodeId);
+				else scheduleRouteStateFlushRetry();
+			}
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not send the route marks for', databaseName, error);
 		}
@@ -6454,19 +6459,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
 			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
 			passHoles++;
+			const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
+			const store = auditStore ?? databaseAuditStore;
+			// an origin this node cannot name could be any it knows
+			const lost =
+				originId !== undefined
+					? [originId]
+					: [0, ...Object.values(exportIdMapping(store)).filter((id): id is number => typeof id === 'number')];
 			if (projectionCopy) {
 				// a projection's end_txn names no route, so its hole is a copy bound no route start passes, durable
 				// before the frame moves on and so before the projection can complete; at any level, so a later engine
 				// that certifies still refuses it, and for a pass this socket has since replaced too, whose replacement
 				// may resume past the record
 				if (copyApplyActive()) {
-					const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
-					const store = auditStore ?? databaseAuditStore;
-					// an origin this node cannot name could be any it knows
-					const lost =
-						originId !== undefined
-							? [originId]
-							: [0, ...Object.values(exportIdMapping(store)).filter((id) => typeof id === 'number')];
 					const prior = holesByPass.get(pass);
 					const hole = {
 						revision: (prior?.revision ?? 0) + 1,
@@ -6487,14 +6492,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					hole.slot = [HOLE_ROW, pass, hole.revision, hole.lossKey];
 					holesByPass.set(pass, hole);
 				}
-			} else if (originId !== undefined) {
+			} else {
 				const routeId = routeRowId();
-				const seqEntry =
-					routeId !== undefined ? readDbisCursorSync(getDatabaseStores().dbisDB, 'seq', routeId) : undefined;
-				const existingGen = seqEntry?.nodes?.find?.((state: any) => state?.id === originId)?.originGeneration;
-				const gen = typeof existingGen === 'string' ? existingGen : undefined;
-				holedOrigins.set(originId, gen);
-				pendingRouteState.hole(originId, gen);
+				const nodes = routeId !== undefined ? readDbisCursorSync(dbisDB, 'seq', routeId)?.nodes : undefined;
+				for (const lostId of lost) {
+					const existingGen = nodes?.find?.((state: any) => state?.id === lostId)?.originGeneration;
+					const gen = typeof existingGen === 'string' ? existingGen : undefined;
+					holedOrigins.set(lostId, gen);
+					pendingRouteState.hole(lostId, gen);
+				}
 				flushRouteState();
 			}
 			// The connection can close during the write; the caller must not keep applying frames then.
