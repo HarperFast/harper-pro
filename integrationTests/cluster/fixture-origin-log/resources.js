@@ -1,5 +1,10 @@
 import './standinSyncWal.mjs';
 
+function namesById(auditStore) {
+	const nodeLogs = auditStore.loadLogs();
+	return new Map([...auditStore.logByName].map(([name, log]) => [nodeLogs.indexOf(log), name]));
+}
+
 // Writes the way the replication apply loop does (explicit timestamp, origin `nodeId`), so a record whose origin
 // is `ghost` lands in the `ghost` transaction log.
 export class OriginLogWrite extends Resource {
@@ -92,7 +97,7 @@ export class ClosedFloors extends Resource {
 		const Table = databases.data[data.table];
 		const auditStore = Table.auditStore;
 		const nodeLogs = auditStore.loadLogs();
-		const nameById = new Map([...auditStore.logByName].map(([name, log]) => [nodeLogs.indexOf(log), name]));
+		const nameById = namesById(auditStore);
 		const peerId = nodeLogs.indexOf(auditStore.logByName.get(data.peer));
 		const row = Table.dbisDB.getSync([Symbol.for('seq'), peerId]);
 		const nodes = {};
@@ -165,6 +170,43 @@ export class SetRouteCoverage extends Resource {
 		}));
 		await Table.dbisDB.put(seqKey, { ...row, nodes });
 		return { updated: true };
+	}
+}
+
+export class CopyBounds extends Resource {
+	static loadAsInstance = false;
+	async post(target, data) {
+		const Table = databases.data[data.table];
+		const nameById = namesById(Table.auditStore);
+		nameById.set(0, 'own');
+		if (data.clearSettled) {
+			for (const { key } of Table.dbisDB.getRange({
+				start: Symbol.for('copyBound'),
+				end: [Symbol.for('copyBound'), Buffer.from([0xff])],
+			})) {
+				if (key.length === 2) await Table.dbisDB.remove(key);
+			}
+			const epochBuf = Table.auditStore?.rootStore?.sharedBuffers?.get('origin-state-epoch');
+			if (epochBuf) Atomics.add(new Int32Array(epochBuf), 0, 1);
+		}
+		const rows = [];
+		for (const { key, value } of Table.dbisDB.getRange({
+			start: Symbol.for('copyBound'),
+			end: [Symbol.for('copyBound'), Buffer.from([0xff])],
+		})) {
+			const bounds = {};
+			for (const [id, bound] of Object.entries(value)) bounds[nameById.get(Number(id)) ?? id] = bound;
+			rows.push({ key: key.slice(1), bounds });
+		}
+		let copyCursors = 0;
+		for (const _entry of Table.dbisDB.getRange({
+			start: Symbol.for('copyCursor'),
+			end: [Symbol.for('copyCursor'), Buffer.from([0xff])],
+		}))
+			copyCursors++;
+		const generation = Table.auditStore.databaseGeneration?.id ?? null;
+		const marker = generation ? Table.dbisDB.getSync([Symbol.for('copyFence'), generation]) : undefined;
+		return { rows, copyCursors, generation, marker: marker ? { ...marker } : null };
 	}
 }
 
