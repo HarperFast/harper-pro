@@ -19,7 +19,12 @@ import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { membersDigest } from '#src/core/resources/subscriptionCheckpoint';
 import { setOriginCaptureIntervalForTests } from '#src/core/resources/transactionBroadcast';
 import { getThisNodeName } from '#src/core/server/nodeName';
-import { persistMergedCopyBounds, persistCopyHoles, settleCopyBounds } from '#src/replication/replicationConnection';
+import {
+	persistMergedCopyBounds,
+	persistCopyHoles,
+	readCopyHoles,
+	settleCopyBounds,
+} from '#src/replication/replicationConnection';
 import { PrimaryRocksDatabase } from '#src/core/resources/PrimaryRocksDatabase';
 import { OpenDBIObject } from '#src/core/utility/lmdb/OpenDBIObject';
 import { setMainIsWorker } from '#js/core/server/threads/manageThreads';
@@ -326,7 +331,7 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 		subscription.end();
 	});
 
-	it('refuses an origin a copy dropped a record of until a later complete pass from the same peer settles', async function () {
+	it('refuses an origin a copy dropped a record of, and once a later complete pass fills it admits only starts after that pass', async function () {
 		this.timeout(30_000);
 		const T = table({
 			table: 'CopyHoleAdmission',
@@ -337,32 +342,39 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 		const route = getIdOfRemoteNode('route-r', T.auditStore);
 		const origin = getIdOfRemoteNode('origin-x', T.auditStore);
 		const copier = getIdOfRemoteNode('copier-q', T.auditStore);
+		const rootStore = T.primaryStore.rootStore;
 		const listener = (event) => listener.values.push(event?.value?.value);
 		listener.values = [];
 		const subscription = await T.subscribe({ omitCurrent: true, reportProgress: true, listener });
-		let releaseSource;
+		let releaseSource, sendRecertification;
 		const held = new Promise((resolve) => (releaseSource = resolve));
+		const recertification = new Promise((resolve) => (sendRecertification = resolve));
+		const txnStream = {};
+		const routeUpdate = (floor, routeStates) => {
+			const event = {
+				type: 'end_txn',
+				localTime: floor,
+				remoteNodeIds: [route],
+				txnStream,
+				onFailure: () => false,
+				originRouteStates: routeStates,
+			};
+			event.onCommit = () => {
+				event.originFloors = [[origin, floor, true, 'origin-generation', true]];
+			};
+			return event;
+		};
 		try {
 			await T.put('a', { value: 'a' });
 			await waitFor(() => listener.values.includes('a'), 'the live write');
 			await new Promise((resolve) => setTimeout(resolve, 2));
 			const floor = certify(T);
-			const certificate = {
-				type: 'end_txn',
-				localTime: floor,
-				remoteNodeIds: [route],
-				txnStream: {},
-				onFailure: () => false,
-				originRouteStates: [[origin, floor - 1000, undefined, undefined, 'origin-generation']],
-			};
-			certificate.onCommit = () => {
-				certificate.originFloors = [[origin, floor, true, 'origin-generation', true]];
-			};
 			T.sourcedFrom(
 				{
 					subscribeOnThisThread: () => true,
 					async *subscribe() {
-						yield certificate;
+						yield routeUpdate(floor, [[origin, floor - 1000, undefined, undefined, 'origin-generation']]);
+						yield await recertification;
 						await held;
 					},
 				},
@@ -379,20 +391,55 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 			admitted.end();
 
 			// a projection from Q dropped a record of the origin: what any later process reads from the store
-			await persistCopyHoles(T.dbisDB, [origin], copier, T.primaryStore.rootStore);
+			await persistCopyHoles(T.dbisDB, [origin], copier, rootStore, 'dropping-pass');
 			await assert.rejects(
 				T.subscribe({ resume: token, omitCurrent: true }),
 				(error) => error.statusCode === 410,
 				'no route certifies an origin missing a record'
 			);
 
-			// a later pass from Q copies everything again and drops nothing
-			await settleCopyBounds(T.dbisDB, new Map(), copier, T.primaryStore.rootStore, 'later-pass', true);
-			const readmitted = await T.subscribe({ resume: token, omitCurrent: true, listener: () => {} });
-			assert.strictEqual(await readmitted.resumeVerified, true, 'admitted again once the hole is filled');
+			// a later pass from Q copies everything again and drops nothing: it fills the hole, but its snapshot carries
+			// no audit entry for the dropped record, so a checkpoint from before it still cannot be resumed
+			const copyStart = Date.now();
+			await settleCopyBounds(
+				T.dbisDB,
+				new Map(),
+				copier,
+				rootStore,
+				'later-pass',
+				readCopyHoles(T.dbisDB, copier),
+				copyStart
+			);
+			assert.deepEqual(readCopyHoles(T.dbisDB, copier), []);
+			await assert.rejects(
+				T.subscribe({ resume: token, omitCurrent: true }),
+				(error) => error.statusCode === 410,
+				'a checkpoint from before the filled hole stays refused'
+			);
+
+			// the route certifies again from after the pass, as its next fresh socket does: the void start cleared first
+			await T.put('b', { value: 'b' });
+			await waitFor(() => listener.values.includes('b'), 'a later live write');
+			await new Promise((resolve) => setTimeout(resolve, 2));
+			const laterFloor = certify(T);
+			assert.ok(laterFloor > copyStart + 1);
+			sendRecertification(
+				routeUpdate(laterFloor, [
+					[origin, undefined, true, undefined, 'origin-generation'],
+					[origin, copyStart + 1, false, undefined, 'origin-generation'],
+				])
+			);
+			let laterToken;
+			await waitFor(
+				() => (laterToken = subscription.checkpoint())?.members === members && laterToken.time >= laterFloor,
+				'a checkpoint after the recertification'
+			);
+			const readmitted = await T.subscribe({ resume: laterToken, omitCurrent: true, listener: () => {} });
+			assert.strictEqual(await readmitted.resumeVerified, true, 'a start after the filled hole is admitted');
 			readmitted.end();
 		} finally {
 			releaseSource();
+			sendRecertification(undefined);
 			subscription.end();
 		}
 	});

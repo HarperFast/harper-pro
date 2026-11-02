@@ -48,6 +48,7 @@ import {
 	cursorBelowFloor,
 	HOLE_COPY_BOUND,
 	persistCopyHoles,
+	readCopyHoles,
 } from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
@@ -2776,16 +2777,21 @@ describe('Declarative tables keep control and event traffic independent of place
 			}
 		}));
 
-	for (const drop of ['local-only', 'undecodable'])
-		it(`persists a projection's permanent hole where checkpoint admission reads it, before completion (${drop})`, () =>
-			atCheckpointLevel(async () => {
+	for (const [drop, certifies] of [
+		['local-only', true],
+		['undecodable', true],
+		['local-only', false],
+	])
+		it(`persists a projection's permanent hole where checkpoint admission reads it, before completion (${drop}, syncWal=${certifies})`, () =>
+			// an engine that cannot certify yet still records it, so the same node refuses the origin once it can
+			(certifies ? atCheckpointLevel : (run) => run())(async () => {
 				env.setProperty('replication_shards', [0, 1]);
 				const connection = new EventEmitter();
 				connection.nodeSubscriptions = [{ name: 'slot-control-peer', replicateByDefault: true }];
 				let Plain;
 				const { Records, socket } = await connect(
 					false,
-					'projection_hole_' + drop.replace('-', '_'),
+					'projection_hole_' + drop.replace('-', '_') + (certifies ? '' : '_uncertified'),
 					false,
 					checkpointCapabilities(),
 					(database) => {
@@ -2859,7 +2865,11 @@ describe('Declarative tables keep control and event traffic independent of place
 					assert.equal(boundsAtCompletion?.get(peerId), HOLE_COPY_BOUND, 'the hole is durable before completion');
 					// what a restart reads: the store, not this connection's memory
 					assert.equal(readCopyBounds(Records.dbisDB).get(peerId), HOLE_COPY_BOUND);
-					assert.equal(Records.dbisDB.getSync([Symbol.for('copyBound'), peerId, 'hole'])?.[peerId], HOLE_COPY_BOUND);
+					assert.deepEqual(
+						readCopyHoles(Records.dbisDB, peerId).map(({ origins }) => origins),
+						[[peerId]],
+						'in a hole row of its own'
+					);
 					assert.equal(Plain.primaryStore.getEntry('dropped'), undefined);
 				} finally {
 					Records.dbisDB.put = put;
@@ -2883,12 +2893,20 @@ describe('Declarative tables keep control and event traffic independent of place
 					connection
 				);
 				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
-				const holeRow = () => Records.dbisDB.getSync([Symbol.for('copyBound'), peerId, 'hole']);
+				const holes = () => readCopyHoles(Records.dbisDB, peerId);
 				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
 				assert.deepEqual(socket.closes, []);
 				// an earlier projection from this peer dropped a record of its origin
-				await persistCopyHoles(Records.dbisDB, [peerId], peerId, Records.auditStore.rootStore);
-				assert.equal(holeRow()?.[peerId], HOLE_COPY_BOUND);
+				await persistCopyHoles(Records.dbisDB, [peerId], peerId, Records.auditStore.rootStore, 'earlier-pass');
+				assert.equal(holes().length, 1);
+				// what this pass reserves: an abandoned reservation outlives the hole's release, so it must not carry it
+				const reserved = [];
+				const boundStore = Records.auditStore.rootStore.dbisDb;
+				const putSync = boundStore.putSync;
+				boundStore.putSync = function (key, value, ...rest) {
+					if (Array.isArray(key) && key[0] === Symbol.for('copyBound') && key[2] === 'reserved') reserved.push(value);
+					return putSync.call(this, key, value, ...rest);
+				};
 				const anchor = Date.now() + 100;
 				const encoder = Records.primaryStore.encoder;
 				socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
@@ -2925,7 +2943,16 @@ describe('Declarative tables keep control and event traffic independent of place
 				socket.emit('message', encode([149]));
 				await until(() => Records.dbisDB.getSync(copyCursorKey) === undefined || socket.closes.length);
 				assert.deepEqual(socket.closes, []);
-				if (drops) assert.equal(holeRow()?.[peerId], HOLE_COPY_BOUND, 'a pass that drops a record fills no hole');
-				else assert.equal(holeRow(), undefined, 'a complete pass that dropped nothing fills the hole');
+				boundStore.putSync = putSync;
+				assert.ok(reserved.length > 0, 'the pass reserved its copy start');
+				for (const row of reserved)
+					assert.ok(!Object.values(row).includes(HOLE_COPY_BOUND), 'a reservation never carries a hole');
+				if (drops) assert.equal(holes().length, 1, 'a pass that drops a record fills no hole');
+				else {
+					assert.deepEqual(holes(), [], 'a complete pass that dropped nothing fills the hole');
+					// its snapshot restored no audit entries: starts from before it stay void
+					assert.ok(readCopyBounds(Records.dbisDB).get(peerId) >= anchor);
+					assert.ok(readCopyBounds(Records.dbisDB).get(peerId) < HOLE_COPY_BOUND);
+				}
 			}));
 });
