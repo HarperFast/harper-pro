@@ -49,10 +49,11 @@ import {
 	HOLE_COPY_BOUND,
 	persistCopyHole,
 	readCopyHoles,
+	copyHoleStatus,
 } from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
-import { residencyTopologyErrors, registerResidencySender } from '#src/replication/residencyTopology';
+import { residencyTopologyErrors, registerResidencySender, residencyStatus } from '#src/replication/residencyTopology';
 import { FrameWriter } from '#src/replication/frameWriter';
 import { advanceShardingHistory } from '#src/replication/shardingBootstrapState';
 import {
@@ -2789,7 +2790,7 @@ describe('Declarative tables keep control and event traffic independent of place
 				const connection = new EventEmitter();
 				connection.nodeSubscriptions = [{ name: 'slot-control-peer', replicateByDefault: true }];
 				let Plain;
-				const { Records, socket } = await connect(
+				const { Records, socket, database } = await connect(
 					false,
 					'projection_hole_' + drop.replace('-', '_') + (certifies ? '' : '_uncertified'),
 					false,
@@ -2817,6 +2818,9 @@ describe('Declarative tables keep control and event traffic independent of place
 						boundsAtCompletion = readCopyBounds(Records.dbisDB);
 					return put.call(this, key, ...args);
 				};
+				const warnings = [];
+				const originalWarn = logger.warn;
+				logger.warn = (...args) => warnings.push(args.join(' '));
 				try {
 					await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
 					assert.equal(socket.sent.find((frame) => frame[0] === 129)[1][0].shardingProjection, true);
@@ -2870,7 +2874,19 @@ describe('Declarative tables keep control and event traffic independent of place
 					assert.deepEqual([hole.peerId, hole.origins], [peerId, [peerId]], 'in a hole row of its own');
 					assert.ok(hole.lossKey >= anchor + 1, 'keyed at the dropped entry');
 					assert.equal(Plain.primaryStore.getEntry('dropped'), undefined);
+					// an operator sees it: one warning for the newly holed origin, and the row in cluster_status
+					const holeWarnings = warnings.filter((warning) => warning.includes('checkpoint admission is void'));
+					assert.equal(holeWarnings.length, 1, holeWarnings.join('\n'));
+					assert.match(holeWarnings[0], new RegExp(`${database}.*Plain.*void for slot-control-peer `));
+					assert.deepEqual(residencyStatus()[database].checkpointHoles, [
+						{
+							source: 'slot-control-peer',
+							origins: ['slot-control-peer'],
+							lostAt: new Date(hole.lossKey).toISOString(),
+						},
+					]);
 				} finally {
+					logger.warn = originalWarn;
 					Records.dbisDB.put = put;
 					env.setProperty('replication_shards', [0]);
 				}
@@ -2902,7 +2918,15 @@ describe('Declarative tables keep control and event traffic independent of place
 				const rootStore = Records.auditStore.rootStore;
 				await persistCopyHole(Records.dbisDB, peerId, rootStore, 'earlier-pass', 1, [peerId], lossKey);
 				await persistCopyHole(Records.dbisDB, departed, rootStore, 'departed-pass', 1, [departed], 1);
-				assert.equal(holes().length, 2);
+				assert.deepEqual(
+					copyHoleStatus(Records.dbisDB, Records.auditStore)
+						.map(({ source, origins }) => [source, origins])
+						.sort(),
+					[
+						['departed-peer', ['departed-peer']],
+						[peer, [peer]],
+					]
+				);
 				// what this pass reserves: an abandoned reservation outlives the hole's release, so it must not carry it
 				const reserved = [];
 				const boundStore = Records.auditStore.rootStore.dbisDb;
@@ -2954,6 +2978,7 @@ describe('Declarative tables keep control and event traffic independent of place
 				if (drops) assert.equal(holes().length, 2, 'a pass that drops a record fills no hole');
 				else {
 					assert.deepEqual(holes(), [], 'a complete pass that dropped nothing fills every hole that stood');
+					assert.deepEqual(copyHoleStatus(Records.dbisDB, Records.auditStore), []);
 					// its snapshot restored no audit entries: starts from before it, or before the loss, stay void
 					const bounds = readCopyBounds(Records.dbisDB);
 					assert.equal(bounds.get(peerId), lossKey, 'a loss keyed after the copy start keeps its key');

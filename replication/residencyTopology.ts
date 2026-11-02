@@ -18,7 +18,7 @@ import { server } from '../core/server/Server.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import * as logger from '../core/utility/logging/harper_logger.ts';
 import { getHDBNodeTable, getReplicationRecipients } from './knownNodes.ts';
-import { PING_TIMEOUT } from './replicationConnection.ts';
+import { PING_TIMEOUT, copyHoleStatus, resolveDatabaseStores } from './replicationConnection.ts';
 
 const agreements = new WeakMap<object, Map<string, Map<string, Int32Array>>>();
 const peerDigests = new WeakMap<object, Map<string, BigUint64Array>>();
@@ -298,9 +298,12 @@ export function residencyStatus() {
 		if (!snapshot) errors.push('no shard map is installed');
 		const waitingOrigins = shardingWaitingOrigins(database);
 		const recovery = shardingBootstrapStatus(database);
+		const { dbisDB, auditStore } = resolveDatabaseStores(undefined, databases[database]);
+		const checkpointHoles = copyHoleStatus(dbisDB, auditStore);
 		status[database] = {
 			waitingOrigins,
 			recovery,
+			checkpointHoles: checkpointHoles.length ? checkpointHoles : undefined,
 			version: snapshot?.version,
 			digest: snapshot?.digest,
 			shardsDigest: configuration?.digest,

@@ -3957,6 +3957,22 @@ export function readCopyHoles(dbisDB: DbisStore | undefined): CopyHole[] {
 	return holes;
 }
 
+function copyHoleOriginNames(auditStore: any, origins: Iterable<number>): string[] {
+	return Array.from(origins, (originId) => getNodeNameForId(auditStore, originId) ?? `node#${originId}`);
+}
+
+/** The hole rows standing in a database, for `cluster_status`: each voids checkpoint admission for its origins. */
+export function copyHoleStatus(
+	dbisDB: DbisStore | undefined,
+	auditStore: any
+): { source: string; origins: string[]; lostAt?: string }[] {
+	return readCopyHoles(dbisDB).map(({ peerId, origins, lossKey }) => ({
+		source: getNodeNameForId(auditStore, peerId) ?? `node#${peerId}`,
+		origins: copyHoleOriginNames(auditStore, origins),
+		lostAt: lossKey < HOLE_COPY_BOUND ? new Date(lossKey).toISOString() : undefined,
+	}));
+}
+
 /**
  * Once a pass's rows are durable: merges the exact versions it copied into the settled row and drops its
  * reservation in the same commit, so a route can certify again from just above what was actually copied. A pass
@@ -6487,6 +6503,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					);
 					hole.slot = [HOLE_ROW, pass, hole.revision, hole.lossKey];
 					holesByPass.set(pass, hole);
+					// once per newly holed origin, not per dropped record: an excluded table drops every record it has
+					if (hole.origins.size > (prior?.origins.size ?? 0))
+						logger.warn?.(
+							connectionId,
+							`Sharding projection of ${databaseName} from ${remoteNodeName} dropped a record of ${tableName} (${reason}); checkpoint admission is void for ${copyHoleOriginNames(store, hole.origins).join(', ')} until a later pass from the beginning over every table, from any peer, drops nothing (cluster_status sharding.${databaseName}.checkpointHoles)`
+						);
 				}
 			} else {
 				const routeId = routeRowId();
