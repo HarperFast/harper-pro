@@ -20,8 +20,9 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 	const contexts = [];
 	const retiredNodes = [];
 	let lastStatuses;
-	const start = (context, i) =>
+	const start = (context, i, env) =>
 		startHarper(context, {
+			env,
 			config: {
 				threads: { count: 1 },
 				analytics: { aggregatePeriod: -1 },
@@ -306,7 +307,9 @@ export class BootstrapLocal extends Resource {
 				{ timeoutMs: 30_000, description: 'peer holds a committed cursor above the older reservation' }
 			);
 			await stopNodeProcess(contexts[2].harper);
-			await start(contexts[2], 2);
+			// a level-2 route resumes just below its certified floor, which the held reservation keeps below itself, so
+			// it needs no wait; at level 1 the peer resumes at its cursor above the reservation, the start this admits
+			await start(contexts[2], 2, { HARPER_TEST_FORCE_ORIGIN_FLOORS_LEVEL_1: '1' });
 			await waitForCondition(
 				async () => {
 					const log = await readFile(join(node.logDir ?? join(node.dataRootDir, 'test-logs'), 'hdb.log'), 'utf8');
