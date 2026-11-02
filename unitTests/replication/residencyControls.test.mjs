@@ -2658,6 +2658,54 @@ describe('Declarative tables keep control and event traffic independent of place
 				}
 			}));
 
+	it('delivers route marks a closed queue refused through a replacement that becomes ready later', () =>
+		atCheckpointLevel(async () => {
+			const peer = 'slot-control-peer';
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+			const { Records, socket, database } = await connect(
+				false,
+				'refused_route_marks',
+				true,
+				checkpointCapabilities(),
+				undefined,
+				connection
+			);
+			const subscription = databaseSubscriptions.get(database);
+			const send = subscription.send;
+			let resolvePlaceholder;
+			const placeholder = new Promise((resolve) => (resolvePlaceholder = resolve));
+			let refused = 0;
+			subscription.send = function (event) {
+				if (event.type === 'end_txn' && event.originRouteStates?.length && refused++ === 0) {
+					// the queue closed and the database now holds a placeholder for its replacement
+					databaseSubscriptions.set(database, placeholder);
+					setTimeout(() => {
+						databaseSubscriptions.set(database, subscription);
+						resolvePlaceholder(subscription);
+					}, 300);
+					return false;
+				}
+				return send.call(this, event);
+			};
+			try {
+				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				socket.emit('message', encode([148, Date.now() + 100, 1]));
+				await until(
+					() =>
+						Records.dbisDB
+							.getSync([SEQ, peerId])
+							?.nodes?.some((node) => node.id === peerId && node.partialHistory === true) || socket.closes.length
+				);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(refused > 1, true, 'the marks were sent again after the refusal');
+			} finally {
+				subscription.send = send;
+				databaseSubscriptions.set(database, subscription);
+			}
+		}));
+
 	it('certifies a floor-only start only from a socket’s first subscription request', () =>
 		atCheckpointLevel(async () => {
 			const peer = 'slot-control-peer';

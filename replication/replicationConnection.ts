@@ -7010,10 +7010,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	/**
 	 * A closed queue takes an event without calling its onCommit or onFailure, so the event's marks stay pending and
 	 * a cursor removal it carried goes back in line. The cached subscription is not retired, so the replacement the
-	 * database now holds, if any, is taken explicitly.
+	 * database now holds, if any, is taken explicitly, and a placeholder is adopted once it resolves: nothing marks it
+	 * retired, so the retries would otherwise keep reading the placeholder.
 	 */
 	function afterRefusedSend(removalNodeId?: number): void {
-		tableSubscriptionToReplicator = subscriptionForDatabase(databaseName, dbSubscriptions);
+		const replacement = subscriptionForDatabase(databaseName, dbSubscriptions);
+		tableSubscriptionToReplicator = replacement;
+		if (replacement?.then)
+			(replacement as Promise<DatabaseSubscription | undefined>)
+				.then((resolved) => {
+					if (resolved?.send && tableSubscriptionToReplicator === replacement && !connectionSuperseded())
+						tableSubscriptionToReplicator = resolved;
+				})
+				.catch((error) => logger.warn?.(connectionId, 'replacement subscription failed for', databaseName, error));
 		if (removalNodeId !== undefined) deferCopyCursorRemoval(removalNodeId);
 		else scheduleRouteStateFlushRetry();
 	}
