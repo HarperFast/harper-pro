@@ -11099,7 +11099,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					committedSequence = Math.max(committedSequence, endTxnEvent.localTime ?? 0);
 					if (failedFrameAttempts.size > 0) {
 						const peerKey = `${remoteNodeName}/${databaseName}`;
-						if (endTxnEvent.localTime >= failedFrameAttempts.get(peerKey)?.position)
+						// a failure that named no position is behind any later positioned commit
+						if (
+							endTxnEvent.localTime !== undefined &&
+							!(failedFrameAttempts.get(peerKey)?.position > endTxnEvent.localTime)
+						)
 							failedFrameAttempts.delete(peerKey);
 					}
 					// Advance the durable watermark WITHOUT awaiting blobs — for copy AND non-copy frames alike.
