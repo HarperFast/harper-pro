@@ -199,6 +199,20 @@ describe('CopyStallTracker', () => {
 		expect(stall.noteRefusal(STUCK_COPY_OWNER_REFUSED)).to.equal(undefined);
 	});
 
+	it('restarts the hold at its floor after a quiet clear once progress or a new position comes', () => {
+		for (const recover of [(stall) => stall.noteDurableProgress(), (stall) => stall.noteCopyStart('elsewhere')]) {
+			const { stall } = tracker(2);
+			stall.noteRefusal(STUCK_COPY_OWNER_REFUSED);
+			stall.noteClosed();
+			stall.noteOpened();
+			stall.noteSessionQuiet();
+			recover(stall);
+			stall.noteOpened();
+			stall.noteRefusal(STUCK_COPY_OWNER_REFUSED);
+			expect(stall.noteClosed().holdMs).to.equal(COPY_STALL_HOLD_MIN_MS);
+		}
+	});
+
 	it('leaves the shared status untouched for progress on a leg with nothing stuck', () => {
 		const { stall, status } = tracker();
 		status.fill(7);

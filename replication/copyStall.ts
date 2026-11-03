@@ -80,7 +80,8 @@ export class CopyStallTracker {
 		if (startKey !== this.startKey) {
 			this.attempts = 1;
 			this.startKey = startKey;
-			return this.state === STUCK_COPY_HELD || this.state === STUCK_COPY_RETRYING ? this.clear() : undefined;
+			// a hold reported or escalated for another position no longer applies; a refusal is settled at close
+			return this.state !== STUCK_COPY_REFUSED && (this.state || this.hold.attempts) ? this.clear() : undefined;
 		}
 		this.attempts++;
 		// a refused leg is settled at close, so repeated refusals do not flap through retrying
@@ -102,7 +103,7 @@ export class CopyStallTracker {
 	}
 
 	noteDurableProgress(): StuckCopyTransition | undefined {
-		if (!this.attempts && this.startKey === undefined && !this.state) return;
+		if (!this.attempts && this.startKey === undefined && !this.state && !this.hold.attempts) return;
 		this.attempts = 0;
 		this.startKey = undefined;
 		return this.clear();
