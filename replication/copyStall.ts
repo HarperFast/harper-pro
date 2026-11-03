@@ -25,7 +25,14 @@ const REASONS = [
 export const COPY_STALL_HOLD_MIN_MS = 60_000;
 export const COPY_STALL_HOLD_MAX_MS = 15 * 60_000;
 
-export type StuckCopyTransition = { from: number; to: number; count: number; reason: number; holdMs?: number };
+export type StuckCopyTransition = {
+	from: number;
+	to: number;
+	count: number;
+	reason: number;
+	holdMs?: number;
+	quiet?: boolean;
+};
 
 /**
  * The receiving leg's view of a copy that does not finish (harper-pro#1235, #1231): attempts started from one
@@ -103,9 +110,12 @@ export class CopyStallTracker {
 
 	// an idle leg may never deliver the durable progress that otherwise clears its state
 	noteSessionQuiet(): StuckCopyTransition | undefined {
-		if (this.sessionStarted || this.sessionRefused) return;
-		// the attempt count stays: a copy can start after this, and only progress resets it
-		return this.clear();
+		if (this.sessionStarted || this.sessionRefused || !this.state) return;
+		// only what is reported: a copy can start after this, and only progress resets the count or the hold
+		const from = this.state;
+		this.state = this.reason = this.count = this.since = this.retryAt = 0;
+		this.publish();
+		return { from, to: 0, count: 0, reason: 0, quiet: true };
 	}
 
 	/**
@@ -206,6 +216,8 @@ export function describeStuckCopy(transition: StuckCopyTransition): string {
 				? `refused a copy this node cannot accept; reconnects are held: ${reason}`
 				: `refused a copy this node cannot accept; reconnecting on the ordinary schedule: ${reason}`;
 		default:
-			return 'copy is progressing again';
+			return transition.quiet
+				? 'no copy started this session; cleared the stuck-copy report'
+				: 'copy is progressing again';
 	}
 }

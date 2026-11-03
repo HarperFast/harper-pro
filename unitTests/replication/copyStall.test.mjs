@@ -150,11 +150,13 @@ describe('CopyStallTracker', () => {
 		expect(readStuckCopy(status)).to.include({ state: 'held' });
 		stall.noteClosed();
 		stall.noteOpened();
-		expect(stall.noteSessionQuiet()).to.include({ from: STUCK_COPY_HELD, to: 0 });
+		expect(stall.noteSessionQuiet()).to.include({ from: STUCK_COPY_HELD, to: 0, quiet: true });
 		expect(readStuckCopy(status)).to.equal(undefined);
-		// a copy that starts late in the session still counts from where the attempts were
+		// a copy that starts late in the session still counts from where the attempts were, and its hold
+		// keeps doubling
 		stall.noteCopyStart('k');
 		expect(stall.attempts).to.equal(4);
+		expect(stall.noteClosed().holdMs).to.be.at.least(COPY_STALL_HOLD_MIN_MS * 4 - 1);
 	});
 
 	it('holds a later copy that fails at one position on a leg an earlier refusal left refused', () => {
