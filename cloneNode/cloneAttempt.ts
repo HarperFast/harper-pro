@@ -99,7 +99,6 @@ export function liveCloneAttempt(rootPath: string = get(CONFIG_PARAMS.ROOTPATH))
 	return marker.attemptId === attemptId && !retired(marker) ? attemptId : undefined;
 }
 
-/** Undefined while unfinished; NaN when the recorded time is not a number. */
 function completionTime(marker: CloneAttemptMarker | undefined): number | undefined {
 	const completedAt = marker?.completedAt ?? process.env[CLONE_COMPLETED_AT_ENV];
 	if (completedAt === undefined) return undefined;

@@ -102,16 +102,25 @@ export async function poison(database: string, origin: string, table: string, re
 }
 
 /**
- * Before a copy's first row. A home-map row created during the clone attempt in flight was created on
- * the storage being copied into; any other row may predate it. Resolves true while the flag is set, so
- * the caller re-runs its durability barrier on every copy; a failed read writes nothing.
+ * Before a copy's first row. A clone's copy passes a reader for its live attempt; a sharding snapshot
+ * recovery passes none and refuses over any home-map row. A row created during the live attempt was
+ * created on the storage being copied into; any other may predate it. Resolves true while the flag is
+ * set, so the caller repeats its durability barrier on every copy; a failed read writes nothing.
  */
-export async function markReclonedIfLockHistory(database: string, cloneAttempt: string | undefined): Promise<boolean> {
+export async function markReclonedIfLockHistory(
+	database: string,
+	liveCloneAttempt: (() => string | undefined) | undefined
+): Promise<boolean> {
 	const dbisDB = dbisFor(database);
 	if (!dbisDB) throw new Error(`no dbis store for ${database} to record the reclone in`);
 	if (dbisDB.getSync([RECLONED]) === true) return true;
 	const row = await existingHomesRow(database);
-	if (!row || (cloneAttempt !== undefined && row.cloneAttempt === cloneAttempt)) return false;
+	if (!row) return false;
+	if (liveCloneAttempt) {
+		// Read only once a row exists, so an unreadable marker stops only the copies it could change.
+		const attempt = liveCloneAttempt();
+		if (attempt === undefined || row.cloneAttempt === attempt) return false;
+	}
 	await dbisDB.put([RECLONED], true);
 	logger.warn?.(
 		`Record locks: ${database} is being copied over record-lock state this node held before the copy; cluster locks that depend on this node's own earlier writes are refused from now on`

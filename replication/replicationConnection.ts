@@ -8260,20 +8260,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (databaseName && (cloneAttempt || missingShardingOriginStart(databaseName))) {
 							// Durable before the first copied row, so a crash mid-copy leaves the flag, never the ambiguity.
 							try {
-								// Snapshot recovery refuses over any home-map row, even one this attempt created, so it
-								// passes no attempt. The raw variable outlives the attempt in every worker; only a live
-								// attempt counts.
-								const shardingRecovery = missingShardingOriginStart(databaseName);
-								const liveAttempt = !shardingRecovery && cloneAttempt ? liveCloneAttempt() : undefined;
-								if (shardingRecovery || liveAttempt !== undefined) {
-									const flagged = await markReclonedIfLockHistory(databaseName, liveAttempt);
-									if (connectionSuperseded()) return;
-									if (flagged) {
-										for (const { catalog } of shardingNativeRoots(databaseName)) {
-											if (typeof catalog.flush === 'function') await catalog.flush({ allowWriteStall: true });
-											else await catalog.flushed; // LMDB exposes its durability barrier as a promise.
-											if (connectionSuperseded()) return;
-										}
+								// The raw variable outlives the attempt in every worker; only a live attempt counts.
+								const flagged = await markReclonedIfLockHistory(
+									databaseName,
+									missingShardingOriginStart(databaseName) ? undefined : liveCloneAttempt
+								);
+								if (connectionSuperseded()) return;
+								if (flagged) {
+									for (const { catalog } of shardingNativeRoots(databaseName)) {
+										if (typeof catalog.flush === 'function') await catalog.flush({ allowWriteStall: true });
+										else await catalog.flushed; // LMDB exposes its durability barrier as a promise.
+										if (connectionSuperseded()) return;
 									}
 								}
 							} catch (error) {

@@ -51,7 +51,7 @@ describe('the ever-recloned flag marks only a copy over earlier record-lock stat
 
 	it('leaves a first join unflagged: no home-map row, though the database holds writes of its own', async () => {
 		await databaseWithOwnWrites('recloneFirstJoin');
-		assert.strictEqual(await markReclonedIfLockHistory('recloneFirstJoin', 'attempt-a'), false);
+		assert.strictEqual(await markReclonedIfLockHistory('recloneFirstJoin', () => 'attempt-a'), false);
 		assert.strictEqual(await markReclonedIfLockHistory('recloneFirstJoin', undefined), false);
 		assert.strictEqual(everRecloned('recloneFirstJoin'), false);
 	});
@@ -61,7 +61,7 @@ describe('the ever-recloned flag marks only a copy over earlier record-lock stat
 		inAttempt('attempt-a');
 		await stage('recloneMidClone');
 		assert.strictEqual((await currentRow('recloneMidClone')).cloneAttempt, 'attempt-a');
-		assert.strictEqual(await markReclonedIfLockHistory('recloneMidClone', 'attempt-a'), false);
+		assert.strictEqual(await markReclonedIfLockHistory('recloneMidClone', () => 'attempt-a'), false);
 		assert.strictEqual(everRecloned('recloneMidClone'), false);
 	});
 
@@ -69,7 +69,7 @@ describe('the ever-recloned flag marks only a copy over earlier record-lock stat
 		await databaseWithOwnWrites('recloneLaterAttempt');
 		inAttempt('attempt-a');
 		await stage('recloneLaterAttempt');
-		assert.strictEqual(await markReclonedIfLockHistory('recloneLaterAttempt', 'attempt-b'), true);
+		assert.strictEqual(await markReclonedIfLockHistory('recloneLaterAttempt', () => 'attempt-b'), true);
 		assert.strictEqual(everRecloned('recloneLaterAttempt'), true);
 	});
 
@@ -77,7 +77,7 @@ describe('the ever-recloned flag marks only a copy over earlier record-lock stat
 		await databaseWithOwnWrites('recloneOverInstall');
 		await stage('recloneOverInstall');
 		assert.strictEqual((await currentRow('recloneOverInstall')).cloneAttempt, undefined);
-		assert.strictEqual(await markReclonedIfLockHistory('recloneOverInstall', 'attempt-b'), true);
+		assert.strictEqual(await markReclonedIfLockHistory('recloneOverInstall', () => 'attempt-b'), true);
 		assert.strictEqual(everRecloned('recloneOverInstall'), true);
 	});
 
@@ -97,11 +97,29 @@ describe('the ever-recloned flag marks only a copy over earlier record-lock stat
 		assert.strictEqual(everRecloned('recloneSharding'), true);
 	});
 
+	it('reads the clone marker only once a row exists, so an unreadable one stops only the copies it could change', async () => {
+		await databaseWithOwnWrites('recloneUnreadableMarker');
+		const unreadable = () => {
+			throw new Error('unreadable marker');
+		};
+		assert.strictEqual(await markReclonedIfLockHistory('recloneUnreadableMarker', unreadable), false);
+		await stage('recloneUnreadableMarker');
+		await assert.rejects(markReclonedIfLockHistory('recloneUnreadableMarker', unreadable), /unreadable marker/);
+		assert.strictEqual(everRecloned('recloneUnreadableMarker'), false, 'nothing written');
+	});
+
+	it('does not flag a copy whose attempt has retired, though the variable lingers', async () => {
+		await databaseWithOwnWrites('recloneRetiredCopy');
+		await stage('recloneRetiredCopy');
+		assert.strictEqual(await markReclonedIfLockHistory('recloneRetiredCopy', () => undefined), false);
+		assert.strictEqual(everRecloned('recloneRetiredCopy'), false);
+	});
+
 	it('keeps answering true for a flag already set, so every copy repeats the durability barrier', async () => {
 		await databaseWithOwnWrites('recloneAlreadyFlagged');
 		await stage('recloneAlreadyFlagged');
 		assert.strictEqual(await markReclonedIfLockHistory('recloneAlreadyFlagged', undefined), true);
-		assert.strictEqual(await markReclonedIfLockHistory('recloneAlreadyFlagged', 'attempt-a'), true);
+		assert.strictEqual(await markReclonedIfLockHistory('recloneAlreadyFlagged', () => 'attempt-a'), true);
 		assert.strictEqual(everRecloned('recloneAlreadyFlagged'), true);
 	});
 
