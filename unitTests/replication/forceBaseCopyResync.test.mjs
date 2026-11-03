@@ -69,45 +69,32 @@ describe('shouldForceBaseCopyForRetention', () => {
 	describe('with a purge bound from the source (harper-pro#1229)', () => {
 		const now = Date.now();
 		const cutoff = now - RETENTION;
+		const forced = (start, bound) => replayStartUnderPurge(['local'], start, undefined, () => bound) !== undefined;
 
 		it('does NOT force a follower caught up on an idle source whose log was purged empty', () => {
 			const lastWrite = now - 5 * 86400 * 1000; // idle five days, past the three-day retention
-			expect(shouldForceBaseCopyForRetention(lastWrite, undefined, cutoff, lastWrite, cutoff)).to.equal(false);
+			expect(forced(lastWrite, lastWrite)).to.equal(false);
 		});
 
 		it('does NOT force a follower of a log that was never written', () => {
 			const tracked = now - 10 * 86400 * 1000; // the floor when tracking began
-			const followerStart = now - 4 * 86400 * 1000;
-			expect(shouldForceBaseCopyForRetention(followerStart, undefined, cutoff, tracked, cutoff)).to.equal(false);
+			expect(forced(now - 4 * 86400 * 1000, tracked)).to.equal(false);
 		});
 
 		it('forces a follower that missed entries a prune removed, even with the log now empty', () => {
-			const followerStart = now - 6 * 86400 * 1000;
-			const newestPurged = now - 5 * 86400 * 1000;
-			expect(shouldForceBaseCopyForRetention(followerStart, undefined, cutoff, newestPurged, cutoff)).to.equal(true);
+			expect(forced(now - 6 * 86400 * 1000, now - 5 * 86400 * 1000)).to.equal(true);
 		});
 
 		it('forces a follower behind a manual purge whose cutoff is past nominal retention', () => {
 			// delete_transaction_logs_before at now - 1h emptied a log written until then; the follower is at now - 2h
-			const followerStart = now - 2 * 3600 * 1000;
-			const purgedThrough = now - 3600 * 1000;
-			expect(shouldForceBaseCopyForRetention(followerStart, undefined, cutoff, purgedThrough, purgedThrough)).to.equal(
-				true
-			);
-		});
-
-		it('trusts the bound over the oldest retained entry', () => {
-			// entries between the start and the oldest retained one never existed: nothing was purged above the start
-			expect(shouldForceBaseCopyForRetention(1000, 5000, 3000, 900, 3000)).to.equal(false);
+			expect(forced(now - 2 * 3600 * 1000, now - 3600 * 1000)).to.equal(true);
 		});
 
 		it('falls back to the audit floor when the store has no trusted bound', () => {
 			// no bound: a manual purge past nominal retention is still caught through the floor it recorded
-			expect(shouldForceBaseCopyForRetention(now - 7200_000, undefined, cutoff, undefined, now - 3600_000)).to.equal(
-				true
-			);
+			expect(shouldForceBaseCopyForRetention(now - 7200_000, undefined, cutoff, now - 3600_000)).to.equal(true);
 			// an unknown floor (Infinity) is ignored, leaving the oldest entry and nominal cutoff
-			expect(shouldForceBaseCopyForRetention(now - 3600_000, undefined, cutoff, undefined, Infinity)).to.equal(false);
+			expect(shouldForceBaseCopyForRetention(now - 3600_000, undefined, cutoff, Infinity)).to.equal(false);
 		});
 	});
 

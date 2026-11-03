@@ -39,16 +39,26 @@ describe('unnamed origins in the replication id map', () => {
 		);
 	});
 
-	it('names an unnamed origin even after an earlier version minted its derived name to another id', () => {
+	it('names each unnamed origin the same way after an earlier version minted a derived name to another id', () => {
 		const auditStore = freshAuditStore();
-		const name = unnamedOriginName(getThisNodeName(), 777);
+		const ownName = (id) => unnamedOriginName(getThisNodeName(), id);
 		// what a 5.3 node stores when a peer relays the derived name back to it (harper-pro#1246)
-		const minted = getIdOfRemoteNode(name, auditStore);
-		assert.strictEqual(exportIdMappingWithUnnamed(auditStore, [777])[name], 777);
-		// that other id, if it is sent too, keeps a name a receiver can translate
+		const minted = getIdOfRemoteNode(ownName(777), auditStore);
+		assert.deepStrictEqual(exportIdMappingWithUnnamed(auditStore, [777]), {
+			[getThisNodeName()]: 0,
+			[ownName(777)]: 777,
+		});
+		assert.deepStrictEqual(exportIdMappingWithUnnamed(auditStore, [minted]), {
+			[getThisNodeName()]: 0,
+			[ownName(minted)]: minted,
+		});
 		const both = exportIdMappingWithUnnamed(auditStore, [minted, 777]);
-		assert.strictEqual(both[name], 777);
-		assert.strictEqual(both[unnamedOriginName(getThisNodeName(), minted)], minted);
+		assert.strictEqual(both[ownName(777)], 777);
+		assert.strictEqual(both[ownName(minted)], minted);
+		// a peer relaying either name back maps it home, adding no identity
+		const home = translateIdMap({ [ownName(777)]: 5, [ownName(minted)]: 6 }, auditStore);
+		assert.strictEqual(home.get(5), 777);
+		assert.strictEqual(home.get(6), minted);
 	});
 
 	it('maps its own derived name home, until that id is given to a node', () => {

@@ -679,28 +679,23 @@ export let leadingDuplicateSkipCount = 0;
  * (data loss) or replay an unbounded history (the heap-unbounded path that OOMs, harper#1114). Returning
  * true routes the peer through the base-copy path (startTime = 0). See harper-pro#277.
  *
- * `purgeBound` is core's upper bound on every key a prune removed from the logs the peer reads
- * (`getLogPurgeBounds`). When the store has one, a start at or past it missed nothing a prune took, whatever
- * the start's age: a source that wrote nothing has an idle or empty log, not a gap (harper-pro#1229). When it
- * has none, the floor is the oldest retained entry, the nominal cutoff or the recorded audit floor, whichever
- * is highest — an empty log alone cannot tell "never written" from "fully purged".
+ * Used only when the store has no trusted purge bound (`replayStartUnderPurge` decides otherwise,
+ * harper-pro#1229): the floor is then the oldest retained entry, the nominal cutoff or the recorded audit
+ * floor, whichever is highest — an empty log alone cannot tell "never written" from "fully purged".
  *
  * @param requestedStartTime peer's requested incremental start (epoch ms); 0 already means base copy
  * @param oldestRetainedTime timestamp of the oldest retained audit entry, or undefined if none retained
  * @param retentionCutoffTime Date.now() - auditRetention, the nominal time-based purge floor
- * @param purgeBound core's purge bound for the peer's logs, or undefined when the store cannot give one
  * @param auditFloor the database's recorded audit floor (Infinity when unknown)
  */
 export function shouldForceBaseCopyForRetention(
 	requestedStartTime: number,
 	oldestRetainedTime: number | undefined,
 	retentionCutoffTime: number,
-	purgeBound?: number,
 	auditFloor?: number
 ): boolean {
 	// 0 means a base copy was already requested; guard against non-positive/NaN starts too.
 	if (!(requestedStartTime > 0)) return false;
-	if (purgeBound !== undefined) return requestedStartTime < purgeBound;
 	const floor = auditFloor !== undefined && Number.isFinite(auditFloor) ? auditFloor : 0;
 	return requestedStartTime < Math.max(oldestRetainedTime ?? 0, retentionCutoffTime, floor);
 }
@@ -760,30 +755,38 @@ const SKIP_ORIGIN_NAMING_FOR_TEST = process.env.HARPER_TEST_SKIP_ORPHAN_ORIGIN_N
 const COPY_APPLY_FAILURE_KEY_FOR_TEST = process.env.HARPER_TEST_COPY_APPLY_FAILURE_KEY;
 
 /**
+ * The stored id map without names derived for this node's own unnamed origins. Such a name names no node; an
+ * earlier version stores it, under a new id, when a peer relays it back (harper-pro#1246).
+ */
+function idMappingOfNodes(auditStore: any, thisNodeName: string): Record<string, number> {
+	const stored = exportIdMapping(auditStore);
+	let nodes = stored;
+	for (const name in stored) {
+		if (ownUnnamedOriginId(name, thisNodeName) === undefined) continue;
+		if (nodes === stored) nodes = { ...stored };
+		delete nodes[name];
+	}
+	return nodes;
+}
+
+/**
  * The id map a sender sends: every named origin, plus a name for each sent origin id this node has none for
  * (v4-era data, a node whose mapping is gone), so the receiver can translate every row (harper-pro#1235).
  * The name is derived, not stored here, so this node's own reading of the id does not change; a peer that
- * relays it back is mapped home by `translateIdMap`. An earlier version may have minted the derived name to
- * another id when a peer relayed it back (harper-pro#1246); the rows are still this id's, and relays now come
- * home to it, so the name goes out with this id, and that other id, if sent, under its own derived name.
+ * relays it back is mapped home by `translateIdMap`.
  */
 export function exportIdMappingWithUnnamed(auditStore: any, sentNodeIds: Iterable<number>): Record<string, number> {
-	const nameToId = exportIdMapping(auditStore);
-	if (SKIP_ORIGIN_NAMING_FOR_TEST) return nameToId;
+	if (SKIP_ORIGIN_NAMING_FOR_TEST) return exportIdMapping(auditStore);
 	const thisNodeName = getThisNodeName();
-	const sent = new Set(sentNodeIds);
+	const nameToId = idMappingOfNodes(auditStore, thisNodeName);
 	let named: Set<number> | undefined;
 	let exported = nameToId;
-	for (const id of sent) {
+	for (const id of sentNodeIds) {
 		if (!(Number.isSafeInteger(id) && id > 0)) continue;
 		named ??= new Set(Object.values(nameToId));
 		if (named.has(id)) continue;
-		const name = unnamedOriginName(thisNodeName, id);
 		if (exported === nameToId) exported = { ...nameToId };
-		const displaced = nameToId[name];
-		exported[name] = id;
-		if (displaced !== undefined && sent.has(displaced))
-			exported[unnamedOriginName(thisNodeName, displaced)] = displaced;
+		exported[unnamedOriginName(thisNodeName, id)] = id;
 	}
 	return exported;
 }
@@ -806,10 +809,10 @@ export function translateIdMap(remoteMapping: Record<string, number>, auditStore
 	const translated = remoteToLocalNodeId(named ?? remoteMapping, auditStore);
 	if (!own) return translated;
 	// after the mint above, so a peer it just named cannot share the id
-	const localIds = new Set(Object.values(exportIdMapping(auditStore)));
+	const nodeIds = new Set(Object.values(idMappingOfNodes(auditStore, thisNodeName)));
 	for (const [name, remoteId] of own) {
 		const ownId = ownUnnamedOriginId(name, thisNodeName);
-		translated.set(remoteId, localIds.has(ownId) ? getIdOfRemoteNode(name, auditStore) : ownId);
+		translated.set(remoteId, nodeIds.has(ownId) ? getIdOfRemoteNode(name, auditStore) : ownId);
 	}
 	return translated;
 }
@@ -10000,7 +10003,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// LMDB has one bound for every name; every bound carries the epoch, which an empty scope would drop
 												const purgeScope = scopedLogs?.length ? scopedLogs : [oldestLogName];
 												const purgeBounds = getLogPurgeBounds(auditStore, purgeScope);
-												const purgeBound = purgeBounds && Math.max(0, ...purgeBounds.values());
 												const purgedLog = purgeBounds
 													? replayStartUnderPurge(purgeScope, currentSequenceId, originFloors, (name) =>
 															purgeBounds.get(name)
@@ -10017,7 +10019,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																	currentSequenceId,
 																	oldestRetainedTime,
 																	Date.now() - auditRetention,
-																	purgeBound,
 																	getAuditFloor(auditStore)
 																)))
 												) {
@@ -10026,7 +10027,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													logger.warn?.(
 														purgedLog
 															? `Peer ${remoteNodeName} requested replication of database ${databaseName}, whose log ${purgedLog.log} it would replay from ${new Date(purgedLog.start).toISOString()}, under transaction-log history purged through ${purgedThrough(purgedLog.bound)}; forcing a bounded base-copy resync.`
-															: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purged through ${purgedThrough(purgeBound)}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
+															: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purge bound unknown, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
 													);
 													currentSequenceId = 0;
 												}
