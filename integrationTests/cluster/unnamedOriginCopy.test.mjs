@@ -12,12 +12,14 @@
  *   position, reports `stuckCopy: held`, and the sender stops copying to it for the hold.
  * RocksDB additionally runs the mixed-version pairings, through HARPER_TEST_SKIP_ORPHAN_ORIGIN_NAMING: a
  * receiver that throws on an untranslatable origin (as before) behind a sender that names its unnamed
- * origins, and a sender that does not name them in front of a receiver that does.
+ * origins, including after an older version minted the derived name to another id on the sender
+ * (harper-pro#1246), and a sender that does not name them in front of a receiver that does.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal, deepEqual } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
+import { unpack } from 'msgpackr';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, stopAndTeardownNodes, waitForCondition, readLog } from './clusterShared.mjs';
 
@@ -142,11 +144,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 		});
 
 		if (engine === 'rocksdb') {
-			test('a receiver that cannot translate an unnamed origin copies from a sender that names it', async () => {
-				await copiesEverything(await startNode({ HARPER_TEST_SKIP_ORPHAN_ORIGIN_NAMING: '1' }), sender);
-			});
-
-			test('a sender that does not name its unnamed origins copies to a receiver that names them', async () => {
+			async function restartSender(env = {}) {
 				await killHarper({ harper: sender });
 				const restarted = (
 					await startHarper(
@@ -158,11 +156,38 @@ for (const engine of ['rocksdb', 'lmdb']) {
 								replication: { port: sender.hostname + ':9933', securePort: null, databases: ['data'] },
 								unnamedOriginFixture: { package: join(TEST_DIR, 'fixture-unnamed-origin') },
 							},
-							env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_SKIP_ORPHAN_ORIGIN_NAMING: '1' },
+							env: { HARPER_NO_FLUSH_ON_EXIT: true, ...env },
 						}
 					)
 				).harper;
 				Object.assign(sender, restarted);
+			}
+
+			test('a receiver that cannot translate an unnamed origin copies from a sender that names it', async () => {
+				await copiesEverything(await startNode({ HARPER_TEST_SKIP_ORPHAN_ORIGIN_NAMING: '1' }), sender);
+			});
+
+			test('a sender still names its unnamed origin after an older version minted that name to another id', async () => {
+				// a 5.3 node persists the derived name under a new id when a peer relays it back, then upgrades (harper-pro#1246)
+				const auth = {
+					Authorization: 'Basic ' + Buffer.from(`${sender.admin.username}:${sender.admin.password}`).toString('base64'),
+				};
+				const { record } = await (await fetch(`${sender.httpURL}/NodeIdMappingRecord`, { headers: auth })).json();
+				const { remoteNameToId } = unpack(Buffer.from(record, 'base64'));
+				remoteNameToId[`unnamed-origin-${UNNAMED_ORIGIN}@${sender.hostname}`] =
+					Math.max(...Object.values(remoteNameToId)) + 1;
+				const written = await fetch(`${sender.httpURL}/NodeIdMappingRecord`, {
+					method: 'POST',
+					headers: { ...auth, 'Content-Type': 'application/json' },
+					body: JSON.stringify({ nodeName: sender.hostname, remoteNameToId }),
+				});
+				equal(written.status, 200, await written.text());
+				await restartSender();
+				await copiesEverything(await startNode({ HARPER_TEST_SKIP_ORPHAN_ORIGIN_NAMING: '1' }), sender);
+			});
+
+			test('a sender that does not name its unnamed origins copies to a receiver that names them', async () => {
+				await restartSender({ HARPER_TEST_SKIP_ORPHAN_ORIGIN_NAMING: '1' });
 				await copiesEverything(await startNode(), sender);
 			});
 		}

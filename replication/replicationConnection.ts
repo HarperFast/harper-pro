@@ -763,22 +763,27 @@ const COPY_APPLY_FAILURE_KEY_FOR_TEST = process.env.HARPER_TEST_COPY_APPLY_FAILU
  * The id map a sender sends: every named origin, plus a name for each sent origin id this node has none for
  * (v4-era data, a node whose mapping is gone), so the receiver can translate every row (harper-pro#1235).
  * The name is derived, not stored here, so this node's own reading of the id does not change; a peer that
- * relays it back is mapped home by `translateIdMap`. A derived name this node already maps (an earlier
- * version minted it on relay) keeps its own id.
+ * relays it back is mapped home by `translateIdMap`. An earlier version may have minted the derived name to
+ * another id when a peer relayed it back (harper-pro#1246); the rows are still this id's, and relays now come
+ * home to it, so the name goes out with this id, and that other id, if sent, under its own derived name.
  */
 export function exportIdMappingWithUnnamed(auditStore: any, sentNodeIds: Iterable<number>): Record<string, number> {
 	const nameToId = exportIdMapping(auditStore);
 	if (SKIP_ORIGIN_NAMING_FOR_TEST) return nameToId;
+	const thisNodeName = getThisNodeName();
+	const sent = new Set(sentNodeIds);
 	let named: Set<number> | undefined;
 	let exported = nameToId;
-	for (const id of sentNodeIds) {
+	for (const id of sent) {
 		if (!(Number.isSafeInteger(id) && id > 0)) continue;
 		named ??= new Set(Object.values(nameToId));
 		if (named.has(id)) continue;
-		const name = unnamedOriginName(getThisNodeName(), id);
-		if (nameToId[name] !== undefined) continue;
+		const name = unnamedOriginName(thisNodeName, id);
 		if (exported === nameToId) exported = { ...nameToId };
+		const displaced = nameToId[name];
 		exported[name] = id;
+		if (displaced !== undefined && sent.has(displaced))
+			exported[unnamedOriginName(thisNodeName, displaced)] = displaced;
 	}
 	return exported;
 }

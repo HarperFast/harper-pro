@@ -39,11 +39,16 @@ describe('unnamed origins in the replication id map', () => {
 		);
 	});
 
-	it('keeps the id of a derived name this node already maps', () => {
+	it('names an unnamed origin even after an earlier version minted its derived name to another id', () => {
 		const auditStore = freshAuditStore();
 		const name = unnamedOriginName(getThisNodeName(), 777);
+		// what a 5.3 node stores when a peer relays the derived name back to it (harper-pro#1246)
 		const minted = getIdOfRemoteNode(name, auditStore);
-		assert.strictEqual(exportIdMappingWithUnnamed(auditStore, [777])[name], minted);
+		assert.strictEqual(exportIdMappingWithUnnamed(auditStore, [777])[name], 777);
+		// that other id, if it is sent too, keeps a name a receiver can translate
+		const both = exportIdMappingWithUnnamed(auditStore, [minted, 777]);
+		assert.strictEqual(both[name], 777);
+		assert.strictEqual(both[unnamedOriginName(getThisNodeName(), minted)], minted);
 	});
 
 	it('maps its own derived name home, until that id is given to a node', () => {
