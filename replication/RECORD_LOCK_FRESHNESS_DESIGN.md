@@ -91,9 +91,10 @@ record of that origin and table this node dropped or failed to apply. Those are 
     returns barrier positions), and it appends those only under an active generation, which lives in
     that row (LOCAL_ONLY, never deleted, never cloned). So a first join, which has no row when its
     copy starts, is never flagged (harper-pro#1236). A row created during the clone attempt now in
-    flight carries that attempt's id (`cloneAttempt`, set only at creation) and does not flag; any
-    other row does (an install cloned over, replaced database storage, a row from before the field
-    existed, a sharding recovery outside a clone). "In flight" is `liveCloneAttempt()`, not the raw
+    flight carries that attempt's id (`cloneAttempt`, set only at creation) and does not flag a copy
+    of that attempt; any other row does (an install cloned over, replaced database storage, a row from
+    before the field existed), and a sharding snapshot recovery (`missingShardingOriginStart`) flags
+    over any row, even inside an attempt. "In flight" is `liveCloneAttempt()`, not the raw
     `HARPER_CLONE_ATTEMPT`, which outlives the attempt in every worker; the row's tag is taken the same
     way. A database storage lost in the middle of a clone attempt needs `FORCE_CLONE`: resuming the same
     attempt would trust a row it tagged on the lost storage. With the flag set, every self-origin

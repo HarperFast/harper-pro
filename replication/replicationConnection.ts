@@ -8262,8 +8262,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							try {
 								// The raw variable outlives the attempt in every worker; only a live attempt counts.
 								const liveAttempt = cloneAttempt ? liveCloneAttempt() : undefined;
-								if (liveAttempt !== undefined || !cloneAttempt || missingShardingOriginStart(databaseName)) {
-									const flagged = await markReclonedIfLockHistory(databaseName, liveAttempt);
+								const shardingRecovery = missingShardingOriginStart(databaseName);
+								if (liveAttempt !== undefined || shardingRecovery) {
+									// Snapshot recovery refuses over any home-map row, even one this attempt created.
+									const flagged = await markReclonedIfLockHistory(
+										databaseName,
+										shardingRecovery ? undefined : liveAttempt
+									);
 									if (connectionSuperseded()) return;
 									if (flagged) {
 										for (const { catalog } of shardingNativeRoots(databaseName)) {

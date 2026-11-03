@@ -93,7 +93,7 @@ describe('the ever-recloned flag marks only a copy over earlier record-lock stat
 		assert.strictEqual((await currentRow('recloneAfterRetire')).cloneAttempt, undefined);
 	});
 
-	it('flags a copy outside a clone attempt, the sharding trigger, over any row', async () => {
+	it('flags a sharding recovery, which passes no attempt, over any row, even one the live attempt created', async () => {
 		await databaseWithOwnWrites('recloneSharding');
 		inAttempt('attempt-a');
 		await stage('recloneSharding');
