@@ -97,6 +97,8 @@ import {
 	isLockControlType,
 	readOriginClosedFloor,
 	getDatabaseGeneration,
+	getAuditFloor,
+	getLogPurgeBound,
 } from '../core/resources/auditStore.ts';
 import { isValidFloor, originFloorsDurable } from '../core/resources/originClosedFloor.ts';
 import {
@@ -657,34 +659,58 @@ const LEADING_DUP_SKIP_ENABLED = env.get(CONFIG_PARAMS.REPLICATION_LEADINGDUPLIC
 // Distinctive log substring tests grep for to confirm the fast-skip path engaged. Keep stable.
 export const LEADING_DUP_SKIP_LOG = 'leading-duplicate fast-skip';
 // Process-wide counter of records suppressed by the fast-skip, for in-process tests/observability.
-export let leadingDuplicateSkipCount = 0;
-
-/**
- * Decide whether an incremental replication start must be upgraded to a bounded base copy because
- * the requested start predates the transaction-log history the sender still retains. Audit-log
- * retention is time-based (auditRetention purges whole files by mtime), so a peer behind by more
- * than the retention window can no longer be caught up incrementally — the entries it needs were
- * purged. Serving it incremental replay instead would either silently skip the purged entries
- * (data loss) or replay an unbounded history (the heap-unbounded path that OOMs, harper#1114).
- * Returning true routes the peer through the existing base-copy path (startTime = 0). See harper-pro#277.
+export l/**
+ * Decide whether an incremental replication start must be upgraded to a bounded base copy because a prune
+ * may have removed an entry the peer has not received. Audit-log retention is time-based, so a peer behind
+ * the purge cannot be caught up incrementally: serving it replay would silently skip the purged entries
+ * (data loss) or replay an unbounded history (the heap-unbounded path that OOMs, harper#1114). Returning
+ * true routes the peer through the base-copy path (startTime = 0). See harper-pro#277.
  *
- * The retention floor is max(oldestRetainedTime, retentionCutoffTime): the oldest actually-retained
- * entry catches purges more aggressive than nominal retention (cleanup runs with a dynamic divisor),
- * while the cutoff catches a fully-purged/idle log whose data still lives in the primary store but
- * has no surviving audit entry to compare against.
+ * `purgeBound` is core's per-log upper bound on every key a prune removed from the logs the peer reads
+ * (`getLogPurgeBound`). When the store has one, a start at or past it missed nothing a prune took, whatever
+ * the start's age: a source that wrote nothing has an idle or empty log, not a gap (harper-pro#1229). When it
+ * has none, the floor is the oldest retained entry, the nominal cutoff or the recorded audit floor, whichever
+ * is highest — an empty log alone cannot tell "never written" from "fully purged".
  *
  * @param requestedStartTime peer's requested incremental start (epoch ms); 0 already means base copy
  * @param oldestRetainedTime timestamp of the oldest retained audit entry, or undefined if none retained
  * @param retentionCutoffTime Date.now() - auditRetention, the nominal time-based purge floor
+ * @param purgeBound core's purge bound for the peer's logs, or undefined when the store cannot give one
+ * @param auditFloor the database's recorded audit floor (Infinity when unknown)
  */
 export function shouldForceBaseCopyForRetention(
 	requestedStartTime: number,
 	oldestRetainedTime: number | undefined,
-	retentionCutoffTime: number
+	retentionCutoffTime: number,
+	purgeBound?: number,
+	auditFloor?: number
 ): boolean {
 	// 0 means a base copy was already requested; guard against non-positive/NaN starts too.
 	if (!(requestedStartTime > 0)) return false;
-	return requestedStartTime < Math.max(oldestRetainedTime ?? 0, retentionCutoffTime);
+	if (purgeBound !== undefined) return requestedStartTime < purgeBound;
+	const floor = auditFloor !== undefined && Number.isFinite(auditFloor) ? auditFloor : 0;
+	return requestedStartTime < Math.max(oldestRetainedTime ?? 0, retentionCutoffTime, floor);
+}
+
+/**
+ * The logs a subscription's replay reads, named as core's purge bounds name them: the subscribed log, or
+ * every log the aggregate range does not exclude. LMDB has one log, and the bound ignores the names.
+ */
+export function purgeBoundLogNames(
+	auditStore: any,
+	logName: string | undefined,
+	excludedNodes: string[] | undefined
+): string[] | undefined {
+	if (logName !== undefined) return [logName];
+	if (typeof auditStore?.loadLogs !== 'function') return undefined;
+	const names: string[] = [];
+	for (const log of auditStore.loadLogs()) {
+		if (log?.name && !excludedNodes?.includes(log.name)) names.push(log.name);
+	}
+	return names;
+}
+
+ime ?? 0, retentionCutoffTime);
 }
 
 export function hostnameFromNodeUrl(url: unknown): string | undefined {
@@ -9776,6 +9802,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													oldestRetainedTime = entry.txnLogKey;
 													break;
 												}
+												const purgeBound = getLogPurgeBound(
+													auditStore,
+													purgeBoundLogNames(auditStore, excludedNodes ? undefined : oldestLogName, excludedNodes)
+												);
 												if (
 													!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
@@ -9783,11 +9813,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													shouldForceBaseCopyForRetention(
 														currentSequenceId,
 														oldestRetainedTime,
-														Date.now() - auditRetention
+														Date.now() - auditRetention,
+														purgeBound,
+														getAuditFloor(auditStore)
 													)
 												) {
 													logger.warn?.(
-														`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
+														`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purged through ${purgeBound === undefined ? 'unknown' : new Date(purgeBound).toISOString()}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
 													);
 													currentSequenceId = 0;
 												}
