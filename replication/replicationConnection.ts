@@ -9252,10 +9252,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!invalidationEntry && encodeCopy) wireRecord.encoded = encodeCopy();
 							const typedStructs = encoder.typedStructs;
 							const structures = encoder.structures;
-							if (
-								typedStructs?.length != tableEntry.typed_length ||
-								structures?.length != tableEntry.structure_length
-							) {
+							if (typedStructs?.length != tableEntry.typed_length || structures.length != tableEntry.structure_length) {
 								tableEntry.typed_length = typedStructs?.length;
 								tableEntry.structure_length = structures.length;
 								// the structure used for encoding records has changed, so we need to send the new structure
