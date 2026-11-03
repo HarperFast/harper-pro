@@ -1,12 +1,6 @@
 /**
- * A shared-structure save that throws leaves this thread's `primaryStore.encoder` reset (structon's
- * save guard empties `typedStructs`/`structures` and marks them `uninitialized`). The sender forwards
- * stored record bytes without packing, so it must reload the dictionaries itself before comparing them
- * with what this peer was last sent; otherwise it advertises empty dictionaries, the peer replaces its
- * decoder with them, and every record that references a dropped id is skipped as undecodable.
- *
- * Drives the real sender over a fake socket. Backpressure parks it after the first record, so the
- * failing save lands between two records it forwards, as a local write on the sending thread would.
+ * Backpressure parks the sender after its first record, so the failing save lands between two records
+ * it forwards, as a local write on the sending thread would. See replication/DESIGN.md item 34.
  */
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
@@ -58,7 +52,6 @@ async function until(predicate, description) {
 	}
 }
 
-// Decodes the stream as the receiver does: each TABLE_FIXED_STRUCTURE replaces the table's decoder.
 function receive(socket, tableId) {
 	let decoder;
 	const records = new Map();
@@ -97,7 +90,6 @@ function receive(socket, tableId) {
 	return { records, advertised, flagged };
 }
 
-// The failed write commits nothing, so it adds no audit entry; only the thread's encoder is left reset.
 async function failStructureSave(Rows) {
 	const encoder = Rows.primaryStore.encoder;
 	const save = encoder.saveStructures;
@@ -143,8 +135,7 @@ describe('sender reloads structures a failed shared-structure save reset', funct
 				const startTime = path === 'copy' ? 0 : Date.now();
 				await new Promise((resolve) => setTimeout(resolve, 5));
 				for (const row of expected) await Rows.put(row);
-				// A peer catching up reads rows older than the newest shape: their structureVersion is lower
-				// than the table's current count.
+				// RocksDB reloads on a structureVersion above the reset count, which these older rows are not.
 				if (path === 'catch-up') {
 					await Rows.put(laterShape);
 					expected.push(laterShape);

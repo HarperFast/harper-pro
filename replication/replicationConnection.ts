@@ -9067,14 +9067,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								!tableEntry.structuresLoaded ||
 								auditRecord.extendedType & HAS_STRUCTURE_UPDATE ||
 								!encoder.typedStructs ||
-								encoder.structures?.uninitialized ||
+								encoder.structures.uninitialized ||
 								auditRecord.structureVersion > encoder.typedStructs.length + encoder.structures.length
 							) {
-								tableEntry.structuresLoaded = true;
 								// there is a structure update, we need to reload the structure from storage.
 								// this is copied from msgpackr's struct, may want to expose as public method
 								encoder._mergeStructures(encoder.getStructures());
 								if (encoder.typedStructs) encoder.lastTypedStructuresLength = encoder.typedStructs.length;
+								tableEntry.structuresLoaded = true;
 							}
 							const timeRange = subscribedNodeIds?.[subscriptionNodeId];
 							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
