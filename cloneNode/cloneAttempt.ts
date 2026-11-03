@@ -84,18 +84,19 @@ export function cloneAttemptSource(rootPath: string = get(CONFIG_PARAMS.ROOTPATH
 export function liveCloneAttempt(rootPath: string = get(CONFIG_PARAMS.ROOTPATH)): string | undefined {
 	const attemptId = process.env.HARPER_CLONE_ATTEMPT;
 	if (!attemptId || !rootPath) return undefined;
+	const markerPath = cloneAttemptPath(rootPath);
 	let text: string;
 	try {
-		text = readFileSync(cloneAttemptPath(rootPath), 'utf8');
+		text = readFileSync(markerPath, 'utf8');
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return undefined;
 		throw error;
 	}
 	const marker: CloneAttemptMarker = JSON.parse(text);
 	if (typeof marker?.attemptId !== 'string' || !marker.attemptId.trim())
-		throw new Error(`The clone attempt marker at ${rootPath} names no attempt`);
+		throw new Error(`The clone attempt marker ${markerPath} names no attempt`);
 	if (Number.isNaN(completionTime(marker)))
-		throw new Error(`The clone attempt marker at ${rootPath} has an unreadable completion time`);
+		throw new Error(`The clone attempt marker ${markerPath} has an unreadable completion time`);
 	return marker.attemptId === attemptId && !retired(marker) ? attemptId : undefined;
 }
 
