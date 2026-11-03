@@ -216,8 +216,7 @@ async function reportWidening(t, widening) {
 	);
 	const resumeMatch = resume?.[0]?.match(/start time: ([\d.]+)/);
 	const resumeStart = resumeMatch ? Number(resumeMatch[1]) : null;
-	const firstMatch = async (needle, ...scopes) =>
-		(await restartLog(needle))?.find((line) => scopes.every((scope) => line.includes(scope))) ?? null;
+	const firstLine = async (needle, accept = () => true) => (await restartLog(needle))?.find(accept) ?? null;
 	const summary = {
 		clauses: widening.clauses?.report() ?? null,
 		coverageRewrite: widening.coverage ?? null,
@@ -236,9 +235,16 @@ async function reportWidening(t, widening) {
 							? null
 							: (certificatesWhileStopping?.some(({ floor }) => resumeStart < floor && floor - resumeStart < 1e-3) ??
 								null),
-					widened: await firstMatch(`Route coverage widened to full for ${A.hostname} on database data `),
-					fullCopyRequested: await firstMatch('full copy', 'database data', A.hostname),
-					bulkCopyCompleteAnyDatabase: await firstMatch(`bulk copy complete from ${A.hostname}`),
+					widened: await firstLine(`Route coverage widened to full for ${A.hostname} on database data `),
+					fullCopyRequested: await firstLine(
+						'full copy',
+						(line) =>
+							line.includes('database data') &&
+							(line.includes(`//${A.hostname}:`) || line.includes(`for ${A.hostname} on`))
+					),
+					bulkCopyCompleteAnyDatabase: await firstLine(`bulk copy complete from ${A.hostname}`, (line) =>
+						line.endsWith(`from ${A.hostname}`)
+					),
 				}
 			: 'unknown',
 		beforeRewriteRows: widening.beforeRewrite ?? null,
