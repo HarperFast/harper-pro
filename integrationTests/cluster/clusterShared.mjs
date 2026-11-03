@@ -173,8 +173,9 @@ export function replicationPoolOffEnv() {
 }
 
 /**
- * Whether this run's nodes replicate on the `replication` worker pool: the pool-on CI legs set
- * `replication.threads` for every node through HARPER_CONFIG.
+ * Whether this run's nodes replicate on the `replication` worker pool: `startHarper` passes `--THREADS_COUNT=1`
+ * unless `threads.count` is set (keeping the `Math.floor(threads.count / 2)` default at 0), and the pool-on CI
+ * legs set `replication.threads` for every node through `HARPER_CONFIG`.
  */
 export function replicationPoolActive() {
 	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;

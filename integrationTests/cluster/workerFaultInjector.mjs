@@ -1,12 +1,12 @@
 // Test-only `threads.preload` module, so it runs on every worker thread including `replication` pool
 // workers, which load no application code. Two features, each inert unless its environment variable is set:
 //
-// HARPER_TEST_BLOB_FAULT_DIR — blob save faults. Armed by the test creating `<dir>/armed`; while armed, every data-database /blobs/ save is SLOW (each held in flight
-// HARPER_TEST_BLOB_SLOW_MS) and selected saves FAIL asynchronously with ENOENT (HARPER_TEST_BLOB_FAIL_SAVES:
-// `<record>:<n>` fails that record's n-th fresh save, `<record>:repair` its first in-place repair save).
-// Attempts are claimed with exclusive-create files in the directory, so the schedule is process-wide and does
-// not replay when the subscription moves to another worker or a worker restarts. Each injected failure leaves
-// `<dir>/failed-<record>-<n or repair>-<thread type>`.
+// HARPER_TEST_BLOB_FAULT_DIR — blob save faults. Armed by the test creating `<dir>/armed`; while armed, every
+// data-database /blobs/ save is SLOW (each held in flight HARPER_TEST_BLOB_SLOW_MS) and selected saves FAIL
+// asynchronously with ENOENT (HARPER_TEST_BLOB_FAIL_SAVES: `<record>:<n>` fails that record's n-th fresh save,
+// `<record>:repair` its first in-place repair save). Attempts are claimed with exclusive-create files in the
+// directory, so the schedule is process-wide and does not replay when the subscription moves to another worker
+// or a worker restarts. Each injected failure leaves `<dir>/failed-<record>-<n or repair>-<thread type>`.
 //
 // HARPER_TEST_WORKER_COMMANDS=1 — commands over a BroadcastChannel, sent by fixture-worker-exit:
 //   { type: 'exit', threadId }            the named thread exits abruptly (no close handlers, no DOWN write)

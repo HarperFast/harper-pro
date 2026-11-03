@@ -118,7 +118,7 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			config: {
 				...sharedConfig(nodeB.harper.hostname),
 				replication: { securePort: nodeB.harper.hostname + ':9933', blobGapReconnectMs: GAP_RECONNECT_MS },
-				threads: workerFaultInjectorThreads(),
+				threads: workerFaultInjectorThreads({ count: 1 }),
 			},
 			env: {
 				HARPER_NO_FLUSH_ON_EXIT: true,
