@@ -24,7 +24,7 @@
  */
 import { createHash } from 'node:crypto';
 import Joi from 'joi';
-import { table } from '../core/resources/databases.ts';
+import { getDatabases, table } from '../core/resources/databases.ts';
 import {
 	DELEGATION_LEASE_MS,
 	LOCK_LEASE_SKEW_MS,
@@ -34,6 +34,8 @@ import { validateBySchema } from '../core/validation/validationWrapper.js';
 import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/hdbError.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { server } from '../core/server/Server.ts';
+import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { liveCloneAttempt } from '../cloneNode/cloneAttempt.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
 
 const MAX_HOMES = 256;
@@ -63,6 +65,8 @@ export interface RecordLockHomesRow {
 	staged?: RecordLockGenerationState;
 	highestActedOn: number;
 	fenced: FenceEntry[];
+	/** The clone attempt in flight when the row was created; never written afterwards. */
+	cloneAttempt?: string;
 }
 
 export interface FenceEntry {
@@ -109,6 +113,7 @@ export function getRecordLockHomesTable() {
 				{ attribute: 'staged' },
 				{ attribute: 'highestActedOn' },
 				{ attribute: 'fenced' },
+				{ attribute: 'cloneAttempt' },
 			],
 		}) as any)
 	);
@@ -162,6 +167,22 @@ export function validateGenerationInput(generation: unknown, homes: unknown): as
 
 async function readRow(database: string): Promise<RecordLockHomesRow | undefined> {
 	return getRecordLockHomesTable().primaryStore.get(database);
+}
+
+/**
+ * Taken only at creation: a later write cannot know which storage an older row was written on. An
+ * unreadable clone marker leaves the row untagged, which a later clone treats as earlier state.
+ */
+function withCreationAttempt(existing: RecordLockHomesRow | undefined, row: RecordLockHomesRow): RecordLockHomesRow {
+	let cloneAttempt = existing?.cloneAttempt;
+	if (!existing) {
+		try {
+			cloneAttempt = liveCloneAttempt();
+		} catch (error) {
+			logger.warn?.(`Record lock home map row for ${row.database}: could not read the clone attempt marker`, error);
+		}
+	}
+	return cloneAttempt === undefined ? row : { ...row, cloneAttempt };
 }
 
 /**
@@ -219,7 +240,7 @@ function withRow<T>(
 		});
 		try {
 			const existing = await readRow(database);
-			return await plan(existing, (row) => writeRow(locked, row));
+			return await plan(existing, (row) => writeRow(locked, withCreationAttempt(existing, row)));
 		} finally {
 			// Never let an unlock failure replace the real outcome: if the write failed 409 because the row
 			// lease was lost to a storage stall, `unlock()` on the expired handle throws too, and the
@@ -525,6 +546,17 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 /** Current durable row, for `homeMap()` cache population and status reporting. Not the hot path. */
 export async function currentRow(database: string): Promise<RecordLockHomesRow | undefined> {
 	return readRow(database);
+}
+
+/**
+ * This node's row without creating the table: with the feature off, only a table already on disk can
+ * hold one, and the catalog load opens those on every thread.
+ */
+export async function existingRow(database: string): Promise<RecordLockHomesRow | undefined> {
+	const homes = CLUSTER_RECORD_LOCKS_ENABLED
+		? getRecordLockHomesTable()
+		: (getDatabases() as any).system?.hdb_record_lock_homes;
+	return homes ? homes.primaryStore.get(database) : undefined;
 }
 
 /**

@@ -65,18 +65,7 @@ export function cloneAttemptSource(rootPath: string = get(CONFIG_PARAMS.ROOTPATH
 		const path = cloneAttemptPath(rootPath);
 		if (!existsSync(path)) return undefined;
 		const marker: CloneAttemptMarker = JSON.parse(readFileSync(path, 'utf8'));
-		const completedAt = marker?.completedAt ?? process.env[CLONE_COMPLETED_AT_ENV];
-		if (completedAt !== undefined) {
-			const now = Date.now();
-			const parsedCompletedAt = typeof completedAt === 'string' ? Number(completedAt) : completedAt;
-			if (
-				typeof parsedCompletedAt !== 'number' ||
-				!Number.isFinite(parsedCompletedAt) ||
-				parsedCompletedAt - now > CLONE_COMPLETION_GRACE_MS ||
-				parsedCompletedAt + CLONE_COMPLETION_GRACE_MS <= now
-			)
-				return undefined;
-		}
+		if (retired(marker)) return undefined;
 		const source = marker?.leaderHost;
 		return typeof source === 'string' && source ? source : undefined;
 	} catch (error) {
@@ -85,4 +74,46 @@ export function cloneAttemptSource(rootPath: string = get(CONFIG_PARAMS.ROOTPATH
 		logger.warn?.('Could not read the clone attempt marker', error);
 		return undefined;
 	}
+}
+
+/**
+ * The id of the clone attempt this process is running, while it is in flight (the window
+ * `cloneAttemptSource` uses). A marker that is present but unreadable, or names no attempt, throws: read
+ * as "no attempt", it would skip the record-lock reclone check for the copy asking.
+ */
+export function liveCloneAttempt(rootPath: string = get(CONFIG_PARAMS.ROOTPATH)): string | undefined {
+	const attemptId = process.env.HARPER_CLONE_ATTEMPT;
+	if (!attemptId || !rootPath) return undefined;
+	const markerPath = cloneAttemptPath(rootPath);
+	let text: string;
+	try {
+		text = readFileSync(markerPath, 'utf8');
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return undefined;
+		throw error;
+	}
+	const marker: CloneAttemptMarker = JSON.parse(text);
+	if (typeof marker?.attemptId !== 'string' || !marker.attemptId.trim())
+		throw new Error(`The clone attempt marker ${markerPath} names no attempt`);
+	if (Number.isNaN(completionTime(marker)))
+		throw new Error(`The clone attempt marker ${markerPath} has an unreadable completion time`);
+	return marker.attemptId === attemptId && !retired(marker) ? attemptId : undefined;
+}
+
+function completionTime(marker: CloneAttemptMarker | undefined): number | undefined {
+	const completedAt = marker?.completedAt ?? process.env[CLONE_COMPLETED_AT_ENV];
+	if (completedAt === undefined) return undefined;
+	const parsed = typeof completedAt === 'string' ? (completedAt.trim() ? Number(completedAt) : NaN) : completedAt;
+	return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function retired(marker: CloneAttemptMarker | undefined): boolean {
+	const completedAt = completionTime(marker);
+	if (completedAt === undefined) return false;
+	const now = Date.now();
+	return (
+		Number.isNaN(completedAt) ||
+		completedAt - now > CLONE_COMPLETION_GRACE_MS ||
+		completedAt + CLONE_COMPLETION_GRACE_MS <= now
+	);
 }

@@ -81,13 +81,32 @@ record of that origin and table this node dropped or failed to apply. Those are 
 
 - **Clean handoff.** For each `(origin, position)` (validated with `isValidLogPosition`,
   `recordLockFreshness.ts`):
-  - `origin === thisNode`: satisfied iff the database has **never been recloned** — the local log
-    is intact and the write at `position` is this node's own committed history. harper-pro persists
-    an **ever-recloned** flag (`[Symbol.for('lockEverRecloned')]`) in the database's `dbis` store
-    when a clone attempt _starts_ (before any copied row lands, so a crash mid-clone leaves the flag,
-    never the ambiguity); with it set, every self-origin dependency rejects with 503 until the
-    operator reclones the peers instead or the origin incarnation reaches the wire (a core
-    follow-up).
+  - `origin === thisNode`: satisfied iff the database is **not flagged ever-recloned** — the local
+    log is intact and the write at `position` is this node's own committed history. The flag
+    (`[Symbol.for('lockEverRecloned')]` in the database's `dbis` store; `markReclonedIfLockHistory`)
+    is written before a clone or sharding recovery copies its first row, so a crash mid-copy leaves
+    the flag, never the ambiguity — but only when this node holds an `hdb_record_lock_homes` row for
+    the database that the copy did not create. A position names this node only at its own control
+    entries (core's `#applyEntry` merges a release's author at the release's position; recovery
+    returns barrier positions), and it appends those only under an active generation, which lives in
+    that row (LOCAL_ONLY, never deleted, never cloned). So a first join, which has no row when its
+    copy starts, is never flagged (harper-pro#1236). A row created during the clone attempt now in
+    flight carries that attempt's id (`cloneAttempt`, set only at creation) and does not flag a copy
+    of that attempt; any other row does (an install cloned over, replaced database storage, a row from
+    before the field existed), and a sharding snapshot recovery (`missingShardingOriginStart`) flags
+    over any row, even inside an attempt. "In flight" is `liveCloneAttempt()`, not the raw
+    `HARPER_CLONE_ATTEMPT`, which outlives the attempt in every worker; the row's tag is taken the same
+    way. A database storage lost in the middle of a clone attempt needs `FORCE_CLONE`: resuming the same
+    attempt would trust a row it tagged on the lost storage. With the flag set, every self-origin
+    dependency rejects with 503 and every later copy repeats the flush that made it durable; an upgrade
+    does not clear an existing flag (it records no evidence), so the remedy is a re-clone with a fresh
+    root.
+    **Not decided locally:** a fully fresh root under a reused node name looks exactly like a first
+    join, while a home that kept the current generation may still hold lineage naming the old
+    incarnation's releases. Re-provision under a new name, or stage and activate a new generation on
+    every node before that node takes cluster locks (a generation change drops every home's lineage,
+    `#prepareFreshnessGeneration`). harper-pro#944 (the origin's database generation on the wire)
+    decides it mechanically.
   - otherwise the origin must be in `homeMap().homes` at the exact capability level, the table must
     replicate (`replicate !== false`), and `(database, origin, table)` must not be poisoned — any
     failure rejects at once with a 503 naming which. Then request a barrier from the origin
@@ -218,6 +237,11 @@ The planning rounds that produced this table are in harper-pro#822's description
   lease bound on a wait, and a hole recorded while a barrier is in flight.
 - `integrationTests/cluster/recordLockCluster.test.mjs` — exact hot-key convergence across three
   nodes, with `freshness.applied >= 1` and no poisoned pairs.
+- `unitTests/replication/recordLockReclone.test.mjs` — when a copy sets the ever-recloned flag, and
+  that the home-map row keeps its creation attempt through every write.
+- `integrationTests/cluster/recordLockClonedNode.test.mjs` — a node joined through `cloneNode` hands a
+  key back and forth with the leader; the same node, cloned again after losing its database storage
+  with its home-map row kept, refuses its own earlier lineage (`recloned`).
 - Not covered by any test: the `record_lock_barrier` operation's server-side checks, the receive
   loop's poison writes, and the end-to-end refusal paths (clock rollback, an excluded route, poison
-  surviving a restart or base copy, a reclone, a mixed-level member, LMDB).
+  surviving a restart or base copy, a mixed-level member, LMDB).

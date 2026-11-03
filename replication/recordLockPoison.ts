@@ -7,9 +7,11 @@
  *   barrier committed after such a hole still proves nothing about the write in it, and a base copy
  *   cannot re-deliver an absence, so the row is permanent — only a fresh clone of this node's
  *   database, which discards the store, clears it.
- * - **Ever recloned**: written when a clone attempt starts, before any copied row lands. Copied rows
- *   carry no local log entry and positions do not identify an incarnation, so once set, this node's
- *   own earlier lineage is not provable from its log.
+ * - **Ever recloned**: written before a clone (or a sharding recovery) copies its first row, when this
+ *   node held record-lock home-map state for the database from before that copy. A home's lineage can
+ *   name this node only at its own control entries, which it appends only under such state, and a
+ *   position does not identify which storage appended it; so once set, this node's own earlier lineage
+ *   is not provable from its log. A first join holds no such state and is never flagged.
  *
  * A hole is recorded on whichever thread holds the socket while the barrier that must refuse it waits
  * on the coordinating thread, so the checks here read the **store**, never a per-thread cache: the
@@ -20,6 +22,7 @@
  */
 import { getDatabases } from '../core/resources/databases.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
+import { existingRow as existingHomesRow } from './recordLockHomes.ts';
 
 const POISON = Symbol.for('lockPoison');
 const RECLONED = Symbol.for('lockEverRecloned');
@@ -98,11 +101,31 @@ export async function poison(database: string, origin: string, table: string, re
 	pending.delete(pair);
 }
 
-/** Resolves once the flag is durable; the clone must not copy a row before then. */
-export async function markRecloned(database: string): Promise<void> {
+/**
+ * Before a copy's first row. A clone's copy passes a reader for its live attempt; a sharding snapshot
+ * recovery passes none and refuses over any home-map row. A row created during the live attempt was
+ * created on the storage being copied into; any other may predate it. Resolves true while the flag is
+ * set, so the caller repeats its durability barrier on every copy; a failed read writes nothing.
+ */
+export async function markReclonedIfLockHistory(
+	database: string,
+	liveCloneAttempt: (() => string | undefined) | undefined
+): Promise<boolean> {
 	const dbisDB = dbisFor(database);
 	if (!dbisDB) throw new Error(`no dbis store for ${database} to record the reclone in`);
+	if (dbisDB.getSync([RECLONED]) === true) return true;
+	const row = await existingHomesRow(database);
+	if (!row) return false;
+	if (liveCloneAttempt) {
+		// Read only once a row exists, so an unreadable marker stops only the copies it could change.
+		const attempt = liveCloneAttempt();
+		if (attempt === undefined || row.cloneAttempt === attempt) return false;
+	}
 	await dbisDB.put([RECLONED], true);
+	logger.warn?.(
+		`Record locks: ${database} is being copied over record-lock state this node held before the copy; cluster locks that depend on this node's own earlier writes are refused from now on`
+	);
+	return true;
 }
 
 /** `origin:table` for every recorded or still-unwritten pair — status reporting, not the lock path. */
