@@ -185,7 +185,7 @@ for (const engine of ['rocksdb']) {
 				if (bootError) record.error = bootError.message;
 				else {
 					record.pid = booted.process?.pid;
-					record.replayNotice = /replaying transaction logs/.test(booted.startupOutput?.stderr ?? '')
+					record.stderrReplayNotice = /replaying transaction logs/.test(booted.startupOutput?.stderr ?? '')
 						? 'seen'
 						: 'not-seen';
 				}
