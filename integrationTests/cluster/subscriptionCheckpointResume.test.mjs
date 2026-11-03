@@ -29,6 +29,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 
 const TABLE = 'checkpoint_origin';
 const FLOOR_INTERVAL_MS = 5_000;
 const CONVERGE_TIMEOUT_MS = 120_000;
+const SUITE_TIMEOUT_MS = 900_000;
 
 const nodeOptions = (node, env = {}) => ({
 	config: {
@@ -36,8 +37,9 @@ const nodeOptions = (node, env = {}) => ({
 		logging: { colors: false, stdStreams: false, console: true, level: 'debug' },
 		replication: { port: node.hostname + ':9933', securePort: null, databases: ['data'] },
 		originLogFixture: { package: join(TEST_DIR, 'fixture-origin-log') },
-		// held-copy-bound pins A's floor across B's restarts and base copy, which outlast the default 30 s limit
-		storage: { maxTransactionOpenTime: 300_000 },
+		// held-copy-bound pins A's floor across B's restarts and base copy, which outlast the default 30 s limit; the
+		// suite's own timeout bounds it instead, so a slow run fails on its wait rather than on an aborted hold
+		storage: { maxTransactionOpenTime: SUITE_TIMEOUT_MS },
 	},
 	env: {
 		HARPER_NO_FLUSH_ON_EXIT: true,
@@ -175,7 +177,7 @@ const endMqtt = (client) => new Promise((resolve) => client.end(true, {}, () => 
 const topicIds = (received) => received.map(({ topic }) => topic.split('/').pop());
 
 const SUITE = 'Subscription checkpoints resume across nodes (harper-pro#922 items 3–4)';
-suite(SUITE, { timeout: 900_000 }, (ctx) => {
+suite(SUITE, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 	before(async () => {
 		[ctx.A, ctx.B, ctx.C, ctx.E] = await Promise.all([
 			startNewNode(ctx.name),
