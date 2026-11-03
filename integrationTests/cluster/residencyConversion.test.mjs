@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { join, basename } from 'node:path';
-import { cp, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, cp, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, postOperation, waitForCondition, stopAndTeardownNodes } from './clusterShared.mjs';
+import { sendOperation, postOperation, waitForCondition, stopAndTeardownNodes, readLog } from './clusterShared.mjs';
 
 const currentBinary = join(import.meta.dirname, '../../dist/bin/harper.js');
 const fixture = join(import.meta.dirname, 'fixture-residency-conversion');
@@ -159,8 +159,79 @@ for (const engine of ['rocksdb']) {
 			const before = await Promise.all(nodes().map((node) => request(node, 'ConversionRows/')));
 			const oldSchema = await readFile(join(fixture, 'schema.graphql'), 'utf8');
 			const oldResources = await readFile(join(fixture, 'resources.js'), 'utf8');
+			// Diagnostics only: they go to the test output and the node's retained log directory, and a failure to
+			// collect them is reported rather than thrown, so the test's own steps and assertions still run.
+			async function emit(label, payload, harper) {
+				ctx.diagnostic(`residency ${label}: ${JSON.stringify(payload)}`);
+				if (!harper?.logDir) return;
+				try {
+					await appendFile(
+						join(harper.logDir, 'residency-snapshots.jsonl'),
+						JSON.stringify({ label, at: new Date().toISOString(), ...payload }) + '\n'
+					);
+				} catch (error) {
+					ctx.diagnostic(`residency ${label}: could not append to ${harper.logDir}: ${error.message}`);
+				}
+			}
+			async function snapshot(stage) {
+				const views = await Promise.all(
+					nodes().map((node) => request(node, 'ConversionSnapshot/drain7').catch((error) => ({ error: error.message })))
+				);
+				for (const [i, context] of contexts.entries())
+					await emit(`snapshot ${stage} node${i}`, views[i], context.harper);
+			}
+			// The boot after an unclean stop logs its replay to the stopped incarnation's log, past where it ended.
+			async function recordRestart(restart, i, outgoing, replicaExpiration, bootError) {
+				const { pid, exitCode, signalCode } = outgoing.harper.process;
+				const booted = contexts[i].harper;
+				const record = {
+					restart,
+					node: i,
+					replicaExpiration,
+					stopped: { pid, exitCode, signal: signalCode, confirmed: exitCode !== null || signalCode !== null },
+					stopMs: outgoing.stopMs,
+					boot: bootError
+						? { error: bootError.message }
+						: {
+								pid: booted.process?.pid,
+								replayNotice: /replaying transaction logs/.test(booted.startupOutput?.stderr ?? '')
+									? 'seen'
+									: 'not-seen',
+							},
+				};
+				try {
+					const logs = [(await readLog(outgoing.harper)).slice(outgoing.logOffset)];
+					if (!bootError && booted.logDir && booted.logDir !== outgoing.harper.logDir) logs.push(await readLog(booted));
+					record.replayed = logs.flatMap((text) =>
+						Array.from(text.matchAll(/Replayed (\d+) records in (\S+) database/g), ([, count, database]) => ({
+							database,
+							count: Number(count),
+						}))
+					);
+				} catch (error) {
+					record.replayed = `error: ${error.message}`;
+				}
+				await emit(`restart ${restart} node${i}`, record, bootError ? outgoing.harper : booted);
+			}
+			let restarts = 0;
 			async function reopen(declarative, binary, replicaExpiration = 3600, settleReplication = true) {
-				await Promise.all(contexts.map((context) => killHarper(context)));
+				const restart = ++restarts;
+				const outgoing = await Promise.all(
+					contexts.map(async (context) => ({
+						harper: context.harper,
+						logOffset: await readLog(context.harper).then(
+							(text) => text.length,
+							() => 0
+						),
+					}))
+				);
+				await Promise.all(
+					contexts.map(async (context, i) => {
+						const start = performance.now();
+						await killHarper(context);
+						outgoing[i].stopMs = Math.round(performance.now() - start);
+					})
+				);
 				for (const [i, context] of contexts.entries()) {
 					const declared = Array.isArray(declarative) ? declarative[i] : declarative;
 					const schema = oldSchema.replace('replicaExpiration: 3600', `replicaExpiration: ${replicaExpiration}`);
@@ -180,7 +251,13 @@ for (const engine of ['rocksdb']) {
 						join(component, 'resources.js'),
 						declared ? oldResources.slice(oldResources.indexOf('\n') + 1) : oldResources
 					);
-					await startHarper(context, options(context, i, Array.isArray(binary) ? binary[i] : binary));
+					try {
+						await startHarper(context, options(context, i, Array.isArray(binary) ? binary[i] : binary));
+					} catch (error) {
+						await recordRestart(restart, i, outgoing[i], replicaExpiration, error);
+						throw error;
+					}
+					await recordRestart(restart, i, outgoing[i], replicaExpiration);
 				}
 				if (settleReplication) await settle();
 			}
@@ -268,11 +345,16 @@ for (const engine of ['rocksdb']) {
 			}
 			// Seed a non-owner writer replica even when the optional mixed-version arm did not run.
 			await request(nodes()[0], 'Converted/drain7', { id: 'drain7', tag: 'drain', body: 'temporary writer copy' });
+			await snapshot('after-seed');
 			await settle();
+			await snapshot('after-settle');
 			await reopen(true, currentBinary, 0, false);
+			await snapshot('after-reopen');
 			await ready();
 			await settle();
+			await snapshot('before-drain');
 			const drains = await Promise.all(nodes().map((node) => request(node, 'ConversionDrain/', {})));
+			ctx.diagnostic(`residency drain: ${JSON.stringify(drains)}`);
 			assert.ok(drains.every((result) => result.remaining === 0));
 			assert.equal(drains.reduce((sum, result) => sum + result.demoted, 0) > 0, engine === 'rocksdb');
 			if (!previousBinary) {
