@@ -13,7 +13,7 @@
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { cp, mkdtemp, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
@@ -155,7 +155,16 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		for (const owner of [0, 1]) for (const id of OWNED_BY[owner]) await ownerHolds(owner, id, 'before-idle');
 	});
 
-	after(() => stopAndTeardownNodes(nodes));
+	after(async () => {
+		try {
+			await stopAndTeardownNodes(nodes);
+		} finally {
+			// the data roots are this suite's own, not the harness's
+			await Promise.all(
+				nodes.map((node) => node?.dataRootDir && rm(node.dataRootDir, { recursive: true, force: true }))
+			);
+		}
+	});
 
 	test('both nodes restart after an idle interval longer than retention and replicate with no base copy', async () => {
 		await delay(IDLE_MS);
@@ -175,7 +184,6 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 			equal(forced.length, 0, `node ${i} forced a copy:\n${forced.join('\n')}`);
 			ok(!(await socketTo(node, nodes[i ^ 1]))?.stuckCopy, `node ${i} reports a stuck copy`);
 		}
-		// a non-owner write reaches its owner again
 		await put(nodes[0], OWNED_BY[1][0], 'after-idle');
 		await ownerHolds(1, OWNED_BY[1][0], 'after-idle');
 	});

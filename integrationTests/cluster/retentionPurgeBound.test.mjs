@@ -3,7 +3,8 @@
  *
  * Two nodes on `data`, retention in seconds. B is stopped while A sits idle past retention, so no live
  * traffic or certified floor can freshen B's resume point:
- * - when B had everything A wrote, A resumes B incrementally: no forced copy;
+ * - when B had everything A wrote before the idle interval, and A writes again just before B returns, A
+ *   resumes B incrementally: no forced copy;
  * - when B missed a tagged write that A has since aged out, A forces the copy and B recovers the tag.
  * Before the fix the guard compared B's start against `now - auditRetention` alone and forced a full copy
  * in both cases.
@@ -19,7 +20,8 @@ const TEST_DIR = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 'dist', 'bin', 'harper.js');
 
 const TABLE = 'purge_bound';
-const RETENTION_S = 20;
+// long enough for B to restart and subscribe while A still retains the write made just before
+const RETENTION_S = 40;
 // past retention plus two cleanup passes (the RocksDB pass runs at least every 10 s)
 const IDLE_MS = (RETENTION_S + 25) * 1000;
 const FORCED_COPY = 'forcing a bounded base-copy resync';
@@ -57,16 +59,6 @@ for (const engine of ['rocksdb', 'lmdb']) {
 				timeoutMs: 90_000,
 				description: `${id} on ${node.hostname}`,
 			});
-		const connected = (node, peer) =>
-			waitForCondition(
-				async (signal) => {
-					const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
-					return status.connections
-						?.find((connection) => connection.name === peer.hostname)
-						?.database_sockets?.some((socket) => socket.database === 'data' && socket.connected);
-				},
-				{ timeoutMs: 60_000, description: `${node.hostname} connected to ${peer.hostname}` }
-			);
 		const forcedCopiesTo = async (node, since) =>
 			(await readLog(A))
 				.slice(since)
@@ -96,11 +88,8 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			await killHarper({ harper: B });
 			await delay(IDLE_MS);
 			const mark = (await readLog(A)).length;
-			await start(B);
-			// a write before A has decided B's start would leave A's log written above its bound
-			await connected(B, A);
-			await delay(3000);
 			await upsert(A, 'after-idle');
+			await start(B);
 			await arrives(B, 'after-idle');
 			const forced = await forcedCopiesTo(B, mark);
 			equal(forced.length, 0, `A forced a copy for B:\n${forced.join('\n')}`);
