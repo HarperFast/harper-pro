@@ -252,7 +252,11 @@ import { cloneAttemptSource, liveCloneAttempt } from '../cloneNode/cloneAttempt.
 import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 import {
 	CopyStallTracker,
+	COPY_STALL_HOLD_MIN_MS,
+	STUCK_COPY_OWNER_REFUSED,
+	STUCK_COPY_ORIGIN_REFUSED,
 	STUCK_COPY_HELD,
+	STUCK_COPY_REFUSED,
 	copyStartKey,
 	describeStuckCopy,
 	type StuckCopyTransition,
@@ -718,6 +722,13 @@ export function purgeBoundLogNames(
 		if (log?.name && !excludedNodes?.includes(log.name)) names.push(log.name);
 	}
 	return names;
+}
+
+// Integration tests force the retention copy for the named databases to exercise what a receiver does with
+// a copy it cannot accept (harper-pro#1231).
+const FORCE_RETENTION_COPY_DATABASES_FOR_TEST = process.env.HARPER_TEST_FORCE_RETENTION_COPY_DATABASES?.split(',');
+function forceRetentionCopyForTest(databaseName: string): boolean {
+	return FORCE_RETENTION_COPY_DATABASES_FOR_TEST?.includes(databaseName) === true;
 }
 
 // A peer naming more new origins than this on one connection is not sending orphan v4-era ids.
@@ -4738,6 +4749,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	blobGapGeneration = 0;
 	// Copies from this peer that do not finish, across this connection's sockets (copyStall.ts).
 	copyStall = new CopyStallTracker(COPY_STALL_ATTEMPTS);
+	refusalLapseTimer?: ReturnType<typeof setTimeout>;
 	// The current socket's frozen effective peer capabilities (harper-pro#440), replaced on every handshake.
 	// `undefined` means NOT YET LEARNED on this socket — including every reconnect window — and never "the
 	// peer does not support it": a peer that advertised nothing is the frozen defaults object. A future
@@ -4835,6 +4847,7 @@ export class NodeReplicationConnection extends EventEmitter {
 				});
 			}
 			this.isConnected = true;
+			this.armRefusalLapse(socket);
 			try {
 				session = replicateOverWS(
 					this.socket,
@@ -4967,6 +4980,18 @@ export class NodeReplicationConnection extends EventEmitter {
 		} catch {
 			// a log sink failure must not stop the reconnect it reports on
 		}
+	}
+	// A refusal is cleared once a later session has stayed open this long without one: an idle leg may never
+	// deliver the durable progress that otherwise clears it.
+	armRefusalLapse(socket: ReplicationWebSocket) {
+		clearTimeout(this.refusalLapseTimer);
+		if (this.copyStall.state !== STUCK_COPY_REFUSED) return;
+		const refusals = this.copyStall.count;
+		this.refusalLapseTimer = setTimeout(() => {
+			if (this.socket !== socket || !this.isConnected || this.copyStall.count !== refusals) return;
+			this.reportStuckCopy(this.copyStall.noteRefusalLapsed());
+		}, COPY_STALL_HOLD_MIN_MS);
+		this.refusalLapseTimer.unref?.();
 	}
 	resetRetryBackoff() {
 		if (this.retries !== 0 || this.retryBackoff?.attempts) {
@@ -6721,6 +6746,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	function refuseShardingSource(origin: string, copying = false) {
 		recordShardingWait(databaseName, origin, true);
+		noteCopyStall((tracker) => tracker.noteRefusal(copying ? STUCK_COPY_OWNER_REFUSED : STUCK_COPY_ORIGIN_REFUSED));
 		wsClosed = true;
 		close(
 			1011,
@@ -9928,16 +9954,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													purgeBoundLogNames(auditStore, excludedNodes ? undefined : oldestLogName, excludedNodes)
 												);
 												if (
-													!(
+													forceRetentionCopyForTest(databaseName) ||
+													(!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
-													shouldForceBaseCopyForRetention(
-														currentSequenceId,
-														oldestRetainedTime,
-														Date.now() - auditRetention,
-														purgeBound,
-														getAuditFloor(auditStore)
-													)
+														shouldForceBaseCopyForRetention(
+															currentSequenceId,
+															oldestRetainedTime,
+															Date.now() - auditRetention,
+															purgeBound,
+															getAuditFloor(auditStore)
+														))
 												) {
 													logger.warn?.(
 														`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purged through ${purgeBound === undefined ? 'unknown' : new Date(purgeBound).toISOString()}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
