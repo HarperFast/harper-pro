@@ -103,7 +103,7 @@ export function liveCloneAttempt(rootPath: string = get(CONFIG_PARAMS.ROOTPATH))
 function completionTime(marker: CloneAttemptMarker | undefined): number | undefined {
 	const completedAt = marker?.completedAt ?? process.env[CLONE_COMPLETED_AT_ENV];
 	if (completedAt === undefined) return undefined;
-	const parsed = typeof completedAt === 'string' ? Number(completedAt) : completedAt;
+	const parsed = typeof completedAt === 'string' ? (completedAt.trim() ? Number(completedAt) : NaN) : completedAt;
 	return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : NaN;
 }
 

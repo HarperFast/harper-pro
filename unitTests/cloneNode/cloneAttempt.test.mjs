@@ -215,8 +215,10 @@ describe('clone-attempt marker (#737)', () => {
 			assert.throws(() => liveCloneAttempt(rootPath));
 			writeMarker(JSON.stringify({ leaderHost: 'leader.example' }));
 			assert.throws(() => liveCloneAttempt(rootPath), /names no attempt/);
-			writeMarker(JSON.stringify({ attemptId: 'attempt-under-test', completedAt: 'recently' }));
-			assert.throws(() => liveCloneAttempt(rootPath), /unreadable completion time/);
+			for (const completedAt of ['recently', '', ' ']) {
+				writeMarker(JSON.stringify({ attemptId: 'attempt-under-test', completedAt }));
+				assert.throws(() => liveCloneAttempt(rootPath), /unreadable completion time/);
+			}
 			rmSync(cloneAttemptPath(rootPath));
 			mkdirSync(cloneAttemptPath(rootPath));
 			assert.throws(() => liveCloneAttempt(rootPath));
