@@ -16,6 +16,7 @@ import {
 	cloneAttemptPath,
 	cloneAttemptSource,
 	completeCloneAttempt,
+	liveCloneAttempt,
 	reusableCloneAttemptId,
 } from '#src/cloneNode/cloneAttempt';
 
@@ -176,5 +177,47 @@ describe('clone-attempt marker (#737)', () => {
 
 	it('places the marker in the root path', () => {
 		assert.equal(cloneAttemptPath(rootPath), join(rootPath, CLONE_ATTEMPT_FILE));
+	});
+
+	describe('liveCloneAttempt (#1236)', () => {
+		it("names this process's attempt while its marker is in flight", () => {
+			writeMarker(JSON.stringify({ attemptId: 'attempt-under-test', leaderHost: 'leader.example' }));
+			assert.equal(liveCloneAttempt(rootPath), 'attempt-under-test');
+		});
+
+		it('still names it during the completed-at grace', () => {
+			writeMarker(JSON.stringify({ attemptId: 'attempt-under-test', completedAt: Date.now() }));
+			assert.equal(liveCloneAttempt(rootPath), 'attempt-under-test');
+		});
+
+		it('has none once the attempt is retired, though the variable lingers in this worker', () => {
+			writeMarker(
+				JSON.stringify({ attemptId: 'attempt-under-test', completedAt: Date.now() - CLONE_COMPLETION_GRACE_MS })
+			);
+			assert.equal(liveCloneAttempt(rootPath), undefined);
+			rmSync(cloneAttemptPath(rootPath));
+			assert.equal(liveCloneAttempt(rootPath), undefined);
+		});
+
+		it('has none when the marker names another attempt', () => {
+			writeMarker(JSON.stringify({ attemptId: 'a-later-attempt' }));
+			assert.equal(liveCloneAttempt(rootPath), undefined);
+		});
+
+		it('has none outside a clone run', () => {
+			writeMarker(JSON.stringify({ attemptId: 'attempt-under-test' }));
+			delete process.env.HARPER_CLONE_ATTEMPT;
+			assert.equal(liveCloneAttempt(rootPath), undefined);
+		});
+
+		it('throws, rather than answering "no attempt", for a marker it cannot read', () => {
+			writeMarker('{ not json');
+			assert.throws(() => liveCloneAttempt(rootPath));
+			writeMarker(JSON.stringify({ leaderHost: 'leader.example' }));
+			assert.throws(() => liveCloneAttempt(rootPath), /names no attempt/);
+			rmSync(cloneAttemptPath(rootPath));
+			mkdirSync(cloneAttemptPath(rootPath));
+			assert.throws(() => liveCloneAttempt(rootPath));
+		});
 	});
 });

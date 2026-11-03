@@ -151,7 +151,7 @@ import {
 	currentHomesDigest,
 	recordLockBarrierApplied,
 } from './recordLockTransport.ts';
-import { ANY_TABLE, markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
+import { ANY_TABLE, markReclonedIfLockHistory, poison as poisonRecordLockPair } from './recordLockPoison.ts';
 import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { requiresLegacyCopyVerification, verifyLegacyCopyBaseline } from './legacyCopy.ts';
@@ -246,7 +246,7 @@ import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
 import { createInflate } from 'node:zlib';
 import { FrameWriter } from './frameWriter.ts';
 import { isExplicitDatabaseSubscription, tableReplicates } from './replicatedDatabases.ts';
-import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
+import { cloneAttemptSource, liveCloneAttempt } from '../cloneNode/cloneAttempt.ts';
 import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
@@ -8258,15 +8258,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const sharedStatus = getSharedStatus();
 						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
 						if (databaseName && (cloneAttempt || missingShardingOriginStart(databaseName))) {
-							// Durable before the first copied row: a clone replaces this node's own history with
-							// rows that carry no local log entry, and the record-lock barrier must know that.
+							// Durable before the first copied row, so a crash mid-copy leaves the flag, never the ambiguity.
 							try {
-								await markRecloned(databaseName);
-								if (connectionSuperseded()) return;
-								for (const { catalog } of shardingNativeRoots(databaseName)) {
-									if (typeof catalog.flush === 'function') await catalog.flush({ allowWriteStall: true });
-									else await catalog.flushed; // LMDB exposes its durability barrier as a promise.
+								// The raw variable outlives the attempt in every worker; only a live attempt counts.
+								const liveAttempt = cloneAttempt ? liveCloneAttempt() : undefined;
+								if (liveAttempt !== undefined || !cloneAttempt || missingShardingOriginStart(databaseName)) {
+									const marked = await markReclonedIfLockHistory(databaseName, liveAttempt);
 									if (connectionSuperseded()) return;
+									if (marked) {
+										for (const { catalog } of shardingNativeRoots(databaseName)) {
+											if (typeof catalog.flush === 'function') await catalog.flush({ allowWriteStall: true });
+											else await catalog.flushed; // LMDB exposes its durability barrier as a promise.
+											if (connectionSuperseded()) return;
+										}
+									}
 								}
 							} catch (error) {
 								logger.error?.(connectionId, 'failed to record the clone for record locks', databaseName, error);
