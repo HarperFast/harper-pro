@@ -8,7 +8,7 @@
  *
  * Fresh receivers join with add_node, which requests a full copy. Per engine:
  * - a receiver copies every row, the unnamed origin's included;
- * - with one row's apply forced to throw, the receiver stops after `copyStallAttempts` attempts from one
+ * - with one row's apply forced to throw, the receiver stops after 5 attempts from one
  *   position, reports `stuckCopy: held`, and the sender stops copying to it for the hold.
  * RocksDB additionally runs the mixed-version pairings, through HARPER_TEST_SKIP_ORPHAN_ORIGIN_NAMING: a
  * receiver that throws on an untranslatable origin (as before) behind a sender that names its unnamed
@@ -29,7 +29,7 @@ const UNNAMED_ORIGIN = 777;
 const LOCAL_IDS = Array.from({ length: 30 }, (_, i) => `local-${String(i).padStart(2, '0')}`);
 const ORPHAN_IDS = Array.from({ length: 10 }, (_, i) => `orphan-${i}`);
 const ALL_IDS = [...LOCAL_IDS, ...ORPHAN_IDS].sort();
-const STALL_ATTEMPTS = 3;
+const STALL_ATTEMPTS = 5;
 const COPY_TIMEOUT_MS = 90_000;
 
 for (const engine of ['rocksdb', 'lmdb']) {
@@ -114,10 +114,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 		});
 
 		test('a copy that fails at one row is held after a bounded number of attempts', async () => {
-			const receiver = await startNode(
-				{ HARPER_TEST_COPY_APPLY_FAILURE_KEY: ORPHAN_IDS[5] },
-				{ copyStallAttempts: STALL_ATTEMPTS }
-			);
+			const receiver = await startNode({ HARPER_TEST_COPY_APPLY_FAILURE_KEY: ORPHAN_IDS[5] });
 			await addNode(receiver, sender);
 			const stuck = await waitForCondition(
 				async (signal) => {
@@ -129,7 +126,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 				},
 				{ timeoutMs: COPY_TIMEOUT_MS, description: 'the receiver to hold the copy' }
 			);
-			ok(stuck.count >= STALL_ATTEMPTS, `held after ${stuck.count} attempts`);
+			equal(stuck.count, STALL_ATTEMPTS, 'held at the attempt limit');
 			ok(Date.parse(stuck.retryAt) > Date.now(), `retries at ${stuck.retryAt}`);
 			// both ends are released: the sender starts no new copy to this receiver during the hold
 			const copiesTo = async () =>

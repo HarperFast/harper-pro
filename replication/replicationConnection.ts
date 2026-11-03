@@ -256,7 +256,6 @@ import {
 	STUCK_COPY_OWNER_REFUSED,
 	STUCK_COPY_ORIGIN_REFUSED,
 	STUCK_COPY_HELD,
-	STUCK_COPY_REFUSED,
 	copyStartKey,
 	describeStuckCopy,
 	type StuckCopyTransition,
@@ -4685,7 +4684,7 @@ const INITIAL_RETRY_TIME = 500;
 const MAX_RETRY_TIME = 30_000;
 // Copy attempts from one start position, with no durable progress between them, before the leg's reconnects
 // are held (harper-pro#1235).
-const COPY_STALL_ATTEMPTS = nonNegativeIntegerOr(env.get('replication_copyStallAttempts'), 5) || 5;
+const COPY_STALL_ATTEMPTS = 5;
 const COPY_FLUSH_RETRY_INITIAL_MS = 250;
 const COPY_FLUSH_RETRY_MAX_MS = 30_000;
 /**
@@ -4747,9 +4746,8 @@ export class NodeReplicationConnection extends EventEmitter {
 	// socket's late blob settlements cannot charge or resolve the live one's budget.
 	blobGapBudget?: BlobGapEscalationBudget;
 	blobGapGeneration = 0;
-	// Copies from this peer that do not finish, across this connection's sockets (copyStall.ts).
 	copyStall = new CopyStallTracker(COPY_STALL_ATTEMPTS);
-	refusalLapseTimer?: ReturnType<typeof setTimeout>;
+	quietSessionTimer?: ReturnType<typeof setTimeout>;
 	// The current socket's frozen effective peer capabilities (harper-pro#440), replaced on every handshake.
 	// `undefined` means NOT YET LEARNED on this socket — including every reconnect window — and never "the
 	// peer does not support it": a peer that advertised nothing is the frozen defaults object. A future
@@ -4847,7 +4845,7 @@ export class NodeReplicationConnection extends EventEmitter {
 				});
 			}
 			this.isConnected = true;
-			this.armRefusalLapse(socket);
+			this.armQuietSession(socket);
 			try {
 				session = replicateOverWS(
 					this.socket,
@@ -4960,7 +4958,6 @@ export class NodeReplicationConnection extends EventEmitter {
 		});
 		const delay = this.retryBackoff.nextDelay();
 		if (delay === undefined) return;
-		// a copy that cannot finish waits out its own hold, so neither end works on it in the meantime
 		const { holdMs, transition } = this.copyStall.noteClosed();
 		this.setReconnectTimer(
 			() => {
@@ -4981,17 +4978,15 @@ export class NodeReplicationConnection extends EventEmitter {
 			// a log sink failure must not stop the reconnect it reports on
 		}
 	}
-	// A refusal is cleared once a later session has stayed open this long without one: an idle leg may never
-	// deliver the durable progress that otherwise clears it.
-	armRefusalLapse(socket: ReplicationWebSocket) {
-		clearTimeout(this.refusalLapseTimer);
-		if (this.copyStall.state !== STUCK_COPY_REFUSED) return;
-		const refusals = this.copyStall.count;
-		this.refusalLapseTimer = setTimeout(() => {
-			if (this.socket !== socket || !this.isConnected || this.copyStall.count !== refusals) return;
-			this.reportStuckCopy(this.copyStall.noteRefusalLapsed());
+	armQuietSession(socket: ReplicationWebSocket) {
+		clearTimeout(this.quietSessionTimer);
+		this.copyStall.noteOpened();
+		if (!this.copyStall.state && !this.copyStall.attempts) return;
+		this.quietSessionTimer = setTimeout(() => {
+			if (this.socket !== socket || !this.isConnected) return;
+			this.reportStuckCopy(this.copyStall.noteSessionQuiet());
 		}, COPY_STALL_HOLD_MIN_MS);
-		this.refusalLapseTimer.unref?.();
+		this.quietSessionTimer.unref?.();
 	}
 	resetRetryBackoff() {
 		if (this.retries !== 0 || this.retryBackoff?.attempts) {
@@ -5496,6 +5491,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (persisted) {
 					try {
 						await getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
+						noteCopyFinished();
 					} catch (error) {
 						logger.warn?.(connectionId, 'could not remove copy cursor for', databaseName, error);
 						deferCopyCursorRemoval(nodeId);
@@ -5704,7 +5700,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			inCopyMode = false;
 			copyWasResumed = false;
 			copyResumedWithWidening = false;
-			noteCopyStall((tracker) => tracker.noteDurableProgress());
 			if (hadCopyOriginAnchors || pendingRouteState.size > 0 || copyPassPendingRestore) {
 				if (frameOpen) {
 					pendingCopyCursorRemovalNodeId = copyNodeId;
@@ -5739,7 +5734,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						.then((ok) => {
 							if (connectionSuperseded()) return;
 							if (ok && isCopyPassRouteRestoredDurable()) {
-								return getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), copyNodeId]);
+								return Promise.resolve(
+									getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), copyNodeId])
+								).then(noteCopyFinished);
 							}
 							deferCopyCursorRemoval(copyNodeId);
 						})
@@ -5855,10 +5852,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!copyApplyActive()) {
 				// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
 				// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
-				if (!projectionCopy) getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursor);
+				writeCopyCursor(copyFromNodeId, cursor);
 				void persistCopyBounds();
 				if (pendingCopyCursor === cursor) pendingCopyCursor = null;
-				noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
 				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
 				maybeFinishCopy();
 				reconnectAtDrainedBarrier();
@@ -5896,13 +5892,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// closure died, or after a same-socket COPY_START replaced the walk.
 					if (connectionSuperseded() || passAtPersist !== copyWatermark.currentPass) return;
 					if (copyFromNodeId !== undefined) {
-						if (!projectionCopy)
-							getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
+						writeCopyCursor(copyFromNodeId, cursorAtFlush);
 						void persistCopyBounds();
 					}
 					copyFlushBackoffUntil = 0;
 					copyFlushBackoff?.reset();
-					noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursorAtFlush, encode)));
 					if (copyCompleteReceived) noteCopyFinalizeProgress();
 					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
 					// A persist under a drained barrier is the connection's LAST possible progress: every
@@ -6910,11 +6904,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
-	// Only this leg's live subscription session feeds its stuck-copy state; a superseded one must not touch it.
+	// a superseded session must not touch the leg's stuck-copy state
 	function noteCopyStall(note: (tracker: CopyStallTracker) => StuckCopyTransition | undefined) {
 		const connection = options.connection;
 		if (connection?.nodeSubscriptions === undefined || connectionSuperseded()) return;
 		connection.reportStuckCopy(note(connection.copyStall));
+	}
+	// progress counts once it is what the next attempt resumes from; a projection copy persists no cursor
+	function writeCopyCursor(nodeId: number, cursor: any) {
+		if (projectionCopy) return;
+		const persisted = getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), nodeId], cursor);
+		const credit = () => noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
+		if (persisted?.then) persisted.then(credit);
+		else credit();
+	}
+	function noteCopyFinished() {
+		noteCopyStall((tracker) => tracker.noteDurableProgress());
 	}
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
 	// committed AND its blob (and all earlier blobs) have finished saving; the persisted replication

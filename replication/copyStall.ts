@@ -31,7 +31,7 @@ export type StuckCopyTransition = { from: number; to: number; count: number; rea
  * The receiving leg's view of a copy that does not finish (harper-pro#1235, #1231): attempts started from one
  * position with no durable progress between them, and refusals of a copy this node cannot accept. Lives on the
  * leg's `NodeReplicationConnection`, which outlives its sockets. Only durable progress resets the attempt
- * count; a refusal also clears once a later session has stayed open without one.
+ * count; a session that stays open without starting or refusing a copy clears what was reported.
  */
 export class CopyStallTracker {
 	attempts = 0;
@@ -45,6 +45,9 @@ export class CopyStallTracker {
 	hold: Backoff;
 	status: Float64Array | undefined;
 	now: () => number;
+	// a close holds the leg only for what its own session did
+	private sessionStarted = false;
+	private sessionRefused = false;
 
 	constructor(limit: number, options: { random?: () => number; now?: () => number } = {}) {
 		this.limit = limit;
@@ -58,8 +61,16 @@ export class CopyStallTracker {
 		});
 	}
 
-	/** A copy began from `startKey` (a structural cursor key, or `fresh`). */
+	noteOpened(): void {
+		this.sessionStarted = this.sessionRefused = false;
+		if (!this.retryAt) return;
+		this.retryAt = 0;
+		this.publish();
+	}
+
+	// `startKey`: a structural cursor key, or `fresh`
 	noteCopyStart(startKey: string): StuckCopyTransition | undefined {
+		this.sessionStarted = true;
 		this.attempts = startKey === this.startKey ? this.attempts + 1 : 1;
 		this.startKey = startKey;
 		if (this.attempts < 2 || this.state === STUCK_COPY_REFUSED) return;
@@ -71,33 +82,41 @@ export class CopyStallTracker {
 	}
 
 	noteRefusal(reason: number): StuckCopyTransition | undefined {
+		this.sessionRefused = true;
 		return this.enter(STUCK_COPY_REFUSED, reason, this.state === STUCK_COPY_REFUSED ? this.count + 1 : 1);
 	}
 
-	/** A copy cursor was persisted; one at the position the attempt started from is not progress. */
+	// one rewritten at the position the attempt started from is not progress
 	noteCursorPersisted(cursorKey: string): StuckCopyTransition | undefined {
 		if (cursorKey !== this.startKey) return this.noteDurableProgress();
 	}
 
-	/** Copy rows or replicated writes became durable on this leg. */
 	noteDurableProgress(): StuckCopyTransition | undefined {
+		if (!this.attempts && this.startKey === undefined && !this.state) return;
 		this.attempts = 0;
 		this.startKey = undefined;
 		return this.clear();
 	}
 
-	/** A later session stayed open long enough without a refusal. */
-	noteRefusalLapsed(): StuckCopyTransition | undefined {
-		if (this.state === STUCK_COPY_REFUSED) return this.clear();
+	// an idle leg may never deliver the durable progress that otherwise clears its state
+	noteSessionQuiet(): StuckCopyTransition | undefined {
+		if (this.sessionStarted || this.sessionRefused) return;
+		this.attempts = 0;
+		this.startKey = undefined;
+		return this.clear();
 	}
 
 	/**
-	 * The leg's socket closed: how long its reconnect must wait, 0 for the ordinary schedule. A refusal, or the
-	 * `limit`-th attempt from one position, holds it on a backoff of its own that doubles per held failure.
+	 * The leg's socket closed: how long its reconnect must wait, 0 for the ordinary schedule. A session that
+	 * reached the `limit`-th attempt from one position, or that an owner refused, holds the leg on a backoff of
+	 * its own that doubles per held failure. An origin refusal follows a sharding map change that can clear
+	 * within seconds, so it keeps the ordinary schedule.
 	 */
 	noteClosed(): { holdMs: number; transition?: StuckCopyTransition } {
-		const exhausted = this.attempts >= this.limit && this.state !== STUCK_COPY_REFUSED;
-		if (!exhausted && this.state !== STUCK_COPY_REFUSED) return { holdMs: 0 };
+		const exhausted = this.sessionStarted && this.attempts >= this.limit && this.state !== STUCK_COPY_REFUSED;
+		const refused = this.sessionRefused && this.reason === STUCK_COPY_OWNER_REFUSED;
+		this.sessionStarted = this.sessionRefused = false;
+		if (!exhausted && !refused) return { holdMs: 0 };
 		const holdMs = this.hold.nextDelay() ?? COPY_STALL_HOLD_MAX_MS;
 		this.retryAt = this.now() + holdMs;
 		const transition = exhausted ? this.enter(STUCK_COPY_HELD, STUCK_COPY_NO_PROGRESS, this.attempts) : undefined;
@@ -129,20 +148,21 @@ export class CopyStallTracker {
 		return from ? { from, to: 0, count: 0, reason: 0 } : undefined;
 	}
 
-	// readers on other threads key off the state slot, so it is cleared first and set last
+	// readers on other threads key off the state slot, so a change clears it first and sets it last
 	private publish(): void {
 		const status = this.status;
 		if (!status) return;
-		status[STUCK_COPY_STATE_POSITION] = 0;
+		const changed = status[STUCK_COPY_STATE_POSITION] !== this.state;
+		if (changed) status[STUCK_COPY_STATE_POSITION] = 0;
 		status[STUCK_COPY_REASON_POSITION] = this.reason;
 		status[STUCK_COPY_COUNT_POSITION] = this.count;
 		status[STUCK_COPY_SINCE_POSITION] = this.since;
 		status[STUCK_COPY_RETRY_AT_POSITION] = this.state ? this.retryAt : 0;
-		status[STUCK_COPY_STATE_POSITION] = this.state;
+		if (changed) status[STUCK_COPY_STATE_POSITION] = this.state;
 	}
 }
 
-/** The structural start position of a copy: its persisted resume cursor, or `fresh` when there is none. */
+// its persisted resume cursor, or `fresh` when there is none
 export function copyStartKey(
 	cursor: { copyStartTime?: unknown; currentTable?: unknown; afterKey?: unknown } | undefined,
 	encode: (value: unknown) => Uint8Array
@@ -151,7 +171,6 @@ export function copyStartKey(
 	return Buffer.from(encode([cursor.copyStartTime, cursor.currentTable, cursor.afterKey])).toString('base64');
 }
 
-/** `cluster_status`'s view of a leg's stuck copy, or undefined when there is none. */
 export function readStuckCopy(
 	status: Float64Array
 ): { state: string; reason: string; count: number; since: string; retryAt?: string } | undefined {

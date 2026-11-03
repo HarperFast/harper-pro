@@ -1,4 +1,3 @@
-// harper-pro#1235 / #1231: the receiving leg's bound on a copy that does not finish, and how it reports.
 import { expect } from 'chai';
 import { encode } from 'msgpackr';
 import {
@@ -6,6 +5,7 @@ import {
 	COPY_STALL_HOLD_MIN_MS,
 	COPY_STALL_HOLD_MAX_MS,
 	STUCK_COPY_HELD,
+	STUCK_COPY_ORIGIN_REFUSED,
 	STUCK_COPY_OWNER_REFUSED,
 	STUCK_COPY_REFUSED,
 	STUCK_COPY_RETRYING,
@@ -112,8 +112,55 @@ describe('CopyStallTracker', () => {
 			reason: 'Owned sharding slots require a complete co-owner or backup restore',
 			count: 2,
 		});
-		expect(stall.noteRefusalLapsed()).to.include({ from: STUCK_COPY_REFUSED, to: 0 });
+		stall.noteOpened();
+		expect(stall.noteSessionQuiet()).to.include({ from: STUCK_COPY_REFUSED, to: 0 });
 		expect(readStuckCopy(status)).to.equal(undefined);
+	});
+
+	it('keeps the ordinary schedule for an origin refusal, which a sharding map change can clear', () => {
+		const { stall, status } = tracker(2);
+		expect(stall.noteRefusal(STUCK_COPY_ORIGIN_REFUSED)).to.include({ to: STUCK_COPY_REFUSED });
+		expect(stall.noteClosed().holdMs).to.equal(0);
+		expect(readStuckCopy(status)).to.include({ state: 'refused' });
+	});
+
+	it('holds a leg only for what the closing session did', () => {
+		const { stall, status } = tracker(2);
+		stall.noteCopyStart('k');
+		stall.noteClosed();
+		stall.noteCopyStart('k');
+		expect(stall.noteClosed().holdMs).to.be.at.least(COPY_STALL_HOLD_MIN_MS);
+		stall.noteOpened();
+		expect(readStuckCopy(status).retryAt).to.equal(undefined, 'the hold it reported is over');
+		expect(stall.noteClosed().holdMs).to.equal(0, 'a session that started no copy closed for another reason');
+		stall.noteRefusal(STUCK_COPY_OWNER_REFUSED);
+		stall.noteClosed();
+		stall.noteOpened();
+		expect(stall.noteClosed().holdMs).to.equal(0);
+	});
+
+	it('clears a held copy after a session that starts no copy, not after one that does', () => {
+		const { stall, status } = tracker(2);
+		stall.noteCopyStart('k');
+		stall.noteClosed();
+		stall.noteCopyStart('k');
+		stall.noteClosed();
+		stall.noteOpened();
+		stall.noteCopyStart('k');
+		expect(stall.noteSessionQuiet()).to.equal(undefined);
+		expect(readStuckCopy(status)).to.include({ state: 'held' });
+		stall.noteClosed();
+		stall.noteOpened();
+		expect(stall.noteSessionQuiet()).to.include({ from: STUCK_COPY_HELD, to: 0 });
+		expect(stall.attempts).to.equal(0);
+		expect(readStuckCopy(status)).to.equal(undefined);
+	});
+
+	it('leaves the shared status untouched for progress on a leg with nothing stuck', () => {
+		const { stall, status } = tracker();
+		status.fill(7);
+		expect(stall.noteDurableProgress()).to.equal(undefined);
+		expect([...status].every((slot) => slot === 7)).to.equal(true);
 	});
 
 	it('keys a resume cursor by its value, not its object identity', () => {
