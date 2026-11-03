@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793692575009,
+  "lastUpdate": 1793692579316,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -16237,6 +16237,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 53.3,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "abc868bef48896baade7b7bd1027fad2da5f1cf4",
+          "message": "A defaulted replication pool no longer breaks app-resolved computed indexes or legacy residency hooks (#1202)\n\n* A defaulted replication pool no longer breaks app-resolved computed indexes or legacy residency hooks\n\nWith replication.threads omitted, core now starts no replication pool when the\napplications register Table.setResidency, Table.setResidencyById or an\napplication resolver for an indexed computed attribute (deprecated in 5.4), so\nthose databases keep replicating on HTTP workers with their hooks applied. The\npool's own startup warning for computed indexes is folded into core's\ndeprecation warning; an explicit replication.threads > 0 still refuses.\n\nFixes #1197\n\nDispatch-Task: hp-1197-pool-default-app-hazards\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_017xoBA88avYZ2sAqVBwkkC2\n\n* Pin core to harper#3833's merge commit\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-03T03:45:53Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/abc868bef48896baade7b7bd1027fad2da5f1cf4"
+        },
+        "date": 1793692579205,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 10.61,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 18.08,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 20.81,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 25.67,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 26.45,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 25.8,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 49.61,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 111.85,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 63.46,
             "unit": "ms"
           }
         ]
