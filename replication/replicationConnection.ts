@@ -725,20 +725,22 @@ export function purgeBoundLogNames(
 }
 
 /**
- * Whether any log the replay reads starts under what a prune removed from it. A relayed origin with a resume
- * floor replays from that floor; every other log from the merged start, as the time-based rule assumed.
+ * The first log the replay reads whose start is under what a prune removed from it, or undefined. A relayed
+ * origin with a resume floor replays from that floor; every other log from the merged start, as the
+ * time-based rule assumed.
  */
-export function replayStartPredatesPurge(
+export function replayStartUnderPurge(
 	logNames: string[],
 	start: number,
 	originFloors: Map<string, number> | undefined,
 	boundOf: (logName: string) => number | undefined
-): boolean {
-	for (const name of logNames) {
-		const bound = boundOf(name);
-		if (bound === undefined || (originFloors?.get(name) ?? start) < bound) return true;
+): { log: string; start: number; bound: number | undefined } | undefined {
+	for (const log of logNames) {
+		const bound = boundOf(log);
+		const logStart = originFloors?.get(log) ?? start;
+		if (bound === undefined || logStart < bound) return { log, start: logStart, bound };
 	}
-	return false;
+	return undefined;
 }
 
 // Integration tests force the retention copy for the named databases to exercise what a receiver does with
@@ -9992,15 +9994,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const purgeBound = purgeScope
 													? purgeBounds && Math.max(0, ...purgeBounds.values())
 													: getLogPurgeBound(auditStore);
+												const purgedLog =
+													purgeScope && purgeBounds
+														? replayStartUnderPurge(purgeScope, currentSequenceId, originFloors, (name) =>
+																purgeBounds.get(name)
+															)
+														: undefined;
 												if (
 													forceRetentionCopyForTest(databaseName) ||
 													(!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
 														(purgeScope && purgeBounds
-															? replayStartPredatesPurge(purgeScope, currentSequenceId, originFloors, (name) =>
-																	purgeBounds.get(name)
-																)
+															? purgedLog !== undefined
 															: shouldForceBaseCopyForRetention(
 																	currentSequenceId,
 																	oldestRetainedTime,
@@ -10009,8 +10015,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																	getAuditFloor(auditStore)
 																)))
 												) {
+													const purgedThrough = (bound: number | undefined) =>
+														bound === undefined ? 'unknown' : new Date(bound).toISOString();
 													logger.warn?.(
-														`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purged through ${purgeBound === undefined ? 'unknown' : new Date(purgeBound).toISOString()}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
+														purgedLog
+															? `Peer ${remoteNodeName} requested replication of database ${databaseName}, whose log ${purgedLog.log} it would replay from ${new Date(purgedLog.start).toISOString()}, under transaction-log history purged through ${purgedThrough(purgedLog.bound)}; forcing a bounded base-copy resync.`
+															: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purged through ${purgedThrough(purgeBound)}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
 													);
 													currentSequenceId = 0;
 												}

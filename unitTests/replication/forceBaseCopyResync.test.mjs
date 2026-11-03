@@ -12,7 +12,7 @@ import { expect } from 'chai';
 import {
 	shouldForceBaseCopyForRetention,
 	purgeBoundLogNames,
-	replayStartPredatesPurge,
+	replayStartUnderPurge,
 } from '#src/replication/replicationConnection';
 
 describe('shouldForceBaseCopyForRetention', () => {
@@ -129,22 +129,36 @@ describe('shouldForceBaseCopyForRetention', () => {
 	});
 });
 
-describe('replayStartPredatesPurge', () => {
+describe('replayStartUnderPurge', () => {
 	const bounds = { local: 900, relayed: 3000, quiet: 100 };
 	const boundOf = (name) => bounds[name];
 
 	it('compares a relayed origin with a resume floor from that floor, not from the merged start', () => {
 		// the merged start (1000) is under `relayed`'s bound, but `relayed` replays from 4940
-		expect(replayStartPredatesPurge(['local', 'relayed'], 1000, new Map([['relayed', 4940]]), boundOf)).to.equal(false);
-		expect(replayStartPredatesPurge(['local', 'relayed'], 1000, new Map([['relayed', 2000]]), boundOf)).to.equal(true);
+		expect(replayStartUnderPurge(['local', 'relayed'], 1000, new Map([['relayed', 4940]]), boundOf)).to.equal(
+			undefined
+		);
+		expect(replayStartUnderPurge(['local', 'relayed'], 1000, new Map([['relayed', 2000]]), boundOf)).to.deep.equal({
+			log: 'relayed',
+			start: 2000,
+			bound: 3000,
+		});
 	});
 
 	it('compares every other log from the merged start', () => {
-		expect(replayStartPredatesPurge(['local', 'quiet'], 950, undefined, boundOf)).to.equal(false);
-		expect(replayStartPredatesPurge(['local', 'quiet'], 800, undefined, boundOf)).to.equal(true);
+		expect(replayStartUnderPurge(['local', 'quiet'], 950, undefined, boundOf)).to.equal(undefined);
+		expect(replayStartUnderPurge(['local', 'quiet'], 800, undefined, boundOf)).to.deep.equal({
+			log: 'local',
+			start: 800,
+			bound: 900,
+		});
 	});
 
 	it('forces a copy for a log whose bound cannot be read', () => {
-		expect(replayStartPredatesPurge(['unknown'], 5000, undefined, boundOf)).to.equal(true);
+		expect(replayStartUnderPurge(['unknown'], 5000, undefined, boundOf)).to.deep.equal({
+			log: 'unknown',
+			start: 5000,
+			bound: undefined,
+		});
 	});
 });
