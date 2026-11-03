@@ -104,8 +104,7 @@ export class CopyStallTracker {
 	// an idle leg may never deliver the durable progress that otherwise clears its state
 	noteSessionQuiet(): StuckCopyTransition | undefined {
 		if (this.sessionStarted || this.sessionRefused) return;
-		this.attempts = 0;
-		this.startKey = undefined;
+		// the attempt count stays: a copy can start after this, and only progress resets it
 		return this.clear();
 	}
 
