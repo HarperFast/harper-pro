@@ -99,6 +99,7 @@ import {
 	getDatabaseGeneration,
 	getAuditFloor,
 	getLogPurgeBound,
+	getLogPurgeBounds,
 } from '../core/resources/auditStore.ts';
 import { isValidFloor, originFloorsDurable } from '../core/resources/originClosedFloor.ts';
 import {
@@ -9987,15 +9988,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													excludedNodes ? undefined : oldestLogName,
 													excludedNodes
 												);
-												const purgeBound = getLogPurgeBound(auditStore, purgeScope);
+												const purgeBounds = purgeScope && getLogPurgeBounds(auditStore, purgeScope);
+												const purgeBound = purgeScope
+													? purgeBounds && Math.max(0, ...purgeBounds.values())
+													: getLogPurgeBound(auditStore);
 												if (
 													forceRetentionCopyForTest(databaseName) ||
 													(!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
-														(purgeScope && purgeBound !== undefined
+														(purgeScope && purgeBounds
 															? replayStartPredatesPurge(purgeScope, currentSequenceId, originFloors, (name) =>
-																	getLogPurgeBound(auditStore, [name])
+																	purgeBounds.get(name)
 																)
 															: shouldForceBaseCopyForRetention(
 																	currentSequenceId,
