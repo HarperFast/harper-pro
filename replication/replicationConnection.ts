@@ -772,6 +772,19 @@ function sentIdMapping(auditStore: any, thisNodeName: string): Record<string, nu
 	return mapping;
 }
 
+/**
+ * Names this node sends with another id than its transaction log of that name holds: the log of a stored derived
+ * name still holds the entries applied under the id an earlier version stored it under, so that log takes no
+ * start from the follower's cursor for the name.
+ */
+export function namesSentUnderAnotherId(auditStore: any): Set<string> | undefined {
+	const stored = exportIdMapping(auditStore);
+	const sent = sentIdMapping(auditStore, getThisNodeName());
+	let names: Set<string> | undefined;
+	for (const name in sent) if (sent[name] !== stored[name]) (names ??= new Set()).add(name);
+	return names;
+}
+
 function idsOfNodes(nameToId: Record<string, number>, thisNodeName: string): Set<number> {
 	const ids = new Set<number>();
 	for (const name in nameToId) if (ownUnnamedOriginId(name, thisNodeName) === undefined) ids.add(nameToId[name]);
@@ -9688,7 +9701,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										} else {
 											(originFloors ??= new Map()).set(nodeName, floor);
 											(originFloorById ??= [])[localId] = floor;
-											liveStartByLog?.set(nodeName, floor);
+											if (!namesSentUnderAnotherId(auditStore)?.has(nodeName)) liveStartByLog?.set(nodeName, floor);
 										}
 									}
 									// Add this log back to the iterator
@@ -10537,7 +10550,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// older-keyed entry this range would correctly yield is dropped by the subscription predicate
 											// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
 											boundaryLogName = undefined;
-											liveStartByLog = new Map([[logName, currentSequenceId || 1], ...(originFloors ?? [])]);
+											const relabeled = namesSentUnderAnotherId(auditStore);
+											liveStartByLog = new Map([
+												[logName, currentSequenceId || 1],
+												...[...(originFloors ?? [])].filter(([name]) => !relabeled?.has(name)),
+											]);
 											auditLogIterable = auditStore.getRange({
 												start: currentSequenceId || 1,
 												exclusiveStart: true,

@@ -3,7 +3,11 @@ import { createRequire } from 'node:module';
 import { table } from '#src/core/resources/databases';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { getThisNodeName } from '#src/core/server/nodeName';
-import { exportIdMappingWithUnnamed, translateIdMap } from '#src/replication/replicationConnection';
+import {
+	exportIdMappingWithUnnamed,
+	namesSentUnderAnotherId,
+	translateIdMap,
+} from '#src/replication/replicationConnection';
 import { unnamedOriginName } from '#src/replication/unnamedOrigins';
 import { setMainIsWorker } from '#js/core/server/threads/manageThreads';
 import '#src/core/server/serverHelpers/serverUtilities';
@@ -60,6 +64,14 @@ describe('unnamed origins in the replication id map', () => {
 		const home = translateIdMap({ [ownName(777)]: 5, [ownName(minted)]: 6 }, auditStore);
 		assert.strictEqual(home.get(5), 777);
 		assert.strictEqual(home.get(6), minted);
+	});
+
+	it("names the log of a derived name stored under another id, so it takes no start from that name's cursor", () => {
+		const auditStore = freshAuditStore();
+		const ownName = unnamedOriginName(getThisNodeName(), 777);
+		assert.strictEqual(namesSentUnderAnotherId(auditStore), undefined);
+		getIdOfRemoteNode(ownName, auditStore);
+		assert.deepStrictEqual([...namesSentUnderAnotherId(auditStore)], [ownName]);
 	});
 
 	it('keeps a stored derived name with the id it was stored under once a node holds the id it names', () => {
