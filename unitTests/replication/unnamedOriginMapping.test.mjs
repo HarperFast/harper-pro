@@ -50,6 +50,7 @@ describe('unnamed origins in the replication id map', () => {
 		});
 		assert.deepStrictEqual(exportIdMappingWithUnnamed(auditStore, [minted]), {
 			[getThisNodeName()]: 0,
+			[ownName(777)]: 777,
 			[ownName(minted)]: minted,
 		});
 		const both = exportIdMappingWithUnnamed(auditStore, [minted, 777]);
@@ -59,6 +60,17 @@ describe('unnamed origins in the replication id map', () => {
 		const home = translateIdMap({ [ownName(777)]: 5, [ownName(minted)]: 6 }, auditStore);
 		assert.strictEqual(home.get(5), 777);
 		assert.strictEqual(home.get(6), minted);
+	});
+
+	it('keeps a stored derived name with the id it was stored under once a node holds the id it names', () => {
+		const auditStore = freshAuditStore();
+		const ownName = unnamedOriginName(getThisNodeName(), 1);
+		const peer = getIdOfRemoteNode('peer-a', auditStore);
+		assert.strictEqual(peer, 1);
+		// a relayed copy of the name, minted once peer-a held id 1
+		const minted = translateIdMap({ [ownName]: 5 }, auditStore).get(5);
+		assert.notStrictEqual(minted, 1);
+		assert.strictEqual(exportIdMappingWithUnnamed(auditStore, [minted])[ownName], minted);
 	});
 
 	it('maps its own derived name home, until that id is given to a node', () => {

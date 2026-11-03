@@ -755,18 +755,27 @@ const SKIP_ORIGIN_NAMING_FOR_TEST = process.env.HARPER_TEST_SKIP_ORPHAN_ORIGIN_N
 const COPY_APPLY_FAILURE_KEY_FOR_TEST = process.env.HARPER_TEST_COPY_APPLY_FAILURE_KEY;
 
 /**
- * The stored id map without names derived for this node's own unnamed origins. Such a name names no node; an
- * earlier version stores it, under a new id, when a peer relays it back (harper-pro#1246).
+ * The stored id map as this node sends it. A name derived for one of this node's own unnamed origins belongs to
+ * that origin's id while no node holds the id, whatever id an earlier version stored it under when a peer
+ * relayed it back (harper-pro#1246); once a node holds the id, the stored entry is that name's identity.
  */
-function idMappingOfNodes(auditStore: any, thisNodeName: string): Record<string, number> {
+function sentIdMapping(auditStore: any, thisNodeName: string): Record<string, number> {
 	const stored = exportIdMapping(auditStore);
-	let nodes = stored;
+	const nodeIds = idsOfNodes(stored, thisNodeName);
+	let mapping = stored;
 	for (const name in stored) {
-		if (ownUnnamedOriginId(name, thisNodeName) === undefined) continue;
-		if (nodes === stored) nodes = { ...stored };
-		delete nodes[name];
+		const ownId = ownUnnamedOriginId(name, thisNodeName);
+		if (ownId === undefined || nodeIds.has(ownId) || stored[name] === ownId) continue;
+		if (mapping === stored) mapping = { ...stored };
+		mapping[name] = ownId;
 	}
-	return nodes;
+	return mapping;
+}
+
+function idsOfNodes(nameToId: Record<string, number>, thisNodeName: string): Set<number> {
+	const ids = new Set<number>();
+	for (const name in nameToId) if (ownUnnamedOriginId(name, thisNodeName) === undefined) ids.add(nameToId[name]);
+	return ids;
 }
 
 /**
@@ -778,7 +787,7 @@ function idMappingOfNodes(auditStore: any, thisNodeName: string): Record<string,
 export function exportIdMappingWithUnnamed(auditStore: any, sentNodeIds: Iterable<number>): Record<string, number> {
 	if (SKIP_ORIGIN_NAMING_FOR_TEST) return exportIdMapping(auditStore);
 	const thisNodeName = getThisNodeName();
-	const nameToId = idMappingOfNodes(auditStore, thisNodeName);
+	const nameToId = sentIdMapping(auditStore, thisNodeName);
 	let named: Set<number> | undefined;
 	let exported = nameToId;
 	for (const id of sentNodeIds) {
@@ -809,7 +818,7 @@ export function translateIdMap(remoteMapping: Record<string, number>, auditStore
 	const translated = remoteToLocalNodeId(named ?? remoteMapping, auditStore);
 	if (!own) return translated;
 	// after the mint above, so a peer it just named cannot share the id
-	const nodeIds = new Set(Object.values(idMappingOfNodes(auditStore, thisNodeName)));
+	const nodeIds = idsOfNodes(exportIdMapping(auditStore), thisNodeName);
 	for (const [name, remoteId] of own) {
 		const ownId = ownUnnamedOriginId(name, thisNodeName);
 		translated.set(remoteId, nodeIds.has(ownId) ? getIdOfRemoteNode(name, auditStore) : ownId);
@@ -9657,7 +9666,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								peerSupportsOriginCursors(peerCapabilities);
 							const includeCursors = acceptIncludeCursors ? parseOriginKeyMap(data?.originCursors) : undefined;
 							const includeFloors = acceptIncludeCursors
-								? resolveOriginFloors(data?.originCursors, exportIdMapping(auditStore))
+								? resolveOriginFloors(data?.originCursors, sentIdMapping(auditStore, getThisNodeName()))
 								: undefined;
 							for (const nodeName of nodesToInclude) {
 								const index = excludedNodes.indexOf(nodeName);
@@ -9778,7 +9787,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 								// Only a multi-log range reads unlisted origins, and only per-origin logs carry their keys.
 								if (excludedNodes && auditStore.reusableIterable === true) {
-									const nameToId = exportIdMapping(auditStore);
+									const nameToId = sentIdMapping(auditStore, getThisNodeName());
 									originFloors = resolveOriginFloors(requestedOriginCursors, nameToId);
 									for (const name of [
 										getThisNodeName(),
