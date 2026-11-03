@@ -68,12 +68,17 @@ export class CopyStallTracker {
 		this.publish();
 	}
 
-	// `startKey`: a structural cursor key, or `fresh`
 	noteCopyStart(startKey: string): StuckCopyTransition | undefined {
 		this.sessionStarted = true;
-		this.attempts = startKey === this.startKey ? this.attempts + 1 : 1;
-		this.startKey = startKey;
-		if (this.attempts < 2 || this.state === STUCK_COPY_REFUSED) return;
+		if (startKey !== this.startKey) {
+			this.attempts = 1;
+			this.startKey = startKey;
+			// a hold or retry reported for another position no longer describes this leg
+			return this.state === STUCK_COPY_HELD || this.state === STUCK_COPY_RETRYING ? this.clear() : undefined;
+		}
+		this.attempts++;
+		// a refused leg is settled at close, so repeated refusals do not flap through retrying
+		if (this.state === STUCK_COPY_REFUSED) return;
 		return this.enter(
 			this.state === STUCK_COPY_HELD ? STUCK_COPY_HELD : STUCK_COPY_RETRYING,
 			STUCK_COPY_NO_PROGRESS,
@@ -115,8 +120,12 @@ export class CopyStallTracker {
 		const refused = this.sessionRefused && this.reason === STUCK_COPY_OWNER_REFUSED;
 		// a refusal reported earlier does not exempt a later accepted copy that fails at one position
 		const exhausted = !this.sessionRefused && this.sessionStarted && this.attempts >= this.limit;
+		let settled: StuckCopyTransition | undefined;
+		if (this.state === STUCK_COPY_REFUSED && this.sessionStarted && !this.sessionRefused && !exhausted)
+			settled =
+				this.attempts >= 2 ? this.enter(STUCK_COPY_RETRYING, STUCK_COPY_NO_PROGRESS, this.attempts) : this.clear();
 		this.sessionStarted = this.sessionRefused = false;
-		if (!exhausted && !refused) return { holdMs: 0 };
+		if (!exhausted && !refused) return { holdMs: 0, transition: settled };
 		const holdMs = this.hold.nextDelay() ?? COPY_STALL_HOLD_MAX_MS;
 		this.retryAt = this.now() + holdMs;
 		const transition = exhausted ? this.enter(STUCK_COPY_HELD, STUCK_COPY_NO_PROGRESS, this.attempts) : undefined;
@@ -163,7 +172,6 @@ export class CopyStallTracker {
 	}
 }
 
-// its persisted resume cursor, or `fresh` when there is none
 export function copyStartKey(
 	cursor: { copyStartTime?: unknown; currentTable?: unknown; afterKey?: unknown } | undefined,
 	encode: (value: unknown) => Uint8Array

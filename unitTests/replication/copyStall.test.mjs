@@ -73,16 +73,15 @@ describe('CopyStallTracker', () => {
 		expect(holdMs).to.be.above(COPY_STALL_HOLD_MAX_MS / 2);
 	});
 
-	it('starts over at a new position, and clears only on durable progress', () => {
+	it('starts over at a new position, which clears a hold reported for the old one', () => {
 		const { stall, status } = tracker(2);
 		stall.noteCopyStart('a');
 		stall.noteClosed();
 		stall.noteCopyStart('a');
 		stall.noteClosed();
 		expect(stall.state).to.equal(STUCK_COPY_HELD);
-		expect(stall.noteCopyStart('b')).to.equal(undefined);
+		expect(stall.noteCopyStart('b')).to.include({ from: STUCK_COPY_HELD, to: 0 });
 		expect(stall.attempts).to.equal(1);
-		expect(stall.noteDurableProgress()).to.include({ from: STUCK_COPY_HELD, to: 0 });
 		expect(readStuckCopy(status)).to.equal(undefined);
 		expect(stall.noteClosed().holdMs).to.equal(0);
 	});
@@ -167,8 +166,23 @@ describe('CopyStallTracker', () => {
 		stall.noteCopyStart('k');
 		const closed = stall.noteClosed();
 		expect(closed.holdMs).to.be.at.least(COPY_STALL_HOLD_MIN_MS);
-		expect(closed.transition).to.include({ from: STUCK_COPY_REFUSED, to: STUCK_COPY_HELD });
+		expect(closed.transition).to.include({ from: STUCK_COPY_RETRYING, to: STUCK_COPY_HELD });
 		expect(readStuckCopy(status)).to.include({ state: 'held' });
+	});
+
+	it('replaces a refusal with what an accepted copy then does, at close', () => {
+		const { stall, status } = tracker(5);
+		stall.noteRefusal(STUCK_COPY_ORIGIN_REFUSED);
+		stall.noteClosed();
+		stall.noteOpened();
+		expect(stall.noteCopyStart('k')).to.equal(undefined, 'still refused until this session closes');
+		expect(stall.noteClosed().transition).to.include({ from: STUCK_COPY_REFUSED, to: 0 });
+		for (let i = 0; i < 2; i++) {
+			stall.noteOpened();
+			stall.noteCopyStart('k');
+			stall.noteClosed();
+		}
+		expect(readStuckCopy(status)).to.include({ state: 'retrying', count: 3 });
 	});
 
 	it('reports a refusal whose reason changes', () => {

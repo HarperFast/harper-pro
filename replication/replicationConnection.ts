@@ -769,8 +769,9 @@ export function exportIdMappingWithUnnamed(auditStore: any, sentNodeIds: Iterabl
 	for (const id of sentNodeIds) {
 		if (!(Number.isSafeInteger(id) && id > 0)) continue;
 		named ??= new Set(Object.values(nameToId));
+		if (named.has(id)) continue;
 		const name = unnamedOriginName(getThisNodeName(), id);
-		if (named.has(id) || nameToId[name] !== undefined) continue;
+		if (nameToId[name] !== undefined) continue;
 		if (exported === nameToId) exported = { ...nameToId };
 		exported[name] = id;
 	}
@@ -4707,8 +4708,6 @@ export async function createWebSocket(
 
 const INITIAL_RETRY_TIME = 500;
 const MAX_RETRY_TIME = 30_000;
-// Copy attempts from one start position, with no durable progress between them, before the leg's reconnects
-// are held (harper-pro#1235).
 const COPY_STALL_ATTEMPTS = 5;
 const COPY_FLUSH_RETRY_INITIAL_MS = 250;
 const COPY_FLUSH_RETRY_MAX_MS = 30_000;
@@ -5515,8 +5514,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!connectionSuperseded() && isCopyPassRouteRestoredDurable()) {
 				if (persisted) {
 					try {
-						await getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
-						noteCopyFinished();
+						await removeFinishedCopyCursor(nodeId);
 					} catch (error) {
 						logger.warn?.(connectionId, 'could not remove copy cursor for', databaseName, error);
 						deferCopyCursorRemoval(nodeId);
@@ -5759,9 +5757,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						.then((ok) => {
 							if (connectionSuperseded()) return;
 							if (ok && isCopyPassRouteRestoredDurable()) {
-								return Promise.resolve(
-									getDatabaseStores().dbisDB?.remove?.([Symbol.for('copyCursor'), copyNodeId])
-								).then(noteCopyFinished);
+								return removeFinishedCopyCursor(copyNodeId);
 							}
 							deferCopyCursorRemoval(copyNodeId);
 						})
@@ -6935,16 +6931,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (connection?.nodeSubscriptions === undefined || connectionSuperseded()) return;
 		connection.reportStuckCopy(note(connection.copyStall));
 	}
-	// progress counts once it is what the next attempt resumes from; a projection copy persists no cursor
 	function writeCopyCursor(nodeId: number, cursor: any) {
 		const dbisDB = getDatabaseStores().dbisDB;
 		if (projectionCopy || !dbisDB) return;
 		const persisted = dbisDB.put([Symbol.for('copyCursor'), nodeId], cursor);
 		const credit = () => noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
-		if (persisted?.then) persisted.then(credit);
+		if (persisted?.then)
+			persisted.then(credit, (error: unknown) =>
+				logger.warn?.(connectionId, 'failed to persist the copy cursor', error)
+			);
 		else credit();
 	}
-	function noteCopyFinished() {
+	async function removeFinishedCopyCursor(nodeId: number) {
+		const dbisDB = getDatabaseStores().dbisDB;
+		if (!dbisDB?.remove) return;
+		await dbisDB.remove([Symbol.for('copyCursor'), nodeId]);
 		noteCopyStall((tracker) => tracker.noteDurableProgress());
 	}
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
