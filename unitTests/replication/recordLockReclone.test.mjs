@@ -1,7 +1,3 @@
-/**
- * When a copy sets the ever-recloned flag (harper-pro#1236), over real tables and the real home-map
- * row written through the operator's own operations.
- */
 import assert from 'node:assert';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';

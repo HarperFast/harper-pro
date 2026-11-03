@@ -1,8 +1,3 @@
-/**
- * Cluster record locks on a node that joined through `cloneNode` (harper-pro#1236): a first join takes
- * handoffs that depend on its own writes, and the same node cloned again after losing its database
- * storage, with its home-map row kept, refuses its own earlier lineage.
- */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, rmSync } from 'node:fs';

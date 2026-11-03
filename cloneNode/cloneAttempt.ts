@@ -92,7 +92,7 @@ export function liveCloneAttempt(rootPath: string = get(CONFIG_PARAMS.ROOTPATH))
 		throw error;
 	}
 	const marker: CloneAttemptMarker = JSON.parse(text);
-	if (typeof marker?.attemptId !== 'string' || !marker.attemptId)
+	if (typeof marker?.attemptId !== 'string' || !marker.attemptId.trim())
 		throw new Error(`The clone attempt marker at ${rootPath} names no attempt`);
 	if (Number.isNaN(completionTime(marker)))
 		throw new Error(`The clone attempt marker at ${rootPath} has an unreadable completion time`);
