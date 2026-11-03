@@ -1,12 +1,7 @@
 /**
- * Cluster record locks on a node that joined through `cloneNode` (harper-pro#1236).
- *
- * A copy used to mark every cloned database ever-recloned, after which the node refused each handoff
- * whose lineage named its own writes: here, its second acquisition of a key after the other node took it.
- * The flag is now written only when the node holds record-lock home-map state for the database that the
- * clone attempt did not create, so the first part proves a first join locks like any member, and the
- * second that the refusal still holds where it is needed: the same node, cloned again after losing its
- * database storage while keeping its system database (and so its home-map row).
+ * Cluster record locks on a node that joined through `cloneNode` (harper-pro#1236): a first join takes
+ * handoffs that depend on its own writes, and the same node cloned again after losing its database
+ * storage, with its home-map row kept, refuses its own earlier lineage.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -127,8 +122,6 @@ suite('cluster record locks on a node that joined by cloning (harper-pro#1236)',
 		await waitForMesh([leader, joined]);
 		await waitForRing([leader, joined], 2);
 
-		// The joined node's own release puts it in the key's lineage; after the leader takes the key, the
-		// joined node's next acquisition depends on that release.
 		const id = `recloned-${Date.now()}`;
 		await waitForCondition(async () => (await increment(joined, id).catch(() => undefined))?.status === 200, {
 			timeoutMs: 180_000,

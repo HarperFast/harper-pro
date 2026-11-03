@@ -35,6 +35,7 @@ import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/h
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { server } from '../core/server/Server.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { liveCloneAttempt } from '../cloneNode/cloneAttempt.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
 
 const MAX_HOMES = 256;
@@ -64,7 +65,7 @@ export interface RecordLockHomesRow {
 	staged?: RecordLockGenerationState;
 	highestActedOn: number;
 	fenced: FenceEntry[];
-	/** The clone attempt running when this row was created; never set on a later write. See `markReclonedIfLockHistory`. */
+	/** The clone attempt in flight when the row was created; never written afterwards. */
 	cloneAttempt?: string;
 }
 
@@ -169,11 +170,18 @@ async function readRow(database: string): Promise<RecordLockHomesRow | undefined
 }
 
 /**
- * Some plans build a fresh row object, so the creation attempt is carried here for all of them. Taken
- * only when the row is created: a later write cannot know which storage an older row was written on.
+ * Taken only at creation: a later write cannot know which storage an older row was written on. An
+ * unreadable clone marker leaves the row untagged, which a later clone treats as earlier state.
  */
 function withCreationAttempt(existing: RecordLockHomesRow | undefined, row: RecordLockHomesRow): RecordLockHomesRow {
-	const cloneAttempt = existing ? existing.cloneAttempt : process.env.HARPER_CLONE_ATTEMPT;
+	let cloneAttempt = existing?.cloneAttempt;
+	if (!existing) {
+		try {
+			cloneAttempt = liveCloneAttempt();
+		} catch (error) {
+			logger.warn?.(`Record lock home map row for ${row.database}: could not read the clone attempt marker`, error);
+		}
+	}
 	return cloneAttempt === undefined ? row : { ...row, cloneAttempt };
 }
 

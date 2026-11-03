@@ -94,18 +94,26 @@ export function liveCloneAttempt(rootPath: string = get(CONFIG_PARAMS.ROOTPATH))
 	const marker: CloneAttemptMarker = JSON.parse(text);
 	if (typeof marker?.attemptId !== 'string')
 		throw new Error(`The clone attempt marker at ${rootPath} names no attempt`);
+	if (Number.isNaN(completionTime(marker)))
+		throw new Error(`The clone attempt marker at ${rootPath} has an unreadable completion time`);
 	return marker.attemptId === attemptId && !retired(marker) ? attemptId : undefined;
 }
 
-function retired(marker: CloneAttemptMarker | undefined): boolean {
+/** Undefined while unfinished; NaN when the recorded time is not a number. */
+function completionTime(marker: CloneAttemptMarker | undefined): number | undefined {
 	const completedAt = marker?.completedAt ?? process.env[CLONE_COMPLETED_AT_ENV];
+	if (completedAt === undefined) return undefined;
+	const parsed = typeof completedAt === 'string' ? Number(completedAt) : completedAt;
+	return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function retired(marker: CloneAttemptMarker | undefined): boolean {
+	const completedAt = completionTime(marker);
 	if (completedAt === undefined) return false;
 	const now = Date.now();
-	const parsedCompletedAt = typeof completedAt === 'string' ? Number(completedAt) : completedAt;
 	return (
-		typeof parsedCompletedAt !== 'number' ||
-		!Number.isFinite(parsedCompletedAt) ||
-		parsedCompletedAt - now > CLONE_COMPLETION_GRACE_MS ||
-		parsedCompletedAt + CLONE_COMPLETION_GRACE_MS <= now
+		Number.isNaN(completedAt) ||
+		completedAt - now > CLONE_COMPLETION_GRACE_MS ||
+		completedAt + CLONE_COMPLETION_GRACE_MS <= now
 	);
 }

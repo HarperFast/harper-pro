@@ -102,15 +102,14 @@ export async function poison(database: string, origin: string, table: string, re
 }
 
 /**
- * Called before a copy's first row, with the clone attempt in flight (`liveCloneAttempt`), if any. A
- * home-map row created during that attempt was created on the storage being copied into; any other row
- * may predate it, so the flag is set. Resolves true once the flag is newly durable; a failed read
- * rejects with nothing written, so the copy is retried rather than flagged.
+ * Before a copy's first row. A home-map row created during the clone attempt in flight was created on
+ * the storage being copied into; any other row may predate it. Resolves true while the flag is set, so
+ * the caller re-runs its durability barrier on every copy; a failed read writes nothing.
  */
 export async function markReclonedIfLockHistory(database: string, cloneAttempt: string | undefined): Promise<boolean> {
 	const dbisDB = dbisFor(database);
 	if (!dbisDB) throw new Error(`no dbis store for ${database} to record the reclone in`);
-	if (dbisDB.getSync([RECLONED]) === true) return false;
+	if (dbisDB.getSync([RECLONED]) === true) return true;
 	const row = await existingHomesRow(database);
 	if (!row || (cloneAttempt !== undefined && row.cloneAttempt === cloneAttempt)) return false;
 	await dbisDB.put([RECLONED], true);

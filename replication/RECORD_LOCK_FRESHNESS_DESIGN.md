@@ -94,9 +94,12 @@ record of that origin and table this node dropped or failed to apply. Those are 
     flight carries that attempt's id (`cloneAttempt`, set only at creation) and does not flag; any
     other row does (an install cloned over, replaced database storage, a row from before the field
     existed, a sharding recovery outside a clone). "In flight" is `liveCloneAttempt()`, not the raw
-    `HARPER_CLONE_ATTEMPT`, which outlives the attempt in every worker. With the flag set, every
-    self-origin dependency rejects with 503; an upgrade does not clear an existing flag (it records no
-    evidence), so the remedy is a re-clone with a fresh root.
+    `HARPER_CLONE_ATTEMPT`, which outlives the attempt in every worker; the row's tag is taken the same
+    way. A database storage lost in the middle of a clone attempt needs `FORCE_CLONE`: resuming the same
+    attempt would trust a row it tagged on the lost storage. With the flag set, every self-origin
+    dependency rejects with 503 and every later copy repeats the flush that made it durable; an upgrade
+    does not clear an existing flag (it records no evidence), so the remedy is a re-clone with a fresh
+    root.
     **Not decided locally:** a fully fresh root under a reused node name looks exactly like a first
     join, while a home that kept the current generation may still hold lineage naming the old
     incarnation's releases. Re-provision under a new name, or stage and activate a new generation on

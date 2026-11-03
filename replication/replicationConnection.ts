@@ -8263,9 +8263,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// The raw variable outlives the attempt in every worker; only a live attempt counts.
 								const liveAttempt = cloneAttempt ? liveCloneAttempt() : undefined;
 								if (liveAttempt !== undefined || !cloneAttempt || missingShardingOriginStart(databaseName)) {
-									const marked = await markReclonedIfLockHistory(databaseName, liveAttempt);
+									const flagged = await markReclonedIfLockHistory(databaseName, liveAttempt);
 									if (connectionSuperseded()) return;
-									if (marked) {
+									if (flagged) {
 										for (const { catalog } of shardingNativeRoots(databaseName)) {
 											if (typeof catalog.flush === 'function') await catalog.flush({ allowWriteStall: true });
 											else await catalog.flushed; // LMDB exposes its durability barrier as a promise.
