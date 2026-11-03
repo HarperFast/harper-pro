@@ -9678,9 +9678,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								peerCapabilitiesLearned &&
 								peerSupportsOriginCursors(peerCapabilities);
 							const includeCursors = acceptIncludeCursors ? parseOriginKeyMap(data?.originCursors) : undefined;
-							const includeFloors = acceptIncludeCursors
-								? resolveOriginFloors(data?.originCursors, sentIdMapping(auditStore, getThisNodeName()))
-								: undefined;
+							const sentMapping = acceptIncludeCursors ? sentIdMapping(auditStore, getThisNodeName()) : undefined;
+							const includeFloors = sentMapping ? resolveOriginFloors(data?.originCursors, sentMapping) : undefined;
+							const relabeled = sentMapping ? namesSentUnderAnotherId(auditStore) : undefined;
 							for (const nodeName of nodesToInclude) {
 								const index = excludedNodes.indexOf(nodeName);
 								if (index !== -1) {
@@ -9691,17 +9691,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// Update the subscribedNodeIds to remove the exclusion
 									if (auditStore && subscribedNodeIds) {
 										const localId = getIdOfRemoteNode(nodeName, auditStore);
+										// the id this node sends the name with, which its cursor was earned on
+										const floorId = sentMapping?.[nodeName] ?? localId;
 										delete subscribedNodeIds[localId];
 										// Bound the log before addLog re-admits it: the live range reads its start from this map.
 										const floor = includeFloors?.get(nodeName);
 										if (floor === undefined) {
 											originFloors?.delete(nodeName);
-											if (originFloorById) delete originFloorById[localId];
+											if (originFloorById) delete originFloorById[floorId];
 											liveStartByLog?.delete(nodeName);
 										} else {
 											(originFloors ??= new Map()).set(nodeName, floor);
-											(originFloorById ??= [])[localId] = floor;
-											if (!namesSentUnderAnotherId(auditStore)?.has(nodeName)) liveStartByLog?.set(nodeName, floor);
+											(originFloorById ??= [])[floorId] = floor;
+											if (!relabeled?.has(nodeName)) liveStartByLog?.set(nodeName, floor);
 										}
 									}
 									// Add this log back to the iterator
@@ -10025,8 +10027,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// LMDB has one bound for every name; every bound carries the epoch, which an empty scope would drop
 												const purgeScope = scopedLogs?.length ? scopedLogs : [oldestLogName];
 												const purgeBounds = getLogPurgeBounds(auditStore, purgeScope);
+												// a log holding another id's entries than its name is sent with replays from the merged start
+												const relabeledLogs = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
+												const comparedFloors = relabeledLogs
+													? new Map([...originFloors].filter(([name]) => !relabeledLogs.has(name)))
+													: originFloors;
 												const purgedLog = purgeBounds
-													? replayStartUnderPurge(purgeScope, currentSequenceId, originFloors, (name) =>
+													? replayStartUnderPurge(purgeScope, currentSequenceId, comparedFloors, (name) =>
 															purgeBounds.get(name)
 														)
 													: undefined;
@@ -10550,7 +10557,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// older-keyed entry this range would correctly yield is dropped by the subscription predicate
 											// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
 											boundaryLogName = undefined;
-											const relabeled = namesSentUnderAnotherId(auditStore);
+											const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
 											liveStartByLog = new Map([
 												[logName, currentSequenceId || 1],
 												...[...(originFloors ?? [])].filter(([name]) => !relabeled?.has(name)),
