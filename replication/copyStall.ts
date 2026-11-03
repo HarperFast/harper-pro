@@ -73,7 +73,6 @@ export class CopyStallTracker {
 		if (startKey !== this.startKey) {
 			this.attempts = 1;
 			this.startKey = startKey;
-			// a hold or retry reported for another position no longer describes this leg
 			return this.state === STUCK_COPY_HELD || this.state === STUCK_COPY_RETRYING ? this.clear() : undefined;
 		}
 		this.attempts++;

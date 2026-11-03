@@ -6925,7 +6925,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
-	// a superseded session must not touch the leg's stuck-copy state
 	function noteCopyStall(note: (tracker: CopyStallTracker) => StuckCopyTransition | undefined) {
 		const connection = options.connection;
 		if (connection?.nodeSubscriptions === undefined || connectionSuperseded()) return;
