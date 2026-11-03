@@ -222,8 +222,8 @@ for (const engine of ['rocksdb']) {
 						const start = performance.now();
 						await killHarper(context);
 						const stopMs = Math.round(performance.now() - start);
-						const { pid, exitCode, signalCode } = outgoing[i].harper.process;
-						const confirmed = exitCode !== null || signalCode !== null;
+						const { pid, exitCode, signalCode } = outgoing[i].harper.process ?? {};
+						const confirmed = exitCode != null || signalCode != null;
 						const record = { restart, node: i, pid, exitCode, signal: signalCode, confirmed, stopMs };
 						await emit(`restart ${restart} node${i} stop`, record, outgoing[i].harper);
 					})
