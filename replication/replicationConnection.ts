@@ -724,21 +724,18 @@ export function purgeBoundLogNames(
 }
 
 /**
- * Whether a log that replays from its own origin floor, below the merged start, starts under what a prune
- * removed from it: the merged start alone does not bound those logs.
+ * Whether any log the replay reads starts under what a prune removed from it. A relayed origin with a resume
+ * floor replays from that floor; every other log from the merged start, as the time-based rule assumed.
  */
-export function originFloorPredatesPurge(
-	logNames: string[] | undefined,
+export function replayStartPredatesPurge(
+	logNames: string[],
 	start: number,
 	originFloors: Map<string, number> | undefined,
 	boundOf: (logName: string) => number | undefined
 ): boolean {
-	if (!originFloors || !logNames) return false;
 	for (const name of logNames) {
-		const floor = originFloors.get(name);
-		if (floor === undefined || floor >= start) continue;
 		const bound = boundOf(name);
-		if (bound !== undefined && floor < bound) return true;
+		if (bound === undefined || (originFloors?.get(name) ?? start) < bound) return true;
 	}
 	return false;
 }
@@ -9994,17 +9991,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													(!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
-														(shouldForceBaseCopyForRetention(
-															currentSequenceId,
-															oldestRetainedTime,
-															Date.now() - auditRetention,
-															purgeBound,
-															getAuditFloor(auditStore)
-														) ||
-															(purgeBound !== undefined &&
-																originFloorPredatesPurge(purgeScope, currentSequenceId, originFloors, (name) =>
+														(purgeScope && purgeBound !== undefined
+															? replayStartPredatesPurge(purgeScope, currentSequenceId, originFloors, (name) =>
 																	getLogPurgeBound(auditStore, [name])
-																))))
+																)
+															: shouldForceBaseCopyForRetention(
+																	currentSequenceId,
+																	oldestRetainedTime,
+																	Date.now() - auditRetention,
+																	purgeBound,
+																	getAuditFloor(auditStore)
+																)))
 												) {
 													logger.warn?.(
 														`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purged through ${purgeBound === undefined ? 'unknown' : new Date(purgeBound).toISOString()}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`

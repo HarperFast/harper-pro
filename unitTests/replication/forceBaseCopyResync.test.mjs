@@ -12,7 +12,7 @@ import { expect } from 'chai';
 import {
 	shouldForceBaseCopyForRetention,
 	purgeBoundLogNames,
-	originFloorPredatesPurge,
+	replayStartPredatesPurge,
 } from '#src/replication/replicationConnection';
 
 describe('shouldForceBaseCopyForRetention', () => {
@@ -129,19 +129,22 @@ describe('shouldForceBaseCopyForRetention', () => {
 	});
 });
 
-describe('originFloorPredatesPurge', () => {
-	const bounds = { relayed: 500, other: 100 };
+describe('replayStartPredatesPurge', () => {
+	const bounds = { local: 900, relayed: 3000, quiet: 100 };
 	const boundOf = (name) => bounds[name];
 
-	it('forces a copy when a log replaying from its origin floor starts under that log’s bound', () => {
-		// the merged start (900) clears every bound, but `relayed` replays from 400
-		expect(originFloorPredatesPurge(['relayed', 'other'], 900, new Map([['relayed', 400]]), boundOf)).to.equal(true);
+	it('compares a relayed origin with a resume floor from that floor, not from the merged start', () => {
+		// the merged start (1000) is under `relayed`'s bound, but `relayed` replays from 4940
+		expect(replayStartPredatesPurge(['local', 'relayed'], 1000, new Map([['relayed', 4940]]), boundOf)).to.equal(false);
+		expect(replayStartPredatesPurge(['local', 'relayed'], 1000, new Map([['relayed', 2000]]), boundOf)).to.equal(true);
 	});
 
-	it('leaves floors at or above their bound, or above the merged start, to the merged comparison', () => {
-		expect(originFloorPredatesPurge(['relayed'], 900, new Map([['relayed', 600]]), boundOf)).to.equal(false);
-		expect(originFloorPredatesPurge(['relayed'], 300, new Map([['relayed', 400]]), boundOf)).to.equal(false);
-		expect(originFloorPredatesPurge(['relayed'], 900, undefined, boundOf)).to.equal(false);
-		expect(originFloorPredatesPurge(['unknown'], 900, new Map([['unknown', 1]]), boundOf)).to.equal(false);
+	it('compares every other log from the merged start', () => {
+		expect(replayStartPredatesPurge(['local', 'quiet'], 950, undefined, boundOf)).to.equal(false);
+		expect(replayStartPredatesPurge(['local', 'quiet'], 800, undefined, boundOf)).to.equal(true);
+	});
+
+	it('forces a copy for a log whose bound cannot be read', () => {
+		expect(replayStartPredatesPurge(['unknown'], 5000, undefined, boundOf)).to.equal(true);
 	});
 });
