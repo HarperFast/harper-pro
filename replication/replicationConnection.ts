@@ -9060,11 +9060,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// thread, and this connection's initial TABLE_FIXED_STRUCTURE must reflect
 							// what's actually in LMDB right now. After this, HAS_STRUCTURE_UPDATE on
 							// subsequent audit records keeps the encoder in sync, since every
-							// typed-struct addition produces a flagged audit record.
+							// typed-struct addition produces a flagged audit record. A shared-structure save that
+							// throws resets this encoder without an audit record; a pack would reload it, but this
+							// path forwards stored bytes, and the peer's decoder is replaced by what is sent below.
 							if (
 								!tableEntry.structuresLoaded ||
 								auditRecord.extendedType & HAS_STRUCTURE_UPDATE ||
 								!encoder.typedStructs ||
+								encoder.structures?.uninitialized ||
 								auditRecord.structureVersion > encoder.typedStructs.length + encoder.structures.length
 							) {
 								tableEntry.structuresLoaded = true;
