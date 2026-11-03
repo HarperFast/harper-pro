@@ -9,7 +9,11 @@
  */
 
 import { expect } from 'chai';
-import { shouldForceBaseCopyForRetention, purgeBoundLogNames } from '#src/replication/replicationConnection';
+import {
+	shouldForceBaseCopyForRetention,
+	purgeBoundLogNames,
+	originFloorPredatesPurge,
+} from '#src/replication/replicationConnection';
 
 describe('shouldForceBaseCopyForRetention', () => {
 	const RETENTION = 3 * 86400 * 1000; // 3 days, like the incident's auditRetention
@@ -122,5 +126,22 @@ describe('shouldForceBaseCopyForRetention', () => {
 		it('leaves an engine with no per-origin logs to the store', () => {
 			expect(purgeBoundLogNames({}, undefined, [])).to.equal(undefined);
 		});
+	});
+});
+
+describe('originFloorPredatesPurge', () => {
+	const bounds = { relayed: 500, other: 100 };
+	const boundOf = (name) => bounds[name];
+
+	it('forces a copy when a log replaying from its origin floor starts under that log’s bound', () => {
+		// the merged start (900) clears every bound, but `relayed` replays from 400
+		expect(originFloorPredatesPurge(['relayed', 'other'], 900, new Map([['relayed', 400]]), boundOf)).to.equal(true);
+	});
+
+	it('leaves floors at or above their bound, or above the merged start, to the merged comparison', () => {
+		expect(originFloorPredatesPurge(['relayed'], 900, new Map([['relayed', 600]]), boundOf)).to.equal(false);
+		expect(originFloorPredatesPurge(['relayed'], 300, new Map([['relayed', 400]]), boundOf)).to.equal(false);
+		expect(originFloorPredatesPurge(['relayed'], 900, undefined, boundOf)).to.equal(false);
+		expect(originFloorPredatesPurge(['unknown'], 900, new Map([['unknown', 1]]), boundOf)).to.equal(false);
 	});
 });

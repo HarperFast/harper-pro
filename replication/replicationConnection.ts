@@ -723,6 +723,26 @@ export function purgeBoundLogNames(
 	return names;
 }
 
+/**
+ * Whether a log that replays from its own origin floor, below the merged start, starts under what a prune
+ * removed from it: the merged start alone does not bound those logs.
+ */
+export function originFloorPredatesPurge(
+	logNames: string[] | undefined,
+	start: number,
+	originFloors: Map<string, number> | undefined,
+	boundOf: (logName: string) => number | undefined
+): boolean {
+	if (!originFloors || !logNames) return false;
+	for (const name of logNames) {
+		const floor = originFloors.get(name);
+		if (floor === undefined || floor >= start) continue;
+		const bound = boundOf(name);
+		if (bound !== undefined && floor < bound) return true;
+	}
+	return false;
+}
+
 // Integration tests force the retention copy for the named databases to exercise what a receiver does with
 // a copy it cannot accept (harper-pro#1231).
 const FORCE_RETENTION_COPY_DATABASES_FOR_TEST = process.env.HARPER_TEST_FORCE_RETENTION_COPY_DATABASES?.split(',');
@@ -9963,22 +9983,28 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													oldestRetainedTime = entry.txnLogKey;
 													break;
 												}
-												const purgeBound = getLogPurgeBound(
+												const purgeScope = purgeBoundLogNames(
 													auditStore,
-													purgeBoundLogNames(auditStore, excludedNodes ? undefined : oldestLogName, excludedNodes)
+													excludedNodes ? undefined : oldestLogName,
+													excludedNodes
 												);
+												const purgeBound = getLogPurgeBound(auditStore, purgeScope);
 												if (
 													forceRetentionCopyForTest(databaseName) ||
 													(!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
-														shouldForceBaseCopyForRetention(
+														(shouldForceBaseCopyForRetention(
 															currentSequenceId,
 															oldestRetainedTime,
 															Date.now() - auditRetention,
 															purgeBound,
 															getAuditFloor(auditStore)
-														))
+														) ||
+															(purgeBound !== undefined &&
+																originFloorPredatesPurge(purgeScope, currentSequenceId, originFloors, (name) =>
+																	getLogPurgeBound(auditStore, [name])
+																))))
 												) {
 													logger.warn?.(
 														`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purged through ${purgeBound === undefined ? 'unknown' : new Date(purgeBound).toISOString()}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
