@@ -192,17 +192,17 @@ async function dependencyVersions() {
 	return versions;
 }
 
-// A sender's `certified origin floors` line is logged at send, not at the receiver's commit: it correlates with B's
-// row, it does not prove it.
+// A sender's `certified origin floors` line is logged at send, not at the receiver's commit, and names no database:
+// it correlates with B's row, it does not prove it. `bulk copy complete` names no database either.
 async function reportWidening(t, widening) {
 	const { A, B, marks } = widening;
 	const certificates = await logLinesSince(marks.aLog, marks.aLogFrom, `certified origin floors to ${B.hostname} `, 2);
 	const entryPattern = new RegExp(
 		`'${A.hostname.replaceAll('.', '\\.')}' => \\[ ([\\d.]+), '[0-9a-f]+', (true|false) \\]`
 	);
-	const windowKnown = marks.coverageAt !== undefined && marks.stopReturnedAt !== undefined;
+	const windowKnown = marks.rewrittenAt !== undefined && marks.stopReturnedAt !== undefined;
 	const sendsWhileStopping = (windowKnown ? certificates : null)?.filter(
-		(line) => logTime(line) > marks.coverageAt && logTime(line) < marks.stopReturnedAt
+		(line) => logTime(line) > marks.rewrittenAt && logTime(line) < marks.stopReturnedAt
 	);
 	const certificatesWhileStopping = sendsWhileStopping
 		?.map((line) => {
@@ -217,7 +217,8 @@ async function reportWidening(t, widening) {
 	);
 	const resumeMatch = resume?.[0]?.match(/start time: ([\d.]+)/);
 	const resumeStart = resumeMatch ? Number(resumeMatch[1]) : null;
-	const firstMatch = async (needle) => (await restartLog(needle))?.[0] ?? null;
+	const firstMatch = async (needle, scope = '') =>
+		(await restartLog(needle))?.find((line) => line.includes(scope)) ?? null;
 	const summary = {
 		clauses: widening.clauses?.report() ?? null,
 		coverageRewrite: widening.coverage ?? null,
@@ -237,12 +238,13 @@ async function reportWidening(t, widening) {
 							: (certificatesWhileStopping?.some(({ floor }) => resumeStart < floor && floor - resumeStart < 1e-3) ??
 								null),
 					widened: await firstMatch(`Route coverage widened to full for ${A.hostname} on database data `),
-					fullCopyRequested: await firstMatch('full copy'),
-					copyComplete: await firstMatch(`bulk copy complete from ${A.hostname}`),
+					fullCopyRequested: await firstMatch('full copy', 'database data'),
+					bulkCopyCompleteAnyDatabase: await firstMatch(`bulk copy complete from ${A.hostname}`),
 				}
 			: 'unknown',
+		beforeRewriteRows: widening.beforeRewrite ?? null,
 		afterRestartRows: (await widening.afterRestart) ?? null,
-		atWaitEndRows: widening.atWaitEnd ?? null,
+		atWaitEndRows: (await widening.atWaitEnd) ?? null,
 		heldTransaction: {
 			openedAt: marks.heldAt ?? null,
 			releasedAt: marks.releasedAt ?? null,
@@ -269,7 +271,8 @@ async function reportWidening(t, widening) {
 				: 'unknown',
 			resumedJustBelowACertificateFloor: summary.bRestart.resumedJustBelowACertificateFloor ?? null,
 			widened: typeof summary.bRestart === 'object' ? Boolean(summary.bRestart.widened) : 'unknown',
-			copyComplete: typeof summary.bRestart === 'object' ? Boolean(summary.bRestart.copyComplete) : 'unknown',
+			bulkCopyCompleteAnyDatabase:
+				typeof summary.bRestart === 'object' ? Boolean(summary.bRestart.bulkCopyCompleteAnyDatabase) : 'unknown',
 			stopMs: summary.bStop.returnedAfterMs,
 			heldAbortedAt: summary.heldTransaction.abortedAt,
 		})}`
@@ -512,12 +515,9 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			marks.maxCopiedVersion = maxCopiedVersion;
 			marks.bLogBeforeStop = logPath(B);
 			marks.bLogFrom = (await readText(marks.bLogBeforeStop)).length;
-			widening.coverage = await postToFixture(B, 'SetRouteCoverage', {
-				peer: A.hostname,
-				fullCoverage: false,
-				copyRows: true,
-			});
-			marks.coverageAt = now();
+			widening.beforeRewrite = await floorsOn(B, A, { copyRows: true }).catch((error) => ({ error: error.message }));
+			widening.coverage = await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
+			marks.rewrittenAt = widening.coverage.writtenAt;
 			const stopStarted = Date.now();
 			await stopNodeProcess(B);
 			marks.stopReturnedAt = now();
@@ -548,7 +548,7 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 				marks.waitEndedAt = now();
 			} catch (error) {
 				marks.waitEndedAt = now();
-				widening.atWaitEnd = await floorsOn(B, A, { copyRows: true }).catch((cause) => ({ error: cause.message }));
+				widening.atWaitEnd = floorsOn(B, A, { copyRows: true }).catch((cause) => ({ error: cause.message }));
 				throw error;
 			}
 

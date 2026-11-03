@@ -181,17 +181,10 @@ export class SetRouteCoverage extends Resource {
 			...node,
 			fullCoverage: data?.fullCoverage ?? false,
 		}));
+		const writtenAt = new Date().toISOString();
 		await Table.dbisDB.put(seqKey, { ...row, nodes });
 		const readBack = Table.dbisDB.getSync(seqKey);
-		return {
-			updated: true,
-			readBack: {
-				peerId,
-				seqId: readBack?.seqId ?? null,
-				nodes: readBack?.nodes ?? null,
-				...(data.copyRows ? copyRowsFor(Table.dbisDB, peerId) : undefined),
-			},
-		};
+		return { updated: true, writtenAt, readBack: { seqId: readBack?.seqId ?? null, nodes: readBack?.nodes ?? null } };
 	}
 }
 
