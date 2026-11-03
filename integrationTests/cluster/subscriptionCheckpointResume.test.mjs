@@ -166,7 +166,6 @@ function clauseTracker(clauses) {
 }
 
 const logTime = (line) => line.slice(0, 24);
-/** `null` is unknown: no log, or a log shorter than the offset saved for it. */
 async function logLinesSince(path, from, needle, following = 0) {
 	const text = await readText(path).catch(() => '');
 	if (!text || from > text.length) return null;
@@ -202,7 +201,7 @@ async function reportWidening(t, widening) {
 	);
 	const windowKnown = marks.rewrittenAt !== undefined && marks.stopReturnedAt !== undefined;
 	const sendsWhileStopping = (windowKnown ? certificates : null)?.filter(
-		(line) => logTime(line) > marks.rewrittenAt && logTime(line) < marks.stopReturnedAt
+		(line) => logTime(line) >= marks.rewrittenAt && logTime(line) <= marks.stopReturnedAt
 	);
 	const certificatesWhileStopping = sendsWhileStopping
 		?.map((line) => {
@@ -217,8 +216,8 @@ async function reportWidening(t, widening) {
 	);
 	const resumeMatch = resume?.[0]?.match(/start time: ([\d.]+)/);
 	const resumeStart = resumeMatch ? Number(resumeMatch[1]) : null;
-	const firstMatch = async (needle, scope = '') =>
-		(await restartLog(needle))?.find((line) => line.includes(scope)) ?? null;
+	const firstMatch = async (needle, ...scopes) =>
+		(await restartLog(needle))?.find((line) => scopes.every((scope) => line.includes(scope))) ?? null;
 	const summary = {
 		clauses: widening.clauses?.report() ?? null,
 		coverageRewrite: widening.coverage ?? null,
@@ -229,7 +228,7 @@ async function reportWidening(t, widening) {
 		},
 		certificateSendsToBWhileStopping: sendsWhileStopping?.length ?? 'unknown',
 		certificatesWhileStopping: certificatesWhileStopping ?? 'unknown',
-		bRestart: resume
+		bRestart: resume?.length
 			? {
 					resumeStart,
 					resumedJustBelowACertificateFloor:
@@ -238,7 +237,7 @@ async function reportWidening(t, widening) {
 							: (certificatesWhileStopping?.some(({ floor }) => resumeStart < floor && floor - resumeStart < 1e-3) ??
 								null),
 					widened: await firstMatch(`Route coverage widened to full for ${A.hostname} on database data `),
-					fullCopyRequested: await firstMatch('full copy', 'database data'),
+					fullCopyRequested: await firstMatch('full copy', 'database data', A.hostname),
 					bulkCopyCompleteAnyDatabase: await firstMatch(`bulk copy complete from ${A.hostname}`),
 				}
 			: 'unknown',
