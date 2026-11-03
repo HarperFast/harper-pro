@@ -741,7 +741,8 @@ const COPY_APPLY_FAILURE_KEY_FOR_TEST = process.env.HARPER_TEST_COPY_APPLY_FAILU
  * The id map a sender sends: every named origin, plus a name for each sent origin id this node has none for
  * (v4-era data, a node whose mapping is gone), so the receiver can translate every row (harper-pro#1235).
  * The name is derived, not stored here, so this node's own reading of the id does not change; a peer that
- * relays it back is mapped home by `translateIdMap`.
+ * relays it back is mapped home by `translateIdMap`. A derived name this node already maps (an earlier
+ * version minted it on relay) keeps its own id.
  */
 export function exportIdMappingWithUnnamed(auditStore: any, sentNodeIds: Iterable<number>): Record<string, number> {
 	const nameToId = exportIdMapping(auditStore);
@@ -751,30 +752,37 @@ export function exportIdMappingWithUnnamed(auditStore: any, sentNodeIds: Iterabl
 	for (const id of sentNodeIds) {
 		if (!(Number.isSafeInteger(id) && id > 0)) continue;
 		named ??= new Set(Object.values(nameToId));
-		if (named.has(id)) continue;
+		const name = unnamedOriginName(getThisNodeName(), id);
+		if (named.has(id) || nameToId[name] !== undefined) continue;
 		if (exported === nameToId) exported = { ...nameToId };
-		exported[unnamedOriginName(getThisNodeName(), id)] = id;
+		exported[name] = id;
 	}
 	return exported;
 }
 
 /**
  * A peer's id map translated to local ids. A name this node derived for one of its own unnamed origins comes
- * back to that id rather than becoming a second identity for the same writes.
+ * back to that id rather than becoming a second identity for the same writes, unless the id has been given
+ * to a node since.
  */
 export function translateIdMap(remoteMapping: Record<string, number>, auditStore: any): Map<number, number> {
 	const thisNodeName = getThisNodeName();
 	let named: Record<string, number> | undefined;
-	let home: Array<[number, number]> | undefined;
+	let own: Array<[string, number]> | undefined;
 	for (const name in remoteMapping) {
-		const ownId = ownUnnamedOriginId(name, thisNodeName);
-		if (ownId === undefined) continue;
+		if (ownUnnamedOriginId(name, thisNodeName) === undefined) continue;
 		named ??= { ...remoteMapping };
 		delete named[name];
-		(home ??= []).push([remoteMapping[name], ownId]);
+		(own ??= []).push([name, remoteMapping[name]]);
 	}
 	const translated = remoteToLocalNodeId(named ?? remoteMapping, auditStore);
-	for (const [remoteId, ownId] of home ?? []) translated.set(remoteId, ownId);
+	if (!own) return translated;
+	// after the mint above, so a peer it just named cannot share the id
+	const localIds = new Set(Object.values(exportIdMapping(auditStore)));
+	for (const [name, remoteId] of own) {
+		const ownId = ownUnnamedOriginId(name, thisNodeName);
+		translated.set(remoteId, localIds.has(ownId) ? getIdOfRemoteNode(name, auditStore) : ownId);
+	}
 	return translated;
 }
 
@@ -10747,7 +10755,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					const origin = remoteShortIdToLocalId.get(record.nodeId);
 					if (!projectionCopy && restrictedOrigins && (origin === undefined || origin !== directShardingOriginId)) {
 						refuseShardingSource(
-							origin === undefined ? String(record.nodeId) : getNodeNameForId(auditStore, origin, true)
+							origin === undefined ? String(record.nodeId) : (getNodeNameForId(auditStore, origin) ?? `node#${origin}`)
 						);
 						return;
 					}
@@ -10892,7 +10900,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					return;
 				}
 				if (!projectionCopy && restrictedOrigins && localSourceNodeId !== directShardingOriginId) {
-					refuseShardingSource(getNodeNameForId(auditStore, localSourceNodeId, true));
+					refuseShardingSource(getNodeNameForId(auditStore, localSourceNodeId) ?? `node#${localSourceNodeId}`);
 					return;
 				}
 				if (
