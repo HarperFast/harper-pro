@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793621914691,
+  "lastUpdate": 1793692575009,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -7071,6 +7071,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2568.6,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "abc868bef48896baade7b7bd1027fad2da5f1cf4",
+          "message": "A defaulted replication pool no longer breaks app-resolved computed indexes or legacy residency hooks (#1202)\n\n* A defaulted replication pool no longer breaks app-resolved computed indexes or legacy residency hooks\n\nWith replication.threads omitted, core now starts no replication pool when the\napplications register Table.setResidency, Table.setResidencyById or an\napplication resolver for an indexed computed attribute (deprecated in 5.4), so\nthose databases keep replicating on HTTP workers with their hooks applied. The\npool's own startup warning for computed indexes is folded into core's\ndeprecation warning; an explicit replication.threads > 0 still refuses.\n\nFixes #1197\n\nDispatch-Task: hp-1197-pool-default-app-hazards\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_017xoBA88avYZ2sAqVBwkkC2\n\n* Pin core to harper#3833's merge commit\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-03T03:45:53Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/abc868bef48896baade7b7bd1027fad2da5f1cf4"
+        },
+        "date": 1793692573467,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 5345.6,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 16511.33,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 11797.72,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 5155.76,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 3673.92,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2107.96,
             "unit": "ops/sec"
           }
         ]
