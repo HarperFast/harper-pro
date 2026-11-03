@@ -724,19 +724,23 @@ export function purgeBoundLogNames(
 }
 
 /**
- * The first log the replay reads whose bound is above the merged start, or undefined. Every log is compared
- * from the merged start, as the time-based rule was: a relayed origin's resume floor can sit below the
- * source's epoch (a relay created after that floor, which never pruned), so comparing the floor would force
- * copies no prune caused.
+ * The first log the replay reads whose bound is above where the follower holds it, or undefined. A relayed
+ * origin with a resume floor is compared from its cursor, the floor plus `ORIGIN_CURSOR_OVERLAP_MS`: the
+ * follower holds that origin's entries up to it, and the overlap below exists for commits that land out of key
+ * order, so comparing the floor would force a copy whenever the origin's last key sits inside it, as an idle
+ * origin's does. Every other log is compared from the merged start.
  */
 export function replayStartUnderPurge(
 	logNames: string[],
 	start: number,
+	originFloors: Map<string, number> | undefined,
 	boundOf: (logName: string) => number | undefined
 ): { log: string; start: number; bound: number | undefined } | undefined {
 	for (const log of logNames) {
 		const bound = boundOf(log);
-		if (bound === undefined || start < bound) return { log, start, bound };
+		const floor = originFloors?.get(log);
+		const logStart = floor === undefined ? start : floor + ORIGIN_CURSOR_OVERLAP_MS;
+		if (bound === undefined || logStart < bound) return { log, start: logStart, bound };
 	}
 	return undefined;
 }
@@ -9993,7 +9997,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const purgeBounds = getLogPurgeBounds(auditStore, purgeScope);
 												const purgeBound = purgeBounds && Math.max(0, ...purgeBounds.values());
 												const purgedLog = purgeBounds
-													? replayStartUnderPurge(purgeScope, currentSequenceId, (name) => purgeBounds.get(name))
+													? replayStartUnderPurge(purgeScope, currentSequenceId, originFloors, (name) =>
+															purgeBounds.get(name)
+														)
 													: undefined;
 												if (
 													forceRetentionCopyForTest(databaseName) ||
