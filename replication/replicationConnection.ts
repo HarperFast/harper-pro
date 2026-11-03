@@ -98,7 +98,6 @@ import {
 	readOriginClosedFloor,
 	getDatabaseGeneration,
 	getAuditFloor,
-	getLogPurgeBound,
 	getLogPurgeBounds,
 } from '../core/resources/auditStore.ts';
 import { isValidFloor, originFloorsDurable } from '../core/resources/originClosedFloor.ts';
@@ -680,8 +679,8 @@ export let leadingDuplicateSkipCount = 0;
  * (data loss) or replay an unbounded history (the heap-unbounded path that OOMs, harper#1114). Returning
  * true routes the peer through the base-copy path (startTime = 0). See harper-pro#277.
  *
- * `purgeBound` is core's per-log upper bound on every key a prune removed from the logs the peer reads
- * (`getLogPurgeBound`). When the store has one, a start at or past it missed nothing a prune took, whatever
+ * `purgeBound` is core's upper bound on every key a prune removed from the logs the peer reads
+ * (`getLogPurgeBounds`). When the store has one, a start at or past it missed nothing a prune took, whatever
  * the start's age: a source that wrote nothing has an idle or empty log, not a gap (harper-pro#1229). When it
  * has none, the floor is the oldest retained entry, the nominal cutoff or the recorded audit floor, whichever
  * is highest — an empty log alone cannot tell "never written" from "fully purged".
@@ -9985,27 +9984,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													oldestRetainedTime = entry.txnLogKey;
 													break;
 												}
-												const purgeScope = purgeBoundLogNames(
+												const scopedLogs = purgeBoundLogNames(
 													auditStore,
 													excludedNodes ? undefined : oldestLogName,
 													excludedNodes
 												);
-												const purgeBounds = purgeScope && getLogPurgeBounds(auditStore, purgeScope);
-												const purgeBound = purgeScope
-													? purgeBounds && Math.max(0, ...purgeBounds.values())
-													: getLogPurgeBound(auditStore);
-												const purgedLog =
-													purgeScope && purgeBounds
-														? replayStartUnderPurge(purgeScope, currentSequenceId, originFloors, (name) =>
-																purgeBounds.get(name)
-															)
-														: undefined;
+												// LMDB has one bound for every name; every bound carries the epoch, which an empty scope would drop
+												const purgeScope = scopedLogs?.length ? scopedLogs : [oldestLogName];
+												const purgeBounds = getLogPurgeBounds(auditStore, purgeScope);
+												const purgeBound = purgeBounds && Math.max(0, ...purgeBounds.values());
+												const purgedLog = purgeBounds
+													? replayStartUnderPurge(purgeScope, currentSequenceId, originFloors, (name) =>
+															purgeBounds.get(name)
+														)
+													: undefined;
 												if (
 													forceRetentionCopyForTest(databaseName) ||
 													(!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
-														(purgeScope && purgeBounds
+														(purgeBounds
 															? purgedLog !== undefined
 															: shouldForceBaseCopyForRetention(
 																	currentSequenceId,
