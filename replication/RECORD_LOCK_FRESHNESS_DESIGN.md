@@ -233,6 +233,11 @@ The planning rounds that produced this table are in harper-pro#822's description
   lease bound on a wait, and a hole recorded while a barrier is in flight.
 - `integrationTests/cluster/recordLockCluster.test.mjs` — exact hot-key convergence across three
   nodes, with `freshness.applied >= 1` and no poisoned pairs.
+- `unitTests/replication/recordLockReclone.test.mjs` — when a copy sets the ever-recloned flag, and
+  that the home-map row keeps its creation attempt through every write.
+- `integrationTests/cluster/recordLockClonedNode.test.mjs` — a node joined through `cloneNode` hands a
+  key back and forth with the leader; the same node, cloned again after losing its database storage
+  with its home-map row kept, refuses its own earlier lineage (`recloned`).
 - Not covered by any test: the `record_lock_barrier` operation's server-side checks, the receive
   loop's poison writes, and the end-to-end refusal paths (clock rollback, an excluded route, poison
-  surviving a restart or base copy, a reclone, a mixed-level member, LMDB).
+  surviving a restart or base copy, a mixed-level member, LMDB).
