@@ -159,8 +159,6 @@ for (const engine of ['rocksdb']) {
 			const before = await Promise.all(nodes().map((node) => request(node, 'ConversionRows/')));
 			const oldSchema = await readFile(join(fixture, 'schema.graphql'), 'utf8');
 			const oldResources = await readFile(join(fixture, 'resources.js'), 'utf8');
-			// Diagnostics only: they go to the test output and the node's retained log directory, and a failure to
-			// collect them is reported rather than thrown, so the test's own steps and assertions still run.
 			async function emit(label, payload, harper) {
 				ctx.diagnostic(`residency ${label}: ${JSON.stringify(payload)}`);
 				if (!harper?.logDir) return;
@@ -181,37 +179,31 @@ for (const engine of ['rocksdb']) {
 					await emit(`snapshot ${stage} node${i}`, views[i], context.harper);
 			}
 			// The boot after an unclean stop logs its replay to the stopped incarnation's log, past where it ended.
-			async function recordRestart(restart, i, outgoing, replicaExpiration, bootError) {
-				const { pid, exitCode, signalCode } = outgoing.harper.process;
+			async function recordBoot(restart, i, outgoing, replicaExpiration, bootError) {
 				const booted = contexts[i].harper;
-				const record = {
-					restart,
-					node: i,
-					replicaExpiration,
-					stopped: { pid, exitCode, signal: signalCode, confirmed: exitCode !== null || signalCode !== null },
-					stopMs: outgoing.stopMs,
-					boot: bootError
-						? { error: bootError.message }
-						: {
-								pid: booted.process?.pid,
-								replayNotice: /replaying transaction logs/.test(booted.startupOutput?.stderr ?? '')
-									? 'seen'
-									: 'not-seen',
-							},
-				};
-				try {
-					const logs = [(await readLog(outgoing.harper)).slice(outgoing.logOffset)];
-					if (!bootError && booted.logDir && booted.logDir !== outgoing.harper.logDir) logs.push(await readLog(booted));
-					record.replayed = logs.flatMap((text) =>
-						Array.from(text.matchAll(/Replayed (\d+) records in (\S+) database/g), ([, count, database]) => ({
-							database,
-							count: Number(count),
-						}))
-					);
-				} catch (error) {
-					record.replayed = `error: ${error.message}`;
+				const record = { restart, node: i, replicaExpiration };
+				if (bootError) record.error = bootError.message;
+				else {
+					record.pid = booted.process?.pid;
+					record.replayNotice = /replaying transaction logs/.test(booted.startupOutput?.stderr ?? '')
+						? 'seen'
+						: 'not-seen';
 				}
-				await emit(`restart ${restart} node${i}`, record, bootError ? outgoing.harper : booted);
+				const reads = [
+					outgoing.logOffset === null
+						? Promise.reject(new Error('stopped incarnation log offset unknown'))
+						: readLog(outgoing.harper).then((text) => text.slice(outgoing.logOffset)),
+				];
+				if (!bootError && booted.logDir && booted.logDir !== outgoing.harper.logDir) reads.push(readLog(booted));
+				record.replayed = (await Promise.allSettled(reads)).flatMap((read) =>
+					read.status === 'fulfilled'
+						? Array.from(read.value.matchAll(/Replayed (\d+) records in (\S+) database/g), ([, count, database]) => ({
+								database,
+								count: Number(count),
+							}))
+						: [{ error: read.reason.message }]
+				);
+				await emit(`restart ${restart} node${i} boot`, record, bootError ? outgoing.harper : booted);
 			}
 			let restarts = 0;
 			async function reopen(declarative, binary, replicaExpiration = 3600, settleReplication = true) {
@@ -221,7 +213,7 @@ for (const engine of ['rocksdb']) {
 						harper: context.harper,
 						logOffset: await readLog(context.harper).then(
 							(text) => text.length,
-							() => 0
+							() => null
 						),
 					}))
 				);
@@ -229,7 +221,11 @@ for (const engine of ['rocksdb']) {
 					contexts.map(async (context, i) => {
 						const start = performance.now();
 						await killHarper(context);
-						outgoing[i].stopMs = Math.round(performance.now() - start);
+						const stopMs = Math.round(performance.now() - start);
+						const { pid, exitCode, signalCode } = outgoing[i].harper.process;
+						const confirmed = exitCode !== null || signalCode !== null;
+						const record = { restart, node: i, pid, exitCode, signal: signalCode, confirmed, stopMs };
+						await emit(`restart ${restart} node${i} stop`, record, outgoing[i].harper);
 					})
 				);
 				for (const [i, context] of contexts.entries()) {
@@ -254,10 +250,10 @@ for (const engine of ['rocksdb']) {
 					try {
 						await startHarper(context, options(context, i, Array.isArray(binary) ? binary[i] : binary));
 					} catch (error) {
-						await recordRestart(restart, i, outgoing[i], replicaExpiration, error);
+						await recordBoot(restart, i, outgoing[i], replicaExpiration, error);
 						throw error;
 					}
-					await recordRestart(restart, i, outgoing[i], replicaExpiration);
+					await recordBoot(restart, i, outgoing[i], replicaExpiration);
 				}
 				if (settleReplication) await settle();
 			}
