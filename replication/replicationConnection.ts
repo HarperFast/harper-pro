@@ -6583,7 +6583,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// can record DOWN/error without re-resolving auditStore. See W1 (harper-pro#431).
 			if (options.connection) options.connection.sharedStatus = replicationSharedStatus;
 			if (options.connection?.nodeSubscriptions !== undefined && !connectionSuperseded())
-				options.connection.copyStall.attachStatus(replicationSharedStatus);
+				options.connection.copyStall?.attachStatus(replicationSharedStatus);
 			publishPeerCertifiesFloors(replicationSharedStatus);
 		}
 		return replicationSharedStatus;
@@ -6930,7 +6930,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
 	function noteCopyStall(note: (tracker: CopyStallTracker) => StuckCopyTransition | undefined) {
 		const connection = options.connection;
-		if (connection?.nodeSubscriptions === undefined || connectionSuperseded()) return;
+		if (!connection?.copyStall || connection.nodeSubscriptions === undefined || connectionSuperseded()) return;
 		connection.reportStuckCopy(note(connection.copyStall));
 	}
 	function writeCopyCursor(nodeId: number, cursor: any) {
