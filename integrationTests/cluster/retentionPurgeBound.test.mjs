@@ -14,7 +14,7 @@ import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, waitForCondition, readLog } from './clusterShared.mjs';
+import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition, readLog } from './clusterShared.mjs';
 
 const TEST_DIR = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 'dist', 'bin', 'harper.js');
@@ -38,6 +38,12 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			},
 			env: { HARPER_NO_FLUSH_ON_EXIT: true, ...(engine === 'lmdb' ? { HARPER_STORAGE_ENGINE: 'lmdb' } : {}) },
 		});
+
+		// the pid file's process too: one killed seconds after it started can outlive the spawned handle
+		async function stop(node) {
+			await killHarper({ harper: node });
+			await stopNodeProcess(node);
+		}
 
 		async function start(node) {
 			const started = (await startHarper({ name: ctx.name, harper: node }, options(node))).harper;
@@ -85,7 +91,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 		test('a follower that missed nothing resumes from an idle source without a copy', async () => {
 			await upsert(A, 'caught-up');
 			await arrives(B, 'caught-up');
-			await killHarper({ harper: B });
+			await stop(B);
 			await delay(IDLE_MS);
 			const mark = (await readLog(A)).length;
 			await upsert(A, 'after-idle');
@@ -96,7 +102,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 		});
 
 		test('a follower that missed a write A has since aged out gets a copy and the write', async () => {
-			await killHarper({ harper: B });
+			await stop(B);
 			await upsert(A, 'missed');
 			await delay(IDLE_MS);
 			const mark = (await readLog(A)).length;
