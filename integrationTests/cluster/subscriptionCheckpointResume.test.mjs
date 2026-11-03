@@ -15,7 +15,7 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal, deepEqual } from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import mqtt from 'mqtt';
@@ -86,7 +86,7 @@ async function postToFixture(node, resource, body) {
 	return response.json();
 }
 
-const floorsOn = (node, peer) => postToFixture(node, 'ClosedFloors', { peer: peer.hostname });
+const floorsOn = (node, peer, options) => postToFixture(node, 'ClosedFloors', { peer: peer.hostname, ...options });
 const stateFor = async (node, peer, origin) => (await floorsOn(node, peer)).nodes[origin.hostname] ?? null;
 const subscription = (node, body) => postToFixture(node, 'CheckpointSubscription', body);
 
@@ -105,11 +105,14 @@ const waitForRecord = (node, id) =>
 		description: `${id} to reach ${node.hostname}`,
 	});
 
-const waitForState = (node, peer, origin, predicate, what) =>
-	waitForCondition(async () => predicate(await stateFor(node, peer, origin)), {
+function waitForState(node, peer, origin, predicate, what) {
+	let last;
+	return waitForCondition(async () => predicate((last = await stateFor(node, peer, origin))), {
 		timeoutMs: CONVERGE_TIMEOUT_MS,
-		description: `${node.hostname}'s state for ${origin.hostname} via ${peer.hostname}: ${what}`,
+		description: () =>
+			`${node.hostname}'s state for ${origin.hostname} via ${peer.hostname}: ${what}; last observed ${JSON.stringify(last)}`,
 	});
+}
 
 const waitForEvents = (node, name, ids) =>
 	waitForCondition(
@@ -135,6 +138,141 @@ async function waitForCheckpoint(node, name, aboveTime = 0) {
 const logPath = (node) => join(node.logDir ?? join(node.dataRootDir, 'log'), 'hdb.log');
 const readText = (path) =>
 	readFile(path, 'utf8').catch((error) => (error.code === 'ENOENT' ? '' : Promise.reject(error)));
+
+/**
+ * Evaluates each clause of a readiness predicate on the state the wait already fetched, so a timeout names the clause
+ * that never held. `observedSince` is the first poll that saw the current value, not proof it held in between.
+ */
+function clauseTracker(clauses) {
+	const report = Object.fromEntries(
+		Object.keys(clauses).map((name) => [name, { holds: null, observedSince: null, polls: 0, heldPolls: 0 }])
+	);
+	let lastState;
+	let lastAt = null;
+	return {
+		observe(state) {
+			lastState = state;
+			lastAt = new Date().toISOString();
+			let all = true;
+			for (const [name, clause] of Object.entries(clauses)) {
+				const holds = clause(state);
+				const entry = report[name];
+				if (entry.holds !== holds) Object.assign(entry, { holds, observedSince: lastAt });
+				entry.polls++;
+				if (holds) entry.heldPolls++;
+				all &&= holds;
+			}
+			return all;
+		},
+		report: () => ({ lastAt, lastState: lastState ?? null, clauses: report }),
+	};
+}
+
+const logTime = (line) => line.slice(0, 24);
+/** `null` when the log is unreadable or empty, so a missing log reads as unknown rather than as no events. */
+async function logLinesSince(path, from, needle, following = 0) {
+	const text = await readText(path).catch(() => '');
+	if (!text) return null;
+	const lines = text.slice(from).split('\n');
+	const found = [];
+	for (let i = 0; i < lines.length; i++) {
+		if (lines[i].includes(needle)) found.push(lines.slice(i, i + 1 + following).join(' '));
+	}
+	return found;
+}
+
+async function dependencyVersions() {
+	const root = join(TEST_DIR, '..', '..');
+	const versionOf = (path) =>
+		readFile(path, 'utf8')
+			.then((text) => JSON.parse(text).version)
+			.catch(() => null);
+	const versions = { node: process.version, gitSha: process.env.GITHUB_SHA ?? null };
+	versions['harper-pro'] = await versionOf(join(root, 'package.json'));
+	for (const name of ['@harperfast/rocksdb-js', 'msgpackr', 'lmdb', 'structon', '@harperfast/integration-testing']) {
+		versions[name] = await versionOf(join(root, 'node_modules', name, 'package.json'));
+	}
+	return versions;
+}
+
+/**
+ * Read only after the held transaction is released, so it adds nothing to that window. A sender's `certified origin
+ * floors` line is logged at send, not at the receiver's commit: it correlates with B's row, it does not prove it.
+ */
+async function reportWidening(t, widening) {
+	const { A, B, marks } = widening;
+	const certificates = await logLinesSince(marks.aLog, marks.aLogFrom, `certified origin floors to ${B.hostname} `, 2);
+	const entryPattern = new RegExp(
+		`'${A.hostname.replaceAll('.', '\\.')}' => \\[ ([\\d.]+), '[0-9a-f]+', (true|false) \\]`
+	);
+	const certificatesWhileStopping = certificates
+		?.filter((line) => logTime(line) > marks.coverageAt && logTime(line) < marks.stopReturnedAt)
+		.map((line) => {
+			const entry = line.match(entryPattern);
+			return entry && { at: logTime(line), floor: Number(entry[1]), fullCoverage: entry[2] === 'true' };
+		})
+		.filter(Boolean);
+	const shutdown = await logLinesSince(marks.bLogBeforeStop, marks.bLogFrom, '[notify]: ');
+	const resume = await logLinesSince(marks.bLogAfterStart, 0, `Starting time recorded in db ${A.hostname} `);
+	const resumeStart = resume?.[0] ? Number(resume[0].match(/start time: ([\d.]+)/)?.[1]) : null;
+	const firstMatch = async (needle) => (await logLinesSince(marks.bLogAfterStart, 0, needle))?.[0] ?? null;
+	const summary = {
+		clauses: widening.clauses?.report() ?? null,
+		coverageRewrite: widening.coverage ?? null,
+		bStop: {
+			signalledAt: shutdown?.find((line) => line.includes('Received SIGTERM'))?.slice(0, 24) ?? null,
+			completedAt: shutdown?.find((line) => line.includes('Shutdown complete'))?.slice(0, 24) ?? null,
+			returnedAfterMs: marks.stopReturnedAfterMs ?? null,
+		},
+		certificatesWhileStopping: certificatesWhileStopping ?? 'unknown (no A log)',
+		bRestart: resume
+			? {
+					resumeStart,
+					resumedJustBelowACertificateFloor:
+						certificatesWhileStopping?.some(({ floor }) => resumeStart < floor && floor - resumeStart < 1e-3) ?? null,
+					widened: await firstMatch(`Route coverage widened to full for ${A.hostname} `),
+					fullCopyRequested: await firstMatch('full copy'),
+					copyComplete: await firstMatch(`bulk copy complete from ${A.hostname}`),
+				}
+			: 'unknown (no B restart log)',
+		afterRestartRows: widening.afterRestart ?? null,
+		atWaitEndRows: widening.atWaitEnd ?? null,
+		heldTransaction: {
+			openedAt: marks.heldAt ?? null,
+			releasedAt: marks.releasedAt ?? null,
+			abortedAt:
+				(await logLinesSince(marks.aLog, marks.aLogFrom, 'open too long'))?.map(logTime) ?? 'unknown (no A log)',
+		},
+		timeline: marks,
+		versions: await dependencyVersions(),
+	};
+	const fullCoverageAtRewrite = summary.coverageRewrite?.readBack?.nodes?.find?.(
+		(node) => node.id === summary.coverageRewrite.readBack.peerId
+	)?.fullCoverage;
+	t.diagnostic(
+		`widening: ${JSON.stringify({
+			clauses: Object.fromEntries(
+				Object.entries(summary.clauses?.clauses ?? {}).map(([name, { holds }]) => [name, holds])
+			),
+			rewriteUpdated: summary.coverageRewrite?.updated ?? null,
+			fullCoverageAtRewrite: fullCoverageAtRewrite ?? null,
+			certificatesWhileStopping: Array.isArray(certificatesWhileStopping)
+				? certificatesWhileStopping.length
+				: 'unknown',
+			resumedJustBelowACertificateFloor: summary.bRestart.resumedJustBelowACertificateFloor ?? null,
+			widened: typeof summary.bRestart === 'object' ? Boolean(summary.bRestart.widened) : 'unknown',
+			copyComplete: typeof summary.bRestart === 'object' ? Boolean(summary.bRestart.copyComplete) : 'unknown',
+			stopMs: summary.bStop.returnedAfterMs,
+			heldAbortedAt: summary.heldTransaction.abortedAt,
+		})}`
+	);
+	const directory = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;
+	if (directory) {
+		const file = join(directory, `subscriptionCheckpointResume-widening-${B.hostname}-${Date.now()}.json`);
+		await writeFile(file, JSON.stringify(summary, null, '\t'));
+		t.diagnostic(`widening diagnostics: ${file}`);
+	}
+}
 
 function mqttUrlFor(node) {
 	const wsScheme = node.httpURL.startsWith('https') ? 'wss' : 'ws';
@@ -345,8 +483,12 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			await endMqtt(onB.client);
 		}
 	});
-	test('a route widened from partial coverage runs a full base copy and clears partialHistory without certifying audit-less copyApply history', async () => {
+	test('a route widened from partial coverage runs a full base copy and clears partialHistory without certifying audit-less copyApply history', async (t) => {
 		const { A, B } = ctx;
+		const marks = { aLog: logPath(A), aLogFrom: (await readText(logPath(A))).length };
+		const widening = { A, B, marks };
+		const now = () => new Date().toISOString();
+		marks.heldAt = now();
 		await postToFixture(A, 'HoldTransaction', { id: 'held-copy-bound' });
 		try {
 			await upsert(A, 'copied-above-pinned-floor');
@@ -359,21 +501,39 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 				copiedVersions['copied-above-pinned-floor'] ?? 0,
 				copiedVersions['copy-anchor-record'] ?? 0
 			);
-			await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
-			await restartNode(B);
+			marks.maxCopiedVersion = maxCopiedVersion;
+			marks.bLogBeforeStop = logPath(B);
+			marks.bLogFrom = (await readText(marks.bLogBeforeStop)).length;
+			widening.coverage = await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
+			marks.coverageAt = now();
+			const stopStarted = Date.now();
+			await stopNodeProcess(B);
+			marks.stopReturnedAt = now();
+			marks.stopReturnedAfterMs = Date.now() - stopStarted;
+			await startNode(B);
+			marks.bLogAfterStart = logPath(B);
+			widening.afterRestart = await floorsOn(B, A, { copyRows: true }).catch((error) => ({ error: error.message }));
 			await upsert(A, 'after-widening-copy');
 			await waitForRecord(B, 'after-widening-copy');
-			await waitForState(
-				B,
-				A,
-				A,
-				(state) =>
-					state?.partialHistory === false &&
-					state?.fullCoverage === true &&
-					state?.closedFloor > 0 &&
-					state?.certifiedFrom === null,
-				'widening to full coverage triggers a full base copy that clears partialHistory without certifying audit-less copyApply history'
-			);
+			marks.deliveredAt = now();
+			widening.clauses = clauseTracker({
+				'partialHistory === false': (state) => state?.partialHistory === false,
+				'fullCoverage === true': (state) => state?.fullCoverage === true,
+				'closedFloor > 0': (state) => state?.closedFloor > 0,
+				'certifiedFrom === null': (state) => state?.certifiedFrom === null,
+			});
+			try {
+				await waitForState(
+					B,
+					A,
+					A,
+					(state) => widening.clauses.observe(state),
+					'widening to full coverage triggers a full base copy that clears partialHistory without certifying audit-less copyApply history'
+				);
+			} finally {
+				marks.waitEndedAt = now();
+				widening.atWaitEnd = await floorsOn(B, A, { copyRows: true }).catch((error) => ({ error: error.message }));
+			}
 
 			const logKeyBeforePinnedRestart = (await stateFor(B, A, A))?.originLogKey ?? 0;
 			await restartNode(B);
@@ -404,6 +564,8 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			);
 		} finally {
 			await postToFixture(A, 'ReleaseTransaction', {}).catch(() => {});
+			marks.releasedAt = now();
+			await reportWidening(t, widening).catch((error) => t.diagnostic(`widening diagnostics failed: ${error.stack}`));
 		}
 
 		await restartNode(B);

@@ -86,6 +86,24 @@ export class ReplicationCursor extends Resource {
 	}
 }
 
+// JSON-safe copies of the copy-cursor and copy-bound rows a peer's base copy leaves in `dbisDB`
+function copyRowsFor(dbisDB, peerId) {
+	const jsonSafe = (value) =>
+		JSON.parse(
+			JSON.stringify(value ?? null, (key, entry) =>
+				typeof entry === 'symbol' ? entry.description : typeof entry === 'bigint' ? String(entry) : entry
+			)
+		);
+	const copyBounds = [];
+	for (const { key, value } of dbisDB.getRange({
+		start: Symbol.for('copyBound'),
+		end: [Symbol.for('copyBound'), Buffer.from([0xff])],
+	})) {
+		if (key[1] === peerId) copyBounds.push({ key: jsonSafe(key), value: jsonSafe(value) });
+	}
+	return { copyCursor: jsonSafe(dbisDB.getSync([Symbol.for('copyCursor'), peerId])), copyBounds };
+}
+
 export class ClosedFloors extends Resource {
 	static loadAsInstance = false;
 	post(target, data) {
@@ -113,6 +131,7 @@ export class ClosedFloors extends Resource {
 			seqId: row?.seqId ?? null,
 			syncWalInstalled: typeof auditStore?.rootStore?.syncWal === 'function',
 			nodes,
+			...(data.copyRows ? copyRowsFor(Table.dbisDB, peerId) : undefined),
 		};
 	}
 }
@@ -164,7 +183,16 @@ export class SetRouteCoverage extends Resource {
 			fullCoverage: data?.fullCoverage ?? false,
 		}));
 		await Table.dbisDB.put(seqKey, { ...row, nodes });
-		return { updated: true };
+		const readBack = Table.dbisDB.getSync(seqKey);
+		return {
+			updated: true,
+			readBack: {
+				peerId,
+				seqId: readBack?.seqId ?? null,
+				nodes: readBack?.nodes ?? null,
+				...copyRowsFor(Table.dbisDB, peerId),
+			},
+		};
 	}
 }
 
