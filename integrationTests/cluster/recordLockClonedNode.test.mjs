@@ -182,7 +182,7 @@ suite(
 					pollMs: 200,
 					description: `the clone's ${DB} copy to hold at COPY_START`,
 				});
-				await bootstrapHomeMap([leader, joined]);
+				await bootstrapHomeMap([leader, joined], undefined, AbortSignal.timeout(120_000));
 				const attempt = JSON.parse(readFileSync(join(joined.dataRootDir, '.cloneAttempt.json'), 'utf8'));
 				assert.equal(attempt.completedAt, undefined, 'the clone attempt was still live when the home map activated');
 			} finally {

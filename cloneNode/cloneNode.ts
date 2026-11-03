@@ -1482,7 +1482,7 @@ function startCloneAttempt(): void {
 				rmSync(temporaryPath, { force: true });
 			} catch {}
 			// Every clone-mode branch of replication keys on this attempt, so a clone that cannot record it
-			// must not start. Nothing has started yet: bin/harper.js exits.
+			// must not start.
 			throw new Error(`Could not persist the clone attempt marker at ${path}, so the clone cannot start: ${error}`, {
 				cause: error,
 			});
