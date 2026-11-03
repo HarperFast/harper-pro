@@ -15,7 +15,7 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal, deepEqual } from 'node:assert/strict';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import mqtt from 'mqtt';
@@ -36,6 +36,8 @@ const nodeOptions = (node, env = {}) => ({
 		logging: { colors: false, stdStreams: false, console: true, level: 'debug' },
 		replication: { port: node.hostname + ':9933', securePort: null, databases: ['data'] },
 		originLogFixture: { package: join(TEST_DIR, 'fixture-origin-log') },
+		// held-copy-bound pins A's floor across B's restarts and base copy, which outlast the default 30 s limit
+		storage: { maxTransactionOpenTime: 300_000 },
 	},
 	env: {
 		HARPER_NO_FLUSH_ON_EXIT: true,
@@ -86,7 +88,7 @@ async function postToFixture(node, resource, body) {
 	return response.json();
 }
 
-const floorsOn = (node, peer, options) => postToFixture(node, 'ClosedFloors', { peer: peer.hostname, ...options });
+const floorsOn = (node, peer) => postToFixture(node, 'ClosedFloors', { peer: peer.hostname });
 const stateFor = async (node, peer, origin) => (await floorsOn(node, peer)).nodes[origin.hostname] ?? null;
 const subscription = (node, body) => postToFixture(node, 'CheckpointSubscription', body);
 
@@ -138,157 +140,6 @@ async function waitForCheckpoint(node, name, aboveTime = 0) {
 const logPath = (node) => join(node.logDir ?? join(node.dataRootDir, 'log'), 'hdb.log');
 const readText = (path) =>
 	readFile(path, 'utf8').catch((error) => (error.code === 'ENOENT' ? '' : Promise.reject(error)));
-
-/** `observedSince` is the first poll that saw the current value, not proof it held in between. */
-function clauseTracker(clauses) {
-	const report = Object.fromEntries(
-		Object.keys(clauses).map((name) => [name, { holds: null, observedSince: null, polls: 0, heldPolls: 0 }])
-	);
-	let lastState;
-	let lastAt = null;
-	return {
-		observe(state) {
-			lastState = state;
-			lastAt = new Date().toISOString();
-			let all = true;
-			for (const [name, clause] of Object.entries(clauses)) {
-				const holds = clause(state);
-				const entry = report[name];
-				if (entry.holds !== holds) Object.assign(entry, { holds, observedSince: lastAt });
-				entry.polls++;
-				if (holds) entry.heldPolls++;
-				all &&= holds;
-			}
-			return all;
-		},
-		report: () => ({ lastAt, lastState: lastState ?? null, clauses: report }),
-	};
-}
-
-const logTime = (line) => line.slice(0, 24);
-async function logLinesSince(path, from, needle, following = 0) {
-	const text = await readText(path).catch(() => '');
-	if (!text || from > text.length) return null;
-	const lines = text.slice(from).split('\n');
-	const found = [];
-	for (let i = 0; i < lines.length; i++) {
-		if (lines[i].includes(needle)) found.push(lines.slice(i, i + 1 + following).join(' '));
-	}
-	return found;
-}
-
-async function dependencyVersions() {
-	const root = join(TEST_DIR, '..', '..');
-	const versionOf = (path) =>
-		readFile(path, 'utf8')
-			.then((text) => JSON.parse(text).version)
-			.catch(() => null);
-	const versions = { node: process.version, gitSha: process.env.GITHUB_SHA ?? null };
-	versions['harper-pro'] = await versionOf(join(root, 'package.json'));
-	for (const name of ['@harperfast/rocksdb-js', 'msgpackr', 'lmdb', 'structon', '@harperfast/integration-testing']) {
-		versions[name] = await versionOf(join(root, 'node_modules', name, 'package.json'));
-	}
-	return versions;
-}
-
-// A sender's `certified origin floors` line is logged at send, not at the receiver's commit, and names no database:
-// it correlates with B's row, it does not prove it. `bulk copy complete` names no database either.
-async function reportWidening(t, widening) {
-	const { A, B, marks } = widening;
-	const certificates = await logLinesSince(marks.aLog, marks.aLogFrom, `certified origin floors to ${B.hostname} `, 2);
-	const entryPattern = new RegExp(
-		`'${A.hostname.replaceAll('.', '\\.')}' => \\[ ([\\d.]+), '[0-9a-f]+', (true|false) \\]`
-	);
-	const windowKnown = marks.rewrittenAt !== undefined && marks.stopReturnedAt !== undefined;
-	const sendsWhileStopping = (windowKnown ? certificates : null)?.filter(
-		(line) => logTime(line) >= marks.rewrittenAt && logTime(line) <= marks.stopReturnedAt
-	);
-	const certificatesWhileStopping = sendsWhileStopping
-		?.map((line) => {
-			const entry = line.match(entryPattern);
-			return entry && { at: logTime(line), floor: Number(entry[1]), fullCoverage: entry[2] === 'true' };
-		})
-		.filter(Boolean);
-	const shutdown = await logLinesSince(marks.bLogBeforeStop, marks.bLogFrom, '[notify]: ');
-	const restartLog = (needle) => logLinesSince(marks.bLogAfterStart, marks.bLogAfterStartFrom ?? 0, needle);
-	const resume = (await restartLog(`Starting time recorded in db ${A.hostname} `))?.filter((line) =>
-		/ data [\d.]+ start time: /.test(line)
-	);
-	const resumeMatch = resume?.[0]?.match(/start time: ([\d.]+)/);
-	const resumeStart = resumeMatch ? Number(resumeMatch[1]) : null;
-	const firstLine = async (needle, accept = () => true) => (await restartLog(needle))?.find(accept) ?? null;
-	const summary = {
-		clauses: widening.clauses?.report() ?? null,
-		coverageRewrite: widening.coverage ?? null,
-		bStop: {
-			signalledAt: shutdown?.find((line) => line.includes('Received SIGTERM'))?.slice(0, 24) ?? null,
-			completedAt: shutdown?.find((line) => line.includes('Shutdown complete'))?.slice(0, 24) ?? null,
-			returnedAfterMs: marks.stopReturnedAfterMs ?? null,
-		},
-		certificateSendsToBWhileStopping: sendsWhileStopping?.length ?? 'unknown',
-		certificatesWhileStopping: certificatesWhileStopping ?? 'unknown',
-		bRestart: resume?.length
-			? {
-					resumeStart,
-					resumedJustBelowACertificateFloor:
-						resumeStart === null
-							? null
-							: (certificatesWhileStopping?.some(({ floor }) => resumeStart < floor && floor - resumeStart < 1e-3) ??
-								null),
-					widened: await firstLine(`Route coverage widened to full for ${A.hostname} on database data `),
-					fullCopyRequested: await firstLine(
-						'full copy',
-						(line) =>
-							line.includes('database data') &&
-							(line.includes(`//${A.hostname}:`) || line.includes(`for ${A.hostname} on`))
-					),
-					bulkCopyCompleteAnyDatabase: await firstLine(`bulk copy complete from ${A.hostname}`, (line) =>
-						line.endsWith(`from ${A.hostname}`)
-					),
-				}
-			: 'unknown',
-		beforeRewriteRows: widening.beforeRewrite ?? null,
-		afterRestartRows: (await widening.afterRestart) ?? null,
-		atWaitEndRows: (await widening.atWaitEnd) ?? null,
-		heldTransaction: {
-			openedAt: marks.heldAt ?? null,
-			releasedAt: marks.releasedAt ?? null,
-			cleanupReleasedAt: marks.cleanupReleasedAt ?? null,
-			abortedAt: (await logLinesSince(marks.aLog, marks.aLogFrom, 'open too long'))?.map(logTime) ?? 'unknown',
-		},
-		timeline: marks,
-		versions: await dependencyVersions(),
-	};
-	const readBackNodes = summary.coverageRewrite?.readBack?.nodes;
-	const fullCoverageAtRewrite = Array.isArray(readBackNodes)
-		? [...new Set(readBackNodes.map((node) => node.fullCoverage))]
-		: null;
-	t.diagnostic(
-		`widening: ${JSON.stringify({
-			clauses: Object.fromEntries(
-				Object.entries(summary.clauses?.clauses ?? {}).map(([name, { holds }]) => [name, holds])
-			),
-			rewriteUpdated: summary.coverageRewrite?.updated ?? null,
-			fullCoverageAtRewrite,
-			certificateSendsToBWhileStopping: summary.certificateSendsToBWhileStopping,
-			certificatesWhileStopping: Array.isArray(certificatesWhileStopping)
-				? certificatesWhileStopping.length
-				: 'unknown',
-			resumedJustBelowACertificateFloor: summary.bRestart.resumedJustBelowACertificateFloor ?? null,
-			widened: typeof summary.bRestart === 'object' ? Boolean(summary.bRestart.widened) : 'unknown',
-			bulkCopyCompleteAnyDatabase:
-				typeof summary.bRestart === 'object' ? Boolean(summary.bRestart.bulkCopyCompleteAnyDatabase) : 'unknown',
-			stopMs: summary.bStop.returnedAfterMs,
-			heldAbortedAt: summary.heldTransaction.abortedAt,
-		})}`
-	);
-	const directory = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;
-	if (directory) {
-		const file = join(directory, `subscriptionCheckpointResume-widening-${B.hostname}-${Date.now()}.json`);
-		await writeFile(file, JSON.stringify(summary, null, '\t'));
-		t.diagnostic(`widening diagnostics: ${file}`);
-	}
-}
 
 function mqttUrlFor(node) {
 	const wsScheme = node.httpURL.startsWith('https') ? 'wss' : 'ws';
@@ -499,16 +350,36 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			await endMqtt(onB.client);
 		}
 	});
-	test('a route widened from partial coverage runs a full base copy and clears partialHistory without certifying audit-less copyApply history', async (t) => {
+	test('a route widened from partial coverage runs a full base copy and clears partialHistory without certifying audit-less copyApply history', async () => {
 		const { A, B } = ctx;
-		const marks = { aLog: logPath(A), aLogFrom: (await readText(logPath(A))).length };
-		const widening = { A, B, marks };
-		const now = () => new Date().toISOString();
-		marks.heldAt = now();
+		// A's live link rewrites B's coverage bit with each certificate it applies, B's SIGTERM drain included, so the
+		// partial-coverage precondition is written while A is down and survives until B restarts
+		await stopNodeProcess(A);
+		await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
+		const beforeRestart = await stateFor(B, A, A);
+		equal(beforeRestart?.fullCoverage, false, `B's row for A before B restarts: ${JSON.stringify(beforeRestart)}`);
+		ok(beforeRestart?.partialHistory !== true, 'only fullCoverage: false can widen the route at restart');
+		await stopNodeProcess(B);
+		await startNode(A);
 		await postToFixture(A, 'HoldTransaction', { id: 'held-copy-bound' });
 		try {
 			await upsert(A, 'copied-above-pinned-floor');
 			await upsert(A, 'copy-anchor-record');
+			const logBeforeStart = logPath(B);
+			const logLengthBeforeStart = (await readText(logBeforeStart)).length;
+			await startNode(B);
+			// a runner without a log dir appends every start to one file
+			const startLogFrom = logPath(B) === logBeforeStart ? logLengthBeforeStart : 0;
+			await waitForCondition(
+				async () =>
+					(await readText(logPath(B)))
+						.slice(startLogFrom)
+						.includes(`Route coverage widened to full for ${A.hostname} on database data `),
+				{
+					timeoutMs: CONVERGE_TIMEOUT_MS,
+					description: `${B.hostname} to restart with fullCoverage: false for ${A.hostname} and widen the route`,
+				}
+			);
 			await waitForRecord(B, 'copy-anchor-record');
 			const copiedVersions = await postToFixture(A, 'RecordVersions', {
 				ids: ['copied-above-pinned-floor', 'copy-anchor-record'],
@@ -517,45 +388,19 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 				copiedVersions['copied-above-pinned-floor'] ?? 0,
 				copiedVersions['copy-anchor-record'] ?? 0
 			);
-			marks.maxCopiedVersion = maxCopiedVersion;
-			marks.bLogBeforeStop = logPath(B);
-			marks.bLogFrom = (await readText(marks.bLogBeforeStop)).length;
-			widening.beforeRewrite = await floorsOn(B, A, { copyRows: true }).catch((error) => ({ error: error.message }));
-			widening.coverage = await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
-			marks.rewrittenAt = widening.coverage.writtenAt;
-			const stopStarted = Date.now();
-			await stopNodeProcess(B);
-			marks.stopReturnedAt = now();
-			marks.stopReturnedAfterMs = Date.now() - stopStarted;
-			const stoppedLogLength = (await readText(marks.bLogBeforeStop)).length;
-			await startNode(B);
-			marks.bLogAfterStart = logPath(B);
-			// a runner without a log dir appends every start to one file
-			marks.bLogAfterStartFrom = marks.bLogAfterStart === marks.bLogBeforeStop ? stoppedLogLength : 0;
-			widening.afterRestart = floorsOn(B, A, { copyRows: true }).catch((error) => ({ error: error.message }));
 			await upsert(A, 'after-widening-copy');
 			await waitForRecord(B, 'after-widening-copy');
-			marks.deliveredAt = now();
-			widening.clauses = clauseTracker({
-				'partialHistory === false': (state) => state?.partialHistory === false,
-				'fullCoverage === true': (state) => state?.fullCoverage === true,
-				'closedFloor > 0': (state) => state?.closedFloor > 0,
-				'certifiedFrom === null': (state) => state?.certifiedFrom === null,
-			});
-			try {
-				await waitForState(
-					B,
-					A,
-					A,
-					(state) => widening.clauses.observe(state),
-					'widening to full coverage triggers a full base copy that clears partialHistory without certifying audit-less copyApply history'
-				);
-				marks.waitEndedAt = now();
-			} catch (error) {
-				marks.waitEndedAt = now();
-				widening.atWaitEnd = floorsOn(B, A, { copyRows: true }).catch((cause) => ({ error: cause.message }));
-				throw error;
-			}
+			await waitForState(
+				B,
+				A,
+				A,
+				(state) =>
+					state?.partialHistory === false &&
+					state?.fullCoverage === true &&
+					state?.closedFloor > 0 &&
+					state?.certifiedFrom === null,
+				'widening to full coverage triggers a full base copy that clears partialHistory without certifying audit-less copyApply history'
+			);
 
 			const logKeyBeforePinnedRestart = (await stateFor(B, A, A))?.originLogKey ?? 0;
 			await restartNode(B);
@@ -575,7 +420,6 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 			);
 
 			await postToFixture(A, 'ReleaseTransaction', {});
-			marks.releasedAt = now();
 			await upsert(A, 'after-floor-unpinned');
 			await waitForRecord(B, 'after-floor-unpinned');
 			await waitForState(
@@ -586,9 +430,7 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 				"A's closedFloor on B to advance past the copied rows after releasing the held transaction"
 			);
 		} finally {
-			const cleanup = await postToFixture(A, 'ReleaseTransaction', {}).catch(() => {});
-			if (cleanup?.released) marks.cleanupReleasedAt = now();
-			await reportWidening(t, widening).catch((error) => t.diagnostic(`widening diagnostics failed: ${error.stack}`));
+			await postToFixture(A, 'ReleaseTransaction', {}).catch(() => {});
 		}
 
 		await restartNode(B);
