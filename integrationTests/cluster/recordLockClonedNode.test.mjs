@@ -13,6 +13,7 @@ import {
 	stopNode,
 	waitForCounter,
 	waitForMesh,
+	waitForProvableDrain,
 	waitForRing,
 } from './recordLockShared.mjs';
 
@@ -75,6 +76,9 @@ suite('cluster record locks on a node that joined by cloning (harper-pro#1236)',
 		await waitForMesh([leader, joined]);
 		await bootstrapHomeMap([leader, joined]);
 		await waitForRing([leader, joined], 2);
+		// A home that has just taken ownership refuses grants (503) until it can rule out live delegations
+		// from an earlier incarnation, which a first handoff would otherwise race.
+		await waitForProvableDrain([leader, joined]);
 	});
 
 	after(async () => {
