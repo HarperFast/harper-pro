@@ -724,20 +724,19 @@ export function purgeBoundLogNames(
 }
 
 /**
- * The first log the replay reads whose start is under what a prune removed from it, or undefined. A relayed
- * origin with a resume floor replays from that floor; every other log from the merged start, as the
- * time-based rule assumed.
+ * The first log the replay reads whose bound is above the merged start, or undefined. Every log is compared
+ * from the merged start, as the time-based rule was: a relayed origin's resume floor can sit below the
+ * source's epoch (a relay created after that floor, which never pruned), so comparing the floor would force
+ * copies no prune caused.
  */
 export function replayStartUnderPurge(
 	logNames: string[],
 	start: number,
-	originFloors: Map<string, number> | undefined,
 	boundOf: (logName: string) => number | undefined
 ): { log: string; start: number; bound: number | undefined } | undefined {
 	for (const log of logNames) {
 		const bound = boundOf(log);
-		const logStart = originFloors?.get(log) ?? start;
-		if (bound === undefined || logStart < bound) return { log, start: logStart, bound };
+		if (bound === undefined || start < bound) return { log, start, bound };
 	}
 	return undefined;
 }
@@ -9994,9 +9993,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const purgeBounds = getLogPurgeBounds(auditStore, purgeScope);
 												const purgeBound = purgeBounds && Math.max(0, ...purgeBounds.values());
 												const purgedLog = purgeBounds
-													? replayStartUnderPurge(purgeScope, currentSequenceId, originFloors, (name) =>
-															purgeBounds.get(name)
-														)
+													? replayStartUnderPurge(purgeScope, currentSequenceId, (name) => purgeBounds.get(name))
 													: undefined;
 												if (
 													forceRetentionCopyForTest(databaseName) ||
