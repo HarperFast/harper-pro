@@ -201,16 +201,20 @@ async function reportWidening(t, widening) {
 		`'${A.hostname.replaceAll('.', '\\.')}' => \\[ ([\\d.]+), '[0-9a-f]+', (true|false) \\]`
 	);
 	const windowKnown = marks.coverageAt !== undefined && marks.stopReturnedAt !== undefined;
-	const certificatesWhileStopping = (windowKnown ? certificates : null)
-		?.filter((line) => logTime(line) > marks.coverageAt && logTime(line) < marks.stopReturnedAt)
-		.map((line) => {
+	const sendsWhileStopping = (windowKnown ? certificates : null)?.filter(
+		(line) => logTime(line) > marks.coverageAt && logTime(line) < marks.stopReturnedAt
+	);
+	const certificatesWhileStopping = sendsWhileStopping
+		?.map((line) => {
 			const entry = line.match(entryPattern);
 			return entry && { at: logTime(line), floor: Number(entry[1]), fullCoverage: entry[2] === 'true' };
 		})
 		.filter(Boolean);
 	const shutdown = await logLinesSince(marks.bLogBeforeStop, marks.bLogFrom, '[notify]: ');
 	const restartLog = (needle) => logLinesSince(marks.bLogAfterStart, marks.bLogAfterStartFrom ?? 0, needle);
-	const resume = await restartLog(`Starting time recorded in db ${A.hostname} `);
+	const resume = (await restartLog(`Starting time recorded in db ${A.hostname} `))?.filter((line) =>
+		/ data [\d.]+ start time: /.test(line)
+	);
 	const resumeMatch = resume?.[0]?.match(/start time: ([\d.]+)/);
 	const resumeStart = resumeMatch ? Number(resumeMatch[1]) : null;
 	const firstMatch = async (needle) => (await restartLog(needle))?.[0] ?? null;
@@ -222,6 +226,7 @@ async function reportWidening(t, widening) {
 			completedAt: shutdown?.find((line) => line.includes('Shutdown complete'))?.slice(0, 24) ?? null,
 			returnedAfterMs: marks.stopReturnedAfterMs ?? null,
 		},
+		certificateSendsToBWhileStopping: sendsWhileStopping?.length ?? 'unknown',
 		certificatesWhileStopping: certificatesWhileStopping ?? 'unknown',
 		bRestart: resume
 			? {
@@ -231,7 +236,7 @@ async function reportWidening(t, widening) {
 							? null
 							: (certificatesWhileStopping?.some(({ floor }) => resumeStart < floor && floor - resumeStart < 1e-3) ??
 								null),
-					widened: await firstMatch(`Route coverage widened to full for ${A.hostname} `),
+					widened: await firstMatch(`Route coverage widened to full for ${A.hostname} on database data `),
 					fullCopyRequested: await firstMatch('full copy'),
 					copyComplete: await firstMatch(`bulk copy complete from ${A.hostname}`),
 				}
@@ -258,6 +263,7 @@ async function reportWidening(t, widening) {
 			),
 			rewriteUpdated: summary.coverageRewrite?.updated ?? null,
 			fullCoverageAtRewrite,
+			certificateSendsToBWhileStopping: summary.certificateSendsToBWhileStopping,
 			certificatesWhileStopping: Array.isArray(certificatesWhileStopping)
 				? certificatesWhileStopping.length
 				: 'unknown',
