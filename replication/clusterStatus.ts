@@ -128,7 +128,6 @@ export function applySharedStatus(socket, replicationSharedStatus: Float64Array)
 	// problem). This is the evidence the later watchdog-demotion decision is meant to rest on; nothing
 	// in the recovery paths reads it. Omitted entirely for a link where nothing has ever fired.
 	socket.recoveryFires = readFireCounters(replicationSharedStatus);
-	// omitted while no copy from this peer is stuck (harper-pro#1235, #1231)
 	socket.stuckCopy = readStuckCopy(replicationSharedStatus);
 }
 

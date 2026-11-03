@@ -6920,8 +6920,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	// progress counts once it is what the next attempt resumes from; a projection copy persists no cursor
 	function writeCopyCursor(nodeId: number, cursor: any) {
-		if (projectionCopy) return;
-		const persisted = getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), nodeId], cursor);
+		const dbisDB = getDatabaseStores().dbisDB;
+		if (projectionCopy || !dbisDB) return;
+		const persisted = dbisDB.put([Symbol.for('copyCursor'), nodeId], cursor);
 		const credit = () => noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
 		if (persisted?.then) persisted.then(credit);
 		else credit();

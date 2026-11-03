@@ -12,7 +12,7 @@ export const STUCK_COPY_HELD = 2;
 export const STUCK_COPY_REFUSED = 3;
 const STATE_NAMES = ['', 'retrying', 'held', 'refused'] as const;
 
-export const STUCK_COPY_NO_PROGRESS = 1;
+const STUCK_COPY_NO_PROGRESS = 1;
 export const STUCK_COPY_OWNER_REFUSED = 2;
 export const STUCK_COPY_ORIGIN_REFUSED = 3;
 const REASONS = [
@@ -86,7 +86,6 @@ export class CopyStallTracker {
 		return this.enter(STUCK_COPY_REFUSED, reason, this.state === STUCK_COPY_REFUSED ? this.count + 1 : 1);
 	}
 
-	// one rewritten at the position the attempt started from is not progress
 	noteCursorPersisted(cursorKey: string): StuckCopyTransition | undefined {
 		if (cursorKey !== this.startKey) return this.noteDurableProgress();
 	}
@@ -113,8 +112,9 @@ export class CopyStallTracker {
 	 * within seconds, so it keeps the ordinary schedule.
 	 */
 	noteClosed(): { holdMs: number; transition?: StuckCopyTransition } {
-		const exhausted = this.sessionStarted && this.attempts >= this.limit && this.state !== STUCK_COPY_REFUSED;
 		const refused = this.sessionRefused && this.reason === STUCK_COPY_OWNER_REFUSED;
+		// a refusal reported earlier does not exempt a later accepted copy that fails at one position
+		const exhausted = !this.sessionRefused && this.sessionStarted && this.attempts >= this.limit;
 		this.sessionStarted = this.sessionRefused = false;
 		if (!exhausted && !refused) return { holdMs: 0 };
 		const holdMs = this.hold.nextDelay() ?? COPY_STALL_HOLD_MAX_MS;
@@ -132,12 +132,13 @@ export class CopyStallTracker {
 
 	private enter(state: number, reason: number, count: number): StuckCopyTransition | undefined {
 		const from = this.state;
+		const changed = from !== state || this.reason !== reason;
 		if (from !== state) this.since = this.now();
 		this.state = state;
 		this.reason = reason;
 		this.count = count;
 		this.publish();
-		return from === state ? undefined : { from, to: state, count, reason };
+		return changed ? { from, to: state, count, reason } : undefined;
 	}
 
 	private clear(): StuckCopyTransition | undefined {
@@ -195,7 +196,9 @@ export function describeStuckCopy(transition: StuckCopyTransition): string {
 		case STUCK_COPY_HELD:
 			return `copy stopped after ${transition.count} attempts from one position; retrying in ${Math.round((transition.holdMs ?? 0) / 1000)}s: ${reason}`;
 		case STUCK_COPY_REFUSED:
-			return `refused a copy this node cannot accept; reconnects are held: ${reason}`;
+			return transition.reason === STUCK_COPY_OWNER_REFUSED
+				? `refused a copy this node cannot accept; reconnects are held: ${reason}`
+				: `refused a copy this node cannot accept; reconnecting on the ordinary schedule: ${reason}`;
 		default:
 			return 'copy is progressing again';
 	}

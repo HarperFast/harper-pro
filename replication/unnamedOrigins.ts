@@ -16,7 +16,6 @@ export function unnamedOriginName(nodeName: string, id: number): string {
 	return `${PREFIX}${id}@${escapeNodeName(nodeName)}`;
 }
 
-/** The id behind a name `unnamedOriginName(nodeName, id)` produced for this node, else undefined. */
 export function ownUnnamedOriginId(name: string, nodeName: string): number | undefined {
 	if (!name.startsWith(PREFIX)) return undefined;
 	const at = name.indexOf('@', PREFIX.length);

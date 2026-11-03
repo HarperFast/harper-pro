@@ -156,6 +156,31 @@ describe('CopyStallTracker', () => {
 		expect(readStuckCopy(status)).to.equal(undefined);
 	});
 
+	it('holds a later copy that fails at one position on a leg an earlier refusal left refused', () => {
+		const { stall, status } = tracker(2);
+		stall.noteRefusal(STUCK_COPY_ORIGIN_REFUSED);
+		stall.noteClosed();
+		stall.noteOpened();
+		stall.noteCopyStart('k');
+		expect(stall.noteClosed().holdMs).to.equal(0);
+		stall.noteOpened();
+		stall.noteCopyStart('k');
+		const closed = stall.noteClosed();
+		expect(closed.holdMs).to.be.at.least(COPY_STALL_HOLD_MIN_MS);
+		expect(closed.transition).to.include({ from: STUCK_COPY_REFUSED, to: STUCK_COPY_HELD });
+		expect(readStuckCopy(status)).to.include({ state: 'held' });
+	});
+
+	it('reports a refusal whose reason changes', () => {
+		const { stall } = tracker();
+		expect(stall.noteRefusal(STUCK_COPY_ORIGIN_REFUSED)).to.include({ to: STUCK_COPY_REFUSED });
+		expect(stall.noteRefusal(STUCK_COPY_OWNER_REFUSED)).to.include({
+			to: STUCK_COPY_REFUSED,
+			reason: STUCK_COPY_OWNER_REFUSED,
+		});
+		expect(stall.noteRefusal(STUCK_COPY_OWNER_REFUSED)).to.equal(undefined);
+	});
+
 	it('leaves the shared status untouched for progress on a leg with nothing stuck', () => {
 		const { stall, status } = tracker();
 		status.fill(7);
