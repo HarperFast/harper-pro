@@ -86,7 +86,6 @@ export class ReplicationCursor extends Resource {
 	}
 }
 
-// JSON-safe copies of the copy-cursor and copy-bound rows a peer's base copy leaves in `dbisDB`
 function copyRowsFor(dbisDB, peerId) {
 	const jsonSafe = (value) =>
 		JSON.parse(
@@ -190,7 +189,7 @@ export class SetRouteCoverage extends Resource {
 				peerId,
 				seqId: readBack?.seqId ?? null,
 				nodes: readBack?.nodes ?? null,
-				...copyRowsFor(Table.dbisDB, peerId),
+				...(data.copyRows ? copyRowsFor(Table.dbisDB, peerId) : undefined),
 			},
 		};
 	}
