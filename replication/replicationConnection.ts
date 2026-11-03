@@ -6859,8 +6859,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let remoteShortIdToLocalId: Map<number, number>;
 	let mintedOrigins = 0;
 	/**
-	 * The local id for a sender's origin id. A sender that predates naming its orphan origins sends rows whose
-	 * origin has no name in its map (harper-pro#1235); this mints the name an upgraded sender would bind, so
+	 * The local id for a sender's origin id. A sender that predates naming its unnamed origins sends rows whose
+	 * origin has no name in its map (harper-pro#1235); this mints the name an upgraded sender would send, so
 	 * the row applies under the same identity either way.
 	 */
 	function translateOrigin(remoteId: number): number | undefined {
