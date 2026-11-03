@@ -6761,7 +6761,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	function refuseShardingSource(origin: string, copying = false) {
 		recordShardingWait(databaseName, origin, true);
-		noteCopyStall((tracker) => tracker.noteRefusal(copying ? STUCK_COPY_OWNER_REFUSED : STUCK_COPY_ORIGIN_REFUSED));
+		// a refusal on a live incremental stream is not a stuck copy
+		if (copying || inCopyMode)
+			noteCopyStall((tracker) => tracker.noteRefusal(copying ? STUCK_COPY_OWNER_REFUSED : STUCK_COPY_ORIGIN_REFUSED));
 		wsClosed = true;
 		close(
 			1011,
