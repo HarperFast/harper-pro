@@ -250,6 +250,14 @@ import { FrameWriter } from './frameWriter.ts';
 import { isExplicitDatabaseSubscription, tableReplicates } from './replicatedDatabases.ts';
 import { cloneAttemptSource, liveCloneAttempt } from '../cloneNode/cloneAttempt.ts';
 import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
+import {
+	CopyStallTracker,
+	STUCK_COPY_HELD,
+	copyStartKey,
+	describeStuckCopy,
+	type StuckCopyTransition,
+} from './copyStall.ts';
+import { ownUnnamedOriginId, unnamedOriginName } from './unnamedOrigins.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
 // blob-send backpressure both need it, so the private field is declared here rather than at each read.
@@ -659,7 +667,9 @@ const LEADING_DUP_SKIP_ENABLED = env.get(CONFIG_PARAMS.REPLICATION_LEADINGDUPLIC
 // Distinctive log substring tests grep for to confirm the fast-skip path engaged. Keep stable.
 export const LEADING_DUP_SKIP_LOG = 'leading-duplicate fast-skip';
 // Process-wide counter of records suppressed by the fast-skip, for in-process tests/observability.
-export l/**
+export let leadingDuplicateSkipCount = 0;
+
+/**
  * Decide whether an incremental replication start must be upgraded to a bounded base copy because a prune
  * may have removed an entry the peer has not received. Audit-log retention is time-based, so a peer behind
  * the purge cannot be caught up incrementally: serving it replay would silently skip the purged entries
@@ -710,7 +720,52 @@ export function purgeBoundLogNames(
 	return names;
 }
 
-ime ?? 0, retentionCutoffTime);
+// A peer naming more new origins than this on one connection is not sending orphan v4-era ids.
+const MAX_MINTED_ORIGINS_PER_CONNECTION = 64;
+// Integration tests stand in for a build without orphan-origin naming on either side (harper-pro#1235).
+const SKIP_ORIGIN_NAMING_FOR_TEST = process.env.HARPER_TEST_SKIP_ORPHAN_ORIGIN_NAMING === '1';
+// Integration tests make one copy row fail on every attempt, to exercise the same-position bound.
+const COPY_APPLY_FAILURE_KEY_FOR_TEST = process.env.HARPER_TEST_COPY_APPLY_FAILURE_KEY;
+
+/**
+ * The id map a sender sends: every named origin, plus a name for each sent origin id this node has none for
+ * (v4-era data, a node whose mapping is gone), so the receiver can translate every row (harper-pro#1235).
+ * The name is derived, not stored here, so this node's own reading of the id does not change; a peer that
+ * relays it back is mapped home by `translateIdMap`.
+ */
+export function exportIdMappingWithUnnamed(auditStore: any, sentNodeIds: Iterable<number>): Record<string, number> {
+	const nameToId = exportIdMapping(auditStore);
+	if (SKIP_ORIGIN_NAMING_FOR_TEST) return nameToId;
+	let named: Set<number> | undefined;
+	let exported = nameToId;
+	for (const id of sentNodeIds) {
+		if (!(Number.isSafeInteger(id) && id > 0)) continue;
+		named ??= new Set(Object.values(nameToId));
+		if (named.has(id)) continue;
+		if (exported === nameToId) exported = { ...nameToId };
+		exported[unnamedOriginName(getThisNodeName(), id)] = id;
+	}
+	return exported;
+}
+
+/**
+ * A peer's id map translated to local ids. A name this node derived for one of its own unnamed origins comes
+ * back to that id rather than becoming a second identity for the same writes.
+ */
+export function translateIdMap(remoteMapping: Record<string, number>, auditStore: any): Map<number, number> {
+	const thisNodeName = getThisNodeName();
+	let named: Record<string, number> | undefined;
+	let home: Array<[number, number]> | undefined;
+	for (const name in remoteMapping) {
+		const ownId = ownUnnamedOriginId(name, thisNodeName);
+		if (ownId === undefined) continue;
+		named ??= { ...remoteMapping };
+		delete named[name];
+		(home ??= []).push([remoteMapping[name], ownId]);
+	}
+	const translated = remoteToLocalNodeId(named ?? remoteMapping, auditStore);
+	for (const [remoteId, ownId] of home ?? []) translated.set(remoteId, ownId);
+	return translated;
 }
 
 export function hostnameFromNodeUrl(url: unknown): string | undefined {
@@ -4617,6 +4672,9 @@ export async function createWebSocket(
 
 const INITIAL_RETRY_TIME = 500;
 const MAX_RETRY_TIME = 30_000;
+// Copy attempts from one start position, with no durable progress between them, before the leg's reconnects
+// are held (harper-pro#1235).
+const COPY_STALL_ATTEMPTS = nonNegativeIntegerOr(env.get('replication_copyStallAttempts'), 5) || 5;
 const COPY_FLUSH_RETRY_INITIAL_MS = 250;
 const COPY_FLUSH_RETRY_MAX_MS = 30_000;
 /**
@@ -4678,6 +4736,8 @@ export class NodeReplicationConnection extends EventEmitter {
 	// socket's late blob settlements cannot charge or resolve the live one's budget.
 	blobGapBudget?: BlobGapEscalationBudget;
 	blobGapGeneration = 0;
+	// Copies from this peer that do not finish, across this connection's sockets (copyStall.ts).
+	copyStall = new CopyStallTracker(COPY_STALL_ATTEMPTS);
 	// The current socket's frozen effective peer capabilities (harper-pro#440), replaced on every handshake.
 	// `undefined` means NOT YET LEARNED on this socket — including every reconnect window — and never "the
 	// peer does not support it": a peer that advertised nothing is the frozen defaults object. A future
@@ -4887,9 +4947,26 @@ export class NodeReplicationConnection extends EventEmitter {
 		});
 		const delay = this.retryBackoff.nextDelay();
 		if (delay === undefined) return;
-		this.setReconnectTimer(() => {
-			this.connect();
-		}, delay).unref();
+		// a copy that cannot finish waits out its own hold, so neither end works on it in the meantime
+		const { holdMs, transition } = this.copyStall.noteClosed();
+		this.setReconnectTimer(
+			() => {
+				this.connect();
+			},
+			Math.max(delay, holdMs)
+		).unref();
+		this.reportStuckCopy(transition);
+	}
+	reportStuckCopy(transition: StuckCopyTransition | undefined) {
+		if (!transition) return;
+		try {
+			const message = `Replication of ${this.databaseName} from ${this.nodeName}: ${describeStuckCopy(transition)}`;
+			if (transition.to === STUCK_COPY_HELD) logger.error?.(message);
+			else if (transition.to) logger.warn?.(message);
+			else logger.info?.(message);
+		} catch {
+			// a log sink failure must not stop the reconnect it reports on
+		}
 	}
 	resetRetryBackoff() {
 		if (this.retries !== 0 || this.retryBackoff?.attempts) {
@@ -4917,6 +4994,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	onDurableProgress(sequence: number) {
 		if (!(sequence > this.creditedDurableSequence) || !isValidReplicationClock(sequence)) return;
 		this.creditedDurableSequence = sequence;
+		this.reportStuckCopy(this.copyStall.noteDurableProgress());
 		if (this.sendFailed) this.progressWhileSendFailed = true;
 		else this.resetRetryBackoff();
 	}
@@ -5601,6 +5679,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			inCopyMode = false;
 			copyWasResumed = false;
 			copyResumedWithWidening = false;
+			noteCopyStall((tracker) => tracker.noteDurableProgress());
 			if (hadCopyOriginAnchors || pendingRouteState.size > 0 || copyPassPendingRestore) {
 				if (frameOpen) {
 					pendingCopyCursorRemovalNodeId = copyNodeId;
@@ -5754,6 +5833,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (!projectionCopy) getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursor);
 				void persistCopyBounds();
 				if (pendingCopyCursor === cursor) pendingCopyCursor = null;
+				noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
 				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
 				maybeFinishCopy();
 				reconnectAtDrainedBarrier();
@@ -5797,6 +5877,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					copyFlushBackoffUntil = 0;
 					copyFlushBackoff?.reset();
+					noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursorAtFlush, encode)));
 					if (copyCompleteReceived) noteCopyFinalizeProgress();
 					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
 					// A persist under a drained barrier is the connection's LAST possible progress: every
@@ -6460,6 +6541,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// Make the buffer available to the connection's lifecycle methods (close/forceReconnect) so they
 			// can record DOWN/error without re-resolving auditStore. See W1 (harper-pro#431).
 			if (options.connection) options.connection.sharedStatus = replicationSharedStatus;
+			if (options.connection?.nodeSubscriptions !== undefined && !connectionSuperseded())
+				options.connection.copyStall.attachStatus(replicationSharedStatus);
 			publishPeerCertifiesFloors(replicationSharedStatus);
 		}
 		return replicationSharedStatus;
@@ -6748,6 +6831,33 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	});
 	ws.on('close', () => blockedTablesInvalidator.remove());
 	let remoteShortIdToLocalId: Map<number, number>;
+	let mintedOrigins = 0;
+	/**
+	 * The local id for a sender's origin id. A sender that predates naming its orphan origins sends rows whose
+	 * origin has no name in its map (harper-pro#1235); this mints the name an upgraded sender would bind, so
+	 * the row applies under the same identity either way.
+	 */
+	function translateOrigin(remoteId: number): number | undefined {
+		// no map yet means the sender broke protocol, not that the origin is unnamed
+		if (!remoteShortIdToLocalId) return undefined;
+		const known = remoteShortIdToLocalId.get(remoteId);
+		if (known !== undefined) return known;
+		if (!auditStore || !remoteNodeName || !(Number.isSafeInteger(remoteId) && remoteId > 0)) return undefined;
+		if (SKIP_ORIGIN_NAMING_FOR_TEST) throw new Error(`No node name mapped for origin id ${remoteId}`);
+		const name = unnamedOriginName(remoteNodeName, remoteId);
+		// only new names count, so a reconnect does not spend the cap on the ones minted before it
+		if (exportIdMapping(auditStore)[name] === undefined) {
+			if (mintedOrigins >= MAX_MINTED_ORIGINS_PER_CONNECTION) return undefined;
+			mintedOrigins++;
+		}
+		const localId = getIdOfRemoteNode(name, auditStore);
+		remoteShortIdToLocalId.set(remoteId, localId);
+		logger.warn?.(
+			connectionId,
+			`${remoteNodeName} sent ${databaseName} records from origin id ${remoteId}, which has no name there; applying them as origin ${name}`
+		);
+		return localId;
+	}
 	let wakeSender: (() => void) | undefined;
 	let lastFloorCaptureAt = 0;
 	let certifiedFloors: Map<string, number> | undefined;
@@ -6774,6 +6884,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
+	// Only this leg's live subscription session feeds its stuck-copy state; a superseded one must not touch it.
+	function noteCopyStall(note: (tracker: CopyStallTracker) => StuckCopyTransition | undefined) {
+		const connection = options.connection;
+		if (connection?.nodeSubscriptions === undefined || connectionSuperseded()) return;
+		connection.reportStuckCopy(note(connection.copyStall));
+	}
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
 	// committed AND its blob (and all earlier blobs) have finished saving; the persisted replication
 	// resume cursor must never advance past that point. We track this with an ASYNC watermark rather
@@ -8125,7 +8241,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					case NODE_NAME_TO_ID_MAP:
 						// this is the mapping of node names to short local ids. if there is no auditStore (yet), just make an empty map, but not sure why that would happen.
-						remoteShortIdToLocalId = auditStore ? remoteToLocalNodeId(data, auditStore) : new Map();
+						remoteShortIdToLocalId = auditStore ? translateIdMap(data, auditStore) : new Map();
 						receivingDataFromNodeNames = message[2];
 						logger.debug?.(
 							connectionId,
@@ -8270,6 +8386,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyModeOrderVersion = message[2];
 						copyOriginAnchors = !projectionCopy && recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						noteCopyStall((tracker) =>
+							tracker.noteCopyStart(
+								copyStartKey(readDbisCursorSync(getDatabaseStores().dbisDB, 'copyCursor', copyFromNodeId), encode)
+							)
+						);
 						if (copyApplyActive() && supportsCheckpointFloors()) {
 							try {
 								// any complete pass refills an ordinary table, whichever peer's pass dropped the record
@@ -9267,7 +9388,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								ws.send(
 									encode([
 										NODE_NAME_TO_ID_MAP,
-										exportIdMapping(tableSubscriptionToReplicator.auditStore),
+										exportIdMappingWithUnnamed(tableSubscriptionToReplicator.auditStore, sentNodeIds),
 										nodeSubscriptions.map(({ name }) => name),
 									])
 								);
@@ -10726,12 +10847,28 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					close(1011, 'invalid replication record version');
 					return;
 				}
-				const localSourceNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
-				if (localSourceNodeId === undefined) throw new Error(`No node name mapped for origin id ${auditRecord.nodeId}`);
+				const localSourceNodeId = translateOrigin(auditRecord.nodeId);
+				if (localSourceNodeId === undefined) {
+					// past the per-connection cap, or not an id at all: hold rather than mint without bound
+					recordAction(true, DECODE_HOLD_METRIC, databaseName + '.origin');
+					logger.error?.(
+						connectionId,
+						`Replication record from ${remoteNodeName} for ${databaseName} carries origin id ${auditRecord.nodeId}, which cannot be given a name; holding and reconnecting`
+					);
+					wsClosed = true;
+					close(1011, 'untranslatable replication origin');
+					return;
+				}
 				if (!projectionCopy && restrictedOrigins && localSourceNodeId !== directShardingOriginId) {
 					refuseShardingSource(getNodeNameForId(auditStore, localSourceNodeId, true));
 					return;
 				}
+				if (
+					COPY_APPLY_FAILURE_KEY_FOR_TEST !== undefined &&
+					messageIsCopyFrame &&
+					COPY_APPLY_FAILURE_KEY_FOR_TEST === String(auditRecord.recordId)
+				)
+					throw new Error(`HARPER_TEST_COPY_APPLY_FAILURE_KEY: refusing copy row ${auditRecord.recordId}`);
 				const tableDecoder = tableDecoders[auditRecord.tableId];
 				if (!tableDecoder) {
 					// No structure/decoder for this table id yet. tableDecoders is populated only by a

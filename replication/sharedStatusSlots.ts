@@ -54,6 +54,12 @@ export const SHARDING_CERTIFICATE_GENERATION_POSITION = allocate();
 export const SHARDING_CERTIFICATE_POSITION = allocate(4);
 export const SHARDING_PEER_SHARD_POSITION = allocate();
 export const SHARDING_WAIT_POSITION = allocate();
+// The receiving leg's stuck copy (copyStall.ts): state, reason code, attempt count, since and retry-at (epoch ms).
+export const STUCK_COPY_STATE_POSITION = allocate();
+export const STUCK_COPY_REASON_POSITION = allocate();
+export const STUCK_COPY_COUNT_POSITION = allocate();
+export const STUCK_COPY_SINCE_POSITION = allocate();
+export const STUCK_COPY_RETRY_AT_POSITION = allocate();
 
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
 export const ALLOCATED_SLOTS = cursor;
