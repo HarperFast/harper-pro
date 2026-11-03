@@ -1472,14 +1472,20 @@ function startCloneAttempt(): void {
 	let attemptId = forceClone ? undefined : reusableCloneAttemptId(persistedMarker, leaderHost);
 	if (!attemptId) {
 		attemptId = randomBytes(16).toString('hex');
+		const temporaryPath = `${path}.${process.pid}.tmp`;
 		try {
-			const temporaryPath = `${path}.${process.pid}.tmp`;
 			mkdirSync(dirname(path), { recursive: true });
 			writeFileSync(temporaryPath, JSON.stringify({ attemptId, leaderHost }), { encoding: 'utf8', mode: 0o600 });
 			renameSync(temporaryPath, path);
 		} catch (error) {
-			log(`Could not persist clone attempt at ${path}: ${error}`, 'error');
-			return;
+			try {
+				rmSync(temporaryPath, { force: true });
+			} catch {}
+			// Every clone-mode branch of replication keys on this attempt, so a clone that cannot record it
+			// must not start. Nothing has started yet: bin/harper.js exits.
+			throw new Error(`Could not persist the clone attempt marker at ${path}, so the clone cannot start: ${error}`, {
+				cause: error,
+			});
 		}
 	}
 	process.env[CLONE_ATTEMPT_ENV] = attemptId;
