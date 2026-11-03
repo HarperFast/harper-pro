@@ -213,8 +213,10 @@ describe('clone-attempt marker (#737)', () => {
 		it('throws, rather than answering "no attempt", for a marker it cannot read', () => {
 			writeMarker('{ not json');
 			assert.throws(() => liveCloneAttempt(rootPath));
-			writeMarker(JSON.stringify({ leaderHost: 'leader.example' }));
-			assert.throws(() => liveCloneAttempt(rootPath), /names no attempt/);
+			for (const marker of [{ leaderHost: 'leader.example' }, { attemptId: '' }]) {
+				writeMarker(JSON.stringify(marker));
+				assert.throws(() => liveCloneAttempt(rootPath), /names no attempt/);
+			}
 			for (const completedAt of ['recently', '', ' ']) {
 				writeMarker(JSON.stringify({ attemptId: 'attempt-under-test', completedAt }));
 				assert.throws(() => liveCloneAttempt(rootPath), /unreadable completion time/);

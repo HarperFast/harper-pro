@@ -8260,15 +8260,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (databaseName && (cloneAttempt || missingShardingOriginStart(databaseName))) {
 							// Durable before the first copied row, so a crash mid-copy leaves the flag, never the ambiguity.
 							try {
-								// The raw variable outlives the attempt in every worker; only a live attempt counts.
-								const liveAttempt = cloneAttempt ? liveCloneAttempt() : undefined;
+								// Snapshot recovery refuses over any home-map row, even one this attempt created, so it
+								// passes no attempt. The raw variable outlives the attempt in every worker; only a live
+								// attempt counts.
 								const shardingRecovery = missingShardingOriginStart(databaseName);
-								if (liveAttempt !== undefined || shardingRecovery) {
-									// Snapshot recovery refuses over any home-map row, even one this attempt created.
-									const flagged = await markReclonedIfLockHistory(
-										databaseName,
-										shardingRecovery ? undefined : liveAttempt
-									);
+								const liveAttempt = !shardingRecovery && cloneAttempt ? liveCloneAttempt() : undefined;
+								if (shardingRecovery || liveAttempt !== undefined) {
+									const flagged = await markReclonedIfLockHistory(databaseName, liveAttempt);
 									if (connectionSuperseded()) return;
 									if (flagged) {
 										for (const { catalog } of shardingNativeRoots(databaseName)) {
