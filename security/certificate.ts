@@ -417,8 +417,7 @@ function sanitizeName(cn: string): string {
 	return cn.replace(/[^a-z0-9.]/gi, '-');
 }
 
-// These will register the operations for the operations API. For now the method and schema are ignored,
-// they are there for when build the REST interface for operations API
+// parametersSchema is reserved for the legacy REST interface; MCP uses inputSchema.
 server.registerOperation?.({
 	name: 'add_certificate',
 	execute: addCertificate,
@@ -435,6 +434,7 @@ server.registerOperation?.({
 
 server.registerOperation?.({
 	name: 'list_certificates',
+	inputSchema: { type: 'object', properties: {} },
 	execute: listCertificates,
 	httpMethod: 'GET',
 	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],

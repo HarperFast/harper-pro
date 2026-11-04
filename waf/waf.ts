@@ -210,7 +210,12 @@ export function startOnMainThread(options: WafComponentOptions) {
 	options.server.registerOperation?.({ name: 'add_waf_rule', execute: operations.addWafRule, httpMethod: 'POST' });
 	options.server.registerOperation?.({ name: 'alter_waf_rule', execute: operations.alterWafRule, httpMethod: 'POST' });
 	options.server.registerOperation?.({ name: 'drop_waf_rule', execute: operations.dropWafRule, httpMethod: 'POST' });
-	options.server.registerOperation?.({ name: 'list_waf_rules', execute: operations.listWafRules, httpMethod: 'GET' });
+	options.server.registerOperation?.({
+		name: 'list_waf_rules',
+		execute: operations.listWafRules,
+		httpMethod: 'GET',
+		inputSchema: { type: 'object', properties: {} },
+	});
 	options.server.registerOperation?.({ name: 'set_waf_mode', execute: operations.setWafMode, httpMethod: 'POST' });
 }
 
