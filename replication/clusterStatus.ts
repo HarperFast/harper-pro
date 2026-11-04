@@ -18,6 +18,7 @@ import {
 	readConnectionTruth,
 	readFireCounters,
 } from './replicationConnection.ts';
+import { readStuckCopy } from './copyStall.ts';
 import '../core/server/serverHelpers/serverUtilities.ts';
 
 // Keyed by request id: the main thread's answer takes a bounded fan-out, so two cluster_status calls on
@@ -85,6 +86,7 @@ export async function clusterStatus() {
 			// problem). This is the evidence the later watchdog-demotion decision is meant to rest on; nothing
 			// in the recovery paths reads it. Omitted entirely for a link where nothing has ever fired.
 			socket.recoveryFires = readFireCounters(replicationSharedStatus);
+			socket.stuckCopy = readStuckCopy(replicationSharedStatus);
 			// W1 (harper-pro#431): the shared-memory connection truth is authoritative over the edge-triggered
 			// map mirror in requestClusterStatus, which can still read connected:true for an open-but-idle
 			// wedge that never delivered a disconnect (#289/#233). Also surface the last disconnect (#214).

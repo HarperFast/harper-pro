@@ -1,0 +1,8 @@
+type unnamed_rows @table(database: "data") @export {
+	id: ID @primaryKey
+	name: String
+}
+
+type after_copy @table(database: "data") {
+	id: ID @primaryKey
+}

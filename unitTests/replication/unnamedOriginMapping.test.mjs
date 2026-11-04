@@ -1,0 +1,124 @@
+import assert from 'node:assert';
+import { createRequire } from 'node:module';
+import { table } from '#src/core/resources/databases';
+import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
+import { getThisNodeName } from '#src/core/server/nodeName';
+import { exportIdMappingWithUnnamed, translateIdMap } from '#src/replication/replicationConnection';
+import { unnamedOriginName } from '#src/replication/unnamedOrigins';
+import { setMainIsWorker } from '#js/core/server/threads/manageThreads';
+import '#src/core/server/serverHelpers/serverUtilities';
+
+const { setupTestDBPath } = createRequire(import.meta.url)('../testUtils.js');
+
+describe('unnamed origins in the replication id map', () => {
+	let databaseCount = 0;
+	const freshAuditStore = () =>
+		table({
+			table: 'UnnamedOrigins',
+			database: `unnamedOriginMapping_${databaseCount++}`,
+			attributes: [{ name: 'id', isPrimaryKey: true }],
+			audit: true,
+		}).auditStore;
+
+	before(() => {
+		setupTestDBPath();
+		setMainIsWorker(true);
+	});
+
+	after(() => setMainIsWorker(false));
+
+	it('names each sent origin id this node has no name for, and only those', () => {
+		const auditStore = freshAuditStore();
+		const peer = getIdOfRemoteNode('peer-a', auditStore);
+		const exported = exportIdMappingWithUnnamed(auditStore, [peer, 777, 0]);
+		assert.strictEqual(exported['peer-a'], peer);
+		assert.strictEqual(exported[unnamedOriginName(getThisNodeName(), 777)], 777);
+		assert.deepStrictEqual(
+			Object.values(exported).sort((a, b) => a - b),
+			[0, peer, 777]
+		);
+	});
+
+	it('names each unnamed origin the same way after an earlier version minted a derived name to another id', () => {
+		const auditStore = freshAuditStore();
+		const ownName = (id) => unnamedOriginName(getThisNodeName(), id);
+		// what a 5.3 node stores when a peer relays the derived name back to it (harper-pro#1246)
+		const minted = getIdOfRemoteNode(ownName(777), auditStore);
+		assert.deepStrictEqual(exportIdMappingWithUnnamed(auditStore, [777]), {
+			[getThisNodeName()]: 0,
+			[ownName(777)]: 777,
+		});
+		assert.deepStrictEqual(exportIdMappingWithUnnamed(auditStore, [minted]), {
+			[getThisNodeName()]: 0,
+			[ownName(777)]: 777,
+			[ownName(minted)]: minted,
+		});
+		const both = exportIdMappingWithUnnamed(auditStore, [minted, 777]);
+		assert.strictEqual(both[ownName(777)], 777);
+		assert.strictEqual(both[ownName(minted)], minted);
+		// a peer relaying either name back maps it home, adding no identity
+		const home = translateIdMap({ [ownName(777)]: 5, [ownName(minted)]: 6 }, auditStore);
+		assert.strictEqual(home.get(5), 777);
+		assert.strictEqual(home.get(6), minted);
+	});
+
+	it('keeps a stored derived name with the id it was stored under once a node holds the id it names', () => {
+		const auditStore = freshAuditStore();
+		const ownName = unnamedOriginName(getThisNodeName(), 1);
+		const peer = getIdOfRemoteNode('peer-a', auditStore);
+		assert.strictEqual(peer, 1);
+		// a relayed copy of the name, minted once peer-a held id 1
+		const minted = translateIdMap({ [ownName]: 5 }, auditStore).get(5);
+		assert.notStrictEqual(minted, 1);
+		assert.strictEqual(exportIdMappingWithUnnamed(auditStore, [minted])[ownName], minted);
+	});
+
+	it('maps its own derived name home, until that id is given to a node', () => {
+		const auditStore = freshAuditStore();
+		const ownName = unnamedOriginName(getThisNodeName(), 50);
+		const home = translateIdMap({ [ownName]: 5, 'peer-b': 6 }, auditStore);
+		assert.strictEqual(home.get(5), 50);
+		assert.strictEqual(home.get(6), getIdOfRemoteNode('peer-b', auditStore));
+		for (let i = 0; i < 50; i++) getIdOfRemoteNode(`peer-${i}`, auditStore);
+		const taken = translateIdMap({ [ownName]: 5 }, auditStore);
+		assert.notStrictEqual(taken.get(5), 50);
+		assert.strictEqual(taken.get(5), getIdOfRemoteNode(ownName, auditStore));
+	});
+
+	for (const order of ['displaced first', 'displaced last']) {
+		it(`gives two derived names distinct ids when one's mint takes the other's own id (${order})`, () => {
+			const auditStore = freshAuditStore();
+			const peer = getIdOfRemoteNode('peer-a', auditStore);
+			const displaced = unnamedOriginName(getThisNodeName(), peer);
+			const next = unnamedOriginName(getThisNodeName(), peer + 1);
+			const entries = [
+				[displaced, 5],
+				[next, 6],
+			];
+			const map = Object.fromEntries(order === 'displaced first' ? entries : entries.reverse());
+			const translated = translateIdMap(map, auditStore);
+			assert.notStrictEqual(translated.get(5), peer);
+			assert.notStrictEqual(translated.get(5), translated.get(6));
+			const sent = Object.values(exportIdMappingWithUnnamed(auditStore, []));
+			assert.strictEqual(new Set(sent).size, sent.length, 'no two names are sent with one id');
+		});
+	}
+
+	it('leaves a stored derived name where it is when another derived name holds its own id', () => {
+		const auditStore = freshAuditStore();
+		const peer = getIdOfRemoteNode('peer-a', auditStore);
+		const displaced = unnamedOriginName(getThisNodeName(), peer);
+		const heldOut = unnamedOriginName(getThisNodeName(), peer + 1);
+		getIdOfRemoteNode(displaced, auditStore);
+		const storedId = getIdOfRemoteNode(heldOut, auditStore);
+		const sent = exportIdMappingWithUnnamed(auditStore, []);
+		assert.strictEqual(sent[displaced], peer + 1);
+		assert.strictEqual(sent[heldOut], storedId, 'its own id belongs to the displaced name');
+	});
+
+	it('does not map home onto an id the same map gives a new peer', () => {
+		const auditStore = freshAuditStore();
+		const translated = translateIdMap({ [unnamedOriginName(getThisNodeName(), 1)]: 5, 'peer-b': 6 }, auditStore);
+		assert.notStrictEqual(translated.get(5), translated.get(6));
+	});
+});
