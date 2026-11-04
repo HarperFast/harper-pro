@@ -205,6 +205,7 @@ const { forComponent, errorToString } = harperLogger;
 import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptionManager.ts';
 import { materializeOperationResponse } from './materializeOperationResponse.ts';
 import { deferSubscribeUntilSessionForTest, subscribeDeferralAllowedForTest } from './subscribeDeferralForTest.ts';
+import { copyStartHoldDatabaseForTest, holdCopyStartForTest } from './copyStartHoldForTest.ts';
 import { EventEmitter } from 'events';
 import { createTLSSelector } from '../core/security/keys.js';
 import * as tls from 'node:tls';
@@ -8495,6 +8496,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 						loadPersistedCopyBounds();
 						if (copyApplyActive() && supportsCheckpointFloors()) reserveCopyStartBounds(copyModeStartTime);
+						if (copyStartHoldDatabaseForTest && copyStartHoldDatabaseForTest === databaseName) {
+							await holdCopyStartForTest(connectionSuperseded);
+							if (connectionSuperseded()) return;
+						}
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
 						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;

@@ -100,7 +100,7 @@ record of that origin and table this node dropped or failed to apply. Those are 
     attempt would trust a row it tagged on the lost storage. With the flag set, every self-origin
     dependency rejects with 503 and every later copy repeats the flush that made it durable; an upgrade
     does not clear an existing flag (it records no evidence), so the remedy is a re-clone with a fresh
-    root.
+    root, under a new name or a new generation (next paragraph).
     **Not decided locally:** a fully fresh root under a reused node name looks exactly like a first
     join, while a home that kept the current generation may still hold lineage naming the old
     incarnation's releases. Re-provision under a new name, or stage and activate a new generation on
@@ -241,7 +241,9 @@ The planning rounds that produced this table are in harper-pro#822's description
   that the home-map row keeps its creation attempt through every write.
 - `integrationTests/cluster/recordLockClonedNode.test.mjs` — a node joined through `cloneNode` hands a
   key back and forth with the leader; the same node, cloned again after losing its database storage
-  with its home-map row kept, refuses its own earlier lineage (`recloned`).
+  with its home-map row kept, refuses its own earlier lineage (`recloned`). A second suite holds the
+  clone's copy at `COPY_START` (`copyStartHoldForTest.ts`), activates the home map during the hold, and
+  shows the copy that then runs leaves the node unflagged.
 - Not covered by any test: the `record_lock_barrier` operation's server-side checks, the receive
   loop's poison writes, and the end-to-end refusal paths (clock rollback, an excluded route, poison
   surviving a restart or base copy, a mixed-level member, LMDB).

@@ -1,18 +1,23 @@
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 import {
 	DB,
 	bootstrapHomeMap,
 	call,
 	clusterStatusOf,
+	putCounter,
 	restartStoppedNode,
 	startNode,
 	stopNode,
 	waitForCounter,
 	waitForMesh,
+	waitForProvableDrain,
 	waitForRing,
 } from './recordLockShared.mjs';
 
@@ -75,6 +80,9 @@ suite('cluster record locks on a node that joined by cloning (harper-pro#1236)',
 		await waitForMesh([leader, joined]);
 		await bootstrapHomeMap([leader, joined]);
 		await waitForRing([leader, joined], 2);
+		// A home that has just taken ownership refuses grants (503) until it can rule out live delegations
+		// from an earlier incarnation, which a first handoff would otherwise race.
+		await waitForProvableDrain([leader, joined]);
 	});
 
 	after(async () => {
@@ -131,3 +139,92 @@ suite('cluster record locks on a node that joined by cloning (harper-pro#1236)',
 		assert.ok(freshness.rejected?.recloned >= 1, `refused as recloned: ${JSON.stringify(freshness)}`);
 	});
 });
+
+suite(
+	'cluster record locks on a node whose home map was activated during its clone (harper-pro#1240)',
+	{ timeout: 600_000 },
+	(ctx) => {
+		const contexts = [];
+		let leader;
+		let token;
+		let holdDirectory;
+
+		before(async () => {
+			holdDirectory = await mkdtemp(join(tmpdir(), 'harper-copy-hold-'));
+			contexts.push(await startNode(ctx.name));
+			leader = contexts[0].harper;
+			({ operation_token: token } = await sendOperation(leader, {
+				operation: 'create_authentication_tokens',
+				authorization: leader.admin,
+			}));
+			await putCounter(leader, 'seeded', 7);
+		});
+
+		after(async () => {
+			for (const c of contexts) await stopNode(c);
+			rmSync(holdDirectory, { recursive: true, force: true });
+		});
+
+		test('the copy held at COPY_START sees the attempt-tagged row, and the node takes handoffs over its own writes', async () => {
+			contexts.push(
+				await startNode(
+					ctx.name,
+					cloneEnv(leader, token, {
+						HARPER_TEST_HOLD_COPY_START_DB: DB,
+						HARPER_TEST_HOLD_COPY_START_DIR: holdDirectory,
+					})
+				)
+			);
+			const joined = contexts.at(-1).harper;
+			try {
+				await waitForCondition(() => existsSync(join(holdDirectory, 'held')), {
+					timeoutMs: 180_000,
+					pollMs: 200,
+					description: `the clone's ${DB} copy to hold at COPY_START`,
+				});
+				await bootstrapHomeMap([leader, joined], undefined, AbortSignal.timeout(120_000));
+				const attempt = JSON.parse(readFileSync(join(joined.dataRootDir, '.cloneAttempt.json'), 'utf8'));
+				assert.equal(attempt.completedAt, undefined, 'the clone attempt was still live when the home map activated');
+			} finally {
+				writeFileSync(join(holdDirectory, 'release'), 'go');
+			}
+			await waitForCompletedClone(joined);
+			await waitForMesh([leader, joined]);
+			await waitForRing([leader, joined], 2);
+			await waitForCounter([joined], 'seeded', 7);
+			await waitForProvableDrain([leader, joined]);
+
+			const id = `own-lineage-${Date.now()}`;
+			for (const [index, node] of [joined, leader, joined, leader].entries()) {
+				const result = await increment(node, id);
+				assert.equal(
+					result.status,
+					200,
+					`step ${index} on ${node === joined ? 'the joined node' : 'the leader'}: ${JSON.stringify(result.body)}`
+				);
+				assert.equal(result.body.n, index + 1, `step ${index} read every earlier increment`);
+			}
+			const freshness = await freshnessOf(joined);
+			assert.ok(freshness.applied > 0, `the joined node proved its handoffs by barrier: ${JSON.stringify(freshness)}`);
+			assert.equal(freshness.rejected?.recloned, undefined, JSON.stringify(freshness));
+		});
+
+		test('a clone whose attempt marker cannot be persisted exits before it contacts the leader', async () => {
+			const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
+			// A directory at the marker path fails the rename whatever the process's privileges.
+			mkdirSync(join(dataRootDir, '.cloneAttempt.json'));
+			const refused = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress(), dataRootDir } };
+			contexts.push(refused);
+			await assert.rejects(restartStoppedNode(refused, cloneEnv(leader, token)), (error) => {
+				assert.match(error.message, /exit code\/signal 1\b/);
+				assert.match(error.message, /Could not persist the clone attempt marker/);
+				return true;
+			});
+			const { connections } = await clusterStatusOf(leader);
+			assert.ok(
+				connections.every((connection) => connection.name !== refused.harper.hostname),
+				`the leader never added the refused node: ${JSON.stringify(connections.map((connection) => connection.name))}`
+			);
+		});
+	}
+);
