@@ -864,7 +864,7 @@ async function getSSHKnownHosts(): Promise<{ known_hosts: string | null }> {
 	return { known_hosts: await readFile(knownHostsFile, 'utf8') };
 }
 
-// parametersSchema is reserved for the legacy REST interface; MCP uses inputSchema.
+// MCP reads inputSchema; httpMethod and parametersSchema are currently unused.
 server.registerOperation?.({
 	name: 'add_ssh_key',
 	execute: addSSHKey,
