@@ -24,4 +24,4 @@ Every thread loads the built-in components (`HARPER_BUILTIN_COMPONENTS` in `bin/
 
 `unitTests/startupDependencies.test.mjs` loads the built-in component entry points listed in `bin/harper.js` in a fresh process and fails if any of these packages lands in the require cache. It requires Pro's own entry modules (replication, license, analytics, secretCustody, waf) and what they transitively import, so it passes only when those modules' core imports defer them as well; core's own built-in components are covered by a separate core test.
 
-Pro’s default listing operations declare exact empty-object contracts, which core validates without loading Ajv. Nontrivial contracts use registration-local compilers so replaced schemas and generated code can be collected; reference validation still happens before announcement. The startup guard includes Ajv.
+Pro’s default listing registrations use exact empty-object contracts, keeping Ajv deferred. `unitTests/startupDependencies.test.mjs` guards that startup constraint; core owns the validation/compiler details in [core/dependencies.md](core/dependencies.md#ajv).

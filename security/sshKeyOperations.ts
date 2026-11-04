@@ -864,7 +864,6 @@ async function getSSHKnownHosts(): Promise<{ known_hosts: string | null }> {
 	return { known_hosts: await readFile(knownHostsFile, 'utf8') };
 }
 
-// MCP reads inputSchema; httpMethod and parametersSchema are currently unused.
 server.registerOperation?.({
 	name: 'add_ssh_key',
 	execute: addSSHKey,

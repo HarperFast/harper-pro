@@ -417,7 +417,6 @@ function sanitizeName(cn: string): string {
 	return cn.replace(/[^a-z0-9.]/gi, '-');
 }
 
-// MCP reads inputSchema; httpMethod and parametersSchema are currently unused.
 server.registerOperation?.({
 	name: 'add_certificate',
 	execute: addCertificate,
