@@ -8,9 +8,9 @@ function escapeNodeName(nodeName: string): string {
 }
 
 /**
- * The name for an origin id a node holds rows for but has no name for (harper-pro#1235): one per (the node
- * that holds it, its id there), the same whichever side derives it, and safe as a transaction-log name, since
- * every character of the node name outside `[A-Za-z0-9.-]` is escaped (an IPv6 literal's `:` included).
+ * The name for an origin id a node holds rows for but has no name for (harper-pro#1235). Both sides must derive
+ * the identical name, and it becomes a transaction-log name on relay, so a node name's other characters (an IPv6
+ * literal's `:`) are escaped.
  */
 export function unnamedOriginName(nodeName: string, id: number): string {
 	return `${PREFIX}${id}@${escapeNodeName(nodeName)}`;

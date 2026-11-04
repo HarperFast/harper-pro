@@ -615,19 +615,20 @@ function sentIdMapping(auditStore: any, thisNodeName: string): Record<string, nu
 
 /**
  * The ids no derived name can come home to: every node's, and the stored id of each derived name whose own id
- * is held, since that name keeps it. Grows until stable, as a kept id can be another derived name's own id.
+ * is held, since that name keeps it, and a kept id can be another derived name's own id.
  */
 function heldIds(nameToId: Record<string, number>, thisNodeName: string): Set<number> {
 	const held = new Set<number>();
-	for (const name in nameToId) if (ownUnnamedOriginId(name, thisNodeName) === undefined) held.add(nameToId[name]);
-	for (let grew = true; grew;) {
-		grew = false;
-		for (const name in nameToId) {
-			const ownId = ownUnnamedOriginId(name, thisNodeName);
-			if (ownId === undefined || !held.has(ownId) || held.has(nameToId[name])) continue;
-			held.add(nameToId[name]);
-			grew = true;
-		}
+	const storedByOwnId = new Map<number, number>();
+	for (const name in nameToId) {
+		const ownId = ownUnnamedOriginId(name, thisNodeName);
+		if (ownId === undefined) held.add(nameToId[name]);
+		else storedByOwnId.set(ownId, nameToId[name]);
+	}
+	// a Set's iteration visits what is added during it
+	for (const id of held) {
+		const kept = storedByOwnId.get(id);
+		if (kept !== undefined) held.add(kept);
 	}
 	return held;
 }
@@ -3513,7 +3514,7 @@ export class NodeReplicationConnection extends EventEmitter {
 			else if (transition.to) logger.warn?.(message);
 			else logger.info?.(message);
 		} catch {
-			// a log sink failure must not stop the reconnect it reports on
+			// must not stop the reconnect it reports on
 		}
 	}
 	armQuietSession(socket: ReplicationWebSocket) {
@@ -4705,6 +4706,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
+	function warnCursorFailure(what: string, error: unknown) {
+		try {
+			logger.warn?.(connectionId, what, error);
+		} catch {
+			// nothing awaits this promise, so a failing log sink must not reject it
+		}
+	}
 	function noteCopyStall(note: (tracker: CopyStallTracker) => StuckCopyTransition | undefined) {
 		const connection = options.connection;
 		if (!connection?.copyStall || connection.nodeSubscriptions === undefined || connectionSuperseded()) return;
@@ -4716,18 +4724,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const persisted = dbisDB.put([Symbol.for('copyCursor'), nodeId], cursor);
 		const credit = () => noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
 		if (persisted?.then)
-			persisted
-				.then(credit)
-				.catch((error: unknown) => logger.warn?.(connectionId, 'failed to persist the copy cursor', error));
+			persisted.then(credit).catch((error: unknown) => warnCursorFailure('failed to persist the copy cursor', error));
 		else credit();
 	}
 	function removeFinishedCopyCursor(nodeId: number) {
 		const removed = getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), nodeId]);
 		const credit = () => noteCopyStall((tracker) => tracker.noteDurableProgress());
 		if (removed?.then)
-			removed
-				.then(credit)
-				.catch((error: unknown) => logger.warn?.(connectionId, 'failed to remove the copy cursor', error));
+			removed.then(credit).catch((error: unknown) => warnCursorFailure('failed to remove the copy cursor', error));
 		else credit();
 	}
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is

@@ -127,6 +127,24 @@ for (const engine of ['rocksdb', 'lmdb']) {
 					.split('\n')
 					.filter((line) => line.includes(`Replicating all tables to ${receiver.hostname}`)).length;
 			const copiesBefore = await copiesTo();
+			const afterCopy = (id) =>
+				waitForCondition(
+					async (signal) =>
+						(
+							await sendOperation(
+								receiver,
+								{ operation: 'search_by_id', database: 'data', table: 'after_copy', ids: [id], get_attributes: ['id'] },
+								{ signal }
+							)
+						).length === 1,
+					{ timeoutMs: COPY_TIMEOUT_MS, description: `${id} to reach the receiver` }
+				);
+			const writeAfterCopy = (id) =>
+				sendOperation(sender, { operation: 'upsert', database: 'data', table: 'after_copy', records: [{ id }] });
+			// a live write first: a kill right after the copy, before the receiver has a resume cursor, rightly copies again
+			await writeAfterCopy('before-restart');
+			await afterCopy('before-restart');
+			await delay(2_000);
 
 			await killHarper({ harper: receiver });
 			await stopNodeProcess(receiver);
@@ -148,29 +166,8 @@ for (const engine of ['rocksdb', 'lmdb']) {
 				).harper
 			);
 			deepEqual(await rowIds(receiver), ALL_IDS, 'the copied rows survive the restart');
-			await sendOperation(sender, {
-				operation: 'upsert',
-				database: 'data',
-				table: 'after_copy',
-				records: [{ id: 'after-restart' }],
-			});
-			await waitForCondition(
-				async (signal) =>
-					(
-						await sendOperation(
-							receiver,
-							{
-								operation: 'search_by_id',
-								database: 'data',
-								table: 'after_copy',
-								ids: ['after-restart'],
-								get_attributes: ['id'],
-							},
-							{ signal }
-						)
-					).length === 1,
-				{ timeoutMs: COPY_TIMEOUT_MS, description: 'the next write to reach the restarted receiver' }
-			);
+			await writeAfterCopy('after-restart');
+			await afterCopy('after-restart');
 			equal(await copiesTo(), copiesBefore, 'no second copy after the restart');
 		});
 
@@ -205,6 +202,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 		if (engine === 'rocksdb') {
 			async function restartSender(env = {}) {
 				await killHarper({ harper: sender });
+				await stopNodeProcess(sender);
 				const restarted = (
 					await startHarper(
 						{ name: ctx.name, harper: sender },
