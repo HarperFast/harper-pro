@@ -197,30 +197,39 @@ export function waitForRing(nodes, expectedSize) {
  * small backstop, so this bootstraps immediately; that is safe here specifically because every node is
  * freshly started with no prior generation, not something a real reconfiguration could skip.
  * `afterActivate`, when supplied, runs after each activation response and before starting the next.
+ * `signal`, when supplied, aborts every request.
  */
-export async function bootstrapHomeMap(nodes, afterActivate) {
+export async function bootstrapHomeMap(nodes, afterActivate, signal) {
 	const homes = [];
 	for (const node of nodes) {
-		const status = await clusterStatusOf(node);
+		const status = await clusterStatusOf(node, signal);
 		homes.push(status.node_name);
 	}
 	for (const node of nodes)
-		await sendOperation(node, {
-			operation: 'record_lock_stage_generation',
-			database: DB,
-			generation: 1,
-			homes,
-			quiesce: homes,
-			authorization: node.admin,
-		});
+		await sendOperation(
+			node,
+			{
+				operation: 'record_lock_stage_generation',
+				database: DB,
+				generation: 1,
+				homes,
+				quiesce: homes,
+				authorization: node.admin,
+			},
+			{ signal }
+		);
 	for (const node of nodes) {
-		await sendOperation(node, {
-			operation: 'record_lock_activate_generation',
-			database: DB,
-			generation: 1,
-			homes,
-			authorization: node.admin,
-		});
+		await sendOperation(
+			node,
+			{
+				operation: 'record_lock_activate_generation',
+				database: DB,
+				generation: 1,
+				homes,
+				authorization: node.admin,
+			},
+			{ signal }
+		);
 		await afterActivate?.(node);
 	}
 	return homes;

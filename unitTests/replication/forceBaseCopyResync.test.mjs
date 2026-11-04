@@ -4,12 +4,17 @@
  * retention is time-based), incremental replay can no longer serve it without silently skipping
  * purged entries or replaying an unbounded history (the heap-unbounded path that OOMs, harper#1114).
  * shouldForceBaseCopyForRetention is the pure decision that upgrades such a start to the bounded
- * base-copy path (startTime = 0). The retention floor is max(oldestRetainedEntry, now - retention),
- * so it catches both purges more aggressive than nominal retention and a fully-purged/idle log.
+ * base-copy path (startTime = 0). Without a purge bound from the source the floor is
+ * max(oldestRetainedEntry, now - retention, audit floor); with one, the start is compared against it alone.
  */
 
 import { expect } from 'chai';
-import { shouldForceBaseCopyForRetention } from '#src/replication/replicationConnection';
+import {
+	shouldForceBaseCopyForRetention,
+	purgeBoundLogNames,
+	replayStartUnderPurge,
+	ORIGIN_CURSOR_OVERLAP_MS,
+} from '#src/replication/replicationConnection';
 
 describe('shouldForceBaseCopyForRetention', () => {
 	const RETENTION = 3 * 86400 * 1000; // 3 days, like the incident's auditRetention
@@ -59,5 +64,96 @@ describe('shouldForceBaseCopyForRetention', () => {
 		// Defensive: non-positive / NaN starts never force.
 		expect(shouldForceBaseCopyForRetention(-1, 5000, 3000)).to.equal(false);
 		expect(shouldForceBaseCopyForRetention(Number.NaN, 5000, 3000)).to.equal(false);
+	});
+
+	describe('with a purge bound from the source (harper-pro#1229)', () => {
+		const now = Date.now();
+		const cutoff = now - RETENTION;
+		const forced = (start, bound) => replayStartUnderPurge(['local'], start, undefined, () => bound) !== undefined;
+
+		it('does NOT force a follower caught up on an idle source whose log was purged empty', () => {
+			const lastWrite = now - 5 * 86400 * 1000; // idle five days, past the three-day retention
+			expect(forced(lastWrite, lastWrite)).to.equal(false);
+		});
+
+		it('does NOT force a follower of a log that was never written', () => {
+			const tracked = now - 10 * 86400 * 1000; // the floor when tracking began
+			expect(forced(now - 4 * 86400 * 1000, tracked)).to.equal(false);
+		});
+
+		it('forces a follower that missed entries a prune removed, even with the log now empty', () => {
+			expect(forced(now - 6 * 86400 * 1000, now - 5 * 86400 * 1000)).to.equal(true);
+		});
+
+		it('forces a follower behind a manual purge whose cutoff is past nominal retention', () => {
+			// delete_transaction_logs_before at now - 1h emptied a log written until then; the follower is at now - 2h
+			expect(forced(now - 2 * 3600 * 1000, now - 3600 * 1000)).to.equal(true);
+		});
+
+		it('falls back to the audit floor when the store has no trusted bound', () => {
+			// no bound: a manual purge past nominal retention is still caught through the floor it recorded
+			expect(shouldForceBaseCopyForRetention(now - 7200_000, undefined, cutoff, now - 3600_000)).to.equal(true);
+			// an unknown floor (Infinity) is ignored, leaving the oldest entry and nominal cutoff
+			expect(shouldForceBaseCopyForRetention(now - 3600_000, undefined, cutoff, Infinity)).to.equal(false);
+		});
+	});
+
+	describe('purgeBoundLogNames', () => {
+		const store = {
+			loadLogs: () => [{ name: 'local' }, undefined, { name: 'node-b' }, { name: 'node-c' }],
+		};
+
+		it('names only the subscribed log for a single-log subscription', () => {
+			expect(purgeBoundLogNames(store, 'node-b', ['node-c'])).to.deep.equal(['node-b']);
+		});
+
+		it('names every log the aggregate range does not exclude', () => {
+			expect(purgeBoundLogNames(store, undefined, ['node-c'])).to.deep.equal(['local', 'node-b']);
+		});
+
+		it('leaves an engine with no per-origin logs to the store', () => {
+			expect(purgeBoundLogNames({}, undefined, [])).to.equal(undefined);
+		});
+	});
+});
+
+describe('replayStartUnderPurge', () => {
+	const bounds = { local: 900, relayed: 3000, quiet: 100 };
+	const boundOf = (name) => bounds[name];
+
+	// a follower's resume floor for an origin is its cursor less the overlap
+	const floorAt = (cursor) => new Map([['relayed', cursor - ORIGIN_CURSOR_OVERLAP_MS]]);
+
+	it('compares a relayed origin with a resume floor from its cursor, not from the merged start', () => {
+		// the merged start (1000) is under `relayed`'s bound, but the follower holds `relayed` through 4940
+		expect(replayStartUnderPurge(['local', 'relayed'], 1000, floorAt(4940), boundOf)).to.equal(undefined);
+		// a prune removed `relayed` past the follower's cursor, though the merged start is past every bound
+		expect(replayStartUnderPurge(['local', 'relayed'], 5000, floorAt(2000), boundOf)).to.deep.equal({
+			log: 'relayed',
+			start: 2000,
+			bound: 3000,
+		});
+	});
+
+	it("forces nothing for a relayed origin whose last key sits inside the floor's overlap", () => {
+		// an idle origin's bound is its last key, which the follower's cursor reached
+		expect(replayStartUnderPurge(['relayed'], 5000, floorAt(3000), boundOf)).to.equal(undefined);
+	});
+
+	it('compares every other log from the merged start', () => {
+		expect(replayStartUnderPurge(['local', 'quiet'], 950, undefined, boundOf)).to.equal(undefined);
+		expect(replayStartUnderPurge(['local', 'quiet'], 800, undefined, boundOf)).to.deep.equal({
+			log: 'local',
+			start: 800,
+			bound: 900,
+		});
+	});
+
+	it('forces a copy for a log whose bound cannot be read', () => {
+		expect(replayStartUnderPurge(['unknown'], 5000, undefined, boundOf)).to.deep.equal({
+			log: 'unknown',
+			start: 5000,
+			bound: undefined,
+		});
 	});
 });

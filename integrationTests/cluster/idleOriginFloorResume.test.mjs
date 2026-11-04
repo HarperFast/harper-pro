@@ -12,7 +12,7 @@
  *
  *   E ─ A ─ B ─ C      A writes; B relays A to C and C to A; C and B never write (empty local logs).
  *                      E omits its capability bag (`HARPER_TEST_OMIT_REPLICATION_CAPABILITIES`), so A and E
- *                      exchange no floors and keep main's behaviour.
+ *                      exchange no floors; core's purge bound alone keeps E's idle link incremental.
  *
  * Retention is seconds and the floor interval is shortened, so an idle interval longer than retention fits in
  * one test. The sender's oracle lines are its `forcing a bounded base-copy resync` warning and `Replicating all
@@ -225,13 +225,12 @@ suite('Idle origins keep a certified resume floor (harper-pro#922)', { timeout: 
 		const markB = await logMark(B);
 		await restartNode(C);
 		await restartNode(E);
-		// without the capability the idle link aged past retention, so its reconnect is a base copy, as before
-		await waitForCondition(
-			async () => linesAbout(await logSince(A, markA), E).some((line) => line.includes(FORCED_COPY)),
-			{ timeoutMs: CONVERGE_TIMEOUT_MS, description: 'A to force a base copy for the peer without the capability' }
-		);
 		await upsert(A, 'after-restarts');
 		await Promise.all([B, C, E].map((node) => waitForRecord(node, 'after-restarts')));
+		// without the capability the idle link aged past retention, yet A's idle log is bounded by its last
+		// write, which E holds, so core's purge bound forces nothing either (harper-pro#1229)
+		const logAboutE = linesAbout(await logSince(A, markA), E);
+		ok(!logAboutE.some((line) => line.includes(FORCED_COPY)), `A forced a copy for E:\n${logAboutE.join('\n')}`);
 
 		// B's post-restart resume to A used an ordinary (non-boundary) range: a scan-failure latch that
 		// over-fires on the healthy `exactStartFailures` case would silently stop certification here, past

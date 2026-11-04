@@ -1,0 +1,4 @@
+type unnamed_rows @table(database: "data") @export {
+	id: ID @primaryKey
+	name: String
+}
