@@ -5,8 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Pro defers these packages. Ajv is loaded by schema-bearing operation registrations on each thread.
+// These packages remain deferred, including validation of the built-in empty-object contracts.
 const DEFERRED_PACKAGES = [
+	'ajv',
 	'lmdb',
 	'pkijs',
 	'asn1js',
