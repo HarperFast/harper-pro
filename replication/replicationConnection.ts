@@ -744,7 +744,7 @@ export function replayStartUnderPurge(
 /**
  * Did the follower certify its floor-only start under another copy of this database (a restore or replacement)?
  * Then its position names nothing here, and the purge bounds, which describe this copy's own prunes, cannot vouch
- * for it. A store with no established generation vouches for no position (core `getDatabaseGeneration`).
+ * for it.
  */
 export function floorFromAnotherGeneration(auditStore: any, floorGeneration: unknown): boolean {
 	return typeof floorGeneration === 'string' && getDatabaseGeneration(auditStore)?.id !== floorGeneration;
@@ -10019,10 +10019,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// retain, the entries needed to catch up incrementally have been purged (retention is
 											// time-based). Upgrade to the bounded base-copy path instead of audit replay, which would
 											// otherwise silently skip the purged entries or replay an unbounded history (harper#1114).
+											const otherGeneration =
+												ownSubscription !== undefined &&
+												floorFromAnotherGeneration(auditStore, ownSubscription.floorGeneration);
 											if (currentSequenceId > 0) {
-												const otherGeneration =
-													ownSubscription !== undefined &&
-													floorFromAnotherGeneration(auditStore, ownSubscription.floorGeneration);
 												const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 												let oldestRetainedTime: number | undefined;
 												// Mirror the replay scope below (single log, or all non-excluded logs) and take the
@@ -10080,13 +10080,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purge bound unknown, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
 													);
 													currentSequenceId = 0;
-													// the copy filters rows at or below the start, which holds only for a position taken from this copy
-													if (otherGeneration) {
-														const ownId = getThisNodeId(auditStore);
-														const own = subscribedNodeIds[ownId];
-														if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
-													}
 												}
+											}
+											// the copy filters rows at or below the start, which holds only for a position taken from this
+											// copy; another subscription's start of 0 can have made it a copy already
+											if (otherGeneration) {
+												const ownId = getThisNodeId(auditStore);
+												const own = subscribedNodeIds[ownId];
+												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
 											}
 											if (currentSequenceId === 0) {
 												copying = true;

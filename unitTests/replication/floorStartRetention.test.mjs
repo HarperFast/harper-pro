@@ -175,6 +175,14 @@ describe('a floor-only start below the sender’s first log entry', function () 
 			await until(() => rows(socket).includes('first'), 'a row below the follower’s start is copied');
 		});
 
+		it('copies the rows below a start from another generation when another subscription already requests 0', async () => {
+			const socket = await subscribe(database, oldest + 60_000, { floorGeneration: 'f'.repeat(32) }, [
+				{ name: 'floor-relayed-origin', startTime: 0, tables: ['Records'], replicateByDefault: false },
+			]);
+			await copies(socket);
+			await until(() => rows(socket).includes('first'), 'a row below the follower’s start is copied');
+		});
+
 		it('forces a base copy for another generation even when an earlier subscription would resume', async () => {
 			await copies(
 				await subscribe(database, oldest + 1, { floorGeneration: 'f'.repeat(32) }, [
