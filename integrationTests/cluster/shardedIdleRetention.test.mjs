@@ -41,7 +41,14 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		config: {
 			threads: { count: 1 },
 			analytics: { aggregatePeriod: -1 },
-			logging: { colors: false, stdStreams: false, level: 'debug', auditRetention: RETENTION_S },
+			logging: {
+				colors: false,
+				stdStreams: false,
+				level: 'debug',
+				auditRetention: RETENTION_S,
+				// marks into hdb.log assume it is only appended to
+				rotation: { enabled: false },
+			},
 			replication: {
 				failover: true,
 				securePort: node.hostname + ':9933',

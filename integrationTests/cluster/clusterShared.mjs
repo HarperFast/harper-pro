@@ -110,8 +110,9 @@ export async function readLog(node) {
 const hdbLogPath = (node) => join(node.logDir ?? join(node.dataRootDir, 'log'), 'hdb.log');
 
 /**
- * Mark the end of a stopped node's hdb.log, for `readLogSince`. An offset means something only in the file it was
- * measured on, and with `HARPER_INTEGRATION_TEST_LOG_DIR` set every start opens a new log directory.
+ * Mark the end of a node's hdb.log, for `readLogSince`. Take it before the event under test; an offset only means
+ * something in the file it was measured on, and with `HARPER_INTEGRATION_TEST_LOG_DIR` set each start opens a new
+ * log directory.
  */
 export async function logMark(node) {
 	const path = hdbLogPath(node);
@@ -119,9 +120,8 @@ export async function logMark(node) {
 }
 
 /**
- * What the node's current log holds past `mark`: the rest of the marked file when the node still logs there, else the
- * whole new file. Assumes one start since the mark and an append-only log; a missing or shrunken log throws rather
- * than reading as empty, so an assertion that nothing was logged cannot pass without having seen the log.
+ * What the node's current log holds past `mark`. Assumes at most one start since the mark and an append-only log; a
+ * missing or shorter log throws, so an assertion that nothing was logged cannot pass without having seen the log.
  */
 export async function readLogSince(node, mark) {
 	const path = hdbLogPath(node);

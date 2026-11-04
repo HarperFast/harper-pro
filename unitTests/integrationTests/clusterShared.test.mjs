@@ -379,7 +379,6 @@ describe('cluster test helpers — log marks', () => {
 		const mark = await logMark(node);
 		await writeLog(second, 'forced\n');
 		node.logDir = second;
-		// the offset into the first file lies past the end of the second, which a bare slice turns into ''
 		expect((await readLog(node)).slice(mark.length)).to.equal('');
 		expect(await readLogSince(node, mark)).to.equal('forced\n');
 	});
