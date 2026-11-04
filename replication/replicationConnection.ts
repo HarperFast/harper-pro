@@ -750,6 +750,20 @@ export function floorFromAnotherGeneration(auditStore: any, floorGeneration: unk
 	return typeof floorGeneration === 'string' && getDatabaseGeneration(auditStore)?.id !== floorGeneration;
 }
 
+/**
+ * Whether the follower's position on this node predates where its purge record began accounting. Compared from
+ * the follower's start for this node: a listed proxied origin's start is that origin's key, which can predate this
+ * node with nothing missing, and it only reaches the merged start.
+ */
+export function predatesPurgeTracking(
+	subscriptions: { name: string; startTime?: number }[],
+	thisNodeName: string,
+	mergedStart: number,
+	trackedFrom: number
+): boolean {
+	return (subscriptions.find(({ name }) => name === thisNodeName)?.startTime ?? mergedStart) < trackedFrom;
+}
+
 // Integration tests force the retention copy for the named databases to exercise what a receiver does with
 // a copy it cannot accept (harper-pro#1231).
 const FORCE_RETENTION_COPY_DATABASES_FOR_TEST = process.env.HARPER_TEST_FORCE_RETENTION_COPY_DATABASES?.split(',');
@@ -10052,9 +10066,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													: originFloors;
 												const purgedLog = purgeBounds
 													? replayStartUnderPurge(purgeScope, currentSequenceId, comparedFloors, (name) =>
-															purgeBounds.get(name)
+															purgeBounds.bounds.get(name)
 														)
 													: undefined;
+												const predatesTracking =
+													purgeBounds !== undefined &&
+													predatesPurgeTracking(
+														nodeSubscriptions,
+														getThisNodeName(),
+														currentSequenceId,
+														purgeBounds.trackedFrom
+													);
 												if (
 													forceRetentionCopyForTest(databaseName) ||
 													otherGeneration ||
@@ -10062,7 +10084,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
 														(purgeBounds
-															? purgedLog !== undefined
+															? purgedLog !== undefined || predatesTracking
 															: shouldForceBaseCopyForRetention(
 																	currentSequenceId,
 																	oldestRetainedTime,
@@ -10077,7 +10099,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															? `Peer ${remoteNodeName} requested replication of database ${databaseName} from a floor this node certified under another database generation; forcing a bounded base-copy resync.`
 															: purgedLog
 																? `Peer ${remoteNodeName} requested replication of database ${databaseName}, whose log ${purgedLog.log} it would replay from ${new Date(purgedLog.start).toISOString()}, under transaction-log history purged through ${purgedThrough(purgedLog.bound)}; forcing a bounded base-copy resync.`
-																: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purge bound unknown, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
+																: predatesTracking
+																	? `Peer ${remoteNodeName} requested replication of database ${databaseName} from before ${new Date(purgeBounds.trackedFrom).toISOString()}, where this node began accounting for its transaction-log history; forcing a bounded base-copy resync.`
+																	: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purge bound unknown, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
 													);
 													currentSequenceId = 0;
 												}

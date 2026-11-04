@@ -13,6 +13,7 @@ import {
 	shouldForceBaseCopyForRetention,
 	purgeBoundLogNames,
 	replayStartUnderPurge,
+	predatesPurgeTracking,
 	ORIGIN_CURSOR_OVERLAP_MS,
 } from '#src/replication/replicationConnection';
 
@@ -155,5 +156,27 @@ describe('replayStartUnderPurge', () => {
 			start: 5000,
 			bound: undefined,
 		});
+	});
+});
+
+describe('predatesPurgeTracking', () => {
+	const TRACKED_FROM = 5000;
+	const subscriptions = (own, proxied) => [
+		{ name: 'relay', startTime: own },
+		{ name: 'proxied', startTime: proxied },
+	];
+
+	it("compares the follower's start on this node", () => {
+		expect(predatesPurgeTracking(subscriptions(5000, 6000), 'relay', 5000, TRACKED_FROM)).to.equal(false);
+		expect(predatesPurgeTracking(subscriptions(4999, 6000), 'relay', 4999, TRACKED_FROM)).to.equal(true);
+	});
+
+	it("ignores a listed proxied origin's older start, which is that origin's key", () => {
+		expect(predatesPurgeTracking(subscriptions(5000, 100), 'relay', 100, TRACKED_FROM)).to.equal(false);
+	});
+
+	it('falls back to the merged start when the follower does not list this node', () => {
+		expect(predatesPurgeTracking([{ name: 'proxied', startTime: 100 }], 'relay', 100, TRACKED_FROM)).to.equal(true);
+		expect(predatesPurgeTracking([{ name: 'proxied', startTime: 6000 }], 'relay', 6000, TRACKED_FROM)).to.equal(false);
 	});
 });
