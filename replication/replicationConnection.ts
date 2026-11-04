@@ -744,12 +744,10 @@ export function replayStartUnderPurge(
 /**
  * Did the follower certify its floor-only start under another copy of this database (a restore or replacement)?
  * Then its position names nothing here, and the purge bounds, which describe this copy's own prunes, cannot vouch
- * for it. A start with no generation (an ordinary resume, or a receiver that predates the field) says nothing.
+ * for it. A store with no established generation vouches for no position (core `getDatabaseGeneration`).
  */
 export function floorFromAnotherGeneration(auditStore: any, floorGeneration: unknown): boolean {
-	if (typeof floorGeneration !== 'string') return false;
-	const generation = getDatabaseGeneration(auditStore)?.id;
-	return generation !== undefined && generation !== floorGeneration;
+	return typeof floorGeneration === 'string' && getDatabaseGeneration(auditStore)?.id !== floorGeneration;
 }
 
 // Integration tests force the retention copy for the named databases to exercise what a receiver does with
@@ -10082,6 +10080,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purge bound unknown, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
 													);
 													currentSequenceId = 0;
+													// the copy filters rows at or below the start, which holds only for a position taken from this copy
+													if (otherGeneration) {
+														const ownId = getThisNodeId(auditStore);
+														const own = subscribedNodeIds[ownId];
+														if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
+													}
 												}
 											}
 											if (currentSequenceId === 0) {

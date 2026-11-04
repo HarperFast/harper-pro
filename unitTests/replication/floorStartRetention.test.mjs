@@ -108,6 +108,10 @@ describe('a floor-only start below the sender’s first log entry', function () 
 			for (const floorGeneration of [undefined, 7, { id: generation }])
 				assert.equal(floorFromAnotherGeneration(auditStore, floorGeneration), false);
 		});
+
+		it('is true while this store has established no generation', () => {
+			assert.equal(floorFromAnotherGeneration({}, generation), true);
+		});
 	});
 
 	async function subscribe(database, startTime, subscription, extra = [], originCursors) {
@@ -163,6 +167,12 @@ describe('a floor-only start below the sender’s first log entry', function () 
 
 		it('forces a base copy for the same start under another generation', async () => {
 			await copies(await subscribe(database, floorStart, { floorGeneration: 'f'.repeat(32) }));
+		});
+
+		it('copies the rows at or below a start taken from another generation', async () => {
+			const socket = await subscribe(database, oldest + 60_000, { floorGeneration: 'f'.repeat(32) });
+			await copies(socket);
+			await until(() => rows(socket).includes('first'), 'a row below the follower’s start is copied');
 		});
 
 		it('forces a base copy for another generation even when an earlier subscription would resume', async () => {
