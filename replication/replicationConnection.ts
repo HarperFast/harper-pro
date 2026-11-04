@@ -9060,18 +9060,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// thread, and this connection's initial TABLE_FIXED_STRUCTURE must reflect
 							// what's actually in LMDB right now. After this, HAS_STRUCTURE_UPDATE on
 							// subsequent audit records keeps the encoder in sync, since every
-							// typed-struct addition produces a flagged audit record.
+							// typed-struct addition produces a flagged audit record. A shared-structure save that
+							// throws resets this encoder without an audit record; a pack would reload it, but this
+							// path forwards stored bytes, and the peer's decoder is replaced by what is sent below.
 							if (
 								!tableEntry.structuresLoaded ||
 								auditRecord.extendedType & HAS_STRUCTURE_UPDATE ||
 								!encoder.typedStructs ||
+								encoder.structures.uninitialized ||
 								auditRecord.structureVersion > encoder.typedStructs.length + encoder.structures.length
 							) {
-								tableEntry.structuresLoaded = true;
 								// there is a structure update, we need to reload the structure from storage.
 								// this is copied from msgpackr's struct, may want to expose as public method
 								encoder._mergeStructures(encoder.getStructures());
 								if (encoder.typedStructs) encoder.lastTypedStructuresLength = encoder.typedStructs.length;
+								tableEntry.structuresLoaded = true;
 							}
 							const timeRange = subscribedNodeIds?.[subscriptionNodeId];
 							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
@@ -9249,10 +9252,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!invalidationEntry && encodeCopy) wireRecord.encoded = encodeCopy();
 							const typedStructs = encoder.typedStructs;
 							const structures = encoder.structures;
-							if (
-								typedStructs?.length != tableEntry.typed_length ||
-								structures?.length != tableEntry.structure_length
-							) {
+							if (typedStructs?.length != tableEntry.typed_length || structures.length != tableEntry.structure_length) {
 								tableEntry.typed_length = typedStructs?.length;
 								tableEntry.structure_length = structures.length;
 								// the structure used for encoding records has changed, so we need to send the new structure
