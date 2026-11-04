@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// The packages core's own startupDependencies test defers, plus the full lodash build.
+// Pro defers these packages. Ajv is loaded by schema-bearing operation registrations on each thread.
 const DEFERRED_PACKAGES = [
 	'lmdb',
 	'pkijs',

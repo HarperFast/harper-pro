@@ -43,6 +43,7 @@ suite('Pro operation input schemas through MCP', (ctx) => {
 	test('default glob matches publish their explicitly registered schemas', async () => {
 		const response = await mcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
 		const body = await response.json();
+		assert.ok(body.result.tools.some((tool) => tool.name === 'describe_all'));
 		for (const name of ['list_certificates', 'list_ssh_keys', 'list_waf_rules']) {
 			const tool = body.result.tools.find((tool) => tool.name === name);
 			assert.ok(tool, `${name} must remain discoverable without a literal allow opt-in`);
@@ -67,7 +68,11 @@ suite('Pro operation input schemas through MCP', (ctx) => {
 	test('declared schemas do not expose the tools to a non-super user', async () => {
 		const user = { username: 'schema_restricted_user', password: 'Abc1234!' };
 		for (const body of [
-			{ operation: 'add_role', role: 'schema_restricted_role', permission: { super_user: false } },
+			{
+				operation: 'add_role',
+				role: 'schema_restricted_role',
+				permission: { super_user: false, operations: ['describe_all'] },
+			},
 			{ operation: 'add_user', ...user, role: 'schema_restricted_role', active: true },
 		]) {
 			const { username, password } = ctx.harper.admin;
@@ -97,6 +102,7 @@ suite('Pro operation input schemas through MCP', (ctx) => {
 		await init.body?.cancel();
 		const response = await mcp({ jsonrpc: '2.0', id: 7, method: 'tools/list' }, restrictedSession, user);
 		const body = await response.json();
+		assert.ok(body.result.tools.some((tool) => tool.name === 'describe_all'));
 		for (const name of ['list_certificates', 'list_ssh_keys', 'list_waf_rules']) {
 			assert.equal(
 				body.result.tools.some((tool) => tool.name === name),
