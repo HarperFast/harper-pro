@@ -165,8 +165,8 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 
 	test('both nodes restart after an idle interval longer than retention and replicate with no base copy', async () => {
 		await delay(IDLE_MS);
-		const marks = await Promise.all(nodes.map(logMark));
 		for (const node of nodes) await killHarper({ harper: node });
+		const marks = await Promise.all(nodes.map(logMark));
 		for (let i = 0; i < 2; i++) await start(i);
 		await ready();
 		await waitForCondition(
@@ -186,8 +186,8 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 	});
 
 	test("an owner's refusal of a forced copy is logged once, reported, and backed off", async () => {
-		const marks = await Promise.all(nodes.map(logMark));
 		await killHarper({ harper: nodes[0] });
+		const marks = await Promise.all(nodes.map(logMark));
 		await start(0, { HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: 'data' });
 		const stuck = await waitForCondition(
 			async (signal) => {

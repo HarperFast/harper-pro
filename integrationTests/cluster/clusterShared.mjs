@@ -110,32 +110,26 @@ export async function readLog(node) {
 const hdbLogPath = (node) => join(node.logDir ?? join(node.dataRootDir, 'log'), 'hdb.log');
 
 /**
- * Mark the end of a node's current hdb.log, for `readLogSince`. A bare `readLog(node).length` is an offset
- * into one file: with `HARPER_INTEGRATION_TEST_LOG_DIR` set, every start opens a new log directory, so after
- * a restart that offset points past the end of a file it never described.
+ * Mark the end of a stopped node's hdb.log, for `readLogSince`. An offset means something only in the file it was
+ * measured on, and with `HARPER_INTEGRATION_TEST_LOG_DIR` set every start opens a new log directory.
  */
 export async function logMark(node) {
 	const path = hdbLogPath(node);
-	return { path, length: (await readLogFile(path)).length };
+	return { path, length: (await readFile(path, 'utf8')).length };
 }
 
 /**
- * The log text written since `mark`: the rest of the marked file, plus the node's current log when a restart
- * moved it to a different file.
+ * What the node's current log holds past `mark`: the rest of the marked file when the node still logs there, else the
+ * whole new file. Assumes one start since the mark and an append-only log; a missing or shrunken log throws rather
+ * than reading as empty, so an assertion that nothing was logged cannot pass without having seen the log.
  */
 export async function readLogSince(node, mark) {
-	const text = (await readLogFile(mark.path)).slice(mark.length);
-	const current = hdbLogPath(node);
-	return current === mark.path ? text : text + (await readLogFile(current));
-}
-
-async function readLogFile(path) {
-	try {
-		return await readFile(path, 'utf8');
-	} catch (err) {
-		if (err.code !== 'ENOENT') throw err;
-		return '';
-	}
+	const path = hdbLogPath(node);
+	const text = await readFile(path, 'utf8');
+	if (path !== mark.path) return text;
+	if (text.length < mark.length)
+		throw new Error(`${path} is ${text.length} characters, shorter than its mark at ${mark.length}`);
+	return text.slice(mark.length);
 }
 
 /**

@@ -379,28 +379,37 @@ describe('cluster test helpers — log marks', () => {
 		const mark = await logMark(node);
 		await writeLog(second, 'forced\n');
 		node.logDir = second;
-		// the offset into the first file lies past the end of the second, which a bare slice would turn into ''
+		// the offset into the first file lies past the end of the second, which a bare slice turns into ''
 		expect((await readLog(node)).slice(mark.length)).to.equal('');
 		expect(await readLogSince(node, mark)).to.equal('forced\n');
 	});
 
-	it('keeps what the old log gained between the mark and the restart', async () => {
-		const first = join(root, 'first');
-		const second = join(root, 'second');
-		const node = { dataRootDir: root, logDir: first };
-		await writeLog(first, 'one\n');
+	it('fails rather than reading a missing log as empty', async () => {
+		const node = { dataRootDir: root, logDir: join(root, 'first') };
+		await writeLog(node.logDir, 'one\n');
 		const mark = await logMark(node);
-		await writeLog(first, 'one\ntwo\n');
-		await writeLog(second, 'three\n');
-		node.logDir = second;
-		expect(await readLogSince(node, mark)).to.equal('two\nthree\n');
+		node.logDir = join(root, 'second');
+		const error = await readLogSince(node, mark).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.code).to.equal('ENOENT');
+		const unmarked = await logMark({ dataRootDir: join(root, 'nowhere') }).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(unmarked?.code).to.equal('ENOENT');
 	});
 
-	it('treats a log that does not exist yet as empty', async () => {
+	it('fails when the marked log is now shorter than its mark', async () => {
 		const node = { dataRootDir: root };
+		await writeLog(join(root, 'log'), 'a long record\n');
 		const mark = await logMark(node);
-		expect(mark.length).to.equal(0);
-		await writeLog(join(root, 'log'), 'first\n');
-		expect(await readLogSince(node, mark)).to.equal('first\n');
+		await writeLog(join(root, 'log'), 'forced\n');
+		const error = await readLogSince(node, mark).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.message).to.match(/shorter than its mark/);
 	});
 });
