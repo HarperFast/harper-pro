@@ -100,10 +100,10 @@ import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 import './recordLockApply.ts';
 
-// Slots 29..31 of the 32-slot per-(database, peer) status buffer (`getReplicationSharedStatus`);
+// Slots 29..31 of the per-(database, peer) status buffer (`getReplicationSharedStatus`);
 // 0..28 are taken (13..28 by the R4 fire-classification counters, harper-pro#431). 29 is the
 // capability support flag; 30 is the home-map digest agreement tri-state; 31 is the exact
-// advertised level (below). The buffer is full — grow `REPLICATION_SHARED_STATUS_SLOTS` for the next.
+// advertised level (below).
 export const RECORD_LOCKS_CAPABILITY_POSITION = 29;
 export const LOCK_CAPABILITY_UNKNOWN = 0;
 export const LOCK_CAPABILITY_UNSUPPORTED = 1;

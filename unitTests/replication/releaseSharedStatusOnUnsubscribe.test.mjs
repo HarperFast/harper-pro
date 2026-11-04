@@ -19,6 +19,7 @@ import {
 	deriveConnectionTruth,
 } from '#src/replication/replicationConnection';
 import { REPLICATION_SHARED_STATUS_SLOTS } from '#src/replication/knownNodes';
+import { CopyStallTracker, STUCK_COPY_HELD, STUCK_COPY_STATE_POSITION } from '#src/replication/copyStall';
 
 const NOW = 1_700_000_000_000;
 
@@ -55,6 +56,19 @@ describe('releaseSharedStatusOnUnsubscribe', () => {
 			shared[LAST_LIVENESS_TIME_POSITION] = NOW;
 		}
 		expect(deriveConnectionTruth(shared, NOW).connected).to.equal(false);
+	});
+
+	it("a departed leg's stall tracker cannot clear the report of the membership that replaced it", () => {
+		const { connection, shared } = departingConnection();
+		connection.copyStall = new CopyStallTracker(2);
+		connection.copyStall.attachStatus(shared);
+		connection.copyStall.noteCopyStart('k');
+		connection.copyStall.noteCopyStart('k');
+		releaseSharedStatusOnUnsubscribe(connection);
+
+		shared[STUCK_COPY_STATE_POSITION] = STUCK_COPY_HELD;
+		connection.copyStall.noteDurableProgress();
+		expect(shared[STUCK_COPY_STATE_POSITION]).to.equal(STUCK_COPY_HELD);
 	});
 
 	it('a late close cannot put a stale 1008 on the membership that replaced it', () => {

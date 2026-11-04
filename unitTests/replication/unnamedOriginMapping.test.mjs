@@ -85,6 +85,37 @@ describe('unnamed origins in the replication id map', () => {
 		assert.strictEqual(taken.get(5), getIdOfRemoteNode(ownName, auditStore));
 	});
 
+	for (const order of ['displaced first', 'displaced last']) {
+		it(`gives two derived names distinct ids when one's mint takes the other's own id (${order})`, () => {
+			const auditStore = freshAuditStore();
+			const peer = getIdOfRemoteNode('peer-a', auditStore);
+			const displaced = unnamedOriginName(getThisNodeName(), peer);
+			const next = unnamedOriginName(getThisNodeName(), peer + 1);
+			const entries = [
+				[displaced, 5],
+				[next, 6],
+			];
+			const map = Object.fromEntries(order === 'displaced first' ? entries : entries.reverse());
+			const translated = translateIdMap(map, auditStore);
+			assert.notStrictEqual(translated.get(5), peer);
+			assert.notStrictEqual(translated.get(5), translated.get(6));
+			const sent = Object.values(exportIdMappingWithUnnamed(auditStore, []));
+			assert.strictEqual(new Set(sent).size, sent.length, 'no two names are sent with one id');
+		});
+	}
+
+	it('leaves a stored derived name where it is when another derived name holds its own id', () => {
+		const auditStore = freshAuditStore();
+		const peer = getIdOfRemoteNode('peer-a', auditStore);
+		const displaced = unnamedOriginName(getThisNodeName(), peer);
+		const heldOut = unnamedOriginName(getThisNodeName(), peer + 1);
+		getIdOfRemoteNode(displaced, auditStore);
+		const storedId = getIdOfRemoteNode(heldOut, auditStore);
+		const sent = exportIdMappingWithUnnamed(auditStore, []);
+		assert.strictEqual(sent[displaced], peer + 1);
+		assert.strictEqual(sent[heldOut], storedId, 'its own id belongs to the displaced name');
+	});
+
 	it('does not map home onto an id the same map gives a new peer', () => {
 		const auditStore = freshAuditStore();
 		const translated = translateIdMap({ [unnamedOriginName(getThisNodeName(), 1)]: 5, 'peer-b': 6 }, auditStore);

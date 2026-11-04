@@ -18,7 +18,7 @@ import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { killHarper, startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
+import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 
 const TEST_DIR = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 'dist', 'bin', 'harper.js');
@@ -46,6 +46,7 @@ async function startNode(node) {
 
 async function restartNode(node) {
 	await killHarper({ harper: node });
+	await stopNodeProcess(node);
 	return startNode(node);
 }
 

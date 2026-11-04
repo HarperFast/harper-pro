@@ -66,7 +66,6 @@ export class CopyStallTracker {
 		if (startKey !== this.startKey) {
 			this.attempts = 1;
 			this.startKey = startKey;
-			// a hold reported or escalated for another position no longer applies
 			return this.state || this.hold.attempts ? this.clear() : undefined;
 		}
 		this.attempts++;
@@ -94,11 +93,7 @@ export class CopyStallTracker {
 		return { from, to: 0, count: 0, quiet: true };
 	}
 
-	/**
-	 * The leg's socket closed: how long its reconnect must wait, 0 for the ordinary schedule. A session that
-	 * reached the `limit`-th attempt from one position holds the leg on a backoff of its own that doubles per
-	 * held failure.
-	 */
+	/** The leg's socket closed: how long its reconnect must wait, 0 for the ordinary schedule. */
 	noteClosed(): { holdMs: number; transition?: StuckCopyTransition } {
 		const exhausted = this.sessionStarted && this.attempts >= this.limit;
 		this.sessionStarted = false;

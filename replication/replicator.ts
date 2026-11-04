@@ -798,6 +798,7 @@ export function releaseSharedStatusOnUnsubscribe(connection) {
 	if (!connection) return;
 	connection.nodeSubscriptions = undefined;
 	connection.sharedStatus = undefined;
+	connection.copyStall?.attachStatus(undefined);
 }
 
 // Force a wedged-but-connected subscription to tear down and reconnect. Unlike unsubscribeFromNode this

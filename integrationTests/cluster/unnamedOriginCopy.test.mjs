@@ -22,7 +22,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { unpack } from 'msgpackr';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, waitForCondition, readLog } from './clusterShared.mjs';
+import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition, readLog } from './clusterShared.mjs';
 
 const TEST_DIR = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 'dist', 'bin', 'harper.js');
@@ -129,6 +129,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			const copiesBefore = await copiesTo();
 
 			await killHarper({ harper: receiver });
+			await stopNodeProcess(receiver);
 			Object.assign(
 				receiver,
 				(

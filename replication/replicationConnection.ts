@@ -602,21 +602,34 @@ const COPY_APPLY_FAILURE_KEY_FOR_TEST = process.env.HARPER_TEST_COPY_APPLY_FAILU
  */
 function sentIdMapping(auditStore: any, thisNodeName: string): Record<string, number> {
 	const stored = exportIdMapping(auditStore);
-	const nodeIds = idsOfNodes(stored, thisNodeName);
+	const held = heldIds(stored, thisNodeName);
 	let mapping = stored;
 	for (const name in stored) {
 		const ownId = ownUnnamedOriginId(name, thisNodeName);
-		if (ownId === undefined || nodeIds.has(ownId) || stored[name] === ownId) continue;
+		if (ownId === undefined || held.has(ownId) || stored[name] === ownId) continue;
 		if (mapping === stored) mapping = { ...stored };
 		mapping[name] = ownId;
 	}
 	return mapping;
 }
 
-function idsOfNodes(nameToId: Record<string, number>, thisNodeName: string): Set<number> {
-	const ids = new Set<number>();
-	for (const name in nameToId) if (ownUnnamedOriginId(name, thisNodeName) === undefined) ids.add(nameToId[name]);
-	return ids;
+/**
+ * The ids no derived name can come home to: every node's, and the stored id of each derived name whose own id
+ * is held, since that name keeps it. Grows until stable, as a kept id can be another derived name's own id.
+ */
+function heldIds(nameToId: Record<string, number>, thisNodeName: string): Set<number> {
+	const held = new Set<number>();
+	for (const name in nameToId) if (ownUnnamedOriginId(name, thisNodeName) === undefined) held.add(nameToId[name]);
+	for (let grew = true; grew;) {
+		grew = false;
+		for (const name in nameToId) {
+			const ownId = ownUnnamedOriginId(name, thisNodeName);
+			if (ownId === undefined || !held.has(ownId) || held.has(nameToId[name])) continue;
+			held.add(nameToId[name]);
+			grew = true;
+		}
+	}
+	return held;
 }
 
 /**
@@ -658,13 +671,24 @@ export function translateIdMap(remoteMapping: Record<string, number>, auditStore
 	}
 	const translated = remoteToLocalNodeId(named ?? remoteMapping, auditStore);
 	if (!own) return translated;
-	// after the mint above, so a peer it just named cannot share the id
-	const nodeIds = idsOfNodes(exportIdMapping(auditStore), thisNodeName);
-	for (const [name, remoteId] of own) {
-		const ownId = ownUnnamedOriginId(name, thisNodeName);
-		translated.set(remoteId, nodeIds.has(ownId) ? getIdOfRemoteNode(name, auditStore) : ownId);
+	// After the mint above, so a peer it just named cannot share the id. A mint can take the id another name in
+	// this map would come home to, so every mint happens before any name is mapped home.
+	for (;;) {
+		const nameToId = exportIdMapping(auditStore);
+		const held = heldIds(nameToId, thisNodeName);
+		const displaced = own.find(
+			([name]) => nameToId[name] === undefined && held.has(ownUnnamedOriginId(name, thisNodeName))
+		);
+		if (displaced) {
+			getIdOfRemoteNode(displaced[0], auditStore);
+			continue;
+		}
+		for (const [name, remoteId] of own) {
+			const ownId = ownUnnamedOriginId(name, thisNodeName);
+			translated.set(remoteId, held.has(ownId) ? nameToId[name] : ownId);
+		}
+		return translated;
 	}
-	return translated;
 }
 
 export function hostnameFromNodeUrl(url: unknown): string | undefined {
@@ -3497,7 +3521,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.copyStall.noteOpened();
 		if (!this.copyStall.state && !this.copyStall.attempts) return;
 		this.quietSessionTimer = setTimeout(() => {
-			if (this.socket !== socket || !this.isConnected) return;
+			if (this.socket !== socket || !this.isConnected || this.nodeSubscriptions === undefined) return;
 			this.reportStuckCopy(this.copyStall.noteSessionQuiet());
 		}, COPY_STALL_HOLD_MIN_MS);
 		this.quietSessionTimer.unref?.();
@@ -4692,16 +4716,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const persisted = dbisDB.put([Symbol.for('copyCursor'), nodeId], cursor);
 		const credit = () => noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
 		if (persisted?.then)
-			persisted.then(credit, (error: unknown) =>
-				logger.warn?.(connectionId, 'failed to persist the copy cursor', error)
-			);
+			persisted
+				.then(credit)
+				.catch((error: unknown) => logger.warn?.(connectionId, 'failed to persist the copy cursor', error));
 		else credit();
 	}
 	function removeFinishedCopyCursor(nodeId: number) {
 		const removed = getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), nodeId]);
 		const credit = () => noteCopyStall((tracker) => tracker.noteDurableProgress());
 		if (removed?.then)
-			removed.then(credit, (error: unknown) => logger.warn?.(connectionId, 'failed to remove the copy cursor', error));
+			removed
+				.then(credit)
+				.catch((error: unknown) => logger.warn?.(connectionId, 'failed to remove the copy cursor', error));
 		else credit();
 	}
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
@@ -6308,23 +6334,25 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// otherwise silently skip the purged entries or replay an unbounded history (harper#1114).
 										if (currentSequenceId > 0) {
 											const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
-											let oldestRetainedTime: number | undefined;
-											// Mirror the replay scope below (single log, or all non-excluded logs) and take the
-											// first (oldest) entry; getRange yields ascending by audit-log key. Use the same key
-											// basis as the replay loop (`txnLogKey`) and retention cleanup.
-											for (const entry of auditStore.getRange({
-												start: 1,
-												log: excludedNodes ? undefined : oldestLogName,
-												excludeLogs: excludedNodes,
-												snapshot: false,
-											})) {
-												oldestRetainedTime = entry.txnLogKey;
-												break;
-											}
 											const purgeBound = getLogPurgeBound(
 												auditStore,
 												purgeBoundLogNames(auditStore, excludedNodes ? undefined : oldestLogName, excludedNodes)
 											);
+											let oldestRetainedTime: number | undefined;
+											// Mirror the replay scope below (single log, or all non-excluded logs) and take the
+											// first (oldest) entry; getRange yields ascending by audit-log key. Use the same key
+											// basis as the replay loop (`txnLogKey`) and retention cleanup.
+											if (purgeBound === undefined) {
+												for (const entry of auditStore.getRange({
+													start: 1,
+													log: excludedNodes ? undefined : oldestLogName,
+													excludeLogs: excludedNodes,
+													snapshot: false,
+												})) {
+													oldestRetainedTime = entry.txnLogKey;
+													break;
+												}
+											}
 											if (
 												purgeBound === undefined
 													? shouldForceBaseCopyForRetention(
@@ -6971,7 +6999,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					);
 					if (
 						!(await recordReplicationHole(
-							remoteShortIdToLocalId.get(auditRecord.nodeId),
+							translateOrigin(auditRecord.nodeId),
 							tableDecoder.name,
 							'table excluded by the receive route'
 						))
@@ -6994,7 +7022,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					);
 					if (
 						!(await recordReplicationHole(
-							remoteShortIdToLocalId.get(auditRecord.nodeId),
+							translateOrigin(auditRecord.nodeId),
 							tableDecoder?.name ?? ANY_TABLE,
 							'local-only record forwarded by the peer'
 						))
@@ -7027,7 +7055,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					(await isDurableIdentityTie(
 						readLocalEntry(tableDecoder, id),
 						auditRecord.version,
-						remoteShortIdToLocalId?.get(auditRecord.nodeId),
+						translateOrigin(auditRecord.nodeId),
 						true
 					))
 				) {
