@@ -752,9 +752,8 @@ export function floorFromAnotherGeneration(auditStore: any, floorGeneration: unk
 }
 
 /**
- * Whether the follower's position on this node predates where its purge record began accounting. Compared from
- * the follower's start for this node: a listed proxied origin's start is that origin's key, which can predate this
- * node with nothing missing, and it only reaches the merged start.
+ * Compared from the follower's start for this node: a listed proxied origin's start is that origin's key, which can
+ * predate this node with nothing missing, and it only reaches the merged start.
  */
 export function predatesPurgeTracking(
 	subscriptions: { name: string; startTime?: number }[],
@@ -10057,12 +10056,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													excludedNodes ? undefined : oldestLogName,
 													excludedNodes
 												);
-												// LMDB has one bound for every name; every bound carries the epoch, which an empty scope would drop
+												// LMDB has one bound for every name, and an empty scope would drop a prune's bound on every log
 												const purgeScope = scopedLogs?.length ? scopedLogs : [oldestLogName];
-												// both reads or neither: a store that cannot say where tracking began takes the time-based rule
-												const trackedFrom = getLogPurgeTrackedFrom(auditStore);
-												const purgeBounds =
-													trackedFrom === undefined ? undefined : getLogPurgeBounds(auditStore, purgeScope);
+												// read second: a prune landing between the reads can only raise it, which errs toward a copy
+												const readBounds = getLogPurgeBounds(auditStore, purgeScope);
+												const trackedFrom = readBounds && getLogPurgeTrackedFrom(auditStore);
+												const purgeBounds = trackedFrom === undefined ? undefined : readBounds;
 												// a log holding another id's entries than its name is sent with replays from the merged start
 												const relabeledLogs = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
 												const comparedFloors = relabeledLogs
