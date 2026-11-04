@@ -20,6 +20,7 @@ import {
 	readConnectionTruth,
 	readFireCounters,
 } from './replicationConnection.ts';
+import { readStuckCopy } from './copyStall.ts';
 import '../core/server/serverHelpers/serverUtilities.ts';
 
 // Keyed by request id: the main thread's answer takes a bounded fan-out, so two cluster_status calls on
@@ -127,6 +128,7 @@ export function applySharedStatus(socket, replicationSharedStatus: Float64Array)
 	// problem). This is the evidence the later watchdog-demotion decision is meant to rest on; nothing
 	// in the recovery paths reads it. Omitted entirely for a link where nothing has ever fired.
 	socket.recoveryFires = readFireCounters(replicationSharedStatus);
+	socket.stuckCopy = readStuckCopy(replicationSharedStatus);
 }
 
 function asDate(date) {
