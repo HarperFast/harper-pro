@@ -2,9 +2,9 @@ import { createBackoff, type Backoff } from './backoff.ts';
 
 // Shared-status slots (`REPLICATION_SHARED_STATUS_SLOTS` in knownNodes.ts); since and retry-at are epoch ms.
 export const STUCK_COPY_STATE_POSITION = 32;
-export const STUCK_COPY_COUNT_POSITION = 33;
-export const STUCK_COPY_SINCE_POSITION = 34;
-export const STUCK_COPY_RETRY_AT_POSITION = 35;
+const STUCK_COPY_COUNT_POSITION = 33;
+const STUCK_COPY_SINCE_POSITION = 34;
+const STUCK_COPY_RETRY_AT_POSITION = 35;
 
 export const STUCK_COPY_RETRYING = 1;
 export const STUCK_COPY_HELD = 2;
