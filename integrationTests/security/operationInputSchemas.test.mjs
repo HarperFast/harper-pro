@@ -48,6 +48,8 @@ suite('Pro operation input schemas through MCP', (ctx) => {
 			const tool = body.result.tools.find((tool) => tool.name === name);
 			assert.ok(tool, `${name} must remain discoverable without a literal allow opt-in`);
 			assert.deepEqual(tool.inputSchema, { type: 'object', properties: {} });
+			assert.equal(tool.annotations.readOnlyHint, true);
+			assert.notEqual(tool.annotations.destructiveHint, true);
 		}
 	});
 

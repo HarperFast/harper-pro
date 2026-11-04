@@ -433,6 +433,7 @@ server.registerOperation?.({
 
 server.registerOperation?.({
 	name: 'list_certificates',
+	readOnly: true,
 	inputSchema: { type: 'object', properties: {} },
 	execute: listCertificates,
 	httpMethod: 'GET',

@@ -212,6 +212,7 @@ export function startOnMainThread(options: WafComponentOptions) {
 	options.server.registerOperation?.({ name: 'drop_waf_rule', execute: operations.dropWafRule, httpMethod: 'POST' });
 	options.server.registerOperation?.({
 		name: 'list_waf_rules',
+		readOnly: true,
 		execute: operations.listWafRules,
 		httpMethod: 'GET',
 		inputSchema: { type: 'object', properties: {} },

@@ -894,6 +894,7 @@ server.registerOperation?.({
 
 server.registerOperation?.({
 	name: 'list_ssh_keys',
+	readOnly: true,
 	inputSchema: { type: 'object', properties: {} },
 	execute: listSSHKeys,
 	httpMethod: 'GET',
