@@ -33,7 +33,7 @@ suite('Pro operation input schemas through MCP', (ctx) => {
 		});
 		sessionId = response.headers.get('mcp-session-id');
 		assert.ok(sessionId);
-		await response.body?.cancel();
+		await response.body.cancel();
 	});
 
 	after(async () => {
@@ -101,7 +101,7 @@ suite('Pro operation input schemas through MCP', (ctx) => {
 		);
 		const restrictedSession = init.headers.get('mcp-session-id');
 		assert.ok(restrictedSession);
-		await init.body?.cancel();
+		await init.body.cancel();
 		const response = await mcp({ jsonrpc: '2.0', id: 7, method: 'tools/list' }, restrictedSession, user);
 		const body = await response.json();
 		assert.ok(body.result.tools.some((tool) => tool.name === 'describe_all'));
