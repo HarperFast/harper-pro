@@ -371,6 +371,12 @@ describe('cluster test helpers — log marks', () => {
 		expect(await readLogSince(node, mark)).to.equal('after\n');
 	});
 
+	it('uses the data root log when the node has no log directory', async () => {
+		const node = { dataRootDir: root, logDir: '' };
+		await writeLog(join(root, 'log'), 'one\n');
+		expect((await logMark(node)).path).to.equal(join(root, 'log', 'hdb.log'));
+	});
+
 	it('reads the whole new log when a restart moved the node to a new log directory', async () => {
 		const first = join(root, 'first');
 		const second = join(root, 'second');
