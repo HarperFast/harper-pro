@@ -1,6 +1,4 @@
 import { equal } from 'node:assert';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { teardownHarper } from '@harperfast/integration-testing';
 
@@ -94,6 +92,8 @@ export function concurrent(task, concurrency = 20) {
  * recent lines can filter by timestamp themselves.
  */
 export async function readLog(node) {
+	const { readFile } = await import('node:fs/promises');
+	const { join } = await import('node:path');
 	const candidates = [];
 	if (node.logDir) candidates.push(join(node.logDir, 'hdb.log'));
 	if (node.dataRootDir) candidates.push(join(node.dataRootDir, 'log', 'hdb.log'));
@@ -107,15 +107,19 @@ export async function readLog(node) {
 	return '';
 }
 
-const hdbLogPath = (node) => join(node.logDir ?? join(node.dataRootDir, 'log'), 'hdb.log');
+async function hdbLogPath(node) {
+	const { join } = await import('node:path');
+	return join(node.logDir ?? join(node.dataRootDir, 'log'), 'hdb.log');
+}
 
 /**
  * Mark the end of a node's hdb.log, for `readLogSince`. Take it before the event under test; an offset only means
  * something in the file it was measured on, and with `HARPER_INTEGRATION_TEST_LOG_DIR` set each start opens a new
- * log directory.
+ * log directory. Unlike `readLog`, there is no fallback to another directory: the node's own log must exist.
  */
 export async function logMark(node) {
-	const path = hdbLogPath(node);
+	const { readFile } = await import('node:fs/promises');
+	const path = await hdbLogPath(node);
 	return { path, length: (await readFile(path, 'utf8')).length };
 }
 
@@ -124,7 +128,8 @@ export async function logMark(node) {
  * missing or shorter log throws, so an assertion that nothing was logged cannot pass without having seen the log.
  */
 export async function readLogSince(node, mark) {
-	const path = hdbLogPath(node);
+	const { readFile } = await import('node:fs/promises');
+	const path = await hdbLogPath(node);
 	const text = await readFile(path, 'utf8');
 	if (path !== mark.path) return text;
 	if (text.length < mark.length)
@@ -144,6 +149,8 @@ export async function readLogSince(node, mark) {
  * @returns {Promise<number|undefined>}
  */
 export async function readNodePid(node) {
+	const { readFile } = await import('node:fs/promises');
+	const { join } = await import('node:path');
 	if (!node.dataRootDir) throw new Error('node has no dataRootDir; cannot locate its pid file');
 	let contents;
 	try {
