@@ -741,6 +741,15 @@ export function replayStartUnderPurge(
 	return undefined;
 }
 
+/**
+ * Did the follower certify its floor-only start under another copy of this database (a restore or replacement)?
+ * Then its position names nothing here, and the purge bounds, which describe this copy's own prunes, cannot vouch
+ * for it.
+ */
+export function floorFromAnotherGeneration(auditStore: any, floorGeneration: unknown): boolean {
+	return typeof floorGeneration === 'string' && getDatabaseGeneration(auditStore)?.id !== floorGeneration;
+}
+
 // Integration tests force the retention copy for the named databases to exercise what a receiver does with
 // a copy it cannot accept (harper-pro#1231).
 const FORCE_RETENTION_COPY_DATABASES_FOR_TEST = process.env.HARPER_TEST_FORCE_RETENTION_COPY_DATABASES?.split(',');
@@ -9746,6 +9755,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// off this one copyResume); per-source resume would need a cursor per source.
 							if (subscription.copyResume) copyResume = subscription.copyResume;
 						}
+						const ownSubscription = nodeSubscriptions.find(({ name }) => name === getThisNodeName());
 
 						const sendSubscription = auditSubscription;
 						// A promise that never settles here would leave this WS ping-alive forever with the
@@ -10009,6 +10019,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// retain, the entries needed to catch up incrementally have been purged (retention is
 											// time-based). Upgrade to the bounded base-copy path instead of audit replay, which would
 											// otherwise silently skip the purged entries or replay an unbounded history (harper#1114).
+											const otherGeneration =
+												ownSubscription !== undefined &&
+												floorFromAnotherGeneration(auditStore, ownSubscription.floorGeneration);
 											if (currentSequenceId > 0) {
 												const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 												let oldestRetainedTime: number | undefined;
@@ -10044,6 +10057,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													: undefined;
 												if (
 													forceRetentionCopyForTest(databaseName) ||
+													otherGeneration ||
 													(!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
@@ -10059,12 +10073,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													const purgedThrough = (bound: number | undefined) =>
 														bound === undefined ? 'unknown' : new Date(bound).toISOString();
 													logger.warn?.(
-														purgedLog
-															? `Peer ${remoteNodeName} requested replication of database ${databaseName}, whose log ${purgedLog.log} it would replay from ${new Date(purgedLog.start).toISOString()}, under transaction-log history purged through ${purgedThrough(purgedLog.bound)}; forcing a bounded base-copy resync.`
-															: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purge bound unknown, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
+														otherGeneration
+															? `Peer ${remoteNodeName} requested replication of database ${databaseName} from a floor this node certified under another database generation; forcing a bounded base-copy resync.`
+															: purgedLog
+																? `Peer ${remoteNodeName} requested replication of database ${databaseName}, whose log ${purgedLog.log} it would replay from ${new Date(purgedLog.start).toISOString()}, under transaction-log history purged through ${purgedThrough(purgedLog.bound)}; forcing a bounded base-copy resync.`
+																: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purge bound unknown, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
 													);
 													currentSequenceId = 0;
 												}
+											}
+											// the copy filters rows at or below the start, which holds only for a position taken from this
+											// copy; another subscription's start of 0 can have made it a copy already
+											if (otherGeneration) {
+												const ownId = getThisNodeId(auditStore);
+												const own = subscribedNodeIds[ownId];
+												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
 											}
 											if (currentSequenceId === 0) {
 												copying = true;
@@ -13154,6 +13177,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					endTime: node.endTime,
 					shardingProjection,
 					copyResume, // present only when resuming an interrupted bulk copy
+					...(floorOnlyStart !== undefined && startTime === floorOnlyStart && { floorGeneration: floorOnlyGeneration }),
 				};
 			});
 		if (
