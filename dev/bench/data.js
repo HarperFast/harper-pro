@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793778908078,
+  "lastUpdate": 1793778911161,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -16356,6 +16356,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 63.46,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "7473cee99bf05330d30e3117a93da82b1f1d2344",
+          "message": "A failed shared-structure save no longer makes replication peers drop records (#1260)\n\n* Replication sender reloads shared structures after a failed save\n\nA shared-structure save that throws resets the thread's encoder and marks it\nuninitialized without writing an audit record. Audit forwarding sends stored\nbytes, so nothing packs and reloads it: the sender then advertised a dictionary\nwith no typed structures, the peer replaced its decoder, and it skipped those\nrecords permanently as undecodable. Reload on the mark before comparing lengths.\n\nDispatch-Task: harper-pro-sender-structures-uninitialized\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Reload structures flag only after the reload succeeds, trim test comments\n\nDispatch-Task: harper-pro-sender-structures-uninitialized\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Drop the optional chain on the send-side structure length check\n\nDispatch-Task: harper-pro-sender-structures-uninitialized\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-04T03:41:42Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/7473cee99bf05330d30e3117a93da82b1f1d2344"
+        },
+        "date": 1793778911061,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 11.02,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 11.62,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 13.92,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 24.83,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 25.57,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 24.12,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 47.67,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 101.37,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 67.55,
             "unit": "ms"
           }
         ]
