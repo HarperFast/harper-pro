@@ -20,3 +20,35 @@ describe('Pro operation schema dialect dependencies', () => {
 		});
 	}
 });
+
+describe('Pro shared Ajv HTTP validation', () => {
+	it('accepts valid bodies and rejects missing or invalid values through Fastify', async () => {
+		const { default: Fastify } = await import('fastify');
+		const app = Fastify();
+		try {
+			app.post(
+				'/schema-smoke',
+				{
+					schema: {
+						body: {
+							type: 'object',
+							required: ['value'],
+							properties: { value: { type: 'string', minLength: 2 } },
+						},
+					},
+				},
+				async (request) => request.body
+			);
+			for (const [payload, status] of [
+				[{ value: 'ok' }, 200],
+				[{}, 400],
+				[{ value: 'x' }, 400],
+			]) {
+				const response = await app.inject({ method: 'POST', url: '/schema-smoke', payload });
+				assert.equal(response.statusCode, status, response.body);
+			}
+		} finally {
+			await app.close();
+		}
+	});
+});
