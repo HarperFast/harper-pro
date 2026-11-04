@@ -99,6 +99,7 @@ import {
 	getDatabaseGeneration,
 	getAuditFloor,
 	getLogPurgeBounds,
+	getLogPurgeTrackedFrom,
 } from '../core/resources/auditStore.ts';
 import { isValidFloor, originFloorsDurable } from '../core/resources/originClosedFloor.ts';
 import {
@@ -10058,7 +10059,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												);
 												// LMDB has one bound for every name; every bound carries the epoch, which an empty scope would drop
 												const purgeScope = scopedLogs?.length ? scopedLogs : [oldestLogName];
-												const purgeBounds = getLogPurgeBounds(auditStore, purgeScope);
+												// both reads or neither: a store that cannot say where tracking began takes the time-based rule
+												const trackedFrom = getLogPurgeTrackedFrom(auditStore);
+												const purgeBounds =
+													trackedFrom === undefined ? undefined : getLogPurgeBounds(auditStore, purgeScope);
 												// a log holding another id's entries than its name is sent with replays from the merged start
 												const relabeledLogs = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
 												const comparedFloors = relabeledLogs
@@ -10066,17 +10070,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													: originFloors;
 												const purgedLog = purgeBounds
 													? replayStartUnderPurge(purgeScope, currentSequenceId, comparedFloors, (name) =>
-															purgeBounds.bounds.get(name)
+															purgeBounds.get(name)
 														)
 													: undefined;
 												const predatesTracking =
 													purgeBounds !== undefined &&
-													predatesPurgeTracking(
-														nodeSubscriptions,
-														getThisNodeName(),
-														currentSequenceId,
-														purgeBounds.trackedFrom
-													);
+													predatesPurgeTracking(nodeSubscriptions, getThisNodeName(), currentSequenceId, trackedFrom);
 												if (
 													forceRetentionCopyForTest(databaseName) ||
 													otherGeneration ||
@@ -10100,7 +10099,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															: purgedLog
 																? `Peer ${remoteNodeName} requested replication of database ${databaseName}, whose log ${purgedLog.log} it would replay from ${new Date(purgedLog.start).toISOString()}, under transaction-log history purged through ${purgedThrough(purgedLog.bound)}; forcing a bounded base-copy resync.`
 																: predatesTracking
-																	? `Peer ${remoteNodeName} requested replication of database ${databaseName} from before ${new Date(purgeBounds.trackedFrom).toISOString()}, where this node began accounting for its transaction-log history; forcing a bounded base-copy resync.`
+																	? `Peer ${remoteNodeName} requested replication of database ${databaseName} from before ${new Date(trackedFrom).toISOString()}, where this node began accounting for its transaction-log history; forcing a bounded base-copy resync.`
 																	: `Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, purge bound unknown, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
 													);
 													currentSequenceId = 0;
