@@ -15,6 +15,7 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert/strict';
 import { readdir } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition, readLog } from './clusterShared.mjs';
@@ -27,7 +28,7 @@ const FORCED_COPY = 'forcing a bounded base-copy resync';
 const SEED_ROWS = Array.from({ length: 10 }, (_, i) => `a-${i}`);
 const RELAY_RESTARTS = 3;
 
-function chain(ctx, auditRetention) {
+function chain(ctx, auditRetention, env) {
 	const nodes = {};
 
 	const options = (node) => ({
@@ -36,7 +37,7 @@ function chain(ctx, auditRetention) {
 			logging: { colors: false, stdStreams: false, console: true, level: 'debug', ...auditRetention },
 			replication: { port: node.hostname + ':9933', securePort: null, databases: ['data'] },
 		},
-		env: { HARPER_NO_FLUSH_ON_EXIT: true },
+		env,
 	});
 
 	async function start(node) {
@@ -171,20 +172,27 @@ suite('a relayed log the relay purged after the follower held it', { timeout: 60
 	});
 });
 
-// B writes nothing of its own here, so only its log for A can force the copy
 suite('a relayed log the relay purged before the follower received all of it', { timeout: 600_000 }, (ctx) => {
-	const { nodes, start, stop, upsert, arrive, forcedCopies, logPurged, build } = chain(ctx, RETENTION);
+	const FLOOR_INTERVAL_MS = 2000;
+	const { nodes, start, stop, upsert, arrive, forcedCopies, logPurged, build } = chain(ctx, RETENTION, {
+		HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS: String(FLOOR_INTERVAL_MS),
+	});
 
 	before(build);
 	after(() => stopAndTeardownNodes(Object.values(nodes)));
 
 	test('forces the copy that carries the write', async () => {
 		const { A, B, C } = nodes;
+		// C resumes from its certified floor for B: past B's own last write, only B's log for A can force the copy
+		await delay(5 * FLOOR_INTERVAL_MS);
 		await stop(C);
 		await start(A);
 		await upsert(A, 'missed');
 		await arrive(B, 'missed');
 		await stop(A);
+		// retention removes only flushed segments, and a write that arrived as a plain frame waits for a flush; exit is one
+		await stop(B);
+		await start(B);
 		await logPurged(B, A.hostname);
 		await start(C);
 		await arrive(C, 'missed');
