@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793692579316,
+  "lastUpdate": 1793778908078,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -7123,6 +7123,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2107.96,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "7473cee99bf05330d30e3117a93da82b1f1d2344",
+          "message": "A failed shared-structure save no longer makes replication peers drop records (#1260)\n\n* Replication sender reloads shared structures after a failed save\n\nA shared-structure save that throws resets the thread's encoder and marks it\nuninitialized without writing an audit record. Audit forwarding sends stored\nbytes, so nothing packs and reloads it: the sender then advertised a dictionary\nwith no typed structures, the peer replaced its decoder, and it skipped those\nrecords permanently as undecodable. Reload on the mark before comparing lengths.\n\nDispatch-Task: harper-pro-sender-structures-uninitialized\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Reload structures flag only after the reload succeeds, trim test comments\n\nDispatch-Task: harper-pro-sender-structures-uninitialized\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Drop the optional chain on the send-side structure length check\n\nDispatch-Task: harper-pro-sender-structures-uninitialized\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-04T03:41:42Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/7473cee99bf05330d30e3117a93da82b1f1d2344"
+        },
+        "date": 1793778906313,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 5442.33,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 17787.79,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 14150.72,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 5843.11,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 4066.53,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2021.39,
             "unit": "ops/sec"
           }
         ]
