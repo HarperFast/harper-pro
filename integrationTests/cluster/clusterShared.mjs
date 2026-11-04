@@ -1,4 +1,6 @@
 import { equal } from 'node:assert';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { teardownHarper } from '@harperfast/integration-testing';
 
@@ -92,8 +94,6 @@ export function concurrent(task, concurrency = 20) {
  * recent lines can filter by timestamp themselves.
  */
 export async function readLog(node) {
-	const { readFile } = await import('node:fs/promises');
-	const { join } = await import('node:path');
 	const candidates = [];
 	if (node.logDir) candidates.push(join(node.logDir, 'hdb.log'));
 	if (node.dataRootDir) candidates.push(join(node.dataRootDir, 'log', 'hdb.log'));
@@ -105,6 +105,37 @@ export async function readLog(node) {
 		}
 	}
 	return '';
+}
+
+const hdbLogPath = (node) => join(node.logDir ?? join(node.dataRootDir, 'log'), 'hdb.log');
+
+/**
+ * Mark the end of a node's current hdb.log, for `readLogSince`. A bare `readLog(node).length` is an offset
+ * into one file: with `HARPER_INTEGRATION_TEST_LOG_DIR` set, every start opens a new log directory, so after
+ * a restart that offset points past the end of a file it never described.
+ */
+export async function logMark(node) {
+	const path = hdbLogPath(node);
+	return { path, length: (await readLogFile(path)).length };
+}
+
+/**
+ * The log text written since `mark`: the rest of the marked file, plus the node's current log when a restart
+ * moved it to a different file.
+ */
+export async function readLogSince(node, mark) {
+	const text = (await readLogFile(mark.path)).slice(mark.length);
+	const current = hdbLogPath(node);
+	return current === mark.path ? text : text + (await readLogFile(current));
+}
+
+async function readLogFile(path) {
+	try {
+		return await readFile(path, 'utf8');
+	} catch (err) {
+		if (err.code !== 'ENOENT') throw err;
+		return '';
+	}
 }
 
 /**
@@ -119,8 +150,6 @@ export async function readLog(node) {
  * @returns {Promise<number|undefined>}
  */
 export async function readNodePid(node) {
-	const { readFile } = await import('node:fs/promises');
-	const { join } = await import('node:path');
 	if (!node.dataRootDir) throw new Error('node has no dataRootDir; cannot locate its pid file');
 	let contents;
 	try {
