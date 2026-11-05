@@ -1,11 +1,14 @@
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 
-// Commits only after the delay, so a confirmation cannot have arrived before the SIGTERM the test sends once the marker exists.
+// Commits only once the test, having sent SIGTERM, allows it, so no confirmation can arrive before the signal.
 export class SlowConfirmed extends tables.Confirmed {
 	static loadAsInstance = false;
 	static async put(target, record, context) {
 		writeFileSync(process.env.SHUTDOWN_TEST_ENTERED_FILE, 'entered');
-		await new Promise((resolve) => setTimeout(resolve, 1000));
+		const deadline = Date.now() + 2000;
+		while (!existsSync(process.env.SHUTDOWN_TEST_COMMIT_FILE) && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
 		return super.put(target, record, context);
 	}
 }

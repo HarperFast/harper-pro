@@ -144,7 +144,7 @@ async function stop(node, { crash = false } = {}) {
 	if (crash) {
 		const harperProcess = node.process;
 		ok(harperProcess.exitCode === null && harperProcess.signalCode === null, 'Harper exited before the kill');
-		// Harper's SIGTERM handler exits at once, so a graceMs of 0 would still be a clean stop.
+		// SIGTERM starts a clean stop, so SIGKILL goes first: graceMs: 0 alone would race it.
 		try {
 			process.kill(-harperProcess.pid, 'SIGKILL');
 		} catch {

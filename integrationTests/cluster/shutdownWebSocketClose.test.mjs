@@ -5,9 +5,10 @@
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { once } from 'node:events';
-import { cp, mkdtemp, readFile } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
 
@@ -22,10 +23,12 @@ for (const [layout, threads, replicationThreads] of [
 	suite(`stopping a node with a live peer (${layout})`, (ctx) => {
 		const contexts = [{ name: ctx.name }, { name: ctx.name }];
 		const nodes = () => contexts.map((context) => context.harper);
+		let parent;
 		let enteredFile;
+		let commitFile;
 		const start = (context) =>
 			startHarper(context, {
-				env: { SHUTDOWN_TEST_ENTERED_FILE: enteredFile },
+				env: { SHUTDOWN_TEST_ENTERED_FILE: enteredFile, SHUTDOWN_TEST_COMMIT_FILE: commitFile },
 				config: {
 					threads: { count: threads },
 					analytics: { aggregatePeriod: -1 },
@@ -54,10 +57,11 @@ for (const [layout, threads, replicationThreads] of [
 				{ description: 'both directions connected' }
 			);
 		before(async () => {
-			const parent = await mkdtemp(
+			parent = await mkdtemp(
 				join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'shutdown-websocket-close-')
 			);
 			enteredFile = join(parent, 'entered');
+			commitFile = join(parent, 'commit');
 			for (const context of contexts) {
 				context.harper = { hostname: await getNextAvailableLoopbackAddress() };
 				context.harper.dataRootDir = await mkdtemp(
@@ -78,7 +82,10 @@ for (const [layout, threads, replicationThreads] of [
 			});
 			await connected();
 		});
-		after(() => stopAndTeardownNodes(nodes()));
+		after(async () => {
+			await stopAndTeardownNodes(nodes());
+			await rm(parent, { recursive: true, force: true });
+		});
 
 		test('a write confirmed after SIGTERM still returns, reaches the peer, and the stop stays quick', async () => {
 			const [writer, peer] = nodes();
@@ -101,15 +108,17 @@ for (const [layout, threads, replicationThreads] of [
 						() => true,
 						() => false
 					),
-				{
-					description: 'the write is in flight',
-				}
+				{ pollMs: 50, description: 'the write is in flight' }
 			);
+			const exited = once(child, 'exit', { signal: AbortSignal.timeout(30_000) });
 			const signalledAt = Date.now();
 			child.kill('SIGTERM');
+			// Long enough for a thread that closes its replication sockets at its own drain to have done so.
+			await delay(300);
+			await writeFile(commitFile, 'commit');
 			const response = await pending;
 			assert.ok(response.status >= 200 && response.status < 300, `the confirmed write returned ${response.status}`);
-			await once(child, 'exit');
+			await exited;
 			const stopMs = Date.now() - signalledAt;
 			assert.equal(child.exitCode, 0);
 			assert.ok(stopMs < STOP_LIMIT_MS, `stop took ${stopMs} ms`);
