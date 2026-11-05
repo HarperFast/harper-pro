@@ -14,6 +14,9 @@ import {
 	waitForCondition,
 	waitForNewPid,
 	stopAndTeardownNodes,
+	readLog,
+	logMark,
+	readLogSince,
 } from '../../integrationTests/cluster/clusterShared.mjs';
 
 async function startStub(handler) {
@@ -343,5 +346,75 @@ describe('cluster test helpers — restart identity and teardown', () => {
 		expect(error.errors[0].code).to.equal('EISDIR');
 		expect(existsSync(brokenRoot)).to.equal(false);
 		expect(existsSync(healthyRoot)).to.equal(false);
+	});
+});
+
+describe('cluster test helpers — log marks', () => {
+	let root;
+	beforeEach(async () => {
+		root = await mkdtemp(join(tmpdir(), 'cluster-shared-'));
+	});
+	afterEach(async () => {
+		await rm(root, { recursive: true, force: true });
+	});
+
+	const writeLog = async (dir, text) => {
+		await mkdir(dir, { recursive: true });
+		await writeFile(join(dir, 'hdb.log'), text);
+	};
+
+	it('reads only what was appended to a log that kept its file across a restart', async () => {
+		const node = { dataRootDir: root };
+		await writeLog(join(root, 'log'), 'before\n');
+		const mark = await logMark(node);
+		await writeLog(join(root, 'log'), 'before\nafter\n');
+		expect(await readLogSince(node, mark)).to.equal('after\n');
+	});
+
+	it('uses the data root log when the node has no log directory', async () => {
+		const node = { dataRootDir: root, logDir: '' };
+		await writeLog(join(root, 'log'), 'one\n');
+		expect((await logMark(node)).path).to.equal(join(root, 'log', 'hdb.log'));
+	});
+
+	it('reads the whole new log when a restart moved the node to a new log directory', async () => {
+		const first = join(root, 'first');
+		const second = join(root, 'second');
+		const node = { dataRootDir: root, logDir: first };
+		await writeLog(first, 'a long record written before the restart\n');
+		const mark = await logMark(node);
+		await writeLog(second, 'forced\n');
+		node.logDir = second;
+		expect((await readLog(node)).slice(mark.length)).to.equal('');
+		expect(await readLogSince(node, mark)).to.equal('forced\n');
+	});
+
+	it('fails rather than reading a missing log as empty', async () => {
+		const node = { dataRootDir: root, logDir: join(root, 'first') };
+		await writeLog(node.logDir, 'one\n');
+		const mark = await logMark(node);
+		node.logDir = join(root, 'second');
+		const error = await readLogSince(node, mark).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.code).to.equal('ENOENT');
+		const unmarked = await logMark({ dataRootDir: join(root, 'nowhere') }).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(unmarked?.code).to.equal('ENOENT');
+	});
+
+	it('fails when the marked log is now shorter than its mark', async () => {
+		const node = { dataRootDir: root };
+		await writeLog(join(root, 'log'), 'a long record\n');
+		const mark = await logMark(node);
+		await writeLog(join(root, 'log'), 'forced\n');
+		const error = await readLogSince(node, mark).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.message).to.match(/shorter than its mark/);
 	});
 });

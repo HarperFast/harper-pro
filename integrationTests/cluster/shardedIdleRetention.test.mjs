@@ -17,7 +17,7 @@ import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, waitForCondition, readLog } from './clusterShared.mjs';
+import { sendOperation, stopAndTeardownNodes, waitForCondition, logMark, readLogSince } from './clusterShared.mjs';
 
 const TEST_DIR = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 'dist', 'bin', 'harper.js');
@@ -41,7 +41,14 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		config: {
 			threads: { count: 1 },
 			analytics: { aggregatePeriod: -1 },
-			logging: { colors: false, stdStreams: false, level: 'debug', auditRetention: RETENTION_S },
+			logging: {
+				colors: false,
+				stdStreams: false,
+				level: 'debug',
+				auditRetention: RETENTION_S,
+				// marks into hdb.log assume it is only appended to
+				rotation: { enabled: false },
+			},
 			replication: {
 				failover: true,
 				securePort: node.hostname + ':9933',
@@ -105,10 +112,7 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 	};
 
 	const linesSince = async (node, mark, text) =>
-		(await readLog(node))
-			.slice(mark)
-			.split('\n')
-			.filter((line) => line.includes(text));
+		(await readLogSince(node, mark)).split('\n').filter((line) => line.includes(text));
 
 	async function ready() {
 		await waitForCondition(
@@ -168,8 +172,8 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 
 	test('both nodes restart after an idle interval longer than retention and replicate with no base copy', async () => {
 		await delay(IDLE_MS);
-		const marks = await Promise.all(nodes.map(async (node) => (await readLog(node)).length));
 		for (const node of nodes) await killHarper({ harper: node });
+		const marks = await Promise.all(nodes.map(logMark));
 		for (let i = 0; i < 2; i++) await start(i);
 		await ready();
 		await waitForCondition(
@@ -189,8 +193,8 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 	});
 
 	test("an owner's refusal of a forced copy is logged once, reported, and backed off", async () => {
-		const marks = await Promise.all(nodes.map(async (node) => (await readLog(node)).length));
 		await killHarper({ harper: nodes[0] });
+		const marks = await Promise.all(nodes.map(logMark));
 		await start(0, { HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: 'data' });
 		const stuck = await waitForCondition(
 			async (signal) => {
@@ -205,7 +209,7 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		const refusals = await linesSince(nodes[1], marks[1], REFUSED);
 		equal(refusals.length, 1, `one refusal line:\n${refusals.join('\n')}`);
 		// the hold floor is 60 s: the sender forced the copy at most twice in that window, not every few seconds
-		const forced = await linesSince(nodes[0], 0, FORCED_COPY);
+		const forced = await linesSince(nodes[0], marks[0], FORCED_COPY);
 		ok(forced.length >= 1 && forced.length <= 2, `node 0 forced ${forced.length} copies:\n${forced.join('\n')}`);
 	});
 });

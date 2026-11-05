@@ -107,6 +107,36 @@ export async function readLog(node) {
 	return '';
 }
 
+async function hdbLogPath(node) {
+	const { join } = await import('node:path');
+	return join(node.logDir || join(node.dataRootDir, 'log'), 'hdb.log');
+}
+
+/**
+ * Mark the end of a node's hdb.log, for `readLogSince`. Take it before the event under test; an offset only means
+ * something in the file it was measured on, and with `HARPER_INTEGRATION_TEST_LOG_DIR` set each start opens a new
+ * log directory. Unlike `readLog`, there is no fallback to another directory: the node's own log must exist.
+ */
+export async function logMark(node) {
+	const { readFile } = await import('node:fs/promises');
+	const path = await hdbLogPath(node);
+	return { path, length: (await readFile(path, 'utf8')).length };
+}
+
+/**
+ * What the node's current log holds past `mark`. Assumes at most one start since the mark and an append-only log; a
+ * missing or shorter log throws, so an assertion that nothing was logged cannot pass without having seen the log.
+ */
+export async function readLogSince(node, mark) {
+	const { readFile } = await import('node:fs/promises');
+	const path = await hdbLogPath(node);
+	const text = await readFile(path, 'utf8');
+	if (path !== mark.path) return text;
+	if (text.length < mark.length)
+		throw new Error(`${path} is ${text.length} characters, shorter than its mark at ${mark.length}`);
+	return text.slice(mark.length);
+}
+
 /**
  * Read the pid of a node's main Harper process from its pid file.
  *
