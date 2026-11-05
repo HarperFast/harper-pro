@@ -62,7 +62,14 @@ X-Replicate-To: 2;confirm=1
 ```
 
 - `2` — replicate to two additional nodes
-- `confirm=1` — wait for confirmation from one additional node before responding
+- `confirm=1` — wait for confirmation from one additional peer before responding (see below for exactly what this confirms)
+
+`confirm=N` (and the operation-body and programmatic `replicatedConfirmation: N` below) waits for N peers to acknowledge the commit, not N specific peers. Acknowledgements are counted by peer identity, so one peer never counts twice. Which peers count depends on the storage engine:
+
+- **RocksDB:** a peer counts only for records it is resident for. When the written records have different residents, each set of other residents must reach N on its own. A count larger than this node's replication recipients, or than a written record's reachable residents, is refused before the write lands; see [Confirmation Failure After a Local Commit](#confirmation-failure-after-a-local-commit) for failures after it does.
+- **LMDB:** any N peers that replicate the database count, including peers outside the record's residency that hold only an invalidation entry. A count that can't be met waits out the confirmation timeout instead of being refused.
+
+A count of `0` or less does not wait.
 
 Specify exact destination nodes by hostname:
 
@@ -71,7 +78,7 @@ PUT /MyTable/3
 X-Replicate-To: node1,node2
 ```
 
-The `confirm` parameter can be combined with explicit node lists, or with `*` to require confirmation while keeping the database's configured replication (no per-request residency; passing `X-Replicate-To` requires `super_user` permissions, and non-superuser write paths can set [`context.replicatedConfirmation`](#programmatic-replication-control) in a Resource method):
+The `confirm` parameter can be combined with explicit node lists (a count and a node list can't be combined in one value: `X-Replicate-To: 2,node1` parses `2` as a hostname), or with `*` to require confirmation while keeping the database's configured replication (no per-request residency; passing `X-Replicate-To` requires `super_user` permissions, and non-superuser write paths can set [`context.replicatedConfirmation`](#programmatic-replication-control) in a Resource method):
 
 ```http
 PUT /MyTable/3
@@ -97,6 +104,8 @@ Specify `replicateTo` and `replicatedConfirmation` in the operation body:
 	"replicatedConfirmation": 1
 }
 ```
+
+`replicatedConfirmation` and `replicateTo` carry the same confirmation and placement semantics as `confirm` and `X-Replicate-To` over REST; see [Replication Control via REST Header](#replication-control-via-rest-header) for what confirmation does and doesn't guarantee.
 
 Or specify explicit nodes:
 
