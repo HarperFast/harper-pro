@@ -39,6 +39,24 @@ export class LockedIncrement extends Resource {
 	}
 }
 
+/**
+ * POST { id, ifMatch, revision, workMs? }: an application's read-check-write under a cluster lock, which
+ * spends `workMs` inside the critical section. Answers 412 when the record no longer carries `ifMatch`;
+ * the lock is released as the request ends, either way.
+ */
+export class LockedRevision extends Resource {
+	async post(data) {
+		const record = await tables.Counter.lock(data.id, lockOptions(data));
+		if (data.workMs) await new Promise((resolve) => setTimeout(resolve, data.workMs));
+		const current = record.getProperty('n');
+		if (current !== data.ifMatch)
+			throw Object.assign(new Error(`revision ${current} does not match ${data.ifMatch}`), { statusCode: 412 });
+		record.set('n', data.revision);
+		await record.save();
+		return { n: data.revision };
+	}
+}
+
 /** POST { id, timeout?, scope? }: take and release a lock within one request, so any worker can serve it. */
 export class LockOnce extends Resource {
 	async post(data) {
