@@ -28,7 +28,7 @@ jobs:
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      # tsconfig.json includes core/**, so the submodule must be present.
+      # tsconfig.json includes core/** and extends core/tsconfig.json, so the submodule must be present.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: 'recursive'
