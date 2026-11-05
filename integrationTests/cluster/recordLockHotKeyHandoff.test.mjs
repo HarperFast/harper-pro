@@ -33,6 +33,7 @@ const ROUNDS = 3;
 /** Half of `DEFAULT_LOCK_TIMEOUT_MS` (30 s), which these locks wait under. */
 const WAITER_BOUND_MS = 15_000;
 const REQUEST_BOUND_MS = 45_000;
+const poolOff = JSON.parse(process.env.HARPER_CONFIG ?? '{}').replication?.threads === 0;
 
 function summarize(outcomes) {
 	const byStatus = {};
@@ -143,7 +144,8 @@ function hotKeySuite(name, threadsCount) {
 				// than that are grants given up before anyone was admitted.
 				assert.ok(barriers >= 1, `the handoffs crossed nodes without a barrier: ${summary}`);
 				assert.ok(barriers <= (nodes.length - 1) * REVISIONS, `grants were lost to recalls: ${summary}`);
-				if (threadsCount > 1)
+				// With the pool on every http worker relays; off it, a client can stay pinned to the coordinating worker.
+				if (threadsCount > 1 && !poolOff)
 					assert.ok(
 						after.relayedAdmissions > before.relayedAdmissions,
 						`no non-owner worker served a lock: ${summary}`
