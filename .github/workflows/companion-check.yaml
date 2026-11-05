@@ -401,15 +401,26 @@ jobs:
               core.info(`${pr.number} -> ${desired.state}: ${description}`);
             }
 
+            // A red run must mean this workflow or its access needs fixing. The next sweep retries
+            // whatever a GitHub 5xx interrupted; Octokit reports a network failure as 500 too.
+            const isGitHubFault = (e) => e.status >= 500;
+            const warnRequest = (subject, e) => core.warning(`${subject}: ${e.message || e.status}`);
+
             const prs =
               context.eventName === 'pull_request_target'
                 ? [context.payload.pull_request]
-                : await github.paginate(github.rest.pulls.list, {
-                    owner,
-                    repo,
-                    state: 'open',
-                    per_page: 100,
-                  });
+                : await github
+                    .paginate(github.rest.pulls.list, {
+                      owner,
+                      repo,
+                      state: 'open',
+                      per_page: 100,
+                    })
+                    .catch((e) => {
+                      if (!isGitHubFault(e)) throw e;
+                      warnRequest('Cannot list open PRs', e);
+                      return [];
+                    });
             let failures = 0;
             for (const pr of prs) {
               try {
@@ -417,12 +428,16 @@ jobs:
                   !!pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`;
                 await postIfChanged(pr, await evaluate(pr, parseDeps(pr.body), allowSecret));
               } catch (e) {
-                failures++;
-                core.warning(`PR #${pr.number}: ${e.message}`);
+                warnRequest(`PR #${pr.number}`, e);
+                let failed = !isGitHubFault(e);
                 // A failed refresh must not leave a stale success behind.
                 try {
                   await postStatus(pr.head.sha, 'pending', 'companion-check errored; next run will retry');
-                } catch {}
+                } catch (pendingError) {
+                  warnRequest(`PR #${pr.number} pending status`, pendingError);
+                  failed ||= !isGitHubFault(pendingError);
+                }
+                if (failed) failures++;
               }
             }
             if (failures) core.setFailed(`${failures} PR(s) could not be updated`);
