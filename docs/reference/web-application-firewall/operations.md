@@ -1,6 +1,8 @@
 ---
 id: operations
 title: Operations and Rule Schema
+sidebar_position: 30
+sidebar_label: 'Operations & Rule Schema'
 ---
 
 # WAF Operations and Rule Schema

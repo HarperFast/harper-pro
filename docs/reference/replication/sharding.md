@@ -1,5 +1,7 @@
 ---
 title: Sharding
+sidebar_position: 30
+sidebar_label: 'Sharding and legacy APIs'
 ---
 
 <!-- Source: versioned_docs/version-4.7/developers/replication/sharding.md (primary) -->

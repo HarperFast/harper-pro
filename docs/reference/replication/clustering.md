@@ -1,5 +1,7 @@
 ---
 title: Clustering
+sidebar_position: 20
+sidebar_label: 'Clustering'
 ---
 
 <!-- Source: versioned_docs/version-4.7/developers/operations-api/clustering.md (primary) -->

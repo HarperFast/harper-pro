@@ -1,5 +1,7 @@
 ---
 title: Schema-defined sharding
+sidebar_position: 40
+sidebar_label: 'Schema-defined sharding'
 ---
 
 # Schema-defined sharding

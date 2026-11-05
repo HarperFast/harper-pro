@@ -1,6 +1,8 @@
 ---
 id: configuration
 title: Configuration
+sidebar_position: 20
+sidebar_label: 'Configuration'
 ---
 
 # WAF Configuration

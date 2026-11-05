@@ -1,6 +1,8 @@
 ---
 id: overview
 title: Web Application Firewall
+sidebar_position: 10
+sidebar_label: 'Overview'
 ---
 
 # Web Application Firewall

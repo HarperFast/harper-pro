@@ -1,5 +1,7 @@
 ---
 title: Replication Overview
+sidebar_position: 10
+sidebar_label: 'Overview'
 ---
 
 <!-- Source: versioned_docs/version-4.7/developers/replication/index.md (primary) -->
