@@ -1,6 +1,4 @@
 {
-	// Pro compiles core's source, so what that source assumes (lib, target, module settings)
-	// comes from core's config. Set here only what is Pro's own.
 	"extends": "./core/tsconfig.json",
 	"include": [
 		"replication/**/*",
