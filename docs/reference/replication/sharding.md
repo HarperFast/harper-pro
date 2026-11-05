@@ -66,7 +66,7 @@ X-Replicate-To: 2;confirm=1
 
 `confirm=N` (and the operation-body and programmatic `replicatedConfirmation: N` below) waits for N peers to acknowledge the commit, not N specific peers. Acknowledgements are counted by peer identity, so one peer never counts twice. Which peers count depends on the storage engine:
 
-- **RocksDB:** a peer counts only for records it is resident for. When the written records have different residents, each set of other residents must reach N on its own. A count larger than this node's replication recipients, or than a written record's reachable residents, is refused before the write lands; see [Confirmation Failure After a Local Commit](#confirmation-failure-after-a-local-commit) for failures after it does.
+- **RocksDB:** a peer counts only for records it is resident for; with no residency (every node holds every record), any N peers count. When the written records have different residents, each set of other residents must reach N on its own. A count larger than this node's replication recipients, or than a written record's reachable residents, is refused before the write lands; see [Confirmation Failure After a Local Commit](#confirmation-failure-after-a-local-commit) for failures after it does.
 - **LMDB:** any N peers that replicate the database count, including peers outside the record's residency that hold only an invalidation entry. A count that can't be met waits out the confirmation timeout instead of being refused.
 
 A count of `0` or less does not wait.
