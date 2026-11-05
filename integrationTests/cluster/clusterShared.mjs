@@ -1,4 +1,5 @@
 import { equal } from 'node:assert';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { teardownHarper } from '@harperfast/integration-testing';
 
@@ -199,6 +200,26 @@ export function replicationPoolOffEnv() {
 	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
 	if (shared?.replication?.threads === 0) return {};
 	return { HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared?.replication, threads: 0 } }) };
+}
+
+/**
+ * Whether this run's nodes replicate on the `replication` worker pool: `startHarper` passes `--THREADS_COUNT=1`
+ * unless `threads.count` is set (keeping the `Math.floor(threads.count / 2)` default at 0), and the pool-on CI
+ * legs set `replication.threads` for every node through `HARPER_CONFIG`.
+ */
+export function replicationPoolActive() {
+	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
+	return shared?.replication?.threads > 0;
+}
+
+/**
+ * `threads` config that preloads workerFaultInjector.mjs on every worker thread, `replication` pool workers
+ * included. Its features are armed by env; see that module.
+ *
+ * @param {Object} [threads] - other `threads` config to keep
+ */
+export function workerFaultInjectorThreads(threads) {
+	return { ...threads, preload: [...(threads?.preload ?? []), join(import.meta.dirname, 'workerFaultInjector.mjs')] };
 }
 
 /**
