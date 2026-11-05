@@ -508,7 +508,6 @@ function faultyEnv(eventName, openPrs, payloadPr, { read = {}, fresh = {}, pendi
 	return env;
 }
 
-// The incident: empty-bodied 500s on one PR's status read, with later PRs still to evaluate.
 const outage = faultyEnv('schedule', [pr(740, 'plain', 'out1'), pr(741, 'plain', 'out2')], undefined, {
 	read: { out1: httpError(500) },
 });
@@ -517,13 +516,14 @@ assert.equal(outageBySha.out1.state, 'pending', 'an interrupted PR fails closed'
 assert.match(outageBySha.out1.description, /next run will retry/);
 assert.equal(outageBySha.out2.state, 'success', 'later PRs are still evaluated');
 assert.equal(outage.core.failed, undefined, 'a GitHub 5xx is not a failed run');
-assert.deepEqual(outage.core.warnings, ['PR #740: 500'], 'an empty error message falls back to the status');
+assert.deepEqual(outage.core.warnings, ['PR #740: 500'], 'an empty error message still reports the status');
 
 const outageEvent = faultyEnv('pull_request_target', [], pr(742, 'plain', 'out3'), {
 	read: { out3: httpError(503, 'Service Unavailable') },
 });
 assert.equal((await run(outageEvent)).out3.state, 'pending');
 assert.equal(outageEvent.core.failed, undefined, 'a PR-event run gets the same sweep retry');
+assert.deepEqual(outageEvent.core.warnings, ['PR #742: 503 Service Unavailable']);
 
 // The sweep's freshness re-read, which only a sweep runs.
 const freshOutage = faultyEnv('schedule', [pr(743, 'plain', 'out4')], undefined, { fresh: { 743: httpError(502) } });
@@ -534,9 +534,8 @@ const freshDenied = faultyEnv('schedule', [pr(744, 'plain', 'out5')], undefined,
 });
 assert.equal((await run(freshDenied)).out5.state, 'pending');
 assert.match(freshDenied.core.failed, /1 PR/, 'a rejected request still fails the run');
-assert.deepEqual(freshDenied.core.warnings, ['PR #744: Resource not accessible by integration']);
+assert.deepEqual(freshDenied.core.warnings, ['PR #744: 403 Resource not accessible by integration']);
 
-// Primary error then pending-fallback error: a fault of ours in either one fails that PR, once.
 for (const [name, primary, fallback, fails] of [
 	['5xx then 5xx', httpError(500), httpError(500), false],
 	['5xx then rejected', httpError(500), httpError(403, 'denied'), true],
@@ -556,16 +555,14 @@ for (const [name, primary, fallback, fails] of [
 	else assert.equal(chain.core.failed, undefined, name);
 }
 
-// Only the PRs with a fault of ours count toward the failure.
 const mixed = faultyEnv('schedule', [pr(747, 'plain', 'mix1'), pr(748, 'plain', 'mix2')], undefined, {
 	read: { mix1: httpError(500), mix2: httpError(401, 'Bad credentials') },
 });
 const mixedBySha = await run(mixed);
 assert.equal(mixedBySha.mix1.state, 'pending');
 assert.equal(mixedBySha.mix2.state, 'pending');
-assert.equal(mixed.core.failed, '1 PR(s) could not be updated');
+assert.equal(mixed.core.failed, '1 PR(s) could not be updated', 'only the PR with a fault of ours counts');
 
-// Listing open PRs, outside the per-PR handling: nothing evaluated, so the next sweep repeats it.
 const listOutage = makeEnv('schedule', [pr(749, 'plain', 'lst1')]);
 listOutage.github.paginate = async () => {
 	throw httpError(500);

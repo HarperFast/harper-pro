@@ -404,7 +404,7 @@ jobs:
             // A red run must mean this workflow or its access needs fixing. The next sweep retries
             // whatever a GitHub 5xx interrupted; Octokit reports a network failure as 500 too.
             const isGitHubFault = (e) => e.status >= 500;
-            const warnRequest = (subject, e) => core.warning(`${subject}: ${e.message || e.status}`);
+            const warnRequest = (subject, e) => core.warning(`${subject}: ${[e.status, e.message].filter(Boolean).join(' ')}`);
 
             const prs =
               context.eventName === 'pull_request_target'
