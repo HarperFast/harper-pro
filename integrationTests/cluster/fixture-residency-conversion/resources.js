@@ -27,39 +27,6 @@ export class ConversionAudit extends Resource {
 	}
 }
 
-const SNAPSHOT_FLAGS = { INVALIDATED: 1, REPLICA: 4, EVICTED: 8, FULL_WRITE_HEAD: 0x40000 };
-export class ConversionSnapshot extends Resource {
-	get(target) {
-		const id = String(target.id);
-		const entry = tables.Converted.primaryStore.getEntry(id);
-		const node = { id, hostname: server.hostname, pid: process.pid, uptimeMs: Math.round(process.uptime() * 1000) };
-		if (!entry) return { ...node, stored: false };
-		let owners;
-		try {
-			owners = tables.Converted.getRecordResidency({
-				key: id,
-				residencyId: entry.residencyId,
-				residencySlot: entry.residencySlot,
-			});
-		} catch (error) {
-			owners = `error: ${error.message}`;
-		}
-		return {
-			...node,
-			stored: true,
-			version: entry.version,
-			flags: entry.metadataFlags,
-			flagNames: Object.keys(SNAPSHOT_FLAGS).filter((name) => entry.metadataFlags & SNAPSHOT_FLAGS[name]),
-			expiresAt: entry.expiresAt,
-			residencyId: entry.residencyId,
-			slot: entry.residencySlot,
-			owners,
-			localOwner: Array.isArray(owners) ? owners.includes(server.hostname) : undefined,
-			hasBody: entry.value?.body !== undefined,
-		};
-	}
-}
-
 export class ConversionDrain extends Resource {
 	async put() {
 		const REPLICA = 4; // Primary metadata bit shared by both binaries.
