@@ -33,11 +33,12 @@
 		// that flips this default (e.g. TypeScript 7) doesn't silently change results
 		"strict": false,
 		"target": "ES2022",
-		// TypeScript's default lib for target ES2022, plus ES2024.Promise for Node 22's
-		// Promise.withResolvers() — called by pinned core code (server/threads/socketRouter.ts).
+		// TypeScript's default lib for target ES2022, plus ES2024.Promise and ES2024.String for Node 22's
+		// Promise.withResolvers() and String.prototype.toWellFormed() — called by pinned core code.
 		"lib": [
 			"ES2022",
 			"ES2024.Promise",
+			"ES2024.String",
 			"DOM",
 			"WebWorker.ImportScripts",
 			"ScriptHost",
