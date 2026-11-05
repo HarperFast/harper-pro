@@ -24,6 +24,8 @@ const RELAY_RESTARTS = 3;
 
 function chain(ctx, auditRetention, env) {
 	const nodes = {};
+	let beforeSeed = 0;
+	let beforeRelay = 0;
 
 	const options = (node) => ({
 		config: {
@@ -39,7 +41,7 @@ function chain(ctx, auditRetention, env) {
 		return Object.assign(node, started);
 	}
 
-	// the pid file's process too: one killed seconds after it started can outlive the spawned handle
+	// Also stop the process recorded in the pid file, because a node killed seconds after startup can outlive the child handle spawned by startHarper.
 	async function stop(node) {
 		await killHarper({ harper: node });
 		await stopNodeProcess(node);
@@ -52,12 +54,13 @@ function chain(ctx, auditRetention, env) {
 		return node;
 	}
 
-	const addNode = (node, to) =>
+	const addNode = (node, to, extra) =>
 		sendOperation(node, {
 			operation: 'add_node',
 			hostname: to.hostname,
 			rejectUnauthorized: false,
 			authorization: to.admin,
+			...extra,
 		});
 
 	const upsert = (node, ...ids) =>
@@ -93,12 +96,41 @@ function chain(ctx, auditRetention, env) {
 		equal(forced.length, 0, `${from.hostname} forced a copy for ${to.hostname}:\n${forced.join('\n')}`);
 	};
 
+	async function lastDataSubscriptionCursors() {
+		const { A, B, C } = nodes;
+		const log = await readLog(C);
+		const startMatches = [
+			...log.matchAll(
+				new RegExp(
+					`Starting time recorded in db ${B.hostname.replaceAll('.', '\\.')} \\d+ data \\S+ start time: ([0-9.]+)`,
+					'g'
+				)
+			),
+		];
+		ok(startMatches.length > 0, `C logged its data subscription start time for ${B.hostname}`);
+		const lastStart = startMatches.at(-1);
+		const startForB = Number(lastStart[1]);
+		const cursorsLine = log.slice(lastStart.index).match(/per-origin resume cursors[^\n]*/)?.[0] ?? '';
+		const cursorMatch = cursorsLine.match(new RegExp(`['"]?${A.hostname.replaceAll('.', '\\.')}['"]?:\\s*([0-9.]+)`));
+		const cursorForA = cursorMatch ? Number(cursorMatch[1]) : undefined;
+		return { cursorForA, startForB };
+	}
+
 	async function restartFollower(id) {
 		const { B, C } = nodes;
 		await stop(C);
 		await start(C);
 		await upsert(B, id);
 		await arrive(C, id);
+		const { cursorForA, startForB } = await lastDataSubscriptionCursors();
+		ok(
+			cursorForA > 0 && cursorForA < beforeRelay,
+			`C resumed with cursor ${cursorForA} for A older than relay B (${beforeRelay})`
+		);
+		ok(
+			startForB >= beforeRelay,
+			`C resumed with start ${startForB} for B at or after relay B's creation (${beforeRelay})`
+		);
 		await expectNoForcedCopy(B, C);
 	}
 
@@ -122,19 +154,42 @@ function chain(ctx, auditRetention, env) {
 			description: `${logName}'s log purged on ${node.hostname}`,
 		});
 
-	async function build() {
+	async function build({ joinFollower = true } = {}) {
 		const A = await create('A');
+		await delay(20);
+		beforeSeed = Date.now();
+		await delay(20);
 		await upsert(A, ...SEED_ROWS);
+		await delay(20);
+		beforeRelay = Date.now();
+		await delay(20);
 		const B = await create('B');
 		await addNode(B, A);
 		await arrive(B, ...SEED_ROWS);
 		await stop(A);
 		const C = await create('C');
-		await addNode(C, B);
-		await arrive(C, ...SEED_ROWS);
+		if (joinFollower) {
+			await addNode(C, B);
+			await arrive(C, ...SEED_ROWS);
+		}
 	}
 
-	return { nodes, start, stop, upsert, arrive, forcedCopies, restartFollower, restartRelay, logPurged, build };
+	return {
+		nodes,
+		getBeforeSeed: () => beforeSeed,
+		getBeforeRelay: () => beforeRelay,
+		start,
+		stop,
+		addNode,
+		upsert,
+		arrive,
+		forcedCopies,
+		lastDataSubscriptionCursors,
+		restartFollower,
+		restartRelay,
+		logPurged,
+		build,
+	};
 }
 
 suite('a relay younger than the follower cursor it serves', { timeout: 900_000 }, (ctx) => {
@@ -177,14 +232,16 @@ suite('a relayed log the relay purged before the follower received all of it', {
 
 	test('forces the copy that carries the write', async () => {
 		const { A, B, C } = nodes;
-		// C resumes from its certified floor for B: past B's own last write, only B's log for A can force the copy
+		// Wait for B to certify an origin floor so C's resume cursor for B advances past B's own last write;
+		// when C reconnects, only the purge of B's log for A can force the copy.
 		await delay(5 * FLOOR_INTERVAL_MS);
 		await stop(C);
 		await start(A);
 		await upsert(A, 'missed');
 		await arrive(B, 'missed');
 		await stop(A);
-		// retention removes only flushed segments, and a write that arrived as a plain frame waits for a flush; exit is one
+		// Retention removes only flushed log segments, and a write that arrived as a plain frame waits for a
+		// segment flush; stopping B flushes its open segment cleanly.
 		await stop(B);
 		await start(B);
 		await logPurged(B, A.hostname);
@@ -197,3 +254,64 @@ suite('a relayed log the relay purged before the follower received all of it', {
 		);
 	});
 });
+
+suite(
+	'a follower whose start on the relay predates where the relay began tracking purges',
+	{ timeout: 600_000 },
+	(ctx) => {
+		const {
+			nodes,
+			getBeforeSeed,
+			getBeforeRelay,
+			start,
+			stop,
+			addNode,
+			upsert,
+			arrive,
+			forcedCopies,
+			lastDataSubscriptionCursors,
+			build,
+		} = chain(ctx, { auditRetention: 600_000 });
+
+		before(() => build({ joinFollower: false }));
+		after(() => stopAndTeardownNodes(Object.values(nodes)));
+
+		test('forces one copy for the pre-tracking start and none once the follower start advances', async () => {
+			const { B, C } = nodes;
+			const beforeSeed = getBeforeSeed();
+			const beforeRelay = getBeforeRelay();
+			await addNode(C, B, { start_time: beforeSeed });
+			await upsert(B, 'b-live');
+			await arrive(C, ...SEED_ROWS, 'b-live');
+			const initialCursors = await lastDataSubscriptionCursors();
+			equal(initialCursors.startForB, beforeSeed, 'C requested replication of B starting before B existed');
+			const forced = await forcedCopies(B, C);
+			equal(forced.length, 1, `B forced one base copy for C's pre-tracking start:\n${forced.join('\n')}`);
+			const trackedMatch = forced[0].match(
+				/from before (\S+), where this node began accounting for its transaction-log history/
+			);
+			ok(trackedMatch, `B logged the predates-purge-tracking reason:\n${forced[0]}`);
+			const trackedFrom = Date.parse(trackedMatch[1]);
+			ok(beforeRelay < trackedFrom, `beforeRelay ${beforeRelay} predates B's trackedFrom ${trackedFrom}`);
+
+			await stop(C);
+			await start(C);
+			await upsert(B, 'after-pretracking-copy');
+			await arrive(C, 'after-pretracking-copy');
+			const resumedCursors = await lastDataSubscriptionCursors();
+			ok(
+				resumedCursors.cursorForA > beforeSeed && resumedCursors.cursorForA < beforeRelay,
+				`C's cursor ${resumedCursors.cursorForA} for A sits between beforeSeed ${beforeSeed} and beforeRelay ${beforeRelay} (< trackedFrom ${trackedFrom})`
+			);
+			ok(
+				resumedCursors.startForB >= trackedFrom,
+				`C's start ${resumedCursors.startForB} for B advanced to or past trackedFrom ${trackedFrom}`
+			);
+			equal(
+				(await forcedCopies(B, C)).length,
+				1,
+				'B forced no second copy after C reconnected with cursor(A) < trackedFrom <= start(B)'
+			);
+		});
+	}
+);
