@@ -5,12 +5,6 @@
  * stops before C joins, so no origin certificate ever raises C's resume cursor for A. That cursor stays at A's
  * last key, older than B. Nothing is purged, yet comparing the cursor with B's creation time forced a full copy
  * on every reconnect, and the copy could not move the cursor, so the next reconnect forced another.
- *
- * With a retention of seconds, B's log for A really is purged. C held all of it, so that forces nothing either. A
- * write of A's that C missed and B then purged does force the copy that carries it.
- *
- * The oracle is B's forced-copy log line. Each start of a node gets its own log, so each read covers the current
- * process from its start, and `subscription to` shows that process served C.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert/strict';

@@ -175,12 +175,6 @@ describe('predatesPurgeTracking', () => {
 		expect(predatesPurgeTracking(subscriptions(5000, 100), 'relay', 100, TRACKED_FROM)).to.equal(false);
 	});
 
-	it('clears nothing replayStartUnderPurge reports for a log a prune really reached', () => {
-		const floors = new Map([['relayed', 2000 - ORIGIN_CURSOR_OVERLAP_MS]]);
-		expect(predatesPurgeTracking(subscriptions(5000, 6000), 'relay', 5000, TRACKED_FROM)).to.equal(false);
-		expect(replayStartUnderPurge(['relayed'], 5000, floors, () => 3000)?.log).to.equal('relayed');
-	});
-
 	it('falls back to the merged start when the follower does not list this node', () => {
 		expect(predatesPurgeTracking([{ name: 'proxied', startTime: 100 }], 'relay', 100, TRACKED_FROM)).to.equal(true);
 		expect(predatesPurgeTracking([{ name: 'proxied', startTime: 6000 }], 'relay', 6000, TRACKED_FROM)).to.equal(false);

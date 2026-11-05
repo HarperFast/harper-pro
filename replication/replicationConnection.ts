@@ -753,7 +753,7 @@ export function floorFromAnotherGeneration(auditStore: any, floorGeneration: unk
 
 /**
  * Compared from the follower's start for this node: a listed proxied origin's start is that origin's key, which can
- * predate this node with nothing missing, and it only reaches the merged start.
+ * predate this node with nothing missing, so it reaches only the merged start and is never compared here.
  */
 export function predatesPurgeTracking(
 	subscriptions: { name: string; startTime?: number }[],
@@ -10058,7 +10058,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												);
 												// LMDB has one bound for every name, and an empty scope would drop a prune's bound on every log
 												const purgeScope = scopedLogs?.length ? scopedLogs : [oldestLogName];
-												// read second: a prune landing between the reads can only raise it, which errs toward a copy
+												// trackedFrom is read after the bounds: a prune between the reads can only raise it, which errs toward a copy
 												const readBounds = getLogPurgeBounds(auditStore, purgeScope);
 												const trackedFrom = readBounds && getLogPurgeTrackedFrom(auditStore);
 												const purgeBounds = trackedFrom === undefined ? undefined : readBounds;
