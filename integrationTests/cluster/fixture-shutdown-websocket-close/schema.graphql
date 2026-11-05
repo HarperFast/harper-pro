@@ -1,0 +1,3 @@
+type Confirmed @table @export {
+	id: ID @primaryKey
+}
