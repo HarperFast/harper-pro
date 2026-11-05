@@ -29,6 +29,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 
 const TABLE = 'checkpoint_origin';
 const FLOOR_INTERVAL_MS = 5_000;
 const CONVERGE_TIMEOUT_MS = 120_000;
+const SUITE_TIMEOUT_MS = 900_000;
 
 const nodeOptions = (node, env = {}) => ({
 	config: {
@@ -36,6 +37,9 @@ const nodeOptions = (node, env = {}) => ({
 		logging: { colors: false, stdStreams: false, console: true, level: 'debug' },
 		replication: { port: node.hostname + ':9933', securePort: null, databases: ['data'] },
 		originLogFixture: { package: join(TEST_DIR, 'fixture-origin-log') },
+		// held-copy-bound pins A's floor across B's restarts and base copy, which outlast the default 30 s limit; the
+		// suite's own timeout bounds it instead, so a slow run fails on its wait rather than on an aborted hold
+		storage: { maxTransactionOpenTime: SUITE_TIMEOUT_MS },
 	},
 	env: {
 		HARPER_NO_FLUSH_ON_EXIT: true,
@@ -105,11 +109,14 @@ const waitForRecord = (node, id) =>
 		description: `${id} to reach ${node.hostname}`,
 	});
 
-const waitForState = (node, peer, origin, predicate, what) =>
-	waitForCondition(async () => predicate(await stateFor(node, peer, origin)), {
+function waitForState(node, peer, origin, predicate, what) {
+	let last;
+	return waitForCondition(async () => predicate((last = await stateFor(node, peer, origin))), {
 		timeoutMs: CONVERGE_TIMEOUT_MS,
-		description: `${node.hostname}'s state for ${origin.hostname} via ${peer.hostname}: ${what}`,
+		description: () =>
+			`${node.hostname}'s state for ${origin.hostname} via ${peer.hostname}: ${what}; last observed ${JSON.stringify(last)}`,
 	});
+}
 
 const waitForEvents = (node, name, ids) =>
 	waitForCondition(
@@ -170,7 +177,7 @@ const endMqtt = (client) => new Promise((resolve) => client.end(true, {}, () => 
 const topicIds = (received) => received.map(({ topic }) => topic.split('/').pop());
 
 const SUITE = 'Subscription checkpoints resume across nodes (harper-pro#922 items 3–4)';
-suite(SUITE, { timeout: 900_000 }, (ctx) => {
+suite(SUITE, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 	before(async () => {
 		[ctx.A, ctx.B, ctx.C, ctx.E] = await Promise.all([
 			startNewNode(ctx.name),
@@ -347,10 +354,34 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 	});
 	test('a route widened from partial coverage runs a full base copy and clears partialHistory without certifying audit-less copyApply history', async () => {
 		const { A, B } = ctx;
+		// A's live link rewrites B's coverage bit with each certificate it applies, B's SIGTERM drain included, so the
+		// partial-coverage precondition is written while A is down and survives until B restarts
+		await stopNodeProcess(A);
+		await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
+		const beforeRestart = await stateFor(B, A, A);
+		equal(beforeRestart?.fullCoverage, false, `B's row for A before B restarts: ${JSON.stringify(beforeRestart)}`);
+		ok(beforeRestart?.partialHistory !== true, 'only fullCoverage: false can widen the route at restart');
+		await stopNodeProcess(B);
+		await startNode(A);
 		await postToFixture(A, 'HoldTransaction', { id: 'held-copy-bound' });
 		try {
 			await upsert(A, 'copied-above-pinned-floor');
 			await upsert(A, 'copy-anchor-record');
+			const logBeforeStart = logPath(B);
+			const logLengthBeforeStart = (await readText(logBeforeStart)).length;
+			await startNode(B);
+			// a runner without a log dir appends every start to one file
+			const startLogFrom = logPath(B) === logBeforeStart ? logLengthBeforeStart : 0;
+			await waitForCondition(
+				async () =>
+					(await readText(logPath(B)))
+						.slice(startLogFrom)
+						.includes(`Route coverage widened to full for ${A.hostname} on database data `),
+				{
+					timeoutMs: CONVERGE_TIMEOUT_MS,
+					description: `${B.hostname} to restart with fullCoverage: false for ${A.hostname} and widen the route`,
+				}
+			);
 			await waitForRecord(B, 'copy-anchor-record');
 			const copiedVersions = await postToFixture(A, 'RecordVersions', {
 				ids: ['copied-above-pinned-floor', 'copy-anchor-record'],
@@ -359,8 +390,6 @@ suite(SUITE, { timeout: 900_000 }, (ctx) => {
 				copiedVersions['copied-above-pinned-floor'] ?? 0,
 				copiedVersions['copy-anchor-record'] ?? 0
 			);
-			await postToFixture(B, 'SetRouteCoverage', { peer: A.hostname, fullCoverage: false });
-			await restartNode(B);
 			await upsert(A, 'after-widening-copy');
 			await waitForRecord(B, 'after-widening-copy');
 			await waitForState(
