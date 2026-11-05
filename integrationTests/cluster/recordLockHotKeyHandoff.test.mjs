@@ -33,7 +33,7 @@ const ROUNDS = 3;
 /** Half of `DEFAULT_LOCK_TIMEOUT_MS` (30 s), which these locks wait under. */
 const WAITER_BOUND_MS = 15_000;
 const REQUEST_BOUND_MS = 45_000;
-const poolOff = JSON.parse(process.env.HARPER_CONFIG ?? '{}').replication?.threads === 0;
+const poolOff = JSON.parse(process.env.HARPER_CONFIG ?? '{}').replication?.threads <= 0;
 
 function summarize(outcomes) {
 	const byStatus = {};
