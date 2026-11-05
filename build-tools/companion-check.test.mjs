@@ -487,29 +487,28 @@ assert.equal(writeErr.core.failed, undefined, 'a 5xx on the write is retried by 
 const httpError = (status, message = '') => Object.assign(new Error(message), { status });
 const scriptBug = () => new TypeError('x is not a function');
 
-// faults: { read: { sha: error }, fresh: { number: error }, pending: { sha: error } }
-function faultyEnv(eventName, openPrs, payloadPr, { read = {}, fresh = {}, pending = {} }) {
+function faultyEnv(eventName, openPrs, payloadPr, { readBySha = {}, freshByPr = {}, pendingBySha = {} }) {
 	const env = makeEnv(eventName, openPrs, payloadPr);
 	const { repos, pulls } = env.github.rest;
 	const { listCommitStatusesForRef, createCommitStatus } = repos;
 	const { get } = pulls;
 	repos.listCommitStatusesForRef = async (args) => {
-		if (read[args.ref]) throw read[args.ref];
+		if (readBySha[args.ref]) throw readBySha[args.ref];
 		return listCommitStatusesForRef(args);
 	};
 	pulls.get = async (args) => {
-		if (fresh[args.pull_number]) throw fresh[args.pull_number];
+		if (freshByPr[args.pull_number]) throw freshByPr[args.pull_number];
 		return get(args);
 	};
 	repos.createCommitStatus = async (status) => {
-		if (status.state === 'pending' && pending[status.sha]) throw pending[status.sha];
+		if (status.state === 'pending' && pendingBySha[status.sha]) throw pendingBySha[status.sha];
 		return createCommitStatus(status);
 	};
 	return env;
 }
 
 const outage = faultyEnv('schedule', [pr(740, 'plain', 'out1'), pr(741, 'plain', 'out2')], undefined, {
-	read: { out1: httpError(500) },
+	readBySha: { out1: httpError(500) },
 });
 const outageBySha = await run(outage);
 assert.equal(outageBySha.out1.state, 'pending', 'an interrupted PR fails closed');
@@ -519,18 +518,19 @@ assert.equal(outage.core.failed, undefined, 'a GitHub 5xx is not a failed run');
 assert.deepEqual(outage.core.warnings, ['PR #740: 500'], 'an empty error message still reports the status');
 
 const outageEvent = faultyEnv('pull_request_target', [], pr(742, 'plain', 'out3'), {
-	read: { out3: httpError(503, 'Service Unavailable') },
+	readBySha: { out3: httpError(503, 'Service Unavailable') },
 });
 assert.equal((await run(outageEvent)).out3.state, 'pending');
 assert.equal(outageEvent.core.failed, undefined, 'a PR-event run gets the same sweep retry');
 assert.deepEqual(outageEvent.core.warnings, ['PR #742: 503 Service Unavailable']);
 
-// The sweep's freshness re-read, which only a sweep runs.
-const freshOutage = faultyEnv('schedule', [pr(743, 'plain', 'out4')], undefined, { fresh: { 743: httpError(502) } });
+const freshOutage = faultyEnv('schedule', [pr(743, 'plain', 'out4')], undefined, {
+	freshByPr: { 743: httpError(502) },
+});
 assert.equal((await run(freshOutage)).out4.state, 'pending');
 assert.equal(freshOutage.core.failed, undefined);
 const freshDenied = faultyEnv('schedule', [pr(744, 'plain', 'out5')], undefined, {
-	fresh: { 744: httpError(403, 'Resource not accessible by integration') },
+	freshByPr: { 744: httpError(403, 'Resource not accessible by integration') },
 });
 assert.equal((await run(freshDenied)).out5.state, 'pending');
 assert.match(freshDenied.core.failed, /1 PR/, 'a rejected request still fails the run');
@@ -544,8 +544,8 @@ for (const [name, primary, fallback, fails] of [
 	['script bug then 5xx', scriptBug(), httpError(500), true],
 ]) {
 	const chain = faultyEnv('schedule', [pr(745, 'plain', 'chn1'), pr(746, 'plain', 'chn2')], undefined, {
-		read: { chn1: primary },
-		pending: { chn1: fallback },
+		readBySha: { chn1: primary },
+		pendingBySha: { chn1: fallback },
 	});
 	const chainBySha = await run(chain);
 	assert.equal(chainBySha.chn1, undefined, `${name}: the fallback write failed, so nothing was posted`);
@@ -556,7 +556,7 @@ for (const [name, primary, fallback, fails] of [
 }
 
 const mixed = faultyEnv('schedule', [pr(747, 'plain', 'mix1'), pr(748, 'plain', 'mix2')], undefined, {
-	read: { mix1: httpError(500), mix2: httpError(401, 'Bad credentials') },
+	readBySha: { mix1: httpError(500), mix2: httpError(401, 'Bad credentials') },
 });
 const mixedBySha = await run(mixed);
 assert.equal(mixedBySha.mix1.state, 'pending');
