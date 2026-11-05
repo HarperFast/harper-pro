@@ -54,8 +54,7 @@ function optionsFor(hostname, env = {}, threadsCount = 1, preload) {
 
 /** A node with the fixture pre-installed, bound to a pre-allocated address (see cacheReplicationSource).
  * `threadsCount > 1` runs several http workers, so a cluster lock() served on a non-owner worker relays
- * its admission to the coordinating worker (harper-pro#852). `preload` is `threads.preload`, for an injector
- * that has to run on every worker. */
+ * its admission to the coordinating worker (harper-pro#852). */
 export async function startNode(suiteName, env, threadsCount = 1, preload) {
 	const hostname = await getNextAvailableLoopbackAddress();
 	const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));

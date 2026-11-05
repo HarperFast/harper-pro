@@ -39,11 +39,7 @@ export class LockedIncrement extends Resource {
 	}
 }
 
-/**
- * POST { id, ifMatch, revision, workMs? }: an application's read-check-write under a cluster lock, which
- * spends `workMs` inside the critical section. Answers 412 when the record no longer carries `ifMatch`;
- * the lock is released as the request ends, either way.
- */
+/** POST { id, ifMatch, revision, workMs? }: an application's read-check-write under a cluster lock. */
 export class LockedRevision extends Resource {
 	async post(data) {
 		const record = await tables.Counter.lock(data.id, lockOptions(data));
