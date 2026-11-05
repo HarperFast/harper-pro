@@ -2745,6 +2745,7 @@ describe('Declarative tables keep control and event traffic independent of place
 			try {
 				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
 				assert.deepEqual(socket.closes, []);
+				assert.equal('floorGeneration' in socket.sent.find((frame) => frame[0] === 129)[1][0], false);
 				// the first request had no floor to start below; a level-2 certificate then makes the row checkpoint-grade
 				const floor = Date.now() - 1000;
 				socket.emit('message', encode([143, floor + 500, { [peer]: [floor, 'peer-generation', true] }]));
@@ -2763,6 +2764,11 @@ describe('Declarative tables keep control and event traffic independent of place
 					socket.sent.findLast((frame) => frame[0] === 129)[1][0].startTime,
 					cursorBelowFloor(floor),
 					'the replacement still resumes below the floor'
+				);
+				assert.equal(
+					socket.sent.findLast((frame) => frame[0] === 129)[1][0].floorGeneration,
+					'peer-generation',
+					'a floor-only start names the generation its floor was certified under'
 				);
 				socket.emit('message', encode([143, floor + 600]));
 				await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId === floor + 600 || socket.closes.length);
@@ -2820,6 +2826,7 @@ describe('Declarative tables keep control and event traffic independent of place
 				await until(() => retry.sent.some((frame) => frame[0] === 129) || retry.closes.length);
 				assert.deepEqual(retry.closes, []);
 				assert.equal(retry.sent.find((frame) => frame[0] === 129)[1][0].startTime, cursorBelowFloor(floor));
+				assert.equal(retry.sent.find((frame) => frame[0] === 129)[1][0].floorGeneration, 'peer-generation');
 				await until(() => peerNode()?.certifiedFrom === cursorBelowFloor(floor));
 			} finally {
 				subscription.send = send;

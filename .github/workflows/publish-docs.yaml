@@ -1,0 +1,35 @@
+name: Publish Docs
+
+# The documentation site publishes this repo's latest published release, or a docs/<release>-<n>
+# tag of it (docs/README.md in HarperFast/harper, "When docs publish"). This has the site's
+# content-check redeploy now instead of at its hourly check.
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - 'docs/**'
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: github.event_name == 'push' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    steps:
+      # GITHUB_TOKEN cannot dispatch to another repository.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.HARPERFAST_AI_CLIENT_ID }}
+          private-key: ${{ secrets.HARPERFAST_AI_APP_PRIVATE_KEY }}
+          owner: HarperFast
+          repositories: documentation
+          permission-contents: write
+
+      - name: Dispatch docs-source-changed to HarperFast/documentation
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh api repos/HarperFast/documentation/dispatches -f event_type=docs-source-changed

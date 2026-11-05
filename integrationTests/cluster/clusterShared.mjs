@@ -1,4 +1,5 @@
 import { equal } from 'node:assert';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { teardownHarper } from '@harperfast/integration-testing';
 
@@ -107,6 +108,36 @@ export async function readLog(node) {
 	return '';
 }
 
+async function hdbLogPath(node) {
+	const { join } = await import('node:path');
+	return join(node.logDir || join(node.dataRootDir, 'log'), 'hdb.log');
+}
+
+/**
+ * Mark the end of a node's hdb.log, for `readLogSince`. Take it before the event under test; an offset only means
+ * something in the file it was measured on, and with `HARPER_INTEGRATION_TEST_LOG_DIR` set each start opens a new
+ * log directory. Unlike `readLog`, there is no fallback to another directory: the node's own log must exist.
+ */
+export async function logMark(node) {
+	const { readFile } = await import('node:fs/promises');
+	const path = await hdbLogPath(node);
+	return { path, length: (await readFile(path, 'utf8')).length };
+}
+
+/**
+ * What the node's current log holds past `mark`. Assumes at most one start since the mark and an append-only log; a
+ * missing or shorter log throws, so an assertion that nothing was logged cannot pass without having seen the log.
+ */
+export async function readLogSince(node, mark) {
+	const { readFile } = await import('node:fs/promises');
+	const path = await hdbLogPath(node);
+	const text = await readFile(path, 'utf8');
+	if (path !== mark.path) return text;
+	if (text.length < mark.length)
+		throw new Error(`${path} is ${text.length} characters, shorter than its mark at ${mark.length}`);
+	return text.slice(mark.length);
+}
+
 /**
  * Read the pid of a node's main Harper process from its pid file.
  *
@@ -169,6 +200,26 @@ export function replicationPoolOffEnv() {
 	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
 	if (shared?.replication?.threads === 0) return {};
 	return { HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared?.replication, threads: 0 } }) };
+}
+
+/**
+ * Whether this run's nodes replicate on the `replication` worker pool: `startHarper` passes `--THREADS_COUNT=1`
+ * unless `threads.count` is set (keeping the `Math.floor(threads.count / 2)` default at 0), and the pool-on CI
+ * legs set `replication.threads` for every node through `HARPER_CONFIG`.
+ */
+export function replicationPoolActive() {
+	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
+	return shared?.replication?.threads > 0;
+}
+
+/**
+ * `threads` config that preloads workerFaultInjector.mjs on every worker thread, `replication` pool workers
+ * included. Its features are armed by env; see that module.
+ *
+ * @param {Object} [threads] - other `threads` config to keep
+ */
+export function workerFaultInjectorThreads(threads) {
+	return { ...threads, preload: [...(threads?.preload ?? []), join(import.meta.dirname, 'workerFaultInjector.mjs')] };
 }
 
 /**
