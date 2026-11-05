@@ -1,4 +1,7 @@
 {
+	// Pro compiles core's source, so what that source assumes (lib, target, module settings)
+	// comes from core's config. Set here only what is Pro's own.
+	"extends": "./core/tsconfig.json",
 	"include": [
 		"replication/**/*",
 		"security/**/*",
@@ -24,41 +27,16 @@
 		"core/index.ts"
 	],
 	"compilerOptions": {
-		// Allow JS files for mixed codebase
-		"allowJs": true,
+		"noEmit": false,
 		"outDir": "dist",
-		"esModuleInterop": true,
 		"noImplicitAny": false,
 		// Codebase is not strict-clean yet; pin explicitly so a compiler upgrade
 		// that flips this default (e.g. TypeScript 7) doesn't silently change results
 		"strict": false,
-		"target": "ES2022",
-		// TypeScript's default lib for target ES2022, plus ES2024.Promise for Node 22's
-		// Promise.withResolvers() — called by pinned core code (server/threads/socketRouter.ts).
-		"lib": [
-			"ES2022",
-			"ES2024.Promise",
-			"DOM",
-			"WebWorker.ImportScripts",
-			"ScriptHost",
-			"DOM.Iterable",
-			"DOM.AsyncIterable"
-		],
-		"moduleResolution": "NodeNext",
-		"module": "NodeNext",
 		"sourceMap": true,
-		"resolveJsonModule": true,
-		"allowSyntheticDefaultImports": true,
-		"allowImportingTsExtensions": true,
 
 		// Allow .ts extensions in imports (will be transpiled to .js by esbuild)
 		"rewriteRelativeImportExtensions": true,
-
-		// Enforce erasable syntax only so we can use Node.js type-stripping
-		"erasableSyntaxOnly": true,
-
-		// Required: third-party type declarations (alasql, mathjs, msgpackr) have incompatible type errors
-		"skipLibCheck": true,
 
 		// TS7 removes baseUrl; paths are already relative to this file so this
 		// resolves identically without it (verified: 0 resolution changes)
