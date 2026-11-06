@@ -224,4 +224,31 @@ suite('WAF matcher after a full copy', { timeout: 420000 }, (ctx) => {
 		deepEqual(await persistedRuleIds(receiver), [BLOCK_RULE.id, SCORE_RULE.id].sort());
 		await waitForEveryWorkerToCompile(receiver, 2);
 	});
+
+	test('a rejoin with no rules left on the leader empties the matcher', async () => {
+		const { leader, receiver } = ctx;
+		await sendOperation(receiver, { operation: 'remove_node', hostname: leader.hostname });
+		await sendOperation(leader, { operation: 'remove_node', hostname: receiver.hostname });
+
+		await sendOperation(leader, { operation: 'drop_waf_rule', id: BLOCK_RULE.id });
+		await sendOperation(leader, { operation: 'drop_waf_rule', id: SCORE_RULE.id });
+		await waitForBlocked(leader, MOVED_BLOCK_PROBE, 0, 'leader');
+		equal(
+			await blockedProbes(receiver, MOVED_BLOCK_PROBE),
+			PROBES_PER_CHECK,
+			'the old rule must still apply while out'
+		);
+
+		await sendOperation(receiver, {
+			operation: 'add_node',
+			hostname: leader.hostname,
+			rejectUnauthorized: false,
+			isLeader: true,
+			authorization: leader.admin,
+		});
+
+		await waitForBlocked(receiver, MOVED_BLOCK_PROBE, 0, 'receiver');
+		deepEqual(await persistedRuleIds(receiver), []);
+		await waitForEveryWorkerToCompile(receiver, 0);
+	});
 });

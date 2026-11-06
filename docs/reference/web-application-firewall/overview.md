@@ -11,7 +11,7 @@ sidebar_label: 'Overview'
 
 The Harper Web Application Firewall (WAF) filters HTTP requests before authentication and application routing. Rules can match client IP addresses, HTTP methods, paths, headers, and query parameters, then block the request, log the match, or contribute to a shared risk score.
 
-WAF rules are stored in the replicated `system.hdb_waf_rules` table and managed through dedicated Operations API operations. Harper compiles the rules into an immutable in-memory matcher on each worker. Rule changes trigger a debounced recompile and an atomic matcher swap, so updates take effect without restarting Harper. A node that joins or rejoins through a full copy recompiles when the copy completes; until then it enforces the rules it had before the copy.
+WAF rules are stored in the replicated `system.hdb_waf_rules` table and managed through dedicated Operations API operations. Harper compiles the rules into an immutable in-memory matcher on each worker. Rule changes trigger a debounced recompile and an atomic matcher swap, so updates take effect without restarting Harper. A node that joins or rejoins through a full copy recompiles when the copy completes; until then it may enforce the rules it had before the copy, or some of the copied ones.
 
 :::info Harper Pro
 The WAF is available in Harper Pro.

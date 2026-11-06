@@ -3120,6 +3120,7 @@ export function shouldEmitCopyReloadMarker(
 }
 
 const RELOAD_MARKER_RETRY = { initialMs: 1000, maxMs: 30_000 };
+const pendingReloadMarkerRetries = new WeakSet<object>();
 
 /**
  * Write one table's copy-complete reload marker, retrying until it commits. A subscriber whose iterator
@@ -3127,19 +3128,26 @@ const RELOAD_MARKER_RETRY = { initialMs: 1000, maxMs: 30_000 };
  * runs on its own schedule. A duplicate marker only causes one more re-read.
  */
 export function writeReloadMarkerWithRetry(
-	table: { writeReloadMarker(): unknown },
+	table: { writeReloadMarker(): unknown; auditStore?: any },
 	description: string,
 	retry: { initialMs: number; maxMs: number } = RELOAD_MARKER_RETRY
 ): void {
 	const backoff = createBackoff(retry);
 	const attempt = () => {
-		// `.then()` so a SYNCHRONOUS throw (the marker's transaction commits inline) reaches the catch too.
+		// `.then()` so a synchronous throw reaches the catch, never copy finalization.
 		Promise.resolve()
 			.then(() => table.writeReloadMarker())
 			.catch((error: unknown) => {
-				const delay = backoff.nextDelay()!; // no budget, so never exhausted
-				logger.warn?.(`failed to emit reload marker for ${description}; retrying in ${delay}ms`, error);
-				setTimeout(attempt, delay).unref();
+				logger.warn?.(`failed to emit reload marker for ${description}`, error);
+				// A pending retry commits after this copy too. A closed store can never commit, and reopening it
+				// ends every subscription on it, whose subscribers re-read.
+				const status = table.auditStore?.rootStore?.status;
+				if (pendingReloadMarkerRetries.has(table) || status === 'closing' || status === 'closed') return;
+				pendingReloadMarkerRetries.add(table);
+				setTimeout(() => {
+					pendingReloadMarkerRetries.delete(table);
+					attempt();
+				}, backoff.nextDelay()).unref();
 			});
 	};
 	attempt();
@@ -5466,7 +5474,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		for (const tableName of tableNames) {
 			const table = (tables as any)?.[tableName];
 			if (!shouldEmitCopyReloadMarker(isSystem, tableName, table, copiedTablesThisPass)) continue;
-			writeReloadMarkerWithRetry(table, `${databaseName}.${tableName}`);
+			writeReloadMarkerWithRetry(table, `${databaseName}.${tableName} (${connectionId})`);
 		}
 	}
 	// `wsClosed` alone is not ownership: forceReconnect() schedules the replacement without waiting for this

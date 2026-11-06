@@ -92,4 +92,41 @@ describe('writeReloadMarkerWithRetry', () => {
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(writes).to.equal(3);
 	});
+
+	it('keeps one pending retry per table when two copies fail, and a commit after the first ends it', async () => {
+		let fail = true;
+		let writes = 0;
+		const table = {
+			writeReloadMarker() {
+				writes++;
+				if (fail) throw new Error('commit failure');
+			},
+		};
+		const slowRetry = { initialMs: 200, maxMs: 200 };
+		writeReloadMarkerWithRetry(table, 'system.table', slowRetry);
+		writeReloadMarkerWithRetry(table, 'system.table', slowRetry);
+		await until(() => writes === 2);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		fail = false;
+		// one retry, however many attempts failed
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		expect(writes).to.equal(3);
+	});
+
+	for (const status of ['closing', 'closed']) {
+		it(`stops retrying once the store is ${status}`, async () => {
+			let writes = 0;
+			const table = {
+				auditStore: { rootStore: { status } },
+				writeReloadMarker() {
+					writes++;
+					throw new Error('store closed');
+				},
+			};
+			writeReloadMarkerWithRetry(table, 'data.table', FAST_RETRY);
+			await until(() => writes === 1);
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			expect(writes).to.equal(1);
+		});
+	}
 });

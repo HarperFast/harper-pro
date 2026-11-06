@@ -126,13 +126,21 @@ describe('WAF matcher recovery', () => {
 				const table = makeTable();
 				const server = await startSettled(table);
 				end(table);
-				// past any scan the ending itself schedules, so only the post-resubscribe scan can see it
-				await delay(30);
+				await delay(30); // so only the scan after resubscribing can see the write
 				table.put(rule('inserted', '/admin'));
 				await until(() => isBlocked(server, '/admin/x'), 'the inserted rule');
 				expect(table.subscribes).to.equal(2);
 			});
 		}
+
+		it('a final error message schedules no scan on the closing handle', async () => {
+			const table = makeTable();
+			await startSettled(table);
+			const scans = table.scans;
+			table.liveQueue.close(new Error('database closing'));
+			await delay(30);
+			expect(table.scans).to.equal(scans);
+		});
 
 		it('an update converges', async () => {
 			const table = makeTable([rule('moved', '/old')]);
