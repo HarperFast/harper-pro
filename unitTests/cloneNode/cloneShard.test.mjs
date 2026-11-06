@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict';
+import assert from 'node:assert';
 import {
 	assertResumedShard,
 	chooseCloneShard,
@@ -109,8 +109,12 @@ describe('cloneShard', () => {
 		});
 
 		it('leaves an unsharded leader alone', () => {
-			assert.equal(chosen({}), undefined);
-			assert.equal(chosen({ requested: 'auto' }), undefined);
+			assert.strictEqual(chosen({}), undefined);
+			assert.strictEqual(chosen({ requested: 'auto' }), undefined);
+		});
+
+		it('lets a clone of a leader holding no slots hold none either, with no option', () => {
+			assert.strictEqual(chosen({ leaderStatus: { sharding: { data: {} } } }), undefined);
 		});
 
 		it('honors an explicit number, shard 0 included', () => {

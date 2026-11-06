@@ -1,10 +1,9 @@
 // A leader that accepts a clone request and never finishes answering is a failed attempt on both transports.
-import assert from 'node:assert/strict';
+import assert from 'node:assert';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { EventEmitter, once } from 'node:events';
 import { createRequire } from 'node:module';
-import sinon from 'sinon';
 import { requestLeader } from '#src/cloneNode/leaderRequest';
 import { cloneSSHKeysFromLeader } from '#src/cloneNode/sshKeyClone';
 
@@ -158,18 +157,18 @@ describe('requestLeader', function () {
 	});
 
 	describe('over the replication socket', () => {
-		const sandbox = sinon.createSandbox();
 		const transport = { replicationURL: 'wss://leader.example.com:9933', rejectUnauthorized: false };
 		let socket;
 		let sent;
 		let answer;
+		const { createWebSocket, replicateOverWS } = replicationConnection;
 
 		beforeEach(() => {
 			socket = Object.assign(new EventEmitter(), { readyState: 1, close: () => {} });
 			sent = 0;
 			answer = new Promise(() => {});
-			sandbox.stub(replicationConnection, 'createWebSocket').resolves(socket);
-			sandbox.stub(replicationConnection, 'replicateOverWS').returns({
+			replicationConnection.createWebSocket = async () => socket;
+			replicationConnection.replicateOverWS = () => ({
 				sendOperation: () => {
 					sent++;
 					return answer;
@@ -177,7 +176,10 @@ describe('requestLeader', function () {
 			});
 		});
 
-		afterEach(() => sandbox.restore());
+		afterEach(() => {
+			replicationConnection.createWebSocket = createWebSocket;
+			replicationConnection.replicateOverWS = replicateOverWS;
+		});
 
 		it('rejects at the deadline when the leader accepts and never answers', async () => {
 			await assert.rejects(

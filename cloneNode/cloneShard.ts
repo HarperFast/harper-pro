@@ -1,4 +1,7 @@
-/** Stops a clone before it writes config or joins; the process keeps running, Unavailable, so a restart can correct it. */
+/**
+ * Fresh setup refuses before it writes config or joins, and the process keeps running, Unavailable, so a restart can
+ * correct it. A resumed clone refuses before Harper starts, which exits, since it would come up as the wrong shard.
+ */
 export class CloneShardRefusedError extends Error {}
 
 const SHARD_OPTION = '--shard or CLONE_SHARD';
@@ -19,7 +22,7 @@ export function parseShardOption(raw: unknown): number | 'auto' | undefined {
 
 export type ShardMember = { shard: unknown; live: boolean };
 
-/** The leader and its peers with a shard, as the leader sees them; this node is excluded so a retry does not count itself. */
+/** Excludes this node, so a retry does not count itself. */
 export function leaderShardMembers(leaderShard: unknown, leaderStatus: any, thisNode: string): ShardMember[] {
 	const members: ShardMember[] = leaderShard == null ? [] : [{ shard: leaderShard, live: true }];
 	for (const peer of leaderStatus?.connections ?? []) {
@@ -118,6 +121,8 @@ export function chooseCloneShard({
 			members.filter((member) => member.shard === candidate && member.live).length;
 		description = `shard ${shard} from "auto"; live members: ${list.map((candidate) => `${candidate}=${liveCount(candidate)}`).join(', ')}`;
 	} else if (leaderShard != null || list) {
+		// A leader with neither holds no slots itself, and a clone of it may do the same: from any peer, a node that owns
+		// nothing has nothing to wait for.
 		throw new CloneShardRefusedError(
 			`The leader is sharded and a clone does not inherit its shard: choose this node's shard with ${SHARD_OPTION}, ` +
 				`as a number or "auto"${listing}`

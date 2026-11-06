@@ -22,7 +22,6 @@ async function requestOverHTTP(target: LeaderHTTPTarget, operation: any, deadlin
 	}
 }
 
-/** One message answered in full by the deadline, so a leader that accepts and never finishes is a failed attempt. */
 export async function requestLeader(
 	transport: LeaderTransport,
 	operation: { operation: string; [key: string]: any },

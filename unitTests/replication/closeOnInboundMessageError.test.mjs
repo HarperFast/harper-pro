@@ -10,7 +10,7 @@
  * cursor.
  */
 
-import assert from 'node:assert/strict';
+import assert from 'node:assert';
 import { expect } from 'chai';
 import sinon from 'sinon';
 import {

@@ -1199,7 +1199,6 @@ async function leaderClusterStatus(): Promise<any> {
 	return leaderRequest({ operation: 'cluster_status' });
 }
 
-/** The shard this node's own configuration resolves to, by core's layering, and whether only the file names it. */
 function localShardConfiguration(): { effective: unknown; fileOnly: boolean } {
 	const fileShard = hdbConfig[CONFIG_PARAMS.REPLICATION_SHARD];
 	const individualShard = assignCMDENVVariables([CONFIG_PARAMS.REPLICATION_SHARD], true)[
@@ -1372,7 +1371,7 @@ async function cloneSchemas(shardedDatabases: readonly string[]): Promise<void> 
 			const tableDesc = dbDescribe[tableName];
 			return tableDesc && typeof tableDesc === 'object' && tableReplicates(tableDesc);
 		});
-		if (replicatedTableNames.length === 0) continue;
+		if (replicatedTableNames.length === 0 && !shardedDatabases.includes(dbName)) continue;
 		if (!databases[dbName]) {
 			try {
 				await createSchema({ database: dbName, operation: OPERATIONS_ENUM.CREATE_DATABASE });
