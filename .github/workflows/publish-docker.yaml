@@ -87,6 +87,9 @@ jobs:
         node-version: [22, 24, 26]
     outputs:
       docker-image-tag: ${{ steps.meta.outputs.version }}
+      # Legs share job outputs and the last to finish wins, but an empty value never
+      # overwrites a set one: only the default-Node leg sets this, so it is stable.
+      default-image-tag: ${{ steps.default-tag.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -129,6 +132,12 @@ jobs:
       - name: Inspect image
         run: |
           docker buildx imagetools inspect harperfast/harper-pro:${{ steps.meta.outputs.version }}
+      - name: Record default image tag
+        id: default-tag
+        if: matrix.node-version == steps.default.outputs.node-version
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
   # V8 pointer-compression variant (harper#919), isolated from the standard build
   # so it can never block the standard release image. The pc legs build FROM
@@ -312,6 +321,7 @@ jobs:
         node-version: [22, 24, 26]
     outputs:
       docker-image-tag: ${{ steps.meta.outputs.version }}
+      default-image-tag: ${{ steps.default-tag.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -353,6 +363,12 @@ jobs:
       - name: Inspect image
         run: |
           docker buildx imagetools inspect harperfast/harper-pro-gpu:${{ steps.meta.outputs.version }}
+      - name: Record default image tag
+        id: default-tag
+        if: matrix.node-version == steps.default.outputs.node-version
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
   build-openshift:
     if: github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'openshift'
@@ -531,13 +547,13 @@ jobs:
           payload: |
             {
               "channel": "#development-ci",
-              "text": "Harper Pro v${{ needs.merge.outputs.docker-image-tag }} has been published to Docker Hub",
+              "text": "Harper Pro v${{ needs.merge.outputs.default-image-tag }} has been published to Docker Hub",
               "blocks": [
                 {
                   "type": "header",
                   "text": {
                     "type": "plain_text",
-                    "text": "Harper Pro v${{ needs.merge.outputs.docker-image-tag }} release"
+                    "text": "Harper Pro v${{ needs.merge.outputs.default-image-tag }} release"
                   }
                 },
                 {
@@ -553,7 +569,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro/${{ needs.merge.outputs.docker-image-tag }}|harperfast/harper-pro:${{ needs.merge.outputs.docker-image-tag }}>"
+                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro/${{ needs.merge.outputs.default-image-tag }}|harperfast/harper-pro:${{ needs.merge.outputs.default-image-tag }}>"
                     }
                   ]
                 }
@@ -634,13 +650,13 @@ jobs:
           payload: |
             {
               "channel": "#development-ci",
-              "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} has been published to Docker Hub",
+              "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.default-image-tag }} has been published to Docker Hub",
               "blocks": [
                 {
                   "type": "header",
                   "text": {
                     "type": "plain_text",
-                    "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} release"
+                    "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.default-image-tag }} release"
                   }
                 },
                 {
@@ -656,7 +672,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro-gpu/${{ needs.merge-gpu.outputs.docker-image-tag }}|harperfast/harper-pro-gpu:${{ needs.merge-gpu.outputs.docker-image-tag }}>"
+                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro-gpu/${{ needs.merge-gpu.outputs.default-image-tag }}|harperfast/harper-pro-gpu:${{ needs.merge-gpu.outputs.default-image-tag }}>"
                     }
                   ]
                 }
