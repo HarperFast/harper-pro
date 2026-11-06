@@ -152,8 +152,9 @@ export async function checkSyncStatus(
 		}
 	}
 
-	// The leader's watermark says nothing about an owned copy from a same-shard peer, which is a separate socket.
-	for (const dbName of Object.keys(targetTimestamps)) {
+	// The leader's watermark says nothing about an owned copy from a same-shard peer, which is a separate socket, and
+	// a resumed snapshot of targets can predate a database the leader now reports as sharded.
+	for (const dbName of new Set([...Object.keys(targetTimestamps), ...(sharding?.databases ?? [])])) {
 		const status = clusterResponse.sharding?.[dbName];
 		if (!status && !sharding?.databases.includes(dbName)) continue;
 		const hold = shardingHold(status);
@@ -161,8 +162,9 @@ export async function checkSyncStatus(
 		syncComplete = false;
 		noteFailure(dbName);
 		blocked[dbName] ??= hold;
+		// Only the owned copy's sources: another shard's ordinary traffic must not hold off the stall deadline.
 		for (const connection of clusterResponse.connections) {
-			if (connection !== leaderConnection && connection.shard !== sharding?.shard) continue;
+			if (connection.shard !== sharding?.shard) continue;
 			for (const socket of connection.database_sockets ?? []) if (socket.database === dbName) noteArrival(socket);
 		}
 	}
@@ -188,7 +190,6 @@ export type MonitorSyncLoopOptions = {
 	/** Databases whose replication socket must exist before sync can complete (default: every target). */
 	requiredSocketDatabases?: string[];
 	sharding?: ShardingExpectation;
-	/** Live: failed sessions so far per database, updated as they are reported. */
 	copyFailures?: CopyFailures;
 	/** Test hooks: injectable clock and delay. */
 	now?: () => number;

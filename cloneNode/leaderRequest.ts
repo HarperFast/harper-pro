@@ -13,7 +13,8 @@ async function requestOverHTTP(target: LeaderHTTPTarget, operation: any, deadlin
 		deadlineMs
 	);
 	try {
-		return await readLeaderResponse(await postToLeader(target, operation, undefined, deadline.signal));
+		// No idle timer: it would cut a buffered package off before this longer deadline.
+		return await readLeaderResponse(await postToLeader(target, operation, 0, deadline.signal));
 	} catch (error) {
 		throw deadline.signal.aborted ? deadline.signal.reason : error;
 	} finally {

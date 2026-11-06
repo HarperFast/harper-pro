@@ -16,7 +16,6 @@ const HOLD_DIRECTORY = process.env.HARPER_TEST_HOLD_COPY_START_DIR;
 export const copyStartHoldDatabaseForTest = HOLD_DIRECTORY ? process.env.HARPER_TEST_HOLD_COPY_START_DB : undefined;
 const HOLD_PEER = process.env.HARPER_TEST_HOLD_COPY_START_PEER;
 
-/** Unset holds a copy from any peer. */
 export function holdsCopyStartFromPeerForTest(peer: string): boolean {
 	return !HOLD_PEER || HOLD_PEER === peer;
 }

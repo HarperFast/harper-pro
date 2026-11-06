@@ -1,8 +1,4 @@
-/**
- * A leader that accepts a clone request and never finishes answering (harper-pro#961) is a failed attempt on both
- * transports, so setup's retry and Unavailable handling runs. The HTTP leader is a real server. The replication
- * transport fakes its socket, as sendOperationToNode's own tests do, since the deadline is what is under test.
- */
+// A leader that accepts a clone request and never finishes answering is a failed attempt on both transports.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';

@@ -617,7 +617,7 @@ describe('checkSyncStatus for a sharded clone', () => {
 	it('does not count arrivals from another shard: live traffic must not mask a stalled owned copy', async () => {
 		const result = await check({
 			connections: [
-				leader([synced]),
+				leader([{ ...synced, lastReceivedLocalTime: utc(NOW) }]),
 				{
 					name: 'other-shard',
 					url: 'wss://other:9933',
@@ -628,6 +628,33 @@ describe('checkSyncStatus for a sharded clone', () => {
 			sharding: { data: copying },
 		});
 		assert.equal(result.latestReceivedMs, 0);
+	});
+
+	it("counts the leader's arrivals when it is the owned copy's source, in the same shard", async () => {
+		const result = await check(
+			{
+				connections: [{ ...leader([{ ...synced, lastReceivedLocalTime: utc(NOW) }]), shard: 1 }],
+				sharding: { data: copying },
+			},
+			{ databases: ['data'], shard: 1 }
+		);
+		assert.equal(result.latestReceivedMs, NOW);
+	});
+
+	it('holds a sharded database that a resumed snapshot of targets predates', async () => {
+		const result = await checkSyncStatus(
+			{ system: 1000 },
+			async () => ({
+				connections: [leader([{ database: 'system', lastReceivedVersion: 5000 }])],
+				sharding: { data: copying },
+			}),
+			LEADER_URL,
+			noopLog,
+			['system'],
+			{ databases: ['data'], shard: 1 }
+		);
+		assert.equal(result.syncComplete, false);
+		assert.deepEqual(result.blocked, { data: 'Waiting for a certified same-shard copy' });
 	});
 
 	it('does not count arrivals on a socket whose copy keeps restarting from one position', async () => {
@@ -731,6 +758,40 @@ describe('monitorSyncLoop naming a failing copy', () => {
 			maxDurationMs: 3_600_000,
 			checkIntervalMs: 3000,
 			log: noopLog,
+			now,
+			delay,
+		});
+		assert.equal(outcome, 'stalled');
+		assert.ok(checks <= 4, `reached the stall deadline, not the ceiling (${checks} checks)`);
+	});
+
+	it('fails at the stall deadline while a busy leader in another shard keeps delivering', async () => {
+		const { now, delay } = clock();
+		let checks = 0;
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { data: 1000 },
+			clusterStatus: async () => {
+				checks++;
+				return {
+					connections: [
+						{
+							name: 'leader',
+							url: LEADER_URL,
+							shard: 0,
+							database_sockets: [{ database: 'data', lastReceivedVersion: 5000, lastReceivedLocalTime: utc(now()) }],
+						},
+					],
+					sharding: {
+						data: { state: 'recovery-required', waitingOrigins: [], errors: [], recovery: { reason: 'owned copy' } },
+					},
+				};
+			},
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 9000,
+			maxDurationMs: 3_600_000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			sharding: { databases: ['data'], shard: 1 },
 			now,
 			delay,
 		});

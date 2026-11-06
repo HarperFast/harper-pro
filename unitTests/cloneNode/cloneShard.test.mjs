@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import {
+	assertResumedShard,
 	chooseCloneShard,
 	CloneShardRefusedError,
 	leaderShardMembers,
 	parseShardOption,
 	pickAutoShard,
+	requireLeaderMaps,
 } from '#src/cloneNode/cloneShard';
 
 const refuses = (input, message) =>
@@ -204,6 +206,49 @@ describe('cloneShard', () => {
 			it('refuses a different explicit shard: that root may already have joined as the first', () => {
 				refuses({ ...unproven, requested: '1' }, /may be the leader's own shard/);
 			});
+		});
+	});
+
+	describe('assertResumedShard', () => {
+		it('passes when nothing disagrees with the shard the clone started as', () => {
+			assertResumedShard({ durable: 1, requested: undefined, configured: undefined });
+			assertResumedShard({ durable: 1, requested: '1', configured: 1 });
+			assertResumedShard({ durable: 0, requested: 'auto', configured: '0' });
+		});
+
+		it('refuses a different explicit option', () => {
+			assert.throws(
+				() => assertResumedShard({ durable: 1, requested: '0', configured: undefined }),
+				/--shard or CLONE_SHARD says shard 0 but this clone is in progress as shard 1/
+			);
+		});
+
+		it('refuses a configuration that now says otherwise, whatever the option', () => {
+			assert.throws(
+				() => assertResumedShard({ durable: 1, requested: 'auto', configured: 0 }),
+				/replication.shard says shard 0 but this clone is in progress as shard 1/
+			);
+		});
+
+		it('has nothing to enforce when the clone took no shard', () => {
+			assertResumedShard({ durable: undefined, requested: undefined, configured: 3 });
+		});
+	});
+
+	describe('requireLeaderMaps', () => {
+		const map = (database) => ({ database, version: 1 });
+
+		it('returns the maps when every requested database has one', () => {
+			assert.deepEqual(requireLeaderMaps(['a', 'b'], [map('b'), map('a')]), [map('b'), map('a')]);
+			assert.deepEqual(requireLeaderMaps([], []), []);
+		});
+
+		it('names a database the read left out: search_by_id omits a missing row', () => {
+			assert.throws(() => requireLeaderMaps(['a', 'b'], [map('a')]), /reports b as sharded but has no shard map/);
+		});
+
+		it('refuses an answer that is not a list', () => {
+			assert.throws(() => requireLeaderMaps(['a'], { error: 'no' }), /answered its shard map read with object/);
 		});
 	});
 });

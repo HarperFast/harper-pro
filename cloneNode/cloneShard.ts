@@ -68,7 +68,6 @@ export function chooseCloneShard({
 	thisNode,
 }: {
 	requested: unknown;
-	/** The shard this node's own configuration layers resolve to. */
 	configured?: unknown;
 	/** The configured shard came only from a config file an older clone attempt wrote, so it may be the leader's. */
 	configuredUnproven?: boolean;
@@ -128,4 +127,41 @@ export function chooseCloneShard({
 	if (list && !list.includes(shard))
 		throw new CloneShardRefusedError(`Shard ${shard} is not in the leader's replication.shards [${list.join(', ')}]`);
 	return { shard, description };
+}
+
+/**
+ * A clone that has picked a shard keeps it: its owned copy and its membership row may already be bound to it. A
+ * restart whose option or configuration now says otherwise would start the node as a different shard.
+ */
+export function assertResumedShard({
+	durable,
+	requested,
+	configured,
+}: {
+	durable: number | undefined;
+	requested: unknown;
+	configured: unknown;
+}): void {
+	if (durable === undefined) return;
+	const request = parseShardOption(requested);
+	const local = configured == null ? undefined : shardNumber(configured, 'replication.shard');
+	for (const [source, shard] of [
+		[SHARD_OPTION, request],
+		['replication.shard', local],
+	] as const) {
+		if (typeof shard === 'number' && shard !== durable)
+			throw new CloneShardRefusedError(
+				`${source} says shard ${shard} but this clone is in progress as shard ${durable}; ` +
+					'correct it, or clone onto a fresh root to change shards'
+			);
+	}
+}
+
+/** `search_by_id` omits a missing row, so an array alone does not show every requested map was read. */
+export function requireLeaderMaps(databases: readonly string[], answer: unknown): any[] {
+	if (!Array.isArray(answer)) throw new Error(`The leader answered its shard map read with ${typeof answer}`);
+	const missing = databases.filter((database) => !answer.some((map) => map?.database === database));
+	if (missing.length)
+		throw new Error(`The leader reports ${missing.join(', ')} as sharded but has no shard map for it`);
+	return answer;
 }
