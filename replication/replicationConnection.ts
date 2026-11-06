@@ -7042,9 +7042,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
 	// The clone's sync monitor runs on the main thread and names this in place of "no data received yet". Only
-	// during an attempt: nothing else reads it, and the text already went to the log above.
+	// during an attempt: nothing else reads it, and the text already went to the log above. This thread's env var
+	// outlives the attempt; the marker does not.
 	function reportCloneCopyFailure(error: unknown) {
-		if (!process.env.HARPER_CLONE_ATTEMPT || !options.isSubscriptionConnection) return;
+		if (!options.isSubscriptionConnection || !cloneAttemptSource()) return;
 		parentPort?.postMessage({
 			type: CLONE_COPY_FAILURE_MESSAGE,
 			database: databaseName,

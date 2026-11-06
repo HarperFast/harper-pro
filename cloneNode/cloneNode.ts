@@ -301,6 +301,7 @@ export async function cloneNode(): Promise<void> {
 			durable: resumeMarker.shard,
 			requested: requestedShard,
 			configured: localShardConfiguration().effective,
+			joined: Boolean(resumeMarker.replicationEstablished),
 		});
 	}
 	if (!usingCertAuth && !resumeMarker) {
@@ -1355,8 +1356,7 @@ async function cloneSchemas(shardedDatabases: readonly string[]): Promise<void> 
 		throw new Error(`Failed to describe leader databases for schema clone: ${err}`, { cause: err });
 	}
 	if (!allDb || typeof allDb !== 'object') {
-		log(`Leader returned unexpected describe_all shape (${typeof allDb}); skipping schema clone`, 'error');
-		return;
+		throw new Error(`Leader returned unexpected describe_all shape (${typeof allDb})`);
 	}
 
 	// `describe_all` returns `{ databaseName: { tableName: { name, schema, attributes, hash_attribute, ... } } }`,

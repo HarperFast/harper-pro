@@ -211,27 +211,37 @@ describe('cloneShard', () => {
 
 	describe('assertResumedShard', () => {
 		it('passes when nothing disagrees with the shard the clone started as', () => {
-			assertResumedShard({ durable: 1, requested: undefined, configured: undefined });
-			assertResumedShard({ durable: 1, requested: '1', configured: 1 });
-			assertResumedShard({ durable: 0, requested: 'auto', configured: '0' });
+			assertResumedShard({ durable: 1, requested: '1', configured: 1, joined: true });
+			assertResumedShard({ durable: 0, requested: 'auto', configured: '0', joined: true });
 		});
 
 		it('refuses a different explicit option', () => {
 			assert.throws(
-				() => assertResumedShard({ durable: 1, requested: '0', configured: undefined }),
+				() => assertResumedShard({ durable: 1, requested: '0', configured: 1, joined: true }),
 				/--shard or CLONE_SHARD says shard 0 but this clone is in progress as shard 1/
 			);
 		});
 
 		it('refuses a configuration that now says otherwise, whatever the option', () => {
 			assert.throws(
-				() => assertResumedShard({ durable: 1, requested: 'auto', configured: 0 }),
+				() => assertResumedShard({ durable: 1, requested: 'auto', configured: 0, joined: true }),
 				/replication.shard says shard 0 but this clone is in progress as shard 1/
 			);
 		});
 
+		it('refuses a joined clone whose configuration lost the shard: setup will not write it back', () => {
+			assert.throws(
+				() => assertResumedShard({ durable: 1, requested: 'auto', configured: undefined, joined: true }),
+				/replication.shard is missing but this clone is in progress as shard 1/
+			);
+		});
+
+		it('allows a clone not yet joined to be missing it: a crash can land between the marker and the config', () => {
+			assertResumedShard({ durable: 1, requested: undefined, configured: undefined, joined: false });
+		});
+
 		it('has nothing to enforce when the clone took no shard', () => {
-			assertResumedShard({ durable: undefined, requested: undefined, configured: 3 });
+			assertResumedShard({ durable: undefined, requested: undefined, configured: 3, joined: true });
 		});
 	});
 

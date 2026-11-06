@@ -137,14 +137,21 @@ export function assertResumedShard({
 	durable,
 	requested,
 	configured,
+	joined,
 }: {
 	durable: number | undefined;
 	requested: unknown;
 	configured: unknown;
+	/** It has joined, so setup will not run again to write the shard back. */
+	joined: boolean;
 }): void {
 	if (durable === undefined) return;
 	const request = parseShardOption(requested);
 	const local = configured == null ? undefined : shardNumber(configured, 'replication.shard');
+	if (joined && local === undefined)
+		throw new CloneShardRefusedError(
+			`replication.shard is missing but this clone is in progress as shard ${durable}; restore it`
+		);
 	for (const [source, shard] of [
 		[SHARD_OPTION, request],
 		['replication.shard', local],
