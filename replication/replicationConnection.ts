@@ -200,13 +200,17 @@ import { server } from '../core/server/Server.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
 import { WebSocket } from 'ws';
-import { threadId, workerData } from 'node:worker_threads';
+import { parentPort, threadId, workerData } from 'node:worker_threads';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 const { forComponent, errorToString } = harperLogger;
 import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptionManager.ts';
 import { materializeOperationResponse } from './materializeOperationResponse.ts';
 import { deferSubscribeUntilSessionForTest, subscribeDeferralAllowedForTest } from './subscribeDeferralForTest.ts';
-import { copyStartHoldDatabaseForTest, holdCopyStartForTest } from './copyStartHoldForTest.ts';
+import {
+	copyStartHoldDatabaseForTest,
+	holdCopyStartForTest,
+	holdsCopyStartFromPeerForTest,
+} from './copyStartHoldForTest.ts';
 import { EventEmitter } from 'events';
 import { createTLSSelector } from '../core/security/keys.js';
 import * as tls from 'node:tls';
@@ -250,7 +254,7 @@ import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
 import { createInflate } from 'node:zlib';
 import { FrameWriter } from './frameWriter.ts';
 import { isExplicitDatabaseSubscription, tableReplicates } from './replicatedDatabases.ts';
-import { cloneAttemptSource, liveCloneAttempt } from '../cloneNode/cloneAttempt.ts';
+import { CLONE_COPY_FAILURE_MESSAGE, cloneAttemptSource, liveCloneAttempt } from '../cloneNode/cloneAttempt.ts';
 import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 import {
 	CopyStallTracker,
@@ -1305,6 +1309,7 @@ export function closeOnInboundMessageError(
 		logger?: { error?: (...args: unknown[]) => void };
 		markInboundClosed: () => void;
 		close: (code: number, reason: string) => void;
+		reportFailure?: (error: unknown) => void;
 	}
 ): void {
 	deps.markInboundClosed();
@@ -1315,7 +1320,19 @@ export function closeOnInboundMessageError(
 		'Error handling incoming replication message; closing so replication resumes from the last durable cursor',
 		error
 	);
+	deps.reportFailure?.(error);
 	deps.close(1011, 'Error handling incoming replication message');
+}
+
+/** One bounded log line: this runs in the last-resort close path, so an unreadable error must not throw here. */
+export function copyFailureText(error: unknown): string {
+	try {
+		return String((error as Error)?.message ?? error)
+			.replace(/\s+/g, ' ')
+			.slice(0, 500);
+	} catch {
+		return 'an error whose message could not be read';
+	}
 }
 
 /**
@@ -5079,12 +5096,19 @@ export class NodeReplicationConnection extends EventEmitter {
 		const delay = this.retryBackoff.nextDelay();
 		if (delay === undefined) return;
 		const { holdMs, transition } = this.copyStall.noteClosed();
-		this.setReconnectTimer(
-			() => {
-				this.connect();
-			},
-			Math.max(delay, holdMs)
-		).unref();
+		const reconnect = () => {
+			stopWakeWatch?.();
+			this.connect();
+		};
+		const timer = this.setReconnectTimer(reconnect, Math.max(delay, holdMs)).unref();
+		// A leg held while this node's owned copy runs has been waiting for it to finish, and may have minutes left.
+		const stopWakeWatch = holdMs
+			? onShardingRecoveryChange((database) => {
+					if (database !== this.databaseName) return;
+					clearTimeout(timer);
+					reconnect();
+				})
+			: undefined;
 		this.reportStuckCopy(transition);
 	}
 	reportStuckCopy(transition: StuckCopyTransition | undefined) {
@@ -6243,6 +6267,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			)
 		) {
 			logger.warn?.(connectionId, 'Replicated transaction failed; reconnecting to replay it', position, error);
+			reportCloneCopyFailure(error);
 			close(1011, 'Replicated transaction failed');
 			return true;
 		} else {
@@ -7016,6 +7041,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
+	// The clone's sync monitor runs on the main thread and names this in place of "no data received yet". Only
+	// during an attempt: nothing else reads it, and the text already went to the log above.
+	function reportCloneCopyFailure(error: unknown) {
+		if (!process.env.HARPER_CLONE_ATTEMPT || !options.isSubscriptionConnection) return;
+		parentPort?.postMessage({
+			type: CLONE_COPY_FAILURE_MESSAGE,
+			database: databaseName,
+			message: copyFailureText(error),
+		});
+	}
 	function noteCopyStall(note: (tracker: CopyStallTracker) => StuckCopyTransition | undefined) {
 		const connection = options.connection;
 		if (!connection?.copyStall || connection.nodeSubscriptions === undefined || connectionSuperseded()) return;
@@ -8549,7 +8584,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 						loadPersistedCopyBounds();
 						if (copyApplyActive() && supportsCheckpointFloors()) reserveCopyStartBounds(copyModeStartTime);
-						if (copyStartHoldDatabaseForTest && copyStartHoldDatabaseForTest === databaseName) {
+						if (
+							copyStartHoldDatabaseForTest &&
+							copyStartHoldDatabaseForTest === databaseName &&
+							holdsCopyStartFromPeerForTest(remoteNodeName)
+						) {
 							await holdCopyStartForTest(connectionSuperseded);
 							if (connectionSuperseded()) return;
 						}
@@ -8588,6 +8627,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									logger,
 									markInboundClosed: () => (wsClosed = true),
 									close,
+									reportFailure: reportCloneCopyFailure,
 								});
 								return;
 							}
@@ -11781,6 +11821,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				logger,
 				markInboundClosed: () => (wsClosed = true),
 				close,
+				reportFailure: reportCloneCopyFailure,
 			});
 		} finally {
 			if (frameOpen) {

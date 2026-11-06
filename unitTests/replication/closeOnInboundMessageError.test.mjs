@@ -10,11 +10,50 @@
  * cursor.
  */
 
+import assert from 'node:assert/strict';
 import { expect } from 'chai';
 import sinon from 'sinon';
-import { closeOnInboundMessageError, shouldCloseOnRecordDecodeFailure } from '#src/replication/replicationConnection';
+import {
+	closeOnInboundMessageError,
+	copyFailureText,
+	shouldCloseOnRecordDecodeFailure,
+} from '#src/replication/replicationConnection';
+
+describe('copyFailureText', () => {
+	it('is one bounded line', () => {
+		assert.equal(copyFailureText(new Error('line one\n  line two')), 'line one line two');
+		assert.equal(copyFailureText(new Error('x'.repeat(1000))).length, 500);
+	});
+
+	it('reads a thrown non-Error', () => {
+		assert.equal(copyFailureText('refused'), 'refused');
+		assert.equal(copyFailureText(undefined), 'undefined');
+	});
+
+	it('does not throw on an error whose message cannot be read: this runs on the close path', () => {
+		const hostile = {
+			get message() {
+				throw new Error('no');
+			},
+		};
+		assert.equal(copyFailureText(hostile), 'an error whose message could not be read');
+	});
+});
 
 describe('closeOnInboundMessageError', () => {
+	it('reports the failure, after latching inbound closed and before closing the socket', () => {
+		const order = [];
+		const error = new Error('boom');
+		closeOnInboundMessageError(error, {
+			connectionId: 7,
+			logger: { error: () => {} },
+			markInboundClosed: () => order.push('latched'),
+			close: () => order.push('closed'),
+			reportFailure: (reported) => order.push(reported === error ? 'reported' : 'wrong error'),
+		});
+		assert.deepEqual(order, ['latched', 'reported', 'closed']);
+	});
+
 	it('latches inbound processing off before closing the socket', () => {
 		const markInboundClosed = sinon.spy();
 		const close = sinon.spy();

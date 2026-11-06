@@ -12,6 +12,7 @@ import {
 	revokeShardingCertificate,
 } from '#src/replication/shardingRecovery';
 import { advanceShardingHistory } from '#src/replication/shardingBootstrapState';
+import { shardingUncertifiedReason } from '#src/replication/shardingBootstrap';
 import { getThisNodeName } from '#src/core/server/nodeName';
 import { originReadyWord, recordShardingOriginBound } from '#src/replication/shardingOriginAdmission';
 import { table } from '#src/core/resources/databases';
@@ -158,5 +159,18 @@ describe('Native sharding completeness certificates', () => {
 		await revokeShardingCertificate(database);
 		assert.equal(Atomics.load(ready, 0), 0);
 		assert.equal(shardingCertificate(database), undefined);
+	});
+});
+
+describe('shardingUncertifiedReason', () => {
+	it('points a node with data predating the policy at the assertion', () => {
+		assert.match(shardingUncertifiedReason(true, false, false), /Missing existing-owner completeness assertion/);
+	});
+	it('never tells a clone to assert: its baseline comes from a certified copy', () => {
+		assert.match(shardingUncertifiedReason(true, false, true), /Waiting for a certified same-shard copy/);
+	});
+	it('waits for a copy when nothing was converted, or the assertion is already made', () => {
+		assert.match(shardingUncertifiedReason(false, false, false), /Waiting for a certified same-shard copy/);
+		assert.match(shardingUncertifiedReason(true, true, false), /Waiting for a certified same-shard copy/);
 	});
 });

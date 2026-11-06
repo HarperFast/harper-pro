@@ -2,13 +2,37 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 export type SyncMonitorLog = (message: string, level?: string) => void;
 
+export type CopyFailures = ReadonlyMap<string, { count: number; message: string }>;
+
 export type SyncCheckResult = {
 	syncComplete: boolean;
-	/** Most recent arrival stamp (ms epoch) among databases still below their target; 0 if none. */
+	/** Most recent arrival stamp (ms epoch) among databases still pending; 0 if none. */
 	latestReceivedMs: number;
 	/** Databases that had a replication socket to the leader in this check. */
 	socketDatabases: Set<string>;
+	/** Why each pending database is not progressing, for those with a known reason. Absent when there are none. */
+	blocked?: Record<string, string>;
 };
+
+export type ShardingExpectation = {
+	/** Databases the leader reports as sharded; each must report ready here, so an absent status cannot pass. */
+	databases: readonly string[];
+	/** This node's shard: its same-shard peers are the source of its owned copy, not just the leader. */
+	shard?: number;
+};
+
+/** `waitingOrigins` is not a hold: it includes any peer that is down, which must not fail a clone of the others. */
+function shardingHold(status: any): string | undefined {
+	if (!status) return 'its sharding status is not available yet';
+	if (status.state === 'available') return undefined;
+	if (status.errors?.length) return status.errors.join('; ');
+	return status.recovery?.reason ?? `sharding is ${status.state}`;
+}
+
+function copyFailureReason(failure: { count: number; message: string } | undefined): string | undefined {
+	if (!failure) return undefined;
+	return `copy failed ${failure.count} ${failure.count === 1 ? 'time' : 'times'}; last error: ${failure.message}`;
+}
 
 /**
  * Check whether every database has caught up with the leader, and report the freshest arrival
@@ -24,36 +48,59 @@ export async function checkSyncStatus(
 	clusterStatus: () => Promise<any>,
 	leaderReplicationURL: string,
 	log: SyncMonitorLog,
-	requiredSocketDatabases: string[] = Object.keys(targetTimestamps)
+	requiredSocketDatabases: string[] = Object.keys(targetTimestamps),
+	sharding?: ShardingExpectation,
+	copyFailures?: CopyFailures
 ): Promise<SyncCheckResult> {
+	const blocked: Record<string, string> = {};
+	const noteFailure = (dbName: string) => {
+		const reason = copyFailureReason(copyFailures?.get(dbName));
+		if (reason) blocked[dbName] ??= reason;
+	};
+	const incomplete = (): SyncCheckResult => {
+		for (const dbName of Object.keys(targetTimestamps)) noteFailure(dbName);
+		return {
+			syncComplete: false,
+			latestReceivedMs: 0,
+			socketDatabases: new Set(),
+			...(Object.keys(blocked).length ? { blocked } : {}),
+		};
+	};
 	const clusterResponse = await clusterStatus();
 	log(`clone sync check cluster status response: ${JSON.stringify(clusterResponse)}`, 'debug');
 
 	if (!clusterResponse) {
 		log('No cluster status response received for clone, will wait and retry');
-		return { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set() };
+		return incomplete();
 	}
 
 	if (!clusterResponse.connections?.length) {
 		log('No connections found in cluster status response for clone, will wait and retry');
-		return { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set() };
+		return incomplete();
 	}
 
 	const leaderConnection = clusterResponse.connections.find((conn) => conn.url === leaderReplicationURL);
 
 	if (!leaderConnection) {
 		log('No connection found matching leader replication URL, will wait and retry');
-		return { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set() };
+		return incomplete();
 	}
 
 	if (!leaderConnection.database_sockets?.length) {
 		log(`No database sockets found for connection leader ${leaderConnection.name}`, 'debug');
-		return { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set() };
+		return incomplete();
 	}
 
 	let syncComplete = true;
 	let latestReceivedMs = 0;
 	const socketDatabases = new Set<string>();
+	// A socket whose copy keeps restarting from one position re-delivers records without getting anywhere, so its
+	// arrivals are not progress: it must reach the stall deadline rather than the far larger ceiling.
+	const noteArrival = (socket: any) => {
+		if (socket.stuckCopy) return;
+		const receivedAt = socket.lastReceivedLocalTime ? Date.parse(socket.lastReceivedLocalTime) : NaN;
+		if (Number.isFinite(receivedAt) && receivedAt > latestReceivedMs) latestReceivedMs = receivedAt;
+	};
 	for (const socket of leaderConnection.database_sockets) {
 		const dbName = socket.database;
 		socketDatabases.add(dbName);
@@ -82,12 +129,13 @@ export async function checkSyncStatus(
 			log(`No lastReceivedVersion data received yet for database ${dbName}`, 'debug');
 		}
 
+		noteFailure(dbName);
+		if (socket.stuckCopy) blocked[dbName] ??= `${socket.stuckCopy.reason} (${socket.stuckCopy.count} times)`;
 		// Only databases still below target slide the stall deadline — arrivals on synced or
 		// untracked sockets must not mask a wedged copy on a pending one. cluster_status formats
 		// the arrival stamp as a UTC string (absent until data arrives); second precision is ample
 		// for a minutes-scale window, and Number.isFinite drops undefined/unparseable values.
-		const receivedAt = socket.lastReceivedLocalTime ? Date.parse(socket.lastReceivedLocalTime) : NaN;
-		if (Number.isFinite(receivedAt) && receivedAt > latestReceivedMs) latestReceivedMs = receivedAt;
+		noteArrival(socket);
 	}
 
 	// A required database with no socket yet (its subscription is still registering with the
@@ -99,11 +147,32 @@ export async function checkSyncStatus(
 	for (const dbName of requiredSocketDatabases) {
 		if (!socketDatabases.has(dbName)) {
 			log(`Database ${dbName}: no replication socket to the leader yet`, 'debug');
+			noteFailure(dbName);
 			syncComplete = false;
 		}
 	}
 
-	return { syncComplete, latestReceivedMs, socketDatabases };
+	// The leader's watermark says nothing about an owned copy from a same-shard peer, which is a separate socket.
+	for (const dbName of Object.keys(targetTimestamps)) {
+		const status = clusterResponse.sharding?.[dbName];
+		if (!status && !sharding?.databases.includes(dbName)) continue;
+		const hold = shardingHold(status);
+		if (!hold) continue;
+		syncComplete = false;
+		noteFailure(dbName);
+		blocked[dbName] ??= hold;
+		for (const connection of clusterResponse.connections) {
+			if (connection !== leaderConnection && connection.shard !== sharding?.shard) continue;
+			for (const socket of connection.database_sockets ?? []) if (socket.database === dbName) noteArrival(socket);
+		}
+	}
+
+	return {
+		syncComplete,
+		latestReceivedMs,
+		socketDatabases,
+		...(Object.keys(blocked).length ? { blocked } : {}),
+	};
 }
 
 export type MonitorSyncLoopOptions = {
@@ -118,6 +187,9 @@ export type MonitorSyncLoopOptions = {
 	log: SyncMonitorLog;
 	/** Databases whose replication socket must exist before sync can complete (default: every target). */
 	requiredSocketDatabases?: string[];
+	sharding?: ShardingExpectation;
+	/** Live: failed sessions so far per database, updated as they are reported. */
+	copyFailures?: CopyFailures;
 	/** Test hooks: injectable clock and delay. */
 	now?: () => number;
 	delay?: (ms: number) => Promise<unknown>;
@@ -152,6 +224,11 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 	// replicate it) becomes required as soon as its socket appears — so on a v5 leader a small user
 	// database finishing first cannot complete the clone while the system copy is still pending.
 	const seenTargetSockets = new Set<string>();
+	let blocked: Record<string, string> | undefined;
+	const reportBlocked = () => {
+		for (const [dbName, reason] of Object.entries(blocked ?? {}))
+			options.log(`Clone sync did not finish for database ${dbName}: ${reason}`, 'error');
+	};
 
 	while (firstCheck || !deadlinePassed()) {
 		firstCheck = false;
@@ -166,7 +243,9 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 				options.clusterStatus,
 				options.leaderReplicationURL,
 				options.log,
-				[...new Set([...baseRequired, ...seenTargetSockets])]
+				[...new Set([...baseRequired, ...seenTargetSockets])],
+				options.sharding,
+				options.copyFailures
 			);
 			checkPromise.catch(() => {});
 			const result = await Promise.race([
@@ -180,6 +259,7 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 				continue;
 			}
 			const { syncComplete, latestReceivedMs, socketDatabases } = result;
+			blocked = result.blocked;
 			for (const dbName of socketDatabases) {
 				if (dbName in options.targetTimestamps) seenTargetSockets.add(dbName);
 			}
@@ -191,10 +271,15 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 
 			// Log every other iteration to reduce noise
 			if (loopCount % 2 === 0) {
+				const named = Object.entries(blocked ?? {})
+					.map(([dbName, reason]) => `database ${dbName}: ${reason}`)
+					.join('; ');
 				options.log(
-					latestReceivedMs
-						? `Sync incomplete; last replication data arrived ${Math.max(0, Math.round((now() - latestReceivedMs) / 1000))}s ago; retrying in ${options.checkIntervalMs}ms`
-						: `Sync incomplete; no replication data received yet; retrying in ${options.checkIntervalMs}ms`
+					named
+						? `Sync incomplete; ${named}; retrying in ${options.checkIntervalMs}ms`
+						: latestReceivedMs
+							? `Sync incomplete; last replication data arrived ${Math.max(0, Math.round((now() - latestReceivedMs) / 1000))}s ago; retrying in ${options.checkIntervalMs}ms`
+							: `Sync incomplete; no replication data received yet; retrying in ${options.checkIntervalMs}ms`
 				);
 			}
 			loopCount++;
@@ -207,5 +292,6 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 		await delay(options.checkIntervalMs);
 	}
 
+	reportBlocked();
 	return gotDefiniteCheck && now() - startedAt >= maxDurationMs ? 'unconverged' : 'stalled';
 }

@@ -9,6 +9,8 @@ const logger = harperLogger.forComponent('replication').conditional;
 export const CLONE_ATTEMPT_FILE = '.cloneAttempt.json';
 export const CLONE_COMPLETION_GRACE_MS = 60_000;
 export const CLONE_COMPLETED_AT_ENV = 'HARPER_CLONE_COMPLETED_AT';
+/** Worker to main thread, per failed replication session during a clone attempt: `{ database, message }`. */
+export const CLONE_COPY_FAILURE_MESSAGE = 'clone-copy-failure';
 
 type CloneAttemptMarker = {
 	attemptId?: unknown;
