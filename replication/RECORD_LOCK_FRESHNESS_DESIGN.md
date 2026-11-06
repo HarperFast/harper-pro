@@ -190,8 +190,8 @@ origin)` sharing one request and one nonce is only sound for a caller whose depe
   the first included, is bounded by `RESTART_ATTEMPT_MS` (3 s, core's bound on a request to a home)
   or what is left of the deadline, so an origin that accepts it and never answers is asked again on a
   fresh nonce; the bound doubles after an attempt that used all of it, so a slow origin still gets
-  time to answer. Once a reply names a position, its entry is waited on to the deadline. Core does not cancel a wait it abandoned (a recall of the
-  pending delegation, its own deadline race): such a wait keeps its slot and retries until its
+  time to answer. Once a reply names a position, its entry is waited on to the deadline. Core does not cancel a wait it abandoned (a recall past
+  `RECALLED_BARRIER_GRACE_MS`, its own deadline race): such a wait keeps its slot and retries until its
   deadline. The `MAX_OUTSTANDING_BARRIERS` cap is per database, so waits on an origin down for good
   can fill it and refuse handoffs that name only live origins (`capacity`). A wait between attempts stays in the set, so the cap, the
   sweep and an unregister still see it. The proof is unchanged: only the current attempt's entry
@@ -237,6 +237,9 @@ The planning rounds that produced this table are in harper-pro#822's description
   lease bound on a wait, and a hole recorded while a barrier is in flight.
 - `integrationTests/cluster/recordLockCluster.test.mjs` — exact hot-key convergence across three
   nodes, with `freshness.applied >= 1` and no poisoned pairs.
+- `integrationTests/cluster/recordLockHotKeyHandoff.test.mjs` — a barrier slower than a contender's
+  poll, through `replicationLatencyInjector.mjs`, since loopback answers one inside the poll: every
+  waiter resolves well inside its wait and barriers stay within twice one grant per waiter.
 - `unitTests/replication/recordLockReclone.test.mjs` — when a copy sets the ever-recloned flag, and
   that the home-map row keeps its creation attempt through every write.
 - `integrationTests/cluster/recordLockClonedNode.test.mjs` — a node joined through `cloneNode` hands a
