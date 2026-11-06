@@ -19,8 +19,10 @@ describe('createReceiveWatchdog', () => {
 		clock = sinon.useFakeTimers();
 	});
 
+	// Not clock.restore(): a spy on the fake setTimeout stays in the default sandbox, and the next
+	// sinon.restore() anywhere in the run would put that dead fake back on globalThis.
 	afterEach(() => {
-		clock.restore();
+		sinon.restore();
 	});
 
 	it('fires onSilence once after intervalMs when bytesRead is unchanged', () => {

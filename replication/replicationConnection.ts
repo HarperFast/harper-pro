@@ -2918,8 +2918,9 @@ export const COPY_DEPRIORITIZED_TABLES = ['hdb_analytics'];
 // System tables whose subscribers drive cluster machinery off the audit `aftercommit` stream and so
 // must be re-read after a copyApply base copy (whose snapshot rows carry no per-row audit events): a
 // whole-table "reload" marker is emitted for each once the system-DB copy is durable. hdb_nodes feeds
-// peer discovery / outbound subscriptions, hdb_certificate feeds CA install. (harper-pro#489)
-export const SYSTEM_RELOAD_TABLES = ['hdb_nodes', 'hdb_certificate'];
+// peer discovery / outbound subscriptions, hdb_certificate feeds CA install, hdb_waf_rules feeds each
+// worker's compiled matcher. (harper-pro#489)
+export const SYSTEM_RELOAD_TABLES = ['hdb_nodes', 'hdb_certificate', 'hdb_waf_rules'];
 
 /**
  * Order a database's table names for a base copy: COPY_PRIORITY_TABLES first (in listed order), then
@@ -3116,6 +3117,42 @@ export function shouldEmitCopyReloadMarker(
 	if (typeof table?.writeReloadMarker !== 'function') return false;
 	if (isSystem) return true;
 	return copiedTables.has(tableName);
+}
+
+const RELOAD_MARKER_RETRY = { initialMs: 1000, maxMs: 30_000 };
+const pendingReloadMarkerRetries = new WeakSet<object>();
+
+/**
+ * Write one table's copy-complete reload marker, retrying until it commits. A subscriber whose iterator
+ * survived the copy has no other signal, and copy finalization must never wait on the marker, so the retry
+ * runs on its own schedule. A duplicate marker only causes one more re-read.
+ */
+export function writeReloadMarkerWithRetry(
+	getTable: () => { writeReloadMarker(): unknown; auditStore?: any } | undefined,
+	description: string,
+	retry: Pick<BackoffOptions, 'initialMs' | 'maxMs' | 'minMs'> = RELOAD_MARKER_RETRY
+): void {
+	const backoff = createBackoff(retry);
+	const attempt = () => {
+		const table = getTable();
+		if (!table) return; // dropped, so nothing is left to re-read
+		// `.then()` so a synchronous throw reaches the catch, never copy finalization.
+		Promise.resolve()
+			.then(() => table.writeReloadMarker())
+			.catch((error: unknown) => {
+				logger.warn?.(`failed to emit reload marker for ${description}`, error);
+				// A pending retry commits after this copy too. A closed store can never commit, and reopening it
+				// ends every subscription on it, whose subscribers re-read.
+				const status = table.auditStore?.rootStore?.status;
+				if (pendingReloadMarkerRetries.has(table) || status === 'closing' || status === 'closed') return;
+				pendingReloadMarkerRetries.add(table);
+				setTimeout(() => {
+					pendingReloadMarkerRetries.delete(table);
+					attempt();
+				}, backoff.nextDelay()).unref();
+			});
+	};
+	attempt();
 }
 
 /**
@@ -5430,8 +5467,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// A user table that got zero copied rows this pass — empty, non-replicated, or fully audited — has
 	// nothing invisible to recover and is skipped (cb1kenobi review, PR #507). A no-op for
 	// audited (LMDB / non-copyApply) copies, which already delivered per-row events. Fire-and-forget: each
-	// marker is its own tiny transaction, and a failure self-heals on the next restart's subscription scan,
-	// so it must never block or fail copy finalization. (harper-pro#489)
+	// marker is its own tiny transaction that retries on failure, and it must never block or fail copy
+	// finalization. (harper-pro#489)
 	function emitCopyReloadMarkers() {
 		if (!copyApplyActive()) return;
 		const isSystem = databaseName === 'system';
@@ -5439,14 +5476,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		for (const tableName of tableNames) {
 			const table = (tables as any)?.[tableName];
 			if (!shouldEmitCopyReloadMarker(isSystem, tableName, table, copiedTablesThisPass)) continue;
-			// `.then(() => writeReloadMarker())` rather than `Promise.resolve(writeReloadMarker())` so a
-			// SYNCHRONOUS throw (the marker's transaction commits inline) is also routed to the catch — never
-			// bubbling out of this fire-and-forget call into copy finalization (maybeFinishCopy).
-			Promise.resolve()
-				.then(() => table.writeReloadMarker())
-				.catch((error: unknown) =>
-					logger.warn?.(connectionId, `failed to emit reload marker for ${databaseName}.${tableName}`, error)
-				);
+			writeReloadMarkerWithRetry(() => (tables as any)?.[tableName], `${databaseName}.${tableName} (${connectionId})`);
 		}
 	}
 	// `wsClosed` alone is not ownership: forceReconnect() schedules the replacement without waiting for this
