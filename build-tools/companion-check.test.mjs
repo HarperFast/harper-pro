@@ -180,7 +180,12 @@ function makeEnv(eventName, openPrs, payloadPr) {
 			}
 		},
 	};
-	const core = { info: () => {}, warning: () => {}, setFailed: (m) => (core.failed = m) };
+	const core = {
+		info: () => {},
+		warnings: [],
+		warning: (m) => core.warnings.push(m),
+		setFailed: (m) => (core.failed = m),
+	};
 	const context = {
 		repo: { owner: 'HarperFast', repo: 'documentation' },
 		eventName,
@@ -476,7 +481,103 @@ writeErr.github.rest.repos.createCommitStatus = async (s) => {
 const writeErrBySha = await run(writeErr);
 assert.equal(writeErrBySha.err2.state, 'pending', 'failed sweep write must not leave the old verdict');
 assert.equal(writeErrBySha.err2.request?.retries, undefined, 'pending fallback keeps the client retries');
-assert.match(writeErr.core.failed, /1 PR/);
+assert.equal(writeErr.core.failed, undefined, 'a 5xx on the write is retried by the next sweep');
+
+// --- a GitHub 5xx warns and leaves the retry to the next sweep; only a fault of ours fails the run ---
+const httpError = (status, message = '') => Object.assign(new Error(message), { status });
+const scriptBug = () => new TypeError('x is not a function');
+
+function faultyEnv(eventName, openPrs, payloadPr, { readBySha = {}, freshByPr = {}, pendingBySha = {} }) {
+	const env = makeEnv(eventName, openPrs, payloadPr);
+	const { repos, pulls } = env.github.rest;
+	const { listCommitStatusesForRef, createCommitStatus } = repos;
+	const { get } = pulls;
+	repos.listCommitStatusesForRef = async (args) => {
+		if (readBySha[args.ref]) throw readBySha[args.ref];
+		return listCommitStatusesForRef(args);
+	};
+	pulls.get = async (args) => {
+		if (freshByPr[args.pull_number]) throw freshByPr[args.pull_number];
+		return get(args);
+	};
+	repos.createCommitStatus = async (status) => {
+		if (status.state === 'pending' && pendingBySha[status.sha]) throw pendingBySha[status.sha];
+		return createCommitStatus(status);
+	};
+	return env;
+}
+
+const outage = faultyEnv('schedule', [pr(740, 'plain', 'out1'), pr(741, 'plain', 'out2')], undefined, {
+	readBySha: { out1: httpError(500) },
+});
+const outageBySha = await run(outage);
+assert.equal(outageBySha.out1.state, 'pending', 'an interrupted PR fails closed');
+assert.match(outageBySha.out1.description, /next run will retry/);
+assert.equal(outageBySha.out2.state, 'success', 'later PRs are still evaluated');
+assert.equal(outage.core.failed, undefined, 'a GitHub 5xx is not a failed run');
+assert.deepEqual(outage.core.warnings, ['PR #740: 500'], 'an empty error message still reports the status');
+
+const outageEvent = faultyEnv('pull_request_target', [], pr(742, 'plain', 'out3'), {
+	readBySha: { out3: httpError(503, 'Service Unavailable') },
+});
+assert.equal((await run(outageEvent)).out3.state, 'pending');
+assert.equal(outageEvent.core.failed, undefined, 'a PR-event run gets the same sweep retry');
+assert.deepEqual(outageEvent.core.warnings, ['PR #742: 503 Service Unavailable']);
+
+const freshOutage = faultyEnv('schedule', [pr(743, 'plain', 'out4')], undefined, {
+	freshByPr: { 743: httpError(502) },
+});
+assert.equal((await run(freshOutage)).out4.state, 'pending');
+assert.equal(freshOutage.core.failed, undefined);
+const freshDenied = faultyEnv('schedule', [pr(744, 'plain', 'out5')], undefined, {
+	freshByPr: { 744: httpError(403, 'Resource not accessible by integration') },
+});
+assert.equal((await run(freshDenied)).out5.state, 'pending');
+assert.match(freshDenied.core.failed, /1 PR/, 'a rejected request still fails the run');
+assert.deepEqual(freshDenied.core.warnings, ['PR #744: 403 Resource not accessible by integration']);
+
+for (const [name, primary, fallback, fails] of [
+	['5xx then 5xx', httpError(500), httpError(500), false],
+	['5xx then rejected', httpError(500), httpError(403, 'denied'), true],
+	['5xx then script bug', httpError(500), scriptBug(), true],
+	['rejected then 5xx', httpError(403, 'denied'), httpError(500), true],
+	['script bug then 5xx', scriptBug(), httpError(500), true],
+]) {
+	const chain = faultyEnv('schedule', [pr(745, 'plain', 'chn1'), pr(746, 'plain', 'chn2')], undefined, {
+		readBySha: { chn1: primary },
+		pendingBySha: { chn1: fallback },
+	});
+	const chainBySha = await run(chain);
+	assert.equal(chainBySha.chn1, undefined, `${name}: the fallback write failed, so nothing was posted`);
+	assert.equal(chainBySha.chn2.state, 'success', `${name}: later PRs are still evaluated`);
+	assert.equal(chain.core.warnings.length, 2, `${name}: both errors are visible`);
+	if (fails) assert.equal(chain.core.failed, '1 PR(s) could not be updated', name);
+	else assert.equal(chain.core.failed, undefined, name);
+}
+
+const mixed = faultyEnv('schedule', [pr(747, 'plain', 'mix1'), pr(748, 'plain', 'mix2')], undefined, {
+	readBySha: { mix1: httpError(500), mix2: httpError(401, 'Bad credentials') },
+});
+const mixedBySha = await run(mixed);
+assert.equal(mixedBySha.mix1.state, 'pending');
+assert.equal(mixedBySha.mix2.state, 'pending');
+assert.equal(mixed.core.failed, '1 PR(s) could not be updated', 'only the PR with a fault of ours counts');
+
+const listOutage = makeEnv('schedule', [pr(749, 'plain', 'lst1')]);
+listOutage.github.paginate = async () => {
+	throw httpError(500);
+};
+assert.deepEqual(await run(listOutage), {});
+assert.equal(listOutage.core.failed, undefined, 'a 5xx listing PRs is not a failed run');
+assert.deepEqual(listOutage.core.warnings, ['Cannot list open PRs: 500']);
+
+for (const fault of [httpError(403, 'denied'), scriptBug()]) {
+	const listBroken = makeEnv('schedule', [pr(750, 'plain', 'lst2')]);
+	listBroken.github.paginate = async () => {
+		throw fault;
+	};
+	await assert.rejects(run(listBroken), fault, 'a fault of ours listing PRs still fails the run');
+}
 
 // --- secret guards ---
 process.env.COMPANION_CHECK_TOKEN = 'tok';
