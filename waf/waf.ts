@@ -25,11 +25,11 @@
  * Robustness invariants (adversarial review):
  * - after any recovery the matcher converges on the persisted rows with no later write. Every
  *   subscription that resolves schedules a scan, so a commit after registration is either in that
- *   scan or fires an event (O5/O7). A full copy's audit-less rows fire no event on a subscription
- *   that survives it, so the copy's reload marker is the signal (SYSTEM_RELOAD_TABLES in
+ *   scan or fires an event. A full copy's audit-less rows fire no event on a subscription that
+ *   survives it, so the copy's reload marker is the signal (SYSTEM_RELOAD_TABLES in
  *   replication/replicationConnection.ts);
  * - a compile can't throw out of start() or a timer — on failure the current matcher stays
- *   (pass-through if none has compiled) and a backoff retry runs (O2);
+ *   (pass-through if none has compiled) and a backoff retry runs;
  * - the middleware wraps evaluate() and FAILS OPEN on any internal error (O1);
  * - match logging is rate-limited per rule to prevent a log-flood DoS (O3).
  *
@@ -354,7 +354,7 @@ export function start(options: WafComponentOptions) {
 				iterator = events[Symbol.asyncIterator]();
 				if (stopped) break;
 				activeIterator = iterator;
-				// The listener is registered, so nothing committed after this scan can be missed (O5/O7).
+				// The listener is registered, so nothing committed after this scan can be missed.
 				scheduleRecompile();
 				while (true) {
 					const { value: event, done } = await iterator.next();
@@ -376,7 +376,7 @@ export function start(options: WafComponentOptions) {
 		}
 	})().catch((error) => logger.error?.('WAF subscription loop exited unexpectedly', error));
 
-	// Synchronous so a worker serves its rules from the moment the middleware registers (O2).
+	// Synchronous so a worker serves its rules from the moment the middleware registers.
 	compileWithRetry();
 
 	/**
@@ -479,7 +479,7 @@ export function start(options: WafComponentOptions) {
 	);
 	logger.info?.('WAF middleware registered (request phase)');
 
-	// O8: closing the subscription ends the loop and removes its listener.
+	// Closing the subscription ends the loop and removes its listener.
 	stopWorker = () => {
 		stopped = true;
 		if (recompileTimer) clearTimeout(recompileTimer);

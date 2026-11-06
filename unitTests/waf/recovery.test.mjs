@@ -103,7 +103,6 @@ function isBlocked(server, url) {
 	return server.middleware(request, () => 'pass')?.status === 403;
 }
 
-/** Started, subscribed and past the scan the first subscription schedules. */
 async function startSettled(table, options = {}) {
 	const server = makeServer();
 	start({ server, ensureTable: () => table, debounceMs: 5, ...options });

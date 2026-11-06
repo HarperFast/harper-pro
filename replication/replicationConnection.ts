@@ -2919,7 +2919,7 @@ export const COPY_DEPRIORITIZED_TABLES = ['hdb_analytics'];
 // must be re-read after a copyApply base copy (whose snapshot rows carry no per-row audit events): a
 // whole-table "reload" marker is emitted for each once the system-DB copy is durable. hdb_nodes feeds
 // peer discovery / outbound subscriptions, hdb_certificate feeds CA install, hdb_waf_rules feeds each
-// worker's compiled matcher (WAF_RULE_TABLE in waf/waf.ts). (harper-pro#489)
+// worker's compiled matcher. (harper-pro#489)
 export const SYSTEM_RELOAD_TABLES = ['hdb_nodes', 'hdb_certificate', 'hdb_waf_rules'];
 
 /**
@@ -3128,12 +3128,14 @@ const pendingReloadMarkerRetries = new WeakSet<object>();
  * runs on its own schedule. A duplicate marker only causes one more re-read.
  */
 export function writeReloadMarkerWithRetry(
-	table: { writeReloadMarker(): unknown; auditStore?: any },
+	getTable: () => { writeReloadMarker(): unknown; auditStore?: any } | undefined,
 	description: string,
-	retry: { initialMs: number; maxMs: number } = RELOAD_MARKER_RETRY
+	retry: BackoffOptions = RELOAD_MARKER_RETRY
 ): void {
 	const backoff = createBackoff(retry);
 	const attempt = () => {
+		const table = getTable();
+		if (!table) return; // dropped, so nothing is left to re-read
 		// `.then()` so a synchronous throw reaches the catch, never copy finalization.
 		Promise.resolve()
 			.then(() => table.writeReloadMarker())
@@ -5474,7 +5476,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		for (const tableName of tableNames) {
 			const table = (tables as any)?.[tableName];
 			if (!shouldEmitCopyReloadMarker(isSystem, tableName, table, copiedTablesThisPass)) continue;
-			writeReloadMarkerWithRetry(table, `${databaseName}.${tableName} (${connectionId})`);
+			writeReloadMarkerWithRetry(() => (tables as any)?.[tableName], `${databaseName}.${tableName} (${connectionId})`);
 		}
 	}
 	// `wsClosed` alone is not ownership: forceReconnect() schedules the replacement without waiting for this

@@ -72,7 +72,7 @@ describe('writeReloadMarkerWithRetry', () => {
 
 	it('writes once when the first attempt commits', async () => {
 		let writes = 0;
-		writeReloadMarkerWithRetry({ writeReloadMarker: async () => void writes++ }, 'system.table', FAST_RETRY);
+		writeReloadMarkerWithRetry(() => ({ writeReloadMarker: async () => void writes++ }), 'system.table', FAST_RETRY);
 		await until(() => writes === 1);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(writes).to.equal(1);
@@ -87,7 +87,7 @@ describe('writeReloadMarkerWithRetry', () => {
 				if (writes === 2) return Promise.reject(new Error('commit failure'));
 			},
 		};
-		expect(() => writeReloadMarkerWithRetry(table, 'system.table', FAST_RETRY)).to.not.throw();
+		expect(() => writeReloadMarkerWithRetry(() => table, 'system.table', FAST_RETRY)).to.not.throw();
 		await until(() => writes === 3);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(writes).to.equal(3);
@@ -102,13 +102,12 @@ describe('writeReloadMarkerWithRetry', () => {
 				if (fail) throw new Error('commit failure');
 			},
 		};
-		const slowRetry = { initialMs: 200, maxMs: 200 };
-		writeReloadMarkerWithRetry(table, 'system.table', slowRetry);
-		writeReloadMarkerWithRetry(table, 'system.table', slowRetry);
+		const slowRetry = { initialMs: 200, maxMs: 200, minMs: 200 };
+		writeReloadMarkerWithRetry(() => table, 'system.table', slowRetry);
+		writeReloadMarkerWithRetry(() => table, 'system.table', slowRetry);
 		await until(() => writes === 2);
 		await new Promise((resolve) => setTimeout(resolve, 5));
 		fail = false;
-		// one retry, however many attempts failed
 		await new Promise((resolve) => setTimeout(resolve, 400));
 		expect(writes).to.equal(3);
 	});
@@ -123,10 +122,29 @@ describe('writeReloadMarkerWithRetry', () => {
 					throw new Error('store closed');
 				},
 			};
-			writeReloadMarkerWithRetry(table, 'data.table', FAST_RETRY);
+			writeReloadMarkerWithRetry(() => table, 'data.table', FAST_RETRY);
 			await until(() => writes === 1);
 			await new Promise((resolve) => setTimeout(resolve, 30));
 			expect(writes).to.equal(1);
 		});
 	}
+
+	it('stops retrying once the table is dropped from an open database', async () => {
+		let writes = 0;
+		const table = {
+			auditStore: { rootStore: { status: 'open' } },
+			writeReloadMarker() {
+				writes++;
+				throw new Error('table dropped');
+			},
+		};
+		let live = table;
+		writeReloadMarkerWithRetry(() => live, 'data.table', { initialMs: 2, maxMs: 2, minMs: 2 });
+		await until(() => writes >= 2);
+		live = undefined;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const settled = writes;
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(writes).to.equal(settled);
+	});
 });

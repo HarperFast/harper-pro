@@ -99,7 +99,6 @@ async function persistedRuleIds(node, signal) {
 		.sort();
 }
 
-/** Each http worker's most recent compile, from its own `[http/N] ... WAF compiled N rules` line. */
 async function lastCompiledRuleCounts(node) {
 	const counts = {};
 	for (const [, thread, count] of (await readLog(node)).matchAll(/\[(http\/\d+)\].*WAF compiled (\d+) rules/g))
