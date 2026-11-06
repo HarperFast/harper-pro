@@ -864,6 +864,8 @@ async function getSSHKnownHosts(): Promise<{ known_hosts: string | null }> {
 	return { known_hosts: await readFile(knownHostsFile, 'utf8') };
 }
 
+// These will register the operations for the operations API. For now the method and schema are ignored,
+// they are there for when build the REST interface for operations API
 server.registerOperation?.({
 	name: 'add_ssh_key',
 	execute: addSSHKey,
@@ -894,8 +896,6 @@ server.registerOperation?.({
 
 server.registerOperation?.({
 	name: 'list_ssh_keys',
-	readOnly: true,
-	inputSchema: { type: 'object', properties: {} },
 	execute: listSSHKeys,
 	httpMethod: 'GET',
 	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],

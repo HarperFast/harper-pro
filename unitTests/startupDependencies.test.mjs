@@ -5,9 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// These packages remain deferred, including validation of the built-in empty-object contracts.
+// The packages core's own startupDependencies test defers, plus the full lodash build.
 const DEFERRED_PACKAGES = [
-	'ajv',
 	'lmdb',
 	'pkijs',
 	'asn1js',
