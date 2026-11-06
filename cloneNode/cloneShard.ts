@@ -121,13 +121,18 @@ export function chooseCloneShard({
 			members.filter((member) => member.shard === candidate && member.live).length;
 		description = `shard ${shard} from "auto"; live members: ${list.map((candidate) => `${candidate}=${liveCount(candidate)}`).join(', ')}`;
 	} else if (leaderShard != null || list) {
-		// A leader with neither holds no slots itself, and a clone of it may do the same: from any peer, a node that owns
-		// nothing has nothing to wait for.
 		throw new CloneShardRefusedError(
 			`The leader is sharded and a clone does not inherit its shard: choose this node's shard with ${SHARD_OPTION}, ` +
 				`as a number or "auto"${listing}`
 		);
-	} else return { description: 'no shard: the leader is not sharded' };
+	} else {
+		// A leader with neither holds no slots, and a clone of it may do the same: the documented fast clone.
+		return {
+			description: Object.keys(leaderStatus?.sharding ?? {}).length
+				? 'no shard: the leader owns no slots, so this node will own none'
+				: 'no shard: the leader is not sharded',
+		};
+	}
 
 	if (list && !list.includes(shard))
 		throw new CloneShardRefusedError(`Shard ${shard} is not in the leader's replication.shards [${list.join(', ')}]`);

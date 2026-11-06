@@ -25,12 +25,12 @@ const SHARDED = { leaderShard: 0, leaderShards: [0, 1] };
 describe('cloneShard', () => {
 	describe('parseShardOption', () => {
 		it('reads a number, including 0, and "auto"; unset and empty mean no option', () => {
-			assert.equal(parseShardOption('1'), 1);
-			assert.equal(parseShardOption('0'), 0);
-			assert.equal(parseShardOption(2), 2);
-			assert.equal(parseShardOption('auto'), 'auto');
-			assert.equal(parseShardOption(undefined), undefined);
-			assert.equal(parseShardOption(''), undefined);
+			assert.strictEqual(parseShardOption('1'), 1);
+			assert.strictEqual(parseShardOption('0'), 0);
+			assert.strictEqual(parseShardOption(2), 2);
+			assert.strictEqual(parseShardOption('auto'), 'auto');
+			assert.strictEqual(parseShardOption(undefined), undefined);
+			assert.strictEqual(parseShardOption(''), undefined);
 		});
 
 		for (const bad of ['abc', '1.5', '-1', '65536', ' ']) {
@@ -45,33 +45,33 @@ describe('cloneShard', () => {
 		const offline = (shard) => ({ shard, live: false });
 
 		it('picks the listed shard with the fewest live members', () => {
-			assert.equal(pickAutoShard([0, 1], [live(0), live(1), live(1)]), 0);
-			assert.equal(pickAutoShard([0, 1], [live(0), live(0), live(1)]), 1);
+			assert.strictEqual(pickAutoShard([0, 1], [live(0), live(1), live(1)]), 0);
+			assert.strictEqual(pickAutoShard([0, 1], [live(0), live(0), live(1)]), 1);
 		});
 
 		it('takes the lowest shard number on a tie, whatever the list order', () => {
-			assert.equal(pickAutoShard([1, 0], [live(0), live(1)]), 0);
-			assert.equal(pickAutoShard([2, 1], []), 1);
+			assert.strictEqual(pickAutoShard([1, 0], [live(0), live(1)]), 0);
+			assert.strictEqual(pickAutoShard([2, 1], []), 1);
 		});
 
 		it('counts only live members', () => {
-			assert.equal(pickAutoShard([0, 1], [live(0), live(0), live(1), offline(1), offline(1)]), 1);
+			assert.strictEqual(pickAutoShard([0, 1], [live(0), live(0), live(1), offline(1), offline(1)]), 1);
 		});
 
 		it('fills a shard with no members at all', () => {
-			assert.equal(pickAutoShard([0, 1, 2], [live(0), live(1)]), 2);
+			assert.strictEqual(pickAutoShard([0, 1, 2], [live(0), live(1)]), 2);
 		});
 
 		it('passes over a shard whose members are all offline: nothing to copy its owned slots from', () => {
-			assert.equal(pickAutoShard([0, 1], [live(0), offline(1)]), 0);
+			assert.strictEqual(pickAutoShard([0, 1], [live(0), offline(1)]), 0);
 		});
 
 		it('never adds a shard: a member outside the list is ignored', () => {
-			assert.equal(pickAutoShard([0, 1], [live(0), live(1), live(1), live(7)]), 0);
+			assert.strictEqual(pickAutoShard([0, 1], [live(0), live(1), live(1), live(7)]), 0);
 		});
 
 		it('answers nothing when every shard has only offline members', () => {
-			assert.equal(pickAutoShard([0, 1], [offline(0), offline(1)]), undefined);
+			assert.strictEqual(pickAutoShard([0, 1], [offline(0), offline(1)]), undefined);
 		});
 	});
 
@@ -114,12 +114,14 @@ describe('cloneShard', () => {
 		});
 
 		it('lets a clone of a leader holding no slots hold none either, with no option', () => {
-			assert.strictEqual(chosen({ leaderStatus: { sharding: { data: {} } } }), undefined);
+			const result = chooseCloneShard({ thisNode: 'new-node', leaderStatus: { sharding: { data: {} } } });
+			assert.strictEqual(result.shard, undefined);
+			assert.strictEqual(result.description, 'no shard: the leader owns no slots, so this node will own none');
 		});
 
 		it('honors an explicit number, shard 0 included', () => {
-			assert.equal(chosen({ ...SHARDED, requested: '1' }), 1);
-			assert.equal(chosen({ ...SHARDED, requested: '0' }), 0);
+			assert.strictEqual(chosen({ ...SHARDED, requested: '1' }), 1);
+			assert.strictEqual(chosen({ ...SHARDED, requested: '0' }), 0);
 		});
 
 		it('refuses a shard the leader does not list', () => {
@@ -128,13 +130,13 @@ describe('cloneShard', () => {
 		});
 
 		it('keeps an explicit shard with no list to check against', () => {
-			assert.equal(chosen({ leaderShard: 0, requested: '7' }), 7);
+			assert.strictEqual(chosen({ leaderShard: 0, requested: '7' }), 7);
 		});
 
 		it("takes this node's configured shard with no option", () => {
-			assert.equal(chosen({ ...SHARDED, configured: 1 }), 1);
-			assert.equal(chosen({ ...SHARDED, configured: '1' }), 1);
-			assert.equal(chosen({ ...SHARDED, configured: 0 }), 0);
+			assert.strictEqual(chosen({ ...SHARDED, configured: 1 }), 1);
+			assert.strictEqual(chosen({ ...SHARDED, configured: '1' }), 1);
+			assert.strictEqual(chosen({ ...SHARDED, configured: 0 }), 0);
 		});
 
 		it('refuses an explicit shard that disagrees with the configuration, instead of ignoring either', () => {
@@ -142,11 +144,14 @@ describe('cloneShard', () => {
 				{ ...SHARDED, requested: '1', configured: 0 },
 				/asks for shard 1 but this node is configured for shard 0/
 			);
-			assert.equal(chosen({ ...SHARDED, requested: '1', configured: 1 }), 1);
+			assert.strictEqual(chosen({ ...SHARDED, requested: '1', configured: 1 }), 1);
 		});
 
 		it('keeps an existing choice on "auto", so a restart does not re-pick from a changed view', () => {
-			assert.equal(chosen({ ...SHARDED, requested: 'auto', configured: 1, leaderStatus: { connections: [] } }), 1);
+			assert.strictEqual(
+				chosen({ ...SHARDED, requested: 'auto', configured: 1, leaderStatus: { connections: [] } }),
+				1
+			);
 		});
 
 		it('resolves "auto" from the leader\'s members and describes the choice', () => {
@@ -161,8 +166,8 @@ describe('cloneShard', () => {
 					],
 				},
 			});
-			assert.equal(result.shard, 0);
-			assert.equal(result.description, 'shard 0 from "auto"; live members: 0=1, 1=2');
+			assert.strictEqual(result.shard, 0);
+			assert.strictEqual(result.description, 'shard 0 from "auto"; live members: 0=1, 1=2');
 		});
 
 		it('refuses "auto" with no list to fill, naming the option', () => {
@@ -204,7 +209,7 @@ describe('cloneShard', () => {
 			});
 
 			it('stands once the operator confirms it', () => {
-				assert.equal(chosen({ ...unproven, requested: '0' }), 0);
+				assert.strictEqual(chosen({ ...unproven, requested: '0' }), 0);
 			});
 
 			it('refuses a different explicit shard: that root may already have joined as the first', () => {

@@ -1,8 +1,4 @@
-/**
- * Cloning from a statically sharded leader (harper-pro#1280): a clone chooses its shard, copies `@sharded` tables
- * with no operator assertion, and reports a database it cannot copy. The cluster runs an inverted custom map, so
- * a clone that started its own default map from the cloned shard list would conflict with it and never finish.
- */
+// The cluster runs an inverted custom map: a clone that started its own default map would conflict with it.
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, writeFileSync } from 'node:fs';

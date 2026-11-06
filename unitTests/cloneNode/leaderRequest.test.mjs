@@ -1,4 +1,3 @@
-// A leader that accepts a clone request and never finishes answering is a failed attempt on both transports.
 import assert from 'node:assert';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
@@ -128,7 +127,7 @@ describe('requestLeader', function () {
 				sshKeysThrough((operation) => requestLeader(target, operation, DEADLINE_MS)),
 				/list_ssh_keys failed on the leader 3 times: list_ssh_keys to the leader did not answer/
 			);
-			assert.equal(requests, 3);
+			assert.strictEqual(requests, 3);
 		});
 
 		it('also bounds a leader that holds the connection before reading the request', async () => {
@@ -193,7 +192,7 @@ describe('requestLeader', function () {
 				sshKeysThrough((operation) => requestLeader(transport, operation, DEADLINE_MS)),
 				/list_ssh_keys failed on the leader 3 times/
 			);
-			assert.equal(sent, 3);
+			assert.strictEqual(sent, 3);
 		});
 
 		it('answers an array as an array, as HTTP does, though the socket wraps it to carry the request id', async () => {
