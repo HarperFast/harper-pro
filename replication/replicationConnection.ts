@@ -3130,7 +3130,7 @@ const pendingReloadMarkerRetries = new WeakSet<object>();
 export function writeReloadMarkerWithRetry(
 	getTable: () => { writeReloadMarker(): unknown; auditStore?: any } | undefined,
 	description: string,
-	retry: BackoffOptions = RELOAD_MARKER_RETRY
+	retry: Pick<BackoffOptions, 'initialMs' | 'maxMs' | 'minMs'> = RELOAD_MARKER_RETRY
 ): void {
 	const backoff = createBackoff(retry);
 	const attempt = () => {

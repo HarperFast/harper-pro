@@ -479,7 +479,6 @@ export function start(options: WafComponentOptions) {
 	);
 	logger.info?.('WAF middleware registered (request phase)');
 
-	// Closing the subscription ends the loop and removes its listener.
 	stopWorker = () => {
 		stopped = true;
 		if (recompileTimer) clearTimeout(recompileTimer);
