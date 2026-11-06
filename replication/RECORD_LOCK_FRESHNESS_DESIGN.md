@@ -239,7 +239,7 @@ The planning rounds that produced this table are in harper-pro#822's description
   nodes, with `freshness.applied >= 1` and no poisoned pairs.
 - `integrationTests/cluster/recordLockHotKeyHandoff.test.mjs` — a barrier slower than a contender's
   poll, through `replicationLatencyInjector.mjs`, since loopback answers one inside the poll: every
-  waiter resolves well inside its wait and barriers stay within one grant per waiter.
+  waiter resolves well inside its wait and barriers stay within twice one grant per waiter.
 - `unitTests/replication/recordLockReclone.test.mjs` — when a copy sets the ever-recloned flag, and
   that the home-map row keeps its creation attempt through every write.
 - `integrationTests/cluster/recordLockClonedNode.test.mjs` — a node joined through `cloneNode` hands a
