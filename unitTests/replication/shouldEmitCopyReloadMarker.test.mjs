@@ -11,7 +11,12 @@
  */
 
 import { expect } from 'chai';
-import { shouldEmitCopyReloadMarker } from '#src/replication/replicationConnection';
+import {
+	shouldEmitCopyReloadMarker,
+	SYSTEM_RELOAD_TABLES,
+	writeReloadMarkerWithRetry,
+} from '#src/replication/replicationConnection';
+import { WAF_RULE_TABLE } from '#src/waf/waf';
 
 const withMarker = { writeReloadMarker: () => {} };
 
@@ -44,5 +49,47 @@ describe('shouldEmitCopyReloadMarker', () => {
 		expect(shouldEmitCopyReloadMarker(false, 'dog', undefined, copied)).to.equal(false);
 		// even a system table without the method cannot emit
 		expect(shouldEmitCopyReloadMarker(true, 'hdb_nodes', {}, copied)).to.equal(false);
+	});
+});
+
+describe('SYSTEM_RELOAD_TABLES', () => {
+	it('names the WAF rule table, so a copy re-drives a matcher whose subscription survived it', () => {
+		expect(SYSTEM_RELOAD_TABLES).to.include(WAF_RULE_TABLE);
+		// a table emptied on the leader must still re-drive it, so the copied-set cannot gate this
+		expect(shouldEmitCopyReloadMarker(true, WAF_RULE_TABLE, withMarker, new Set())).to.equal(true);
+	});
+});
+
+describe('writeReloadMarkerWithRetry', () => {
+	const FAST_RETRY = { initialMs: 2, maxMs: 4 };
+	const until = async (condition) => {
+		const deadline = Date.now() + 5000;
+		while (!condition()) {
+			if (Date.now() > deadline) throw new Error('timed out');
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+	};
+
+	it('writes once when the first attempt commits', async () => {
+		let writes = 0;
+		writeReloadMarkerWithRetry({ writeReloadMarker: async () => void writes++ }, 'system.table', FAST_RETRY);
+		await until(() => writes === 1);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(writes).to.equal(1);
+	});
+
+	it('retries a rejected and a synchronously thrown write until one commits, then stops', async () => {
+		let writes = 0;
+		const table = {
+			writeReloadMarker() {
+				writes++;
+				if (writes === 1) throw new Error('synchronous failure');
+				if (writes === 2) return Promise.reject(new Error('commit failure'));
+			},
+		};
+		expect(() => writeReloadMarkerWithRetry(table, 'system.table', FAST_RETRY)).to.not.throw();
+		await until(() => writes === 3);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(writes).to.equal(3);
 	});
 });

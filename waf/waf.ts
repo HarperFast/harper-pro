@@ -23,10 +23,13 @@
  * The component itself is wired into HARPER_BUILTIN_COMPONENTS in bin/harper.js.
  *
  * Robustness invariants (adversarial review):
- * - the worker start hook subscribes BEFORE the initial scan so a rule committed in the scan
- *   window still triggers a recompile (O5/O7);
- * - the initial compile can't throw out of start() — on failure the middleware still registers
- *   (pass-through) and a backoff retry runs (O2);
+ * - after any recovery the matcher converges on the persisted rows with no later write. Every
+ *   subscription that resolves schedules a scan, so a commit after registration is either in that
+ *   scan or fires an event (O5/O7). A full copy's audit-less rows fire no event on a subscription
+ *   that survives it, so the copy's reload marker is the signal (SYSTEM_RELOAD_TABLES in
+ *   replication/replicationConnection.ts);
+ * - a compile can't throw out of start() or a timer — on failure the current matcher stays
+ *   (pass-through if none has compiled) and a backoff retry runs (O2);
  * - the middleware wraps evaluate() and FAILS OPEN on any internal error (O1);
  * - match logging is rate-limited per rule to prevent a log-flood DoS (O3).
  *
@@ -47,6 +50,7 @@
  *   operations (ruleOperations.ts); system tables replicate cluster-wide by default.
  */
 
+import { setTimeout as delay } from 'node:timers/promises';
 import { loggerWithTag } from '../core/utility/logging/harper_logger.js';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { canonicalizePath, compileRules, pruneRuleStats, type WafMatcher, type WafRequestInfo } from './matcher.ts';
@@ -301,33 +305,63 @@ export function start(options: WafComponentOptions) {
 	// --- lifecycle flags/timers (O8: cleared by stop) ---
 	let stopped = false;
 	let recompileTimer: NodeJS.Timeout | null = null;
-	let initialRetryTimer: NodeJS.Timeout | null = null;
+	let retryTimer: NodeJS.Timeout | null = null;
+	let retryAttempt = 0;
+	let activeIterator: AsyncIterator<any> | null = null;
+	const stopController = new AbortController();
+
+	// O2: keeps the current matcher on failure, with at most one retry pending however many events fail.
+	const compileWithRetry = () => {
+		if (stopped) return;
+		try {
+			recompile();
+		} catch (error) {
+			logger.error?.('WAF rule compile failed; keeping the current matcher', error);
+			if (retryTimer) return;
+			retryTimer = setTimeout(
+				() => {
+					retryTimer = null;
+					compileWithRetry();
+				},
+				Math.min(1000 * 2 ** retryAttempt++, 30_000)
+			);
+			retryTimer.unref?.();
+			return;
+		}
+		retryAttempt = 0;
+		if (retryTimer) clearTimeout(retryTimer);
+		retryTimer = null;
+	};
 
 	const scheduleRecompile = () => {
 		if (recompileTimer || stopped) return;
 		recompileTimer = setTimeout(() => {
 			recompileTimer = null;
-			if (stopped) return;
-			try {
-				recompile();
-			} catch (error) {
-				logger.error?.('WAF rule recompile failed; keeping previous matcher', error);
-			}
+			compileWithRetry();
 		}, debounceMs);
 		recompileTimer.unref?.();
 	};
 
-	// O5/O7: subscribe BEFORE the initial scan so a rule committed during the scan window still
-	// fires an event (queued behind the async subscribe) and triggers a debounced recompile.
-	// The events processed before the initial recompile completes only schedule recompiles, so no
-	// event is lost even though the first scan reads slightly later.
+	// Runs from stop(), which start() calls first, so a close that fails must not abort either.
+	const closeIterator = (iterator: AsyncIterator<any>) => {
+		(async () => iterator.return?.())().catch((error) =>
+			logger.warn?.('WAF rule subscription did not close cleanly', error)
+		);
+	};
+
 	(async () => {
 		while (!stopped) {
+			let iterator: AsyncIterator<any> | undefined;
 			try {
 				const events = await WafRuleTable.subscribe({ omitCurrent: true });
+				iterator = events[Symbol.asyncIterator]();
 				if (stopped) break;
-				for await (const event of events) {
-					if (stopped) break;
+				activeIterator = iterator;
+				// O5/O7: the listener is registered, so nothing committed after this scan can be missed.
+				scheduleRecompile();
+				while (true) {
+					const { value: event, done } = await iterator.next();
+					if (done || stopped) break;
 					if (event?.type === 'end_txn') continue;
 					scheduleRecompile();
 				}
@@ -335,30 +369,18 @@ export function start(options: WafComponentOptions) {
 			} catch (error) {
 				if (stopped) break;
 				logger.error?.('WAF rule subscription failed; retrying', error);
+			} finally {
+				activeIterator = null;
+				if (iterator) closeIterator(iterator);
 			}
-			if (!stopped) await new Promise((resolve) => setTimeout(resolve, 1000).unref?.());
+			await delay(1000, undefined, { ref: false, signal: stopController.signal }).catch(() => {});
 		}
 	})().catch((error) => logger.error?.('WAF subscription loop exited unexpectedly', error));
 
-	// O2: the initial compile must not throw out of start() (that would skip middleware
-	// registration and silently pass ALL traffic on this worker with no retry). On failure keep
-	// the null/empty matcher (pass-through) and retry with backoff, symmetric with the debounced
-	// keep-previous-on-error path.
-	const initialCompileWithRetry = (attempt: number) => {
-		if (stopped) return;
-		try {
-			recompile();
-		} catch (error) {
-			const delay = Math.min(1000 * 2 ** attempt, 30_000);
-			logger.error?.(`WAF initial rule compile failed; passing traffic through, retrying in ${delay}ms`, error);
-			initialRetryTimer = setTimeout(() => {
-				initialRetryTimer = null;
-				initialCompileWithRetry(attempt + 1);
-			}, delay);
-			initialRetryTimer.unref?.();
-		}
-	};
-	initialCompileWithRetry(0);
+	// O2: the first compile is synchronous so a worker serves its rules from the moment the middleware
+	// registers. It must not throw out of start() (that would skip middleware registration and silently
+	// pass ALL traffic on this worker with no retry).
+	compileWithRetry();
 
 	/**
 	 * Shadow would-block preview log (wave 2): a shadow rule (or, in monitor mode, any rule) that
@@ -460,14 +482,16 @@ export function start(options: WafComponentOptions) {
 	);
 	logger.info?.('WAF middleware registered (request phase)');
 
-	// O8: teardown for component reload — break the subscription loop and clear pending timers so
-	// they don't leak across reloads.
+	// O8: teardown for component reload — close the subscription, which ends the loop and removes its
+	// listener, and clear pending timers so they don't leak across reloads.
 	stopWorker = () => {
 		stopped = true;
 		if (recompileTimer) clearTimeout(recompileTimer);
-		if (initialRetryTimer) clearTimeout(initialRetryTimer);
+		if (retryTimer) clearTimeout(retryTimer);
 		recompileTimer = null;
-		initialRetryTimer = null;
+		retryTimer = null;
+		stopController.abort();
+		if (activeIterator) closeIterator(activeIterator);
 	};
 }
 

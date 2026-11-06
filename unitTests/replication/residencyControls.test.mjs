@@ -849,6 +849,59 @@ describe('Declarative tables keep control and event traffic independent of place
 			Records.writeReloadMarker = originalReload;
 		}
 	});
+	it('retries a failed reload marker without holding copy completion', async () => {
+		const connection = new EventEmitter();
+		connection.nodeSubscriptions = [{ name: 'slot-control-peer', replicateByDefault: true }];
+		const { Records, socket } = await connect(false, 'reload_marker_retry', false, undefined, undefined, connection, [
+			{ start: 0, end: 2, shard: 1 },
+		]);
+		const peerId = getIdOfRemoteNode('slot-control-peer', Records.auditStore);
+		const version = Date.now() + 100;
+		const incoming = recordFrame(
+			Records,
+			'invalidate',
+			'retried-marker',
+			{ id: 'retried-marker', region: 0 },
+			version,
+			42
+		);
+		const encoder = Records.primaryStore.encoder;
+		let reloads = 0;
+		const originalReload = Records.writeReloadMarker;
+		Records.writeReloadMarker = function (...args) {
+			if (++reloads === 1) throw new Error('marker write failed');
+			return originalReload.apply(this, args);
+		};
+		try {
+			socket.emit('message', encode([141, { 'slot-control-peer': 0 }, ['slot-control-peer']]));
+			socket.emit(
+				'message',
+				encode([
+					132,
+					{
+						structures: encoder.structures,
+						typedStructs: encoder.typedStructs,
+						attributes: Records.attributes,
+						residency: Records.residency,
+						schemaDefined: true,
+					},
+					Records.tableId,
+					Records.tableName,
+				])
+			);
+			socket.emit('message', encode([130, [server.hostname], 42]));
+			socket.emit('message', encode([148, version - 1000, 1]));
+			socket.emit('message', incoming);
+			socket.emit('message', encode([149]));
+			await until(() => reloads > 0 || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			await until(() => reloads === 2);
+			assert.deepEqual(socket.closes, []);
+			assert.equal(Records.dbisDB.getSync([Symbol.for('copyCursor'), peerId]), undefined);
+		} finally {
+			Records.writeReloadMarker = originalReload;
+		}
+	});
 	it('unwraps an owner record after residency resolution decodes another native entry', async () => {
 		const { Records, socket } = await connect(false, 'metadata_decode');
 		await Records.put('requested', { id: 'requested', region: 0, body: 'canonical' });
