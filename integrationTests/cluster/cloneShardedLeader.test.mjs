@@ -235,6 +235,10 @@ suite('Clone from a statically sharded leader', { timeout: 900_000 }, (ctx) => {
 		assert.equal(configuration.replication.shards, undefined);
 		const { connections } = await clusterStatus(leader);
 		assert.ok(!connections.some((peer) => peer.name === node.hostname), 'the leader never heard from it');
+		assert.ok(
+			!existsSync(join(node.dataRootDir, 'tmp', 'clone-sync-started.json')),
+			'a restart days later must not inherit this attempt as spent time'
+		);
 	});
 
 	test('an explicit shard across shards completes only once its owned copy from the co-owner does', async () => {
@@ -342,7 +346,7 @@ suite('Clone from a statically sharded leader', { timeout: 900_000 }, (ctx) => {
 			join(dataRootDir, 'tmp', 'clone-sync-started.json'),
 			JSON.stringify({
 				leaderURL: `http://${leader.hostname}:9925`,
-				startedAt: Date.now(),
+				startedAt: Date.now() - 48 * 60 * 60 * 1000, // past any ceiling: it must not be charged to this clone
 				replicationEstablished: true,
 				setupComplete: false,
 			})

@@ -641,6 +641,24 @@ describe('checkSyncStatus for a sharded clone', () => {
 		assert.equal(result.latestReceivedMs, NOW);
 	});
 
+	it('counts no peer as an owned copy source for a clone that holds no shard', async () => {
+		const result = await check(
+			{
+				connections: [
+					leader([synced]),
+					{
+						name: 'no-shard-peer',
+						url: 'wss://peer:9933',
+						database_sockets: [{ database: 'data', lastReceivedVersion: 9000, lastReceivedLocalTime: utc(NOW) }],
+					},
+				],
+				sharding: { data: copying },
+			},
+			{ databases: ['data'] }
+		);
+		assert.equal(result.latestReceivedMs, 0);
+	});
+
 	it('holds a sharded database that a resumed snapshot of targets predates', async () => {
 		const result = await checkSyncStatus(
 			{ system: 1000 },

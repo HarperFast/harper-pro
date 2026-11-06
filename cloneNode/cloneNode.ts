@@ -339,7 +339,8 @@ export async function cloneNode(): Promise<void> {
 	const { onMessageByType } = await import('../core/server/threads/manageThreads.js');
 	onMessageByType(CLONE_COPY_FAILURE_MESSAGE, noteCopyFailure);
 
-	const syncStartedAt: number = resumeMarker?.startedAt ?? Date.now();
+	// An older binary's marker can be long spent, and the ceiling is charged from this time.
+	const syncStartedAt: number = (resumeMarker?.shardAware && resumeMarker.startedAt) || Date.now();
 	// An older binary's marker stays unaware until a shard is resolved: a refusal must still refuse at the next start.
 	shardRecord = {
 		shardAware: resumeMarker ? resumeMarker.shardAware : true,
@@ -399,6 +400,9 @@ export async function cloneNode(): Promise<void> {
 		// Contained rather than thrown: a rejection here reaches bin/harper.js, which exits the
 		// already-started process instead of leaving it queryable. An application this node could not
 		// copy ends the attempt like a missing JWT key; other setup failures keep it for a restart to resume.
+		// A refusal has nothing to resume, and a restart may be days away, so it must not inherit this attempt's
+		// ceiling; only an older binary's marker stays, since it is what makes the next start refuse too.
+		if (err instanceof CloneShardRefusedError && shardRecord.shardAware) clearSyncStartedMarker();
 		await stopUnfinishedClone(`Clone from leader node ${leaderURL} failed during setup (${err})`, {
 			keepAttempt: !(err instanceof ApplicationCloneError || err instanceof CloneShardRefusedError),
 		});

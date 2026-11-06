@@ -164,7 +164,7 @@ export async function checkSyncStatus(
 		blocked[dbName] ??= hold;
 		// Only the owned copy's sources: another shard's ordinary traffic must not hold off the stall deadline.
 		for (const connection of clusterResponse.connections) {
-			if (connection.shard !== sharding?.shard) continue;
+			if (sharding?.shard === undefined || connection.shard !== sharding.shard) continue;
 			for (const socket of connection.database_sockets ?? []) if (socket.database === dbName) noteArrival(socket);
 		}
 	}
