@@ -266,6 +266,7 @@ suite('Clone from a statically sharded leader', { timeout: 900_000 }, (ctx) => {
 		}
 		await waitForAvailable(node);
 		await waitForLog(node, 'Clone shard: shard 1 from --shard or CLONE_SHARD');
+		assert.doesNotMatch(await readLog(node), /Pre-created table 'data\./, 'a plain table cannot take its policy later');
 		await waitForCondition(
 			async () => (await sendOperation(node, { operation: 'get_configuration' })).cloned === true,
 			{
