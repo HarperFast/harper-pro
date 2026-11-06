@@ -200,7 +200,7 @@ import { server } from '../core/server/Server.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
 import { WebSocket } from 'ws';
-import { parentPort, threadId, workerData } from 'node:worker_threads';
+import { threadId, workerData } from 'node:worker_threads';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 const { forComponent, errorToString } = harperLogger;
 import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptionManager.ts';
@@ -254,7 +254,11 @@ import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
 import { createInflate } from 'node:zlib';
 import { FrameWriter } from './frameWriter.ts';
 import { isExplicitDatabaseSubscription, tableReplicates } from './replicatedDatabases.ts';
-import { CLONE_COPY_FAILURE_MESSAGE, cloneAttemptSource, liveCloneAttempt } from '../cloneNode/cloneAttempt.ts';
+import {
+	cloneAttemptSource,
+	liveCloneAttempt,
+	reportCloneCopyFailure as postCloneCopyFailure,
+} from '../cloneNode/cloneAttempt.ts';
 import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 import {
 	CopyStallTracker,
@@ -7046,11 +7050,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// outlives the attempt; the marker does not.
 	function reportCloneCopyFailure(error: unknown) {
 		if (!options.isSubscriptionConnection || !cloneAttemptSource()) return;
-		parentPort?.postMessage({
-			type: CLONE_COPY_FAILURE_MESSAGE,
-			database: databaseName,
-			message: copyFailureText(error),
-		});
+		postCloneCopyFailure({ database: databaseName, message: copyFailureText(error) });
 	}
 	function noteCopyStall(note: (tracker: CopyStallTracker) => StuckCopyTransition | undefined) {
 		const connection = options.connection;

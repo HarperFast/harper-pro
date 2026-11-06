@@ -50,6 +50,7 @@ import {
 	CLONE_COMPLETED_AT_ENV,
 	cloneAttemptPath as cloneAttemptFilePath,
 	completeCloneAttempt,
+	onCloneCopyFailure,
 	reusableCloneAttemptId,
 } from './cloneAttempt.ts';
 import { createBackoff } from '../replication/backoff.ts';
@@ -330,11 +331,13 @@ export async function cloneNode(): Promise<void> {
 	logger.initLogSettings();
 	harperLogger = logger.loggerWithTag('cloneNode');
 
-	const { onMessageByType } = await import('../core/server/threads/manageThreads.js');
-	onMessageByType(CLONE_COPY_FAILURE_MESSAGE, ({ database, message }) => {
+	const noteCopyFailure = ({ database, message }: { database: string; message: string }) => {
 		if (!process.env[CLONE_ATTEMPT_ENV]) return; // a worker's inherited copy of it outlives the attempt
 		copyFailures.set(database, { count: (copyFailures.get(database)?.count ?? 0) + 1, message });
-	});
+	};
+	onCloneCopyFailure(noteCopyFailure);
+	const { onMessageByType } = await import('../core/server/threads/manageThreads.js');
+	onMessageByType(CLONE_COPY_FAILURE_MESSAGE, noteCopyFailure);
 
 	const syncStartedAt: number = resumeMarker?.startedAt ?? Date.now();
 	// An older binary's marker stays unaware until a shard is resolved: a refusal must still refuse at the next start.

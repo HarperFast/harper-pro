@@ -17,6 +17,8 @@ import {
 	cloneAttemptSource,
 	completeCloneAttempt,
 	liveCloneAttempt,
+	onCloneCopyFailure,
+	reportCloneCopyFailure,
 	reusableCloneAttemptId,
 } from '#src/cloneNode/cloneAttempt';
 
@@ -225,5 +227,14 @@ describe('clone-attempt marker (#737)', () => {
 			mkdirSync(cloneAttemptPath(rootPath));
 			assert.throws(() => liveCloneAttempt(rootPath));
 		});
+	});
+});
+
+describe('reportCloneCopyFailure', () => {
+	it('reaches the listener directly on the main thread, where there is no port to post to', () => {
+		const failures = [];
+		onCloneCopyFailure((failure) => failures.push(failure));
+		reportCloneCopyFailure({ database: 'data', message: 'boom' });
+		assert.deepStrictEqual(failures, [{ database: 'data', message: 'boom' }]);
 	});
 });

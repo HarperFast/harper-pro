@@ -86,11 +86,11 @@ describe('cloneShard', () => {
 		};
 
 		it('counts the leader, shard 0 included, which has no row of its own in its connections', () => {
-			assert.deepEqual(leaderShardMembers(0, { connections: [] }, 'new-node'), [{ shard: 0, live: true }]);
+			assert.deepStrictEqual(leaderShardMembers(0, { connections: [] }, 'new-node'), [{ shard: 0, live: true }]);
 		});
 
 		it('reads a peer live from any connected socket, and skips this node and unsharded peers', () => {
-			assert.deepEqual(leaderShardMembers(undefined, status, 'new-node'), [
+			assert.deepStrictEqual(leaderShardMembers(undefined, status, 'new-node'), [
 				{ shard: 1, live: true },
 				{ shard: 0, live: false },
 			]);
@@ -258,8 +258,8 @@ describe('cloneShard', () => {
 		const map = (database) => ({ database, version: 1 });
 
 		it('returns the maps when every requested database has one', () => {
-			assert.deepEqual(requireLeaderMaps(['a', 'b'], [map('b'), map('a')]), [map('b'), map('a')]);
-			assert.deepEqual(requireLeaderMaps([], []), []);
+			assert.deepStrictEqual(requireLeaderMaps(['a', 'b'], [map('b'), map('a')]), [map('b'), map('a')]);
+			assert.deepStrictEqual(requireLeaderMaps([], []), []);
 		});
 
 		it('names a database the read left out: search_by_id omits a missing row', () => {

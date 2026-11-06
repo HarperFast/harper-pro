@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { parentPort } from 'node:worker_threads';
 import { get } from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import harperLogger from '../core/utility/logging/harper_logger.js';
@@ -11,6 +12,19 @@ export const CLONE_COMPLETION_GRACE_MS = 60_000;
 export const CLONE_COMPLETED_AT_ENV = 'HARPER_CLONE_COMPLETED_AT';
 /** Worker to main thread, per failed replication session during a clone attempt: `{ database, message }`. */
 export const CLONE_COPY_FAILURE_MESSAGE = 'clone-copy-failure';
+
+type CopyFailure = { database: string; message: string };
+let copyFailureListener: ((failure: CopyFailure) => void) | undefined;
+
+export function onCloneCopyFailure(listener: (failure: CopyFailure) => void): void {
+	copyFailureListener = listener;
+}
+
+/** A single-threaded instance runs its subscriptions on the main thread, with no port to post to. */
+export function reportCloneCopyFailure(failure: CopyFailure): void {
+	if (parentPort) parentPort.postMessage({ type: CLONE_COPY_FAILURE_MESSAGE, ...failure });
+	else copyFailureListener?.(failure);
+}
 
 type CloneAttemptMarker = {
 	attemptId?: unknown;

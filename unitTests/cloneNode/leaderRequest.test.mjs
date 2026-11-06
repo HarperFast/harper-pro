@@ -98,7 +98,7 @@ describe('requestLeader', function () {
 			await assert.rejects(requestLeader(target, { operation: 'get_status' }, DEADLINE_MS));
 			await closed;
 			await new Promise((resolve) => setImmediate(resolve));
-			assert.deepEqual(uncaught, []);
+			assert.deepStrictEqual(uncaught, []);
 		});
 
 		it('returns a prompt answer, and the deadline does not fire after it', async () => {
@@ -106,9 +106,9 @@ describe('requestLeader', function () {
 				response.writeHead(200, { 'Content-Type': 'application/json' });
 				response.end(JSON.stringify({ ok: true }));
 			};
-			assert.deepEqual(await requestLeader(target, { operation: 'get_status' }, DEADLINE_MS), { ok: true });
+			assert.deepStrictEqual(await requestLeader(target, { operation: 'get_status' }, DEADLINE_MS), { ok: true });
 			await new Promise((resolve) => setTimeout(resolve, DEADLINE_MS * 2));
-			assert.deepEqual(uncaught, []);
+			assert.deepStrictEqual(uncaught, []);
 		});
 
 		it('keeps reporting a leader failure as that failure, not as the deadline', async () => {
@@ -197,12 +197,12 @@ describe('requestLeader', function () {
 
 		it('answers an array as an array, as HTTP does, though the socket wraps it to carry the request id', async () => {
 			answer = Promise.resolve({ results: [{ name: 'key-1' }], requestId: 1 });
-			assert.deepEqual(await requestLeader(transport, { operation: 'list_ssh_keys' }), [{ name: 'key-1' }]);
+			assert.deepStrictEqual(await requestLeader(transport, { operation: 'list_ssh_keys' }), [{ name: 'key-1' }]);
 		});
 
 		it('leaves an object answer alone', async () => {
 			answer = Promise.resolve({ version: '5.4.0', requestId: 1 });
-			assert.deepEqual(await requestLeader(transport, { operation: 'registration_info' }), {
+			assert.deepStrictEqual(await requestLeader(transport, { operation: 'registration_info' }), {
 				version: '5.4.0',
 				requestId: 1,
 			});
