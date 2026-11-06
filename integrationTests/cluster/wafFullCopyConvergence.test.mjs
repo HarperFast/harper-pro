@@ -107,11 +107,19 @@ async function lastCompiledRuleCounts(node) {
 	return counts;
 }
 
-async function assertEveryWorkerCompiled(node, ruleCount) {
-	const counts = await lastCompiledRuleCounts(node);
-	const workers = Object.keys(counts);
-	equal(workers.length, 2, `expected both http workers to have compiled: ${JSON.stringify(counts)}`);
-	for (const worker of workers) equal(counts[worker], ruleCount, `${worker}: ${JSON.stringify(counts)}`);
+async function waitForEveryWorkerToCompile(node, ruleCount) {
+	let counts;
+	await waitForCondition(
+		async () => {
+			counts = await lastCompiledRuleCounts(node);
+			const workers = Object.keys(counts);
+			return workers.length === 2 && workers.every((worker) => counts[worker] === ruleCount);
+		},
+		{
+			timeoutMs: 30000,
+			description: () => `both http workers to compile ${ruleCount} rules, last saw ${JSON.stringify(counts)}`,
+		}
+	);
 }
 
 suite('WAF matcher after a full copy', { timeout: 420000 }, (ctx) => {
@@ -169,7 +177,7 @@ suite('WAF matcher after a full copy', { timeout: 420000 }, (ctx) => {
 
 		await waitForBlocked(receiver, BLOCK_PROBE, PROBES_PER_CHECK, 'receiver');
 		await waitForBlocked(receiver, SCORE_PROBE, PROBES_PER_CHECK, 'receiver');
-		await assertEveryWorkerCompiled(receiver, 3);
+		await waitForEveryWorkerToCompile(receiver, 3);
 		ok(
 			!(await readLog(receiver)).includes('WAF rule subscription ended'),
 			'convergence must come from the live subscription, not a resubscribe'
@@ -214,6 +222,6 @@ suite('WAF matcher after a full copy', { timeout: 420000 }, (ctx) => {
 		await waitForBlocked(receiver, SCORE_PROBE, 0, 'receiver');
 		await waitForBlocked(receiver, DROPPED_PROBE, 0, 'receiver');
 		deepEqual(await persistedRuleIds(receiver), [BLOCK_RULE.id, SCORE_RULE.id].sort());
-		await assertEveryWorkerCompiled(receiver, 2);
+		await waitForEveryWorkerToCompile(receiver, 2);
 	});
 });
