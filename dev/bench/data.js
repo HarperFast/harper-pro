@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793865030186,
+  "lastUpdate": 1793951847091,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -7227,6 +7227,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2342.73,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "ed54a4c9abf2d6c54d7a60b1f1215ac7f9c4b8d8",
+          "message": "Stop cleanly with a live peer, and fix residencyConversion on main (#1282)\n\n* Stop residencyConversion's restarts cleanly, so its writer replica survives them\n\nSince harper#3943 a node with a live peer exits about 5.08 s after SIGTERM, and killHarper's\ndefault grace SIGKILLs it at 5 s. The next boot replays the transaction-log tail, replay stores\nthe non-owner writer replica as a stub, and the drain has nothing to demote (:355).\n\nStop with a grace above threads.shutdownTimeout and assert exit 0, so a forced stop fails with\nits cause. Remove the #1253 diagnostics, which were scoped to this issue.\n\nRefs #1252\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-1252-residency-conversion-fix\n\n* Bump core to close WebSockets promptly on process exit (HarperFast/harper#4058)\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-1252-residency-conversion-fix\n\n* Test that a stop with a live peer is quick, clean, and keeps confirmed writes\n\nA joined node stops well under 5 s and exits 0 under killHarper's default grace. A confirm=1 write\nthat commits after SIGTERM still returns and reaches the peer, with replication sockets on a pool\nworker and on the request's own worker.\n\nRefs #1252\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-1252-residency-conversion-fix\n\n* Hold the test's confirmed write until after SIGTERM, deterministically\n\nThe write now commits only once the test allows it, after the signal, instead of after a fixed\ndelay. The exit wait starts before the signal and is bounded. Also correct the stale drop-table\ncomment that said SIGTERM exits at once.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-1252-residency-conversion-fix\n\n* Fail the test's write if it is never allowed to commit\n\nFalling through after a deadline could commit before SIGTERM on a stalled runner, and the test would\npass without exercising shutdown.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-1252-residency-conversion-fix\n\n* Bump core to the head of HarperFast/harper#4058\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nDispatch-Task: harper-pro-1252-residency-conversion-fix\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-06T04:39:24Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/ed54a4c9abf2d6c54d7a60b1f1215ac7f9c4b8d8"
+        },
+        "date": 1793951845396,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 5212.79,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 15596.49,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 10903.25,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 5378.25,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 3846.63,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2156.05,
             "unit": "ops/sec"
           }
         ]
