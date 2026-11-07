@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794038044907,
+  "lastUpdate": 1794038047881,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -16713,6 +16713,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E scan p99 — short ranges",
             "value": 113.5,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "d94ecf6919b9d6664d810a92f6c58d7913b308a9",
+          "message": "Document how confirm/replicatedConfirmation counts peers (moved from documentation) (#1273)\n\n* docs: how confirm/replicatedConfirmation counts peers, from HarperFast/documentation\n\nPorts the v5 half of the open HarperFast/documentation#723 now that the sharding page lives\nhere, updated to current behavior: since harper-pro#1031 RocksDB counts a peer only for records\nit is resident for and refuses an unreachable count before the write, while LMDB keeps the\ndatabase-wide count and times out instead.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* docs: the RocksDB count is database-wide when no residency applies\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-07T03:59:05Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/d94ecf6919b9d6664d810a92f6c58d7913b308a9"
+        },
+        "date": 1794038047800,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 10.18,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 13.28,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 17.16,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 26.38,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 26.93,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 26.13,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 51.6,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 55.14,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 151.23,
             "unit": "ms"
           }
         ]
