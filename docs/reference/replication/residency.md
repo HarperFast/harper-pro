@@ -90,6 +90,19 @@ On first initialization, sharded writes return a retryable 503 until the configu
 
 A fresh node may start its owned slots empty only when the installed map is the initial version and those slots have no write history. An empty current table is not sufficient: deleted records and lost storage do not erase history. Otherwise, if the entire shard is lost, restore a complete backup. Status reports the backup requirement instead of treating an incomplete copy as recovery. Maps are installed before declarative writes begin; conversion of existing data uses the paused operator-assertion procedure below. Later ownership changes require the [slot-move workflow](https://github.com/HarperFast/harper-pro/issues/1053), which copies from the old owners.
 
+### Cloning a node into a sharded cluster
+
+<VersionBadge version="v5.4.0" />
+
+A shard is part of a node's identity, so a clone never inherits its leader's shard, and changing it later takes a fresh data root and a new node name. Choose it with the other clone options, using the `--shard` flag or the `CLONE_SHARD` environment variable:
+
+- **A shard number.** It must be in the leader's `replication.shards` when the leader has that list. A `replication.shard` the node is already configured with counts as the same choice; a different number in the option is refused.
+- **`auto`.** Takes the shard in the leader's `replication.shards` with the fewest live members, then the lowest shard number, and logs the choice. It only fills listed shards and never adds one. A shard whose members are all offline is passed over, because it has nothing to copy the node's owned slots from. Membership and liveness are the leader's current view, so two clones started together can pick the same shard. From a leader that is not sharded, `auto` assigns no shard.
+
+Cloning from a sharded leader with neither refuses before the node writes configuration or joins: it logs an error naming the option and stays running as `Unavailable`, not marked as cloned. Restart it with the option on the same data root. A leader with neither `replication.shard` nor `replication.shards` holds no slots, and a clone of it with no option holds none either.
+
+Any member can be the leader. A clone receives `replication.shards` and the leader's installed maps, takes projections from any peer, and copies its owned slots from a [same-shard peer](#recovery-sources). It needs no [completeness assertion](#4-assert-each-existing-owners-completeness): an empty table already on its data root is certified by that copy. It reports `Available` only once every sharded database reports `state: available`. A database that does not get there fails the clone at its sync timeout (`--sync-timeout` or `CLONE_SYNC_TIMEOUT`), with the database and its last error in the log.
+
 ### Recovering a lost node
 
 Choose one recovery route before restarting a node whose local data or audit history was lost:
@@ -109,7 +122,7 @@ Snapshot recovery also marks the database's record-lock lineage as recloned: it 
 
 Every member must support sharding recovery admission. An authenticated announcement from an older binary holds sharded writes, even after initialization; ordinary tables and system metadata remain available. This observation survives restart and matching map/schema messages cannot clear it. Upgrade the peer or remove it from the configured membership. An offline peer's unannounced downgrade cannot be detected until it reconnects.
 
-Arbitrary cross-shard relay and clone layouts for owners are unsupported in this release. [Complete-body recovery from origin audit logs](https://github.com/HarperFast/harper-pro/issues/1123) tracks broader topology support, including handling origins whose full audit history is no longer retained.
+Arbitrary cross-shard relay for owners is unsupported in this release: an owner's copy comes from its own shard, including when it [clones](#cloning-a-node-into-a-sharded-cluster) from a leader in another shard. [Complete-body recovery from origin audit logs](https://github.com/HarperFast/harper-pro/issues/1123) tracks broader topology support, including handling origins whose full audit history is no longer retained.
 
 ## Installed maps
 

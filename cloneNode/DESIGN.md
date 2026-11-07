@@ -36,3 +36,23 @@ leader and clone share a platform, as any payload deploy that carries `node_modu
 buffered transfer, an application whose own files compress past about 384 MiB exceeds V8's string limit on
 the leader and stops the clone. Success means the application was prepared, not that its workers loaded
 it.
+
+## A clone chooses its shard, and takes a sharded database's tables from the cluster
+
+**Invariant.** A clone holds the shard it chose, never its leader's, and resolves it before writing config or
+joining. In a database the leader reports as sharded, a clone never creates a table: each arrives with its policy
+from its `@sharded` declaration or the cluster's `DB_SCHEMA`, after the leader's exact map is installed.
+
+**Why.** `describe_all` carries no policy. A plain table refuses first activation (`prepareResidencyDeclaration`),
+then every `DB_SCHEMA` frame for it throws, on the `system` stream too, so the map that would unblock activation
+never arrives, and the leader holds its database over the disagreement. Core's refusal is correct: an empty table
+is not evidence of no history. The map goes first, before config or applications reach disk, because a restart
+with those on disk activates `@sharded` during boot and installs a default map that conflicts with a custom one.
+
+**Readiness.** `Available` needs each sharded database's own status at `available`, since the leader's watermark
+says nothing about the owned copy from a same-shard peer. `waitingOrigins` does not count: it includes any peer
+that is down. A marker that is not `shardAware`
+came from an older binary: setup replays, and a shard only in its config file is refused as possibly inherited.
+
+**Where.** `cloneShard.ts` (`chooseCloneShard`), `cloneNode.ts` (`cloneShardMaps`, `cloneSchemas`),
+`syncMonitor.ts` (`checkSyncStatus`). Test: `integrationTests/cluster/cloneShardedLeader.test.mjs`.

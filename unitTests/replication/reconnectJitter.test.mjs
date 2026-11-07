@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import { NodeReplicationConnection } from '#src/replication/replicationConnection';
+import { notifyShardingRecoveryChange } from '#src/replication/shardingRecovery';
 
 const INITIAL_RETRY_TIME = 500;
 const MAX_RETRY_TIME = 30_000;
@@ -183,5 +184,46 @@ describe('NodeReplicationConnection durable receive progress', () => {
 		assert.equal(connection.retryBackoff.ceiling, 4000);
 		connection.onDurableProgress(1000);
 		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
+});
+
+describe('NodeReplicationConnection held on its copy-stall backoff', () => {
+	function heldConnection(holdMs) {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		const held = { connects: 0, delays: [], fire: undefined };
+		connection.setReconnectTimer = (fire, ms) => {
+			held.fire = fire;
+			held.delays.push(ms);
+			return { unref() {} };
+		};
+		connection.copyStall.noteClosed = () => ({ holdMs });
+		connection.connect = () => held.connects++;
+		connection.scheduleReconnect();
+		return held;
+	}
+
+	it('reconnects as soon as its database finishes its owned copy, once', () => {
+		const held = heldConnection(900_000);
+		assert.ok(held.delays[0] >= 900_000);
+		notifyShardingRecoveryChange('another-database');
+		assert.equal(held.connects, 0);
+		notifyShardingRecoveryChange('db');
+		assert.equal(held.connects, 1);
+		notifyShardingRecoveryChange('db');
+		assert.equal(held.connects, 1);
+	});
+
+	it('stops watching when the hold runs out on its own', () => {
+		const held = heldConnection(60_000);
+		held.fire();
+		assert.equal(held.connects, 1);
+		notifyShardingRecoveryChange('db');
+		assert.equal(held.connects, 1);
+	});
+
+	it('leaves an ordinary retry on its schedule', () => {
+		const held = heldConnection(0);
+		notifyShardingRecoveryChange('db');
+		assert.equal(held.connects, 0);
 	});
 });

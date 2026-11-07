@@ -18,7 +18,8 @@ const LEADER_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 export function postToLeader(
 	target: LeaderHTTPTarget,
 	operation: { operation: string; [key: string]: any },
-	idleTimeoutMs: number = LEADER_IDLE_TIMEOUT_MS
+	idleTimeoutMs: number = LEADER_IDLE_TIMEOUT_MS,
+	signal?: AbortSignal
 ): Promise<IncomingMessage> {
 	const body = JSON.stringify(operation);
 	const url = new URL(target.url);
@@ -34,6 +35,7 @@ export function postToLeader(
 			'Authorization': target.authorization,
 			'Content-Length': Buffer.byteLength(body),
 		},
+		signal,
 	};
 	return new Promise((resolve, reject) => {
 		let response: IncomingMessage | undefined;

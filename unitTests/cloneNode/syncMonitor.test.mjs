@@ -539,3 +539,302 @@ describe('monitorSyncLoop', () => {
 		assert.equal(outcome, 'stalled');
 	});
 });
+
+describe('checkSyncStatus for a sharded clone', () => {
+	const NOW = 1_000_000_000_000;
+	const synced = { database: 'data', lastReceivedVersion: 5000 };
+	const ready = { state: 'available', waitingOrigins: [], errors: [], recovery: { phase: 'ready' } };
+	const copying = {
+		state: 'recovery-required',
+		waitingOrigins: [],
+		errors: [],
+		recovery: { phase: 'recovery-required', reason: 'Waiting for a certified same-shard copy' },
+	};
+	const leader = (sockets) => ({ name: 'leader', url: LEADER_URL, shard: 0, database_sockets: sockets });
+	const check = (response, sharding = { databases: ['data'], shard: 1 }, copyFailures) =>
+		checkSyncStatus({ data: 1000 }, async () => response, LEADER_URL, noopLog, ['data'], sharding, copyFailures);
+
+	it("is not complete on the leader's watermark alone while the owned copy is pending", async () => {
+		const result = await check({ connections: [leader([synced])], sharding: { data: copying } });
+		assert.equal(result.syncComplete, false);
+		assert.deepEqual(result.blocked, { data: 'Waiting for a certified same-shard copy' });
+	});
+
+	it('is complete once the database reports ready', async () => {
+		const result = await check({ connections: [leader([synced])], sharding: { data: ready } });
+		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0, socketDatabases: new Set(['data']) });
+	});
+
+	it('is complete while an origin waits for a source: that includes any peer that is down', async () => {
+		const waiting = {
+			...ready,
+			waitingOrigins: [
+				{ origin: 'offline', missingSource: 'Waiting for origin offline or a complete co-owner of shard 1' },
+			],
+		};
+		const result = await check({ connections: [leader([synced])], sharding: { data: waiting } });
+		assert.equal(result.syncComplete, true);
+	});
+
+	it('cannot pass when an expected database has no status: absence is not proof', async () => {
+		const result = await check({ connections: [leader([synced])], sharding: {} });
+		assert.equal(result.syncComplete, false);
+		assert.match(result.blocked.data, /sharding status is not available/);
+	});
+
+	it('does not require sharding for a database nobody expects and that reports none', async () => {
+		const result = await check({ connections: [leader([synced])] }, { databases: [] });
+		assert.equal(result.syncComplete, true);
+	});
+
+	it('holds a database this node reports as sharded even when the leader did not', async () => {
+		const result = await check({ connections: [leader([synced])], sharding: { data: copying } }, { databases: [] });
+		assert.equal(result.syncComplete, false);
+	});
+
+	it("names the database's errors first", async () => {
+		const held = { state: 'held', waitingOrigins: [], errors: ['shard map agreement with b is blocked'], recovery: {} };
+		const result = await check({ connections: [leader([synced])], sharding: { data: held } });
+		assert.deepEqual(result.blocked, { data: 'shard map agreement with b is blocked' });
+	});
+
+	it('counts arrivals from a same-shard peer, the source of the owned copy, once the leader is done', async () => {
+		const result = await check({
+			connections: [
+				leader([synced]),
+				{
+					name: 'co-owner',
+					url: 'wss://co-owner:9933',
+					shard: 1,
+					database_sockets: [{ database: 'data', lastReceivedVersion: 0, lastReceivedLocalTime: utc(NOW) }],
+				},
+			],
+			sharding: { data: copying },
+		});
+		assert.equal(result.latestReceivedMs, NOW);
+	});
+
+	it('does not count arrivals from another shard: live traffic must not mask a stalled owned copy', async () => {
+		const result = await check({
+			connections: [
+				leader([{ ...synced, lastReceivedLocalTime: utc(NOW) }]),
+				{
+					name: 'other-shard',
+					url: 'wss://other:9933',
+					shard: 2,
+					database_sockets: [{ database: 'data', lastReceivedVersion: 9000, lastReceivedLocalTime: utc(NOW) }],
+				},
+			],
+			sharding: { data: copying },
+		});
+		assert.equal(result.latestReceivedMs, 0);
+	});
+
+	it("counts the leader's arrivals when it is the owned copy's source, in the same shard", async () => {
+		const result = await check(
+			{
+				connections: [{ ...leader([{ ...synced, lastReceivedLocalTime: utc(NOW) }]), shard: 1 }],
+				sharding: { data: copying },
+			},
+			{ databases: ['data'], shard: 1 }
+		);
+		assert.equal(result.latestReceivedMs, NOW);
+	});
+
+	it('counts no peer as an owned copy source for a clone that holds no shard', async () => {
+		const result = await check(
+			{
+				connections: [
+					leader([synced]),
+					{
+						name: 'no-shard-peer',
+						url: 'wss://peer:9933',
+						database_sockets: [{ database: 'data', lastReceivedVersion: 9000, lastReceivedLocalTime: utc(NOW) }],
+					},
+				],
+				sharding: { data: copying },
+			},
+			{ databases: ['data'] }
+		);
+		assert.equal(result.latestReceivedMs, 0);
+	});
+
+	it('holds a sharded database that a resumed snapshot of targets predates', async () => {
+		const result = await checkSyncStatus(
+			{ system: 1000 },
+			async () => ({
+				connections: [leader([{ database: 'system', lastReceivedVersion: 5000 }])],
+				sharding: { data: copying },
+			}),
+			LEADER_URL,
+			noopLog,
+			['system'],
+			{ databases: ['data'], shard: 1 }
+		);
+		assert.equal(result.syncComplete, false);
+		assert.deepEqual(result.blocked, { data: 'Waiting for a certified same-shard copy' });
+	});
+
+	it('does not count arrivals on a socket whose copy keeps restarting from one position', async () => {
+		const stuckCopy = { state: 'retrying', reason: 'the copy made no durable progress', count: 3 };
+		const result = await check(
+			{
+				connections: [
+					leader([{ database: 'data', lastReceivedVersion: 0, lastReceivedLocalTime: utc(NOW), stuckCopy }]),
+				],
+			},
+			{ databases: [] }
+		);
+		assert.equal(result.latestReceivedMs, 0);
+		assert.deepEqual(result.blocked, { data: 'the copy made no durable progress (3 times)' });
+	});
+
+	it('names the last error of a failing copy, ahead of the stuck-copy reason', async () => {
+		const stuckCopy = { state: 'retrying', reason: 'the copy made no durable progress', count: 3 };
+		const result = await check(
+			{ connections: [leader([{ database: 'data', lastReceivedVersion: 0, stuckCopy }])] },
+			{ databases: [] },
+			new Map([['data', { count: 4, message: 'Local schema does not declare sharding for data.Rows' }]])
+		);
+		assert.deepEqual(result.blocked, {
+			data: 'copy failed 4 times; last error: Local schema does not declare sharding for data.Rows',
+		});
+	});
+
+	it('names a failing copy before any socket exists to report it', async () => {
+		const result = await check(
+			{ connections: [] },
+			{ databases: [] },
+			new Map([['data', { count: 1, message: 'boom' }]])
+		);
+		assert.equal(result.syncComplete, false);
+		assert.deepEqual(result.blocked, { data: 'copy failed 1 time; last error: boom' });
+	});
+
+	it('does not name an old failure of a database that has since synced', async () => {
+		const result = await check(
+			{ connections: [leader([synced])] },
+			{ databases: [] },
+			new Map([['data', { count: 2, message: 'boom' }]])
+		);
+		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0, socketDatabases: new Set(['data']) });
+	});
+});
+
+describe('monitorSyncLoop naming a failing copy', () => {
+	function clock() {
+		let time = 0;
+		return { now: () => time, delay: async (ms) => void (time += ms) };
+	}
+
+	it('says which database and why in place of "no replication data received yet", and at the verdict', async () => {
+		const logged = [];
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { data: 1000 },
+			clusterStatus: async () => statusResponse([{ database: 'data', lastReceivedVersion: 0 }]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 9000,
+			checkIntervalMs: 3000,
+			log: (message, level) => logged.push({ message, level }),
+			copyFailures: new Map([['data', { count: 3, message: 'Local schema does not declare sharding' }]]),
+			...clock(),
+		});
+		assert.equal(outcome, 'stalled');
+		const messages = logged.map(({ message }) => message);
+		assert.ok(!messages.some((message) => message.includes('no replication data received yet')), messages.join('\n'));
+		assert.ok(
+			messages.some((message) =>
+				message.includes('Sync incomplete; database data: copy failed 3 times; last error: Local schema')
+			),
+			messages.join('\n')
+		);
+		assert.deepEqual(logged.at(-1), {
+			message:
+				'Clone sync did not finish for database data: copy failed 3 times; last error: Local schema does not declare sharding',
+			level: 'error',
+		});
+	});
+
+	it('fails at the stall deadline when a stuck copy keeps re-delivering records', async () => {
+		const { now, delay } = clock();
+		let checks = 0;
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { data: 1000 },
+			clusterStatus: async () => {
+				checks++;
+				return statusResponse([
+					{
+						database: 'data',
+						lastReceivedVersion: 0,
+						lastReceivedLocalTime: utc(now()),
+						stuckCopy: { state: 'retrying', reason: 'no durable progress', count: checks },
+					},
+				]);
+			},
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 9000,
+			maxDurationMs: 3_600_000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			now,
+			delay,
+		});
+		assert.equal(outcome, 'stalled');
+		assert.ok(checks <= 4, `reached the stall deadline, not the ceiling (${checks} checks)`);
+	});
+
+	it('fails at the stall deadline while a busy leader in another shard keeps delivering', async () => {
+		const { now, delay } = clock();
+		let checks = 0;
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { data: 1000 },
+			clusterStatus: async () => {
+				checks++;
+				return {
+					connections: [
+						{
+							name: 'leader',
+							url: LEADER_URL,
+							shard: 0,
+							database_sockets: [{ database: 'data', lastReceivedVersion: 5000, lastReceivedLocalTime: utc(now()) }],
+						},
+					],
+					sharding: {
+						data: { state: 'recovery-required', waitingOrigins: [], errors: [], recovery: { reason: 'owned copy' } },
+					},
+				};
+			},
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 9000,
+			maxDurationMs: 3_600_000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			sharding: { databases: ['data'], shard: 1 },
+			now,
+			delay,
+		});
+		assert.equal(outcome, 'stalled');
+		assert.ok(checks <= 4, `reached the stall deadline, not the ceiling (${checks} checks)`);
+	});
+
+	it('passes the sharding expectation through, so the leader watermark alone cannot finish', async () => {
+		const { now, delay } = clock();
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { data: 1000 },
+			clusterStatus: async () => ({
+				...statusResponse([{ database: 'data', lastReceivedVersion: 5000 }]),
+				sharding: {
+					data: { state: 'recovery-required', waitingOrigins: [], errors: [], recovery: { reason: 'owned copy' } },
+				},
+			}),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 9000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			sharding: { databases: ['data'], shard: 1 },
+			now,
+			delay,
+		});
+		assert.equal(outcome, 'stalled');
+	});
+});

@@ -43,6 +43,7 @@ import * as logger from '../core/utility/logging/harper_logger.ts';
 import { exportIdMapping } from '../core/resources/nodeIdMapping.ts';
 import { registerShutdownDrain } from '../core/components/shutdownDrain.ts';
 import { createBackoff } from './backoff.ts';
+import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
 import { isResidencyRecord } from './residencyWire.ts';
 import {
 	agreedPeerShard,
@@ -638,6 +639,17 @@ function view(database: string, shard: number): View {
 	};
 }
 
+/**
+ * A clone's converted table holds nothing of its own: its baseline comes from a certified same-shard copy, which
+ * satisfies the certificate with no assertion. Telling an operator to assert mid-copy would certify an incomplete
+ * baseline, so only a node with data predating the policy is pointed at the assertion.
+ */
+export function shardingUncertifiedReason(converted: boolean, asserted: boolean, cloning: boolean): string {
+	return converted && !asserted && !cloning
+		? 'Missing existing-owner completeness assertion through initialize_shard_map'
+		: 'Waiting for a certified same-shard copy; if the entire shard was lost, restore a complete backup';
+}
+
 async function flushRoots(database: string): Promise<void> {
 	for (const { catalog } of shardingNativeRoots(database)) await catalog.flush({ allowWriteStall: true });
 }
@@ -939,11 +951,11 @@ export function startShardingBootstrap(): void {
 					}
 					await publishLocalBaseline(database);
 					if (localLayouts.get(database) && !shardingCertificate(database)) {
-						const converted = shardingConvertedTables(database).some((root) => root.tables.length);
-						const reason =
-							converted && !hasExistingOwnerAssertion(database)
-								? 'Missing existing-owner completeness assertion through initialize_shard_map'
-								: 'Waiting for a certified same-shard copy; if the entire shard was lost, restore a complete backup';
+						const reason = shardingUncertifiedReason(
+							shardingConvertedTables(database).some((root) => root.tables.length),
+							hasExistingOwnerAssertion(database),
+							cloneAttemptSource() !== undefined
+						);
 						report(database, { phase: 'recovery-required', reason, backupRequired: true });
 					} else {
 						for (const current of origins) await enableOrigin(current, await checkNewShardingOrigin(current));

@@ -35,17 +35,22 @@ import {
 	HARPER_CONFIG_FILE,
 	LICENSE_KEY_DIR_NAME,
 	JWT_ENUM,
+	SYSTEM_TABLE_NAMES,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 import { ApplicationCloneError, cloneFilesystemOnlyApplications, streamsPackages } from './applicationClone.ts';
-import { postToLeader, readLeaderResponse, readPackageResponse, type LeaderHTTPTarget } from './leaderHTTP.ts';
+import { postToLeader, readPackageResponse, type LeaderHTTPTarget } from './leaderHTTP.ts';
+import { LEADER_PACKAGE_DEADLINE_MS, LEADER_REQUEST_DEADLINE_MS, requestLeader } from './leaderRequest.ts';
+import { assertResumedShard, chooseCloneShard, CloneShardRefusedError, requireLeaderMaps } from './cloneShard.ts';
 import { cloneSSHKeysFromLeader } from './sshKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
 import {
+	CLONE_COPY_FAILURE_MESSAGE,
 	CLONE_COMPLETION_GRACE_MS,
 	CLONE_COMPLETED_AT_ENV,
 	cloneAttemptPath as cloneAttemptFilePath,
 	completeCloneAttempt,
+	onCloneCopyFailure,
 	reusableCloneAttemptId,
 } from './cloneAttempt.ts';
 import { createBackoff } from '../replication/backoff.ts';
@@ -71,6 +76,8 @@ import {
  * - HDB_LEADER_TOKEN: JWT authentication token for the leader node
  *
  * Optional:
+ * - CLONE_SHARD: This node's shard, a number or "auto". Required when the leader is sharded, since a clone never
+ *   inherits the leader's shard; "auto" picks the listed shard with the fewest live members
  * - CLONE_SSH_KEYS: Clone SSH keys from leader (default: true)
  * - CLONE_JWT_KEYS: Clone JWT keys from leader (default: true)
  * - ALLOW_SELF_SIGNED: Allow self-signed certificates to be used for authentication (default: false)
@@ -100,6 +107,7 @@ import {
  * --sync-timeout: Sync stall timeout in milliseconds — the clone fails only if no replication
  *   data arrives for this long, not on total elapsed time. Intended for minutes-scale values;
  *   arrival stamps have second precision (default: max(300000, 2 x replication.copyTimeout))
+ * --shard: This node's shard, a number or "auto"; see CLONE_SHARD
  * --skip-ssh-keys: Skip cloning SSH keys (default: false)
  * --skip-jwt-keys: Skip cloning JWT keys (default: false)
  * --force-clone: Force clone even if node exists (default: false)
@@ -140,6 +148,7 @@ const CONFIG_TO_EXCLUDE_FROM_CLONE = {
 	tls_certificateauthority: true,
 	replication_hostname: true,
 	replication_url: true,
+	replication_shard: true,
 	cloned: true,
 	node_hostname: true,
 };
@@ -154,6 +163,7 @@ type ParsedValues = {
 	'replication-port'?: string;
 	'skip-sync-monitor'?: boolean;
 	'sync-timeout'?: string;
+	'shard'?: string;
 	'skip-ssh-keys'?: boolean;
 	'skip-jwt-keys'?: boolean;
 	'force-clone'?: boolean;
@@ -171,6 +181,7 @@ const { values } = parseArgs({
 		'replication-port': { type: 'string' },
 		'skip-sync-monitor': { type: 'boolean' },
 		'sync-timeout': { type: 'string' },
+		'shard': { type: 'string' },
 		'skip-ssh-keys': { type: 'boolean' },
 		'skip-jwt-keys': { type: 'boolean' },
 		'force-clone': { type: 'boolean' },
@@ -201,6 +212,7 @@ const composedReplicationPortFallback =
 	composedReplicationPort != null ? String(composedReplicationPort).split(':').pop() : undefined;
 const replicationPort: string =
 	values['replication-port'] || process.env.REPLICATION_PORT || composedReplicationPortFallback;
+const requestedShard: string | undefined = values['shard'] || process.env.CLONE_SHARD;
 const skipSSHKeys: boolean = values['skip-ssh-keys'] ?? process.env.CLONE_SKIP_SSH_KEYS === 'true';
 const skipJWTKeys: boolean = values['skip-jwt-keys'] ?? process.env.CLONE_SKIP_JWT_KEYS === 'true';
 const forceClone: boolean = values['force-clone'] ?? process.env.FORCE_CLONE === 'true';
@@ -217,6 +229,8 @@ let harperLogger: any;
 let leaderReplicationURL: string;
 let hdbConfig: Record<string, any> = {};
 let freshClone: boolean = false;
+let shardRecord: Pick<SyncStartedMarker, 'shardAware' | 'shard' | 'shardedDatabases'> = {};
+const copyFailures = new Map<string, { count: number; message: string }>();
 
 export async function cloneNode(): Promise<void> {
 	// Clone using websockets with certificate-based auth, or with credential/token auth if provided
@@ -282,6 +296,15 @@ export async function cloneNode(): Promise<void> {
 		clearSyncStartedMarker();
 		resumeMarker = undefined;
 	}
+	// Before Harper starts: it would come up as whichever shard the configuration now says.
+	if (resumeMarker?.shardAware) {
+		assertResumedShard({
+			durable: resumeMarker.shard,
+			requested: requestedShard,
+			configured: localShardConfiguration().effective,
+			joined: Boolean(resumeMarker.replicationEstablished),
+		});
+	}
 	if (!usingCertAuth && !resumeMarker) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
 		// Cannot check if cloning with WS - module initialization order prevents access to required variables
@@ -308,7 +331,22 @@ export async function cloneNode(): Promise<void> {
 	logger.initLogSettings();
 	harperLogger = logger.loggerWithTag('cloneNode');
 
-	const syncStartedAt: number = resumeMarker?.startedAt ?? Date.now();
+	const noteCopyFailure = ({ database, message }: { database: string; message: string }) => {
+		if (!process.env[CLONE_ATTEMPT_ENV]) return; // a worker's inherited copy of it outlives the attempt
+		copyFailures.set(database, { count: (copyFailures.get(database)?.count ?? 0) + 1, message });
+	};
+	onCloneCopyFailure(noteCopyFailure);
+	const { onMessageByType } = await import('../core/server/threads/manageThreads.js');
+	onMessageByType(CLONE_COPY_FAILURE_MESSAGE, noteCopyFailure);
+
+	// An older binary's marker can be long spent, and the ceiling is charged from this time.
+	const syncStartedAt: number = (resumeMarker?.shardAware && resumeMarker.startedAt) || Date.now();
+	// An older binary's marker stays unaware until a shard is resolved: a refusal must still refuse at the next start.
+	shardRecord = {
+		shardAware: resumeMarker ? resumeMarker.shardAware : true,
+		shard: resumeMarker?.shard,
+		shardedDatabases: resumeMarker?.shardedDatabases,
+	};
 	let targetTimestamps: Record<string, number> | undefined = resumeMarker?.targetsExcludeLocalTables
 		? resumeMarker.targetTimestamps
 		: undefined;
@@ -317,7 +355,9 @@ export async function cloneNode(): Promise<void> {
 	let totalBytes: number = resumeMarker?.totalBytes ?? 0;
 
 	try {
-		if (resumeMarker?.replicationEstablished) {
+		// A marker that is not shard-aware was written by a binary that copied the leader's shard and pre-created
+		// sharded tables as plain ones. Replaying is the only way that root gets the leader's maps.
+		if (resumeMarker?.replicationEstablished && resumeMarker.shardAware) {
 			// checkSyncStatus matches leaderReplicationURL exactly, and only the marker holds the value
 			// refined against a TLS-only (e.g. v4) leader.
 			leaderReplicationURL = resumeMarker.leaderReplicationURL ?? leaderReplicationURL;
@@ -329,7 +369,7 @@ export async function cloneNode(): Promise<void> {
 			// returns success-with-warning. Replay is cheap and safe — ensureNode upserts by node name,
 			// and a base copy already running resumes from its durable cursor rather than restarting.
 			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
-			await establishReplicationSetup();
+			await establishReplicationSetup(syncStartedAt, resumeMarker);
 			writeSyncStartedMarker({
 				startedAt: syncStartedAt,
 				replicationEstablished: true,
@@ -360,8 +400,11 @@ export async function cloneNode(): Promise<void> {
 		// Contained rather than thrown: a rejection here reaches bin/harper.js, which exits the
 		// already-started process instead of leaving it queryable. An application this node could not
 		// copy ends the attempt like a missing JWT key; other setup failures keep it for a restart to resume.
+		// A refusal has nothing to resume, and a restart may be days away, so it must not inherit this attempt's
+		// ceiling; only an older binary's marker stays, since it is what makes the next start refuse too.
+		if (err instanceof CloneShardRefusedError && shardRecord.shardAware) clearSyncStartedMarker();
 		await stopUnfinishedClone(`Clone from leader node ${leaderURL} failed during setup (${err})`, {
-			keepAttempt: !(err instanceof ApplicationCloneError),
+			keepAttempt: !(err instanceof ApplicationCloneError || err instanceof CloneShardRefusedError),
 		});
 		return;
 	}
@@ -432,15 +475,28 @@ export async function cloneNode(): Promise<void> {
  * Must never be repeated once that succeeds (component re-extract, `npm install`, and a
  * `restartWorkers` that would tear down the replication just resumed). Failures throw uncaught.
  */
-async function establishReplicationSetup(): Promise<void> {
+async function establishReplicationSetup(syncStartedAt: number, priorMarker?: SyncStartedMarker): Promise<void> {
 	// Test hook: appends one line per invocation so a resume test can assert this ran exactly once
 	// across a restart. Without it the resume tests pass either way — a replayed setup also converges,
 	// so convergence alone proves nothing about whether the marker was honoured.
 	const traceFile = process.env.CLONE_SETUP_TRACE_FILE;
 	if (traceFile) appendFileSync(traceFile, `${Date.now()}\n`);
 
-	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
-	const leaderConfigData = await cloneConfig();
+	const leaderConfigData = await leaderRequest({ operation: OPERATIONS_ENUM.GET_CONFIGURATION });
+	if (!leaderConfigData.hasOwnProperty('rootPath')) {
+		throw new Error('Leader config data check failed: rootPath is missing from leader config response');
+	}
+	const leaderStatus = await leaderClusterStatus();
+	const { shard, description } = resolveShard(leaderConfigData, leaderStatus, priorMarker);
+	log(`Clone shard: ${description}`);
+
+	// Before the config or any application reaches disk. If this fails and the node restarts with them already
+	// there, boot activates the @sharded component with a default map that conflicts with a custom one.
+	const shardedDatabases = await cloneShardMaps(leaderStatus);
+	shardRecord = { shardAware: true, shard, shardedDatabases };
+	writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
+
+	cloneConfig(leaderConfigData, shard);
 
 	// Refine the leader replication URL using the leader's own config. This is the only way to
 	// pick the right scheme (ws:// vs wss://) when bootstrapping against a leader whose
@@ -474,7 +530,7 @@ async function establishReplicationSetup(): Promise<void> {
 	// the existing self-bootstrap (cert-auth users are bootstrapping inside an already-clustered
 	// environment that has the cluster CA chain).
 	if (!usingCertAuth) {
-		await cloneSchemas();
+		await cloneSchemas(shardedDatabases);
 	}
 
 	// Base set node request
@@ -484,6 +540,7 @@ async function establishReplicationSetup(): Promise<void> {
 		url: string;
 		isLeader: true;
 		requirePeerAck: true;
+		timeoutMs: number;
 		authorization?:
 			| {
 					username: string;
@@ -502,6 +559,7 @@ async function establishReplicationSetup(): Promise<void> {
 		// every later start would skip setup permanently, and the monitor would poll a leader that never
 		// accepted this node until the ceiling expired.
 		requirePeerAck: true,
+		timeoutMs: LEADER_REQUEST_DEADLINE_MS,
 	};
 
 	if (!usingCertAuth) {
@@ -612,6 +670,11 @@ type SyncStartedMarker = {
 	targetsExcludeLocalTables?: boolean;
 	totalBytes?: number;
 	setupComplete?: boolean;
+	/** Absent means an older binary wrote this marker, so a shard in the config file may be the leader's own. */
+	shardAware?: boolean;
+	shard?: number;
+	/** Databases the leader reports as sharded: the monitor requires each to report ready, across restarts. */
+	shardedDatabases?: string[];
 };
 
 function syncStartedMarkerPath(): string {
@@ -628,7 +691,13 @@ function writeSyncStartedMarker(stage: Omit<SyncStartedMarker, 'leaderURL' | 'le
 	mkdirSync(dirname(target), { recursive: true });
 	// Stage flags are always present, never absent-meaning-false, so the file states plainly how far
 	// setup got for anyone reading it during an incident.
-	const marker: SyncStartedMarker = { leaderURL, leaderReplicationURL, setupComplete: false, ...stage };
+	const marker: SyncStartedMarker = {
+		leaderURL,
+		leaderReplicationURL,
+		setupComplete: false,
+		...shardRecord,
+		...stage,
+	};
 	writeFileSync(temp, JSON.stringify(marker), { mode: 0o600 });
 	renameSync(temp, target);
 }
@@ -767,6 +836,11 @@ async function monitorSync(
 		requiredSocketDatabases: Object.keys(targetTimestamps).filter(
 			(database) => database !== 'system' || systemSocketRequired
 		),
+		sharding: {
+			databases: (shardRecord.shardedDatabases ?? []).filter((database) => isReplicatedDatabase(database)),
+			shard: shardRecord.shard,
+		},
+		copyFailures,
 	});
 
 	if (outcome === 'synced') {
@@ -1125,12 +1199,67 @@ function deriveLeaderReplicationURL(leaderConfig: Record<string, any> | undefine
 	return `${scheme}://${hostname}:${port}`;
 }
 
-async function cloneConfig(): Promise<Record<string, any>> {
-	log('Cloning config from leader');
-	const leaderConfigData = await leaderRequest({ operation: OPERATIONS_ENUM.GET_CONFIGURATION });
-	if (!leaderConfigData.hasOwnProperty('rootPath')) {
-		throw new Error('Leader config data check failed: rootPath is missing from leader config response');
+/** v4 leaders have no shard maps; a leader of unknown version is asked, and a failure stops the clone. */
+async function leaderClusterStatus(): Promise<any> {
+	const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
+	if (leaderMajorVersion >= 1 && leaderMajorVersion < 5) return undefined;
+	return leaderRequest({ operation: 'cluster_status' });
+}
+
+function localShardConfiguration(): { effective: unknown; fileOnly: boolean } {
+	const fileShard = hdbConfig[CONFIG_PARAMS.REPLICATION_SHARD];
+	const individualShard = assignCMDENVVariables([CONFIG_PARAMS.REPLICATION_SHARD], true)[
+		CONFIG_PARAMS.REPLICATION_SHARD
+	];
+	const belowEnvVars = individualShard ?? fileShard;
+	return {
+		effective: composeConfigFromEnv(belowEnvVars === undefined ? {} : { replication: { shard: belowEnvVars } })
+			.replication?.shard,
+		fileOnly:
+			fileShard !== undefined && individualShard === undefined && composedConfig.replication?.shard === undefined,
+	};
+}
+
+function resolveShard(leaderConfigData: Record<string, any>, leaderStatus: any, priorMarker?: SyncStartedMarker) {
+	const { effective, fileOnly } = localShardConfiguration();
+	return chooseCloneShard({
+		requested: requestedShard,
+		// The marker is written before the config, so it alone holds a choice a crash cut off between the two.
+		configured: effective ?? priorMarker?.shard,
+		configuredUnproven: fileOnly && priorMarker !== undefined && !priorMarker.shardAware,
+		leaderShard: leaderConfigData.replication?.shard,
+		leaderShards: leaderConfigData.replication?.shards,
+		leaderStatus,
+		thisNode: nodeHostname,
+	});
+}
+
+/**
+ * Install the leader's exact shard maps before this node declares anything: a declaration with no map would start
+ * one of its own, which the leader's then conflicts with, and a plain table left by an earlier attempt could not
+ * activate at all. Returns every database the leader reports as sharded. Reading "none" after a failed read would
+ * recreate that, so a failure stops the clone.
+ */
+async function cloneShardMaps(leaderStatus: any): Promise<string[]> {
+	const databases = Object.keys(leaderStatus?.sharding ?? {});
+	if (!databases.length) return databases;
+	const maps = await leaderRequest({
+		operation: OPERATIONS_ENUM.SEARCH_BY_ID,
+		database: SYSTEM_SCHEMA_NAME,
+		table: SYSTEM_TABLE_NAMES.RESIDENCY_SLOTS_TABLE_NAME,
+		ids: databases,
+		get_attributes: ['*'],
+	});
+	const { installResidencyMap } = await import('../core/resources/residencyMaps.ts');
+	for (const map of requireLeaderMaps(databases, maps)) {
+		await installResidencyMap(map);
+		log(`Installed the leader's shard map for '${map.database}' (version ${map.version}, ${map.digest})`);
 	}
+	return databases;
+}
+
+function cloneConfig(leaderConfigData: Record<string, any>, shard: number | undefined): void {
+	log('Cloning config from leader');
 
 	// Build base configuration with node-specific settings
 	const configData: Record<string, any> = {
@@ -1174,11 +1303,10 @@ async function cloneConfig(): Promise<Record<string, any>> {
 	// Apply command-line and environment variable overrides
 	const cliArgs = assignCMDENVVariables(Object.keys(CONFIG_PARAM_MAP), true);
 	Object.assign(configData, cliArgs);
+	if (shard !== undefined) configData[CONFIG_PARAMS.REPLICATION_SHARD] = shard;
 
 	// Write final configuration to file
 	createConfigFile(configData, true);
-
-	return leaderConfigData;
 }
 
 /**
@@ -1219,19 +1347,22 @@ async function cloneApplications(): Promise<void> {
  * The system database is intentionally skipped — it already exists on this node from
  * `installHarper`, and its tables are managed by harper itself. Tables we already have locally
  * are also left alone so a re-run of cloneNode is safe.
+ *
+ * A sharded database gets no tables here: describe_all carries no policy, and a plain table can then
+ * never take its `@sharded` declaration or the cluster's schema. Its tables come from those two,
+ * policy included, and only the database is needed for the subscription to open.
  */
-async function cloneSchemas(): Promise<void> {
+async function cloneSchemas(shardedDatabases: readonly string[]): Promise<void> {
 	log('Cloning database/table schemas from leader');
 	let allDb: Record<string, any>;
 	try {
 		allDb = await leaderRequest({ operation: OPERATIONS_ENUM.DESCRIBE_ALL });
 	} catch (err) {
-		log(`Failed to describe leader databases for schema clone: ${err}`, 'error');
-		return;
+		// Not skippable: setNode would run next, and a later start would not repeat setup to create them.
+		throw new Error(`Failed to describe leader databases for schema clone: ${err}`, { cause: err });
 	}
 	if (!allDb || typeof allDb !== 'object') {
-		log(`Leader returned unexpected describe_all shape (${typeof allDb}); skipping schema clone`, 'error');
-		return;
+		throw new Error(`Leader returned unexpected describe_all shape (${typeof allDb})`);
 	}
 
 	// `describe_all` returns `{ databaseName: { tableName: { name, schema, attributes, hash_attribute, ... } } }`,
@@ -1247,7 +1378,7 @@ async function cloneSchemas(): Promise<void> {
 			const tableDesc = dbDescribe[tableName];
 			return tableDesc && typeof tableDesc === 'object' && tableReplicates(tableDesc);
 		});
-		if (replicatedTableNames.length === 0) continue;
+		if (replicatedTableNames.length === 0 && !shardedDatabases.includes(dbName)) continue;
 		if (!databases[dbName]) {
 			try {
 				await createSchema({ database: dbName, operation: OPERATIONS_ENUM.CREATE_DATABASE });
@@ -1262,6 +1393,8 @@ async function cloneSchemas(): Promise<void> {
 				}
 			}
 		}
+
+		if (shardedDatabases.includes(dbName)) continue;
 
 		for (const tableName of replicatedTableNames) {
 			const tableDesc = dbDescribe[tableName];
@@ -1303,17 +1436,17 @@ async function cloneSchemas(): Promise<void> {
  * Send a request to the leader node for the given operation, using either WebSockets or HTTP based on the useWS flag
  * @param operation
  */
-async function leaderRequest(operation: { operation: string; [key: string]: any }): Promise<Record<string, any>> {
-	if (usingCertAuth) {
-		// Dynamically importing the replicator module because it was causing early import of rootpath var on
-		// install before it was initialized.
-		const { sendOperationToNode } = await import('../replication/replicator.js');
-		return sendOperationToNode({ url: leaderReplicationURL }, operation, {
-			rejectUnauthorized: !allowSelfSigned,
-		});
-	}
-
-	return readLeaderResponse(await postToLeader(leaderHTTPTarget(), operation));
+function leaderRequest(
+	operation: { operation: string; [key: string]: any },
+	deadlineMs?: number
+): Promise<Record<string, any>> {
+	return requestLeader(
+		usingCertAuth
+			? { replicationURL: leaderReplicationURL, rejectUnauthorized: !allowSelfSigned }
+			: { http: leaderHTTPTarget() },
+		operation,
+		deadlineMs
+	);
 }
 
 function leaderHTTPTarget(): LeaderHTTPTarget {
@@ -1328,7 +1461,8 @@ function leaderHTTPTarget(): LeaderHTTPTarget {
 
 async function requestApplicationPackage(project: string, withNodeModules: boolean): Promise<string | Readable> {
 	const operation = { operation: OPERATIONS_ENUM.PACKAGE_COMPONENT, project, skip_node_modules: !withNodeModules };
-	if (!withNodeModules) return (await leaderRequest(operation)).payload;
+	if (!withNodeModules) return (await leaderRequest(operation, LEADER_PACKAGE_DEADLINE_MS)).payload;
+	// Bounded by socket inactivity, not a total: an archive that keeps arriving may legitimately take a long time.
 	return readPackageResponse(await postToLeader(leaderHTTPTarget(), { ...operation, stream: true }));
 }
 
@@ -1502,6 +1636,7 @@ function clearCloneAttempt(expectedAttemptId?: string): void {
 	}
 	delete process.env[CLONE_ATTEMPT_ENV];
 	delete process.env[CLONE_COMPLETED_AT_ENV];
+	copyFailures.clear();
 	try {
 		unlinkSync(cloneAttemptPath());
 	} catch (error: any) {

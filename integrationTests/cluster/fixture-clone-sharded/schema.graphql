@@ -1,0 +1,4 @@
+type CloneRows @table @export @sharded(slots: 10) {
+	id: ID @primaryKey
+	body: String
+}
