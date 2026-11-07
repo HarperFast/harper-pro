@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793951851142,
+  "lastUpdate": 1794038044907,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -7279,6 +7279,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2156.05,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "d94ecf6919b9d6664d810a92f6c58d7913b308a9",
+          "message": "Document how confirm/replicatedConfirmation counts peers (moved from documentation) (#1273)\n\n* docs: how confirm/replicatedConfirmation counts peers, from HarperFast/documentation\n\nPorts the v5 half of the open HarperFast/documentation#723 now that the sharding page lives\nhere, updated to current behavior: since harper-pro#1031 RocksDB counts a peer only for records\nit is resident for and refuses an unreachable count before the write, while LMDB keeps the\ndatabase-wide count and times out instead.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* docs: the RocksDB count is database-wide when no residency applies\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-07T03:59:05Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/d94ecf6919b9d6664d810a92f6c58d7913b308a9"
+        },
+        "date": 1794038042967,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 5083.36,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 17745.78,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 13163.08,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 6168.29,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 3736.46,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2146.31,
             "unit": "ops/sec"
           }
         ]
