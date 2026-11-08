@@ -164,13 +164,14 @@ describe('privatePaths', () => {
 			return { paths, pending, fire };
 		}
 
-		function waiter(name, { reachable = true, promotable = true } = {}) {
+		function waiter(name, { reachable = true, promotable = true, waiting = true } = {}) {
 			return {
 				name,
 				probes: 0,
 				promotions: 0,
 				reachable,
 				promotable,
+				waiting,
 				async probePrivatePath() {
 					this.probes++;
 					return this.reachable;
@@ -178,7 +179,11 @@ describe('privatePaths', () => {
 				promoteToPrivatePath() {
 					if (!this.promotable) return false;
 					this.promotions++;
+					this.waiting = false;
 					return true;
+				},
+				isWaitingFor() {
+					return this.waiting;
 				},
 			};
 		}
@@ -274,6 +279,7 @@ describe('privatePaths', () => {
 			const canary = [a, b, c].find((w) => w.promotions === 1);
 			paths.identified(KEY);
 			const queued = pending();
+			canary.waiting = true;
 			paths.failed(KEY, PRIVATE, canary); // the path fails again before the stagger runs
 			for (const timer of queued) await fire(timer);
 			for (const w of [a, b, c]) if (w !== canary) assert.strictEqual(w.promotions, 0, `${w.name} left on public`);
@@ -306,19 +312,52 @@ describe('privatePaths', () => {
 			assert.strictEqual(pending().length, 1, 'probing resumes');
 		});
 
-		it('skips waiters that will not redial, and stops when none remain', async () => {
+		it('drops waiters that left the fallback, and stops when none remain', async () => {
 			const { paths, pending, fire } = harness();
-			const gone = waiter('gone', { promotable: false });
+			const gone = waiter('gone');
 			const live = waiter('live');
 			paths.failed(KEY, PRIVATE, gone);
 			paths.failed(KEY, PRIVATE, live);
+			gone.waiting = false;
 			await fire(pending()[0]);
-			assert.strictEqual(live.promotions, 1, 'the next waiter becomes the canary');
+			assert.strictEqual(gone.probes + gone.promotions, 0, 'a waiter that left is neither prober nor canary');
+			assert.strictEqual(live.promotions, 1);
 			paths.forget(KEY, live);
 			assert.strictEqual(pending().length, 1, 'forgetting the canary resumes probing');
 			await fire(pending()[0]);
 			assert.strictEqual(pending().length, 0, 'no waiters, no more probes');
 			assert.strictEqual(paths.choose(PUBLIC, PRIVATE, KEY, live).path, PATH_PRIVATE, 'the path is tried again');
+		});
+
+		it('a waiter with a redial already pending stays waiting, and the probe runs again', async () => {
+			const { paths, pending, fire } = harness();
+			const pendingRedial = waiter('pending', { promotable: false });
+			paths.failed(KEY, PRIVATE, pendingRedial);
+			await fire(pending()[0]);
+			assert.strictEqual(paths.choose(PUBLIC, PRIVATE, KEY, pendingRedial).path, PATH_PUBLIC_FALLBACK);
+			assert.strictEqual(pending().length, 1, 'another probe is scheduled');
+		});
+
+		it('a waiter that unsubscribed before a renewed outage is not re-added to it', async () => {
+			const { paths, pending, fire } = harness();
+			const [a, b] = [waiter('a'), waiter('b')];
+			paths.failed(KEY, PRIVATE, a);
+			paths.failed(KEY, PRIVATE, b);
+			await fire(pending()[0]);
+			paths.identified(KEY);
+			const queued = pending();
+			const canary = a.promotions ? a : b;
+			const other = canary === a ? b : a;
+			other.waiting = false;
+			paths.forget(KEY, other);
+			canary.waiting = true;
+			paths.failed(KEY, PRIVATE, canary);
+			for (const timer of queued) await fire(timer);
+			canary.waiting = false;
+			paths.forget(KEY, canary);
+			for (const timer of pending()) await fire(timer);
+			assert.strictEqual(pending().length, 0, 'probing stops once no live waiter remains');
+			assert.strictEqual(other.probes, 0);
 		});
 
 		it('a probe that throws counts as unreachable', async () => {

@@ -52,6 +52,12 @@ function selfReplicatesForNodeWrite(): any {
 	return computeSelfReplicates(getConfiguredRoutes());
 }
 
+// ensureNode patches, so a removed advertisement is cleared explicitly
+function ownRowPrivateUrls(privateUrls: unknown): unknown {
+	if (privateUrls) return privateUrls;
+	return getHDBNodeTable().primaryStore.getSync(getThisNodeName())?.private_urls ? null : undefined;
+}
+
 /**
  * Can add, update or remove a node from replication
  * @param req
@@ -245,7 +251,8 @@ export async function setNode(req: any) {
 			subscriptions: null,
 		};
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
-		if (privateUrls) thisNode.private_urls = privateUrls;
+		const ownPrivate = ownRowPrivateUrls(privateUrls);
+		if (ownPrivate !== undefined) thisNode.private_urls = ownPrivate;
 
 		if (req.retain_authorization) thisNode.authorization = req.authorization;
 		if (req.start_time) thisNode.start_time = req.start_time;
@@ -338,7 +345,8 @@ export async function addNodeBack(req) {
 			thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
 			certs.shard = thisNode.shard;
 		}
-		if (privateUrls) thisNode.private_urls = privateUrls;
+		const ownPrivate = ownRowPrivateUrls(privateUrls);
+		if (ownPrivate !== undefined) thisNode.private_urls = ownPrivate;
 
 		if (req.start_time) thisNode.start_time = req.start_time;
 		if (req.authorization) thisNode.authorization = req.authorization;

@@ -291,7 +291,12 @@ import { ownUnnamedOriginId, unnamedOriginName } from './unnamedOrigins.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
 // blob-send backpressure both need it, so the private field is declared here rather than at each read.
-type ReplicationWebSocket = WebSocket & { _socket: Socket | null; dial?: Dial; peerIdentified?: boolean };
+type ReplicationWebSocket = WebSocket & {
+	_socket: Socket | null;
+	dial?: Dial;
+	peerIdentified?: boolean;
+	attemptSession?: Promise<any>;
+};
 
 const logger = forComponent('replication').conditional as Logger;
 let lmdbGetLastVersion: typeof import('lmdb').getLastVersion;
@@ -4999,7 +5004,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 			socket = await createWebSocket(dial.url, this.dialOptions(dial));
 		} catch (error) {
 			if (this.session !== attemptSession || this.intentionallyUnsubscribed) return;
-			if (dial.path === PATH_PRIVATE) this.privateDialFailed(dial, error.message);
+			if (dial.path === PATH_PRIVATE) this.privateDialFailed(dial, error.message, attemptSession);
 			// createWebSocket can reject before any socket exists or any open/error/close listener is
 			// attached — e.g. no valid replication certificate yet, or SNICallback.initialize() failing
 			// while a freshly-restarted peer rebuilds its TLS secure contexts. This connect() is invoked
@@ -5025,6 +5030,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 			return;
 		}
 		socket.dial = dial;
+		socket.attemptSession = attemptSession;
 		this.socket = socket;
 		// The socket this connection owns has just been replaced, so the session bound to the previous one
 		// is superseded by definition: retire it here rather than relying on that socket's 'close', which
@@ -5110,9 +5116,11 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		let socketError: string | undefined;
 		this.socket.on('error', (error: NodeJS.ErrnoException & { isHandled?: boolean }) => {
 			socketError = error.message;
+			const privateFailure = dial.path === PATH_PRIVATE && !socket.peerIdentified;
+			if (privateFailure) this.privateFallbackSession = attemptSession;
 			sessionReject(error);
-			// A private address that fails before the peer is identified is reported once per outage, by the close.
-			if (dial.path === PATH_PRIVATE && !socket.peerIdentified) return;
+			// reported once per outage, by the close
+			if (privateFailure) return;
 			if (error.code === 'SELF_SIGNED_CERT_IN_CHAIN') {
 				logger.warn?.(
 					`Can not connect to ${this.url}, this server does not have a certificate authority for the certificate provided by ${this.url}`
@@ -5376,9 +5384,12 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		return attempt.then(
 			(session) => session.getRecord(request),
 			(error) => {
-				if (attempt === this.privateFallbackSession && this.session !== attempt && !this.intentionallyUnsubscribed)
+				if (attempt !== this.privateFallbackSession || this.intentionallyUnsubscribed) throw error;
+				// the failed socket's close installs the public redial's session
+				return new Promise((resolve) => setImmediate(resolve)).then(() => {
+					if (this.session === attempt) throw error;
 					return this.getRecord(request);
-				throw error;
+				});
 			}
 		);
 	}
@@ -5416,11 +5427,11 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	notePrivateSocketEnded(socket: ReplicationWebSocket, reason: string) {
 		const { dial } = socket;
 		if (dial?.path === PATH_PRIVATE && !socket.peerIdentified && !this.intentionallyUnsubscribed)
-			this.privateDialFailed(dial, reason);
+			this.privateDialFailed(dial, reason, socket.attemptSession);
 	}
 
-	privateDialFailed(dial: Dial, reason: string) {
-		this.privateFallbackSession = this.session;
+	privateDialFailed(dial: Dial, reason: string, attemptSession: Promise<any>) {
+		this.privateFallbackSession = attemptSession;
 		if (privatePaths.failed(dial.pathKey, dial.privateUrl, this))
 			logger.warn?.(
 				`The private address ${dial.url} of ${this.nodeName} did not connect (${reason}); replicating over ${this.url} until it does`
@@ -5446,9 +5457,17 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		);
 	}
 
+	isWaitingFor(pathKey: string): boolean {
+		return (
+			!this.intentionallyUnsubscribed &&
+			!this.isFinished &&
+			this.dial?.path === PATH_PUBLIC_FALLBACK &&
+			this.dial.pathKey === pathKey
+		);
+	}
+
 	promoteToPrivatePath(pathKey: string): boolean {
-		if (this.intentionallyUnsubscribed || this.isFinished || this.reconnectScheduled) return false;
-		if (this.dial?.path !== PATH_PUBLIC_FALLBACK || this.dial.pathKey !== pathKey) return false;
+		if (!this.isWaitingFor(pathKey) || this.reconnectScheduled) return false;
 		this.forceReconnect();
 		return true;
 	}

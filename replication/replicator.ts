@@ -400,9 +400,7 @@ export function monitorNodeCAs(listener: () => void) {
  */
 function redialOnPrivateUrlChange(node: any, name: string) {
 	if (!node) return;
-	const networks = localNetworks();
-	if (networks.size === 0) return;
-	const privateUrl = privateUrlOn(node, networks);
+	const privateUrl = privateUrlOn(node, localNetworks());
 	let delay = 0;
 	const redial = (connection: NodeReplicationConnection) => {
 		if (connection.configuredNodeName !== name || !connection.dial || connection.dial.privateUrl === privateUrl) return;

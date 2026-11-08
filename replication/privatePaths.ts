@@ -6,7 +6,6 @@ import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { createBackoff, type Backoff } from './backoff.ts';
 import { PATH_PRIVATE, PATH_PUBLIC, PATH_PUBLIC_FALLBACK } from './sharedStatusSlots.ts';
 
-// Shorter than replication.pingTimeout: an unreachable private address delays the public dial by this much.
 export const PRIVATE_DIAL_TIMEOUT_MS = 10_000;
 // A private socket whose peer has not identified itself by then is closed, so the next dial is public.
 export const PRIVATE_IDENTIFY_TIMEOUT_MS = 30_000;
@@ -30,8 +29,10 @@ export interface Dial {
 export interface PrivatePathWaiter {
 	/** Whether the private URL now completes TLS, the peer certificate check and the WebSocket upgrade. */
 	probePrivatePath(privateUrl: string): Promise<boolean>;
-	/** Redials over the private path; false when no redial onto it will happen. */
+	/** Redials over the private path; false when a redial is already pending. */
 	promoteToPrivatePath(pathKey: string): boolean;
+	/** Still subscribed and on this path's public fallback. */
+	isWaitingFor(pathKey: string): boolean;
 }
 
 export const PATH_NAMES: Record<number, string> = {
@@ -186,7 +187,7 @@ export class PrivatePaths {
 		let delay = 0;
 		for (const waiter of outage.waiters) {
 			this.#setTimer(() => {
-				// a newer outage of the same path started meanwhile: wait for that one instead
+				if (!waiter.isWaitingFor(pathKey)) return;
 				const renewed = this.#outages.get(pathKey);
 				if (renewed) renewed.waiters.add(waiter);
 				else waiter.promoteToPrivatePath(pathKey);
@@ -221,6 +222,7 @@ export class PrivatePaths {
 	}
 
 	async #probe(pathKey: string, outage: Outage) {
+		for (const waiter of outage.waiters) if (!waiter.isWaitingFor(pathKey)) outage.waiters.delete(waiter);
 		const [prober] = outage.waiters;
 		if (!prober) {
 			this.#outages.delete(pathKey);
@@ -241,8 +243,8 @@ export class PrivatePaths {
 			return;
 		}
 		for (const waiter of outage.waiters) {
-			outage.waiters.delete(waiter);
 			if (!waiter.promoteToPrivatePath(pathKey)) continue;
+			outage.waiters.delete(waiter);
 			outage.canary = waiter;
 			outage.timer = this.#setTimer(() => {
 				if (outage.canary === waiter) this.failed(pathKey, outage.privateUrl, waiter);
@@ -250,8 +252,8 @@ export class PrivatePaths {
 			outage.timer.unref?.();
 			return;
 		}
-		// nothing is waiting on the public fallback any more; the next dial tries the private URL
-		this.#outages.delete(pathKey);
+		// every waiter already has a redial pending: they redial onto the fallback, so probe again later
+		this.#scheduleProbe(pathKey, outage);
 	}
 }
 

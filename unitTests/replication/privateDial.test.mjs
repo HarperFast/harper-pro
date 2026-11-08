@@ -196,6 +196,17 @@ describe('NodeReplicationConnection private dial', () => {
 			assert.strictEqual(await read, 'from the public socket');
 		});
 
+		it("a private socket's late close marks its own attempt, not the session that replaced it", () => {
+			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
+			connections.push(connection);
+			const privateUrl = 'wss://10.6.0.2:9933';
+			const dial = { url: privateUrl, path: PATH_PRIVATE, privateUrl, pathKey: privatePathKey(privateUrl, 'peer') };
+			const privateAttempt = Promise.resolve();
+			connection.session = Promise.resolve();
+			connection.notePrivateSocketEnded({ dial, attemptSession: privateAttempt }, 'closed');
+			assert.strictEqual(connection.privateFallbackSession, privateAttempt);
+		});
+
 		it('a read waiting on a failed public dial still fails', async () => {
 			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
 			connections.push(connection);
