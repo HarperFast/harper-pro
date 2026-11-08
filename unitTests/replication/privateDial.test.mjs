@@ -190,9 +190,10 @@ describe('NodeReplicationConnection private dial', () => {
 			connections.push(connection);
 			let rejectPrivate;
 			const privateAttempt = new Promise((_, reject) => (rejectPrivate = reject));
+			connection.dial = { url: 'wss://10.7.0.2:9933', path: PATH_PRIVATE, privateUrl: 'wss://10.7.0.2:9933' };
 			connection.session = privateAttempt;
 			const read = connection.getRecord({ id: 1 });
-			connection.privateFallbackSession = privateAttempt;
+			connection.sessionAbandonedForPath = privateAttempt;
 			connection.session = Promise.resolve({ getRecord: () => 'from the public socket' });
 			rejectPrivate(new Error('connect ECONNREFUSED'));
 			assert.strictEqual(await read, 'from the public socket');
@@ -206,7 +207,7 @@ describe('NodeReplicationConnection private dial', () => {
 			const privateAttempt = Promise.resolve();
 			connection.session = Promise.resolve();
 			connection.notePrivateSocketEnded({ dial, attemptSession: privateAttempt }, 'closed');
-			assert.strictEqual(connection.privateFallbackSession, privateAttempt);
+			assert.strictEqual(connection.sessionAbandonedForPath, privateAttempt);
 		});
 
 		it('a read sent on a private socket that ended before identification is served by the public redial', async () => {
@@ -214,13 +215,51 @@ describe('NodeReplicationConnection private dial', () => {
 			connections.push(connection);
 			let failRead;
 			const privateAttempt = Promise.resolve({ getRecord: () => new Promise((_, reject) => (failRead = reject)) });
+			connection.dial = { url: 'wss://10.7.0.2:9933', path: PATH_PRIVATE, privateUrl: 'wss://10.7.0.2:9933' };
 			connection.session = privateAttempt;
 			const read = connection.getRecord({ id: 1 });
 			await new Promise((resolve) => setImmediate(resolve));
-			connection.privateFallbackSession = privateAttempt;
+			connection.sessionAbandonedForPath = privateAttempt;
 			connection.session = Promise.resolve({ getRecord: () => 'from the public socket' });
 			failRead(new Error('closed: Unauthorized'));
 			assert.strictEqual(await read, 'from the public socket');
+		});
+
+		it('a read in flight on the public fallback when the connection moves back to private is retried there', async () => {
+			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
+			connections.push(connection);
+			const key = privatePathKey('wss://10.8.0.2:9933', 'peer');
+			connection.dial = {
+				url: 'wss://peer:9933',
+				path: PATH_PUBLIC_FALLBACK,
+				privateUrl: 'wss://10.8.0.2:9933',
+				pathKey: key,
+			};
+			let failRead;
+			const publicSession = Promise.resolve({ getRecord: () => new Promise((_, reject) => (failRead = reject)) });
+			connection.session = publicSession;
+			const read = connection.getRecord({ id: 1 });
+			await new Promise((resolve) => setImmediate(resolve));
+			connection.forceReconnect = () => {
+				connection.session = Promise.resolve({ getRecord: () => 'from the private socket' });
+			};
+			assert.strictEqual(connection.promoteToPrivatePath(key), true);
+			assert.strictEqual(connection.sessionAbandonedForPath, publicSession);
+			failRead(new Error('socket retired'));
+			assert.strictEqual(await read, 'from the private socket');
+		});
+
+		it('a connection with no private address keeps the plain read', async () => {
+			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
+			connections.push(connection);
+			let rejectAttempt;
+			const attempt = new Promise((_, reject) => (rejectAttempt = reject));
+			connection.session = attempt;
+			const read = connection.getRecord({ id: 1 });
+			connection.sessionAbandonedForPath = attempt;
+			connection.session = Promise.resolve({ getRecord: () => 'unexpected' });
+			rejectAttempt(new Error('connect ECONNREFUSED'));
+			await assert.rejects(read, /ECONNREFUSED/);
 		});
 
 		it('a read waiting on a failed public dial still fails', async () => {
