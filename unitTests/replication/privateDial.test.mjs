@@ -1,14 +1,10 @@
-/**
- * How a NodeReplicationConnection picks and falls back from a peer's private address (harper-pro#1292).
- * The dials go to closed local ports, so every attempt is refused before the WebSocket opens.
- */
-
 import assert from 'node:assert';
 import { createServer } from 'node:net';
+import { WebSocketServer } from 'ws';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { NodeReplicationConnection } from '#src/replication/replicationConnection';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
-import { privatePaths } from '#src/replication/privatePaths';
+import { privatePathKey, privatePaths } from '#src/replication/privatePaths';
 import { PATH_PRIVATE, PATH_PUBLIC, PATH_PUBLIC_FALLBACK } from '#src/replication/sharedStatusSlots';
 
 async function closedPort() {
@@ -43,7 +39,7 @@ describe('NodeReplicationConnection private dial', () => {
 			],
 		};
 		const saved = {};
-		// the row is served by the store read chooseDial makes, so other suites never see it in hdb_nodes
+		// served by the store read chooseDial makes: a real row write leaks into later suites
 		before(() => {
 			saved.network = env.get('replication_network');
 			saved.privateUrls = env.get('replication_privateUrls');
@@ -66,6 +62,7 @@ describe('NodeReplicationConnection private dial', () => {
 				url: 'wss://10.1.0.2:9933',
 				path: PATH_PRIVATE,
 				privateUrl: 'wss://10.1.0.2:9933',
+				pathKey: `${peer} wss://10.1.0.2:9933`,
 			});
 			assert.strictEqual(connection.url, `wss://${peer}:9933`);
 			const options = connection.dialOptions(connection.dial);
@@ -92,79 +89,128 @@ describe('NodeReplicationConnection private dial', () => {
 
 	describe('connect', () => {
 		const connections = [];
-		afterEach(() => {
+		const servers = [];
+		afterEach(async () => {
 			for (const connection of connections.splice(0)) {
 				connection.intentionallyUnsubscribed = true;
-				privatePaths.forget(connection.privatePathWaitingOn, connection);
+				privatePaths.forget(connection.dial?.pathKey, connection);
 				connection.socket?.terminate();
 			}
+			for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
 		});
 
-		it('a refused private dial marks the address down; the retry dials the public URL', async () => {
-			const privateUrl = `ws://127.0.0.1:${await closedPort()}`;
-			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
+		// the real chooseDial only takes wss: private URLs
+		function connectionVia(privateUrl, publicUrl) {
 			const connection = new NodeReplicationConnection(publicUrl, null, 'data', 'fallback-peer');
 			connections.push(connection);
-			connection.chooseDial = () => (connection.dial = privatePaths.choose(publicUrl, privateUrl, connection));
+			const pathKey = privatePathKey(privateUrl, 'fallback-peer');
+			connection.chooseDial = () => (connection.dial = privatePaths.choose(publicUrl, privateUrl, pathKey, connection));
 			const retries = [];
 			connection.setReconnectTimer = (callback) => {
 				retries.push(callback);
 				return { unref() {} };
 			};
+			return { connection, pathKey, retries };
+		}
+
+		async function server(onConnection) {
+			const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+			servers.push(wss);
+			wss.on('connection', onConnection);
+			await new Promise((resolve) => wss.once('listening', resolve));
+			return `ws://127.0.0.1:${wss.address().port}`;
+		}
+
+		it('a refused private dial marks the path down; the retry dials the public URL', async () => {
+			const privateUrl = `ws://127.0.0.1:${await closedPort()}`;
+			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
+			const { connection, pathKey, retries } = connectionVia(privateUrl, publicUrl);
 
 			await connection.connect();
 			assert.strictEqual(connection.socket.dial.path, PATH_PRIVATE);
 			await waitFor(() => retries.length === 1, 'the retry after the refused private dial');
-			assert.strictEqual(connection.privatePathWaitingOn, privateUrl);
-			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, connection).path, PATH_PUBLIC_FALLBACK);
+			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PUBLIC_FALLBACK);
 
 			retries[0]();
 			await waitFor(() => connection.socket?.dial?.path === PATH_PUBLIC_FALLBACK, 'the public dial');
 			assert.strictEqual(connection.socket.url.replace(/\/$/, ''), publicUrl);
 			await waitFor(() => retries.length === 2, 'the retry after the refused public dial');
-			assert.strictEqual(connection.privatePathWaitingOn, privateUrl, 'a public failure is not a private one');
 		});
 
-		it('an unsubscribe during the private dial does not mark the address down', async () => {
+		it('a peer that closes after the WebSocket opens, before identifying, is a private failure', async () => {
+			const privateUrl = await server((ws) => ws.close(1008, 'Unauthorized'));
+			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
+			const { connection, pathKey, retries } = connectionVia(privateUrl, publicUrl);
+			await connection.connect();
+			await waitFor(() => retries.length === 1, 'the retry after the 1008 close');
+			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PUBLIC_FALLBACK);
+		});
+
+		it('a private socket whose peer never identifies is closed at the deadline and fails over', async () => {
+			const privateUrl = await server(() => {});
+			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
+			const { connection, pathKey, retries } = connectionVia(privateUrl, publicUrl);
+			connection.privateIdentifyTimeoutMs = 200;
+			await connection.connect();
+			await waitFor(() => retries.length === 1, 'the retry after the identification deadline');
+			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PUBLIC_FALLBACK);
+		});
+
+		it('an unsubscribe during the private dial does not mark the path down', async () => {
 			const privateUrl = `ws://127.0.0.1:${await closedPort()}`;
 			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
-			const connection = new NodeReplicationConnection(publicUrl, null, 'data', 'fallback-peer');
-			connections.push(connection);
-			connection.chooseDial = () => (connection.dial = privatePaths.choose(publicUrl, privateUrl, connection));
+			const { connection, pathKey } = connectionVia(privateUrl, publicUrl);
 			await connection.connect();
 			connection.unsubscribe();
 			await waitFor(() => connection.isFinished, 'the close');
-			assert.strictEqual(connection.privatePathWaitingOn, undefined);
-			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, connection).path, PATH_PRIVATE);
+			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PRIVATE);
 		});
 
 		it('only a private socket whose peer was never identified counts as a private failure', () => {
 			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
 			connections.push(connection);
 			const privateUrl = 'wss://10.4.0.2:9933';
-			const dial = { url: privateUrl, path: PATH_PRIVATE, privateUrl };
+			const pathKey = privatePathKey(privateUrl, 'peer');
+			const dial = { url: privateUrl, path: PATH_PRIVATE, privateUrl, pathKey };
 			connection.notePrivateSocketEnded({ dial, peerIdentified: true }, 'closed');
-			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, connection).path, PATH_PRIVATE);
+			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
 			connection.notePrivateSocketEnded({ dial: { url: 'wss://peer:9933', path: PATH_PUBLIC } }, 'closed');
-			assert.strictEqual(connection.privatePathWaitingOn, undefined);
+			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
 			connection.notePrivateSocketEnded({ dial }, '1008 after open');
-			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, connection).path, PATH_PUBLIC_FALLBACK);
+			assert.strictEqual(
+				privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path,
+				PATH_PUBLIC_FALLBACK
+			);
 		});
 
-		it('promotion redials only a connection on the public fallback of that address', () => {
+		it('promotion redials only a connection that will redial onto that private path', () => {
 			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
 			connections.push(connection);
 			let forced = 0;
 			connection.forceReconnect = () => forced++;
+			const key = privatePathKey('wss://10.5.0.2:9933', 'peer');
 			connection.dial = { url: 'wss://peer:9933', path: PATH_PUBLIC };
-			assert.strictEqual(connection.promoteToPrivatePath('wss://10.5.0.2:9933'), false);
-			connection.dial = { url: 'wss://peer:9933', path: PATH_PUBLIC_FALLBACK, privateUrl: 'wss://10.5.0.3:9933' };
-			assert.strictEqual(connection.promoteToPrivatePath('wss://10.5.0.2:9933'), false);
-			connection.dial.privateUrl = 'wss://10.5.0.2:9933';
-			assert.strictEqual(connection.promoteToPrivatePath('wss://10.5.0.2:9933'), true);
+			assert.strictEqual(connection.promoteToPrivatePath(key), false);
+			connection.dial = {
+				url: 'wss://peer:9933',
+				path: PATH_PUBLIC_FALLBACK,
+				privateUrl: 'wss://10.5.0.3:9933',
+				pathKey: privatePathKey('wss://10.5.0.3:9933', 'peer'),
+			};
+			assert.strictEqual(connection.promoteToPrivatePath(key), false);
+			connection.dial = {
+				url: 'wss://peer:9933',
+				path: PATH_PUBLIC_FALLBACK,
+				privateUrl: 'wss://10.5.0.2:9933',
+				pathKey: key,
+			};
+			connection.reconnectScheduled = true;
+			assert.strictEqual(connection.promoteToPrivatePath(key), false, 'a pending redial is not a promotion');
+			connection.reconnectScheduled = false;
+			assert.strictEqual(connection.promoteToPrivatePath(key), true);
 			assert.strictEqual(forced, 1);
 			connection.intentionallyUnsubscribed = true;
-			assert.strictEqual(connection.promoteToPrivatePath('wss://10.5.0.2:9933'), false);
+			assert.strictEqual(connection.promoteToPrivatePath(key), false);
 		});
 	});
 });

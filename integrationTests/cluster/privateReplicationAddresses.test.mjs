@@ -1,11 +1,7 @@
 /**
- * Replication over private network addresses (harper-pro#1292).
- *
- * Three TLS nodes. A and B advertise a private URL on network `net1`, C on `net2`. Each private URL is a
- * TCP forwarder in this process, on its own loopback address, piping to the node's replication listener; it
- * records the source address of every connection (a node dials from its own address) and the bytes it
- * carries from the node. The forwarder's address is in no certificate, so a private dial only passes by
- * checking the certificate against the name the public dial uses.
+ * Each private URL is a TCP forwarder in this process on its own loopback address. A node dials from its
+ * own address, so the forwarder's source list says who dialed. The forwarder's address is in no
+ * certificate: a private dial passes only by checking the name the public dial uses.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal, deepEqual } from 'node:assert/strict';
@@ -27,7 +23,6 @@ function startForwarder(listenHost, targetHost) {
 		url: `wss://${listenHost}:${PORT}`,
 		targetHost,
 		sources: [],
-		// bytes from the node to whoever dialed it: the replicated data, for a peer subscribed through here
 		bytesFromNode: 0,
 		open() {
 			server = createServer((client) => {
@@ -52,7 +47,6 @@ function startForwarder(listenHost, targetHost) {
 				server.listen(PORT, listenHost, resolve);
 			});
 		},
-		// stops accepting and cuts every connection it carries, as a private network outage would
 		close() {
 			for (const socket of sockets) socket.destroy();
 			return new Promise((resolve) => server.close(() => resolve()));
@@ -83,7 +77,7 @@ async function socketsTo(node, peer, signal) {
 	return status.connections.find((connection) => connection.name === peer.hostname)?.database_sockets ?? [];
 }
 
-// the path of every database socket from `node` to `peer`, or undefined while any of them is down
+// undefined while any socket is down
 async function pathsTo(node, peer, signal) {
 	const sockets = await socketsTo(node, peer, signal);
 	if (!sockets.length || !sockets.every((socket) => socket.connected)) return undefined;
@@ -205,7 +199,6 @@ suite('replication over private network addresses', { timeout: 480_000 }, (ctx) 
 		equal(ctx.forwarders.A.dialsFrom(C) + ctx.forwarders.B.dialsFrom(C), 0, 'C never dials a net1 address');
 		equal(ctx.forwarders.C.sources.length, 0, "nobody shares C's network");
 
-		// B's writes reach A through B's private address
 		const before = ctx.forwarders.B.bytesFromNode;
 		const payload = 'x'.repeat(2048);
 		await insert(
@@ -258,7 +251,7 @@ suite('replication over private network addresses', { timeout: 480_000 }, (ctx) 
 	test('an address that answers with another node is never used', async () => {
 		const [A, B, C] = ctx.nodes;
 		await ctx.forwarders.B.close();
-		// TCP, TLS and the WebSocket upgrade all succeed here, but with C's certificate
+		// TCP connects, but C's certificate fails the check against B's name
 		ctx.forwarders.B.targetHost = C.hostname;
 		await ctx.forwarders.B.open();
 		await waitForPath(A, B, 'public-fallback');

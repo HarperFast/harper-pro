@@ -1,4 +1,3 @@
-// Leader config a clone does not copy: local paths, and settings that name or place the leader itself.
 export const CONFIG_TO_EXCLUDE_FROM_CLONE = {
 	clustering_nodename: true,
 	clustering_leafserver_streams_path: true,

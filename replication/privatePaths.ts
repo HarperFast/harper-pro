@@ -1,8 +1,4 @@
-/**
- * Which address a replication connection dials: a peer's private URL on one of this node's networks, or its
- * public `url`. The choice is per thread and per socket; nothing about it is written to `hdb_nodes`, which
- * every node shares.
- */
+// Nothing about which address a node dials is written to hdb_nodes: every node shares those rows.
 import { isIP } from 'node:net';
 import { urlToNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
@@ -12,6 +8,8 @@ import { PATH_PRIVATE, PATH_PUBLIC, PATH_PUBLIC_FALLBACK } from './sharedStatusS
 
 // Shorter than replication.pingTimeout: an unreachable private address delays the public dial by this much.
 export const PRIVATE_DIAL_TIMEOUT_MS = 10_000;
+// A private socket whose peer has not identified itself by then is closed, so the next dial is public.
+export const PRIVATE_IDENTIFY_TIMEOUT_MS = 30_000;
 // A canary that neither reaches the handshake nor fails within this long is treated as failed.
 const CANARY_TIMEOUT_MS = 60_000;
 // Matches subscriptionManager's RECONNECT_STAGGER_MS: opening many TLS connections at once spikes memory.
@@ -26,13 +24,14 @@ export interface Dial {
 	url: string;
 	path: number;
 	privateUrl?: string;
+	pathKey?: string;
 }
 
 export interface PrivatePathWaiter {
 	/** Whether the private URL now completes TLS, the peer certificate check and the WebSocket upgrade. */
 	probePrivatePath(privateUrl: string): Promise<boolean>;
-	/** Redials over the private URL; false when this connection is no longer on that URL's public fallback. */
-	promoteToPrivatePath(privateUrl: string): boolean;
+	/** Redials over the private path; false when no redial onto it will happen. */
+	promoteToPrivatePath(pathKey: string): boolean;
 }
 
 export const PATH_NAMES: Record<number, string> = {
@@ -83,7 +82,6 @@ export function ownPrivateUrls(): PrivateUrl[] | undefined {
 	return normalizePrivateUrls(env.get(CONFIG_PARAMS.REPLICATION_PRIVATEURLS));
 }
 
-/** The networks this node dials from: `replication.network` and every network it is reachable on. */
 export function localNetworks(): Set<string> {
 	const networks = new Set<string>();
 	const network = env.get(CONFIG_PARAMS.REPLICATION_NETWORK);
@@ -92,7 +90,6 @@ export function localNetworks(): Set<string> {
 	return networks;
 }
 
-/** The first private URL the peer advertises on one of `networks`. */
 export function privateUrlOn(peer: any, networks: Set<string>): string | undefined {
 	if (networks.size === 0) return undefined;
 	return normalizePrivateUrls(peer?.private_urls)?.find((entry) => networks.has(entry.network))?.url;
@@ -110,7 +107,23 @@ export function publicTlsIdentity(publicUrl: string, nodeName?: string): { serve
 	return { servername, checkHost: servername || publicHost };
 }
 
+/**
+ * What `add_node` / `add_node_back` say a peer advertises: undefined when the message is from a release
+ * that does not carry the field (leave the row alone), null when it advertises nothing and the row still
+ * holds an old advertisement (ensureNode patches, so the field has to be cleared explicitly).
+ */
+export function receivedPrivateUrls(message: any, existing: any): PrivateUrl[] | null | undefined {
+	if (message == null || !('private_urls' in message)) return undefined;
+	return normalizePrivateUrls(message.private_urls) ?? (existing?.private_urls ? null : undefined);
+}
+
+/** Two nodes behind one SNI proxy can advertise the same private URL, so outages are per peer identity too. */
+export function privatePathKey(privateUrl: string, identity: string): string {
+	return `${identity} ${privateUrl}`;
+}
+
 interface Outage {
+	privateUrl: string;
 	backoff: Backoff;
 	waiters: Set<PrivatePathWaiter>;
 	canary?: PrivatePathWaiter;
@@ -137,53 +150,59 @@ export class PrivatePaths {
 		this.#random = options.random ?? Math.random;
 	}
 
-	choose(publicUrl: string, privateUrl: string | undefined, waiter: PrivatePathWaiter): Dial {
+	choose(publicUrl: string, privateUrl: string | undefined, pathKey: string, waiter: PrivatePathWaiter): Dial {
 		if (!privateUrl) return { url: publicUrl, path: PATH_PUBLIC };
-		const outage = this.#outages.get(privateUrl);
-		if (!outage || outage.canary === waiter) return { url: privateUrl, path: PATH_PRIVATE, privateUrl };
+		const outage = this.#outages.get(pathKey);
+		if (!outage || outage.canary === waiter) return { url: privateUrl, path: PATH_PRIVATE, privateUrl, pathKey };
 		// a connection sent to the fallback waits for the outage to end, whether or not its own dial failed
 		outage.waiters.add(waiter);
-		return { url: publicUrl, path: PATH_PUBLIC_FALLBACK, privateUrl };
+		return { url: publicUrl, path: PATH_PUBLIC_FALLBACK, privateUrl, pathKey };
 	}
 
 	/** Returns true when this starts an outage, so the caller reports it once. */
-	failed(privateUrl: string, waiter: PrivatePathWaiter): boolean {
-		let outage = this.#outages.get(privateUrl);
+	failed(pathKey: string, privateUrl: string, waiter: PrivatePathWaiter): boolean {
+		let outage = this.#outages.get(pathKey);
 		const started = !outage;
 		if (!outage) {
 			outage = {
+				privateUrl,
 				backoff: createBackoff({ initialMs: 5_000, maxMs: 300_000, minMs: 1_000, random: this.#random }),
 				waiters: new Set(),
 			};
-			this.#outages.set(privateUrl, outage);
+			this.#outages.set(pathKey, outage);
 		}
 		if (outage.canary === waiter) this.#endTrial(outage);
 		outage.waiters.add(waiter);
-		if (!outage.canary && !outage.timer && !outage.probing) this.#scheduleProbe(privateUrl, outage);
+		if (!outage.canary && !outage.timer && !outage.probing) this.#scheduleProbe(pathKey, outage);
 		return started;
 	}
 
-	/** The peer was identified over `privateUrl`. Returns true when this ends an outage. */
-	identified(privateUrl: string): boolean {
-		const outage = this.#outages.get(privateUrl);
+	/** The peer was identified over the private path. Returns true when this ends an outage. */
+	identified(pathKey: string): boolean {
+		const outage = this.#outages.get(pathKey);
 		if (!outage) return false;
-		this.#outages.delete(privateUrl);
+		this.#outages.delete(pathKey);
 		this.#clearTimer(outage.timer);
 		let delay = 0;
 		for (const waiter of outage.waiters) {
-			this.#setTimer(() => waiter.promoteToPrivatePath(privateUrl), delay).unref?.();
+			this.#setTimer(() => {
+				// a newer outage of the same path started meanwhile: wait for that one instead
+				const renewed = this.#outages.get(pathKey);
+				if (renewed) renewed.waiters.add(waiter);
+				else waiter.promoteToPrivatePath(pathKey);
+			}, delay).unref?.();
 			delay += PROMOTION_STAGGER_MS;
 		}
 		return true;
 	}
 
-	forget(privateUrl: string | undefined, waiter: PrivatePathWaiter): void {
-		const outage = privateUrl && this.#outages.get(privateUrl);
+	forget(pathKey: string | undefined, waiter: PrivatePathWaiter): void {
+		const outage = pathKey && this.#outages.get(pathKey);
 		if (!outage) return;
 		outage.waiters.delete(waiter);
 		if (outage.canary === waiter) {
 			this.#endTrial(outage);
-			this.#scheduleProbe(privateUrl, outage);
+			this.#scheduleProbe(pathKey, outage);
 		}
 	}
 
@@ -193,46 +212,46 @@ export class PrivatePaths {
 		outage.timer = undefined;
 	}
 
-	#scheduleProbe(privateUrl: string, outage: Outage) {
+	#scheduleProbe(pathKey: string, outage: Outage) {
 		outage.timer = this.#setTimer(() => {
 			outage.timer = undefined;
-			this.#probe(privateUrl, outage);
+			this.#probe(pathKey, outage);
 		}, outage.backoff.nextDelay());
 		outage.timer.unref?.();
 	}
 
-	async #probe(privateUrl: string, outage: Outage) {
+	async #probe(pathKey: string, outage: Outage) {
 		const [prober] = outage.waiters;
 		if (!prober) {
-			this.#outages.delete(privateUrl);
+			this.#outages.delete(pathKey);
 			return;
 		}
 		let reachable = false;
 		outage.probing = true;
 		try {
-			reachable = await prober.probePrivatePath(privateUrl);
+			reachable = await prober.probePrivatePath(outage.privateUrl);
 		} catch {
-			// an unreachable path, like any other failed probe
+			reachable = false;
 		} finally {
 			outage.probing = false;
 		}
-		if (this.#outages.get(privateUrl) !== outage) return;
+		if (this.#outages.get(pathKey) !== outage) return;
 		if (!reachable) {
-			this.#scheduleProbe(privateUrl, outage);
+			this.#scheduleProbe(pathKey, outage);
 			return;
 		}
 		for (const waiter of outage.waiters) {
 			outage.waiters.delete(waiter);
-			if (!waiter.promoteToPrivatePath(privateUrl)) continue;
+			if (!waiter.promoteToPrivatePath(pathKey)) continue;
 			outage.canary = waiter;
 			outage.timer = this.#setTimer(() => {
-				if (outage.canary === waiter) this.failed(privateUrl, waiter);
+				if (outage.canary === waiter) this.failed(pathKey, outage.privateUrl, waiter);
 			}, CANARY_TIMEOUT_MS);
 			outage.timer.unref?.();
 			return;
 		}
 		// nothing is waiting on the public fallback any more; the next dial tries the private URL
-		this.#outages.delete(privateUrl);
+		this.#outages.delete(pathKey);
 	}
 }
 

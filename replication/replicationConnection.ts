@@ -154,10 +154,12 @@ import {
 } from './sharedStatusSlots.ts';
 import {
 	localNetworks,
+	privatePathKey,
 	privatePaths,
 	privateUrlOn,
 	publicTlsIdentity,
 	PRIVATE_DIAL_TIMEOUT_MS,
+	PRIVATE_IDENTIFY_TIMEOUT_MS,
 	type Dial,
 	type PrivatePathWaiter,
 } from './privatePaths.ts';
@@ -4803,8 +4805,7 @@ export async function createWebSocket(
 		rejectUnauthorized?: boolean;
 		serverName?: string;
 		nodeCA?: string;
-		// For a dial to another address of the node: the SNI ('' for none) and certificate name to use instead
-		// of the ones derived from `url` (publicTlsIdentity).
+		// override what ws and node:tls derive from `url`; servername '' sends no SNI
 		servername?: string;
 		checkHost?: string;
 		handshakeTimeout?: number;
@@ -4969,8 +4970,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	peerCapabilities?: ResolvedPeerCapabilities;
 	// The address the latest connect() chose; `url` stays the public URL every key and report uses.
 	dial?: Dial;
-	// The private URL whose outage this connection is waiting out on its public fallback.
-	privatePathWaitingOn?: string;
+	privateIdentifyTimeoutMs = PRIVATE_IDENTIFY_TIMEOUT_MS;
 	constructor(url: string, subscription: any, databaseName: string, nodeName?: string, authorization?: string) {
 		super();
 		this.url = url;
@@ -5124,6 +5124,15 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 				else logger.error?.(`Error in connection to ${this.url} due to ${error.message}`);
 			}
 		});
+		if (dial.path === PATH_PRIVATE) {
+			// an open socket that answers pings but never identifies would otherwise hold this link off public
+			const identifyDeadline = setTimeout(() => {
+				if (socket.peerIdentified) return;
+				socketError = `the peer did not identify itself within ${this.privateIdentifyTimeoutMs} ms`;
+				socket.terminate();
+			}, this.privateIdentifyTimeoutMs).unref();
+			socket.once('close', () => clearTimeout(identifyDeadline));
+		}
 		this.socket.on('close', (code, reasonBuffer) => {
 			// Ignore a late close from a socket we have already replaced — forceReconnect may have scheduled
 			// a fresh connect() that swapped in a new this.socket before this superseded socket's terminate()
@@ -5304,6 +5313,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		this.isConnected = false;
 		if (this.sharedStatus && this.nodeSubscriptions !== undefined) {
 			this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+			this.sharedStatus[CONNECTION_PATH_POSITION] = 0;
 			if (closeCode !== undefined) {
 				this.sharedStatus[LAST_ERROR_CODE_POSITION] = closeCode;
 				this.sharedStatus[LAST_ERROR_TIME_POSITION] = Date.now();
@@ -5312,7 +5322,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	}
 	unsubscribe() {
 		this.intentionallyUnsubscribed = true;
-		privatePaths.forget(this.privatePathWaitingOn, this);
+		privatePaths.forget(this.dial?.pathKey, this);
 		// No later attempt will settle readers still waiting for a session. An open session is already settled,
 		// and its close handler still needs isConnected to report the disconnect.
 		if (!this.liveSession) {
@@ -5375,11 +5385,9 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 				logger.debug?.(`Unable to read the hdb_nodes row of ${this.configuredNodeName}, dialing ${this.url}`, error);
 			}
 		}
-		if (this.privatePathWaitingOn !== undefined && this.privatePathWaitingOn !== privateUrl)
-			privatePaths.forget(this.privatePathWaitingOn, this);
-		this.dial = privatePaths.choose(this.url, privateUrl, this);
-		this.privatePathWaitingOn = this.dial.path === PATH_PUBLIC_FALLBACK ? privateUrl : undefined;
-		return this.dial;
+		const pathKey = privateUrl && privatePathKey(privateUrl, publicTlsIdentity(this.url, this.nodeName).checkHost);
+		if (this.dial?.pathKey && this.dial.pathKey !== pathKey) privatePaths.forget(this.dial.pathKey, this);
+		return (this.dial = privatePaths.choose(this.url, privateUrl, pathKey, this));
 	}
 
 	dialOptions(dial: Dial) {
@@ -5393,7 +5401,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	onPeerIdentified(socket: ReplicationWebSocket) {
 		socket.peerIdentified = true;
 		const { dial } = socket;
-		if (dial?.path === PATH_PRIVATE && privatePaths.identified(dial.privateUrl))
+		if (dial?.path === PATH_PRIVATE && privatePaths.identified(dial.pathKey))
 			logger.info?.(`Replicating with ${this.nodeName} over its private address ${dial.url} again`);
 	}
 
@@ -5404,8 +5412,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	}
 
 	privateDialFailed(dial: Dial, reason: string) {
-		this.privatePathWaitingOn = dial.privateUrl;
-		if (privatePaths.failed(dial.privateUrl, this))
+		if (privatePaths.failed(dial.pathKey, dial.privateUrl, this))
 			logger.warn?.(
 				`The private address ${dial.url} of ${this.nodeName} did not connect (${reason}); replicating over ${this.url} until it does`
 			);
@@ -5421,6 +5428,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 						socket.terminate();
 						resolve(reachable);
 					};
+					if (this.intentionallyUnsubscribed) return settle(false);
 					socket.once('open', () => settle(true));
 					socket.once('error', () => settle(false));
 					socket.once('close', () => settle(false));
@@ -5429,10 +5437,9 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		);
 	}
 
-	promoteToPrivatePath(privateUrl: string): boolean {
-		if (this.intentionallyUnsubscribed || this.isFinished) return false;
-		if (this.dial?.path !== PATH_PUBLIC_FALLBACK || this.dial.privateUrl !== privateUrl) return false;
-		this.privatePathWaitingOn = undefined;
+	promoteToPrivatePath(pathKey: string): boolean {
+		if (this.intentionallyUnsubscribed || this.isFinished || this.reconnectScheduled) return false;
+		if (this.dial?.path !== PATH_PUBLIC_FALLBACK || this.dial.pathKey !== pathKey) return false;
 		this.forceReconnect();
 		return true;
 	}
