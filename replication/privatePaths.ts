@@ -43,13 +43,14 @@ export const PATH_NAMES: Record<number, string> = {
 
 /**
  * Only `wss:`: a receiver identifies a TLS dialer by its certificate, but a plain-ws dialer by its source
- * address, which a private network changes. The URL is published, so it must not carry credentials.
+ * address, which a private network changes. The URL is published, so it must not carry credentials or a
+ * query, and ws refuses one with a fragment.
  */
 function isUsablePrivateUrl(value: unknown): value is string {
 	if (typeof value !== 'string') return false;
 	try {
 		const url = new URL(value);
-		return url.protocol === 'wss:' && url.hostname !== '' && !url.username && !url.password;
+		return url.protocol === 'wss:' && url.hostname !== '' && !url.username && !url.password && !url.search && !url.hash;
 	} catch {
 		return false;
 	}

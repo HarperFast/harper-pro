@@ -18,7 +18,7 @@ const PRIVATE = 'wss://10.0.0.2:9933';
 
 describe('privatePaths', () => {
 	describe('reading private URLs', () => {
-		it('keeps only wss URLs with a host, no credentials, and a network', () => {
+		it('keeps only wss URLs with a host, no credentials, query or fragment, and a network', () => {
 			assert.deepStrictEqual(
 				normalizePrivateUrls([
 					{ url: PRIVATE, network: 'net1', extra: true },
@@ -26,6 +26,8 @@ describe('privatePaths', () => {
 					'wss://10.0.0.3:9933',
 					{ url: 'ws://10.0.0.4:9933', network: 'net1' },
 					{ url: 'wss://user:pw@10.0.0.5:9933', network: 'net1' },
+					{ url: 'wss://10.0.0.5:9933/?token=x', network: 'net1' },
+					{ url: 'wss://10.0.0.5:9933/#x', network: 'net1' },
 					{ url: 'not a url', network: 'net1' },
 					{ url: 'wss://10.0.0.6:9933', network: '' },
 					{ url: 42, network: 'net1' },
