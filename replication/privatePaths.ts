@@ -42,7 +42,7 @@ export const PATH_NAMES: Record<number, string> = {
  * query, and ws refuses one with a fragment.
  */
 function isUsablePrivateUrl(value: unknown): value is string {
-	if (typeof value !== 'string') return false;
+	if (typeof value !== 'string' || !/^wss:\/\//i.test(value)) return false;
 	try {
 		const url = new URL(value);
 		return url.protocol === 'wss:' && url.hostname !== '' && !url.username && !url.password && !url.search && !url.hash;

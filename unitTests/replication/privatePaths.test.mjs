@@ -33,6 +33,7 @@ describe('privatePaths', () => {
 					{ url: 42, network: 'net1' },
 					{ url: 'wss://[fd00::7]:9933', network: 'net2' },
 					{ url: 'WSS://10.0.0.8:9933', network: 'net3' },
+					{ url: ' wss://10.0.0.9:9933', network: 'net3' },
 				]),
 				[
 					{ url: PRIVATE, network: 'net1' },
@@ -111,7 +112,6 @@ describe('privatePaths', () => {
 		it("accepts the peer's certificate at a private address only for the public name", () => {
 			const named = { subject: { CN: 'node-b.example.com' }, subjectaltname: 'DNS:node-b.example.com' };
 			const byIp = { subject: { CN: '203.0.113.10' }, subjectaltname: 'IP Address:203.0.113.10' };
-			// node:tls's own check for a dial to the private IP
 			assert.ok(tls.checkServerIdentity('10.0.0.2', named) instanceof Error);
 			assert.strictEqual(
 				tls.checkServerIdentity(publicTlsIdentity(PUBLIC, 'node-b.example.com').checkHost, named),
