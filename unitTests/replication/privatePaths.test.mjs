@@ -33,12 +33,14 @@ describe('privatePaths', () => {
 					{ url: 42, network: 'net1' },
 					{ url: 'wss://[fd00::7]:9933', network: 'net2' },
 					{ url: 'WSS://10.0.0.8:9933', network: 'net3' },
-					{ url: ' wss://10.0.0.9:9933', network: 'net3' },
+					{ url: ' wss://10.0.0.9:9933 ', network: 'net3' },
+					{ url: 'x wss://10.0.0.10:9933', network: 'net3' },
 				]),
 				[
 					{ url: PRIVATE, network: 'net1' },
 					{ url: 'wss://[fd00::7]:9933', network: 'net2' },
 					{ url: 'wss://10.0.0.8:9933', network: 'net3' },
+					{ url: 'wss://10.0.0.9:9933', network: 'net3' },
 				]
 			);
 			for (const value of [undefined, null, 'wss://10.0.0.2:9933', { url: PRIVATE }, [], [null]])

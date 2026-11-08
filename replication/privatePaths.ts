@@ -59,9 +59,11 @@ export function normalizePrivateUrls(value: unknown): PrivateUrl[] | undefined {
 	if (!Array.isArray(value)) return undefined;
 	const urls: PrivateUrl[] = [];
 	for (const entry of value) {
+		// config validation accepts what the URL parser does, including surrounding spaces
+		const url = typeof entry?.url === 'string' ? entry.url.trim() : undefined;
 		// createWebSocket recognizes a TLS URL by its lowercase scheme
-		if (isUsablePrivateUrl(entry?.url) && typeof entry.network === 'string' && entry.network !== '')
-			urls.push({ url: 'wss:' + entry.url.slice(4), network: entry.network });
+		if (isUsablePrivateUrl(url) && typeof entry.network === 'string' && entry.network !== '')
+			urls.push({ url: 'wss:' + url.slice(4), network: entry.network });
 	}
 	return urls.length ? urls : undefined;
 }

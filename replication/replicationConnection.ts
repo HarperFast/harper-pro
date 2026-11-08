@@ -13972,6 +13972,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// send a request for a specific record
 			const requestId = nextId++;
 			return new Promise((resolve, reject) => {
+				// a retired instance has already rejected its pending requests; ws drops a send on a closing socket
+				if (wsClosed) return reject(new Error('Replication connection closed before the record request was sent'));
 				let tableId = request.table.tableId;
 				if (request.blobRepairOnly) {
 					// Repair shares the subscription stream's decoder namespace: use the peer's id, not ours.

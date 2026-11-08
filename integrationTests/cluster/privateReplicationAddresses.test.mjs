@@ -140,15 +140,17 @@ suite('replication over private network addresses', { timeout: 480_000 }, (ctx) 
 			await startHarper(nodeCtx, nodeOptions(hostname, network, forwarder.url));
 			return nodeCtx.harper;
 		};
-		// registered as each starts, so after() tears down whichever started if another fails
+		// every start settles before a failure is thrown, so after() tears down each node that started
 		ctx.nodes = [];
-		await Promise.all(
+		const starts = await Promise.allSettled(
 			[
 				[hosts[0], 'net1', ctx.forwarders.A],
 				[hosts[1], 'net1', ctx.forwarders.B],
 				[hosts[2], 'net2', ctx.forwarders.C],
 			].map(async ([host, network, forwarder], i) => (ctx.nodes[i] = await start(host, network, forwarder)))
 		);
+		const failedStart = starts.find(({ status }) => status === 'rejected');
+		if (failedStart) throw failedStart.reason;
 		const [A, B, C] = ctx.nodes;
 		for (const node of ctx.nodes) {
 			await sendOperation(node, {
