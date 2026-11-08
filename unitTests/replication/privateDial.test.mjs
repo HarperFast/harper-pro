@@ -73,6 +73,17 @@ describe('NodeReplicationConnection private dial', () => {
 			assert.strictEqual(options.handshakeTimeout, 10_000);
 		});
 
+		it('keys and authenticates the private dial by the dialed node on a failover subscription', () => {
+			env.setProperty('replication_network', 'net1');
+			const connection = new NodeReplicationConnection(`wss://${peer}:9933`, null, 'data', peer);
+			// subscribeToNode names the origin served through this peer until the handshake names the peer
+			connection.nodeName = 'failover-origin';
+			assert.strictEqual(connection.chooseDial().pathKey, `${peer} wss://10.0.0.2:9933`);
+			const options = connection.dialOptions(connection.dial);
+			assert.strictEqual(options.servername, peer);
+			assert.strictEqual(options.checkHost, peer);
+		});
+
 		it('dials the public URL when no network matches, or none is configured', () => {
 			env.setProperty('replication_network', 'net3');
 			const connection = new NodeReplicationConnection(`wss://${peer}:9933`, null, 'data', peer);
@@ -156,7 +167,12 @@ describe('NodeReplicationConnection private dial', () => {
 			const { connection, pathKey, retries } = connectionVia(privateUrl, publicUrl);
 			connection.privateIdentifyTimeoutMs = 200;
 			await connection.connect();
+			// a socket that never emits close: the deadline must not wait on one
+			const { socket } = connection;
+			const terminate = socket.terminate;
+			socket.terminate = () => {};
 			await waitFor(() => retries.length === 1, 'the retry after the identification deadline');
+			socket.terminate = terminate;
 			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PUBLIC_FALLBACK);
 		});
 

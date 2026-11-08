@@ -5140,8 +5140,13 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 			// an open socket that answers pings but never identifies would otherwise hold this link off public
 			const identifyDeadline = setTimeout(() => {
 				if (socket.peerIdentified) return;
-				socketError = `the peer did not identify itself within ${this.privateIdentifyTimeoutMs} ms`;
-				socket.terminate();
+				this.notePrivateSocketEnded(
+					socket,
+					`the peer did not identify itself within ${this.privateIdentifyTimeoutMs} ms`
+				);
+				// as the watchdogs do: an open socket may never emit the close the reconnect would wait on
+				if (this.socket === socket) this.forceReconnect();
+				else socket.terminate();
 			}, this.privateIdentifyTimeoutMs).unref();
 			socket.once('close', () => clearTimeout(identifyDeadline));
 		}
@@ -5406,7 +5411,8 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 				logger.debug?.(`Unable to read the hdb_nodes row of ${this.configuredNodeName}, dialing ${this.url}`, error);
 			}
 		}
-		const pathKey = privateUrl && privatePathKey(privateUrl, publicTlsIdentity(this.url, this.nodeName).checkHost);
+		const pathKey =
+			privateUrl && privatePathKey(privateUrl, publicTlsIdentity(this.url, this.configuredNodeName).checkHost);
 		if (this.dial?.pathKey && this.dial.pathKey !== pathKey) privatePaths.forget(this.dial.pathKey, this);
 		return (this.dial = privatePaths.choose(this.url, privateUrl, pathKey, this));
 	}
@@ -5414,7 +5420,12 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	dialOptions(dial: Dial) {
 		const options = { serverName: this.nodeName, authorization: this.authorization };
 		if (dial.path !== PATH_PRIVATE) return options;
-		return { ...options, ...publicTlsIdentity(this.url, this.nodeName), handshakeTimeout: PRIVATE_DIAL_TIMEOUT_MS };
+		// the dialed node, not nodeName: a failover subscription sets that to its origin until the handshake
+		return {
+			...options,
+			...publicTlsIdentity(this.url, this.configuredNodeName),
+			handshakeTimeout: PRIVATE_DIAL_TIMEOUT_MS,
+		};
 	}
 
 	// A private socket counts as working only once the peer is identified: the server can still refuse this
@@ -5423,7 +5434,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		socket.peerIdentified = true;
 		const { dial } = socket;
 		if (dial?.path === PATH_PRIVATE && privatePaths.identified(dial.pathKey))
-			logger.info?.(`Replicating with ${this.nodeName} over its private address ${dial.url} again`);
+			logger.info?.(`Replicating with ${this.configuredNodeName} over its private address ${dial.url} again`);
 	}
 
 	notePrivateSocketEnded(socket: ReplicationWebSocket, reason: string) {
@@ -5439,7 +5450,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		this.sessionAbandonedForPath = attemptSession;
 		if (privatePaths.failed(dial.pathKey, dial.privateUrl, this))
 			logger.warn?.(
-				`The private address ${dial.url} of ${this.nodeName} did not connect (${reason}); replicating over ${this.url} until it does`
+				`The private address ${dial.url} of ${this.configuredNodeName} did not connect (${reason}); replicating over ${this.url} until it does`
 			);
 	}
 
