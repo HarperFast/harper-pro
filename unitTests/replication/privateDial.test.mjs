@@ -50,6 +50,8 @@ describe('NodeReplicationConnection private dial', () => {
 			};
 		});
 		after(() => {
+			// setup saves getSync last, and only tests change these
+			if (!saved.getSync) return;
 			env.setProperty('replication_network', saved.network);
 			env.setProperty('replication_privateUrls', saved.privateUrls);
 			getHDBNodeTable().primaryStore.getSync = saved.getSync;
