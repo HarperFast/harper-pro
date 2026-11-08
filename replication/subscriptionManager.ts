@@ -1101,20 +1101,22 @@ function scheduleTopologyRecheck(at: number) {
 /**
  * A supplier must speak region topology and be connected, except through a reconnect this node caused by assigning
  * it an origin: that reconnect reports DOWN and drops the reach the old session reported, and treating either as a
- * failure would move the origin straight back. The hold ends when the new session reports reach, or at its deadline.
+ * failure would move the origin straight back. The hold ends when the new session reports reach, or at its deadline,
+ * and it keeps only the origins already assigned to that link: a pinned link that is down must not draw others.
  */
-function topologySupplierState(database: string, now: number): SupplierState {
+function topologySupplierState(database: string, now: number, current: string | undefined): SupplierState {
+	const pinned = (name: string, entry: any) => name === current && entry?.topologyPinnedUntil > now;
 	return {
 		isLive(name) {
 			const entry = topologyEntry(name, database);
 			if (!entry) return false;
-			if (entry.topologyPinnedUntil > now) return true;
+			if (pinned(name, entry)) return true;
 			return entry.connected === true && !!entry.peerCapabilities && peerSupportsRegionTopology(entry.peerCapabilities);
 		},
 		liveSince: (name) => topologyEntry(name, database)?.liveSince ?? now,
 		reaches(name, region) {
 			const entry = topologyEntry(name, database);
-			return entry?.topologyPinnedUntil > now || entry?.peerReach?.includes(region) === true;
+			return pinned(name, entry) || entry?.peerReach?.includes(region) === true;
 		},
 		reachSince: (name, region) => topologyEntry(name, database)?.reachSince?.get(region) ?? now,
 	};
@@ -1135,7 +1137,6 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 	const selfName = getThisNodeName();
 	let assignments = topologyAssignments.get(database);
 	if (!assignments) topologyAssignments.set(database, (assignments = new Map()));
-	const state = topologySupplierState(database, now);
 	const managed: string[] = [];
 	for (const origin of topology.regionOf.keys()) {
 		if (routes.find((route) => route.name === origin)?.explicitReplication) continue;
@@ -1145,7 +1146,7 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 		const previous = assignments.get(origin);
 		const next: TopologyAssignment = settleSupplier(
 			candidates,
-			state,
+			topologySupplierState(database, now, previous?.supplier),
 			previous,
 			now,
 			TOPOLOGY_HOLD_MS,
@@ -2106,8 +2107,8 @@ export async function startOnMainThread(options) {
 		}
 	}
 	function reconcileWorkers() {
-		// not every hdb_nodes change reaches onNodeUpdate (a patch without topology fields does not), and the review is
-		// a cached comparison until the topology actually changes
+		// not every hdb_nodes change reaches onNodeUpdate (only isLeader patches do), and the review is a cached
+		// comparison until the topology actually changes
 		scheduleTopologyReview();
 		const now = Date.now();
 		const replicationPool = replicationWorkers();

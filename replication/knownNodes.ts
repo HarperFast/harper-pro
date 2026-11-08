@@ -420,7 +420,7 @@ function storeRecordRangeVisible(store: any, name: string): boolean {
 	}
 }
 
-export async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
+async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
 	if (event.type === 'reload') {
 		// A copyApply base copy back-filled hdb_nodes as snapshots with no per-row change events
 		// (harper-pro#489). Re-scan the whole table and fire the listener for every node so outbound
@@ -451,9 +451,9 @@ export async function processNodeUpdateEvent(event: any, listener: (node: any, i
 			if (reconstructed) server.nodes.push(reconstructed as any);
 			else console.error('Invalid node update event', event);
 		}
-	} else if (event.type === 'patch' && node_name !== getThisNodeName()) {
-		// A patch carries only its own fields (add_node's { isLeader: true }, a node republishing its
-		// region), and the node was just filtered out above; read the merged record back in. Sync read
+	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
+		// add_node { isLeader: true } reaches us as a patch event; read the merged
+		// record so server.nodes reflects the full record (including isLeader). Sync read
 		// (getSync): RocksDB get() is a MaybePromise (Promise on a block-cache miss); an un-awaited
 		// get() here would push a pending Promise into server.nodes. See selfNodeReplicates.
 		const fullRecord = getHDBNodeTable().primaryStore.getSync(node_name);
@@ -503,18 +503,12 @@ export async function processNodeUpdateEvent(event: any, listener: (node: any, i
 				);
 			}
 		}
-	} else if (event.type === 'patch' && (event.value?.isLeader !== undefined || patchesTopology(event.value))) {
-		// isLeader patches drive subscription bootstrap, and topology patches change which peers link; pass the merged record.
+	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
+		// isLeader patches need to drive subscription bootstrap; pass the merged record.
 		// Sync read (getSync) — RocksDB get() is a MaybePromise; see selfNodeReplicates.
 		const fullRecord = getHDBNodeTable().primaryStore.getSync(event.id);
 		if (fullRecord) listener(fullRecord, event.id);
 	}
-}
-function patchesTopology(value: any): boolean {
-	return (
-		value != null &&
-		(Object.hasOwn(value, 'region') || Object.hasOwn(value, 'gateway') || Object.hasOwn(value, 'replicates'))
-	);
 }
 /**
  * Distinguish a genuine `remove_node` tombstone from a transient decode failure for a range-visible
