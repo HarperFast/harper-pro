@@ -17,6 +17,7 @@ import { getThisNodeName, hostnameToUrl, getThisNodeUrl } from '../core/server/n
 import * as hdbLogger from '../core/utility/logging/harper_logger.js';
 import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/hdbError.js';
 import { server } from '../core/server/Server.ts';
+import { normalizePrivateUrls, ownPrivateUrls } from './privatePaths.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
 
 const validationSchema = Joi.object({
@@ -127,6 +128,8 @@ export async function setNode(req: any) {
 		authorization: req.retain_authorization ? req.authorization : null,
 	};
 	if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) targetAddNodeObj.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+	const privateUrls = ownPrivateUrls();
+	if (privateUrls) targetAddNodeObj.private_urls = privateUrls;
 
 	if (req.subscriptions) {
 		targetAddNodeObj.subscriptions = req.subscriptions.map(reverseSubscription);
@@ -211,6 +214,8 @@ export async function setNode(req: any) {
 	if (req.revoked_certificates) nodeRecord.revoked_certificates = req.revoked_certificates;
 	if (targetNodeResponse?.shard !== undefined) nodeRecord.shard = targetNodeResponse.shard;
 	else if (req.shard !== undefined) nodeRecord.shard = req.shard;
+	const peerPrivateUrls = normalizePrivateUrls(targetNodeResponse?.private_urls);
+	if (peerPrivateUrls) nodeRecord.private_urls = peerPrivateUrls;
 	// isLeader is LOCAL-ONLY: it means "this peer is my leader; request a full-table copy from it".
 	// It must NOT be forwarded to the peer via targetAddNodeObj — doing so would cause the peer
 	// to treat this node as its leader and attempt to full-copy in the wrong direction.
@@ -236,6 +241,7 @@ export async function setNode(req: any) {
 			subscriptions: null,
 		};
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+		if (privateUrls) thisNode.private_urls = privateUrls;
 
 		if (req.retain_authorization) thisNode.authorization = req.authorization;
 		if (req.start_time) thisNode.start_time = req.start_time;
@@ -304,6 +310,8 @@ export async function addNodeBack(req) {
 	if (req.start_time) nodeRecord.start_time = req.start_time;
 	if (req.authorization) nodeRecord.authorization = req.authorization;
 	if (req.shard !== undefined) nodeRecord.shard = req.shard;
+	const peerPrivateUrls = normalizePrivateUrls(req.private_urls);
+	if (peerPrivateUrls) nodeRecord.private_urls = peerPrivateUrls;
 
 	const rep = await getReplicationCert();
 	if (!rep && (req.csr || req.url?.startsWith('wss:'))) {
@@ -323,6 +331,8 @@ export async function addNodeBack(req) {
 			thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
 			certs.shard = thisNode.shard;
 		}
+		const privateUrls = ownPrivateUrls();
+		if (privateUrls) thisNode.private_urls = certs.private_urls = privateUrls;
 
 		if (req.start_time) thisNode.start_time = req.start_time;
 		if (req.authorization) thisNode.authorization = req.authorization;

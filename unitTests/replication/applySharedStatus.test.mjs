@@ -1,6 +1,7 @@
 /**
  * Only the sending-time slot carries the copy sentinel; every other date slot holds epoch ms.
  */
+import assert from 'node:assert';
 import { expect } from 'chai';
 import { applySharedStatus } from '#src/replication/clusterStatus';
 import {
@@ -12,6 +13,12 @@ import {
 	LAST_BLOB_FAILURE_TIME_POSITION,
 } from '#src/replication/replicationConnection';
 import { REPLICATION_SHARED_STATUS_SLOTS } from '#src/replication/knownNodes';
+import {
+	CONNECTION_PATH_POSITION,
+	PATH_PRIVATE,
+	PATH_PUBLIC,
+	PATH_PUBLIC_FALLBACK,
+} from '#src/replication/sharedStatusSlots';
 
 const NOW = 1_700_000_000_000;
 const newStatus = () => new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
@@ -36,6 +43,19 @@ describe('applySharedStatus', () => {
 
 	it('omits the sending time when nothing is being sent', () => {
 		expect(apply(newStatus()).sendingMessage).to.equal(undefined);
+	});
+
+	it('names the dialed path, and omits it before any handshake', () => {
+		const status = newStatus();
+		assert.strictEqual(apply(status).path, undefined);
+		for (const [value, name] of [
+			[PATH_PUBLIC, 'public'],
+			[PATH_PRIVATE, 'private'],
+			[PATH_PUBLIC_FALLBACK, 'public-fallback'],
+		]) {
+			status[CONNECTION_PATH_POSITION] = value;
+			assert.strictEqual(apply(status).path, name);
+		}
 	});
 
 	it('formats a 1 in any other date slot as a date, never as Copying', () => {

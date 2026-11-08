@@ -75,6 +75,7 @@ import './clusterStatus.ts';
 import './blobRepair.ts';
 import '../security/keyService.ts';
 import { migrateSSHConfigOnce } from '../security/sshKeyOperations.ts';
+import { localNetworks, privateUrlOn, PROMOTION_STAGGER_MS } from './privatePaths.ts';
 
 // Each active replication connection legitimately registers a small handful of updateTable / dropDatabase
 // listeners on the global databaseEventsEmitter (one per subscriptionManager iterator and per per-DB WS), so a
@@ -378,7 +379,8 @@ export function monitorNodeCAs(listener: () => void) {
 	// replication-confirmation watchers; without a distinct key the subscription-manager's default-key
 	// subscribeToNodeUpdates would supersede (stop) this one and CA additions/rotations would stop
 	// updating the replication TLS contexts (harper-pro#460 review follow-up).
-	subscribeToNodeUpdates((node) => {
+	subscribeToNodeUpdates((node, name) => {
+		redialOnPrivateUrlChange(node, name);
 		logger.debug('Adding node CA', node?.ca?.slice(0, 60));
 		if (node?.ca) {
 			// we only care about nodes that have a CA
@@ -390,6 +392,25 @@ export function monitorNodeCAs(listener: () => void) {
 			}
 		}
 	}, 'ca-monitor');
+}
+/**
+ * A peer's advertised private URLs changed (it restarted with new config, or its row just replicated here):
+ * redial each connection to it whose address choice is now different, rather than waiting for a reconnect
+ * that a healthy link may never make. Staggered, as opening many TLS connections at once spikes memory.
+ */
+function redialOnPrivateUrlChange(node: any, name: string) {
+	if (!node) return;
+	const networks = localNetworks();
+	if (networks.size === 0) return;
+	const privateUrl = privateUrlOn(node, networks);
+	let delay = 0;
+	const redial = (connection: NodeReplicationConnection) => {
+		if (connection.configuredNodeName !== name || !connection.dial || connection.dial.privateUrl === privateUrl) return;
+		setTimeout(() => connection.forceReconnect(), delay).unref();
+		delay += PROMOTION_STAGGER_MS;
+	};
+	for (const dbConnections of connections.values()) for (const connection of dbConnections.values()) redial(connection);
+	for (const connection of nodeNameToRetrievalConnections.get(name)?.values() ?? []) redial(connection);
 }
 export function disableReplication(disabled = true) {
 	replicationDisabled = disabled;

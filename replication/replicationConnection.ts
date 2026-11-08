@@ -147,7 +147,20 @@ import {
 	FIRE_COUNTER_BASE_POSITION,
 	PEER_CERTIFIES_FLOORS_POSITION,
 	LAST_SEND_LOG_BREAK_RECONNECT_TIME_POSITION,
+	CONNECTION_PATH_POSITION,
+	PATH_PRIVATE,
+	PATH_PUBLIC,
+	PATH_PUBLIC_FALLBACK,
 } from './sharedStatusSlots.ts';
+import {
+	localNetworks,
+	privatePaths,
+	privateUrlOn,
+	publicTlsIdentity,
+	PRIVATE_DIAL_TIMEOUT_MS,
+	type Dial,
+	type PrivatePathWaiter,
+} from './privatePaths.ts';
 import {
 	recordPeerLockCapability,
 	recordPeerLockLevel,
@@ -276,7 +289,7 @@ import { ownUnnamedOriginId, unnamedOriginName } from './unnamedOrigins.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
 // blob-send backpressure both need it, so the private field is declared here rather than at each read.
-type ReplicationWebSocket = WebSocket & { _socket: Socket | null };
+type ReplicationWebSocket = WebSocket & { _socket: Socket | null; dial?: Dial; peerIdentified?: boolean };
 
 const logger = forComponent('replication').conditional as Logger;
 let lmdbGetLastVersion: typeof import('lmdb').getLastVersion;
@@ -4785,7 +4798,17 @@ export function mergeReplicationCAs(availableCAs?: Iterable<string>, nodeCA?: st
 
 export async function createWebSocket(
 	url: string,
-	options: { authorization?: string; rejectUnauthorized?: boolean; serverName?: string; nodeCA?: string }
+	options: {
+		authorization?: string;
+		rejectUnauthorized?: boolean;
+		serverName?: string;
+		nodeCA?: string;
+		// For a dial to another address of the node: the SNI ('' for none) and certificate name to use instead
+		// of the ones derived from `url` (publicTlsIdentity).
+		servername?: string;
+		checkHost?: string;
+		handshakeTimeout?: number;
+	}
 ): Promise<ReplicationWebSocket> {
 	const { authorization, rejectUnauthorized, nodeCA } = options || {};
 
@@ -4822,10 +4845,10 @@ export async function createWebSocket(
 	if (authorization) {
 		headers.Authorization = authorization;
 	}
-	const wsOptions = {
+	const wsOptions: Record<string, any> = {
 		headers,
 		localAddress: node_name?.startsWith('127.0') ? node_name : undefined, // this is to make sure we use the correct network interface when doing our local loopback testing
-		servername: isIP(options?.serverName) ? undefined : options?.serverName, // use the node name for the SNI negotiation (as long as it is not an IP)
+		servername: options?.servername ?? (isIP(options?.serverName) ? undefined : options?.serverName), // use the node name for the SNI negotiation (as long as it is not an IP)
 		noDelay: true, // we want to send the data immediately
 		// we set this very high (2x times the v22 default) because it performs better
 		highWaterMark: 128 * 1024,
@@ -4835,8 +4858,12 @@ export async function createWebSocket(
 		maxPayload: 10 * 1024 * 1024 * 1024,
 		rejectUnauthorized: rejectUnauthorized !== false,
 		secureContext: undefined,
-		handshakeTimeout: PING_TIMEOUT,
+		handshakeTimeout: options?.handshakeTimeout ?? PING_TIMEOUT,
 	};
+	const checkHost = options?.checkHost;
+	// only when set: node:tls spreads these options over its defaults, so an undefined value would replace the default check
+	if (checkHost !== undefined)
+		wsOptions.checkServerIdentity = (_host, cert) => tls.checkServerIdentity(checkHost, cert);
 	if (secureContext) {
 		if (nodeCA) {
 			// Replicated operations (replicateOperation → sendOperationToNode) run on the main thread.
@@ -4878,7 +4905,7 @@ const COPY_FLUSH_RETRY_MAX_MS = 30_000;
  * This represents a persistent connection to a node for replication, which handles
  * sockets that may be disconnected and reconnected
  */
-export class NodeReplicationConnection extends EventEmitter {
+export class NodeReplicationConnection extends EventEmitter implements PrivatePathWaiter {
 	socket: ReplicationWebSocket;
 	startTime: number;
 	retryBackoff?: Backoff;
@@ -4940,6 +4967,10 @@ export class NodeReplicationConnection extends EventEmitter {
 	// peer does not support it": a peer that advertised nothing is the frozen defaults object. A future
 	// consumer must treat the two apart. Observability only; the socket-local resolution enforces.
 	peerCapabilities?: ResolvedPeerCapabilities;
+	// The address the latest connect() chose; `url` stays the public URL every key and report uses.
+	dial?: Dial;
+	// The private URL whose outage this connection is waiting out on its public fallback.
+	privatePathWaitingOn?: string;
 	constructor(url: string, subscription: any, databaseName: string, nodeName?: string, authorization?: string) {
 		super();
 		this.url = url;
@@ -4961,14 +4992,12 @@ export class NodeReplicationConnection extends EventEmitter {
 		// The handlers below compare this attempt's socket with this.socket: forceReconnect can install a newer
 		// one before this socket's (possibly delayed) terminate() fires close. See harper-pro#420.
 		let socket: ReplicationWebSocket;
-		// TODO: Need to do this specifically for each node
+		const dial = this.chooseDial();
 		try {
-			socket = await createWebSocket(this.url, {
-				serverName: this.nodeName,
-				authorization: this.authorization,
-			});
+			socket = await createWebSocket(dial.url, this.dialOptions(dial));
 		} catch (error) {
 			if (this.session !== attemptSession || this.intentionallyUnsubscribed) return;
+			if (dial.path === PATH_PRIVATE) this.privateDialFailed(dial, error.message);
 			// createWebSocket can reject before any socket exists or any open/error/close listener is
 			// attached — e.g. no valid replication certificate yet, or SNICallback.initialize() failing
 			// while a freshly-restarted peer rebuilds its TLS secure contexts. This connect() is invoked
@@ -4993,6 +5022,7 @@ export class NodeReplicationConnection extends EventEmitter {
 			socket.terminate();
 			return;
 		}
+		socket.dial = dial;
 		this.socket = socket;
 		// The socket this connection owns has just been replaced, so the session bound to the previous one
 		// is superseded by definition: retire it here rather than relying on that socket's 'close', which
@@ -5013,7 +5043,9 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.socket.on('open', () => {
 			this.socket._socket.unref();
 			// in normal startup, just use info, but adjust log level to warn if we were previously disconnected, because there was a warn message on the disconnect and we want to keep symmetry
-			logger[this.isConnected ? 'info' : 'warn']?.(`Connected to ${this.url}, db: ${this.databaseName}`);
+			logger[this.isConnected ? 'info' : 'warn']?.(
+				`Connected to ${this.url}${dial.path === PATH_PRIVATE ? ` at its private address ${dial.url}` : ''}, db: ${this.databaseName}`
+			);
 			// Reset backoff on progress (onFrameSent / onDurableProgress), not here on open: a leg that reopens and
 			// immediately fails to send (an oversized frame throws and closes it) must keep escalating toward the
 			// 30 s cap instead of hot-looping at 500 ms and accumulating native TLS state (harper-pro#339).
@@ -5073,7 +5105,12 @@ export class NodeReplicationConnection extends EventEmitter {
 				this.socket.terminate();
 			}
 		});
+		let socketError: string | undefined;
 		this.socket.on('error', (error: NodeJS.ErrnoException & { isHandled?: boolean }) => {
+			socketError = error.message;
+			sessionReject(error);
+			// A private address that fails before the peer is identified is reported once per outage, by the close.
+			if (dial.path === PATH_PRIVATE && !socket.peerIdentified) return;
 			if (error.code === 'SELF_SIGNED_CERT_IN_CHAIN') {
 				logger.warn?.(
 					`Can not connect to ${this.url}, this server does not have a certificate authority for the certificate provided by ${this.url}`
@@ -5086,7 +5123,6 @@ export class NodeReplicationConnection extends EventEmitter {
 					);
 				else logger.error?.(`Error in connection to ${this.url} due to ${error.message}`);
 			}
-			sessionReject(error);
 		});
 		this.socket.on('close', (code, reasonBuffer) => {
 			// Ignore a late close from a socket we have already replaced — forceReconnect may have scheduled
@@ -5094,6 +5130,7 @@ export class NodeReplicationConnection extends EventEmitter {
 			// finally propagated its close. Acting on it would wrongly tear down the live connection (mark it
 			// disconnected, drop its subscription listener, reset its session). See harper-pro#420.
 			if (this.socket !== socket) return;
+			this.notePrivateSocketEnded(socket, socketError ?? (reasonBuffer?.toString() || `code ${code}`));
 			// This socket's own close listener (retireInstance) has already torn the instance down.
 			if (this.liveSession === session) this.liveSession = undefined;
 			// Only treat the close as terminal when something explicitly marked it as a deliberate
@@ -5275,6 +5312,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	}
 	unsubscribe() {
 		this.intentionallyUnsubscribed = true;
+		privatePaths.forget(this.privatePathWaitingOn, this);
 		// No later attempt will settle readers still waiting for a session. An open session is already settled,
 		// and its close handler still needs isConnected to report the disconnect.
 		if (!this.liveSession) {
@@ -5308,6 +5346,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		// below is best-effort and the 'close' it should trigger may never deliver, which is exactly why
 		// this cannot be left to the close listener. retireInstance is idempotent.
 		this.retireSession('superseded by forceReconnect');
+		if (socket) this.notePrivateSocketEnded(socket, 'no response from the peer');
 		// Sets reconnectScheduled and arms one backoff retry (matching the close-handler backoff so a
 		// repeatedly-wedging peer backs off the same way, #339). connect() clears reconnectScheduled once
 		// the new socket is installed, which keeps a late close from the old socket from double-scheduling.
@@ -5324,6 +5363,78 @@ export class NodeReplicationConnection extends EventEmitter {
 		return this.session.then((session) => {
 			return session.getRecord(request);
 		});
+	}
+
+	chooseDial(): Dial {
+		const networks = localNetworks();
+		let privateUrl: string | undefined;
+		if (networks.size > 0 && this.configuredNodeName) {
+			try {
+				privateUrl = privateUrlOn(getHDBNodeTable().primaryStore.getSync(this.configuredNodeName), networks);
+			} catch (error) {
+				logger.debug?.(`Unable to read the hdb_nodes row of ${this.configuredNodeName}, dialing ${this.url}`, error);
+			}
+		}
+		if (this.privatePathWaitingOn !== undefined && this.privatePathWaitingOn !== privateUrl)
+			privatePaths.forget(this.privatePathWaitingOn, this);
+		this.dial = privatePaths.choose(this.url, privateUrl, this);
+		this.privatePathWaitingOn = this.dial.path === PATH_PUBLIC_FALLBACK ? privateUrl : undefined;
+		return this.dial;
+	}
+
+	dialOptions(dial: Dial) {
+		const options = { serverName: this.nodeName, authorization: this.authorization };
+		if (dial.path !== PATH_PRIVATE) return options;
+		return { ...options, ...publicTlsIdentity(this.url, this.nodeName), handshakeTimeout: PRIVATE_DIAL_TIMEOUT_MS };
+	}
+
+	// A private socket counts as working only once the peer is identified: the server can still refuse this
+	// node after the WebSocket opens.
+	onPeerIdentified(socket: ReplicationWebSocket) {
+		socket.peerIdentified = true;
+		const { dial } = socket;
+		if (dial?.path === PATH_PRIVATE && privatePaths.identified(dial.privateUrl))
+			logger.info?.(`Replicating with ${this.nodeName} over its private address ${dial.url} again`);
+	}
+
+	notePrivateSocketEnded(socket: ReplicationWebSocket, reason: string) {
+		const { dial } = socket;
+		if (dial?.path === PATH_PRIVATE && !socket.peerIdentified && !this.intentionallyUnsubscribed)
+			this.privateDialFailed(dial, reason);
+	}
+
+	privateDialFailed(dial: Dial, reason: string) {
+		this.privatePathWaitingOn = dial.privateUrl;
+		if (privatePaths.failed(dial.privateUrl, this))
+			logger.warn?.(
+				`The private address ${dial.url} of ${this.nodeName} did not connect (${reason}); replicating over ${this.url} until it does`
+			);
+	}
+
+	probePrivatePath(privateUrl: string): Promise<boolean> {
+		return createWebSocket(privateUrl, this.dialOptions({ url: privateUrl, path: PATH_PRIVATE, privateUrl })).then(
+			(socket) =>
+				new Promise<boolean>((resolve) => {
+					const settle = (reachable: boolean) => {
+						socket.removeAllListeners();
+						socket.on('error', () => {});
+						socket.terminate();
+						resolve(reachable);
+					};
+					socket.once('open', () => settle(true));
+					socket.once('error', () => settle(false));
+					socket.once('close', () => settle(false));
+				}),
+			() => false
+		);
+	}
+
+	promoteToPrivatePath(privateUrl: string): boolean {
+		if (this.intentionallyUnsubscribed || this.isFinished) return false;
+		if (this.dial?.path !== PATH_PUBLIC_FALLBACK || this.dial.privateUrl !== privateUrl) return false;
+		this.privatePathWaitingOn = undefined;
+		this.forceReconnect();
+		return true;
 	}
 }
 
@@ -8123,7 +8234,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (handshakeStatus && options.connection?.nodeSubscriptions !== undefined) {
 								handshakeStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
 								handshakeStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
+								if (options.connection.socket === ws)
+									handshakeStatus[CONNECTION_PATH_POSITION] = ws.dial?.path ?? PATH_PUBLIC;
 							}
+							options.connection?.onPeerIdentified?.(ws);
 							//const url = message[3] ?? thisNodeUrl;
 							logger.debug?.(connectionId, 'received node name:', remoteNodeName, 'db:', databaseName ?? message[2]);
 							if (!databaseName) {
