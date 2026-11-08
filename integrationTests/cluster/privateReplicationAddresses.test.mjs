@@ -198,7 +198,8 @@ suite('replication over private network addresses', { timeout: 480_000 }, (ctx) 
 			[B, C, 'public'],
 			[C, B, 'public'],
 		])
-			deepEqual(await pathsTo(node, peer), [path], `${node.hostname} → ${peer.hostname}`);
+			// a dial made before add_node finished exchanging CAs fails on either address; the private one recovers
+			await waitForPath(node, peer, path);
 		ok(ctx.forwarders.A.dialsFrom(B) > 0, "B dials A's private address");
 		ok(ctx.forwarders.B.dialsFrom(A) > 0, "A dials B's private address");
 		equal(ctx.forwarders.A.dialsFrom(C) + ctx.forwarders.B.dialsFrom(C), 0, 'C never dials a net1 address');
