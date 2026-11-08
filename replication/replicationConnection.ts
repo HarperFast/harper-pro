@@ -297,6 +297,8 @@ type ReplicationWebSocket = WebSocket & {
 	peerIdentified?: boolean;
 	attemptSession?: Promise<any>;
 	privateFailureNoted?: boolean;
+	// replaced by a redial for a path change, not lost: its close does not report the peer down
+	pathRedial?: boolean;
 };
 
 const logger = forComponent('replication').conditional as Logger;
@@ -5148,7 +5150,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 				);
 				// as the watchdogs do: an open socket may never emit the close the reconnect would wait on
 				if (this.socket === socket) this.forceReconnect();
-				else socket.terminate();
+				socket.terminate();
 			}, this.privateIdentifyTimeoutMs).unref();
 			socket.once('close', () => clearTimeout(identifyDeadline));
 		}
@@ -5168,7 +5170,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 			// helper, which left the connection silently dead and required hdb_nodes churn to
 			// recover. Those now fall through to the retry path below.
 			const intentional = this.intentionallyUnsubscribed;
-			this.reportDisconnected(intentional, code ?? 0);
+			if (intentional || !socket.pathRedial) this.reportDisconnected(intentional, code ?? 0);
 			this.removeAllListeners('subscriptions-updated');
 			this.removeAllListeners('exclusion-origins-updated');
 
@@ -5358,9 +5360,10 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	// here, independent of the close event: notify the main thread the node is disconnected (flipping the
 	// entry to connected:false for the reconciler backstop), tear the socket down, and schedule one fresh
 	// connect. See harper-pro#420.
-	forceReconnect() {
+	forceReconnect(pathChange = false) {
 		if (this.intentionallyUnsubscribed || this.isFinished || this.reconnectScheduled) return;
-		this.reportDisconnected(false);
+		// the peer is still reachable, and reporting it down would fail its subscriptions over to another node
+		if (!pathChange) this.reportDisconnected(false);
 		// Drop this connection's stale subscription listener before reconnecting. The close handler
 		// normally does this (removeAllListeners), but its socket-identity guard early-returns for a
 		// superseded socket, so an open-but-idle wedge — whose old socket never fires a timely close —
@@ -5375,7 +5378,8 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		// below is best-effort and the 'close' it should trigger may never deliver, which is exactly why
 		// this cannot be left to the close listener. retireInstance is idempotent.
 		this.retireSession('superseded by forceReconnect');
-		if (socket) this.notePrivateSocketEnded(socket, 'no response from the peer');
+		if (socket && pathChange) socket.pathRedial = true;
+		else if (socket) this.notePrivateSocketEnded(socket, 'no response from the peer');
 		// Sets reconnectScheduled and arms one backoff retry (matching the close-handler backoff so a
 		// repeatedly-wedging peer backs off the same way, #339). connect() clears reconnectScheduled once
 		// the new socket is installed, which keeps a late close from the old socket from double-scheduling.
@@ -5492,7 +5496,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	redialForPathChange() {
 		if (this.reconnectScheduled) return;
 		this.sessionAbandonedForPath = this.session;
-		this.forceReconnect();
+		this.forceReconnect(true);
 	}
 }
 
