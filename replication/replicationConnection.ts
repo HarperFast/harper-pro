@@ -4971,6 +4971,8 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	// The address the latest connect() chose; `url` stays the public URL every key and report uses.
 	dial?: Dial;
 	privateIdentifyTimeoutMs = PRIVATE_IDENTIFY_TIMEOUT_MS;
+	// the session of the latest attempt whose private dial failed; its readers wait for the public redial
+	privateFallbackSession?: Promise<any>;
 	constructor(url: string, subscription: any, databaseName: string, nodeName?: string, authorization?: string) {
 		super();
 		this.url = url;
@@ -5370,9 +5372,15 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	}
 
 	getRecord(request) {
-		return this.session.then((session) => {
-			return session.getRecord(request);
-		});
+		const attempt = this.session;
+		return attempt.then(
+			(session) => session.getRecord(request),
+			(error) => {
+				if (attempt === this.privateFallbackSession && this.session !== attempt && !this.intentionallyUnsubscribed)
+					return this.getRecord(request);
+				throw error;
+			}
+		);
 	}
 
 	chooseDial(): Dial {
@@ -5412,6 +5420,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	}
 
 	privateDialFailed(dial: Dial, reason: string) {
+		this.privateFallbackSession = this.session;
 		if (privatePaths.failed(dial.pathKey, dial.privateUrl, this))
 			logger.warn?.(
 				`The private address ${dial.url} of ${this.nodeName} did not connect (${reason}); replicating over ${this.url} until it does`

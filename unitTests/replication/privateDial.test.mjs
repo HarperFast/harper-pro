@@ -183,6 +183,30 @@ describe('NodeReplicationConnection private dial', () => {
 			);
 		});
 
+		it('a read waiting on a failed private dial is served by the public redial', async () => {
+			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
+			connections.push(connection);
+			let rejectPrivate;
+			const privateAttempt = new Promise((_, reject) => (rejectPrivate = reject));
+			connection.session = privateAttempt;
+			const read = connection.getRecord({ id: 1 });
+			connection.privateFallbackSession = privateAttempt;
+			connection.session = Promise.resolve({ getRecord: () => 'from the public socket' });
+			rejectPrivate(new Error('connect ECONNREFUSED'));
+			assert.strictEqual(await read, 'from the public socket');
+		});
+
+		it('a read waiting on a failed public dial still fails', async () => {
+			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
+			connections.push(connection);
+			let rejectAttempt;
+			connection.session = new Promise((_, reject) => (rejectAttempt = reject));
+			const read = connection.getRecord({ id: 1 });
+			connection.session = Promise.resolve({ getRecord: () => 'unexpected' });
+			rejectAttempt(new Error('connect ECONNREFUSED'));
+			await assert.rejects(read, /ECONNREFUSED/);
+		});
+
 		it('promotion redials only a connection that will redial onto that private path', () => {
 			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
 			connections.push(connection);
