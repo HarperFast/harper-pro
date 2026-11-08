@@ -209,6 +209,20 @@ describe('NodeReplicationConnection private dial', () => {
 			assert.strictEqual(connection.privateFallbackSession, privateAttempt);
 		});
 
+		it('a read sent on a private socket that ended before identification is served by the public redial', async () => {
+			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
+			connections.push(connection);
+			let failRead;
+			const privateAttempt = Promise.resolve({ getRecord: () => new Promise((_, reject) => (failRead = reject)) });
+			connection.session = privateAttempt;
+			const read = connection.getRecord({ id: 1 });
+			await new Promise((resolve) => setImmediate(resolve));
+			connection.privateFallbackSession = privateAttempt;
+			connection.session = Promise.resolve({ getRecord: () => 'from the public socket' });
+			failRead(new Error('closed: Unauthorized'));
+			assert.strictEqual(await read, 'from the public socket');
+		});
+
 		it('a read waiting on a failed public dial still fails', async () => {
 			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
 			connections.push(connection);

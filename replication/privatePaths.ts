@@ -26,7 +26,6 @@ export interface Dial {
 
 export interface PrivatePathWaiter {
 	probePrivatePath(privateUrl: string): Promise<boolean>;
-	/** false leaves the waiter waiting: it is not on the fallback yet, or a redial is pending */
 	promoteToPrivatePath(pathKey: string): boolean;
 	isWaitingFor(pathKey: string): boolean;
 }
@@ -60,8 +59,9 @@ export function normalizePrivateUrls(value: unknown): PrivateUrl[] | undefined {
 	if (!Array.isArray(value)) return undefined;
 	const urls: PrivateUrl[] = [];
 	for (const entry of value) {
+		// createWebSocket recognizes a TLS URL by its lowercase scheme
 		if (isUsablePrivateUrl(entry?.url) && typeof entry.network === 'string' && entry.network !== '')
-			urls.push({ url: entry.url, network: entry.network });
+			urls.push({ url: 'wss:' + entry.url.slice(4), network: entry.network });
 	}
 	return urls.length ? urls : undefined;
 }
@@ -149,7 +149,6 @@ export class PrivatePaths {
 		return { url: publicUrl, path: PATH_PUBLIC_FALLBACK, privateUrl, pathKey };
 	}
 
-	/** true when this starts an outage, so the caller reports it once */
 	failed(pathKey: string, privateUrl: string, waiter: PrivatePathWaiter): boolean {
 		let outage = this.#outages.get(pathKey);
 		const started = !outage;
@@ -167,7 +166,6 @@ export class PrivatePaths {
 		return started;
 	}
 
-	/** true when this ends an outage */
 	identified(pathKey: string): boolean {
 		const outage = this.#outages.get(pathKey);
 		if (!outage) return false;
@@ -241,7 +239,6 @@ export class PrivatePaths {
 			outage.timer.unref?.();
 			return;
 		}
-		// no waiter could take the trial yet
 		this.#scheduleProbe(pathKey, outage);
 	}
 }

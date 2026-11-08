@@ -5382,17 +5382,17 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 
 	getRecord(request) {
 		const attempt = this.session;
-		return attempt.then(
-			(session) => session.getRecord(request),
-			(error) => {
+		// covers a read sent on a private socket that opened but ended before its peer identified itself
+		return attempt
+			.then((session) => session.getRecord(request))
+			.catch((error) => {
 				if (attempt !== this.privateFallbackSession || this.intentionallyUnsubscribed) throw error;
 				// the failed socket's close installs the public redial's session
 				return new Promise((resolve) => setImmediate(resolve)).then(() => {
 					if (this.session === attempt || this.intentionallyUnsubscribed) throw error;
 					return this.getRecord(request);
 				});
-			}
-		);
+			});
 	}
 
 	chooseDial(): Dial {

@@ -69,7 +69,7 @@ replication:
       network: vpc-1/us-east1
 ```
 
-Each node publishes its `privateUrls` on its own `hdb_nodes` record, so peers learn them the same way they learn `url` (by [gossip discovery](#gossip-discovery), or from the node that ran `add_node`). A node dials a peer's private URL when the URL's `network` tag is one of its own: a network in its own `privateUrls`, or the `replication.network` setting. Otherwise it dials the peer's `url`. The tags are compared as plain strings; Harper does not check that two nodes are really on the same network.
+Each node publishes its `privateUrls` on its own `hdb_nodes` record, so peers learn them the same way they learn `url` (by [gossip discovery](#gossip-discovery), or from the node that ran `add_node`). A node dials a peer's private URL when the URL's `network` tag is one of its own: a network in its own `privateUrls`, or the `replication.network` setting. If several of the peer's private URLs match, it uses the first in the peer's list. Otherwise it dials the peer's `url`. The tags are compared as plain strings; Harper does not check that two nodes are really on the same network.
 
 - **Only `wss://`.** A private URL must use TLS. Peers identify a TLS connection by its certificate, which does not depend on the address dialed.
 - **Certificates do not change.** A node dialing a private address presents the same TLS server name (SNI) and checks the peer's certificate against the same name as when it dials `url`. Do not add private IP addresses to certificates.
