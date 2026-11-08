@@ -179,8 +179,12 @@ describe('NodeReplicationConnection private dial', () => {
 			const { socket } = connection;
 			const terminate = socket.terminate;
 			socket.terminate = () => {};
-			await waitFor(() => retries.length === 1, 'the retry after the identification deadline');
-			socket.terminate = terminate;
+			try {
+				await waitFor(() => retries.length === 1, 'the retry after the identification deadline');
+			} finally {
+				socket.terminate = terminate;
+				socket.terminate();
+			}
 			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PUBLIC_FALLBACK);
 		});
 
@@ -223,6 +227,22 @@ describe('NodeReplicationConnection private dial', () => {
 			connection.session = Promise.resolve({ getRecord: () => 'from the public socket' });
 			rejectPrivate(new Error('connect ECONNREFUSED'));
 			assert.strictEqual(await read, 'from the public socket');
+		});
+
+		it('a read waiting on a session redialed for a changed private address is served by the redial', async () => {
+			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
+			connections.push(connection);
+			let rejectCurrent;
+			const current = new Promise((_, reject) => (rejectCurrent = reject));
+			connection.dial = { url: 'wss://10.8.0.2:9933', path: PATH_PRIVATE, privateUrl: 'wss://10.8.0.2:9933' };
+			connection.session = current;
+			const read = connection.getRecord({ id: 1 });
+			connection.forceReconnect = () => {
+				connection.session = Promise.resolve({ getRecord: () => 'from the redial' });
+			};
+			connection.redialForPathChange();
+			rejectCurrent(new Error('superseded by forceReconnect'));
+			assert.strictEqual(await read, 'from the redial');
 		});
 
 		it("a private socket's late close marks its own attempt, not the session that replaced it", () => {

@@ -5482,9 +5482,15 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 
 	promoteToPrivatePath(pathKey: string): boolean {
 		if (!this.isWaitingFor(pathKey) || this.dial.path !== PATH_PUBLIC_FALLBACK || this.reconnectScheduled) return false;
+		this.redialForPathChange();
+		return true;
+	}
+
+	// reads waiting on the current session retry on the redial's (getRecord)
+	redialForPathChange() {
+		if (this.reconnectScheduled) return;
 		this.sessionAbandonedForPath = this.session;
 		this.forceReconnect();
-		return true;
 	}
 }
 
