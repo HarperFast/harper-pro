@@ -5,7 +5,13 @@ import { parentPort } from 'worker_threads';
 import { onMessageByType } from '../core/server/threads/manageThreads.js';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { requestClusterStatus } from './subscriptionManager.ts';
-import { getReplicationSharedStatus, getHDBNodeTable } from './knownNodes.ts';
+import {
+	getReplicationSharedStatus,
+	getHDBNodeTable,
+	currentRegionTopology,
+	selfTopologyLabels,
+} from './knownNodes.ts';
+import { isGateway } from './regionTopology.ts';
 import {
 	CONFIRMATION_STATUS_POSITION,
 	RECEIVED_VERSION_POSITION,
@@ -100,6 +106,20 @@ export async function clusterStatus() {
 	// hid removal. `connections` is the per-peer list requestClusterStatus assembles from nodeMap; once a
 	// removed node's hdb_nodes delete propagates to onNodeUpdate(null) the peer is dropped and this flips.
 	response.is_enabled = response.connections.length > 0;
+	const region = selfTopologyLabels().region;
+	if (region !== null) {
+		const topology = currentRegionTopology();
+		response.region_topology = topology.active
+			? {
+					active: true,
+					region,
+					gateway: isGateway(topology, response.node_name),
+					gateways: Object.fromEntries(topology.gatewaysByRegion),
+					suppliers: response.regionSuppliers ?? {},
+				}
+			: { active: false, region, reason: topology.inactiveReason };
+	}
+	delete response.regionSuppliers;
 
 	response.sharding = residencyStatus();
 	return response;

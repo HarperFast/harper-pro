@@ -21,7 +21,10 @@ import {
 	forceReconnectToNode,
 	getSubscriptionConnectionKey,
 	updateExclusionOrigins,
+	type TopologyLink,
+	type TopologyLinks,
 } from './replicator.ts';
+import { peerSupportsRegionTopology } from './protocolCapabilities.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
 import { parentPort } from 'worker_threads';
 import {
@@ -35,7 +38,20 @@ import {
 	clearReplicationSharedStatus,
 	type Route,
 	getNodeURL,
+	currentRegionTopology,
+	regionTopologyFor,
+	selfTopologyLabels,
 } from './knownNodes.ts';
+import {
+	isGateway,
+	orderFailoverCandidates,
+	settleSupplier,
+	supplierCandidates,
+	topologyAllowsDirect,
+	topologySignature,
+	type SupplierAssignment,
+	type SupplierState,
+} from './regionTopology.ts';
 import {
 	RECEIVING_STATUS_POSITION,
 	RECEIVING_STATUS_RECEIVING,
@@ -123,6 +139,12 @@ type ReplicationConnectionStatus = {
 	// Explicit unsubscribe keeps the entry alive for iterator/URL cleanup, but it is no longer
 	// an active subscription and must not take the existing-entry reuse fast path.
 	unsubscribed?: boolean;
+	// Region topology (harper-pro#1291): when this link last came up; the regions the peer gateway reports a
+	// caught-up link to, and since when each; and a liveness hold through a reconnect this node caused.
+	liveSince?: number;
+	peerReach?: string[];
+	reachSince?: Map<string, number>;
+	topologyPinnedUntil?: number;
 	nodes: ({
 		name: string;
 		url: string;
@@ -400,6 +422,7 @@ function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 				// Computed at send time so the worker's initial excludeNodes list reflects the
 				// current registry, not the state when this subscribe was scheduled.
 				exclusionOrigins: computeExclusionOrigins(database),
+				topology: computeTopologyLinks(database)?.byUrl[url] ?? null,
 			};
 			const target = dispatchSubscriptionRequest(
 				entry,
@@ -513,7 +536,12 @@ export function describeIdentityMismatch(
  * (`newSocket`) closes the same gap earlier, for the window before any fenced post arrives.
  */
 export function applyConnectionMetadata(entry: any, connection: any): boolean {
-	if (connection.peerCapabilities === undefined && connection.unknownCommandFrames === undefined) return false;
+	if (
+		connection.peerCapabilities === undefined &&
+		connection.unknownCommandFrames === undefined &&
+		connection.gatewayReach === undefined
+	)
+		return false;
 	const owningThreadId = entry.worker?.threadId;
 	if (owningThreadId !== undefined && connection.threadId !== owningThreadId) return false;
 	// The ordinal orders sessions only within one worker, so it is consulted only when the reporting
@@ -529,6 +557,8 @@ export function applyConnectionMetadata(entry: any, connection: any): boolean {
 		entry.metadataThreadId !== connection.threadId || entry.metadataSessionOrdinal !== connection.sessionOrdinal;
 	entry.metadataThreadId = connection.threadId;
 	entry.metadataSessionOrdinal = connection.sessionOrdinal;
+	// gateway reach is per session too: a new socket has reported none yet
+	if (newSession) entry.peerReach = entry.reachSince = undefined;
 	if (connection.peerCapabilities !== undefined) entry.peerCapabilities = connection.peerCapabilities;
 	else if (newSession) entry.peerCapabilities = undefined;
 	if (connection.unknownCommandFrames !== undefined) entry.unknownCommandFrames = connection.unknownCommandFrames;
@@ -665,7 +695,7 @@ export function findStaleNodeUrls(
 // no longer reusable — see replicator.isReusableConnection). A threshold well above the normal
 // reconnect backoff keeps this from firing on connections that are merely mid-retry.
 // `isDesired` must be the same predicate onDatabase uses to decide shouldSubscribe
-// (shouldReplicateFromNode), so a connection intentionally unsubscribed because this node should NOT
+// (wantsDirectSubscription), so a connection intentionally unsubscribed because this node should NOT
 // subscribe (replication off, or a sendsTo/subscription targeting another database) is not flagged
 // and re-driven forever. See harper-pro#233 / #289.
 export function findWedgedNodeUrls(
@@ -970,6 +1000,21 @@ export function getConfiguredRoutes(): Route[] {
 }
 
 /**
+ * The receive decision plus the region link rule (harper-pro#1291). Every main-thread desire point uses it, so
+ * subscription setup, exclusion and the reconcile nets agree on which peers are direct: a pruned peer is neither
+ * subscribed to, re-driven, nor counted as direct coverage (which would exclude its writes from every relay). A
+ * route with explicit replication settings, and a leader bootstrapping a database this node lacks, keep the link.
+ */
+export function wantsDirectSubscription(node: any, databaseName: string): boolean {
+	if (!shouldReplicateFromNode(node, databaseName)) return false;
+	const topology = node?.name ? regionTopologyFor(databaseName) : undefined;
+	if (!topology) return true;
+	if (routes.find((route) => route.name === node.name)?.explicitReplication) return true;
+	if (node.isLeader && !getDatabases()[databaseName]) return true;
+	return topologyAllowsDirect(topology, getThisNodeName(), node.name);
+}
+
+/**
  * The origins whose logs a relay peer may be told to omit for `databaseName`: this node receives them
  * directly, with full table coverage, so relayed copies are pure duplicates. Owned HERE because only the
  * main thread has the effective per-origin configuration: `routes` lives in this module, and
@@ -980,7 +1025,7 @@ export function getConfiguredRoutes(): Route[] {
  * delivery is a duplicate, a wrong exclusion is silent data loss.
  *
  * An origin qualifies only when ALL of:
- *  - the effective local receive decision accepts a direct subscription (shouldReplicateFromNode over
+ *  - the effective local receive decision accepts a direct subscription (wantsDirectSubscription over
  *    the payload-shaped node, configRouteReplicates attached the same way onDatabase does);
  *  - the origin's own row advertises delivering this database to us with no table exclusions
  *    (qualifiesForMultiHopExclusion; the sender derives its send-side skip from its own view, which we
@@ -1005,7 +1050,7 @@ export function computeExclusionOrigins(databaseName: string): string[] {
 					? node.replicates
 					: null;
 		const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
-		if (!shouldReplicateFromNode({ ...node, routeReplicates, configRouteReplicates } as any, databaseName)) continue;
+		if (!wantsDirectSubscription({ ...node, routeReplicates, configRouteReplicates } as any, databaseName)) continue;
 		if (!qualifiesForMultiHopExclusion(node, thisNodeName, databaseName)) continue;
 		if (getExcludedTablesForRouteEntries(routeReplicates?.receivesFrom, node.name, databaseName)) continue;
 		origins.push(node.name);
@@ -1025,6 +1070,152 @@ function updateShardingFailover(database: string): void {
 	scheduleExclusionOriginsBroadcast();
 }
 
+const TOPOLOGY_HOLD_MS = 3_000;
+const TOPOLOGY_STABLE_MS = 10_000;
+const TOPOLOGY_PIN_MS = 30_000;
+type TopologyAssignment = SupplierAssignment & { relieved?: string | null };
+const topologyAssignments = new Map<string, Map<string, TopologyAssignment>>();
+let topologyRecheckTimer: ReturnType<typeof setTimeout> | undefined;
+let topologyRecheckAt = Infinity;
+
+function topologyEntry(name: string, database: string): any {
+	const node = nodeMap.get(name);
+	return node ? connectionReplicationMap.get(getNodeURL(node))?.get(database) : undefined;
+}
+
+function scheduleTopologyRecheck(at: number) {
+	if (!(at < topologyRecheckAt)) return;
+	topologyRecheckAt = at;
+	clearTimeout(topologyRecheckTimer);
+	topologyRecheckTimer = setTimeout(
+		() => {
+			topologyRecheckAt = Infinity;
+			topologyRecheckTimer = undefined;
+			scheduleExclusionOriginsBroadcast();
+		},
+		Math.max(0, at - Date.now())
+	);
+	topologyRecheckTimer.unref?.();
+}
+
+/**
+ * A supplier must speak region topology and be connected, except through a reconnect this node caused by assigning
+ * it an origin: that reconnect reports DOWN and drops the reach the old session reported, and treating either as a
+ * failure would move the origin straight back. The hold ends when the new session reports reach, or at its deadline.
+ */
+function topologySupplierState(database: string, now: number): SupplierState {
+	return {
+		isLive(name) {
+			const entry = topologyEntry(name, database);
+			if (!entry) return false;
+			if (entry.topologyPinnedUntil > now) return true;
+			return entry.connected === true && !!entry.peerCapabilities && peerSupportsRegionTopology(entry.peerCapabilities);
+		},
+		liveSince: (name) => topologyEntry(name, database)?.liveSince ?? now,
+		reaches(name, region) {
+			const entry = topologyEntry(name, database);
+			return entry?.topologyPinnedUntil > now || entry?.peerReach?.includes(region) === true;
+		},
+		reachSince: (name, region) => topologyEntry(name, database)?.reachSince?.get(region) ?? now,
+	};
+}
+
+/**
+ * Settles the supplier of every topology-managed origin for `database` (harper-pro#1291) and derives each link's
+ * exclusions: an origin is excluded on every link but its supplier's, and nowhere when it has none. Undefined when
+ * the database replicates as a full mesh. Each origin newly assigned to a link pins that link's liveness until it
+ * reconnects, since admitting the origin there is what makes the worker reconnect it.
+ */
+export function computeTopologyLinks(database: string, now = Date.now()): TopologyLinks | undefined {
+	const topology = regionTopologyFor(database);
+	if (!topology) {
+		topologyAssignments.delete(database);
+		return;
+	}
+	const selfName = getThisNodeName();
+	let assignments = topologyAssignments.get(database);
+	if (!assignments) topologyAssignments.set(database, (assignments = new Map()));
+	const state = topologySupplierState(database, now);
+	const managed: string[] = [];
+	for (const origin of topology.regionOf.keys()) {
+		if (routes.find((route) => route.name === origin)?.explicitReplication) continue;
+		const candidates = supplierCandidates(topology, selfName, origin);
+		if (!candidates) continue;
+		managed.push(origin);
+		const previous = assignments.get(origin);
+		const next: TopologyAssignment = settleSupplier(
+			candidates,
+			state,
+			previous,
+			now,
+			TOPOLOGY_HOLD_MS,
+			TOPOLOGY_STABLE_MS
+		);
+		if (next.supplier === previous?.supplier) next.relieved = previous?.relieved;
+		else {
+			next.relieved = previous?.supplier ?? null;
+			const entry = next.supplier === undefined ? undefined : topologyEntry(next.supplier, database);
+			if (entry) {
+				entry.topologyPinnedUntil = now + TOPOLOGY_PIN_MS;
+				scheduleTopologyRecheck(entry.topologyPinnedUntil);
+			}
+			logger.info(
+				`Region topology: ${database} takes ${origin} from ${next.supplier ?? 'any peer'}` +
+					(previous?.supplier ? ` instead of ${previous.supplier}` : '')
+			);
+		}
+		if (next.recheckAt !== undefined) scheduleTopologyRecheck(next.recheckAt);
+		assignments.set(origin, next);
+	}
+	for (const origin of assignments.keys()) if (!managed.includes(origin)) assignments.delete(origin);
+	const byUrl: Record<string, TopologyLink> = {};
+	for (const [name, node] of nodeMap) {
+		const url = getNodeURL(node);
+		if (!connectionReplicationMap.get(url)?.has(database)) continue;
+		const excluded: string[] = [];
+		const borrow: Record<string, string | null> = {};
+		for (const origin of managed) {
+			const { supplier, relieved } = assignments.get(origin)!;
+			if (supplier === undefined) continue;
+			if (supplier === name) borrow[origin] = relieved ?? null;
+			else excluded.push(origin);
+		}
+		byUrl[url] = { excluded, borrow };
+	}
+	return { byUrl, managed };
+}
+
+/** Per database, the peer each topology-managed origin is taken from (null: from any peer). */
+function topologySuppliers(): Record<string, Record<string, string | null>> | undefined {
+	if (topologyAssignments.size === 0) return;
+	const suppliers: Record<string, Record<string, string | null>> = {};
+	for (const [database, assignments] of topologyAssignments) {
+		suppliers[database] = Object.fromEntries(
+			[...assignments].map(([origin, assignment]) => [origin, assignment.supplier ?? null])
+		);
+	}
+	return suppliers;
+}
+
+/** Accepts reach only from a gateway of this node's own region, and only regions the topology knows. */
+function acceptGatewayReach(entry: any, connection: any): boolean {
+	const topology = regionTopologyFor(connection.database);
+	const selfName = getThisNodeName();
+	const region = topology?.regionOf.get(selfName);
+	if (!topology || !isGateway(topology, connection.name) || topology.regionOf.get(connection.name) !== region)
+		return false;
+	const regions = connection.gatewayReach.filter(
+		(reached: unknown) => typeof reached === 'string' && reached !== region && topology.gatewaysByRegion.has(reached)
+	);
+	const now = Date.now();
+	const reachSince = new Map<string, number>();
+	for (const reached of regions) reachSince.set(reached, entry.reachSince?.get(reached) ?? now);
+	const changed = regions.join('\n') !== (entry.peerReach ?? []).join('\n');
+	entry.peerReach = regions;
+	entry.reachSince = reachSince;
+	return changed;
+}
+
 // Re-derive the exclusion-origin set for every database with a live subscription entry and push it to
 // the owning workers. Coalesced through a timer because one hdb_nodes write often arrives as several
 // onNodeUpdate calls (and startup replays every row); the recompute reads current state, so the last
@@ -1038,6 +1229,7 @@ function scheduleExclusionOriginsBroadcast() {
 		exclusionBroadcastScheduled = false;
 		try {
 			const originsByDatabase = new Map<string, string[]>();
+			const topologyByDatabase = new Map<string, TopologyLinks | null>();
 			// One message per (worker, database): application is database-wide on the worker, so
 			// entries for different peer URLs on the same worker would repeat identical work.
 			const notifiedByTarget = new Map<any, Set<string>>();
@@ -1062,7 +1254,18 @@ function scheduleExclusionOriginsBroadcast() {
 						}
 						originsByDatabase.set(databaseName, origins);
 					}
-					const message = { type: 'update-exclusion-origins', database: databaseName, origins };
+					let topology = topologyByDatabase.get(databaseName);
+					if (topology === undefined) {
+						try {
+							topology = computeTopologyLinks(databaseName) ?? null;
+						} catch (error) {
+							// Fail open: no topology exclusions, while the direct-coverage set above stands.
+							logger.error('Error computing region topology exclusions for', databaseName, error);
+							topology = null;
+						}
+						topologyByDatabase.set(databaseName, topology);
+					}
+					const message = { type: 'update-exclusion-origins', database: databaseName, origins, topology };
 					if (entry.worker) entry.worker.postMessage(message);
 					else updateExclusionOrigins(message);
 				}
@@ -1215,16 +1418,21 @@ export async function startOnMainThread(options) {
 				// `mainThreadInitialized`, harper-pro#460), and replication routes are process config, so a
 				// route change takes effect on the next restart — where this rewrite fires.
 				const selfReplicates = computeSelfReplicates(iterateRoutes(options));
+				const { region, gateway } = selfTopologyLabels();
 				if (
 					existing === undefined ||
 					existing.url !== url ||
 					existing.shard !== options.shard ||
+					(existing.region ?? null) !== region ||
+					(existing.gateway ?? null) !== gateway ||
 					!replicatesEqual(existing.replicates, selfReplicates)
 				) {
 					return ensureNode(thisName, {
 						name: thisName,
 						url,
 						shard: options.shard,
+						region,
+						gateway,
 						replicates: selfReplicates,
 					});
 				}
@@ -1255,6 +1463,28 @@ export async function startOnMainThread(options) {
 		subscribeToNodeUpdates(onNodeUpdate, 'subscription-manager');
 	});
 	let isFullyReplicating;
+	let appliedTopology: string | undefined;
+	let topologyReviewScheduled = false;
+	// A change to any row's region, gateway or membership can move links for every peer, not only the one whose
+	// row changed. Re-running onNodeUpdate over all rows is idempotent: links that stay are left alone.
+	function scheduleTopologyReview() {
+		if (topologyReviewScheduled) return;
+		topologyReviewScheduled = true;
+		const timer = setTimeout(() => {
+			topologyReviewScheduled = false;
+			try {
+				const signature = topologySignature(currentRegionTopology());
+				if (signature === appliedTopology) return;
+				appliedTopology = signature;
+				for (const row of getHDBNodeTable().search([])) {
+					if (row?.name) onNodeUpdate(row, row.name);
+				}
+			} catch (error) {
+				logger.error('Error applying a region topology change', error);
+			}
+		}, 0);
+		timer.unref?.();
+	}
 	/**
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
@@ -1264,6 +1494,7 @@ export async function startOnMainThread(options) {
 		// database. Deferred through a timer, so it reads the map state after this call's own
 		// subscribe/unsubscribe bookkeeping has been applied.
 		scheduleExclusionOriginsBroadcast();
+		scheduleTopologyReview();
 		const isSelf =
 			(getThisNodeName() && hostname === getThisNodeName()) || (getThisNodeUrl() && node?.url === getThisNodeUrl());
 		if (isSelf) {
@@ -1454,7 +1685,7 @@ export async function startOnMainThread(options) {
 			// does for table-exclusion. undefined when no config route matches this peer. harper-pro#498.
 			const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
 			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node, routeReplicates, configRouteReplicates }];
-			let shouldSubscribe = shouldReplicateFromNode(nodes[0] as any, databaseName);
+			let shouldSubscribe = wantsDirectSubscription(nodes[0] as any, databaseName);
 			if (shouldSubscribe || existingEntry?.nodes?.[0]?.isLeader) {
 				const { hasExplicitLeader, leaderName, nodeName } = getLeaderContext();
 				nodes[0].isLeader = deriveEffectiveLeader({
@@ -1463,7 +1694,7 @@ export async function startOnMainThread(options) {
 					leaderName,
 					nodeName,
 				});
-				if (!shouldSubscribe) shouldSubscribe = shouldReplicateFromNode(nodes[0] as any, databaseName);
+				if (!shouldSubscribe) shouldSubscribe = wantsDirectSubscription(nodes[0] as any, databaseName);
 			}
 			// Existing-entry re-drives also consume this payload, so resolve its URL before the early return.
 			nodes[0].url ??= getNodeURL(nodes[0] as any);
@@ -1607,7 +1838,8 @@ export async function startOnMainThread(options) {
 		// if a node is disconnected, we need to reassign the subscriptions to another node
 		// we try to do this in a deterministic way so that we don't end up with a cycle that short circuits
 		// a node that may have more recent updates, so we try to go to the next node in the list, using
-		// a sorted list of node names that all nodes should have and use.
+		// a sorted list of node names that all nodes should have and use. The nearest latency bucket goes
+		// first; within a bucket that ring order still decides, so a single-zone cluster fails over as before.
 		try {
 			logger.info('Disconnected from node', connection.name, connection.url, 'finished', !!connection.finished);
 			const nodeMapKeys = Array.from(nodeMap.keys());
@@ -1617,7 +1849,7 @@ export async function startOnMainThread(options) {
 				logger.warn('Disconnected node not found in node map', connection.name, nodeMapKeys);
 				return;
 			}
-			let dbReplicationWorkers = connectionReplicationMap.get(connection.url);
+			const dbReplicationWorkers = connectionReplicationMap.get(connection.url);
 			const existingWorkerEntry = dbReplicationWorkers?.get(connection.database);
 			if (!existingWorkerEntry) {
 				logger.warn('Disconnected node not found in replication map', connection.database, dbReplicationWorkers);
@@ -1627,6 +1859,8 @@ export async function startOnMainThread(options) {
 			// from one that is briefly mid-retry; don't reset it on repeated disconnect notifications.
 			if (existingWorkerEntry.connected !== false) existingWorkerEntry.disconnectedAt = Date.now();
 			existingWorkerEntry.connected = false;
+			existingWorkerEntry.peerReach = existingWorkerEntry.reachSince = undefined;
+			if (regionTopologyFor(connection.database)) scheduleExclusionOriginsBroadcast();
 			if (connection.finished) {
 				return;
 			} // intentionally closed connection
@@ -1651,20 +1885,24 @@ export async function startOnMainThread(options) {
 				return;
 			}
 			const shard = shardingFailoverShard(connection.database, mainNode.shard);
-			let nextIndex = (existingIndex + 1) % nodeNames.length;
-			while (existingIndex !== nextIndex) {
-				const nextNodeName = nodeNames[nextIndex];
-				const nextNode = nodeMap.get(nextNodeName);
-				dbReplicationWorkers = connectionReplicationMap.get(getNodeURL(nextNode));
-				const failoverWorkerEntry = dbReplicationWorkers?.get(connection.database);
+			const entryFor = (name: string) =>
+				connectionReplicationMap.get(getNodeURL(nodeMap.get(name)))?.get(connection.database);
+			let candidates = orderFailoverCandidates(nodeNames, existingIndex, (name) => entryFor(name)?.latency);
+			const topology = regionTopologyFor(connection.database);
+			const originRegion = topology?.regionOf.get(nodeNames[existingIndex]);
+			if (originRegion !== undefined) {
+				// a peer in the origin's region has its writes over a LAN link
+				const inRegion = candidates.filter((name) => topology.regionOf.get(name) === originRegion);
+				candidates = [...inRegion, ...candidates.filter((name) => !inRegion.includes(name))];
+			}
+			for (const nextNodeName of candidates) {
+				const failoverWorkerEntry = entryFor(nextNodeName);
 				if (
 					!failoverWorkerEntry ||
 					failoverWorkerEntry.connected === false ||
 					failoverWorkerEntry.nodes[0].shard !== shard ||
 					!shardingPeerCanRelay(connection.database, nextNodeName)
 				) {
-					// try the next node if this isn't connected or isn't in the same shard
-					nextIndex = (nextIndex + 1) % nodeNames.length;
 					continue;
 				}
 				const { nodes } = failoverWorkerEntry;
@@ -1707,14 +1945,26 @@ export async function startOnMainThread(options) {
 			);
 			return;
 		}
+		const wasConnected = mainWorkerEntry.connected === true;
 		mainWorkerEntry.connected = true;
+		if (!wasConnected) {
+			mainWorkerEntry.liveSince = Date.now();
+			// only a gateway of this node's own region reports reach; any other supplier is back once connected
+			const topology = regionTopologyFor(connection.database);
+			if (topology?.regionOf.get(connection.name) !== topology?.regionOf.get(getThisNodeName()))
+				mainWorkerEntry.topologyPinnedUntil = undefined;
+		}
 		if (connectReportAdvancesGeneration(mainWorkerEntry, connection))
 			advanceConnectGeneration(mainWorkerEntry, Date.now(), RECEIVE_STALL_THRESHOLD_MS);
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
 		if (canClearCapabilitiesForNewSocket(mainWorkerEntry, connection)) mainWorkerEntry.peerCapabilities = undefined;
-		applyConnectionMetadata(mainWorkerEntry, connection);
+		const metadataApplied = applyConnectionMetadata(mainWorkerEntry, connection);
+		const reachChanged =
+			metadataApplied && Array.isArray(connection.gatewayReach) && acceptGatewayReach(mainWorkerEntry, connection);
+		if (reachChanged) mainWorkerEntry.topologyPinnedUntil = undefined;
+		if ((!wasConnected || reachChanged) && regionTopologyFor(connection.database)) scheduleExclusionOriginsBroadcast();
 		const restoredNode = mainWorkerEntry.nodes[0];
 		if (!restoredNode) {
 			logger.warn('Newly connected node has no node subscriptions', connection.database, mainWorkerEntry);
@@ -1766,6 +2016,10 @@ export async function startOnMainThread(options) {
 			database,
 			nodes: [node],
 			exclusionOrigins: computeExclusionOrigins(database),
+			topology: (() => {
+				const links = computeTopologyLinks(database);
+				return links ? { excluded: links.managed } : null;
+			})(),
 		};
 		if (dispatchSubscriptionRequest({ worker }, request, replicationPool, true, subscribeToNode) === 'deferred')
 			logger.warn('No replication workers available to fail over', database, 'to node', connectingNode.name);
@@ -1852,6 +2106,9 @@ export async function startOnMainThread(options) {
 		}
 	}
 	function reconcileWorkers() {
+		// not every hdb_nodes change reaches onNodeUpdate (a patch without topology fields does not), and the review is
+		// a cached comparison until the topology actually changes
+		scheduleTopologyReview();
 		const now = Date.now();
 		const replicationPool = replicationWorkers();
 		// Diagnostics for the two lifecycle corrections below, batched into one line each so a mass worker
@@ -1962,7 +2219,7 @@ export async function startOnMainThread(options) {
 			replicationPool,
 			now,
 			WEDGE_RECONCILE_THRESHOLD_MS,
-			shouldReplicateFromNode
+			wantsDirectSubscription
 		);
 		// Defense-in-depth net for the connected:true / Receiving / no-progress copy wedge (harper-pro#453),
 		// recovered primarily by the worker-local copy-progress watchdog (harper-pro#454); this only matters
@@ -1972,7 +2229,7 @@ export async function startOnMainThread(options) {
 			replicationPool,
 			now,
 			RECEIVE_STALL_THRESHOLD_MS,
-			shouldReplicateFromNode,
+			wantsDirectSubscription,
 			getReceiveStatus
 		);
 		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0 && stalledByUrl.size === 0) return;
@@ -2037,7 +2294,7 @@ export async function startOnMainThread(options) {
 					if (entry.connected === true) continue;
 					const downSince = entry.disconnectedAt ?? entry.createdAt;
 					if (downSince == null || reconcileNow - downSince < WEDGE_RECONCILE_THRESHOLD_MS) continue;
-					if (!shouldReplicateFromNode(entry.nodes?.[0] as any, databaseName)) continue;
+					if (!wantsDirectSubscription(entry.nodes?.[0] as any, databaseName)) continue;
 					// Restart the disconnect clock so this entry is not re-driven on every reconcile
 					// tick until it either connects or exceeds the threshold again. Stamping disconnectedAt
 					// also gives a never-connected entry a real "down since" for subsequent ticks.
@@ -2176,11 +2433,24 @@ export async function requestClusterStatus(message?, port?) {
 			if (dbReplicationMap) {
 				for (const [
 					database,
-					{ worker, connected, nodes, latency, backPressureRatio, peerCapabilities, unknownCommandFrames },
+					{
+						worker,
+						connected,
+						nodes,
+						latency,
+						backPressureRatio,
+						peerCapabilities,
+						unknownCommandFrames,
+						unsubscribed,
+						peerReach,
+					},
 				] of dbReplicationMap) {
 					databases.push({
 						database,
 						connected,
+						// an entry this node stopped subscribing to (region topology pruned it, or replication was turned
+						// off) stays listed while its socket winds down
+						subscribed: unsubscribed !== true,
 						latency,
 						// the reconcile's copy of the owning worker's back-pressure ratio,
 						// 0..1 — the same slot clusterStatus.ts publishes as `backPressurePercent`, carried on the
@@ -2190,6 +2460,8 @@ export async function requestClusterStatus(message?, port?) {
 						peerCapabilities,
 						// Omitted on a healthy link (harper-pro#440), matching blobReplicationFailures.
 						unknownCommandFrames: unknownCommandFrames || undefined,
+						// the regions a gateway of this node's region reports a caught-up link to (region topology)
+						gatewayReach: peerReach,
 						nodes: nodes.filter((node) => !(node.endTime < Date.now())).map((node) => node.name),
 					});
 				}
@@ -2207,6 +2479,7 @@ export async function requestClusterStatus(message?, port?) {
 		}
 	}
 	const recordLocks = await collectRecordLockStatus();
+	const regionSuppliers = topologySuppliers();
 	port?.postMessage({
 		type: 'cluster-status',
 		// Echoed so the requesting worker can pair the answer with its own call: the fan-out above
@@ -2214,8 +2487,9 @@ export async function requestClusterStatus(message?, port?) {
 		requestId: message?.requestId,
 		connections,
 		recordLocks,
+		regionSuppliers,
 	});
-	return { connections, recordLocks };
+	return { connections, recordLocks, regionSuppliers };
 }
 
 // threadServer.js starts servers at import time on non-main workers, and job workers import this
@@ -2344,7 +2618,9 @@ if (parentPort) {
 		// Same component-load gate as subscribe-to-node so an update can never race ahead of the
 		// subscribe that creates the connection it targets; applying to a connection that doesn't
 		// exist yet would silently drop the set (the subscribe carries its own copy anyway).
-		whenWorkerComponentsLoaded().then(() => updateExclusionOrigins(message));
+		whenWorkerComponentsLoaded()
+			.then(() => updateExclusionOrigins(message))
+			.catch((error) => logger.error('Error applying an exclusion-origin update', message.database, error));
 	});
 	onMessageByType('force-reconnect-node', (message) => {
 		// Reconcile-driven recovery for a connected:true / Receiving / no-progress stall. Acts on an

@@ -348,6 +348,38 @@ Update a subscription with `update_node`:
 }
 ```
 
+## Region Topology
+
+<VersionBadge version="v5.5.0" />
+
+By default every node subscribes to every other node, so a write crosses region boundaries once per remote node. Labeling each node with its region lets nodes link only within their region, with a few gateway nodes carrying traffic between regions:
+
+```yaml
+replication:
+  region: us-east
+  gateway: true # optional
+```
+
+- A node subscribes to every node in its own region. A gateway also subscribes to every gateway in the other regions. A non-gateway node opens no cross-region subscription, and gossip discovery does not add one.
+- A region's gateways are the nodes that set `gateway: true`, topped up to two with the lowest-named nodes that do not set `gateway: false`. To use exactly one gateway, set `gateway: true` on it and `gateway: false` on the rest of the region (no failover then). Adding a node whose name sorts first to a region that relies on automatic selection moves a gateway role to it; set `gateway: true` to pin the role.
+- Each node takes the writes of an origin it does not link to from one peer and asks every other peer to leave them out. A non-gateway takes another region's writes from the lowest-named gateway of its own region that holds a caught-up link to that region. A gateway takes them from a lower-named gateway of its own region that has that link, else directly from that region's gateways. So with everything up, each node receives each write once, a non-gateway's write crosses into each other region once, and a gateway's own write reaches every remote gateway directly.
+- When a node's supplier for an origin goes down, or a gateway loses its links to a region while staying reachable in its own, the node switches after 3 seconds to the next candidate, resuming that origin from where it left off. A switch can resend up to the last 60 seconds of the origin's writes, the same overlap a reconnecting node uses: a transaction from that origin that commits more than 60 seconds after it started, during the switch, can be missed. With no candidate, the node accepts the origin's writes from any peer.
+- A route in `replication.routes` that sets `replicates`, `sendsTo`, `receivesFrom` or `subscriptions` keeps its link whatever the topology says. A plain route is a seed for discovery.
+
+Region topology turns on only when every node in `hdb_nodes` has a region and full (non-directional) replication, so it waits until the last node of a rolling upgrade is labeled. Until then, and whenever a node without a region joins, the cluster stays on the full mesh. It also stays off for:
+
+- nodes on LMDB, which do not publish their region, since switching suppliers needs per-origin transaction logs;
+- databases with sharding or residency, which keep direct links;
+- clusters using [directional routes](#controlling-replication-flow).
+
+Notes:
+
+- Every gateway must replicate every database that crosses regions.
+- A write confirmed with `replicatedConfirmation` or `X-Replicate-To: ...;confirm=N` is acknowledged only by the nodes that subscribe to the writer: its own region's nodes, plus the remote gateways when the writer is a gateway. A larger count is refused before the write commits.
+- Client subscription checkpoints need a certified floor for every origin, which a node receiving an origin only through a relay does not hold, so they are not issued on such nodes.
+- `region` and `gateway` shape traffic only. They are not a security boundary: a node with valid cluster credentials can still subscribe to any peer that authorizes it.
+- When failover cannot use a region (no regions set, or a direct link breaks), it prefers the peer with the lowest measured latency, in doubling buckets; peers in the same bucket keep the name order failover used before.
+
 ## Monitoring Replication
 
 <VersionBadge version="v4.5.0" /> (cluster status timing statistics)

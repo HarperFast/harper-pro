@@ -1,0 +1,5 @@
+type RegionRecord @table @export {
+	id: ID @primaryKey
+	phase: String @indexed
+	origin: String
+}

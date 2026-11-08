@@ -14,6 +14,7 @@ import { logger } from '../core/utility/logging/logger.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 import { CONFIRMATION_STATUS_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
 import { createBackoff } from './backoff.ts';
+import { deriveRegionTopology, topologyAllowsDirect, validRegion, type RegionTopology } from './regionTopology.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -419,7 +420,7 @@ function storeRecordRangeVisible(store: any, name: string): boolean {
 	}
 }
 
-async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
+export async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
 	if (event.type === 'reload') {
 		// A copyApply base copy back-filled hdb_nodes as snapshots with no per-row change events
 		// (harper-pro#489). Re-scan the whole table and fire the listener for every node so outbound
@@ -450,9 +451,9 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			if (reconstructed) server.nodes.push(reconstructed as any);
 			else console.error('Invalid node update event', event);
 		}
-	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
-		// add_node { isLeader: true } reaches us as a patch event; read the merged
-		// record so server.nodes reflects the full record (including isLeader). Sync read
+	} else if (event.type === 'patch' && node_name !== getThisNodeName()) {
+		// A patch carries only its own fields (add_node's { isLeader: true }, a node republishing its
+		// region), and the node was just filtered out above; read the merged record back in. Sync read
 		// (getSync): RocksDB get() is a MaybePromise (Promise on a block-cache miss); an un-awaited
 		// get() here would push a pending Promise into server.nodes. See selfNodeReplicates.
 		const fullRecord = getHDBNodeTable().primaryStore.getSync(node_name);
@@ -502,12 +503,18 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 				);
 			}
 		}
-	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
-		// isLeader patches need to drive subscription bootstrap; pass the merged record.
+	} else if (event.type === 'patch' && (event.value?.isLeader !== undefined || patchesTopology(event.value))) {
+		// isLeader patches drive subscription bootstrap, and topology patches change which peers link; pass the merged record.
 		// Sync read (getSync) — RocksDB get() is a MaybePromise; see selfNodeReplicates.
 		const fullRecord = getHDBNodeTable().primaryStore.getSync(event.id);
 		if (fullRecord) listener(fullRecord, event.id);
 	}
+}
+function patchesTopology(value: any): boolean {
+	return (
+		value != null &&
+		(Object.hasOwn(value, 'region') || Object.hasOwn(value, 'gateway') || Object.hasOwn(value, 'replicates'))
+	);
 }
 /**
  * Distinguish a genuine `remove_node` tombstone from a transient decode failure for a range-visible
@@ -980,7 +987,97 @@ export function filterReplicationRecipients(nodes: any[], selfReplicates: any, d
  */
 export function getReplicationRecipients(databaseName: string) {
 	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
-	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
+	const recipients = filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
+	const topology = regionTopologyFor(databaseName);
+	return topology ? topologyRecipients(topology, recipients) : recipients;
+}
+
+const STORAGE_IS_ROCKSDB = (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_PARAMS.STORAGE_ENGINE)) !== 'lmdb';
+let warnedRegionOnLmdb = false;
+
+/**
+ * This node's labels as it publishes them. A node on LMDB publishes no region: supplier switches resume from
+ * per-origin cursors, which only RocksDB keeps, and one unlabeled member keeps the whole cluster on full mesh.
+ */
+export function selfTopologyLabels(): { region: string | null; gateway: boolean | null } {
+	let region = validRegion(env.get(CONFIG_PARAMS.REPLICATION_REGION)) ?? null;
+	if (region !== null && !STORAGE_IS_ROCKSDB) {
+		if (!warnedRegionOnLmdb) {
+			warnedRegionOnLmdb = true;
+			logger.warn?.('replication.region is not published on LMDB; region topology needs RocksDB');
+		}
+		region = null;
+	}
+	const gateway = env.get(CONFIG_PARAMS.REPLICATION_GATEWAY);
+	return { region, gateway: typeof gateway === 'boolean' ? gateway : null };
+}
+
+const TOPOLOGY_CACHE_MS = 5_000;
+let topologyCache:
+	| { nodes: unknown; count: number; at: number; topology: RegionTopology; recipients: WeakMap<object, any[]> }
+	| undefined;
+
+/**
+ * Members come from the `hdb_nodes` table itself: `server.nodes` is built incrementally from change events (a full
+ * rescan appends to it while calling the listener, which reads this), so it can lag a row the table already holds.
+ * The cache is keyed on `server.nodes`, which every event replaces, and lives at most `TOPOLOGY_CACHE_MS`, so the
+ * inactive path costs a compare and a clock read.
+ */
+export function currentRegionTopology(): RegionTopology {
+	const nodes = server.nodes;
+	const now = Date.now();
+	if (
+		topologyCache?.nodes === nodes &&
+		topologyCache.count === nodes.length &&
+		now - topologyCache.at < TOPOLOGY_CACHE_MS
+	)
+		return topologyCache.topology;
+	const selfName = getThisNodeName();
+	const self = {
+		name: selfName,
+		...selfTopologyLabels(),
+		replicates: selfNodeReplicates(getHDBNodeTable().primaryStore, selfName),
+	};
+	const members: any[] = [self];
+	for (const row of getHDBNodeTable().search([])) if (row?.name && row.name !== selfName) members.push(row);
+	const topology = deriveRegionTopology(members);
+	const previous = topologyCache?.topology;
+	if (
+		self.region !== null &&
+		(previous?.active !== topology.active || previous?.inactiveReason !== topology.inactiveReason)
+	)
+		logger.info?.(topology.active ? 'Region topology active' : `Region topology off: ${topology.inactiveReason}`);
+	topologyCache = { nodes, count: nodes.length, at: now, topology, recipients: new WeakMap() };
+	return topology;
+}
+
+/** Relays forward residency partials as they hold them, so a database with residency keeps full mesh. */
+function databaseUsesResidency(databaseName: string): boolean {
+	const database = databases[databaseName];
+	for (const tableName in database) if (database[tableName]?.residency) return true;
+	const configured = env.get(CONFIG_PARAMS.REPLICATION_DATABASES);
+	return (
+		Array.isArray(configured) &&
+		configured.some((entry) => entry?.name === databaseName && (entry.sharded || entry.replicateTo !== undefined))
+	);
+}
+
+/** The topology governing `databaseName` here, or undefined when it replicates as a full mesh. */
+export function regionTopologyFor(databaseName: string): RegionTopology | undefined {
+	const topology = currentRegionTopology();
+	return topology.active && !databaseUsesResidency(databaseName) ? topology : undefined;
+}
+
+/** Peers whose own link rule subscribes them to this node: only they acknowledge its writes. */
+function topologyRecipients(topology: RegionTopology, nodes: any[]): any[] {
+	const cache = topologyCache?.topology === topology ? topologyCache.recipients : undefined;
+	let recipients = cache?.get(nodes);
+	if (!recipients) {
+		const selfName = getThisNodeName();
+		recipients = nodes.filter((node) => topologyAllowsDirect(topology, node.name, selfName));
+		cache?.set(nodes, recipients);
+	}
+	return recipients;
 }
 
 function isRecipient(recipients: { name: string }[], name: string): boolean {
@@ -1144,6 +1241,8 @@ export type Route = {
 				receives?: boolean;
 				receivesFrom?: (RouteEntry | string)[];
 		  };
+	/** The route states its own replication; otherwise it is a seed, and region topology decides the link. */
+	explicitReplication?: boolean;
 };
 export type Node = {
 	name: string;
@@ -1309,6 +1408,12 @@ export function* iterateRoutes(options: { routes: (Route | any)[] }) {
 		}
 		yield {
 			replicates,
+			explicitReplication:
+				typeof route === 'object' &&
+				(route.replicates !== undefined ||
+					route.sendsTo !== undefined ||
+					route.receivesFrom !== undefined ||
+					route.subscriptions !== undefined),
 			name: host,
 			url,
 			port: route.port,

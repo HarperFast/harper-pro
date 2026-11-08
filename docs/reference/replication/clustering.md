@@ -200,6 +200,8 @@ Returns an array of status objects from the cluster, including active WebSocket 
 | `lastReceivedLocalTime`  | Local time when the last transaction was received. A gap between this and `lastReceivedRemoteTime` suggests the node is catching up |
 | `sendingMessage`         | Timestamp of the transaction actively being sent. Absent when waiting for the next transaction                                      |
 
+<VersionBadge version="v5.5.0" /> A socket entry with `"subscribed": false` is one this node no longer subscribes to (for example, [region topology](./overview.md#region-topology) pruned the link, or replication was turned off for the database); it stays listed while the socket winds down. On a node with `replication.region` set, `region_topology` reports `active`, the node's `region`, and either whether it is a `gateway` and each region's `gateways`, or the `reason` the topology is off.
+
 While a database is taking its initial full copy, these timing fields hold the literal string `"Copying"` rather than a timestamp. Anything that parses them as dates needs to handle that value, since a node taking a full copy is exactly the node you are most likely to be watching.
 
 ### Stuck Copies
@@ -341,100 +343,5 @@ Bulk creates or resets subscriptions for any number of remote nodes. **Resets an
 ```json
 {
 	"message": "Cluster successfully configured."
-}
-```
-
----
-
-### Cluster Set Routes
-
-Adds routes to the `replication.routes` configuration. Behaves as a PATCH/upsert — adds new routes while leaving existing routes untouched.
-
-**Parameters**:
-
-- `operation` _(required)_ — must be `cluster_set_routes`
-- `routes` _(required)_ — array of route strings (`wss://host:port`) or objects with `hostname` and `port` properties
-
-**Request**:
-
-```json
-{
-	"operation": "cluster_set_routes",
-	"routes": [
-		"wss://server-two:9925",
-		{
-			"hostname": "server-three",
-			"port": 9930
-		}
-	]
-}
-```
-
-**Response**:
-
-```json
-{
-	"message": "cluster routes successfully set",
-	"set": ["wss://server-two:9925", { "hostname": "server-three", "port": 9930 }],
-	"skipped": []
-}
-```
-
----
-
-### Cluster Get Routes
-
-Returns the replication routes from the Harper config file.
-
-**Parameters**:
-
-- `operation` _(required)_ — must be `cluster_get_routes`
-
-**Request**:
-
-```json
-{
-	"operation": "cluster_get_routes"
-}
-```
-
-**Response**:
-
-```json
-["wss://server-two:9925", { "hostname": "server-three", "port": 9930 }]
-```
-
----
-
-### Cluster Delete Routes
-
-Removes routes from the Harper config file.
-
-**Parameters**:
-
-- `operation` _(required)_ — must be `cluster_delete_routes`
-- `routes` _(required)_ — array of route objects to remove
-
-**Request**:
-
-```json
-{
-	"operation": "cluster_delete_routes",
-	"routes": [
-		{
-			"hostname": "server-three",
-			"port": 9930
-		}
-	]
-}
-```
-
-**Response**:
-
-```json
-{
-	"message": "cluster routes successfully deleted",
-	"deleted": [{ "hostname": "server-three", "port": 9930 }],
-	"skipped": []
 }
 ```
