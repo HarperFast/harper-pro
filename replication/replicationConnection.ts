@@ -8245,6 +8245,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								ensureNode(remoteNodeName, nodeToAdd);
 							}
 							if (options.connection) options.connection.nodeName = remoteNodeName;
+							// before the sharding flush below, which can outlast the private identification deadline
+							options.connection?.onPeerIdentified?.(ws);
 							bindSharedRouteSafety();
 							if (hasResidencySchemaAuthority(databaseName ?? message[2])) {
 								recordResidencyConfiguration(remoteNodeName, message[5]?.shardsDigest);
@@ -8274,7 +8276,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (options.connection.socket === ws)
 									handshakeStatus[CONNECTION_PATH_POSITION] = ws.dial?.path ?? PATH_PUBLIC;
 							}
-							options.connection?.onPeerIdentified?.(ws);
 							//const url = message[3] ?? thisNodeUrl;
 							logger.debug?.(connectionId, 'received node name:', remoteNodeName, 'db:', databaseName ?? message[2]);
 							if (!databaseName) {
