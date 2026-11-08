@@ -188,19 +188,6 @@ describe('NodeReplicationConnection private dial', () => {
 			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PUBLIC_FALLBACK);
 		});
 
-		it('a redial for a path change replaces the socket without reporting the peer down', async () => {
-			const publicUrl = await server(() => {});
-			const { connection, retries } = connectionVia(`ws://127.0.0.1:${await closedPort()}`, publicUrl);
-			connection.chooseDial = () => (connection.dial = { url: publicUrl, path: PATH_PUBLIC });
-			await connection.connect();
-			const { socket } = connection;
-			await waitFor(() => socket.readyState === socket.OPEN, 'the open');
-			connection.redialForPathChange();
-			await waitFor(() => socket.readyState === socket.CLOSED, 'the close');
-			assert.strictEqual(connection.isConnected, true);
-			assert.strictEqual(retries.length, 1);
-		});
-
 		it('an unsubscribe during the private dial does not mark the path down', async () => {
 			const privateUrl = `ws://127.0.0.1:${await closedPort()}`;
 			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
@@ -220,8 +207,6 @@ describe('NodeReplicationConnection private dial', () => {
 			connection.notePrivateSocketEnded({ dial, peerIdentified: true }, 'closed');
 			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
 			connection.notePrivateSocketEnded({ dial: { url: 'wss://peer:9933', path: PATH_PUBLIC } }, 'closed');
-			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
-			connection.notePrivateSocketEnded({ dial, pathRedial: true }, 'replaced by a path-change redial');
 			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
 			connection.notePrivateSocketEnded({ dial }, '1008 after open');
 			assert.strictEqual(
