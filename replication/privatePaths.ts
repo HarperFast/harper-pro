@@ -110,7 +110,7 @@ export function publicTlsIdentity(publicUrl: string, nodeName?: string): { serve
  * holds an old advertisement (ensureNode patches, so the field has to be cleared explicitly).
  */
 export function receivedPrivateUrls(message: any, existing: any): PrivateUrl[] | null | undefined {
-	if (message == null || !('private_urls' in message)) return undefined;
+	if (typeof message !== 'object' || message === null || !('private_urls' in message)) return undefined;
 	return normalizePrivateUrls(message.private_urls) ?? (existing?.private_urls ? null : undefined);
 }
 

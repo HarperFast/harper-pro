@@ -139,6 +139,7 @@ describe('privatePaths', () => {
 		it('leaves the row alone for a release that does not send the field', () => {
 			assert.strictEqual(receivedPrivateUrls({ shard: 1 }, row), undefined);
 			assert.strictEqual(receivedPrivateUrls(undefined, row), undefined);
+			assert.strictEqual(receivedPrivateUrls('Successfully added', row), undefined);
 		});
 	});
 
