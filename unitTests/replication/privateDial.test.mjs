@@ -82,6 +82,14 @@ describe('NodeReplicationConnection private dial', () => {
 			const options = connection.dialOptions(connection.dial);
 			assert.strictEqual(options.servername, peer);
 			assert.strictEqual(options.checkHost, peer);
+			const fallback = { url: `wss://${peer}:9933`, path: PATH_PUBLIC_FALLBACK };
+			assert.strictEqual(connection.dialOptions(fallback).serverName, peer, 'the public fallback names the peer too');
+			const publicOnly = { url: `wss://${peer}:9933`, path: PATH_PUBLIC };
+			assert.strictEqual(
+				connection.dialOptions(publicOnly).serverName,
+				'failover-origin',
+				'unchanged without a private address'
+			);
 		});
 
 		it('dials the public URL when no network matches, or none is configured', () => {

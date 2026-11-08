@@ -5393,7 +5393,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		// also covers a read sent on a socket that later ended for the path change
 		return read.catch((error) => {
 			if (attempt !== this.sessionAbandonedForPath || this.intentionallyUnsubscribed) throw error;
-			// the abandoned socket's close installs the next session
+			// the abandoned socket's reconnect installs the next session
 			return new Promise((resolve) => setImmediate(resolve)).then(() => {
 				if (this.session === attempt || this.intentionallyUnsubscribed) throw error;
 				return this.getRecord(request);
@@ -5418,9 +5418,11 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	}
 
 	dialOptions(dial: Dial) {
-		const options = { serverName: this.nodeName, authorization: this.authorization };
+		// A failover subscription sets nodeName to its origin until the handshake; both legs of a private-capable
+		// link name the node dialed. A link without a private address dials exactly as before.
+		const serverName = dial.path === PATH_PUBLIC ? this.nodeName : this.configuredNodeName;
+		const options = { serverName, authorization: this.authorization };
 		if (dial.path !== PATH_PRIVATE) return options;
-		// the dialed node, not nodeName: a failover subscription sets that to its origin until the handshake
 		return {
 			...options,
 			...publicTlsIdentity(this.url, this.configuredNodeName),
