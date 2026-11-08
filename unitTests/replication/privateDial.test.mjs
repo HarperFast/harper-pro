@@ -220,6 +220,7 @@ describe('NodeReplicationConnection private dial', () => {
 			connections.push(connection);
 			let rejectPrivate;
 			const privateAttempt = new Promise((_, reject) => (rejectPrivate = reject));
+			connection.onPrivateNetwork = true;
 			connection.dial = { url: 'wss://10.7.0.2:9933', path: PATH_PRIVATE, privateUrl: 'wss://10.7.0.2:9933' };
 			connection.session = privateAttempt;
 			const read = connection.getRecord({ id: 1 });
@@ -229,12 +230,14 @@ describe('NodeReplicationConnection private dial', () => {
 			assert.strictEqual(await read, 'from the public socket');
 		});
 
-		it('a read waiting on a session redialed for a changed private address is served by the redial', async () => {
+		it("a read waiting on a session redialed for a peer's new private address is served by the redial", async () => {
 			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
 			connections.push(connection);
 			let rejectCurrent;
 			const current = new Promise((_, reject) => (rejectCurrent = reject));
-			connection.dial = { url: 'wss://10.8.0.2:9933', path: PATH_PRIVATE, privateUrl: 'wss://10.8.0.2:9933' };
+			// the peer has not advertised one yet; this node is on a private network
+			connection.onPrivateNetwork = true;
+			connection.dial = { url: 'wss://peer:9933', path: PATH_PUBLIC };
 			connection.session = current;
 			const read = connection.getRecord({ id: 1 });
 			connection.forceReconnect = () => {
@@ -261,6 +264,7 @@ describe('NodeReplicationConnection private dial', () => {
 			connections.push(connection);
 			let failRead;
 			const privateAttempt = Promise.resolve({ getRecord: () => new Promise((_, reject) => (failRead = reject)) });
+			connection.onPrivateNetwork = true;
 			connection.dial = { url: 'wss://10.7.0.2:9933', path: PATH_PRIVATE, privateUrl: 'wss://10.7.0.2:9933' };
 			connection.session = privateAttempt;
 			const read = connection.getRecord({ id: 1 });
@@ -281,6 +285,7 @@ describe('NodeReplicationConnection private dial', () => {
 				privateUrl: 'wss://10.8.0.2:9933',
 				pathKey: key,
 			};
+			connection.onPrivateNetwork = true;
 			let failRead;
 			const publicSession = Promise.resolve({ getRecord: () => new Promise((_, reject) => (failRead = reject)) });
 			connection.session = publicSession;
@@ -295,7 +300,7 @@ describe('NodeReplicationConnection private dial', () => {
 			assert.strictEqual(await read, 'from the private socket');
 		});
 
-		it('a connection with no private address keeps the plain read', async () => {
+		it('a node on no private network keeps the plain read', async () => {
 			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
 			connections.push(connection);
 			let rejectAttempt;

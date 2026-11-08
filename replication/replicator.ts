@@ -404,7 +404,10 @@ function redialOnPrivateUrlChange(node: any, name: string) {
 	let delay = 0;
 	const redial = (connection: NodeReplicationConnection) => {
 		if (connection.configuredNodeName !== name || !connection.dial || connection.dial.privateUrl === privateUrl) return;
-		setTimeout(() => connection.redialForPathChange(), delay).unref();
+		setTimeout(() => {
+			// it may have reconnected to that address on its own meanwhile
+			if (connection.dial?.privateUrl !== privateUrl) connection.redialForPathChange();
+		}, delay).unref();
 		delay += PROMOTION_STAGGER_MS;
 	};
 	for (const dbConnections of connections.values()) for (const connection of dbConnections.values()) redial(connection);

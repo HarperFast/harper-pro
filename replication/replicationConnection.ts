@@ -4976,9 +4976,11 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	peerCapabilities?: ResolvedPeerCapabilities;
 	// The address the latest connect() chose; `url` stays the public URL every key and report uses.
 	dial?: Dial;
+	// this node dials from a private network, so a peer's advertisement can move this link at any time
+	onPrivateNetwork = false;
 	privateIdentifyTimeoutMs = PRIVATE_IDENTIFY_TIMEOUT_MS;
-	// the session of an attempt abandoned for another path (a failed private dial, or a promotion off the
-	// public fallback); reads waiting on it retry on the next session
+	// the session of an attempt abandoned for another path (a failed private dial, a promotion off the
+	// public fallback, or a peer's changed address); reads waiting on it retry on the next session
 	sessionAbandonedForPath?: Promise<any>;
 	constructor(url: string, subscription: any, databaseName: string, nodeName?: string, authorization?: string) {
 		super();
@@ -5389,7 +5391,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	getRecord(request) {
 		const attempt = this.session;
 		const read = attempt.then((session) => session.getRecord(request));
-		if (!this.dial?.privateUrl) return read;
+		if (!this.onPrivateNetwork) return read;
 		// also covers a read sent on a socket that later ended for the path change
 		return read.catch((error) => {
 			if (attempt !== this.sessionAbandonedForPath || this.intentionallyUnsubscribed) throw error;
@@ -5403,6 +5405,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 
 	chooseDial(): Dial {
 		const networks = localNetworks();
+		this.onPrivateNetwork = networks.size > 0;
 		let privateUrl: string | undefined;
 		if (networks.size > 0 && this.configuredNodeName) {
 			try {
@@ -5486,7 +5489,6 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		return true;
 	}
 
-	// reads waiting on the current session retry on the redial's (getRecord)
 	redialForPathChange() {
 		if (this.reconnectScheduled) return;
 		this.sessionAbandonedForPath = this.session;
