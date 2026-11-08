@@ -296,6 +296,7 @@ type ReplicationWebSocket = WebSocket & {
 	dial?: Dial;
 	peerIdentified?: boolean;
 	attemptSession?: Promise<any>;
+	privateFailureNoted?: boolean;
 };
 
 const logger = forComponent('replication').conditional as Logger;
@@ -5387,7 +5388,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 				if (attempt !== this.privateFallbackSession || this.intentionallyUnsubscribed) throw error;
 				// the failed socket's close installs the public redial's session
 				return new Promise((resolve) => setImmediate(resolve)).then(() => {
-					if (this.session === attempt) throw error;
+					if (this.session === attempt || this.intentionallyUnsubscribed) throw error;
 					return this.getRecord(request);
 				});
 			}
@@ -5426,8 +5427,11 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 
 	notePrivateSocketEnded(socket: ReplicationWebSocket, reason: string) {
 		const { dial } = socket;
-		if (dial?.path === PATH_PRIVATE && !socket.peerIdentified && !this.intentionallyUnsubscribed)
-			this.privateDialFailed(dial, reason, socket.attemptSession);
+		if (dial?.path !== PATH_PRIVATE || socket.peerIdentified || socket.privateFailureNoted) return;
+		if (this.intentionallyUnsubscribed) return;
+		// forceReconnect and the socket's later close both end it
+		socket.privateFailureNoted = true;
+		this.privateDialFailed(dial, reason, socket.attemptSession);
 	}
 
 	privateDialFailed(dial: Dial, reason: string, attemptSession: Promise<any>) {
@@ -5457,17 +5461,13 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		);
 	}
 
+	// A connection whose private dial just failed still shows the private dial until its retry runs.
 	isWaitingFor(pathKey: string): boolean {
-		return (
-			!this.intentionallyUnsubscribed &&
-			!this.isFinished &&
-			this.dial?.path === PATH_PUBLIC_FALLBACK &&
-			this.dial.pathKey === pathKey
-		);
+		return !this.intentionallyUnsubscribed && !this.isFinished && this.dial?.pathKey === pathKey;
 	}
 
 	promoteToPrivatePath(pathKey: string): boolean {
-		if (!this.isWaitingFor(pathKey) || this.reconnectScheduled) return false;
+		if (!this.isWaitingFor(pathKey) || this.dial.path !== PATH_PUBLIC_FALLBACK || this.reconnectScheduled) return false;
 		this.forceReconnect();
 		return true;
 	}

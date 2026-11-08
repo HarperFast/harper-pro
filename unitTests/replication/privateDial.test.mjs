@@ -129,6 +129,8 @@ describe('NodeReplicationConnection private dial', () => {
 			await connection.connect();
 			assert.strictEqual(connection.socket.dial.path, PATH_PRIVATE);
 			await waitFor(() => retries.length === 1, 'the retry after the refused private dial');
+			assert.ok(connection.isWaitingFor(pathKey), 'still waiting on the outage before its retry runs');
+			assert.strictEqual(connection.promoteToPrivatePath(pathKey), false, 'not a canary while its retry is pending');
 			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PUBLIC_FALLBACK);
 
 			retries[0]();
@@ -233,6 +235,14 @@ describe('NodeReplicationConnection private dial', () => {
 				pathKey: privatePathKey('wss://10.5.0.3:9933', 'peer'),
 			};
 			assert.strictEqual(connection.promoteToPrivatePath(key), false);
+			connection.dial = {
+				url: 'wss://10.5.0.2:9933',
+				path: PATH_PRIVATE,
+				privateUrl: 'wss://10.5.0.2:9933',
+				pathKey: key,
+			};
+			assert.ok(connection.isWaitingFor(key));
+			assert.strictEqual(connection.promoteToPrivatePath(key), false, 'not on the fallback yet');
 			connection.dial = {
 				url: 'wss://peer:9933',
 				path: PATH_PUBLIC_FALLBACK,

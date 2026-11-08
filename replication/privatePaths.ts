@@ -7,9 +7,7 @@ import { createBackoff, type Backoff } from './backoff.ts';
 import { PATH_PRIVATE, PATH_PUBLIC, PATH_PUBLIC_FALLBACK } from './sharedStatusSlots.ts';
 
 export const PRIVATE_DIAL_TIMEOUT_MS = 10_000;
-// A private socket whose peer has not identified itself by then is closed, so the next dial is public.
 export const PRIVATE_IDENTIFY_TIMEOUT_MS = 30_000;
-// A canary that neither reaches the handshake nor fails within this long is treated as failed.
 const CANARY_TIMEOUT_MS = 60_000;
 // Matches subscriptionManager's RECONNECT_STAGGER_MS: opening many TLS connections at once spikes memory.
 export const PROMOTION_STAGGER_MS = 50;
@@ -27,11 +25,9 @@ export interface Dial {
 }
 
 export interface PrivatePathWaiter {
-	/** Whether the private URL now completes TLS, the peer certificate check and the WebSocket upgrade. */
 	probePrivatePath(privateUrl: string): Promise<boolean>;
-	/** Redials over the private path; false when a redial is already pending. */
+	/** false leaves the waiter waiting: it is not on the fallback yet, or a redial is pending */
 	promoteToPrivatePath(pathKey: string): boolean;
-	/** Still subscribed and on this path's public fallback. */
 	isWaitingFor(pathKey: string): boolean;
 }
 
@@ -160,7 +156,7 @@ export class PrivatePaths {
 		return { url: publicUrl, path: PATH_PUBLIC_FALLBACK, privateUrl, pathKey };
 	}
 
-	/** Returns true when this starts an outage, so the caller reports it once. */
+	/** true when this starts an outage, so the caller reports it once */
 	failed(pathKey: string, privateUrl: string, waiter: PrivatePathWaiter): boolean {
 		let outage = this.#outages.get(pathKey);
 		const started = !outage;
@@ -178,7 +174,7 @@ export class PrivatePaths {
 		return started;
 	}
 
-	/** The peer was identified over the private path. Returns true when this ends an outage. */
+	/** true when this ends an outage */
 	identified(pathKey: string): boolean {
 		const outage = this.#outages.get(pathKey);
 		if (!outage) return false;
@@ -252,7 +248,7 @@ export class PrivatePaths {
 			outage.timer.unref?.();
 			return;
 		}
-		// every waiter already has a redial pending: they redial onto the fallback, so probe again later
+		// no waiter could take the trial yet
 		this.#scheduleProbe(pathKey, outage);
 	}
 }
