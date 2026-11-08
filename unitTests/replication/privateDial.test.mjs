@@ -221,6 +221,8 @@ describe('NodeReplicationConnection private dial', () => {
 			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
 			connection.notePrivateSocketEnded({ dial: { url: 'wss://peer:9933', path: PATH_PUBLIC } }, 'closed');
 			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
+			connection.notePrivateSocketEnded({ dial, pathRedial: true }, 'replaced by a path-change redial');
+			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
 			connection.notePrivateSocketEnded({ dial }, '1008 after open');
 			assert.strictEqual(
 				privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path,

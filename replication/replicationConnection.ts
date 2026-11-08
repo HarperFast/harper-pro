@@ -5213,6 +5213,8 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		const delay = this.retryBackoff.nextDelay();
 		if (delay === undefined) return;
 		const { holdMs, transition } = this.copyStall.noteClosed();
+		// a path-change redial left the link reported up, which a held reconnect is not
+		if (holdMs) this.reportDisconnected(false);
 		const reconnect = () => {
 			stopWakeWatch?.();
 			this.connect();
@@ -5448,7 +5450,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 
 	notePrivateSocketEnded(socket: ReplicationWebSocket, reason: string) {
 		const { dial } = socket;
-		if (dial?.path !== PATH_PRIVATE || socket.peerIdentified || socket.privateFailureNoted) return;
+		if (dial?.path !== PATH_PRIVATE || socket.peerIdentified || socket.privateFailureNoted || socket.pathRedial) return;
 		if (this.intentionallyUnsubscribed) return;
 		// forceReconnect and the socket's later close both end it
 		socket.privateFailureNoted = true;
