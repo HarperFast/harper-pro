@@ -128,13 +128,7 @@ interface Outage {
 	timer?: ReturnType<typeof setTimeout>;
 }
 
-/**
- * Per-thread health of private URLs. A private socket that ends before the peer is identified marks its URL
- * down; while it is down, one probe for it runs on a backoff. A probe that gets through promotes one waiting
- * connection (the canary) to dial privately; only when the canary's peer is identified is the URL healthy
- * again, and the rest of the waiters follow, staggered. A probe reaching the WebSocket upgrade does not
- * prove the peer accepts this node, so the canary, not the probe, resets the backoff.
- */
+// Per-thread outage state; replication/DESIGN.md non-obvious behavior 37 has the recovery rules.
 export class PrivatePaths {
 	#outages = new Map<string, Outage>();
 	#setTimer: typeof setTimeout;
@@ -151,7 +145,6 @@ export class PrivatePaths {
 		if (!privateUrl) return { url: publicUrl, path: PATH_PUBLIC };
 		const outage = this.#outages.get(pathKey);
 		if (!outage || outage.canary === waiter) return { url: privateUrl, path: PATH_PRIVATE, privateUrl, pathKey };
-		// a connection sent to the fallback waits for the outage to end, whether or not its own dial failed
 		outage.waiters.add(waiter);
 		return { url: publicUrl, path: PATH_PUBLIC_FALLBACK, privateUrl, pathKey };
 	}

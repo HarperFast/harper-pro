@@ -77,7 +77,6 @@ async function socketsTo(node, peer, signal) {
 	return status.connections.find((connection) => connection.name === peer.hostname)?.database_sockets ?? [];
 }
 
-// undefined while any socket is down
 async function pathsTo(node, peer, signal) {
 	const sockets = await socketsTo(node, peer, signal);
 	if (!sockets.length || !sockets.every((socket) => socket.connected)) return undefined;
