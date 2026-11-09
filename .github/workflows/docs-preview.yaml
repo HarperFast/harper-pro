@@ -16,12 +16,12 @@ jobs:
     name: Request the docs preview
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # One run per PR at a time, so a cleanup cannot be overtaken by an earlier request.
     concurrency:
       group: docs-preview-${{ github.event.pull_request.number }}
       cancel-in-progress: false
     if: >-
-      (github.event.action == 'labeled' && github.event.label.name == 'docs-preview') ||
+      (github.event.action == 'labeled' && github.event.label.name == 'docs-preview' &&
+      github.event.pull_request.state == 'open') ||
       (github.event.action == 'unlabeled' && github.event.label.name == 'docs-preview') ||
       (contains(fromJSON('["synchronize", "reopened", "closed"]'), github.event.action) &&
       contains(github.event.pull_request.labels.*.name, 'docs-preview'))
