@@ -108,10 +108,18 @@ describe('copyBoundRoseForLogs', () => {
 		);
 	});
 
-	it('ignores logs the session does not replay and a settle that replaces its own reservation', () => {
-		assert.strictEqual(copyBoundRoseForLogs(bounds(), bounds({ other: T }), ['relayed']), undefined);
+	it('names a settle that replaces the reservation the session started under', () => {
 		assert.strictEqual(
 			copyBoundRoseForLogs(bounds({}, { relayed: T + 9 }), bounds({ relayed: T + 3 }), ['relayed']),
+			'relayed'
+		);
+	});
+
+	it('ignores logs the session does not replay, an unchanged bound and a released reservation', () => {
+		assert.strictEqual(copyBoundRoseForLogs(bounds(), bounds({ other: T }), ['relayed']), undefined);
+		assert.strictEqual(copyBoundRoseForLogs(bounds({ relayed: T }), bounds({ relayed: T }), ['relayed']), undefined);
+		assert.strictEqual(
+			copyBoundRoseForLogs(bounds({ relayed: T }, { relayed: T + 9 }), bounds({ relayed: T }), ['relayed']),
 			undefined
 		);
 		assert.strictEqual(copyBoundRoseForLogs(bounds(), bounds({ local: T }), ['local']), undefined);

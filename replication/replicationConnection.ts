@@ -832,18 +832,20 @@ export function relayedCursorsForCopy(
 
 /**
  * Did a copy bound for a log this session replays rise since `before` was read? The rows under it reached this node
- * without log entries, so the follower must reconnect, and the start check decides whether it needs a copy.
+ * without log entries, so the follower must reconnect, and the start check decides whether it needs a copy. A settle
+ * counts on its own: its exact bound replaces a higher reservation the session may have started under.
  */
 export function copyBoundRoseForLogs(
 	before: RelayCopyBounds,
 	after: RelayCopyBounds,
 	logNames: Iterable<string>
 ): string | undefined {
-	// a settle replaces its reservation with a bound at or below it, which needs no reconnect of its own
-	const highest = (bounds: RelayCopyBounds, log: string) =>
-		Math.max(bounds.settled.get(log) ?? 0, bounds.reserved.get(log) ?? 0);
 	for (const log of logNames) {
-		if (log !== 'local' && highest(after, log) > highest(before, log)) return log;
+		if (log === 'local') continue;
+		for (const kind of ['settled', 'reserved'] as const) {
+			const bound = after[kind].get(log);
+			if (bound !== undefined && !(before[kind].get(log)! >= bound)) return log;
+		}
 	}
 	return undefined;
 }
