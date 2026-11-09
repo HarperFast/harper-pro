@@ -15,11 +15,12 @@ describe('borrowedOriginCursor (harper-pro#1291 supplier switch)', () => {
 		assert.strictEqual(borrowedOriginCursor({ id: 4, originLogKey: 12000, originGeneration: 'g1' }, qualified), 12000);
 	});
 
-	it('ignores a relieved state that is revoked, holed, invalid, or of another generation', () => {
+	it('ignores a relieved state that is revoked, holed, partial, invalid, or of another generation', () => {
 		const qualified = { floor: 9000, generation: 'g1' };
 		for (const state of [
 			{ originLogKey: 12000, originGeneration: 'g1', floorRevoked: true },
 			{ originLogKey: 12000, originGeneration: 'g1', hole: true },
+			{ originLogKey: 12000, originGeneration: 'g1', partialHistory: true },
 			{ originLogKey: 'x', originGeneration: 'g1' },
 			{ originLogKey: 12000, originGeneration: 'g0' },
 		]) {

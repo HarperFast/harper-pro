@@ -2,7 +2,7 @@
  * This module is responsible for managing the list of known nodes in the network. This also tracks replication confirmation
  * when we want to ensure that a transaction has been replicated to multiple nodes before we confirm it.
  */
-import { table } from '../core/resources/databases.ts';
+import { table, databaseEventsEmitter } from '../core/resources/databases.ts';
 import { forEachReplicatedDatabase } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
@@ -1051,6 +1051,12 @@ export function currentRegionTopology(): RegionTopology {
 	topologyCache = { nodes, count: nodes.length, at: now, topology, recipients: new WeakMap(), residency: new Map() };
 	return topology;
 }
+
+// a table gaining or losing residency changes the verdict, which the topology cache would otherwise keep for 5 s
+const clearResidencyVerdicts = () => topologyCache?.residency.clear();
+databaseEventsEmitter.on('updateTable', clearResidencyVerdicts);
+databaseEventsEmitter.on('dropTable', clearResidencyVerdicts);
+databaseEventsEmitter.on('dropDatabase', clearResidencyVerdicts);
 
 /** Relays forward residency partials as they hold them, so a database with residency keeps full mesh. */
 function databaseUsesResidency(databaseName: string): boolean {

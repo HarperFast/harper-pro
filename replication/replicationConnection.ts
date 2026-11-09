@@ -3401,8 +3401,8 @@ export function cursorBelowFloor(floor: number): number {
 /**
  * The cursor a region-topology supplier switch (harper-pro#1291) resumes a managed origin from on its new link: the
  * relieved supplier's own position for it, or a floor core certifies across routes, whichever is higher. A relieved
- * state that marks the origin revoked or holed, or names another generation than the certified floor, contributes
- * nothing. Undefined when neither source has one.
+ * state that marks the origin revoked, holed or partial, or names another generation than the certified floor,
+ * contributes nothing. Undefined when neither source has one.
  */
 export function borrowedOriginCursor(
 	relievedState: any,
@@ -3413,6 +3413,7 @@ export function borrowedOriginCursor(
 		relievedState &&
 		relievedState.floorRevoked !== true &&
 		relievedState.hole !== true &&
+		relievedState.partialHistory !== true &&
 		isValidFrameTxnLogKey(relievedState.originLogKey)
 	) {
 		const generation = relievedState.originGeneration ?? relievedState.lastGeneration;
@@ -10323,7 +10324,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// Copy bounds at the start check, for an aggregate range only: a later rise reconnects the peer.
 								let sessionCopyBounds: RelayCopyBounds | undefined;
 								let sessionCopyEpoch: number | undefined;
-								let copyCheckedKey: number | undefined;
 								const readSessionCopyBounds = (): RelayCopyBounds | undefined => {
 									const { dbisDB } = getDatabaseStores();
 									return dbisDB?.getRange ? readRelayCopyBounds(dbisDB, exportIdMapping(auditStore)) : undefined;
@@ -10336,9 +10336,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									(purgeBoundLogNames(auditStore, undefined, excludedNodes) ?? []).filter(isRelayedLog);
 								/**
 								 * Closes the session once a copy bound of a log it replays rises: the rows under it reached this
-								 * node without log entries. Checked at every transaction the scan reaches, so no later entry of
-								 * that origin goes out first (the bound commits before its rows apply); an unchanged epoch costs one
-								 * atomic load.
+								 * node without log entries. Checked before every record, since sending one awaits, so no later entry
+								 * of that origin goes out first (the bound commits before its rows apply); an unchanged epoch costs
+								 * one atomic load.
 								 */
 								const restartAfterCopyIntoThisNode = (): boolean => {
 									if (sessionCopyEpoch === undefined) return false;
@@ -10502,11 +10502,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												}
 											}
 											const ownStart = ownSubscription?.startTime;
+											// a log sent under another id replays from the merged start, as the purge check compares it
+											const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
 											const relayedBelowOwnStart =
 												Boolean(excludedNodes) &&
 												ownStart > 0 &&
 												replayedRelayedLogs().some((name) => {
-													const floor = originFloors?.get(name);
+													const floor = relabeled?.has(name) ? undefined : originFloors?.get(name);
 													return (floor === undefined ? mergedStart : floor + ORIGIN_CURSOR_OVERLAP_MS) < ownStart;
 												});
 											// The copy filters every row at or below the follower's start on this node, which holds only for a
@@ -11041,12 +11043,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 										for (const auditRecord of auditLogIterable) {
 											const key: number = auditRecord.txnLogKey;
-											if (closed || wsClosed) return;
-											// once per transaction: no entry of a transaction after a copy bound's commit goes unchecked
-											if (key !== copyCheckedKey) {
-												copyCheckedKey = key;
-												if (restartAfterCopyIntoThisNode()) return;
-											}
+											// per record: the send below awaits, and a bound can settle mid-transaction
+											if (closed || wsClosed || restartAfterCopyIntoThisNode()) return;
 											logger.debug?.('sending audit record', key, auditRecord.recordId);
 											if (tables?.test)
 												logger.debug?.(

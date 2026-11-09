@@ -1187,7 +1187,11 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 		const borrow: Record<string, string | null> = {};
 		for (const origin of managed) {
 			const { supplier, relieved } = assignments.get(origin)!;
-			if (supplier === undefined) continue;
+			if (supplier === undefined) {
+				// failing open re-admits the origin on every link, each resuming from where the last supplier left it
+				if (relieved) borrow[origin] = relieved;
+				continue;
+			}
 			if (supplier === name) borrow[origin] = relieved ?? null;
 			else excluded.push(origin);
 		}
@@ -2035,7 +2039,9 @@ export async function startOnMainThread(options) {
 			exclusionOrigins: computeExclusionOrigins(database),
 			topology: (() => {
 				const links = computeTopologyLinks(database);
-				return links ? { excluded: links.managed } : null;
+				if (!links) return null;
+				// a proxied socket carries only `node`'s own origin; a direct one (the restore path) is any other link
+				return connectingNode === node ? (links.byUrl[getNodeURL(node)] ?? null) : { excluded: links.managed };
 			})(),
 		};
 		if (dispatchSubscriptionRequest({ worker }, request, replicationPool, true, subscribeToNode) === 'deferred')
