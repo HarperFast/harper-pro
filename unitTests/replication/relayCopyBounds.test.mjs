@@ -5,6 +5,7 @@
 import assert from 'node:assert';
 import {
 	readRelayCopyBounds,
+	relayedHeldFrom,
 	relayedStartBelowCopyBound,
 	relayedCursorsForCopy,
 	copyBoundRoseForLogs,
@@ -43,6 +44,14 @@ describe('readRelayCopyBounds', () => {
 
 	it('throws on a malformed row rather than reading it as no bound', () => {
 		assert.throws(() => readRelayCopyBounds(rowsStore([[[COPY_BOUND, 6], { 2: 'x' }]]), ids));
+	});
+});
+
+describe('relayedHeldFrom', () => {
+	it('starts at the floor plus the overlap, at 0 for an origin held only by copy, else at the merged start', () => {
+		assert.strictEqual(relayedHeldFrom(T, true, T + 5), T + ORIGIN_CURSOR_OVERLAP_MS);
+		assert.strictEqual(relayedHeldFrom(undefined, true, T + 5), 0);
+		assert.strictEqual(relayedHeldFrom(undefined, false, T + 5), T + 5);
 	});
 });
 

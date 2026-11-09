@@ -29,6 +29,19 @@ describe('borrowedOriginCursor (harper-pro#1291 supplier switch)', () => {
 		assert.strictEqual(borrowedOriginCursor({ originLogKey: 12000, hole: true }, undefined), undefined);
 	});
 
+	it('decides by generation: equal borrows, different takes the floor, unknown still borrows', () => {
+		const qualified = { floor: 9000, generation: 'g1' };
+		assert.strictEqual(borrowedOriginCursor({ originLogKey: 12000, originGeneration: 'g1' }, qualified), 12000);
+		assert.strictEqual(
+			borrowedOriginCursor({ originLogKey: 12000, originGeneration: 'g0' }, qualified),
+			cursorBelowFloor(9000)
+		);
+		assert.strictEqual(borrowedOriginCursor({ originLogKey: 12000 }, qualified), 12000);
+		assert.strictEqual(borrowedOriginCursor({ originLogKey: 12000, lastGeneration: 'g1' }, qualified), 12000);
+		// no floor names the current generation, and nothing records where it began, so the position stands
+		assert.strictEqual(borrowedOriginCursor({ originLogKey: 12000, originGeneration: 'g0' }, undefined), 12000);
+	});
+
 	it('has no cursor with neither source', () => {
 		assert.strictEqual(borrowedOriginCursor(undefined, undefined), undefined);
 	});

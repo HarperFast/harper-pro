@@ -793,6 +793,14 @@ export function readRelayCopyBounds(dbisDB: DbisStore, idMapping: Record<string,
 }
 
 /**
+ * Where the follower holds a relayed origin, as a replay of it starts: its cursor's floor plus the overlap, else the
+ * merged start. An origin held here only by copy, with no log, was never streamed, so without a cursor it starts at 0.
+ */
+export function relayedHeldFrom(floor: number | undefined, heldOnlyByCopy: boolean, mergedStart: number): number {
+	return floor !== undefined ? floor + ORIGIN_CURSOR_OVERLAP_MS : heldOnlyByCopy ? 0 : mergedStart;
+}
+
+/**
  * The first relayed log the replay reads that holds rows a base copy wrote here without log entries, above where the
  * follower holds it (compared as `replayStartUnderPurge` does), or undefined. A replay of that log skips those rows.
  */
@@ -807,9 +815,7 @@ export function relayedStartBelowCopyBound(
 		if (log === 'local') continue;
 		const bound = settled.get(log);
 		if (bound === undefined) continue;
-		const floor = originFloors?.get(log);
-		// an origin held here only by copy, with no log, was never streamed: without a cursor the follower holds none of it
-		const logStart = floor !== undefined ? floor + ORIGIN_CURSOR_OVERLAP_MS : unlogged?.has(log) ? 0 : start;
+		const logStart = relayedHeldFrom(originFloors?.get(log), unlogged?.has(log) === true, start);
 		if (logStart < bound) return { log, start: logStart, bound };
 	}
 	return undefined;
@@ -10531,7 +10537,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												ownStart > 0 &&
 												withCopiedOrigins(replayedRelayedLogs(), sessionCopyBounds).some((name) => {
 													const floor = relabeled?.has(name) ? undefined : originFloors?.get(name);
-													return (floor === undefined ? mergedStart : floor + ORIGIN_CURSOR_OVERLAP_MS) < ownStart;
+													return relayedHeldFrom(floor, unlogged.has(name), mergedStart) < ownStart;
 												});
 											// The copy filters every row at or below the follower's start on this node, which holds only for a
 											// position taken from this copy (another subscription's start of 0 can have made it a copy already),
@@ -13077,7 +13083,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		for (const [name, relieved] of Object.entries(borrow)) {
 			const id = idOf(name);
 			if (id === undefined) continue;
-			qualified ??= readQualifiedOriginFloors(store, dbisDB);
+			qualified ??= readQualifiedOriginFloors(store, dbisDB).floors;
 			const relievedId = idOf(relieved);
 			const relievedNodes = relievedId === undefined ? undefined : seqRows.get(relievedId)?.nodes;
 			const relievedState = Array.isArray(relievedNodes) ? relievedNodes.find((node) => node?.id === id) : undefined;
