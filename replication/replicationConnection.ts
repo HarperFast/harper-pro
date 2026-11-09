@@ -10334,6 +10334,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									!nodeSubscriptions.some((node) => node.name === name);
 								const replayedRelayedLogs = () =>
 									(purgeBoundLogNames(auditStore, undefined, excludedNodes) ?? []).filter(isRelayedLog);
+								// an origin held only through a base copy has a bound but no log, so the logs alone never name it
+								const withCopiedOrigins = (logs: string[], bounds: RelayCopyBounds | undefined) => {
+									const names = new Set(logs);
+									for (const kind of ['settled', 'reserved'] as const) {
+										for (const name of bounds?.[kind].keys() ?? []) {
+											if (isRelayedLog(name) && !excludedNodes?.includes(name)) names.add(name);
+										}
+									}
+									return [...names];
+								};
 								/**
 								 * Closes the session once a copy bound of a log it replays rises: the rows under it reached this
 								 * node without log entries. Checked before every record, since sending one awaits, so no later entry
@@ -10350,7 +10360,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										const bounds = readSessionCopyBounds();
 										risen =
 											bounds && sessionCopyBounds
-												? copyBoundRoseForLogs(sessionCopyBounds, bounds, replayedRelayedLogs())
+												? copyBoundRoseForLogs(
+														sessionCopyBounds,
+														bounds,
+														withCopiedOrigins(replayedRelayedLogs(), bounds)
+													)
 												: undefined;
 									} catch (error) {
 										risen = 'an unreadable copy bound';
@@ -10446,7 +10460,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const copyGap =
 													excludedNodes && !shardingResumes && sessionCopyBounds
 														? relayedStartBelowCopyBound(
-																purgeScope.filter(isRelayedLog),
+																withCopiedOrigins(purgeScope.filter(isRelayedLog), sessionCopyBounds),
 																currentSequenceId,
 																comparedFloors,
 																sessionCopyBounds.settled
@@ -10507,7 +10521,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											const relayedBelowOwnStart =
 												Boolean(excludedNodes) &&
 												ownStart > 0 &&
-												replayedRelayedLogs().some((name) => {
+												withCopiedOrigins(replayedRelayedLogs(), sessionCopyBounds).some((name) => {
 													const floor = relabeled?.has(name) ? undefined : originFloors?.get(name);
 													return (floor === undefined ? mergedStart : floor + ORIGIN_CURSOR_OVERLAP_MS) < ownStart;
 												});
