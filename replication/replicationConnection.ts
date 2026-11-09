@@ -231,6 +231,7 @@ import {
 	probeNodeRow,
 	SEND_AUTH_UNCHANGED,
 	regionTopologyFor,
+	selfTopologyLabels,
 } from './knownNodes.ts';
 import { isGateway, validRegion } from './regionTopology.ts';
 import * as process from 'node:process';
@@ -349,7 +350,6 @@ export {
 	LAST_ERROR_TIME_POSITION,
 	FIRE_MECHANISMS,
 	FIRE_COUNTER_BASE_POSITION,
-	CAUGHT_UP_TIME_POSITION,
 };
 // Per-connection blob save failures before we log one escalation line (above the per-blob errors). A
 // handful of failures on one connection indicates a persistently failing link, not a one-off blip.
@@ -10323,6 +10323,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// Copy bounds at the start check, for an aggregate range only: a later rise reconnects the peer.
 								let sessionCopyBounds: RelayCopyBounds | undefined;
 								let sessionCopyEpoch: number | undefined;
+								let copyCheckedKey: number | undefined;
 								const readSessionCopyBounds = (): RelayCopyBounds | undefined => {
 									const { dbisDB } = getDatabaseStores();
 									return dbisDB?.getRange ? readRelayCopyBounds(dbisDB, exportIdMapping(auditStore)) : undefined;
@@ -10335,8 +10336,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									(purgeBoundLogNames(auditStore, undefined, excludedNodes) ?? []).filter(isRelayedLog);
 								/**
 								 * Closes the session once a copy bound of a log it replays rises: the rows under it reached this
-								 * node without log entries. Checked before every record, so no later entry of that origin goes
-								 * out first (the bound commits before its rows apply); an unchanged epoch costs one atomic load.
+								 * node without log entries. Checked at every transaction the scan reaches, so no later entry of
+								 * that origin goes out first (the bound commits before its rows apply); an unchanged epoch costs one
+								 * atomic load.
 								 */
 								const restartAfterCopyIntoThisNode = (): boolean => {
 									if (sessionCopyEpoch === undefined) return false;
@@ -10394,7 +10396,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											const otherGeneration =
 												ownSubscription !== undefined &&
 												floorFromAnotherGeneration(auditStore, ownSubscription.floorGeneration);
-											let relayedBelowOwnStart = false;
+											const mergedStart = currentSequenceId;
 											if (currentSequenceId > 0) {
 												const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 												let oldestRetainedTime: number | undefined;
@@ -10446,16 +10448,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																sessionCopyBounds.settled
 															)
 														: undefined;
-												const ownStart = ownSubscription?.startTime;
-												relayedBelowOwnStart =
-													Boolean(excludedNodes) &&
-													ownStart > 0 &&
-													purgeScope.filter(isRelayedLog).some((name) => {
-														const floor = comparedFloors?.get(name);
-														return (
-															(floor === undefined ? currentSequenceId : floor + ORIGIN_CURSOR_OVERLAP_MS) < ownStart
-														);
-													});
 												const retentionGap =
 													!shardingResumes &&
 													(copyGap !== undefined ||
@@ -10505,6 +10497,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													currentSequenceId = 0;
 												}
 											}
+											const ownStart = ownSubscription?.startTime;
+											const relayedBelowOwnStart =
+												Boolean(excludedNodes) &&
+												ownStart > 0 &&
+												replayedRelayedLogs().some((name) => {
+													const floor = originFloors?.get(name);
+													return (floor === undefined ? mergedStart : floor + ORIGIN_CURSOR_OVERLAP_MS) < ownStart;
+												});
 											// The copy filters every row at or below the follower's start on this node, which holds only for a
 											// position taken from this copy (another subscription's start of 0 can have made it a copy already),
 											// and only for origins the follower holds that far: one it relays from a lower cursor, carried from
@@ -11037,7 +11037,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 										for (const auditRecord of auditLogIterable) {
 											const key: number = auditRecord.txnLogKey;
-											if (closed || wsClosed || restartAfterCopyIntoThisNode()) return;
+											if (closed || wsClosed) return;
+											// once per transaction: no entry of a transaction after a copy bound's commit goes unchecked
+											if (key !== copyCheckedKey) {
+												copyCheckedKey = key;
+												if (restartAfterCopyIntoThisNode()) return;
+											}
 											logger.debug?.('sending audit record', key, auditRecord.recordId);
 											if (tables?.test)
 												logger.debug?.(
@@ -13758,7 +13763,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				(nodeName) => nodeName && !nodeSubscriptions.some((subscription) => nodeName === subscription.name)
 			);
 			lastSentTopologyExcluded = new Set(topologyExcluded.filter((nodeName) => excluded.includes(nodeName)));
-			if (lastSentTopologyExcluded.size) resetTopologyCertification(lastSentTopologyExcluded);
+			if (lastSentTopologyExcluded.size) {
+				resetTopologyCertification(lastSentTopologyExcluded);
+				flushRouteState();
+			}
 		}
 
 		if (nodeSubscriptions) {
@@ -13938,15 +13946,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * other sessions', possibly on other threads; sent on change.
 	 */
 	function startGatewayReachAnnouncements() {
-		if (gatewayReachTimer || !peerCapabilitiesLearned || !peerSupportsRegionTopology(peerCapabilities)) return;
+		// only a labeled node can be a gateway; unlabeled full-mesh clusters run no reach timer per session
+		if (
+			gatewayReachTimer ||
+			!peerCapabilitiesLearned ||
+			!peerSupportsRegionTopology(peerCapabilities) ||
+			selfTopologyLabels().region === null
+		)
+			return;
 		let lastSent: string | undefined;
 		const announce = () => {
 			try {
 				if (wsClosed) return stopGatewayReachAnnouncements();
 				const regions = gatewayReachFor(databaseName, remoteNodeName, auditStore);
-				if (regions === undefined || regions.join('\n') === lastSent) return;
-				lastSent = regions.join('\n');
+				const signature = regions?.join('\n');
+				if (signature === undefined || signature === lastSent) return;
 				ws.send(encode([GATEWAY_REACH, regions, databaseName]));
+				lastSent = signature;
 			} catch (error) {
 				logger.warn?.(connectionId, 'could not report gateway reach for', databaseName, error);
 			}

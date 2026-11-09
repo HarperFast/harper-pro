@@ -20,47 +20,45 @@ const peers = [
 
 describe('region topology state (harper-pro#1291)', function () {
 	this.timeout(10_000);
-	let priorNodes;
-	let priorRegion;
-	let priorGateway;
-	let rows;
-	let table;
-	let search;
-	let getSync;
+	let rows = [];
+	let stubbed;
+	let prior;
 	// Rows written to the real table would fire node events whose cluster state outlives them and stalls later
 	// suites' copies (residencyControls), so the table's two reads are stubbed instead.
 	before(() => {
-		table = getHDBNodeTable();
-		search = table.search;
-		getSync = table.primaryStore.getSync;
+		const table = getHDBNodeTable();
+		stubbed = { table, search: table.search, getSync: table.primaryStore.getSync };
 		table.search = () => rows;
 		table.primaryStore.getSync = function (key, ...rest) {
 			if (key === getThisNodeName()) return { name: key, replicates: true };
-			return rows.find((row) => row.name === key) ?? getSync.call(this, key, ...rest);
+			return rows.find((row) => row.name === key) ?? stubbed.getSync.call(this, key, ...rest);
 		};
 	});
 	after(() => {
-		table.search = search;
-		table.primaryStore.getSync = getSync;
+		if (!stubbed) return;
+		stubbed.table.search = stubbed.search;
+		stubbed.table.primaryStore.getSync = stubbed.getSync;
 	});
 	const putRows = async (added) => {
 		rows.push(...added);
 	};
-	afterEach(() => {
-		rows = [];
-	});
 	beforeEach(() => {
 		rows = [];
-		priorNodes = server.nodes;
-		priorRegion = env.get('replication_region');
-		priorGateway = env.get('replication_gateway');
+		prior = {
+			nodes: server.nodes,
+			region: env.get('replication_region'),
+			gateway: env.get('replication_gateway'),
+		};
 		env.setProperty('replication_region', 'east');
 		env.setProperty('replication_gateway', true);
 	});
 	afterEach(() => {
-		server.nodes = priorNodes;
-		env.setProperty('replication_region', priorRegion);
-		env.setProperty('replication_gateway', priorGateway);
+		rows = [];
+		if (!prior) return;
+		server.nodes = prior.nodes;
+		env.setProperty('replication_region', prior.region);
+		env.setProperty('replication_gateway', prior.gateway);
+		prior = undefined;
 	});
 
 	it('publishes the configured labels', () => {

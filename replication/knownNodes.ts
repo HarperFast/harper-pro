@@ -1008,7 +1008,14 @@ export function selfTopologyLabels(): { region: string | null; gateway: boolean 
 
 const TOPOLOGY_CACHE_MS = 5_000;
 let topologyCache:
-	| { nodes: unknown; count: number; at: number; topology: RegionTopology; recipients: WeakMap<object, any[]> }
+	| {
+			nodes: unknown;
+			count: number;
+			at: number;
+			topology: RegionTopology;
+			recipients: WeakMap<object, any[]>;
+			residency: Map<string, boolean>;
+	  }
 	| undefined;
 
 /**
@@ -1041,7 +1048,7 @@ export function currentRegionTopology(): RegionTopology {
 		(previous?.active !== topology.active || previous?.inactiveReason !== topology.inactiveReason)
 	)
 		logger.info?.(topology.active ? 'Region topology active' : `Region topology off: ${topology.inactiveReason}`);
-	topologyCache = { nodes, count: nodes.length, at: now, topology, recipients: new WeakMap() };
+	topologyCache = { nodes, count: nodes.length, at: now, topology, recipients: new WeakMap(), residency: new Map() };
 	return topology;
 }
 
@@ -1059,7 +1066,12 @@ function databaseUsesResidency(databaseName: string): boolean {
 /** The topology governing `databaseName` here, or undefined when it replicates as a full mesh. */
 export function regionTopologyFor(databaseName: string): RegionTopology | undefined {
 	const topology = currentRegionTopology();
-	return topology.active && !databaseUsesResidency(databaseName) ? topology : undefined;
+	if (!topology.active) return undefined;
+	// cached with the topology: confirmed writes and every sending session's reach tick ask, and the walk covers every table
+	const residency = topologyCache!.residency;
+	let usesResidency = residency.get(databaseName);
+	if (usesResidency === undefined) residency.set(databaseName, (usesResidency = databaseUsesResidency(databaseName)));
+	return usesResidency ? undefined : topology;
 }
 
 /** Peers whose own link rule subscribes them to this node: only they acknowledge its writes. */
@@ -1110,7 +1122,10 @@ function assertConfirmationFeasible(databaseName: string, confirmationCount: num
 	if (confirmationCount > recipients.length) {
 		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
 		throw new ClientError(
-			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
+			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})` +
+				(regionTopologyFor(databaseName)
+					? '; under region topology only the nodes that subscribe to this node confirm its writes'
+					: '')
 		);
 	}
 	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);

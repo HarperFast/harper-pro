@@ -1104,6 +1104,9 @@ function scheduleTopologyRecheck(at: number) {
  * failure would move the origin straight back. The hold ends when the new session reports reach, or at its deadline,
  * and it keeps only the origins already assigned to that link: a pinned link that is down must not draw others.
  */
+const speaksRegionTopology = (entry: any): boolean =>
+	!!entry.peerCapabilities && peerSupportsRegionTopology(entry.peerCapabilities);
+
 function topologySupplierState(database: string, now: number, current: string | undefined): SupplierState {
 	const pinned = (name: string, entry: any) => name === current && entry?.topologyPinnedUntil > now;
 	return {
@@ -1111,7 +1114,7 @@ function topologySupplierState(database: string, now: number, current: string | 
 			const entry = topologyEntry(name, database);
 			if (!entry) return false;
 			if (pinned(name, entry)) return true;
-			return entry.connected === true && !!entry.peerCapabilities && peerSupportsRegionTopology(entry.peerCapabilities);
+			return entry.connected === true && speaksRegionTopology(entry);
 		},
 		liveSince: (name) => topologyEntry(name, database)?.liveSince ?? now,
 		reaches(name, region) {
@@ -1154,7 +1157,8 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 		);
 		if (next.supplier === previous?.supplier) next.relieved = previous?.relieved;
 		else {
-			next.relieved = previous?.supplier ?? null;
+			// a move through failing open still borrows from the last real supplier
+			next.relieved = previous?.supplier ?? previous?.relieved ?? null;
 			// only a move off another supplier reconnects the new link (the origin was excluded there); a first
 			// assignment, or one out of failing open, finds the origin already admitted and no reconnect to cover
 			const entry =
@@ -1217,7 +1221,8 @@ function acceptGatewayReach(entry: any, connection: any): boolean {
 	const now = Date.now();
 	const reachSince = new Map<string, number>();
 	for (const reached of regions) reachSince.set(reached, entry.reachSince?.get(reached) ?? now);
-	const changed = regions.join('\n') !== (entry.peerReach ?? []).join('\n');
+	// a session's first report is a change even when empty: it ends the pin on the reconnect that awaited it
+	const changed = entry.peerReach === undefined || regions.join('\n') !== entry.peerReach.join('\n');
 	entry.peerReach = regions;
 	entry.reachSince = reachSince;
 	return changed;
@@ -1482,10 +1487,11 @@ export async function startOnMainThread(options) {
 			try {
 				const signature = topologySignature(currentRegionTopology());
 				if (signature === appliedTopology) return;
-				appliedTopology = signature;
 				for (const row of getHDBNodeTable().search([])) {
 					if (row?.name) onNodeUpdate(row, row.name);
 				}
+				// only once every row is applied, so a throw part way leaves the next review to finish it
+				appliedTopology = signature;
 			} catch (error) {
 				logger.error('Error applying a region topology change', error);
 			}
@@ -1967,11 +1973,15 @@ export async function startOnMainThread(options) {
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
 		if (canClearCapabilitiesForNewSocket(mainWorkerEntry, connection)) mainWorkerEntry.peerCapabilities = undefined;
+		const couldSupply = speaksRegionTopology(mainWorkerEntry);
 		const metadataApplied = applyConnectionMetadata(mainWorkerEntry, connection);
 		const reachChanged =
 			metadataApplied && Array.isArray(connection.gatewayReach) && acceptGatewayReach(mainWorkerEntry, connection);
 		if (reachChanged) mainWorkerEntry.topologyPinnedUntil = undefined;
-		if ((!wasConnected || reachChanged) && regionTopologyFor(connection.database)) scheduleExclusionOriginsBroadcast();
+		// capabilities usually arrive after the connect report, and until then the peer cannot be a supplier
+		const canSupplyChanged = couldSupply !== speaksRegionTopology(mainWorkerEntry);
+		if ((!wasConnected || reachChanged || canSupplyChanged) && regionTopologyFor(connection.database))
+			scheduleExclusionOriginsBroadcast();
 		const restoredNode = mainWorkerEntry.nodes[0];
 		if (!restoredNode) {
 			logger.warn('Newly connected node has no node subscriptions', connection.database, mainWorkerEntry);
