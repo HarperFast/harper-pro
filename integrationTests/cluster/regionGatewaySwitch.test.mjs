@@ -6,8 +6,8 @@
  *   every region write without pause. While each gateway is down every live node must catch up with every writer, so
  *   its region has moved to the standby. At the end every node holds exactly the rows written, and each writer's
  *   counter, raised by one `add` per row, equals its row count: a frame applied twice would show there.
- * - A leaf's frames from its preferred gateway are held back (a delay on that link only) until its cursors for the
- *   remote origins it takes through that gateway are older than the 60 s per-origin overlap. Both east gateways then
+ * - A leaf's link to its preferred gateway is slowed until its cursors for the remote origins it takes through that
+ *   gateway are older than the 60 s per-origin overlap, while frames keep arriving. Both east gateways then
  *   purge their transaction logs to a bound past those cursors and the preferred gateway is killed, dropping the held
  *   frames. The standby must force a base copy (the purge-recovery path) rather than replay from history it no longer
  *   accounts for, and the leaf must end with every row.
@@ -39,9 +39,12 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 const OPTIONS = { replicationLogLevel: 'info' };
 const WRITE_INTERVAL_MS = 200;
 const KILL_ORDER = ['east', 'west', 'eu', 'east'];
-// the leaf's held-back cursors must fall more than the 60 s overlap, plus the margin below the bound, behind
-const LAG_MS = 90_000;
-const HOLD_MS = 150_000;
+// The leaf's link to its gateway is slowed a little more each second (latency RAMP × elapsed), so frames keep
+// arriving and the link stays live, yet after LAG_MS the leaf holds the gateway's frames from (1 - 1 / (1 + RAMP)) ×
+// LAG_MS ago: 90 s, more than the 60 s per-origin overlap plus the margin below the purge bound. A flat delay over
+// 60 s would leave the link silent long enough for the leaf to mark it down and switch before the purge.
+const RAMP = 3;
+const LAG_MS = 120_000;
 const PURGE_MARGIN_MS = 10_000;
 const FORCED_COPY = /Peer (\S+) requested replication of database data\b[^\n]*forcing a bounded base-copy resync/g;
 
@@ -228,7 +231,15 @@ suite('Region gateway switches under load', { timeout: 1_800_000 }, (ctx) => {
 		await waitForSuppliers(nodes(), layout.steadySuppliers(), 'settled suppliers');
 		// the standby's own rows keep the leaf's position on its link to the standby current
 		const writes = await startWriters(nodes(), [writer, standby], 'held');
-		await writeFile(latencyFile(workDir, leaf.hostname), JSON.stringify({ [primary.hostname]: HOLD_MS }));
+		const slowedAt = Date.now();
+		const slow = setInterval(
+			() =>
+				writeFile(
+					latencyFile(workDir, leaf.hostname),
+					JSON.stringify({ [primary.hostname]: (Date.now() - slowedAt) * RAMP })
+				).catch(() => {}),
+			1000
+		);
 		let killed = false;
 		try {
 			await delay(LAG_MS);
@@ -260,6 +271,7 @@ suite('Region gateway switches under load', { timeout: 1_800_000 }, (ctx) => {
 				`${standby.hostname} forced no base copy for ${leaf.hostname}: ${JSON.stringify(forced.map(([line]) => line))}`
 			);
 		} finally {
+			clearInterval(slow);
 			await writeFile(latencyFile(workDir, leaf.hostname), '{}');
 			await writes.stop();
 			if (killed) await restart(context);

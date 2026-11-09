@@ -1155,17 +1155,23 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 		if (next.supplier === previous?.supplier) next.relieved = previous?.relieved;
 		else {
 			next.relieved = previous?.supplier ?? null;
-			const entry = next.supplier === undefined ? undefined : topologyEntry(next.supplier, database);
-			if (entry) {
-				entry.topologyPinnedUntil = now + TOPOLOGY_PIN_MS;
-				scheduleTopologyRecheck(entry.topologyPinnedUntil);
-			}
+			// only a move off another supplier reconnects the new link (the origin was excluded there); a first
+			// assignment, or one out of failing open, finds the origin already admitted and no reconnect to cover
+			const entry =
+				next.supplier === undefined || previous?.supplier === undefined
+					? undefined
+					: topologyEntry(next.supplier, database);
+			if (entry) entry.topologyPinnedUntil = now + TOPOLOGY_PIN_MS;
 			logger.info(
 				`Region topology: ${database} takes ${origin} from ${next.supplier ?? 'any peer'}` +
 					(previous?.supplier ? ` instead of ${previous.supplier}` : '')
 			);
 		}
 		if (next.recheckAt !== undefined) scheduleTopologyRecheck(next.recheckAt);
+		// requested on every pass: the timer keeps only the earliest time, so a pin's expiry asked for once is lost
+		const pinnedUntil =
+			next.supplier === undefined ? undefined : topologyEntry(next.supplier, database)?.topologyPinnedUntil;
+		if (pinnedUntil > now) scheduleTopologyRecheck(pinnedUntil);
 		assignments.set(origin, next);
 	}
 	for (const origin of assignments.keys()) if (!managed.includes(origin)) assignments.delete(origin);

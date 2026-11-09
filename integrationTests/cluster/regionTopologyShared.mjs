@@ -21,11 +21,11 @@ const SEND_LINE = /sending replication update (\S+) to: (\S+)/g;
 export const partitionFile = (workDir, hostname) => join(workDir, `partition-${hostname}`);
 export const latencyFile = (workDir, hostname) => join(workDir, `latency-${hostname}`);
 
-export function nodeOptions(hostname, region, workDir, { replicationLogLevel = 'trace', env } = {}) {
+export function nodeOptions(hostname, region, workDir, { logLevel = 'warn', replicationLogLevel = 'trace', env } = {}) {
 	return {
 		config: {
 			analytics: { aggregatePeriod: -1 },
-			logging: { colors: false, console: true, stdStreams: false, level: 'warn' },
+			logging: { colors: false, console: true, stdStreams: false, level: logLevel },
 			replication: {
 				securePort: hostname + ':9933',
 				...(region && { region }),
