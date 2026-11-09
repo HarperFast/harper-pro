@@ -11113,6 +11113,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											continue;
 										}
 										if (frame.position - frame.encodingStart > 8) {
+											// the last record's send awaited: a bound settled since must not see this transaction's cursor out
+											if (restartAfterCopyIntoThisNode()) return;
 											sendAuditRecord(
 												{
 													type: 'end_txn',
