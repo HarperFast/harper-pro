@@ -1,7 +1,10 @@
 /**
- * Test-only: parks a receiver's COPY_START before its record-lock reclone check, the way the deploy tests
- * park an install command, so state a test creates during the hold is in place before that check runs.
- * No deadline: a check that ran on a timeout would let the test pass without the ordering it exists to prove.
+ * Test-only holds on a receiver's copy pass:
+ * - COPY_START is parked before its record-lock reclone check, the way the deploy tests park an install command, so
+ *   state a test creates during the hold is in place before that check runs. No deadline: a check that ran on a
+ *   timeout would let the test pass without the ordering it exists to prove.
+ * - The pass's copy-bound settle reports not done, so it retries as after a failed write, leaving the pass open while
+ *   the source's log tail applies.
  */
 import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -26,4 +29,22 @@ export async function holdCopyStartForTest(superseded: () => boolean): Promise<v
 	writeFileSync(join(HOLD_DIRECTORY!, 'held'), String(Date.now()));
 	logger.warn?.(`[test] holding COPY_START for db "${copyStartHoldDatabaseForTest}" until ${release} exists`);
 	while (!existsSync(release) && !superseded()) await delay(50);
+}
+
+const SETTLE_HOLD_DIRECTORY = process.env.HARPER_TEST_HOLD_COPY_SETTLE_DIR;
+const SETTLE_HOLD_PEER = process.env.HARPER_TEST_HOLD_COPY_SETTLE_PEER;
+
+/** True while `<dir>/release` is absent, for a pass of the named database from the named peer (any, when unset). */
+export function copySettleHeldForTest(databaseName: string, peer: string): boolean {
+	if (!SETTLE_HOLD_DIRECTORY || process.env.HARPER_TEST_HOLD_COPY_SETTLE_DB !== databaseName) return false;
+	if ((SETTLE_HOLD_PEER && SETTLE_HOLD_PEER !== peer) || existsSync(join(SETTLE_HOLD_DIRECTORY, 'release')))
+		return false;
+	const held = join(SETTLE_HOLD_DIRECTORY, 'held');
+	if (!existsSync(held)) {
+		writeFileSync(held, String(Date.now()));
+		logger.warn?.(
+			`[test] holding the copy settle for db "${databaseName}" until ${SETTLE_HOLD_DIRECTORY}/release exists`
+		);
+	}
+	return true;
 }

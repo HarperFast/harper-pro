@@ -214,6 +214,7 @@ import {
 	copyStartHoldDatabaseForTest,
 	holdCopyStartForTest,
 	holdsCopyStartFromPeerForTest,
+	copySettleHeldForTest,
 } from './copyStartHoldForTest.ts';
 import { EventEmitter } from 'events';
 import { createTLSSelector } from '../core/security/keys.js';
@@ -234,6 +235,12 @@ import {
 	selfTopologyLabels,
 } from './knownNodes.ts';
 import { isGateway, validRegion } from './regionTopology.ts';
+import {
+	holdRelayCopyLease,
+	relayCopyLeaseHeld,
+	RELAY_COPY_SETTLE_DEADLINE_MS,
+	type RelayCopyLease,
+} from './relayCopyLease.ts';
 import * as process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isIP, type Socket } from 'node:net';
@@ -324,6 +331,8 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 const CAUGHT_UP = 151;
 const GATEWAY_REACH = 152;
 const GATEWAY_REACH_INTERVAL_MS = 1000;
+// how soon a session withheld by a relay copy lease notices its release
+const RELAY_LEASE_POLL_MS = 1000;
 const MAX_REACH_REGIONS = 64;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
@@ -798,6 +807,20 @@ export function readRelayCopyBounds(dbisDB: DbisStore, idMapping: Record<string,
  */
 export function relayedHeldFrom(floor: number | undefined, heldOnlyByCopy: boolean, mergedStart: number): number {
 	return floor !== undefined ? floor + ORIGIN_CURSOR_OVERLAP_MS : heldOnlyByCopy ? 0 : mergedStart;
+}
+
+/**
+ * What a session withheld by a relay copy lease (harper-pro#1299) does with a record: send this node's own; skip one of
+ * an origin whose start the follower holds itself, which nothing the session sends can move; park on any other, since
+ * the follower resumes such an origin from the merged start, which the session's own records advance.
+ */
+export function withheldRecordAction(
+	origin: string | undefined,
+	thisNodeName: string,
+	heldStarts: ReadonlySet<string>
+): 'send' | 'skip' | 'park' {
+	if (origin === undefined || origin === thisNodeName) return 'send';
+	return heldStarts.has(origin) ? 'skip' : 'park';
 }
 
 /**
@@ -4422,6 +4445,7 @@ export function settleCopyBounds(
 /**
  * The regions this gateway holds a caught-up link to for `databaseName` (harper-pro#1291), or undefined when it reports
  * nothing to `subscriber`: the topology is off, this node is not a gateway, or the subscriber is in another region.
+ * None while it applies an inbound base copy, when it relays nothing (harper-pro#1299).
  */
 export function gatewayReachFor(databaseName: string, subscriber: string, auditStore: any): string[] | undefined {
 	const topology = regionTopologyFor(databaseName);
@@ -4430,6 +4454,7 @@ export function gatewayReachFor(databaseName: string, subscriber: string, auditS
 	const region = topology.regionOf.get(selfName);
 	if (topology.regionOf.get(subscriber) !== region) return;
 	const regions: string[] = [];
+	if (relayCopyLeaseHeld(auditStore, databaseName)) return regions;
 	for (const [otherRegion, gateways] of topology.gatewaysByRegion) {
 		if (otherRegion === region) continue;
 		for (const gateway of gateways) {
@@ -6052,6 +6077,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			drainCopyOriginAnchors();
 			const copyNodeId = copyFromNodeId;
 			inCopyMode = false;
+			relayCopyLease?.armSettleDeadline(() => {
+				relayCopyLease = undefined;
+				logger.warn?.(
+					connectionId,
+					`The base copy of ${databaseName} from ${remoteNodeName} has not settled its copy bounds ${RELAY_COPY_SETTLE_DEADLINE_MS / 1000} s after it finished; relaying resumes without waiting for it`
+				);
+			});
 			copyWasResumed = false;
 			copyResumedWithWidening = false;
 			if (hadCopyOriginAnchors || pendingRouteState.size > 0 || copyPassPendingRestore) {
@@ -7601,6 +7633,30 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let lastCopyBoundLoadEpoch = -1;
 	let copyBoundPersist: Promise<boolean> | undefined;
 	let lastCopyBoundWarnAt = 0;
+	let relayCopyLease: RelayCopyLease | undefined;
+	/** Senders withhold this database's relayed origins from the pass's start until it settles (harper-pro#1299). */
+	/** False when no slot could be claimed: the pass must not apply rows senders would relay across. */
+	function holdRelayLeaseForPass(): boolean {
+		if (relayCopyLease) {
+			relayCopyLease.disarmSettleDeadline();
+			return true;
+		}
+		try {
+			relayCopyLease = holdRelayCopyLease(
+				auditStore ?? getDatabaseStores().auditStore,
+				databaseName,
+				() => !connectionSuperseded() && !wsClosed
+			);
+		} catch (error) {
+			logger.warn?.(connectionId, 'could not claim a relay copy lease for', databaseName, error);
+		}
+		return relayCopyLease !== undefined;
+	}
+	function releaseRelayLease(): void {
+		relayCopyLease?.release();
+		relayCopyLease = undefined;
+	}
+	ws.once('close', releaseRelayLease);
 	function loadPersistedCopyBounds(cursor?: DbisCursor): void {
 		if (!supportsCheckpointFloors()) return;
 		const { dbisDB } = getDatabaseStores();
@@ -7718,6 +7774,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// a pass this socket has since replaced, or a closed socket, settles nothing under the old token
 		if (pass !== copyPassToken || passState !== currentCopyPass || connectionSuperseded() || wsClosed) return false;
 		if (!supportsCheckpointFloors() || !copyApplyActive()) return true;
+		if (copySettleHeldForTest(databaseName, remoteNodeName)) return false;
 		try {
 			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? dbAuditStore;
@@ -7734,6 +7791,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const rootStore = store?.rootStore ?? (dbisDB as any)?.rootStore;
 			await settleCopyBounds(dbisDB, copiedVersionByOrigin, peerId, rootStore, pass, filled, passState?.startTime ?? 0);
 			settledPass = pass;
+			logger.debug?.(connectionId, 'settled copy bounds for', databaseName, Object.fromEntries(copiedVersionByOrigin));
 			// the bounds that keep earlier starts void are committed above, so another peer's row can go now; a release
 			// that fails leaves its hole, which still refuses
 			const elsewhere = new Map<number, (string | number)[][]>();
@@ -7750,6 +7808,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				committedCopyBounds.clear();
 				lastCopyBoundLoadEpoch = -1;
 				loadPersistedCopyBounds();
+				releaseRelayLease();
 			}
 			return !connectionSuperseded() && !wsClosed;
 		} catch (error) {
@@ -8823,7 +8882,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 						}
 						loadPersistedCopyBounds();
-						if (copyApplyActive() && supportsCheckpointFloors()) reserveCopyStartBounds(copyModeStartTime);
+						if (copyApplyActive() && supportsCheckpointFloors()) {
+							// before the reservation, whose commit each relaying session checks before its next send
+							if (!holdRelayLeaseForPass()) {
+								close(1011, 'Every relay copy lease for this database is held; retrying the copy');
+								return;
+							}
+							reserveCopyStartBounds(copyModeStartTime);
+						}
 						if (
 							copyStartHoldDatabaseForTest &&
 							copyStartHoldDatabaseForTest === databaseName &&
@@ -9384,6 +9450,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let skippedMessageSequenceUpdateTimer: ReturnType<typeof setTimeout> | undefined;
 						// set by the send loop: every frame that advances the follower's cursor runs it first
 						let restartAfterCopy: (() => boolean) | undefined;
+						// set while this node holds a relay copy lease for the database: the origins whose start the follower holds
+						let relayWithheld: { heldStarts: Set<string>; skipped: boolean; parked: boolean } | undefined;
 						let copying = false;
 						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
 						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
@@ -9806,7 +9874,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!skippedMessageSequenceUpdateTimer) {
 									skippedMessageSequenceUpdateTimer = setTimeout(() => {
 										skippedMessageSequenceUpdateTimer = undefined;
-										if (closed || wsClosed || copying || currentTransaction.txnLogKey || restartAfterCopy?.()) return;
+										if (
+											closed ||
+											wsClosed ||
+											copying ||
+											currentTransaction.txnLogKey ||
+											relayWithheld?.parked ||
+											restartAfterCopy?.()
+										)
+											return;
 										// check to see if we are too far behind, but if so, send a sequence update
 										if ((sentSequenceId || 0) + SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY / 2 < currentSequenceId) {
 											if (DEBUG_MODE)
@@ -9985,6 +10061,33 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							subscriptionToHdbNodes?.end();
 							wakeSender?.(); // an idle sender settles now rather than at the next transaction
 						});
+						/** Withholds relayed origins until this node's inbound base copy settles (harper-pro#1299). */
+						const withholdRelayedOrigins = () => {
+							const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
+							const heldStarts = new Set<string>(nodeSubscriptions.map(({ name }) => name));
+							for (const name of originFloors?.keys() ?? []) if (!relabeled?.has(name)) heldStarts.add(name);
+							relayWithheld = { heldStarts, skipped: false, parked: false };
+							logger.info?.(
+								connectionId,
+								`Withholding relayed origins of ${databaseName} from ${remoteNodeName} while this node applies a base copy`
+							);
+							const timer = setInterval(() => {
+								if (closed || wsClosed) return clearInterval(timer);
+								if (relayCopyLeaseHeld(auditStore, databaseName)) return;
+								clearInterval(timer);
+								const withheld = relayWithheld;
+								relayWithheld = undefined;
+								if (!withheld?.skipped && !withheld?.parked) return wakeSender?.();
+								logger.info?.(
+									connectionId,
+									`The base copy into this node settled; closing so ${remoteNodeName} reconnects and resumes the origins withheld from it`
+								);
+								wsClosed = true;
+								close(1011, 'Replication resumes after a base copy into this node');
+							}, RELAY_LEASE_POLL_MS);
+							timer.unref?.();
+							ws.once('close', () => clearInterval(timer));
+						};
 						updateSendingSubscription = (data) => {
 							// Handle dynamic updates to subscription exclusion list
 							const nodesToExclude = data?.excludeNodes || [];
@@ -10056,6 +10159,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									logger.debug?.(connectionId, 'added log to iterator:', nodeName);
 								}
 							}
+							if (nodesToInclude.length && !relayWithheld && relayCopyLeaseHeld(auditStore, databaseName))
+								withholdRelayedOrigins();
 							if (includeCursors?.size) {
 								let advancedBareOrigin = false;
 								for (const [nodeName, requestedCursor] of includeCursors) {
@@ -10234,7 +10339,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											);
 										}
 										// only a multi-log range sends unlisted origins, and only per-origin logs have names
-										if (excludedNodes && auditStore.reusableIterable === true) {
+										if (excludedNodes && auditStore.reusableIterable === true && !relayWithheld) {
 											const listed = new Set(nodeSubscriptions.map(({ name }) => name));
 											const names: string[] = [];
 											for (const log of auditStore.loadLogs()) {
@@ -10366,9 +10471,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								 * one atomic load.
 								 */
 								const restartAfterCopyIntoThisNode = (): boolean => {
-									if (sessionCopyEpoch === undefined) return false;
+									// a withheld session sends no relayed origin; once released it compares with its admission bounds
+									if (sessionCopyEpoch === undefined || relayWithheld) return false;
 									const epoch = readOriginStateEpoch(auditStore.rootStore);
 									if (epoch === sessionCopyEpoch) return false;
+									// a pass claims its lease before its reservation commits, and applies no row before that
+									if (relayCopyLeaseHeld(auditStore, databaseName)) {
+										withholdRelayedOrigins();
+										return false;
+									}
 									sessionCopyEpoch = epoch;
 									let risen: string | undefined;
 									try {
@@ -10418,6 +10529,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													close(1011, 'Replication could not read the copy bounds');
 													return;
 												}
+												if (relayCopyLeaseHeld(auditStore, databaseName)) withholdRelayedOrigins();
 											}
 											// If the requested incremental start predates the transaction-log history we still
 											// retain, the entries needed to catch up incrementally have been purged (retention is
@@ -10547,6 +10659,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const ownId = getThisNodeId(auditStore);
 												const own = subscribedNodeIds[ownId];
 												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
+											}
+											// a copy served now would carry the inbound pass's partial rows and hand out cursors past them
+											if (currentSequenceId === 0 && relayWithheld) {
+												relayWithheld.parked = true;
+												logger.info?.(
+													connectionId,
+													`Deferring the base copy for ${remoteNodeName} until this node's own base copy of ${databaseName} settles`
+												);
+												return;
 											}
 											// a projection goes only to a receiver that asked for it, so it is accepted too
 											if (currentSequenceId > 0 || sendingProjection) subscriptionResidencySender?.replaying();
@@ -11073,6 +11194,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											const key: number = auditRecord.txnLogKey;
 											// per record: the send below awaits, and a bound can settle mid-transaction
 											if (closed || wsClosed || restartAfterCopyIntoThisNode()) return;
+											if (relayWithheld) {
+												// a cache miss on a just-minted origin must not read as this node's own
+												const action = withheldRecordAction(
+													getNodeNameForId(auditStore, auditRecord.nodeId, true),
+													getThisNodeName(),
+													relayWithheld.heldStarts
+												);
+												if (action === 'skip') {
+													relayWithheld.skipped = true;
+													await yieldSendLoop();
+													continue;
+												}
+												if (action === 'park') {
+													relayWithheld.parked = true;
+													break;
+												}
+											}
 											logger.debug?.('sending audit record', key, auditRecord.recordId);
 											if (tables?.test)
 												logger.debug?.(
@@ -11136,6 +11274,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												currentSequenceId
 											);
 										}
+										// sends nothing more: the lease's release closes the session
+										if (relayWithheld?.parked) return;
 										// Core latches a log's iterator done at a corrupt frame, and a reusable range is kept for the
 										// session, so that log sends nothing more on this connection. Recover by reconnecting: the
 										// peer's durable and per-origin cursors position the next range, which a sender-side reseed
@@ -11213,7 +11353,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 										getSharedStatus()[SENDING_TIME_POSITION] = 0;
 										if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
-										if (!caughtUpSent && !supersededOrClosed() && peerSupportsRegionTopology(peerCapabilities)) {
+										// a withheld session is not caught up on the origins it holds back
+										if (
+											!caughtUpSent &&
+											!relayWithheld &&
+											!supersededOrClosed() &&
+											peerSupportsRegionTopology(peerCapabilities)
+										) {
 											caughtUpSent = true;
 											ws.send(encode([CAUGHT_UP, databaseName]));
 										}

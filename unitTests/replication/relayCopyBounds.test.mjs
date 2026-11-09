@@ -9,6 +9,7 @@ import {
 	relayedStartBelowCopyBound,
 	relayedCursorsForCopy,
 	copyBoundRoseForLogs,
+	withheldRecordAction,
 	ORIGIN_CURSOR_OVERLAP_MS,
 } from '#src/replication/replicationConnection';
 
@@ -52,6 +53,18 @@ describe('relayedHeldFrom', () => {
 		assert.strictEqual(relayedHeldFrom(T, true, T + 5), T + ORIGIN_CURSOR_OVERLAP_MS);
 		assert.strictEqual(relayedHeldFrom(undefined, true, T + 5), 0);
 		assert.strictEqual(relayedHeldFrom(undefined, false, T + 5), T + 5);
+	});
+});
+
+describe('withheldRecordAction', () => {
+	const held = new Set(['relayed']);
+	it("sends this node's own records, including an origin id with no name", () => {
+		assert.strictEqual(withheldRecordAction('self', 'self', held), 'send');
+		assert.strictEqual(withheldRecordAction(undefined, 'self', held), 'send');
+	});
+	it('skips an origin whose start the follower holds and parks on any other', () => {
+		assert.strictEqual(withheldRecordAction('relayed', 'self', held), 'skip');
+		assert.strictEqual(withheldRecordAction('other', 'self', held), 'park');
 	});
 });
 

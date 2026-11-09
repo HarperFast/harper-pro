@@ -11,10 +11,18 @@
  *   purge their transaction logs to a bound past those cursors and the preferred gateway is killed, dropping the held
  *   frames. The standby must force a base copy (the purge-recovery path) rather than replay from history it no longer
  *   accounts for, and the leaf must end with every row.
+ * - A gateway whose own catch-up base copy is still open must relay nothing to a follower it admits meanwhile
+ *   (harper-pro#1299). East's preferred gateway and the west gateway that takes east's leaf through it are stopped
+ *   while the leaf writes; the leaf's log is purged, so the restarted gateway catches up by a base copy, whose settle
+ *   the test holds while the leaf keeps writing. The west gateway, able to reach only that gateway, is restarted into
+ *   the open pass, and must end with every row the copy applied as well as the later ones.
+ * - The same gateway killed while its pass is held at COPY_START, then restarted, settles a new pass and relays again:
+ *   the lease lives in process memory, and an interrupted pass leaves nothing that withholds relaying.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -22,6 +30,9 @@ import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integr
 import { sendOperation, waitForCondition, stopAndTeardownNodes, logMark, readLogSince } from './clusterShared.mjs';
 import {
 	TABLE,
+	insert,
+	dataLinks,
+	partitionFile,
 	latencyFile,
 	nodeOptions,
 	startNode,
@@ -47,6 +58,7 @@ const RAMP = 3;
 const LAG_MS = 120_000;
 const PURGE_MARGIN_MS = 10_000;
 const FORCED_COPY = /Peer (\S+) requested replication of database data\b[^\n]*forcing a bounded base-copy resync/g;
+const COPIED_ROWS = 40;
 
 const rowId = (phase, writer, seq) => `${phase}-${writer}-${seq}`;
 const counterId = (phase, writer) => `${phase}-counter-${writer}`;
@@ -134,6 +146,33 @@ async function waitForRows(nodes, writes, due, description) {
 	);
 }
 
+/** One row every WRITE_INTERVAL_MS from `node` until stopped; `acked` counts the rows it acknowledged. */
+function startRowWriter(node, phase) {
+	let stopped = false;
+	let acked = 0;
+	let failure;
+	const loop = (async () => {
+		for (let seq = 0; !stopped; seq++) {
+			await sendOperation(node, {
+				operation: 'insert',
+				database: 'data',
+				table: TABLE,
+				records: [{ id: `${phase}-${seq}`, phase, origin: node.hostname }],
+			});
+			acked = seq + 1;
+			await delay(WRITE_INTERVAL_MS);
+		}
+	})().catch((error) => (failure = error));
+	return {
+		async stop() {
+			stopped = true;
+			await loop;
+			if (failure) throw failure;
+			return acked;
+		},
+	};
+}
+
 /** After `writes` stopped: every node holds exactly the acknowledged rows, and each counter equals its writer's rows. */
 async function assertExactlyWritten(nodes, writes) {
 	await waitForRows(nodes, writes, writes.acked, `every node holds every ${writes.phase} row`);
@@ -158,17 +197,68 @@ async function assertExactlyWritten(nodes, writes) {
 	}
 }
 
-suite('Region gateway switches under load', { timeout: 1_800_000 }, (ctx) => {
+suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 	let workDir;
 	const contexts = [];
 	const nodes = () => contexts.map((context) => context.harper);
 	let layout;
 	const contextOf = (node) => contexts.find((context) => context.harper === node);
-	const restart = (context) =>
+	const restart = (context, env) =>
 		startHarper(
 			context,
-			nodeOptions(context.harper.hostname, layout.region.get(context.harper.hostname), workDir, OPTIONS)
+			nodeOptions(context.harper.hostname, layout.region.get(context.harper.hostname), workDir, { ...OPTIONS, env })
 		);
+	/** `node` receives replication data from `reachable` alone. */
+	const cutOffAllBut = (node, reachable) =>
+		writeFile(
+			partitionFile(workDir, node.hostname),
+			JSON.stringify(
+				nodes()
+					.map(({ hostname }) => hostname)
+					.filter((name) => name !== node.hostname && name !== reachable.hostname)
+			)
+		);
+	/**
+	 * East's preferred gateway and west's, which can reach only it, are stopped while east's leaf writes `phase`; the
+	 * leaf's log is then purged past the gateway's cursor. The gateway, which can then reach only the leaf, catches up by
+	 * a base copy from it: no other peer's log can hand it those rows first.
+	 */
+	async function stopRelayAndFollowerAcrossPurge(phase) {
+		const relay = layout.named('east', 0);
+		const follower = layout.named('west', 0);
+		const leaf = layout.named('east', 2);
+		await waitForSuppliers(nodes(), layout.steadySuppliers(), 'settled suppliers');
+		await cutOffAllBut(follower, relay);
+		await waitForSuppliers(
+			nodes(),
+			(node) => new Map(node === follower ? [[leaf.hostname, [relay.hostname]]] : []),
+			`${follower.hostname} takes ${leaf.hostname} from ${relay.hostname}`
+		);
+		await killNode(relay);
+		await killNode(follower);
+		await insert(leaf, phase, leaf.hostname, COPIED_ROWS);
+		// a copy starts at the source's last transaction and applies that one with a log entry: keep `phase` below it
+		await insert(leaf, `${phase}-after`, leaf.hostname, 1);
+		await waitForPhase([layout.named('east', 1)], `${phase}-after`, 1);
+		await delay(1000);
+		await sendOperation(leaf, { operation: 'delete_transaction_logs_before', database: 'data', timestamp: Date.now() });
+		await cutOffAllBut(relay, leaf);
+		return { relay: contextOf(relay), follower: contextOf(follower), leaf };
+	}
+	const reconnectAll = (...contexts) =>
+		Promise.all(contexts.map(({ harper }) => writeFile(partitionFile(workDir, harper.hostname), '[]')));
+	async function holdDirectory(name) {
+		const directory = join(workDir, name);
+		await mkdir(directory, { recursive: true });
+		return directory;
+	}
+	const waitForHold = (directory, description) =>
+		waitForCondition(() => existsSync(join(directory, 'held')), { timeoutMs: 120_000, description });
+	const waitForLink = (node, peer) =>
+		waitForCondition(async (signal) => (await dataLinks(node, signal)).has(peer.hostname), {
+			timeoutMs: 120_000,
+			description: `${node.hostname} connected to ${peer.hostname}`,
+		});
 
 	before(async () => {
 		workDir = await mkdtemp(join(tmpdir(), 'region-switch-'));
@@ -277,5 +367,71 @@ suite('Region gateway switches under load', { timeout: 1_800_000 }, (ctx) => {
 			if (killed) await restart(context);
 		}
 		await assertExactlyWritten(nodes(), writes);
+	});
+
+	test("a follower admitted during a gateway's own base copy ends with every row the copy applied", async () => {
+		const { relay, follower, leaf } = await stopRelayAndFollowerAcrossPurge('open-copied');
+		const hold = await holdDirectory('settle-hold');
+		const leafMark = await logMark(leaf);
+		await restart(relay, {
+			HARPER_TEST_HOLD_COPY_SETTLE_DIR: hold,
+			HARPER_TEST_HOLD_COPY_SETTLE_DB: 'data',
+			HARPER_TEST_HOLD_COPY_SETTLE_PEER: leaf.hostname,
+		});
+		await waitForHold(hold, `${relay.harper.hostname} holding the settle of its base copy from ${leaf.hostname}`);
+		const forcedOnRelay = [...(await readLogSince(leaf, leafMark)).matchAll(FORCED_COPY)];
+		assert.ok(
+			forcedOnRelay.some(([, peer]) => peer === relay.harper.hostname),
+			`${leaf.hostname} forced no base copy for ${relay.harper.hostname}`
+		);
+		// logged by the gateway as its log tail while the pass stays open
+		const tail = startRowWriter(leaf, 'open-tail');
+		let tailRows;
+		try {
+			await restart(follower);
+			await waitForLink(follower.harper, relay.harper);
+			await delay(8000);
+			const relayMark = await logMark(relay.harper);
+			await writeFile(join(hold, 'release'), '');
+			await waitForCondition(
+				async () =>
+					[...(await readLogSince(relay.harper, relayMark)).matchAll(FORCED_COPY)].some(
+						([, peer]) => peer === follower.harper.hostname
+					),
+				{
+					timeoutMs: 120_000,
+					description: `${relay.harper.hostname} forcing a base copy for ${follower.harper.hostname} once its own settled`,
+				}
+			);
+		} finally {
+			tailRows = await tail.stop();
+			await reconnectAll(relay, follower);
+		}
+		await waitForPhase(nodes(), 'open-copied', COPIED_ROWS);
+		await waitForPhase(nodes(), 'open-tail', tailRows);
+	});
+
+	test('a gateway killed during its base copy settles a new one after its restart and relays again', async () => {
+		const { relay, follower, leaf } = await stopRelayAndFollowerAcrossPurge('restart-copied');
+		const hold = await holdDirectory('start-hold');
+		await restart(relay, {
+			HARPER_TEST_HOLD_COPY_START_DIR: hold,
+			HARPER_TEST_HOLD_COPY_START_DB: 'data',
+			HARPER_TEST_HOLD_COPY_START_PEER: leaf.hostname,
+		});
+		await waitForHold(hold, `${relay.harper.hostname} holding COPY_START from ${leaf.hostname}`);
+		try {
+			await restart(follower);
+			await waitForLink(follower.harper, relay.harper);
+			await killNode(relay.harper);
+			await restart(relay);
+			const later = await insert(leaf, 'restart-later', leaf.hostname, 20);
+			// the follower reaches no other peer, so these rows came through the restarted gateway
+			await waitForPhase([follower.harper], 'restart-later', later.length);
+		} finally {
+			await reconnectAll(relay, follower);
+		}
+		await waitForPhase(nodes(), 'restart-copied', COPIED_ROWS);
+		await waitForPhase(nodes(), 'restart-later', 20);
 	});
 });
