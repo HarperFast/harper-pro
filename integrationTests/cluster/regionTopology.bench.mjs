@@ -7,7 +7,7 @@
  * The same nine nodes run once as a full mesh (no regions) and once labeled. `regionNetworkInjector.mjs` counts the
  * bytes each node receives from each peer and adds latency: 30 ms between regions, 1 ms within one. For a single
  * writer (a leaf, then a gateway) it reports the cross-region bytes per write and each node's egress, and it times a
- * leaf's write until a leaf in another region can read it. Results go to REGION_TOPOLOGY_BENCH_OUT (default under the
+ * leaf's write until a leaf in another region can read it. The labeled run is measured once suppliers have settled. Results go to REGION_TOPOLOGY_BENCH_OUT (default under the
  * OS tmpdir) and the test diagnostics.
  */
 import { suite, test, after } from 'node:test';
@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, waitForCondition, stopAndTeardownNodes } from './clusterShared.mjs';
-import { TABLE, startNode, connectTo, waitForLinks, regionLayout } from './regionTopologyShared.mjs';
+import { TABLE, startNode, connectTo, waitForLinks, waitForSuppliers, regionLayout } from './regionTopologyShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -61,6 +61,8 @@ async function startCluster(suiteName, hostnames, labeled, workDir) {
 				.map((peer) => peer.hostname)
 		);
 	await waitForLinks(nodes(), labeled ? layout.expectedLinks : fullMesh, labeled ? 'region links' : 'full-mesh links');
+	// measured once each remote origin has its one supplier, not while suppliers are still settling
+	if (labeled) await waitForSuppliers(nodes(), layout.steadySuppliers(), 'settled suppliers');
 	return { nodes: nodes(), region };
 }
 
