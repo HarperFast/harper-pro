@@ -136,9 +136,10 @@ suite('Region gateway topology', { timeout: 1_500_000 }, (ctx) => {
 		const context = contexts[index];
 		const remoteLeaf = named('west', 2);
 		await insert(remoteLeaf, 'while-down', remoteLeaf.hostname, 20);
+		// before the start, so a copy requested while it starts is in what the assertion reads
+		const mark = await logMark(context.harper);
 		await startHarper(context, nodeOptions(context.harper.hostname, 'east', workDir));
 		const primary = context.harper;
-		const mark = await logMark(primary);
 		await waitForPhase(nodes(), 'while-down', 20);
 		await waitForLinks(nodes(), layout.expectedLinks, 'region links after the gateway restart');
 		assert.ok(

@@ -1040,7 +1040,10 @@ export function currentRegionTopology(): RegionTopology {
 		replicates: selfNodeReplicates(getHDBNodeTable().primaryStore, selfName),
 	};
 	const members: any[] = [self];
-	for (const row of getHDBNodeTable().search([])) if (row?.name && row.name !== selfName) members.push(row);
+	// an unlabeled node decides the gate alone: the table cannot turn it on
+	if (self.region !== null) {
+		for (const row of getHDBNodeTable().search([])) if (row?.name && row.name !== selfName) members.push(row);
+	}
 	const topology = deriveRegionTopology(members);
 	const previous = topologyCache?.topology;
 	if (

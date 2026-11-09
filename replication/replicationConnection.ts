@@ -800,14 +800,16 @@ export function relayedStartBelowCopyBound(
 	logNames: string[],
 	start: number,
 	originFloors: Map<string, number> | undefined,
-	settled: Map<string, number>
+	settled: Map<string, number>,
+	unlogged?: Set<string>
 ): { log: string; start: number; bound: number } | undefined {
 	for (const log of logNames) {
 		if (log === 'local') continue;
 		const bound = settled.get(log);
 		if (bound === undefined) continue;
 		const floor = originFloors?.get(log);
-		const logStart = floor === undefined ? start : floor + ORIGIN_CURSOR_OVERLAP_MS;
+		// an origin held here only by copy, with no log, was never streamed: without a cursor the follower holds none of it
+		const logStart = floor !== undefined ? floor + ORIGIN_CURSOR_OVERLAP_MS : unlogged?.has(log) ? 0 : start;
 		if (logStart < bound) return { log, start: logStart, bound };
 	}
 	return undefined;
@@ -9374,6 +9376,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let liveStartByLog: Map<string, number> | undefined;
 						const frame = new FrameWriter();
 						let skippedMessageSequenceUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+						// set by the send loop: every frame that advances the follower's cursor runs it first
+						let restartAfterCopy: (() => boolean) | undefined;
 						let copying = false;
 						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
 						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
@@ -9796,7 +9800,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!skippedMessageSequenceUpdateTimer) {
 									skippedMessageSequenceUpdateTimer = setTimeout(() => {
 										skippedMessageSequenceUpdateTimer = undefined;
-										if (closed || wsClosed || copying || currentTransaction.txnLogKey) return;
+										if (closed || wsClosed || copying || currentTransaction.txnLogKey || restartAfterCopy?.()) return;
 										// check to see if we are too far behind, but if so, send a sequence update
 										if ((sentSequenceId || 0) + SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY / 2 < currentSequenceId) {
 											if (DEBUG_MODE)
@@ -10295,7 +10299,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										if (encoded === undefined) continue;
 										(rising ??= new Map()).set(name, encoded);
 									}
-									if (!rising || closed || wsClosed) return;
+									if (!rising || closed || wsClosed || restartAfterCopy?.()) return;
 									ws.send(encode([SEQUENCE_ID_UPDATE, currentSequenceId, Object.fromEntries(rising)]));
 									for (const [name, encoded] of rising) {
 										if (encoded === 0) {
@@ -10335,6 +10339,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								const replayedRelayedLogs = () =>
 									(purgeBoundLogNames(auditStore, undefined, excludedNodes) ?? []).filter(isRelayedLog);
 								// an origin held only through a base copy has a bound but no log, so the logs alone never name it
+								// copied origins this node holds no log of
+								const unloggedOrigins = (logs: string[]) => {
+									const present = new Set(logs);
+									return new Set(withCopiedOrigins([], sessionCopyBounds).filter((name) => !present.has(name)));
+								};
 								const withCopiedOrigins = (logs: string[], bounds: RelayCopyBounds | undefined) => {
 									const names = new Set(logs);
 									for (const kind of ['settled', 'reserved'] as const) {
@@ -10360,11 +10369,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										const bounds = readSessionCopyBounds();
 										risen =
 											bounds && sessionCopyBounds
-												? copyBoundRoseForLogs(
-														sessionCopyBounds,
-														bounds,
-														withCopiedOrigins(replayedRelayedLogs(), bounds)
-													)
+												? copyBoundRoseForLogs(sessionCopyBounds, bounds, withCopiedOrigins([], bounds))
 												: undefined;
 									} catch (error) {
 										risen = 'an unreadable copy bound';
@@ -10379,6 +10384,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									close(1011, 'Replication restarts after a base copy into this node');
 									return true;
 								};
+								restartAfterCopy = restartAfterCopyIntoThisNode;
 								// A `return` from inside the loop (close, rejection) still runs this finally, so a timer
 								// armed in the exiting pass can never outlive it to wake a later, superseding loop that
 								// reused the connection-wide `wakeSender`.
@@ -10463,7 +10469,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																withCopiedOrigins(purgeScope.filter(isRelayedLog), sessionCopyBounds),
 																currentSequenceId,
 																comparedFloors,
-																sessionCopyBounds.settled
+																sessionCopyBounds.settled,
+																unloggedOrigins(purgeScope)
 															)
 														: undefined;
 												const retentionGap =
@@ -10518,6 +10525,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											const ownStart = ownSubscription?.startTime;
 											// a log sent under another id replays from the merged start, as the purge check compares it
 											const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
+											const unlogged = unloggedOrigins(replayedRelayedLogs());
 											const relayedBelowOwnStart =
 												Boolean(excludedNodes) &&
 												ownStart > 0 &&
@@ -13187,9 +13195,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		);
 		const excludeNodes = [...shouldExclude].filter((nodeName) => !lastSentExcludedNodes.includes(nodeName));
 		const includeNodes = lastSentExcludedNodes.filter((nodeName) => !shouldExclude.has(nodeName));
-		// A managed origin returns to this link only through a new session: its initial pass applies the borrowed
-		// cursor and the sender's purge recovery, which an in-band include skips (harper-pro#1291).
-		if (includeNodes.some((nodeName) => lastSentTopologyExcluded.has(nodeName))) {
+		// Under region topology an origin returns to a link only through a new session: its initial pass applies the
+		// borrowed cursor and the sender's purge and copy recovery, which an in-band include skips (harper-pro#1291).
+		// That includes an origin leaving direct coverage as the topology turns on, not only a managed one.
+		if (
+			includeNodes.length &&
+			(options.connection?.topologyExcluded !== undefined ||
+				includeNodes.some((nodeName) => lastSentTopologyExcluded.has(nodeName)))
+		) {
 			options.connection.forceReconnect();
 			return;
 		}
