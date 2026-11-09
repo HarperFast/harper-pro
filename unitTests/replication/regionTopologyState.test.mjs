@@ -23,23 +23,34 @@ describe('region topology state (harper-pro#1291)', function () {
 	let priorNodes;
 	let priorRegion;
 	let priorGateway;
-	let selfRow;
-	before(async () => {
-		env.setHdbBasePath(process.env.STORAGE_PATH);
-		selfRow = getHDBNodeTable().primaryStore.getSync(getThisNodeName());
-		await getHDBNodeTable().put(getThisNodeName(), { name: getThisNodeName(), replicates: true });
+	let rows;
+	let table;
+	let search;
+	let getSync;
+	// Rows written to the real table would fire node events whose cluster state outlives them and stalls later
+	// suites' copies (residencyControls), so the table's two reads are stubbed instead.
+	before(() => {
+		table = getHDBNodeTable();
+		search = table.search;
+		getSync = table.primaryStore.getSync;
+		table.search = () => rows;
+		table.primaryStore.getSync = function (key, ...rest) {
+			if (key === getThisNodeName()) return { name: key, replicates: true };
+			return rows.find((row) => row.name === key) ?? getSync.call(this, key, ...rest);
+		};
 	});
-	after(async () => {
-		if (selfRow) await getHDBNodeTable().put(getThisNodeName(), selfRow);
-		else await getHDBNodeTable().delete(getThisNodeName());
+	after(() => {
+		table.search = search;
+		table.primaryStore.getSync = getSync;
 	});
-	const putRows = async (rows) => {
-		for (const row of rows) await getHDBNodeTable().put(row.name, row);
+	const putRows = async (added) => {
+		rows.push(...added);
 	};
-	afterEach(async () => {
-		for (const row of [...peers, { name: 'state-a1' }, { name: 'state-old' }]) await getHDBNodeTable().delete(row.name);
+	afterEach(() => {
+		rows = [];
 	});
 	beforeEach(() => {
+		rows = [];
 		priorNodes = server.nodes;
 		priorRegion = env.get('replication_region');
 		priorGateway = env.get('replication_gateway');

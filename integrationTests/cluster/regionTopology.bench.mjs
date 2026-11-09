@@ -11,18 +11,16 @@
  * OS tmpdir) and the test diagnostics.
  */
 import { suite, test, after } from 'node:test';
-import { cp, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, waitForCondition, stopAndTeardownNodes } from './clusterShared.mjs';
+import { TABLE, startNode, connectTo, waitForLinks, regionLayout } from './regionTopologyShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
-const FIXTURE = join(import.meta.dirname, 'fixture-region-topology');
-const INJECTOR = join(import.meta.dirname, 'regionNetworkInjector.mjs');
-const REGIONS = ['east', 'west', 'eu'];
 const WAN_MS = 30;
 const LAN_MS = 1;
 const RECORDS = 2000;
@@ -31,71 +29,39 @@ const LATENCY_SAMPLES = 40;
 const OUT = process.env.REGION_TOPOLOGY_BENCH_OUT ?? join(tmpdir(), 'region-topology-bench.json');
 
 async function startCluster(suiteName, hostnames, labeled, workDir) {
-	const region = new Map(hostnames.map((name, index) => [name, REGIONS[Math.floor(index / 3)]]));
-	const contexts = await Promise.all(
-		hostnames.map(async (hostname) => {
-			const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
-			await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
-			const latency = Object.fromEntries(
-				hostnames
-					.filter((peer) => peer !== hostname)
-					.map((peer) => [peer, region.get(peer) === region.get(hostname) ? LAN_MS : WAN_MS])
-			);
-			const context = { name: suiteName, harper: { hostname, dataRootDir } };
-			await startHarper(context, {
-				config: {
-					analytics: { aggregatePeriod: -1 },
-					logging: { colors: false, console: true, stdStreams: false, level: 'warn' },
-					replication: { securePort: hostname + ':9933', ...(labeled && { region: region.get(hostname) }) },
-					threads: { count: 1, preload: [INJECTOR] },
+	const contexts = [];
+	const nodes = () => contexts.map((context) => context.harper);
+	const layout = regionLayout(hostnames, nodes);
+	const { region } = layout;
+	const started = await Promise.all(
+		hostnames.map((hostname) =>
+			startNode(
+				suiteName,
+				hostname,
+				labeled ? region.get(hostname) : undefined,
+				workDir,
+				{
+					replicationLogLevel: 'warn',
+					env: { HARPER_TEST_INGRESS_FILE: join(workDir, `ingress-${labeled ? 'labeled' : 'mesh'}-${hostname}`) },
 				},
-				env: {
-					HARPER_NO_FLUSH_ON_EXIT: true,
-					HARPER_TEST_PEER_LATENCY_MS: JSON.stringify(latency),
-					HARPER_TEST_INGRESS_FILE: join(workDir, `ingress-${labeled ? 'labeled' : 'mesh'}-${hostname}`),
-				},
-			});
-			return context;
-		})
+				Object.fromEntries(
+					hostnames
+						.filter((peer) => peer !== hostname)
+						.map((peer) => [peer, region.get(peer) === region.get(hostname) ? LAN_MS : WAN_MS])
+				)
+			)
+		)
 	);
-	const nodes = contexts.map((context) => context.harper);
-	const seed = nodes[0];
-	const { operation_token } = await sendOperation(seed, {
-		operation: 'create_authentication_tokens',
-		authorization: seed.admin,
-	});
-	for (const node of nodes.slice(1)) {
-		await sendOperation(node, {
-			operation: 'add_node',
-			rejectUnauthorized: false,
-			hostname: seed.hostname,
-			authorization: 'Bearer ' + operation_token,
-		});
-	}
-	const expectedPeers = (node) =>
-		nodes.filter(
-			(peer) =>
-				peer !== node &&
-				(!labeled ||
-					region.get(peer.hostname) === region.get(node.hostname) ||
-					(nodes.indexOf(peer) % 3 !== 2 && nodes.indexOf(node) % 3 !== 2))
-		).length;
-	await waitForCondition(
-		async (signal) => {
-			for (const node of nodes) {
-				const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
-				const links = status.connections.filter((connection) =>
-					connection.database_sockets.some(
-						(socket) => socket.database === 'data' && socket.connected && socket.subscribed !== false
-					)
-				).length;
-				if (links !== expectedPeers(node)) return false;
-			}
-			return true;
-		},
-		{ timeoutMs: 300_000, description: `${labeled ? 'region' : 'full-mesh'} links` }
-	);
-	return { nodes, region };
+	contexts.push(...started);
+	await connectTo(nodes()[0], nodes());
+	const fullMesh = (node) =>
+		new Set(
+			nodes()
+				.filter((peer) => peer !== node)
+				.map((peer) => peer.hostname)
+		);
+	await waitForLinks(nodes(), labeled ? layout.expectedLinks : fullMesh, labeled ? 'region links' : 'full-mesh links');
+	return { nodes: nodes(), region };
 }
 
 /** Bytes each node has received from each peer, summed over its threads' counter files. */
@@ -118,7 +84,7 @@ async function countPhase(node, phase) {
 	const found = await sendOperation(node, {
 		operation: 'search_by_value',
 		database: 'data',
-		table: 'RegionRecord',
+		table: TABLE,
 		search_attribute: 'phase',
 		search_value: phase,
 		get_attributes: ['id'],
@@ -137,7 +103,7 @@ async function measureWriter(workDir, labeled, cluster, writer, phase) {
 			phase,
 			origin: BODY,
 		}));
-		await sendOperation(writer, { operation: 'insert', database: 'data', table: 'RegionRecord', records });
+		await sendOperation(writer, { operation: 'insert', database: 'data', table: TABLE, records });
 	}
 	await waitForCondition(
 		async () => {
@@ -176,14 +142,14 @@ async function measureLatency(writer, reader, phase) {
 		await sendOperation(writer, {
 			operation: 'insert',
 			database: 'data',
-			table: 'RegionRecord',
+			table: TABLE,
 			records: [{ id, phase, origin: 'latency' }],
 		});
 		for (;;) {
 			const [found] = await sendOperation(reader, {
 				operation: 'search_by_id',
 				database: 'data',
-				table: 'RegionRecord',
+				table: TABLE,
 				ids: [id],
 				get_attributes: ['id'],
 			});
