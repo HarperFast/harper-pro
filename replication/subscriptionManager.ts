@@ -1222,7 +1222,7 @@ function acceptGatewayReach(entry: any, connection: any): boolean {
 	const reachSince = new Map<string, number>();
 	for (const reached of regions) reachSince.set(reached, entry.reachSince?.get(reached) ?? now);
 	// a session's first report is a change even when empty: it ends the pin on the reconnect that awaited it
-	const changed = entry.peerReach === undefined || regions.join('\n') !== entry.peerReach.join('\n');
+	const changed = entry.peerReach === undefined || JSON.stringify(regions) !== JSON.stringify(entry.peerReach);
 	entry.peerReach = regions;
 	entry.reachSince = reachSince;
 	return changed;

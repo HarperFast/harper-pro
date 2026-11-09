@@ -8638,7 +8638,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					case GATEWAY_REACH:
 						if (message[2] === databaseName && Array.isArray(data) && data.length <= MAX_REACH_REGIONS) {
 							const regions = [...new Set(data.filter((region) => validRegion(region) !== undefined))].sort();
-							if (regions.join('\n') !== receivedGatewayReach?.join('\n')) {
+							if (JSON.stringify(regions) !== JSON.stringify(receivedGatewayReach)) {
 								receivedGatewayReach = regions;
 								postConnectionMetadata();
 							}
@@ -10386,7 +10386,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												try {
 													sessionCopyBounds = readSessionCopyBounds();
 												} catch (error) {
+													// as the mid-session check does: a bound that cannot be read must not read as none
 													logger.warn?.(connectionId, 'could not read the copy bounds for', databaseName, error);
+													wsClosed = true;
+													close(1011, 'Replication could not read the copy bounds');
+													return;
 												}
 											}
 											// If the requested incremental start predates the transaction-log history we still
@@ -12234,7 +12238,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			metadata.unknownCommandFrames = unknownCommands.count;
 			changed = true;
 		}
-		if (receivedGatewayReach !== undefined && receivedGatewayReach.join('\n') !== lastPostedGatewayReach) {
+		if (receivedGatewayReach !== undefined && JSON.stringify(receivedGatewayReach) !== lastPostedGatewayReach) {
 			metadata.gatewayReach = receivedGatewayReach;
 			changed = true;
 		}
@@ -12251,7 +12255,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			lastPostedPeerCapabilities = metadata.peerCapabilities as ResolvedPeerCapabilities;
 		if (metadata.unknownCommandFrames !== undefined)
 			lastPostedUnknownCommandCount = metadata.unknownCommandFrames as number;
-		if (metadata.gatewayReach !== undefined) lastPostedGatewayReach = (metadata.gatewayReach as string[]).join('\n');
+		if (metadata.gatewayReach !== undefined) lastPostedGatewayReach = JSON.stringify(metadata.gatewayReach);
 	}
 	function postConnectionMetadata() {
 		// Only a subscription connection owns the main thread's (database, peer) entry, and a socket that
@@ -13959,7 +13963,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			try {
 				if (wsClosed) return stopGatewayReachAnnouncements();
 				const regions = gatewayReachFor(databaseName, remoteNodeName, auditStore);
-				const signature = regions?.join('\n');
+				const signature = regions && JSON.stringify(regions);
 				if (signature === undefined || signature === lastSent) return;
 				ws.send(encode([GATEWAY_REACH, regions, databaseName]));
 				lastSent = signature;
