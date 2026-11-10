@@ -178,16 +178,21 @@ export async function phaseIds(node, phase, signal) {
 }
 
 export async function waitForPhase(nodes, phase, count) {
+	let short = {};
 	await waitForCondition(
 		async (signal) => {
+			short = {};
 			for (const node of nodes) {
 				// a node that is restarting refuses the connection for a moment
 				const ids = await phaseIds(node, phase, signal).catch(() => new Set());
-				if (ids.size < count) return false;
+				if (ids.size < count) short[node.hostname] = ids.size;
 			}
-			return true;
+			return Object.keys(short).length === 0;
 		},
-		{ timeoutMs: 120_000, description: `every node holds the ${count} ${phase} records` }
+		{
+			timeoutMs: 120_000,
+			description: () => `every node holds the ${count} ${phase} records; held: ${JSON.stringify(short)}`,
+		}
 	);
 }
 

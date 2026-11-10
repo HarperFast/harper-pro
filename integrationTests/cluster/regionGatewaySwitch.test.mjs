@@ -175,28 +175,44 @@ function startRowWriter(node, phase) {
 	};
 }
 
-/** After `writes` stopped: every node holds exactly the acknowledged rows, and each counter equals its writer's rows. */
+/**
+ * After `writes` stopped: every node holds exactly the acknowledged rows, and each counter equals its writer's rows.
+ * A counter can trail its rows while a base copy still applies (rows sort before counters), so short counts are waited
+ * out; a count above the writes never comes back down.
+ */
 async function assertExactlyWritten(nodes, writes) {
 	await waitForRows(nodes, writes, writes.acked, `every node holds every ${writes.phase} row`);
 	const total = [...writes.acked.values()].reduce((sum, count) => sum + count, 0);
 	for (const node of nodes) {
 		const ids = await phaseIds(node, writes.phase);
 		assert.equal(ids.size, total, `${node.hostname} holds ${ids.size} ${writes.phase} rows, ${total} were written`);
-		const counters = await sendOperation(node, {
-			operation: 'search_by_id',
-			database: 'data',
-			table: TABLE,
-			ids: [...writes.acked.keys()].map((writer) => counterId(writes.phase, writer)),
-			get_attributes: ['id', 'origin', 'count'],
-		});
-		for (const { origin, count } of counters) {
-			assert.equal(
-				count,
-				writes.acked.get(origin),
-				`${node.hostname} counts ${count} adds from ${origin}, which made ${writes.acked.get(origin)}`
-			);
-		}
 	}
+	let short = [];
+	await waitForCondition(
+		async (signal) => {
+			short = [];
+			for (const node of nodes) {
+				const counters = await sendOperation(
+					node,
+					{
+						operation: 'search_by_id',
+						database: 'data',
+						table: TABLE,
+						ids: [...writes.acked.keys()].map((writer) => counterId(writes.phase, writer)),
+						get_attributes: ['id', 'origin', 'count'],
+					},
+					{ signal }
+				);
+				for (const { origin, count } of counters) {
+					const made = writes.acked.get(origin);
+					assert.ok(!(count > made), `${node.hostname} counts ${count} adds from ${origin}, which made ${made}`);
+					if (count !== made) short.push(`${node.hostname} counts ${count} adds from ${origin}, which made ${made}`);
+				}
+			}
+			return short.length === 0;
+		},
+		{ timeoutMs: 60_000, pollMs: 1000, description: () => `every counter equals its writes; ${short.join('; ')}` }
+	);
 }
 
 suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
@@ -230,6 +246,9 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 		const follower = layout.named('west', 0);
 		const leaf = layout.named('east', 2);
 		await waitForSuppliers(nodes(), layout.steadySuppliers(), 'settled suppliers');
+		// a route that never carried the leaf's origin starts it at the merged start on a switch (harper-pro#1300)
+		await insert(leaf, `${phase}-seed`, leaf.hostname, 1);
+		await waitForPhase(nodes(), `${phase}-seed`, 1);
 		await cutOffAllBut(follower, relay);
 		await waitForSuppliers(
 			nodes(),
@@ -284,93 +303,6 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 	after(async () => {
 		await stopAndTeardownNodes(nodes());
 		if (workDir) await rm(workDir, { recursive: true, force: true });
-	});
-
-	test('repeated kills of a preferred gateway under writes from every region lose and duplicate nothing', async () => {
-		const writers = ['east', 'west', 'eu'].flatMap((name) => [layout.named(name, 1), layout.named(name, 2)]);
-		const writes = await startWriters(nodes(), writers, 'churn');
-		try {
-			for (const regionName of KILL_ORDER) {
-				await waitForSuppliers(
-					nodes(),
-					layout.steadySuppliers(),
-					`settled suppliers before killing ${regionName}'s gateway`
-				);
-				const context = contextOf(layout.named(regionName, 0));
-				const gateway = context.harper;
-				await killNode(gateway);
-				// rows written after the kill reach the region's leaf only through the standby
-				await delay(5000);
-				await waitForRows(
-					nodes().filter((node) => node !== gateway),
-					writes,
-					new Map(writes.acked),
-					`every live node caught up while ${regionName}'s preferred gateway ${gateway.hostname} is down`
-				);
-				await restart(context);
-				await waitForRows(nodes(), writes, new Map(writes.acked), `${gateway.hostname} caught up after its restart`);
-			}
-		} finally {
-			await writes.stop();
-		}
-		await assertExactlyWritten(nodes(), writes);
-	});
-
-	test('a leaf behind purged history moves to the standby through a base copy and loses nothing', async () => {
-		const primary = layout.named('east', 0);
-		const standby = layout.named('east', 1);
-		const leaf = layout.named('east', 2);
-		const writer = layout.named('west', 2);
-		const context = contextOf(primary);
-		await waitForSuppliers(nodes(), layout.steadySuppliers(), 'settled suppliers');
-		// the standby's own rows keep the leaf's position on its link to the standby current
-		const writes = await startWriters(nodes(), [writer, standby], 'held');
-		const slowedAt = Date.now();
-		const slow = setInterval(
-			() =>
-				writeFile(
-					latencyFile(workDir, leaf.hostname),
-					JSON.stringify({ [primary.hostname]: (Date.now() - slowedAt) * RAMP })
-				).catch(() => {}),
-			1000
-		);
-		let killed = false;
-		try {
-			await delay(LAG_MS);
-			const mark = await logMark(standby);
-			const bound = Date.now() - PURGE_MARGIN_MS;
-			for (const gateway of [primary, standby]) {
-				await sendOperation(gateway, {
-					operation: 'delete_transaction_logs_before',
-					database: 'data',
-					timestamp: bound,
-				});
-			}
-			await killNode(primary);
-			killed = true;
-			await delay(5000);
-			await waitForRows(
-				nodes().filter((node) => node !== primary),
-				writes,
-				new Map(writes.acked),
-				`every live node holds the held rows after ${leaf.hostname} moved to ${standby.hostname}`
-			).catch(async (error) => {
-				const status = await sendOperation(leaf, { operation: 'cluster_status' }).catch((cause) => cause.message);
-				error.message += `; ${leaf.hostname} cluster_status: ${JSON.stringify(status)}`;
-				throw error;
-			});
-			const forced = [...(await readLogSince(standby, mark)).matchAll(FORCED_COPY)];
-			assert.ok(
-				forced.some(([, peer]) => peer === leaf.hostname),
-				`${standby.hostname} forced no base copy for ${leaf.hostname}: ${JSON.stringify(forced.map(([line]) => line))}`
-			);
-		} finally {
-			clearInterval(slow);
-			await writeFile(latencyFile(workDir, leaf.hostname), '{}');
-			await writes.stop();
-			if (killed) await restart(context);
-		}
-		await assertExactlyWritten(nodes(), writes);
 	});
 
 	test("a follower admitted during a gateway's own base copy ends with every row the copy applied", async () => {
@@ -475,5 +407,93 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 		await waitForPhase(nodes(), 'restart-copied', COPIED_ROWS);
 		await waitForPhase(nodes(), 'restart-tail', tailRows);
 		await waitForPhase(nodes(), 'restart-later', 20);
+	});
+
+	test('repeated kills of a preferred gateway under writes from every region lose and duplicate nothing', async () => {
+		const writers = ['east', 'west', 'eu'].flatMap((name) => [layout.named(name, 1), layout.named(name, 2)]);
+		await waitForCopiesSettled(nodes(), 'base copies the earlier tests forced');
+		const writes = await startWriters(nodes(), writers, 'churn');
+		try {
+			for (const regionName of KILL_ORDER) {
+				await waitForSuppliers(
+					nodes(),
+					layout.steadySuppliers(),
+					`settled suppliers before killing ${regionName}'s gateway`
+				);
+				const context = contextOf(layout.named(regionName, 0));
+				const gateway = context.harper;
+				await killNode(gateway);
+				// rows written after the kill reach the region's leaf only through the standby
+				await delay(5000);
+				await waitForRows(
+					nodes().filter((node) => node !== gateway),
+					writes,
+					new Map(writes.acked),
+					`every live node caught up while ${regionName}'s preferred gateway ${gateway.hostname} is down`
+				);
+				await restart(context);
+				await waitForRows(nodes(), writes, new Map(writes.acked), `${gateway.hostname} caught up after its restart`);
+			}
+		} finally {
+			await writes.stop();
+		}
+		await assertExactlyWritten(nodes(), writes);
+	});
+
+	test('a leaf behind purged history moves to the standby through a base copy and loses nothing', async () => {
+		const primary = layout.named('east', 0);
+		const standby = layout.named('east', 1);
+		const leaf = layout.named('east', 2);
+		const writer = layout.named('west', 2);
+		const context = contextOf(primary);
+		await waitForSuppliers(nodes(), layout.steadySuppliers(), 'settled suppliers');
+		// the standby's own rows keep the leaf's position on its link to the standby current
+		const writes = await startWriters(nodes(), [writer, standby], 'held');
+		const slowedAt = Date.now();
+		const slow = setInterval(
+			() =>
+				writeFile(
+					latencyFile(workDir, leaf.hostname),
+					JSON.stringify({ [primary.hostname]: (Date.now() - slowedAt) * RAMP })
+				).catch(() => {}),
+			1000
+		);
+		let killed = false;
+		try {
+			await delay(LAG_MS);
+			const mark = await logMark(standby);
+			const bound = Date.now() - PURGE_MARGIN_MS;
+			for (const gateway of [primary, standby]) {
+				await sendOperation(gateway, {
+					operation: 'delete_transaction_logs_before',
+					database: 'data',
+					timestamp: bound,
+				});
+			}
+			await killNode(primary);
+			killed = true;
+			await delay(5000);
+			await waitForRows(
+				nodes().filter((node) => node !== primary),
+				writes,
+				new Map(writes.acked),
+				`every live node holds the held rows after ${leaf.hostname} moved to ${standby.hostname}`
+			).catch(async (error) => {
+				const status = await sendOperation(leaf, { operation: 'cluster_status' }).catch((cause) => cause.message);
+				error.message += `; ${leaf.hostname} cluster_status: ${JSON.stringify(status)}`;
+				throw error;
+			});
+			const forced = [...(await readLogSince(standby, mark)).matchAll(FORCED_COPY)];
+			assert.ok(
+				forced.some(([, peer]) => peer === leaf.hostname),
+				`${standby.hostname} forced no base copy for ${leaf.hostname}: ${JSON.stringify(forced.map(([line]) => line))}`
+			);
+		} finally {
+			clearInterval(slow);
+			await writeFile(latencyFile(workDir, leaf.hostname), '{}');
+			await writes.stop();
+			if (killed) await restart(context);
+		}
+		await assertExactlyWritten(nodes(), writes);
 	});
 });
