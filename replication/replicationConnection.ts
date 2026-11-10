@@ -7735,8 +7735,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	/** The exact highest version this pass copied per origin, carried in the copy cursor across a resume. */
 	const copiedVersionByOrigin = new Map<number, number>();
 	/**
-	 * Names this attempt's reservation row: an attempt deletes only its own at settle, so an earlier attempt's, which
-	 * may cover rows it applied past its saved cursor, stays and keeps voiding the starts it covers.
+	 * Names this attempt's reservation row. Its settle deletes it and the peer's reservations from attempts created
+	 * before it (`earlierReservationSlots`), whose rows its walk covered; until then they keep voiding their starts.
 	 */
 	let copyPassToken = '';
 	let committedPass: string | undefined;
@@ -7926,7 +7926,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			logger.debug?.(connectionId, 'settled copy bounds for', databaseName, Object.fromEntries(copiedVersionByOrigin));
 			// a pass that lost its socket during the settle leaves them to the next pass's settle: a clock stepped back
 			// can make a later attempt's token read as earlier
-			if (!wsClosed && !connectionSuperseded()) {
+			if (copyPassToken === pass && !wsClosed && !connectionSuperseded()) {
 				try {
 					const earlier = earlierReservationSlots(dbisDB, peerId, pass);
 					if (earlier.length) await writeCopyBoundRows(dbisDB, peerId, rootStore, { release: earlier });
