@@ -27,7 +27,7 @@ const validationSchema = Joi.object({
 	receivesFrom: Joi.array(),
 	subscriptions: Joi.array(),
 	revoked_certificates: Joi.array(),
-	shard: Joi.number(),
+	shard: Joi.number().integer().min(0).max(65535),
 	isLeader: Joi.boolean(),
 });
 

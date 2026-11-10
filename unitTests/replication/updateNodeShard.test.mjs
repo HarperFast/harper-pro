@@ -69,7 +69,10 @@ describe('update_node shard and metadata', function () {
 		await updateNode({ operation: 'update_node', hostname: PEER, shard: '1' });
 		assert.strictEqual(getHDBNodeTable().primaryStore.getSync(PEER).shard, 1);
 		await updateNode({ operation: 'update_node', hostname: getThisNodeName(), shard: '0' });
-		await assert.rejects(updateNode({ operation: 'update_node', hostname: PEER, shard: 'one' }), /shard/);
+		for (const shard of ['one', 1.5, -1]) {
+			await assert.rejects(updateNode({ operation: 'update_node', hostname: PEER, shard }), /shard/);
+		}
+		assert.strictEqual(getHDBNodeTable().primaryStore.getSync(PEER).shard, 1);
 	});
 
 	it('runs the add_node exchange for a request with no metadata to patch', async () => {

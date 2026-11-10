@@ -160,12 +160,10 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 			'a row that left the scan without its own delete event reaches the listener as a removal'
 		);
 		assert.ok(
-			calls.some((call) => call.id === 'consistency-c' && call.node?.name === 'consistency-c') &&
-				!calls.some((call) => call.id === 'consistency-c' && call.node == null),
-			'a delete older than the stored row (a re-add after it) keeps the row'
+			calls.some((call) => call.id === 'consistency-c' && call.node == null) &&
+				!server.nodes.some((node) => node.name === 'consistency-c'),
+			'a delete event removes its row even when the scan still shows it'
 		);
-		assert.ok(server.nodes.some((node) => node.name === 'consistency-c'));
-		assertMatchesFreshScan('after synthetic events');
 
 		calls.length = 0;
 		await Nodes.delete('consistency-a');
@@ -269,27 +267,5 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 
 		await run([{ type: 'put', id: 'consistency-a', value: { name: 'consistency-a', shard: 9 }, version }]);
 		assert.equal(shardOfA(), 0, 'at an equal version the stored record wins');
-	});
-
-	it('scans once when several watchers process the same event', async () => {
-		const Nodes = getHDBNodeTable();
-		await Nodes.put('consistency-a', { name: 'consistency-a', url: 'wss://consistency-a:9933', replicates: true });
-		const event = { type: 'put', id: 'consistency-a', value: null, version: Date.now() };
-		const store = Nodes.primaryStore;
-		const getRange = store.getRange;
-		let scans = 0;
-		store.getRange = function (...args) {
-			scans++;
-			return getRange.apply(this, args);
-		};
-		try {
-			for (const key of [WATCHER, WATCHER + '-second']) {
-				await runNodeUpdateWatcher(() => {}, { key, maxRestarts: 1, subscribe: async () => asyncIterable([event]) });
-			}
-		} finally {
-			store.getRange = getRange;
-			stopNodeUpdateWatcher(WATCHER + '-second');
-		}
-		assert.equal(scans, 1);
 	});
 });

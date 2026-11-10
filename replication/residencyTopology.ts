@@ -329,7 +329,7 @@ server.registerOperation?.({
 	requiresSuperUser: true,
 });
 
-/** Owners and the self-membership check come from the membership residencyOwners() routes by. */
+/** Owners come from the membership residencyOwners() routes by. */
 function shardSummary(snapshot: ResidencyMapSnapshot, localShard: number | undefined) {
 	const slots = new Map<number, number>();
 	for (const { start, end, shard } of snapshot.ranges) slots.set(shard, (slots.get(shard) ?? 0) + end - start);

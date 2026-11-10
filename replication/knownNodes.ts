@@ -478,22 +478,15 @@ function notifyNodeListener(
 }
 
 let publishedRows = new Map<string, any>();
-// every watcher receives each event, so the first to handle it scans for the rest
-const publishedEvents = new Set<string>();
 
 /**
  * Core delivers an event only after its commit, resetting LMDB's read transaction first, so the scan already
- * holds the event's write. A row reconstructed from its key after a decode miss takes the event's own decoded
+ * holds the event's write; a genuine delete still removes its row whatever the scan read (see
+ * isGenuineNodeDeletion). A row reconstructed from its key after a decode miss takes the event's own decoded
  * record when that is not older, else keeps the fields it was last published with (harper-pro#460).
  */
 function publishKnownNodes(event?: any): Map<string, any> {
 	const id = event?.id ?? event?.value?.name;
-	// the same commit reaches each watcher as an equal event; distinct commits differ somewhere in it
-	const eventKey =
-		event?.version === undefined
-			? undefined
-			: `${event.type} ${id} ${event.version} ${event.localTime} ${JSON.stringify(event.value)}`;
-	if (eventKey !== undefined && publishedEvents.has(eventKey)) return publishedRows;
 	const decoded = event?.type === 'put' && isValidNodeRecord(event.value) ? event.value : undefined;
 	const rows = new Map<string, any>();
 	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key, version) => {
@@ -504,6 +497,7 @@ function publishKnownNodes(event?: any): Map<string, any> {
 		}
 		rows.set(key, node);
 	});
+	if (event && isGenuineNodeDeletion(event.type)) rows.delete(id);
 	const thisNodeName = getThisNodeName();
 	const nodes = [];
 	const shards = new Map();
@@ -518,10 +512,6 @@ function publishKnownNodes(event?: any): Map<string, any> {
 	server.nodes = nodes;
 	server.shards = shards;
 	publishedRows = rows;
-	if (eventKey !== undefined) {
-		publishedEvents.add(eventKey);
-		if (publishedEvents.size > 64) publishedEvents.delete(publishedEvents.values().next().value);
-	}
 	return rows;
 }
 
@@ -623,13 +613,14 @@ export function resolveScannedNode(
 	return reconstructNodeFromKey(key);
 }
 
+const undecodedRowsWarned = new Set<unknown>();
+
 /**
  * Iterate the hdb_nodes range and drive `onNode(node, key)` for each peer, reconstructing a minimal
  * descriptor for any range-visible-but-undecodable row while skipping genuine tombstones
  * (harper-pro#460). Takes the store explicitly so it can be unit-tested against a fake/real store
  * without standing up a server. publishKnownNodes owns the `server` bookkeeping.
  */
-const undecodedRowsWarned = new Set<unknown>();
 export function scanNodesForSubscription(store: any, onNode: (node: any, key: any, version?: number) => void) {
 	for (const entry of store.getRange({ versions: true })) {
 		const { value, key, version } = entry;
