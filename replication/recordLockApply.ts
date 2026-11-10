@@ -338,7 +338,7 @@ function manualRecovery(
 			homes.every((node) => stages.alreadyActive.has(node)) &&
 			departing.every((node) => stages.alreadyStaged.has(node))
 		)
-			return `the per-node recovery has already run: generation ${generation} is active on ${JSON.stringify(homes)}${departing.length > 0 ? ` and staged on ${JSON.stringify(departing)}` : ''}. If a home still refuses cluster locks for this database, send ${activate} to it again: on an active node it only re-notifies the threads`;
+			return `the per-node recovery has already run: generation ${generation} is active on ${JSON.stringify(homes)}${departing.length > 0 ? ` and staged on ${JSON.stringify(departing)}` : ''}. Send ${activate} to each of ${JSON.stringify(homes)} once more: on an active node it only re-notifies the threads, so one that missed the activation picks it up`;
 		const stageOn = canonicalizeHomes([...rows.keys()].filter((node) => !stages.alreadyActive.has(node)));
 		const stage = JSON.stringify({ operation: 'record_lock_stage_generation', database, generation, homes, quiesce });
 		return `apply without fenced once it is reachable, or, if ${JSON.stringify(fenced)} will never run again from their current data, re-home without them by hand: send ${stage} to each of ${JSON.stringify(stageOn)}; after the last of those succeeds, wait ${DELEGATION_DRAIN_MS} ms, then send ${activate} to each of ${JSON.stringify(homes)}. Never activate after a failed stage; if interrupted, re-send this call for steps that match the current state`;

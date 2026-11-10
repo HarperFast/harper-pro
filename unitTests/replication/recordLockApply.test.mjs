@@ -866,7 +866,7 @@ describe('applyHomes with fenced nodes (harper-pro#973)', function () {
 });
 
 function recoveryIn(reason) {
-	const steps = [...reason.matchAll(/send (\{.*?\}) to each of (\[.*?\])/g)].map(([, body, nodes]) => ({
+	const steps = [...reason.matchAll(/[Ss]end (\{.*?\}) to each of (\[.*?\])/g)].map(([, body, nodes]) => ({
 		body: JSON.parse(body),
 		nodes: JSON.parse(nodes),
 	}));
@@ -973,11 +973,13 @@ describe('a fenced apply refused on a ring that names removed nodes reports the 
 			);
 		}
 		const finished = await refused(applyHomes(sweep(), cluster.peers));
-		assert.strictEqual(recoveryIn(finished.http_resp_msg.reason), undefined);
 		assert.match(
 			finished.http_resp_msg.reason,
-			/the per-node recovery has already run: generation 2 is active on \["c","d","e","f"\]\. If a home still refuses cluster locks for this database, send \{"operation":"record_lock_activate_generation","database":"db","generation":2,"homes":\["c","d","e","f"\]\} to it again/
+			/the per-node recovery has already run: generation 2 is active on \["c","d","e","f"\]\. Send /
 		);
+		const replay = recoveryIn(finished.http_resp_msg.reason);
+		assert.deepStrictEqual(replay.stage, activate, 'the only step left is the activate replay, to every home');
+		assert.strictEqual(replay.activate, undefined);
 		// Central Manager's next call: no row names a or b, so they are neither in quiesce nor fenced.
 		cluster.calls.length = 0;
 		const next = await applyHomes(sweep({ quiesce: undefined, fenced: undefined }), cluster.peers);
@@ -1024,10 +1026,7 @@ describe('a fenced apply refused on a ring that names removed nodes reports the 
 			undefined,
 			['a', 'b']
 		);
-		assert.match(
-			recovered.reason,
-			/generation 2 is active on \["c","e"\] and staged on \["x\\"y"\]\. If a home still refuses/
-		);
+		assert.match(recovered.reason, /generation 2 is active on \["c","e"\] and staged on \["x\\"y"\]\. Send /);
 	});
 
 	it('moves past a resume target a node would refuse, and offers no generation past the largest safe one', () => {
