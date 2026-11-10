@@ -184,7 +184,6 @@ describe('predatesPurgeTracking', () => {
 });
 
 describe('retentionResumeDecision', () => {
-	// (forceForTest, otherGeneration, retentionGap, restricted)
 	it('replays a start this node can vouch for on any route', () => {
 		expect(retentionResumeDecision(false, false, false, false)).to.equal('replay');
 		expect(retentionResumeDecision(false, false, false, true)).to.equal('replay');

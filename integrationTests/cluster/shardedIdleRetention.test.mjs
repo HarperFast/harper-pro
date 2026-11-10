@@ -1,19 +1,7 @@
 /**
- * A sharded database idle past auditRetention resumes after a restart, and an owner's refusal of a copy it
- * cannot accept is reported once and backed off (harper-pro#1231, #1278).
- *
- * Two nodes, one per shard, `@sharded(slots: 2)` on `data`. Node 0 stops, node 1 writes once more, and both
- * sit idle past a retention of seconds, so node 0's start on node 1 is below node 1's purge bound. A sender
- * may not force a base copy on a node whose owned slots it cannot copy: the owner refuses it with 1011
- * ("Owned sharding slots require a complete co-owner or backup restore") and the leg never resumes. It
- * replays what it retained instead and warns once.
- *
- * Then node 0 restarts with its retention copy forced (HARPER_TEST_FORCE_RETENTION_COPY_DATABASES): node 1
- * must log the refusal once, show it as `stuckCopy` in cluster_status, and hold its reconnects, and a write
- * through node 0 for a key node 1 owns returns 503 rather than an acknowledgement no owner will see.
- * Node 1's next subscription, once the forcing has stopped, clears the refusal in the same node 0 process.
- * Last, node 0 restarts holding a copy-resume cursor from before the route was restricted: it discards the
- * cursor instead of asking node 1 for a copy it would refuse.
+ * Owners of one shard each, idle past auditRetention (harper-pro#1231, #1278, #1315). A sender never forces a base
+ * copy on a node whose owned slots it cannot copy, since that node refuses it; while an owner does refuse, a write
+ * through the refused node for the owner's key returns 503 instead of an acknowledgement no owner will see.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -230,7 +218,6 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		);
 		equal(stuck.reason, 'Owned sharding slots require a complete co-owner or backup restore');
 		ok(Date.parse(stuck.retryAt) > Date.now(), `retries at ${stuck.retryAt}`);
-		// a write node 1 would never receive fails instead of being acknowledged; node 0's own slots still take writes
 		await ready();
 		const refused = await request(nodes[0], `Rows/${OWNED_BY[1][1]}`, {
 			method: 'PUT',

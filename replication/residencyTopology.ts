@@ -121,14 +121,12 @@ export function registerResidencySender(store: any, database: string, peer: stri
 			const replayed = Atomics.load(refusal, REPLAYED);
 			return ordinal >= replayed && !(before !== 0 && before >= replayed);
 		},
-		/** This sender's subscription started replaying, which ends a refusal of it or of an earlier sender. */
 		replaying() {
 			raiseRefusalWord(refusal, REPLAYED, ordinal);
 		},
 	};
 }
 
-/** Raises the word to at least `value`, returning what it held before. */
 function raiseRefusalWord(refusal: Uint32Array, index: number, value: number): number {
 	let seen = Atomics.load(refusal, index);
 	while (seen < value) {

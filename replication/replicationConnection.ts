@@ -9135,6 +9135,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							receiverShard === undefined ? undefined : shardingSourceAgreement(databaseName, receiverShard);
 						const restrictedSendingOrigins =
 							!!receiverLayout && shardingSourceCertificate(databaseName) !== receiverLayout;
+						// an owner whose shard is not agreed refuses any copy, as its end treats this node the same way
+						const refusesCopies =
+							restrictedSendingOrigins ||
+							(receiverShard === undefined &&
+								residencyIdentityBound &&
+								Number.isInteger(announcedPeerShard) &&
+								!!shardingLayout(databaseName));
 						const sendingProjection = data.some((node) => node.shardingProjection === true);
 						if (sendingProjection && !receiverLayout)
 							throw new Error('Sharding projection requires authenticated owned slots');
@@ -10192,7 +10199,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													forceRetentionCopyForTest(databaseName),
 													otherGeneration,
 													retentionGap,
-													restrictedSendingOrigins
+													refusesCopies
 												);
 												if (decision === 'replay-unvouched') {
 													const from = new Date(currentSequenceId).toISOString();
@@ -13245,8 +13252,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						logger.warn?.(
 							`Discarding the copy-resume cursor for ${node.name} on database ${databaseName}: this node owns sharding slots that peer cannot copy, so it resumes ${shardingProjection ? 'by projection' : 'from its floor'} instead`
 						);
-						if (nodeId !== undefined) dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
 						copyCursor = undefined;
+						if (nodeId !== undefined)
+							Promise.resolve()
+								.then(() => dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]))
+								.catch((error) =>
+									logger.warn?.(connectionId, 'could not remove the copy-resume cursor for', databaseName, error)
+								);
 					}
 				}
 				const ownedCopyPending =
