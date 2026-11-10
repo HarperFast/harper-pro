@@ -310,7 +310,7 @@ setResidencyPlacementGuard((database, owners, requireConnected, shard, root, for
 	const reachable = recipients.filter((node) => owners.includes(node.name));
 	if (!reachable.length)
 		throw new ResidencyPlacementError(`No replication route reaches the owners of a record in ${database}`, 503);
-	const auditStore = databaseAuditStore(database);
+	const auditStore = (root as any)?.auditStore ?? databaseAuditStore(database);
 	if (requireConnected) {
 		if (!auditStore || !acceptingOwnerReachable(auditStore, database, reachable, true))
 			throw new ResidencyPlacementError(
