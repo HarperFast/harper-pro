@@ -10230,9 +10230,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									const bounds = dbisDB?.getRange
 										? readRelayCopyBoundsAt(dbisDB, auditStore, readOriginStateEpoch(auditStore.rootStore))
 										: undefined;
+									// an origin held here only by copy has no log, so the follower holds it from 0
+									const logged =
+										auditStore.reusableIterable === true
+											? new Set(auditStore.loadLogs().map((log: any) => log?.name))
+											: undefined;
+									const unlogged =
+										logged && new Set<string>(nodesToInclude.filter((name: string) => !logged.has(name)));
 									gap =
 										bounds &&
-										relayedStartBelowCopyBound(nodesToInclude, currentSequenceId, includeFloors, bounds.settled);
+										relayedStartBelowCopyBound(
+											nodesToInclude,
+											currentSequenceId,
+											includeFloors,
+											bounds.settled,
+											unlogged
+										);
 								} catch (error) {
 									gap = error;
 								}
