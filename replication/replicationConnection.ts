@@ -788,6 +788,12 @@ export function retentionResumeDecision(
 	return restricted ? 'replay-unvouched' : 'copy';
 }
 
+/** Whether the receiver refuses a copy, as its subscription request declares it, or as inferred for a peer too old to. */
+export function receiverRefusesCopies(entries: { refusesCopies?: unknown }[], inferred: () => boolean): boolean {
+	for (const entry of entries) if (typeof entry?.refusesCopies === 'boolean') return entry.refusesCopies;
+	return inferred();
+}
+
 const purgedThrough = (bound: number | undefined) => (bound === undefined ? 'unknown' : new Date(bound).toISOString());
 
 const unvouchedReplayWarned = new Map<string, string>();
@@ -9135,13 +9141,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							receiverShard === undefined ? undefined : shardingSourceAgreement(databaseName, receiverShard);
 						const restrictedSendingOrigins =
 							!!receiverLayout && shardingSourceCertificate(databaseName) !== receiverLayout;
-						// an owner whose shard is not agreed refuses any copy, as its end treats this node the same way
-						const refusesCopies =
-							restrictedSendingOrigins ||
-							(receiverShard === undefined &&
-								residencyIdentityBound &&
-								Number.isInteger(announcedPeerShard) &&
-								!!readResidencyMap(databaseName));
+						// without a declaration, an owner whose shard is not agreed is assumed to refuse, as its end treats this node so
+						const refusesCopies = receiverRefusesCopies(
+							data,
+							() =>
+								restrictedSendingOrigins ||
+								(receiverShard === undefined &&
+									residencyIdentityBound &&
+									Number.isInteger(announcedPeerShard) &&
+									!!readResidencyMap(databaseName))
+						);
 						const sendingProjection = data.some((node) => node.shardingProjection === true);
 						if (sendingProjection && !receiverLayout)
 							throw new Error('Sharding projection requires authenticated owned slots');
@@ -13343,6 +13352,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					isLeader: node.isLeader,
 					endTime: node.endTime,
 					shardingProjection,
+					refusesCopies: restrictedOrigins,
 					copyResume, // present only when resuming an interrupted bulk copy
 					...(floorOnlyStart !== undefined && startTime === floorOnlyStart && { floorGeneration: floorOnlyGeneration }),
 				};

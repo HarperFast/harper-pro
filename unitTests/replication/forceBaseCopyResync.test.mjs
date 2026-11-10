@@ -15,6 +15,7 @@ import {
 	replayStartUnderPurge,
 	predatesPurgeTracking,
 	retentionResumeDecision,
+	receiverRefusesCopies,
 	shouldWarnUnvouchedReplay,
 	ORIGIN_CURSOR_OVERLAP_MS,
 } from '#src/replication/replicationConnection';
@@ -214,5 +215,17 @@ describe('shouldWarnUnvouchedReplay', () => {
 		expect(shouldWarnUnvouchedReplay('other-db', 'peer-a', 'under bound 1')).to.equal(true);
 		expect(shouldWarnUnvouchedReplay('warn-db', 'peer-a', 'under bound 2')).to.equal(true);
 		expect(shouldWarnUnvouchedReplay('warn-db', 'peer-a', 'under bound 2')).to.equal(false);
+	});
+});
+
+describe('receiverRefusesCopies', () => {
+	it("takes the receiver's declaration over the sender's inference", () => {
+		expect(receiverRefusesCopies([{ name: 'a', refusesCopies: false }], () => true)).to.equal(false);
+		expect(receiverRefusesCopies([{ name: 'a', refusesCopies: true }], () => false)).to.equal(true);
+	});
+
+	it('infers for a receiver too old to declare', () => {
+		expect(receiverRefusesCopies([{ name: 'a' }], () => true)).to.equal(true);
+		expect(receiverRefusesCopies([{ name: 'a' }], () => false)).to.equal(false);
 	});
 });
