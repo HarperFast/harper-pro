@@ -172,6 +172,22 @@ export class BootstrapBlob extends Resource {
   return { digest: createHash('sha256').update(actual).digest('hex'), size: actual.length, version: entry.version };
  }
 }
+export class BootstrapEcho extends Resource {
+ get() {
+  let longest = { count: 0 };
+  for (const Table of [tables.Rows, databases.system.hdb_nodes]) {
+   const counts = new Map();
+   for (const entry of Table.auditStore.getRange({ start: 1, includeLogName: true })) {
+    if (entry.tableId !== Table.tableId) continue;
+    const key = [entry.logName, entry.txnLogKey, entry.recordId, entry.type].join(' ');
+    const count = (counts.get(key) ?? 0) + 1;
+    counts.set(key, count);
+    if (count > longest.count) longest = { count, key, table: Table === tables.Rows ? 'Rows' : 'hdb_nodes' };
+   }
+  }
+  return longest;
+ }
+}
 export class BootstrapLocal extends Resource {
  get(target) {
   const Table = tables.Rows;
@@ -626,5 +642,18 @@ export class BootstrapLocal extends Resource {
 			updated.bootstrap.map((history) => history.localFloor),
 			starts
 		);
+		// peers relay a removed or restored origin's entries; a node that re-logs a re-delivered entry grows
+		// one (log, key, record) run that every peer forwards back (harper-pro#1306)
+		for (const [i, { harper }] of contexts.entries()) {
+			const response = await fetch(`${harper.httpURL}/BootstrapEcho`, {
+				signal: AbortSignal.timeout(30_000),
+				headers: {
+					Authorization: 'Basic ' + Buffer.from(`${harper.admin.username}:${harper.admin.password}`).toString('base64'),
+				},
+			});
+			assert.equal(response.status, 200);
+			const longest = await response.json();
+			assert.ok(longest.count <= 3, `node ${i} re-logged one entry ${longest.count} times: ${JSON.stringify(longest)}`);
+		}
 	});
 });
