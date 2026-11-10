@@ -109,9 +109,14 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			{ timeoutMs: 30_000, description: `node ${i} stores complete owned bodies` }
 		);
 	}
-	// A first delivery that carries several copies of one entry logs each once, which core cannot see before
-	// commit; re-logging on every re-delivery (harper-pro#1306) reaches thousands within one test.
-	async function assertNoEcho() {
+	async function assertNoEcho(lastWriteId) {
+		await waitForCondition(
+			async (signal) => {
+				const states = await Promise.all(contexts.map((_, i) => local(i, signal)));
+				return states.every((state) => state.rows.some((row) => row.id === lastWriteId));
+			},
+			{ timeoutMs: 60_000, description: `every node holds ${lastWriteId} before counting its log` }
+		);
 		for (const [i, { harper }] of contexts.entries()) {
 			const response = await fetch(`${harper.httpURL}/BootstrapEcho`, {
 				signal: AbortSignal.timeout(120_000),
@@ -121,7 +126,10 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			});
 			assert.equal(response.status, 200);
 			const longest = await response.json();
-			assert.ok(longest.count <= 3, `node ${i} logged one entry ${longest.count} times: ${JSON.stringify(longest)}`);
+			assert.ok(
+				longest.count <= 3,
+				`node ${i} logged one entry ${longest.count} times; a first delivery carrying copies logs at most a few, a re-log loop thousands: ${JSON.stringify(longest)}`
+			);
 		}
 	}
 	async function provision(i) {
@@ -581,7 +589,7 @@ export class BootstrapLocal extends Resource {
 				description: 'the lagging shard owner receives retained old-origin and fresh new-origin bodies after removal',
 			}
 		);
-		await assertNoEcho();
+		await assertNoEcho('after-rename1');
 	});
 	test('losing a whole shard requires a complete backup and cannot mint another empty baseline', async () => {
 		const paths = await Promise.all([0, 2].map(dataPath));
@@ -658,6 +666,6 @@ export class BootstrapLocal extends Resource {
 			updated.bootstrap.map((history) => history.localFloor),
 			starts
 		);
-		await assertNoEcho();
+		await assertNoEcho('after-backup');
 	});
 });
