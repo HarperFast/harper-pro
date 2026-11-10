@@ -529,12 +529,14 @@ export function renderReport(
 			const full = points.find((row) => row.step === 1);
 			const half = points.find((row) => row.step === pinned.step);
 			const increase = full && half ? half.extraReadsPer1k - full.extraReadsPer1k : null;
+			const [control] = measured([pinned]);
 			const share =
-				increase && increase > 0 && half && pinned.extraReadsPer1k !== null
-					? (half.extraReadsPer1k - pinned.extraReadsPer1k) / increase
+				increase && increase > 0 && half && control
+					? (half.extraReadsPer1k - control.extraReadsPer1k) / increase
 					: null;
+			const controlCell = pinned.saturated ? `⚠ ${fmt(servedPct(pinned), 1)}% served` : fmt(pinned.extraReadsPer1k);
 			lines.push(
-				`| ${pinned.pair} | ${pinned.workload} | ${pinned.skew} | ${fmt(full?.extraReadsPer1k)} | ${fmt(half?.extraReadsPer1k)} | ${fmt(pinned.extraReadsPer1k)} | ${share === null ? '–' : `${fmt(share * 100, 0)}%`} | ${fmt(half?.p99Ms)} / ${fmt(pinned.p99Ms)} |`
+				`| ${pinned.pair} | ${pinned.workload} | ${pinned.skew} | ${fmt(full?.extraReadsPer1k)} | ${fmt(half?.extraReadsPer1k)} | ${controlCell} | ${share === null ? '–' : `${fmt(share * 100, 0)}%`} | ${fmt(half?.p99Ms)} / ${fmt(pinned.p99Ms)} |`
 			);
 		}
 	}

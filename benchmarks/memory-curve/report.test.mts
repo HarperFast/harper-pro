@@ -202,6 +202,14 @@ describe('renderReport', () => {
 		assert.match(chart, /not drawn \(missing cells\): uniform/);
 	});
 
+	it('gives no pinning share for a saturated pinned control', () => {
+		const { markdown } = renderReport(
+			[{ ...pair, cells: [cell(1, 100, 2), cell(0.5, 1500, 4.5), cell(0.5, 0, 0, { pinned: true, saturated: true })] }],
+			{ runId: 'mctest' }
+		);
+		assert.match(markdown, /\| ⚠ 100\.0% served \| – \|/);
+	});
+
 	it('summarizes fio output and tolerates a missing run', () => {
 		assert.deepEqual(fioSummary(null), { iops: null, qd1LatencyMs: null, qd1P99Ms: null });
 		assert.equal(mermaidChart('p', 'C', []), null);
