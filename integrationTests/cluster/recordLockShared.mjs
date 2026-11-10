@@ -70,7 +70,6 @@ export async function startNode(suiteName, env, threadsCount = 1, preload) {
  */
 const DEFAULT_THREADS = Math.min(3, Math.max(2, availableParallelism() - 1));
 
-/** None of the record-lock test overrides `optionsFor` sets. */
 function defaultOptionsFor(hostname, { threadsCount = DEFAULT_THREADS, recordLocks, env = {} } = {}) {
 	const replication = {
 		securePort: hostname + ':9933',

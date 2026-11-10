@@ -421,7 +421,9 @@ describe('runBootstrap: survey, stage and activate over the transition hops', ()
 			replicatingPeers: (database) => peersOf[database] ?? [],
 		});
 	});
-	after(() => setHomesMembershipReaders(previousReaders));
+	after(() => {
+		if (previousReaders) setHomesMembershipReaders(previousReaders);
+	});
 	const slept = [];
 	const sleep = async (ms) => {
 		slept.push(ms);
@@ -729,7 +731,7 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		assert.strictEqual(h.runs.length, 1, 'the refusal cleared as soon as a peer was there');
 	});
 
-	it('a follower that finds itself activated by another node latches it', () => {
+	it('a follower activated by another node can still resume until the whole ring has agreed once', () => {
 		const h = harness();
 		h.trigger.missing('db');
 		h.rows.db = { rowClass: 'first-active', firstSet: ['a', 'b'] };
@@ -738,7 +740,27 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		assert.strictEqual(h.trigger.status('db').state, 'activated');
 		h.trigger.missing('db');
 		h.fire();
-		assert.strictEqual(h.runs.length, 0, 'a later withheld map starts nothing');
+		assert.strictEqual(h.runs.length, 1, 'a member may still be staged: resume');
+		h.trigger.release('db');
+		h.trigger.available('db');
+		h.trigger.missing('db');
+		h.fire();
+		assert.strictEqual(h.runs.length, 1, 'once a map was answered, a withheld one starts nothing');
+	});
+
+	it('reports nothing once an operator generation replaced the first, and a lone-participant refusal re-checks on a short window', async () => {
+		const h = harness({ row: { rowClass: 'empty' } });
+		h.trigger.missing('db');
+		h.fire();
+		h.runs[0].resolve({
+			outcome: 'refused',
+			reason: 'no other node replicating this database takes part in cluster record locks',
+			settled: true,
+		});
+		await h.tick();
+		assert.strictEqual(h.trigger.status('db').retryInMs, 5_000);
+		h.rows.db = { rowClass: 'other' };
+		assert.strictEqual(h.trigger.status('db'), undefined);
 	});
 
 	it('a node already active at generation 1 resumes in the background and never throws', async () => {

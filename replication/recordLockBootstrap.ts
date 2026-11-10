@@ -28,6 +28,9 @@ import {
 import type { RecordLockMode } from './recordLockConfig.ts';
 
 const MAX_NODES = 256;
+const NO_PEERS = 'no other node replicating this database takes part in cluster record locks';
+/** A peer joining clears it, so it is re-checked on a short fixed window rather than backed off. */
+const NO_PEERS_RETRY_MS = 5_000;
 const MAX_NODE_NAME_LENGTH = 256;
 const MODES: ReadonlySet<string> = new Set(['auto', 'operator', 'off']);
 
@@ -212,11 +215,7 @@ export function planBootstrap(
 			settled: true,
 		};
 	if (!participants.includes(self) || participants.length < 2)
-		return {
-			action: 'refuse',
-			reason: 'no other node replicating this database takes part in cluster record locks',
-			settled: true,
-		};
+		return { action: 'refuse', reason: NO_PEERS, settled: true };
 	const outside = outsideReplication(self, candidates, checked);
 	if (outside) return { action: 'refuse', reason: outside, settled: false };
 	const disagreeing = participants.filter((node) => !sameSet(checked.get(node)!.view, candidates));
@@ -279,16 +278,17 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 	const OUT_OF_TIME = 'the attempt ran out of time';
 	const QUEUE_HELD = 'another home-map transition held the queue';
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	const admissionDeadline = new Promise<BootstrapOutcome>((resolve) => {
-		timer = setTimeout(
-			() => resolve({ outcome: 'failed', reason: QUEUE_HELD, planned: false }),
-			timeouts.attemptMs
-		).unref();
-	});
 	let admitted = false;
+	let abandoned = false;
+	const admissionDeadline = new Promise<BootstrapOutcome>((resolve) => {
+		timer = setTimeout(() => {
+			if (!admitted) abandoned = true;
+			resolve({ outcome: 'failed', reason: QUEUE_HELD, planned: false });
+		}, timeouts.attemptMs).unref();
+	});
 	const attempt = withTransitionQueue(database, async (): Promise<BootstrapOutcome> => {
 		admitted = true;
-		if (!current()) return { outcome: 'cancelled' };
+		if (abandoned || !current()) return { outcome: 'cancelled' };
 		if (expired()) return { outcome: 'failed', reason: QUEUE_HELD, planned: false };
 		const self = peers.self();
 		if (!self) return { outcome: 'failed', reason: 'this node has no resolved node name', planned: false };
@@ -300,7 +300,7 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 		if (candidates.length < 2)
 			return {
 				outcome: 'refused',
-				reason: 'no other node replicating this database takes part in cluster record locks',
+				reason: NO_PEERS,
 				settled: true,
 			};
 		// A superseded or expired attempt sends nothing more; what it already sent the per-node planners judge.
@@ -377,7 +377,6 @@ const BOOTSTRAP_JITTER_MS = 500;
 /** How long a node another attempt just staged waits for that attempt to activate it before resuming. */
 export const BOOTSTRAP_FOLLOW_MS = 4_000;
 const RETRY_INITIAL_MS = 1_000;
-const NO_PEERS = 'no other node replicating this database takes part in cluster record locks';
 const RETRY_MAX_MS = 30_000;
 
 export interface BootstrapRowState {
@@ -438,8 +437,13 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 				log('info', `Record lock home map for ${database}: established generation 1 on ${outcome.homes.join(', ')}`);
 			return;
 		}
-		state.backoffMs = Math.min(RETRY_MAX_MS, state.backoffMs ? state.backoffMs * 2 : RETRY_INITIAL_MS);
-		state.retryAt = deps.now() + state.backoffMs;
+		if (outcome.outcome === 'refused' && outcome.reason === NO_PEERS) {
+			state.backoffMs = 0;
+			state.retryAt = deps.now() + NO_PEERS_RETRY_MS;
+		} else {
+			state.backoffMs = Math.min(RETRY_MAX_MS, state.backoffMs ? state.backoffMs * 2 : RETRY_INITIAL_MS);
+			state.retryAt = deps.now() + state.backoffMs;
+		}
 		state.lastFailure = outcome.reason;
 		// Only a refusal that will not clear by itself is answered with a 503; a cluster still converging, or
 		// a failed hop, rides core's wait.
@@ -506,13 +510,7 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 					state.retryAt = deps.now() + BOOTSTRAP_FOLLOW_MS;
 					return;
 				}
-				if (pristine && now?.rowClass === 'first-active') {
-					// Another node's attempt activated this one.
-					state.running = undefined;
-					state.activated = true;
-					return;
-				}
-				if (!now || now.rowClass === 'other') {
+				if (!now || now.rowClass === 'other' || (pristine && now.rowClass === 'first-active')) {
 					state.running = undefined;
 					return;
 				}
@@ -536,13 +534,11 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 			let state = states.get(database);
 			if (!state) states.set(database, (state = { token: 0, retryAt: 0, backoffMs: 0 }));
 			const pristine = row.rowClass !== 'first-active';
-			// This thread's own attempt completed it; a withheld map now is agreement's or a member's absence.
+			// The whole ring agreed once (`available`); a withheld map now is a member's absence, not a bootstrap's.
 			if (state.activated && !pristine) return;
 			if (!state.running && deps.now() >= state.retryAt) {
 				if (row.rowClass === 'empty' && deps.candidates(database).length < 2) {
 					settle(database, state, state.token, { outcome: 'refused', reason: NO_PEERS, settled: true });
-					// Re-checked every window, not backed off: a peer can be added at any moment.
-					state.backoffMs = 0;
 					state.retryAt = deps.now() + RETRY_INITIAL_MS;
 				} else {
 					if (state.refusal === NO_PEERS) state.refusal = undefined;
@@ -552,14 +548,24 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 			if (pristine && state.refusal !== undefined && !state.running?.planned)
 				throw new ClientError(bootstrapRefusedMessage(database), 503);
 		},
+		/** `homeMap()` answered a map: every member agreed on generation 1, so nothing is left to resume. */
+		available(database: string): void {
+			if (!deps.automatic) return;
+			let state = states.get(database);
+			if (!state) states.set(database, (state = { token: 0, retryAt: 0, backoffMs: 0 }));
+			state.activated = true;
+			state.refusal = state.lastFailure = undefined;
+		},
 		status(database: string): BootstrapStatus | undefined {
 			const state = states.get(database);
-			if (!state) return undefined;
+			const row = deps.rowState(database);
+			if (!state || !row || row.rowClass === 'other') return undefined;
 			const retryInMs = Math.max(0, Math.round(state.retryAt - deps.now()));
 			if (state.running) return { state: 'running', reason: state.lastFailure };
 			if (state.activated) return { state: 'activated' };
 			if (state.refusal !== undefined) return { state: 'refused', reason: state.refusal, retryInMs };
 			if (retryInMs > 0) return { state: 'waiting', reason: state.lastFailure, retryInMs };
+			if (row.rowClass === 'first-active') return { state: 'activated' };
 			return { state: 'idle', reason: state.lastFailure };
 		},
 		release(database: string): void {

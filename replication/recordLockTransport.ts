@@ -309,6 +309,8 @@ export interface RecordLockTransportDeps {
 	 * caller should see when that has been refused (`recordLockBootstrap.ts`).
 	 */
 	homeMapMissing?(database: string): void;
+	/** Called once per transport, the first time `homeMap()` answers a map. */
+	homeMapAvailable?(database: string): void;
 	/** The per-database flag a generation-1 ring sets when it meets a different map (`markForeignRing`). */
 	foreignRing?(auditStore: any, database: string): Float64Array;
 	/** harper-pro#852: obtain an admission from the owner worker for an off-owner `lock()`. */
@@ -393,6 +395,7 @@ export function createRecordLockTransport(
 	// own default quarantine applies — that is the correct, safe default core already enforces.
 	const grantableAfterMono = deps.isFirstIncarnation() ? deps.monotonicNow() : undefined;
 	let freshness: FreshnessBarrier | undefined;
+	let answered = false;
 	const transport: RecordLockTransport = {
 		grantableAfterMono,
 		coordinationIncarnation() {
@@ -417,7 +420,12 @@ export function createRecordLockTransport(
 		},
 		homeMap(): LockHomeMap | undefined {
 			const map = readHomeMap();
-			if (map === undefined && deps.homeMapMissing) {
+			if (map !== undefined) {
+				if (!answered) {
+					answered = true;
+					deps.homeMapAvailable?.(database);
+				}
+			} else if (deps.homeMapMissing) {
 				// A generation-1 ring withheld for meeting another map is an operator's to reconcile, not resumable.
 				const active = cacheFor();
 				if (!(active?.generation === 1 && foreignRingSeen(deps.auditStore(database)))) deps.homeMapMissing(database);
@@ -511,7 +519,7 @@ export function createDisabledRecordLockTransport(): ClusterLockTransport {
 // ---- per-thread active-generation cache, refreshed only on change --------------------------------
 
 const activeCache = new Map<string, RecordLockGenerationState | undefined>();
-/** What the last successful read of each database's row allows the automatic first generation; absent after a failed read. */
+/** Absent after a failed read: only a successful one lets the automatic first generation start. */
 const rowStates = new Map<string, BootstrapRowState>();
 
 function cacheForDatabase(database: string): RecordLockGenerationState | undefined {
@@ -816,7 +824,6 @@ function reconcileAllPeerHomesAgreement(database: string): void {
 
 const ownedDatabases = new Set<string>();
 const transports = new Map<string, ClusterLockTransport>();
-/** The registered transport's map for harper-pro's own readers: never starts an automatic first generation, never throws. */
 function peekHomeMap(database: string): LockHomeMap | undefined {
 	const transport = transports.get(database) as Partial<RecordLockTransport> | undefined;
 	try {
@@ -1093,6 +1100,7 @@ const productionDeps: RecordLockTransportDeps = {
 		// Core reads `homeMap()` on the coordinating thread; an attempt runs there and nowhere else.
 		if (ownsRecordLockCoordination(database)) bootstrapTrigger.missing(database);
 	},
+	homeMapAvailable: (database) => bootstrapTrigger.available(database),
 	foreignRing: foreignRingFlagFor,
 	ownsDatabase: ownsRecordLockCoordination,
 	homeIncarnation: currentHomeIncarnation,

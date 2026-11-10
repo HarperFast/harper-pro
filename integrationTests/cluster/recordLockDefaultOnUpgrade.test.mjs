@@ -84,7 +84,7 @@ suite('cluster record locks on LMDB with the key unset', { timeout: 300_000 }, (
 	});
 
 	after(async () => {
-		await stopNode(context);
+		if (context) await stopNode(context);
 	});
 
 	test('stay off: no coordinator is assigned, and lock() is refused by the engine', async () => {
