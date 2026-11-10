@@ -23,6 +23,7 @@ import {
 	runBootstrap,
 } from '#src/replication/recordLockBootstrap';
 import { resolveRecordLockSetting } from '#src/replication/recordLockConfig';
+import { withTransitionQueue } from '#src/replication/recordLockApply';
 import {
 	MIN_DRAIN_BACKSTOP_MS,
 	digestOf,
@@ -546,6 +547,26 @@ describe('runBootstrap: survey, stage and activate over the transition hops', ()
 		assert.ok(!late.calls.some((call) => call.startsWith('activate:')));
 	});
 
+	it('an attempt that cannot join the queue before its deadline gives up rather than waiting', async () => {
+		peersOf.held = ['b', 'c'];
+		let release;
+		const holder = withTransitionQueue('held', () => new Promise((resolve) => (release = resolve)));
+		const started = Date.now();
+		const outcome = await runBootstrap('held', {
+			peers: fakeMesh(abc).peers('a'),
+			sleep,
+			timeouts: { hopMs: 200, stageMs: 200, attemptMs: 50 },
+		});
+		assert.deepStrictEqual(outcome, {
+			outcome: 'failed',
+			reason: 'another home-map transition held the queue',
+			planned: false,
+		});
+		assert.ok(Date.now() - started < 2_000);
+		release();
+		await holder;
+	});
+
 	it('a resume where every member is already active reports nothing changed', async () => {
 		peersOf.allactive = ['b', 'c'];
 		const rows = { a: active1(abc), b: active1(abc), c: active1(abc) };
@@ -572,7 +593,8 @@ describe('runBootstrap: survey, stage and activate over the transition hops', ()
 
 describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', () => {
 	function harness(options = {}) {
-		const { automatic = true, candidates = ['a', 'b'] } = options;
+		const { automatic = true } = options;
+		let candidates = options.candidates ?? ['a', 'b'];
 		const row = 'row' in options ? options.row : { rowClass: 'empty' };
 		let now = 0;
 		const timers = [];
@@ -613,6 +635,7 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 			fire,
 			tick,
 			advance: (ms) => (now += ms),
+			setCandidates: (next) => (candidates = next),
 		};
 	}
 	const isRefusal = (error) => error.statusCode === 503 && error.message === bootstrapRefusedMessage('db');
@@ -691,11 +714,31 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		});
 	});
 
-	it('a node with no peers is refused at once, without an attempt', () => {
+	it('a node with no peers is refused at once, without an attempt, until a peer is added', () => {
 		const h = harness({ candidates: ['a'] });
 		assert.throws(() => h.trigger.missing('db'), isRefusal);
 		assert.strictEqual(h.runs.length, 0);
 		assert.match(h.trigger.status('db').reason, /no other node/);
+		h.advance(1_000);
+		assert.throws(() => h.trigger.missing('db'), isRefusal, 'still alone: re-checked, not backed off');
+		assert.strictEqual(h.trigger.status('db').retryInMs, 1_000);
+		h.setCandidates(['a', 'b']);
+		h.advance(1_000);
+		h.trigger.missing('db');
+		h.fire();
+		assert.strictEqual(h.runs.length, 1, 'the refusal cleared as soon as a peer was there');
+	});
+
+	it('a follower that finds itself activated by another node latches it', () => {
+		const h = harness();
+		h.trigger.missing('db');
+		h.rows.db = { rowClass: 'first-active', firstSet: ['a', 'b'] };
+		h.fire();
+		assert.strictEqual(h.runs.length, 0);
+		assert.strictEqual(h.trigger.status('db').state, 'activated');
+		h.trigger.missing('db');
+		h.fire();
+		assert.strictEqual(h.runs.length, 0, 'a later withheld map starts nothing');
 	});
 
 	it('a node already active at generation 1 resumes in the background and never throws', async () => {
@@ -739,7 +782,7 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		let thrown = 0;
 		const trigger = createBootstrapTrigger({
 			automatic: true,
-			rowState: () => ({ rowClass: 'first-active', firstSet: ['a', 'b'] }),
+			rowState: () => ({ rowClass: 'empty' }),
 			candidates: () => ['a', 'b'],
 			run: async () => ({ outcome: 'refused', reason: 'x', settled: true }),
 			now: () => 0,

@@ -277,9 +277,19 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 	const deadline = now() + timeouts.attemptMs;
 	const expired = () => deadline - now() <= 0;
 	const OUT_OF_TIME = 'the attempt ran out of time';
-	return withTransitionQueue(database, async (): Promise<BootstrapOutcome> => {
+	const QUEUE_HELD = 'another home-map transition held the queue';
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const admissionDeadline = new Promise<BootstrapOutcome>((resolve) => {
+		timer = setTimeout(
+			() => resolve({ outcome: 'failed', reason: QUEUE_HELD, planned: false }),
+			timeouts.attemptMs
+		).unref();
+	});
+	let admitted = false;
+	const attempt = withTransitionQueue(database, async (): Promise<BootstrapOutcome> => {
+		admitted = true;
 		if (!current()) return { outcome: 'cancelled' };
-		if (expired()) return { outcome: 'failed', reason: 'another home-map transition held the queue', planned: false };
+		if (expired()) return { outcome: 'failed', reason: QUEUE_HELD, planned: false };
 		const self = peers.self();
 		if (!self) return { outcome: 'failed', reason: 'this node has no resolved node name', planned: false };
 		const candidates = canonicalizeHomes([
@@ -356,12 +366,18 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 		if (failures.length > 0) return { outcome: 'failed', reason: failures.join('; '), planned: true };
 		return { outcome: 'activated', homes, changed: plan.stage.length > 0 };
 	});
+	attempt.catch(() => {});
+	// The queue cannot be left once joined; an attempt admitted after its deadline returns at once.
+	const raced = await Promise.race([attempt, admissionDeadline.then((late) => (admitted ? attempt : late))]);
+	clearTimeout(timer);
+	return raced;
 }
 
 const BOOTSTRAP_JITTER_MS = 500;
 /** How long a node another attempt just staged waits for that attempt to activate it before resuming. */
 export const BOOTSTRAP_FOLLOW_MS = 4_000;
 const RETRY_INITIAL_MS = 1_000;
+const NO_PEERS = 'no other node replicating this database takes part in cluster record locks';
 const RETRY_MAX_MS = 30_000;
 
 export interface BootstrapRowState {
@@ -409,23 +425,17 @@ export function bootstrapRefusedMessage(database: string): string {
 export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 	const states = new Map<string, TriggerState>();
 
-	function settle(database: string, state: TriggerState, token: number, outcome: BootstrapOutcome) {
+	function settle(database: string, state: TriggerState, token: number, outcome: BootstrapOutcome, pristine = true) {
 		if (states.get(database) !== state || state.token !== token) return;
 		state.running = undefined;
 		if (outcome.outcome === 'cancelled') return;
 		if (outcome.outcome === 'activated') {
 			state.refusal = state.lastFailure = undefined;
+			state.backoffMs = 0;
+			state.retryAt = 0;
 			state.activated = true;
-			if (outcome.changed) {
-				state.backoffMs = 0;
-				state.retryAt = 0;
+			if (outcome.changed)
 				log('info', `Record lock home map for ${database}: established generation 1 on ${outcome.homes.join(', ')}`);
-			} else {
-				// Every member was already active: the map is withheld by agreement or a member's absence,
-				// which another survey would not change soon.
-				state.backoffMs = RETRY_MAX_MS;
-				state.retryAt = deps.now() + RETRY_MAX_MS;
-			}
 			return;
 		}
 		state.backoffMs = Math.min(RETRY_MAX_MS, state.backoffMs ? state.backoffMs * 2 : RETRY_INITIAL_MS);
@@ -434,17 +444,18 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 		// Only a refusal that will not clear by itself is answered with a 503; a cluster still converging, or
 		// a failed hop, rides core's wait.
 		state.refusal = outcome.outcome === 'refused' && outcome.settled ? outcome.reason : undefined;
-		if (outcome.reason !== state.lastLogged) {
-			log('warn', `Record lock home map for ${database} was not established automatically: ${outcome.reason}`);
-			state.lastLogged = outcome.reason;
-		}
+		// A node already active at generation 1 is only waiting on a member; status carries the reason.
+		if (pristine && outcome.reason !== state.lastLogged)
+			if (log('warn', `Record lock home map for ${database} was not established automatically: ${outcome.reason}`))
+				state.lastLogged = outcome.reason;
 	}
 
-	function log(level: 'info' | 'warn', message: string): void {
+	function log(level: 'info' | 'warn', message: string): boolean {
 		try {
 			deps.log[level]?.(message);
+			return true;
 		} catch {
-			// A failing log sink must not turn into the caller's error.
+			return false;
 		}
 	}
 
@@ -462,11 +473,18 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 		} catch (error) {
 			attempt = Promise.reject(error);
 		}
+		const pristine = row.rowClass !== 'first-active';
 		attempt
 			.then(
-				(outcome) => settle(database, state, token, outcome),
+				(outcome) => settle(database, state, token, outcome, pristine),
 				(error) =>
-					settle(database, state, token, { outcome: 'failed', reason: hopError(error), planned: running.planned })
+					settle(
+						database,
+						state,
+						token,
+						{ outcome: 'failed', reason: hopError(error), planned: running.planned },
+						pristine
+					)
 			)
 			.catch(() => {});
 	}
@@ -488,7 +506,13 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 					state.retryAt = deps.now() + BOOTSTRAP_FOLLOW_MS;
 					return;
 				}
-				if (!now || now.rowClass === 'other' || (pristine && now.rowClass === 'first-active')) {
+				if (pristine && now?.rowClass === 'first-active') {
+					// Another node's attempt activated this one.
+					state.running = undefined;
+					state.activated = true;
+					return;
+				}
+				if (!now || now.rowClass === 'other') {
 					state.running = undefined;
 					return;
 				}
@@ -515,13 +539,15 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 			// This thread's own attempt completed it; a withheld map now is agreement's or a member's absence.
 			if (state.activated && !pristine) return;
 			if (!state.running && deps.now() >= state.retryAt) {
-				if (row.rowClass === 'empty' && deps.candidates(database).length < 2)
-					settle(database, state, state.token, {
-						outcome: 'refused',
-						reason: 'no other node replicating this database takes part in cluster record locks',
-						settled: true,
-					});
-				else start(database, state, row);
+				if (row.rowClass === 'empty' && deps.candidates(database).length < 2) {
+					settle(database, state, state.token, { outcome: 'refused', reason: NO_PEERS, settled: true });
+					// Re-checked every window, not backed off: a peer can be added at any moment.
+					state.backoffMs = 0;
+					state.retryAt = deps.now() + RETRY_INITIAL_MS;
+				} else {
+					if (state.refusal === NO_PEERS) state.refusal = undefined;
+					start(database, state, row);
+				}
 			}
 			if (pristine && state.refusal !== undefined && !state.running?.planned)
 				throw new ClientError(bootstrapRefusedMessage(database), 503);
