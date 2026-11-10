@@ -353,7 +353,7 @@ export function svgChart(workload: string, rows: Row[], ceilingIops: number | nu
 	if (ceilingIops) {
 		parts.push(
 			`<line x1="${margin.left}" y1="${y(ceilingIops)}" x2="${margin.left + plotWidth}" y2="${y(ceilingIops)}" stroke="#888" stroke-dasharray="4 4"/>`,
-			`<text x="${margin.left + 6}" y="${y(ceilingIops) - 6}" fill="#555">disk ceiling ${fmt(ceilingIops, 0)} IOPS (fio, 4 KiB random read)</text>`
+			`<text x="${margin.left + plotWidth - 6}" y="${y(ceilingIops) - 6}" text-anchor="end" fill="#555">disk ceiling ${fmt(ceilingIops, 0)} IOPS (fio, 4 KiB random read)</text>`
 		);
 	}
 	let legendY = margin.top;
