@@ -584,10 +584,11 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		if (!current()) return;
 		activeCache.set(database, row?.active);
 		rowStates.set(database, { rowClass: classifyHomesRow(row), firstSet: (row?.active ?? row?.staged)?.homes });
-		// A peer digest that arrived while the row was unreadable was recorded as a mismatch against
-		// no digest at all, and a socket that handshook then received none; both need the recovered one.
-		// The backoff resets only once this is done, so a failure here re-arms the whole cycle.
-		if (state.backoff.attempts > 0) {
+		// A peer digest that arrived while the row was unreadable, or before this first read, was recorded
+		// as a mismatch against no digest at all (and never checked for a second generation-1 map), and a
+		// socket that handshook then received none; both need the one just read. The backoff resets only
+		// once this is done, so a failure here re-arms the whole cycle.
+		if (state.backoff.attempts > 0 || before?.digest !== row?.active?.digest) {
 			pushHomesDigestToPeers(database);
 			reconcileAllPeerHomesAgreement(database);
 		}

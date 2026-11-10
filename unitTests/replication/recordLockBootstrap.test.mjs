@@ -896,6 +896,7 @@ describe('a generation-1 ring meeting another map', () => {
 		table({ table: 'ForeignRingA', database: 'foreignringa', attributes: [{ name: 'id', isPrimaryKey: true }] });
 		table({ table: 'ForeignRingB', database: 'foreignringb', attributes: [{ name: 'id', isPrimaryKey: true }] });
 		table({ table: 'ForeignRingC', database: 'foreignringc', attributes: [{ name: 'id', isPrimaryKey: true }] });
+		table({ table: 'ForeignRingD', database: 'foreignringd', attributes: [{ name: 'id', isPrimaryKey: true }] });
 		previousReader = setRecordLockHomesRowReader(async (database) =>
 			database === 'foreignringc'
 				? { active: { generation: 2, homes: ['a', 'b'], digest: digestOf(2, ['a', 'b']) } }
@@ -904,7 +905,8 @@ describe('a generation-1 ring meeting another map', () => {
 	});
 	after(() => {
 		setRecordLockHomesRowReader(previousReader);
-		for (const database of ['foreignringa', 'foreignringb', 'foreignringc']) forgetRecordLockHomesCache(database);
+		for (const database of ['foreignringa', 'foreignringb', 'foreignringc', 'foreignringd'])
+			forgetRecordLockHomesCache(database);
 	});
 	const ours = digestOf(1, ['a', 'b']);
 
@@ -920,6 +922,13 @@ describe('a generation-1 ring meeting another map', () => {
 		await refreshRecordLockHomesCache('foreignringb');
 		recordPeerHomesDigest('foreignringb', 'b', WITHHELD_DIGEST_PREFIX + ours);
 		assert.strictEqual(currentHomesDigest('foreignringb'), WITHHELD_DIGEST_PREFIX + ours);
+	});
+
+	it('a different map announced before the first read of the row is caught once the row is read', async () => {
+		recordPeerHomesDigest('foreignringd', 'c', digestOf(1, ['c', 'd']));
+		assert.strictEqual(currentHomesDigest('foreignringd'), undefined);
+		await refreshRecordLockHomesCache('foreignringd');
+		assert.strictEqual(currentHomesDigest('foreignringd'), WITHHELD_DIGEST_PREFIX + ours);
 	});
 
 	it('is off at a later generation, where departed and fenced nodes hold stale maps', async () => {
