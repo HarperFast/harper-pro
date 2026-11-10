@@ -5798,15 +5798,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const sourceId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined);
 			if (sourceId === undefined) return;
-			// honored by the next request on this connection even if the write below fails
+			// honored by later requests on this connection until the write below lands
 			if (options.connection) (options.connection.vetoedCopySources ??= new Set()).add(sourceId);
 			const cursor = readDbisCursorSync(dbisDB, 'copyCursor', sourceId);
-			if (!cursor || cursor.restartFullCopy) return;
-			dbisDB
-				.put([Symbol.for('copyCursor'), sourceId], { ...cursor, restartFullCopy: true })
-				?.catch?.((error: unknown) =>
+			if (cursor && !cursor.restartFullCopy) markCopyCursorRestart(sourceId, { ...cursor, restartFullCopy: true });
+			else options.connection?.vetoedCopySources?.delete(sourceId);
+		} catch (error) {
+			logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error);
+		}
+	}
+	function markCopyCursorRestart(sourceId: number, cursor: object): void {
+		try {
+			Promise.resolve(getDatabaseStores().dbisDB.put([Symbol.for('copyCursor'), sourceId], cursor)).then(
+				() => options.connection?.vetoedCopySources?.delete(sourceId),
+				(error: unknown) =>
 					logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error)
-				);
+			);
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error);
 		}
@@ -8913,6 +8920,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyModeOrderVersion = message[2];
 						copyOriginAnchors = !projectionCopy && recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						options.connection?.vetoedCopySources?.delete(copyFromNodeId);
 						noteCopyStall((tracker) =>
 							tracker.noteCopyStart(
 								copyStartKey(readDbisCursorSync(getDatabaseStores().dbisDB, 'copyCursor', copyFromNodeId), encode)
@@ -13589,8 +13597,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					),
 					databaseName
 				);
-				if (nodeId !== undefined && options.connection?.vetoedCopySources?.delete(nodeId) && copyCursor)
-					copyCursor = { ...copyCursor, restartFullCopy: true };
+				if (nodeId !== undefined && options.connection?.vetoedCopySources?.has(nodeId)) {
+					// held until the saved walk is marked or a new pass from that source replaces it
+					if (copyCursor) {
+						copyCursor = { ...copyCursor, restartFullCopy: true };
+						markCopyCursorRestart(nodeId, copyCursor);
+					} else options.connection.vetoedCopySources.delete(nodeId);
+				}
 				loadPersistedCopyBounds(copyCursor);
 				mergeCopyBoundRecordInto(copiedVersionByOrigin, copyCursor?.maxCopiedVersionByOrigin);
 				const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
