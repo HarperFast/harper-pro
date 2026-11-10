@@ -567,22 +567,25 @@ describe('replayedStubPut', function () {
 
 	it("answers the row's own local put at its head reference, reading it as committed state", () => {
 		const audit = store({ 2000: head });
-		assert.equal(
+		assert.deepEqual(
 			replayedStubPut(audit, tableId, row({ additionalAuditRefs: [{ version: 2000, nodeId: 0 }] }), copyStartTime, 4),
-			head
+			{ head, logKey: 2000 }
 		);
 		assert.deepEqual(audit.reads, [[2000, tableId, ['region', 3], 0, true]]);
 	});
 
 	it('answers the put at the row log key when the row has no head reference', () => {
 		const local = { ...head, nodeId: 4 };
-		assert.equal(replayedStubPut(store({ 2000: local }), tableId, row({ localTime: 2000 }), copyStartTime, 4), local);
+		assert.deepEqual(replayedStubPut(store({ 2000: local }), tableId, row({ localTime: 2000 }), copyStartTime, 4), {
+			head: local,
+			logKey: 2000,
+		});
 	});
 
 	it('tries the row log key after a head reference that does not hold its put', () => {
 		const audit = store({ 2000: { ...head, type: 'invalidate' }, 3000: head });
 		const entry = row({ localTime: 3000, additionalAuditRefs: [{ version: 2000, nodeId: 0 }] });
-		assert.equal(replayedStubPut(audit, tableId, entry, copyStartTime, 4), head);
+		assert.deepEqual(replayedStubPut(audit, tableId, entry, copyStartTime, 4), { head, logKey: 3000 });
 		assert.deepEqual(
 			audit.reads.map(([logKey]) => logKey),
 			[2000, 3000]

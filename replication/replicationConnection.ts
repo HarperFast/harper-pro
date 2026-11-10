@@ -1064,28 +1064,32 @@ export function replayedStubPut(
 	entry: any,
 	copyStartTime: number,
 	localNodeId: number
-): AuditRecord | undefined {
-	const isLocal = (nodeId?: number) => !nodeId || nodeId === localNodeId;
-	const logKeys: number[] = [];
+): { head: AuditRecord; logKey: number } | undefined {
 	if (entry.additionalAuditRefs)
-		for (const ref of entry.additionalAuditRefs)
-			if (isLocal(ref.nodeId) && ref.version > copyStartTime) logKeys.push(ref.version);
-	if (entry.localTime > copyStartTime) logKeys.push(entry.localTime);
-	for (const logKey of logKeys) {
-		try {
-			const head = auditStore.get(logKey, tableId, entry.key, 0, true);
-			if (
-				head?.type === 'put' &&
-				head.tableId === tableId &&
-				head.version === entry.version &&
-				isLocal(head.nodeId) &&
-				!(head.extendedType & LOCAL_ONLY) &&
-				compareKeys(head.recordId, entry.key) === 0
-			)
-				return head;
-		} catch (error) {
-			logger.debug?.('could not read the head audit entry of a copied stub', tableId, logKey, error);
+		for (const ref of entry.additionalAuditRefs) {
+			if ((ref.nodeId && ref.nodeId !== localNodeId) || !(ref.version > copyStartTime)) continue;
+			const head = readLocalPut(auditStore, tableId, entry, ref.version, localNodeId);
+			if (head) return { head, logKey: ref.version };
 		}
+	if (entry.localTime > copyStartTime) {
+		const head = readLocalPut(auditStore, tableId, entry, entry.localTime, localNodeId);
+		if (head) return { head, logKey: entry.localTime };
+	}
+}
+function readLocalPut(auditStore: any, tableId: number, entry: any, logKey: number, localNodeId: number) {
+	try {
+		const head = auditStore.get(logKey, tableId, entry.key, 0, true);
+		if (
+			head?.type === 'put' &&
+			head.tableId === tableId &&
+			head.version === entry.version &&
+			(!head.nodeId || head.nodeId === localNodeId) &&
+			!(head.extendedType & LOCAL_ONLY) &&
+			compareKeys(head.recordId, entry.key) === 0
+		)
+			return head as AuditRecord;
+	} catch (error) {
+		logger.debug?.('could not read the head audit entry of a copied stub', tableId, logKey, error);
 	}
 }
 // The receive-side watchdog fires after this much silence on a replication WS. Both client and
@@ -10557,10 +10561,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// origin on the follower. `entry.nodeId` is this node's local id for that
 														// origin (undefined/0 = us) — the same id space the wire uses.
 														const recordNodeId = entry.nodeId ?? nodeId;
-														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
 														const isReplica = Boolean(entry.metadataFlags & REPLICA);
 														const isStub = Boolean(entry.metadataFlags & (INVALIDATED | REPLICA));
-														const replayedPut =
+														const replayed =
 															isStub &&
 															!table.residency &&
 															(!entry.nodeId || entry.nodeId === nodeId) &&
@@ -10568,9 +10571,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																? replayedStubPut(auditStore, table.tableId, entry, copyStartTime, nodeId)
 																: undefined;
 														let encoded: Buffer | undefined;
-														if (replayedPut)
-															await sendAuditRecord(replayedPut, replayedPut.txnLogKey ?? copyTxnLogKey, nodeId);
+														if (replayed) await sendAuditRecord(replayed.head, replayed.logKey, nodeId);
 														else {
+															const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
 															const stubAsInvalidation =
 																isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
 															const legacyStubCopy = isStub && !stubAsInvalidation;
