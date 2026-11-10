@@ -865,7 +865,6 @@ describe('applyHomes with fenced nodes (harper-pro#973)', function () {
 	});
 });
 
-/** The steps a refusal names, parsed back out of its reason. */
 function recoveryIn(reason) {
 	const steps = [...reason.matchAll(/send (\{.*?\}) to each of (\[.*?\])/g)].map(([, body, nodes]) => ({
 		body: JSON.parse(body),
@@ -893,7 +892,7 @@ async function runStep(cluster, { body, nodes }, action) {
 describe('a fenced apply refused on a ring that names removed nodes reports the manual recovery', function () {
 	this.timeout(30_000);
 	const operator = { username: 'ops-admin' };
-	// a and b were removed from a ring {a,b,c,d}; e and f joined later and hold no row.
+	// The reported shape: a and b left the ring {a,b,c,d}, and e and f joined after it.
 	const departedRing = () => {
 		const rows = activeCluster(['a', 'b', 'c', 'd']);
 		delete rows.a;
@@ -964,6 +963,7 @@ describe('a fenced apply refused on a ring that names removed nodes reports the 
 		const partial = recoveryIn((await refused(applyHomes(sweep(), cluster.peers))).http_resp_msg.reason);
 		assert.strictEqual(partial.stage.body.generation, 2);
 		assert.deepStrictEqual(partial.stage.nodes, ['d', 'e', 'f']);
+		assert.deepStrictEqual(partial.activate.nodes, ['c', 'd', 'e', 'f'], 'activating c again is a noop');
 		await runStep(cluster, partial.stage, 'stage');
 		await runStep(cluster, partial.activate, 'activate');
 		for (const node of ['c', 'd', 'e', 'f']) {
@@ -973,7 +973,13 @@ describe('a fenced apply refused on a ring that names removed nodes reports the 
 				[2, ['c', 'd', 'e', 'f'], undefined]
 			);
 		}
-		// What the sweep sends next: no row names a or b, so they are neither in quiesce nor fenced.
+		const finished = await refused(applyHomes(sweep(), cluster.peers));
+		assert.strictEqual(recoveryIn(finished.http_resp_msg.reason), undefined);
+		assert.match(
+			finished.http_resp_msg.reason,
+			/the per-node recovery has already run: generation 2 is active on \["c","d","e","f"\], so nothing is left to run$/
+		);
+		// Central Manager's next call: no row names a or b, so they are neither in quiesce nor fenced.
 		cluster.calls.length = 0;
 		const next = await applyHomes(sweep({ quiesce: undefined, fenced: undefined }), cluster.peers);
 		assert.strictEqual(next.outcome, 'activated', next.reason);
@@ -1001,6 +1007,28 @@ describe('a fenced apply refused on a ring that names removed nodes reports the 
 		assert.strictEqual(stage.body.database, 'd"b');
 		assert.deepStrictEqual(stage.nodes, ['c', 'e', 'x"y']);
 		assert.deepStrictEqual(activate.nodes, ['c', 'e']);
+		const done = state(2, ['c', 'e']);
+		const recovered = planSurvey(
+			'd"b',
+			['c', 'e'],
+			['a', 'b', 'c', 'e', 'x"y'],
+			undefined,
+			replies({
+				'c': reply('c', { active: done, highestActedOn: 2, supportsFenced: true }),
+				'e': reply('e', { active: done, highestActedOn: 2, supportsFenced: true }),
+				'x"y': reply('x"y', {
+					staged: { ...done, quiesce: stage.body.quiesce },
+					highestActedOn: 2,
+					supportsFenced: true,
+				}),
+			}),
+			undefined,
+			['a', 'b']
+		);
+		assert.match(
+			recovered.reason,
+			/generation 2 is active on \["c","e"\] and staged on \["x\\"y"\], so nothing is left/
+		);
 	});
 
 	it('moves past a resume target a node would refuse, and offers no generation past the largest safe one', () => {
@@ -1026,6 +1054,22 @@ describe('a fenced apply refused on a ring that names removed nodes reports the 
 		);
 		assert.strictEqual(conflicting.status, 409);
 		assert.strictEqual(recoveryIn(conflicting.reason).stage.body.generation, 6, 'd holds 5 for another home set');
+		const ring = state(1, ['a', 'b', 'c', 'd']);
+		const requested = planSurvey(
+			'db',
+			homes,
+			all,
+			9,
+			replies({
+				c: reply('c', { active: ring, highestActedOn: 1, supportsFenced: true }),
+				d: reply('d', { active: ring, highestActedOn: 1, supportsFenced: true }),
+				e: reply('e', { supportsFenced: true }),
+				f: reply('f', { supportsFenced: true }),
+			}),
+			undefined,
+			['a', 'b']
+		);
+		assert.strictEqual(recoveryIn(requested.reason).stage.body.generation, 9, 'the generation the caller asked for');
 		const exhausted = planSurvey(
 			'db',
 			['c', 'd'],
@@ -1048,7 +1092,7 @@ describe('a fenced apply refused on a ring that names removed nodes reports the 
 		);
 		assert.strictEqual(exhausted.status, 409);
 		assert.strictEqual(recoveryIn(exhausted.reason), undefined);
-		assert.match(exhausted.reason, /use the per-node operations and keep it stopped until it is re-staged$/);
+		assert.match(exhausted.reason, /no generation above 9007199254740991 is left to re-home them by hand$/);
 	});
 });
 

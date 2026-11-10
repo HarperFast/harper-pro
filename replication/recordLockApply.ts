@@ -275,7 +275,7 @@ export function planSurvey(
 		return {
 			action: 'refuse',
 			status: 409,
-			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; apply without fenced once it is reachable, or ${manualRecovery(database, homes, quiesce, fenced, rows, [resumeTarget, floor + 1]) ?? 'use the per-node operations and keep it stopped until it is re-staged'}`,
+			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; ${manualRecovery(database, homes, quiesce, fenced, rows, [generation, resumeTarget], floor)}`,
 		};
 	const stages = planStages(database, homes, quiesce, rows, generation, digest);
 	if ('rejected' in stages)
@@ -316,9 +316,8 @@ function planStages(
 
 /**
  * The per-node runbook (RECORD_LOCK_HOMES_DESIGN.md "Minority survivors get a 409") for the surveyed
- * rows, at the first candidate generation every surveyed node accepts. The resume target comes first:
- * it stays put once the operator has staged it, so a re-sent call repeats the same steps through the
- * drain wait. Undefined when no candidate fits or no node is left to stage.
+ * rows, at the first of `preferred` every surveyed node accepts, else one past `floor`, which every
+ * one does: the `unlisted` check already proved `quiesce` covers each ring a row remembers.
  */
 function manualRecovery(
 	database: string,
@@ -326,19 +325,25 @@ function manualRecovery(
 	quiesce: string[],
 	fenced: string[],
 	rows: Map<string, SurveyReply>,
-	candidates: number[]
-): string | undefined {
-	for (const generation of candidates) {
-		if (!Number.isSafeInteger(generation)) return undefined;
+	preferred: number[],
+	floor: number
+): string {
+	for (const generation of new Set([...preferred, floor + 1])) {
+		if (!Number.isSafeInteger(generation)) continue;
 		const stages = planStages(database, homes, quiesce, rows, generation, digestOf(generation, homes));
 		if ('rejected' in stages) continue;
+		const departing = canonicalizeHomes([...rows.keys()].filter((node) => !homes.includes(node)));
+		if (
+			homes.every((node) => stages.alreadyActive.has(node)) &&
+			departing.every((node) => stages.alreadyStaged.has(node))
+		)
+			return `the per-node recovery has already run: generation ${generation} is active on ${JSON.stringify(homes)}${departing.length > 0 ? ` and staged on ${JSON.stringify(departing)}` : ''}, so nothing is left to run`;
 		const stageOn = canonicalizeHomes([...rows.keys()].filter((node) => !stages.alreadyActive.has(node)));
-		if (stageOn.length === 0) return undefined;
 		const stage = JSON.stringify({ operation: 'record_lock_stage_generation', database, generation, homes, quiesce });
 		const activate = JSON.stringify({ operation: 'record_lock_activate_generation', database, generation, homes });
-		return `if ${JSON.stringify(fenced)} will never run again from their current data, re-home without them by hand: send ${stage} to each of ${JSON.stringify(stageOn)}; after the last of those succeeds, wait ${DELEGATION_DRAIN_MS} ms, then send ${activate} to each of ${JSON.stringify(homes)}. Never activate after a failed stage; if interrupted, re-send this call for steps that match the current state`;
+		return `apply without fenced once it is reachable, or, if ${JSON.stringify(fenced)} will never run again from their current data, re-home without them by hand: send ${stage} to each of ${JSON.stringify(stageOn)}; after the last of those succeeds, wait ${DELEGATION_DRAIN_MS} ms, then send ${activate} to each of ${JSON.stringify(homes)}. Never activate after a failed stage; if interrupted, re-send this call for steps that match the current state`;
 	}
-	return undefined;
+	return `apply without fenced once it is reachable; no generation above ${floor} is left to re-home them by hand`;
 }
 
 export type ActivationPlan =
