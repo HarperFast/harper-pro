@@ -5798,13 +5798,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const store = auditStore ?? databaseAuditStore;
 		const sourceId = copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined);
 		if (sourceId === undefined) return;
-		// set before the read, and kept when no saved walk is visible yet: another pass's cursor clears it
+		// keyed by the received copy start, not a visible cursor's, which can be an older walk's; set before the read
 		const vetoed = (options.connection.vetoedCopySources ??= new Map());
 		vetoed.set(sourceId, copyModeStartTime);
 		try {
 			const cursor = readDbisCursorSync(dbisDB, 'copyCursor', sourceId);
-			// an already-flagged cursor is an older walk's, not the one vetoed
-			if (cursor?.copyStartTime !== undefined && !cursor.restartFullCopy) vetoed.set(sourceId, cursor.copyStartTime);
 			if (cursor && !cursor.restartFullCopy) markCopyCursorRestart(sourceId, { ...cursor, restartFullCopy: true });
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error);
@@ -10237,15 +10235,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											: undefined;
 									const unlogged =
 										logged && new Set<string>(nodesToInclude.filter((name: string) => !logged.has(name)));
+									// with no floor, where the follower holds an origin is unknown here: admission decides, as on a reconnect
 									gap =
 										bounds &&
-										relayedStartBelowCopyBound(
-											nodesToInclude,
-											currentSequenceId,
-											includeFloors,
-											bounds.settled,
-											unlogged
-										);
+										(nodesToInclude.some((name: string) => bounds.settled.has(name) && !includeFloors?.has(name)) ||
+											relayedStartBelowCopyBound(
+												nodesToInclude,
+												currentSequenceId,
+												includeFloors,
+												bounds.settled,
+												unlogged
+											));
 								} catch (error) {
 									gap = error;
 								}
