@@ -260,16 +260,38 @@ Each change of state, or of the refusal reason, logs one line beginning `Replica
 
 The top-level `cluster_status.sharding` field is keyed by database and describes active or attempted declarative tables. It is empty in the legacy-table example above. Each entry has:
 
-| Field               | Meaning                                                                                                                                                                                                                                                          |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `version`, `digest` | Installed map identity; absent if no map is installed.                                                                                                                                                                                                           |
-| `shardsDigest`      | Digest of the configured shard set, or `null` when no list is configured.                                                                                                                                                                                        |
-| `blocked`           | Whether a configuration/map error or a recovery phase other than `ready` blocks placement.                                                                                                                                                                       |
-| `state`             | `quarantined` for a startup quarantine, `held` for a live configuration/map error, the current `recovery.phase` while recovery is incomplete, or `available`.                                                                                                    |
-| `restartRequired`   | `true` for startup quarantine: repair the configuration and restart the full process. `false` does not mean recovery is complete.                                                                                                                                |
-| `recovery`          | Bootstrap/recovery phase and reason, including a missing existing-owner completeness assertion in `recovery.reason`. `origin-history-lost` refuses a reused name without its audit; restore a complete backup or rejoin with a fresh root under a new node name. |
-| `waitingOrigins`    | Origins waiting for a direct source or certified same-shard relay, with the missing source described.                                                                                                                                                            |
-| `errors`            | Reasons, such as differing peer lists, a local shard outside its list, a missing required list/map, or a refused peer map.                                                                                                                                       |
+| Field                | Meaning                                                                                                                                                                                                                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`, `digest`  | Installed map identity; absent if no map is installed.                                                                                                                                                                                                                          |
+| `shards`             | One entry per shard in the installed map, ordered by `shard`: `slots` is the number of the map's slots the shard holds, and `owners` lists the names of the nodes assigned to it, in name order. A shard with no assigned node has `owners: []`. Absent if no map is installed. |
+| `nodesOwningNoSlots` | Names of cluster members, this node included, that own no slot of the installed map: nodes with no shard, or in a shard the map does not contain. Present with `shards`, as `[]` when there are none.                                                                           |
+| `shardsDigest`       | Digest of the configured shard set, or `null` when no list is configured.                                                                                                                                                                                                       |
+| `blocked`            | Whether a configuration/map error or a recovery phase other than `ready` blocks placement.                                                                                                                                                                                      |
+| `state`              | `quarantined` for a startup quarantine, `held` for a live configuration/map error, the current `recovery.phase` while recovery is incomplete, or `available`.                                                                                                                   |
+| `restartRequired`    | `true` for startup quarantine: repair the configuration and restart the full process. `false` does not mean recovery is complete.                                                                                                                                               |
+| `recovery`           | Bootstrap/recovery phase and reason, including a missing existing-owner completeness assertion in `recovery.reason`. `origin-history-lost` refuses a reused name without its audit; restore a complete backup or rejoin with a fresh root under a new node name.                |
+| `waitingOrigins`     | Origins waiting for a direct source or certified same-shard relay, with the missing source described.                                                                                                                                                                           |
+| `errors`             | Reasons, such as differing peer lists, a local shard outside its list, a missing required list/map, or a refused peer map.                                                                                                                                                      |
+
+`shards` and `nodesOwningNoSlots` come from the installed map and the shard each node's record in the cluster membership table publishes, the same view that routes writes. The responding node does not read its own `replication.shard` setting to decide ownership, so with no installed map no owners are reported. They describe what this node sees. A listed owner can still be disconnected or refuse writes, for example when its record's shard differs from its own `replication.shard` setting, and `recovery` and `waitingOrigins` track recovery agreement separately, so read them together. A node that has just joined can be missing from both lists until its record reaches the responding node.
+
+```json
+"sharding": {
+	"data": {
+		"version": 1,
+		"digest": "5f0c...",
+		"state": "available",
+		"errors": [],
+		"shards": [
+			{ "shard": 0, "slots": 5, "owners": ["server-1.domain.com", "server-2.domain.com"] },
+			{ "shard": 1, "slots": 5, "owners": ["server-3.domain.com"] }
+		],
+		"nodesOwningNoSlots": ["server-4.domain.com"]
+	}
+}
+```
+
+The top-level `shard` of the response is the responding node's own shard, including `0`. It is absent when the node has no shard.
 
 A clear status is not proof that an owner is connected; write admission also checks the required replication route. See [configuration agreement](./sharding.md#complete-shard-id-set) and [map recovery](./residency.md#installed-maps).
 

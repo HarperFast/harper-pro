@@ -93,7 +93,7 @@ export async function clusterStatus() {
 	// getSync (not get): a get() Promise on a cache miss has no .shard/.url, so cluster_status would
 	// silently omit this node's shard/url once hdb_nodes grows past the block cache.
 	const thisNode = getHDBNodeTable().primaryStore.getSync(response.node_name);
-	if (thisNode?.shard) response.shard = thisNode.shard;
+	if (thisNode?.shard != undefined) response.shard = thisNode.shard;
 	if (thisNode?.url) response.url = thisNode.url;
 	// is_enabled now reports whether this node is an active cluster member (harper-pro#217): a removed node
 	// (or one with no peers) has no connections and reports false, instead of the previous always-true that

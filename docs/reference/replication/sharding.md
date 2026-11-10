@@ -212,6 +212,8 @@ Once installed, the snapshot is authoritative. Changing the list never recompute
 
 Setup exchanges include a digest of the list. Nodes with different lists refuse declarative writes on both sides, even after a map is installed. A configured list on one peer and no list on another also differs. A node whose own shard is outside its list, or which needs an initial map but has no list, also refuses placement. The condition appears in `cluster_status.sharding` and is logged once. Plan for this write refusal during a rolling list change.
 
+To see which nodes own which shard once a map is installed, read `cluster_status.sharding.<database>.shards` and `nodesOwningNoSlots`; see [Sharding Status](./clustering.md#sharding-status).
+
 ### Other shard configuration
 
 Shards can also be assigned per route:
