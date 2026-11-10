@@ -115,7 +115,6 @@ export function registerResidencySender(store: any, database: string, peer: stri
 			const active = Atomics.load(status, 1);
 			if (active >> 32n === generation) Atomics.compareExchange(status, 1, active, 0n);
 		},
-		/** True when this starts a refusal. */
 		refused(): boolean {
 			const before = raiseRefusalWord(refusal, REFUSED, ordinal);
 			const replayed = Atomics.load(refusal, REPLAYED);

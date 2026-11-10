@@ -219,13 +219,13 @@ describe('shouldWarnUnvouchedReplay', () => {
 });
 
 describe('receiverRefusesCopies', () => {
-	it("takes the receiver's declaration over the sender's inference", () => {
-		expect(receiverRefusesCopies([{ name: 'a', refusesCopies: false }], () => true)).to.equal(false);
-		expect(receiverRefusesCopies([{ name: 'a', refusesCopies: true }], () => false)).to.equal(true);
+	it("takes the receiver's declaration for this node over the inference", () => {
+		expect(receiverRefusesCopies([{ name: 'me', refusesCopies: false }], 'me', true)).to.equal(false);
+		expect(receiverRefusesCopies([{ name: 'me', refusesCopies: true }], 'me', false)).to.equal(true);
 	});
 
-	it('infers for a receiver too old to declare', () => {
-		expect(receiverRefusesCopies([{ name: 'a' }], () => true)).to.equal(true);
-		expect(receiverRefusesCopies([{ name: 'a' }], () => false)).to.equal(false);
+	it('infers for a receiver too old to declare, or with no entry for this node', () => {
+		expect(receiverRefusesCopies([{ name: 'me' }], 'me', true)).to.equal(true);
+		expect(receiverRefusesCopies([{ name: 'other', refusesCopies: true }], 'me', false)).to.equal(false);
 	});
 });

@@ -788,10 +788,13 @@ export function retentionResumeDecision(
 	return restricted ? 'replay-unvouched' : 'copy';
 }
 
-/** Whether the receiver refuses a copy, as its subscription request declares it, or as inferred for a peer too old to. */
-export function receiverRefusesCopies(entries: { refusesCopies?: unknown }[], inferred: () => boolean): boolean {
-	for (const entry of entries) if (typeof entry?.refusesCopies === 'boolean') return entry.refusesCopies;
-	return inferred();
+export function receiverRefusesCopies(
+	entries: { name?: string; refusesCopies?: unknown }[],
+	thisNodeName: string,
+	inferred: boolean
+): boolean {
+	const declared = entries.find((entry) => entry?.name === thisNodeName)?.refusesCopies;
+	return typeof declared === 'boolean' ? declared : inferred;
 }
 
 const purgedThrough = (bound: number | undefined) => (bound === undefined ? 'unknown' : new Date(bound).toISOString());
@@ -9141,16 +9144,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							receiverShard === undefined ? undefined : shardingSourceAgreement(databaseName, receiverShard);
 						const restrictedSendingOrigins =
 							!!receiverLayout && shardingSourceCertificate(databaseName) !== receiverLayout;
-						// without a declaration, an owner whose shard is not agreed is assumed to refuse, as its end treats this node so
-						const refusesCopies = receiverRefusesCopies(
-							data,
-							() =>
-								restrictedSendingOrigins ||
-								(receiverShard === undefined &&
-									residencyIdentityBound &&
-									Number.isInteger(announcedPeerShard) &&
-									!!readResidencyMap(databaseName))
-						);
+						// a peer too old to declare it: a wrong guess of copy is a held, reported refusal, a wrong replay loses rows
+						const refusesCopies = receiverRefusesCopies(data, getThisNodeName(), restrictedSendingOrigins);
 						const sendingProjection = data.some((node) => node.shardingProjection === true);
 						if (sendingProjection && !receiverLayout)
 							throw new Error('Sharding projection requires authenticated owned slots');
