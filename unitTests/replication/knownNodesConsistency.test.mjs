@@ -101,7 +101,6 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 		assertMatchesFreshScan('after two puts');
 
 		calls.length = 0;
-		// update_node's local metadata patch
 		await ensureNode('consistency-a', { shard: 1, revoked_certificates: ['dead01'] });
 		await waitFor(() => seen('consistency-a', (node) => node?.shard === 1), 'the patched peer to reach the listener');
 		const patched = server.nodes.find((node) => node.name === 'consistency-a');
@@ -137,7 +136,6 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 		await Nodes.put('consistency-c', { name: 'consistency-c', url: 'wss://consistency-c:9933', replicates: true });
 		const calls = [];
 		const listener = (node, id) => calls.push({ node, id });
-		// the first event tells the listener of every row the scan holds that it has not heard of yet
 		await runNodeUpdateWatcher(listener, {
 			key: WATCHER,
 			maxRestarts: 1,
@@ -148,7 +146,6 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 			'a put with no decodable value takes the stored record'
 		);
 
-		// a later delete of B that this watcher never sees as an event, and a patch event carrying only its field
 		await Nodes.delete('consistency-b');
 		calls.length = 0;
 		await runNodeUpdateWatcher(listener, {
@@ -188,5 +185,50 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 		);
 		assert.ok(!calls.some((call) => call.id === 'consistency-a' && call.node != null));
 		assertMatchesFreshScan('after a valueless put for a deleted row');
+	});
+
+	it('a queued put older than the committed delete does not revive the peer', async () => {
+		const Nodes = getHDBNodeTable();
+		const record = { name: 'consistency-a', url: 'wss://consistency-a:9933', shard: 0, replicates: true };
+		await Nodes.put('consistency-a', record);
+		const [{ version: putVersion }] = Array.from(
+			Nodes.primaryStore.getRange({ start: 'consistency-a', end: 'consistency-a\uffff', versions: true })
+		);
+		await Nodes.delete('consistency-a');
+		const calls = [];
+		await runNodeUpdateWatcher((node, id) => calls.push({ node, id }), {
+			key: WATCHER,
+			maxRestarts: 1,
+			subscribe: async () => asyncIterable([{ type: 'put', id: 'consistency-a', value: record, version: putVersion }]),
+		});
+		assert.ok(!server.nodes.some((node) => node.name === 'consistency-a'));
+		assert.ok(!calls.some((call) => call.id === 'consistency-a' && call.node != null));
+		assertMatchesFreshScan('after a stale put');
+	});
+
+	it('tells a listener that threw of the rows it missed on the next event', async () => {
+		const Nodes = getHDBNodeTable();
+		await Nodes.put('consistency-a', { name: 'consistency-a', url: 'wss://consistency-a:9933', replicates: true });
+		await Nodes.put('consistency-b', { name: 'consistency-b', url: 'wss://consistency-b:9933', replicates: true });
+		const told = [];
+		let failOnce = true;
+		const listener = (node, id) => {
+			if (id === 'consistency-a' && failOnce) {
+				failOnce = false;
+				throw new Error('listener failure');
+			}
+			told.push(id);
+		};
+		await runNodeUpdateWatcher(listener, {
+			key: WATCHER,
+			maxRestarts: 1,
+			subscribe: async () =>
+				asyncIterable([
+					{ type: 'put', id: 'consistency-b', value: null },
+					{ type: 'put', id: 'consistency-b', value: null },
+				]),
+		});
+		assert.ok(told.includes('consistency-a'), 'the row the listener threw on is delivered again');
+		assert.ok(told.includes('consistency-b'));
 	});
 });

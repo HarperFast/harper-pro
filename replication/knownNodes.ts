@@ -438,8 +438,9 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 const deliveredNodeNames = new WeakMap<(node: any, id: string) => void, Set<string>>();
 
 /**
- * Tells `listener` of every row that left `rows` since its last call (as a nullish node), then of `id`'s row
- * and every row it has not been told of, or of every row when `id` is undefined.
+ * Tells `listener` of each row that left `rows` since its last call (as a nullish node), then of `id`'s row
+ * and each row it has not been told of, or of every row when `id` is undefined. A name is recorded only once
+ * its call returns, so a throwing listener hears of it again on the next event.
  */
 function notifyNodeListener(
 	listener: (node: any, id: string) => void,
@@ -447,36 +448,47 @@ function notifyNodeListener(
 	id?: string,
 	deleted?: boolean
 ) {
-	const delivered = deliveredNodeNames.get(listener) ?? new Set();
-	deliveredNodeNames.set(listener, new Set(rows.keys()));
-	for (const name of delivered) if (!rows.has(name)) listener(undefined, name);
-	for (const [name, node] of rows) if (id === undefined || name === id || !delivered.has(name)) listener(node, name);
-	if (deleted && id !== undefined && !rows.has(id) && !delivered.has(id)) listener(undefined, id);
+	const previous = deliveredNodeNames.get(listener) ?? new Set();
+	const delivered = new Set(previous);
+	deliveredNodeNames.set(listener, delivered);
+	for (const name of previous) {
+		if (rows.has(name)) continue;
+		listener(undefined, name);
+		delivered.delete(name);
+	}
+	for (const [name, node] of rows) {
+		if (id !== undefined && name !== id && previous.has(name)) continue;
+		listener(node, name);
+		delivered.add(name);
+	}
+	if (deleted && id !== undefined && !rows.has(id) && !previous.has(id)) listener(undefined, id);
 }
+
+// the rows the last scan published, this node's included
+let publishedRows = new Map<string, any>();
 
 /**
  * Publishes server.nodes (peers) and server.shards (every row with a shard, this node's included) from one
  * synchronous hdb_nodes scan, and returns the scanned rows by key. A row reconstructed from its key after a
- * decode miss keeps the fields of its prior entry (harper-pro#460). The event's own row is decided by
- * whichever is newer, the event or the stored row: a put carries its full record and a delete removes
- * the row, while a patch carries only its changed fields and takes the stored row.
+ * decode miss keeps the fields it was last published with (harper-pro#460). The event's own row comes from
+ * the event only when the event is not older than the stored row or tombstone: a patch carries only its
+ * changed fields, so it always takes the stored row.
  */
 function publishKnownNodes(event?: any): Map<string, any> {
-	const oldNodes = server.nodes ?? [];
 	const rows = new Map<string, any>();
 	const versions = new Map<string, number>();
-	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key, version) => {
-		// only a reconstruct lacks a url; a real record keeps its freshly decoded `replicates` (PR #572 review)
-		if (!node.url) {
-			const name = node.name ?? key;
-			const oldNode = name !== undefined ? oldNodes.find((n) => n?.name === name) : undefined;
-			if (oldNode) node = mergeReconstructedNode(node, oldNode);
-		}
-		rows.set(key, node);
-		versions.set(key, version);
-	});
+	scanNodesForSubscription(
+		getHDBNodeTable().primaryStore,
+		(node, key, version) => {
+			// a real record always has a url and keeps its freshly decoded `replicates`
+			if (!node.url && publishedRows.has(key)) node = mergeReconstructedNode(node, publishedRows.get(key));
+			rows.set(key, node);
+			versions.set(key, version);
+		},
+		(key, version) => versions.set(key, version)
+	);
 	const id = event?.id ?? event?.value?.name;
-	if (id !== undefined && !(versions.get(id) > event.version)) {
+	if (id !== undefined && event.version !== undefined && !(versions.get(id) > event.version)) {
 		if (isGenuineNodeDeletion(event.type)) rows.delete(id);
 		else if (event.type === 'put' && isValidNodeRecord(event.value)) rows.set(id, event.value);
 	}
@@ -493,6 +505,7 @@ function publishKnownNodes(event?: any): Map<string, any> {
 	}
 	server.nodes = nodes;
 	server.shards = shards;
+	publishedRows = rows;
 	return rows;
 }
 
@@ -601,13 +614,21 @@ export function resolveScannedNode(
  * without standing up a server. publishKnownNodes owns the `server` bookkeeping.
  */
 const undecodedRowsWarned = new Set<unknown>();
-export function scanNodesForSubscription(store: any, onNode: (node: any, key: any, version?: number) => void) {
+export function scanNodesForSubscription(
+	store: any,
+	onNode: (node: any, key: any, version?: number) => void,
+	onDeleted?: (key: any, version?: number) => void
+) {
 	for (const entry of store.getRange({ versions: true })) {
 		const { value, key, version } = entry;
 		const node = resolveScannedNode(value, key, (probeKey) => probeNodeRow(store, probeKey));
-		if (!node) continue;
-		if (!value) {
-			// every hdb_nodes event rescans, so a row that stays undecodable warns once
+		if (!node) {
+			onDeleted?.(key, version);
+			continue;
+		}
+		if (value) undecodedRowsWarned.delete(key);
+		else {
+			// every hdb_nodes event rescans
 			const log = undecodedRowsWarned.has(key) ? logger.trace : logger.warn;
 			undecodedRowsWarned.add(key);
 			log?.(

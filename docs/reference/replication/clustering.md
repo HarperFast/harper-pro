@@ -102,7 +102,7 @@ Modifies an existing Harper instance in the cluster. Will attempt to add the nod
 }
 ```
 
-When the request carries only `revoked_certificates` and `shard`, the change is written to this node's record of `hostname` without contacting it, and replicates to the cluster from there. Any other field runs the full `add_node` exchange with that node.
+A request that changes nothing but `revoked_certificates` and/or `shard` is written to this node's record of `hostname` without contacting it, and replicates to the cluster from there. Any other field, or neither of those two, runs the full `add_node` exchange with that node.
 
 **Response**:
 

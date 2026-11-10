@@ -64,4 +64,19 @@ describe('update_node shard and metadata', function () {
 		assert.equal(row.ca, 'PEER-CA', 'the stored CA survives');
 		assert.equal(row.url, PEER_URL);
 	});
+
+	it('stores a numeric-string shard as a number, and compares it with replication.shard as one', async () => {
+		await updateNode({ operation: 'update_node', hostname: PEER, shard: '1' });
+		assert.strictEqual(getHDBNodeTable().primaryStore.getSync(PEER).shard, 1);
+		await updateNode({ operation: 'update_node', hostname: getThisNodeName(), shard: '0' });
+		await assert.rejects(updateNode({ operation: 'update_node', hostname: PEER, shard: 'one' }), /shard/);
+	});
+
+	it('runs the add_node exchange for a request with no metadata to patch', async () => {
+		await assert.rejects(
+			updateNode({ operation: 'update_node', hostname: PEER }),
+			/replication url is missing/,
+			'not a local no-op reported as success'
+		);
+	});
 });

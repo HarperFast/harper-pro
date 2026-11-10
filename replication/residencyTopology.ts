@@ -329,10 +329,7 @@ server.registerOperation?.({
 	requiresSuperUser: true,
 });
 
-/**
- * Owners come from the membership residencyOwners() routes by. `selfMembershipAgrees` is false when write
- * admission's self-membership check (residencyOwners) refuses some shard of the map for `localShard`.
- */
+/** Owners come from the membership residencyOwners() routes by, and so does its self-membership check. */
 function shardSummary(snapshot: ResidencyMapSnapshot, localShard: number | undefined) {
 	const slots = new Map<number, number>();
 	for (const { start, end, shard } of snapshot.ranges) slots.set(shard, (slots.get(shard) ?? 0) + end - start);

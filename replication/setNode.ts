@@ -6,7 +6,7 @@ import {
 	getReplicationCertAuth,
 	loadForge,
 } from '../security/certificate.ts';
-import { validateBySchema } from '../core/validation/validationWrapper.js';
+import { validateBySchema, validateAndConvertBySchema } from '../core/validation/validationWrapper.js';
 import Joi from 'joi';
 import { get } from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -451,9 +451,18 @@ export async function updateNode(req: any) {
 			`update_node does not support top-level 'subscribe'/'publish' without 'subscriptions'; supply a subscriptions array, or use set_node`
 		);
 	}
+	if (req.shard !== undefined) {
+		const { error, value } = validateAndConvertBySchema({ shard: req.shard }, validationSchema);
+		if (error) throw new ClientError(error.message);
+		req.shard = value.shard;
+	}
 	const requestHasTopology = Boolean(req.subscriptions || req.sendsTo || req.receivesFrom);
-	// decided from what the caller sent, before the stored url is filled in below
-	const metadataOnly = !requestHasTopology && !FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined);
+	// Classified before req.url is filled from the stored row below, which would make every request look
+	// like a url change.
+	const metadataOnly =
+		!requestHasTopology &&
+		(req.revoked_certificates !== undefined || req.shard !== undefined) &&
+		!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined);
 
 	if (hostname) {
 		const found = await findExistingNodeRecord(hostname, url);
