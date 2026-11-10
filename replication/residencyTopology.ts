@@ -311,7 +311,7 @@ setResidencyPlacementGuard((database, owners, requireConnected, shard, root, for
 	if (requireConnected) {
 		if (!auditStore || !acceptingOwnerReachable(auditStore, database, reachable, true))
 			throw new ResidencyPlacementError(
-				`No new shard owner is connected for ${database}; attribute-slot change refused`,
+				`No new shard owner is connected and accepting replication from this node for ${database}; attribute-slot change refused`,
 				503
 			);
 	} else if (auditStore && !acceptingOwnerReachable(auditStore, database, reachable, false))
