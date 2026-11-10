@@ -1,4 +1,3 @@
-// The refusal the write guard reads (harper-pro#1278), fenced by sender generation.
 import assert from 'node:assert';
 import { registerResidencySender, residencyOwnerRefusing } from '#src/replication/residencyTopology';
 

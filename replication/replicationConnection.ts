@@ -9141,7 +9141,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							(receiverShard === undefined &&
 								residencyIdentityBound &&
 								Number.isInteger(announcedPeerShard) &&
-								!!shardingLayout(databaseName));
+								!!readResidencyMap(databaseName));
 						const sendingProjection = data.some((node) => node.shardingProjection === true);
 						if (sendingProjection && !receiverLayout)
 							throw new Error('Sharding projection requires authenticated owned slots');
@@ -10230,7 +10230,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const own = subscribedNodeIds[ownId];
 												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
 											}
-											if (currentSequenceId > 0) subscriptionResidencySender?.replaying();
+											// a projection goes only to a receiver that asked for it, so it is accepted too
+											if (currentSequenceId > 0 || sendingProjection) subscriptionResidencySender?.replaying();
 											if (currentSequenceId === 0) {
 												copying = true;
 												const legacyCopy = await requiresLegacyCopyVerification(
@@ -13255,7 +13256,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyCursor = undefined;
 						if (nodeId !== undefined)
 							Promise.resolve()
-								.then(() => dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]))
+								.then(() => connectionSuperseded() || dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]))
 								.catch((error) =>
 									logger.warn?.(connectionId, 'could not remove the copy-resume cursor for', databaseName, error)
 								);

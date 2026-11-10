@@ -115,7 +115,7 @@ export function registerResidencySender(store: any, database: string, peer: stri
 			const active = Atomics.load(status, 1);
 			if (active >> 32n === generation) Atomics.compareExchange(status, 1, active, 0n);
 		},
-		/** The receiver closed this sender's stream refusing it. True when that starts a refusal. */
+		/** True when this starts a refusal. */
 		refused(): boolean {
 			const before = raiseRefusalWord(refusal, REFUSED, ordinal);
 			const replayed = Atomics.load(refusal, REPLAYED);
