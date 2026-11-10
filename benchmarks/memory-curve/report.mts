@@ -121,7 +121,7 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 		extraReadsPerSec: (extraReadsPer1k * okPerSec) / 1000,
 		readMBPerSec: window.disk.readBytesPerSec / 1e6,
 		readLatencyMs: window.disk.meanReadLatencyMs,
-		dataHitPct: cell.server.blockCache.dataHitRate === null ? null : cell.server.blockCache.dataHitRate * 100,
+		dataHitPct: cell.server.blockCache?.dataHitRate == null ? null : cell.server.blockCache.dataHitRate * 100,
 		majorFaultsPerSec: window.majorFaultsPerSec,
 		p50Ms: measure.latencySummary.p50Ms,
 		p99Ms: measure.latencySummary.p99Ms,

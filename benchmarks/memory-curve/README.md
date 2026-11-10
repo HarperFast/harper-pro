@@ -35,7 +35,7 @@ Memory steps are fractions of `memory.max` = 6 GB (a Level-2 instance: 4 GB nomi
 
 Per pair: fio on the data disk (4 KiB random reads, QD 1 and QD 256) → load all records over REST → wait for compaction → snapshot the data directory (XFS reflink). Then, for every calibration and every cell: restore the snapshot, drop the page cache, start Harper under the cell's policy.
 
-- **Calibration** (per workload and skew): closed loop, no memory limit, 2 + 2 minutes; the maximum rate.
+- **Calibration** (per workload and skew): closed loop, no memory limit, the SST and blob files read into the page cache first, then 2 minutes warm-up + 2 measured; the in-memory maximum rate.
 - **Cell**: open loop at 50% of that maximum; 10 minutes warm-up, then 10 minutes measured.
 
 ## Measurements

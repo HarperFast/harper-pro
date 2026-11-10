@@ -22,6 +22,7 @@ import {
 	blockCacheWindow,
 	parseServerSnapshot,
 	windowMetrics,
+	type BlockCacheCounters,
 	type ServerSnapshot,
 } from './counters.mts';
 import { summarize } from './histogram.mts';
@@ -236,6 +237,8 @@ class Orchestrator {
 		const { calibrateWarmupSec, calibrateMeasureSec } = pair.timing;
 		await this.log(`calibrate: ${workload} ${skew}`);
 		await this.prepare(policy);
+		// The maximum is meant with the dataset in memory; a 2-minute warm-up cannot read 24 GB at disk IOPS.
+		await this.ctl(['warm-page-cache'], 60 * 60_000);
 		try {
 			const startMs = Date.now() + 2000;
 			const phases = [
@@ -275,22 +278,37 @@ class Orchestrator {
 		}
 	}
 
+	/**
+	 * Block-cache counters come from Harper itself, so a server stalled under memory pressure may not
+	 * answer; the kernel counters that show the stall are still recorded, with the cache stats unavailable.
+	 */
+	async cacheCounters(notes: string[]): Promise<BlockCacheCounters | null> {
+		try {
+			return blockCacheCounters(await this.harperMetrics(), 'data');
+		} catch (error) {
+			notes.push(`block-cache counters unavailable: ${(error as Error).message.split('\n')[0]}`);
+			return null;
+		}
+	}
+
 	/** Server counters at the start, middle and end of a window, and block-cache counters at its ends. */
 	async windowSnapshots(windowStartMs: number, windowMs: number) {
+		const notes: string[] = [];
 		await delay(Math.max(0, windowStartMs - Date.now()));
 		const start = await this.snapshot();
-		const cacheStart = blockCacheCounters(await this.harperMetrics(), 'data');
+		const cacheStart = await this.cacheCounters(notes);
 		await delay(Math.max(0, windowStartMs + windowMs / 2 - Date.now()));
 		const middle = await this.snapshot();
 		await delay(Math.max(0, windowStartMs + windowMs - Date.now()));
 		const end = await this.snapshot();
-		const cacheEnd = blockCacheCounters(await this.harperMetrics(), 'data');
+		const cacheEnd = await this.cacheCounters(notes);
 		const window = windowMetrics(start, end);
 		return {
 			window,
 			firstHalf: windowMetrics(start, middle),
 			secondHalf: windowMetrics(middle, end),
-			blockCache: blockCacheWindow(cacheStart, cacheEnd, window.seconds),
+			blockCache: cacheStart && cacheEnd ? blockCacheWindow(cacheStart, cacheEnd, window.seconds) : null,
+			notes,
 		};
 	}
 

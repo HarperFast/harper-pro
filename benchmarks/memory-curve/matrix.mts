@@ -215,7 +215,7 @@ export function estimatedHours(plan: PairPlan, loadRecordsPerSec = 8000): number
 	const seconds =
 		plan.records / loadRecordsPerSec +
 		1800 +
-		plan.calibrations.length * (calibrateWarmupSec + calibrateMeasureSec + restart) +
+		plan.calibrations.length * (calibrateWarmupSec + calibrateMeasureSec + restart + 120) +
 		plan.cells.length * (warmupSec + measureSec + restart);
 	return seconds / 3600;
 }

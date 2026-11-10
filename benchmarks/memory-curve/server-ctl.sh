@@ -122,6 +122,10 @@ restore)
 	rm -rf "$ROOT"
 	cp -a --reflink=always "$PRISTINE" "$ROOT"
 	;;
+warm-page-cache)
+	# Only for the unconstrained calibration: these reads are charged to this shell's cgroup, not the container's.
+	find "$ROOT" -type f \( -name '*.sst' -o -name '*.blob' \) -print0 | xargs -0 -r -P 4 cat >/dev/null
+	;;
 metrics)
 	ops '{"operation":"system_information","attributes":["metrics"]}'
 	;;
@@ -142,7 +146,7 @@ fio)
 	rm -f "$file"
 	;;
 *)
-	echo "usage: server-ctl.sh counters|start|stop|logs|drop-caches|init-root|snapshot|has-snapshot|restore|metrics|sizes|fio" >&2
+	echo "usage: server-ctl.sh counters|start|stop|logs|drop-caches|warm-page-cache|init-root|snapshot|has-snapshot|restore|metrics|sizes|fio" >&2
 	exit 2
 	;;
 esac

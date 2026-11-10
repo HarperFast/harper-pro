@@ -616,9 +616,23 @@ class Launcher {
 
 	/** Pairs whose VMs hold results that exist nowhere else. */
 	unsavedPairs(): string[] {
-		return this.manifest.pairs
-			.filter((pair) => !pair.saved && pair.outcome !== 'lost' && pair.client.externalIp)
-			.map((pair) => pair.name);
+		return this.manifest.pairs.filter((pair) => !pair.saved && pair.client.externalIp).map((pair) => pair.name);
+	}
+
+	/** A resumed run may come from another address than the one its SSH rule admits. */
+	async refreshSshSource(): Promise<void> {
+		const sshSource = await this.detectSshSource();
+		if (sshSource === this.manifest.sshSource) return;
+		log(`firewall: SSH source ${this.manifest.sshSource} -> ${sshSource}`);
+		await this.gcloud([
+			'compute',
+			'firewall-rules',
+			'update',
+			`mc-${this.options.runId}-ssh`,
+			`--source-ranges=${sshSource}`,
+		]);
+		this.manifest.sshSource = sshSource;
+		await this.saveManifest();
 	}
 
 	async cleanup(): Promise<void> {
@@ -737,6 +751,7 @@ async function main(): Promise<void> {
 			for (const pair of launcher.manifest.pairs) await launcher.startOrchestrator(pair.client.externalIp!);
 		} else {
 			await launcher.loadManifest();
+			await launcher.refreshSshSource();
 			await launcher.refreshAddresses();
 		}
 		await launcher.waitForPairs();
