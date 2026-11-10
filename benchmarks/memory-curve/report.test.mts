@@ -111,15 +111,24 @@ describe('knee and slopes', () => {
 		assert.match(knee(rows.slice(0, 2)).description, /not reached/);
 	});
 
-	it('computes extra reads per GiB removed between adjacent steps', () => {
+	it('treats a saturated cell that completed no request as the knee', () => {
+		const stalled = cellRow(cell(0.5, 0, 0, { saturated: true }), calibration, dataset, 'p');
+		stalled.p99Ms = null;
+		stalled.okPerSec = 0;
+		const result = knee([rows[0], rows[1], stalled]);
+		assert.equal(result.memoryGiB, 3);
+		assert.match(result.description, /no request completed, saturated \(0\.0% served\)/);
+	});
+
+	it('computes extra reads per GiB removed between adjacent unsaturated steps', () => {
 		const result = slopes(rows);
-		assert.equal(result.length, 3);
+		assert.equal(result.length, 2);
 		const first = result[0];
 		assert.equal(first.fromGiB, 6);
 		assert.ok(Math.abs(first.toGiB - 4.2) < 0.01);
 		// (500 - 100) reads/s per 10k req/s = 40 per 1k, over 1.8 GiB
 		assert.ok(Math.abs(first.extraReadsPerGiBPer1k - 40 / 1.8) < 0.1, `${first.extraReadsPerGiBPer1k}`);
-		assert.equal(result[2].saturated, true);
+		assert.ok(Math.abs(result[1].toGiB - 3) < 0.01);
 	});
 });
 
@@ -162,6 +171,8 @@ describe('renderReport', () => {
 		assert.match(markdown, /Cells with no result \(1\):\*\* d2x-1k\/C-zipf-1-35pct/);
 		assert.ok(charts['chart-C.svg'].startsWith('<svg'));
 		assert.match(charts['chart-C.svg'], /disk ceiling 5432 IOPS/);
+		assert.match(markdown, /\| ⚠ 100\.0% served \(40\.0\) \|/);
+		assert.match(markdown, /steps cut because a cell saturated: uniform at 0\.25/);
 	});
 
 	it('subtracts no baseline from a calibration whose window was invalid', () => {

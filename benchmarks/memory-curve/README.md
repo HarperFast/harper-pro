@@ -42,12 +42,12 @@ Per pair: fio on the data disk (4 KiB random reads, QD 1 and QD 256) → load al
 
 Per cell, over the measured window:
 
-| source                       | values                                                                                                                                                                                                        |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| client                       | offered and completed rate; p50/p99/p99.9 latency measured from each request's scheduled send time (no coordinated omission); shed (in-flight cap reached), timeouts (10 s), errors; schedule lag; client CPU |
-| `/proc/diskstats`, data disk | reads/s, read bytes/s, mean read latency (time in queue + device ÷ reads; unavailable when there are no reads), writes, utilization                                                                           |
-| container cgroup             | `io.stat` reads, `memory.stat` major faults/s and file/anon bytes, `memory.events`, `cpu.stat` (CPU per request), `memory.pressure` / `io.pressure` / `cpu.pressure` stall %                                  |
-| Harper `system_information`  | RocksDB block-cache hit rate, overall and data blocks, for the `data` database                                                                                                                                |
+| source                       | values                                                                                                                                                                                                                                                                                                            |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| client                       | offered and completed rate; p50/p99/p99.9 latency measured from each request's scheduled send time (no coordinated omission); shed (in-flight cap reached), timeouts (10 s), errors; schedule lag; client CPU                                                                                                     |
+| `/proc/diskstats`, data disk | reads/s, read bytes/s, mean read latency (time in queue + device ÷ reads; unavailable when there are no reads), writes, utilization                                                                                                                                                                               |
+| container cgroup             | `io.stat` reads on the data disk and on every device (the boot disk holds the image, whose code pages are read back when the page cache is squeezed), `memory.stat` major faults/s and file/anon bytes, `memory.events`, `cpu.stat` (CPU per request), `memory.pressure` / `io.pressure` / `cpu.pressure` stall % |
+| Harper `system_information`  | RocksDB block-cache hit rate, overall and data blocks, for the `data` database                                                                                                                                                                                                                                    |
 
 A cell is **invalid** if the container restarted or was OOM-killed, a counter went backwards, or more than 0.1% of requests failed with errors. It is **saturated** (kept, flagged ⚠) if more than 0.1% of requests were shed or timed out, or under 99% of the offered rate completed; latency percentiles then cover completed requests only. Counters are also taken at the middle of the window, so drift between halves is visible in the cell JSON.
 
@@ -84,8 +84,9 @@ Outputs go to `benchmarks/memory-curve/runs/<run-id>/` (git-ignored): `manifest.
 
 - **memory / data**: the cell's `memory.max` over the on-disk dataset (SST + blob files after load and compaction).
 - **reads per 1k**: data-disk reads per completed request × 1000, i.e. reads/s per 1,000 req/s. **Extra** subtracts the same figure from the unconstrained calibration of that workload and skew.
-- **p99 knee**: the largest memory step whose p99 is at least 2× the lowest p99 in its series.
-- **reads per GB removed**: the change in extra reads per 1k between adjacent steps divided by the memory removed, tagged with data / (mean memory of the two steps).
+- **p99 knee**: the largest memory step whose p99 is at least 2× the lowest p99 in its series, or that saturated (including one that completed no request).
+- **saturated cells** show the share of the offered rate served instead of reads: their reads are those of a server that stopped keeping up. Slopes skip them, and charts draw them as a cross on the top edge.
+- **reads per GB removed**: the change in extra reads per 1k between adjacent unsaturated steps divided by the memory removed, tagged with data / (mean memory of the two steps).
 - **pinned share**: the fraction of the 100% → 50% increase in extra reads that pinning the block cache at its 100% size removes, i.e. the block cache's part of the loss, with the page cache's part as the remainder.
 
 ## What it does not represent

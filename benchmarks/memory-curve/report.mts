@@ -38,6 +38,12 @@ export interface Row {
 	readLatencyMs: number | null;
 	dataHitPct: number | null;
 	majorFaultsPerSec: number;
+	/** The container's reads on every device; null for results recorded before it was measured. */
+	allDeviceReadsPerSec: number | null;
+	allDeviceReadMBPerSec: number | null;
+	/** Container anonymous and page-cache memory at the end of the window. */
+	anonGiB: number | null;
+	pageCacheGiB: number | null;
 	p50Ms: number | null;
 	p99Ms: number | null;
 	p999Ms: number | null;
@@ -94,6 +100,10 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 			readLatencyMs: null,
 			dataHitPct: null,
 			majorFaultsPerSec: 0,
+			allDeviceReadsPerSec: null,
+			allDeviceReadMBPerSec: null,
+			anonGiB: null,
+			pageCacheGiB: null,
 			p50Ms: null,
 			p99Ms: null,
 			p999Ms: null,
@@ -127,6 +137,10 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 		readLatencyMs: window.disk.meanReadLatencyMs,
 		dataHitPct: cell.server.blockCache?.dataHitRate == null ? null : cell.server.blockCache.dataHitRate * 100,
 		majorFaultsPerSec: window.majorFaultsPerSec,
+		allDeviceReadsPerSec: window.cgroupIoAllDevices?.readsPerSec ?? null,
+		allDeviceReadMBPerSec: window.cgroupIoAllDevices ? window.cgroupIoAllDevices.readBytesPerSec / 1e6 : null,
+		anonGiB: window.memoryEnd ? window.memoryEnd.anonBytes / GiB : null,
+		pageCacheGiB: window.memoryEnd ? window.memoryEnd.fileBytes / GiB : null,
 		p50Ms: measure.latencySummary.p50Ms,
 		p99Ms: measure.latencySummary.p99Ms,
 		p999Ms: measure.latencySummary.p999Ms,
@@ -163,7 +177,7 @@ export interface Knee {
 }
 
 export function knee(series: Row[]): Knee {
-	const points = curve(series).filter((row) => row.p99Ms !== null);
+	const points = curve(series).filter((row) => row.p99Ms !== null || row.saturated);
 	if (points.length === 0) return { description: 'no valid cells', memoryGiB: null, ratio: null };
 	if (points[0].saturated)
 		return {
@@ -172,11 +186,11 @@ export function knee(series: Row[]): Knee {
 			ratio: points[0].ratio,
 		};
 	const baseline = Math.min(...points.filter((row) => !row.saturated).map((row) => row.p99Ms!));
-	const hit = points.find((row) => row.p99Ms! >= KNEE_FACTOR * baseline || row.saturated);
+	const hit = points.find((row) => row.saturated || row.p99Ms! >= KNEE_FACTOR * baseline);
 	if (!hit)
 		return { description: `not reached down to ${fmt(points.at(-1)!.memoryGiB)} GB`, memoryGiB: null, ratio: null };
 	return {
-		description: `${fmt(hit.memoryGiB)} GB (memory/data ${fmt(hit.ratio)}): p99 ${fmt(hit.p99Ms)} ms vs ${fmt(baseline)} ms${hit.saturated ? ', saturated' : ''}`,
+		description: `${fmt(hit.memoryGiB)} GB (memory/data ${fmt(hit.ratio)}): ${hit.p99Ms === null ? 'no request completed' : `p99 ${fmt(hit.p99Ms)} ms vs ${fmt(baseline)} ms`}${hit.saturated ? `, saturated (${fmt(servedPct(hit), 1)}% served)` : ''}`,
 		memoryGiB: hit.memoryGiB,
 		ratio: hit.ratio,
 	};
@@ -190,12 +204,14 @@ export interface Slope {
 	toGiB: number;
 	dataToMemory: number;
 	extraReadsPerGiBPer1k: number;
-	saturated: boolean;
 }
 
-/** Extra reads/s per GiB of memory removed, per 1,000 req/s, between adjacent curve points. */
+/**
+ * Extra reads/s per GiB of memory removed, per 1,000 req/s, between adjacent unsaturated curve points;
+ * a saturated cell measured a server that stopped serving the offered load.
+ */
 export function slopes(series: Row[]): Slope[] {
-	const points = curve(series);
+	const points = curve(series).filter((row) => !row.saturated);
 	const result: Slope[] = [];
 	for (let i = 1; i < points.length; i++) {
 		const higher = points[i - 1];
@@ -208,10 +224,13 @@ export function slopes(series: Row[]): Slope[] {
 			toGiB: lower.memoryGiB,
 			dataToMemory: lower.dataGiB / ((higher.memoryGiB + lower.memoryGiB) / 2),
 			extraReadsPerGiBPer1k: (lower.extraReadsPer1k - higher.extraReadsPer1k) / (higher.memoryGiB - lower.memoryGiB),
-			saturated: higher.saturated || lower.saturated,
 		});
 	}
 	return result;
+}
+
+export function servedPct(row: Row): number {
+	return row.offeredPerSec > 0 ? (row.okPerSec / row.offeredPerSec) * 100 : 0;
 }
 
 export function fmt(value: number | null | undefined, digits?: number): string {
@@ -252,7 +271,9 @@ export function fioSummary(fio: any): { iops: number | null; qd1LatencyMs: numbe
 
 /** A Mermaid xychart of extra disk reads/s against memory/data, one line per skew. */
 export function mermaidChart(pair: string, workload: string, rows: Row[]): string | null {
-	const points = curve(rows);
+	const stalled = curve(rows).filter((row) => row.saturated);
+	const stalledRatios = new Set(stalled.map((row) => fmt(row.ratio, 2)));
+	const points = curve(rows).filter((row) => !stalledRatios.has(fmt(row.ratio, 2)));
 	const ratios = [...new Set(points.map((row) => fmt(row.ratio, 2)))];
 	const bySkew = groupBy(points, (row) => row.skew);
 	// xychart has no gaps: a skew missing any step is left out rather than drawn through a fake zero.
@@ -267,7 +288,10 @@ export function mermaidChart(pair: string, workload: string, rows: Row[]): strin
 	const max = Math.max(1, ...points.map((row) => row.extraReadsPerSec));
 	const legend =
 		skews.map((skew, i) => `${skew} = ${PALETTE[i]}`).join(', ') +
-		(omitted.length > 0 ? `; not drawn (missing cells): ${omitted.join(', ')}` : '');
+		(omitted.length > 0 ? `; not drawn (missing cells): ${omitted.join(', ')}` : '') +
+		(stalled.length > 0
+			? `; steps cut because a cell saturated: ${stalled.map((row) => `${row.skew} at ${fmt(row.ratio, 2)}`).join(', ')}`
+			: '');
 	return [
 		'```mermaid',
 		`%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "${skews.map((_, i) => PALETTE[i]).join(', ')}"}}}}%%`,
@@ -295,7 +319,10 @@ export function svgChart(workload: string, rows: Row[], ceilingIops: number | nu
 	const ratios = points.map((row) => row.ratio);
 	const minX = Math.log10(Math.min(...ratios, 1) * 0.8);
 	const maxX = Math.log10(Math.max(...ratios, 1) * 1.25);
-	const maxY = Math.log10(1 + Math.max(10, ceilingIops ?? 0, ...points.map((row) => row.extraReadsPerSec))) * 1.05;
+	const maxY =
+		Math.log10(
+			1 + Math.max(10, ceilingIops ?? 0, ...points.filter((row) => !row.saturated).map((row) => row.extraReadsPerSec))
+		) * 1.05;
 	const x = (ratio: number) => margin.left + ((Math.log10(ratio) - minX) / (maxX - minX)) * plotWidth;
 	const y = (value: number) => margin.top + plotHeight - (Math.log10(1 + Math.max(0, value)) / maxY) * plotHeight;
 	const pairs = [...new Set(points.map((row) => row.pair))];
@@ -334,13 +361,21 @@ export function svgChart(workload: string, rows: Row[], ceilingIops: number | nu
 		const { pair, skew } = series[0];
 		const color = PALETTE[skewIndex(skew) % PALETTE.length];
 		const dash = dashes[pairs.indexOf(pair) % dashes.length];
-		const path = series
+		const served = series.filter((row) => !row.saturated);
+		const path = served
 			.map((row, i) => `${i === 0 ? 'M' : 'L'}${x(row.ratio).toFixed(1)},${y(row.extraReadsPerSec).toFixed(1)}`)
 			.join(' ');
 		parts.push(`<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-dasharray="${dash}"/>`);
-		for (const row of series) {
+		for (const row of served) {
 			parts.push(
-				`<circle cx="${x(row.ratio).toFixed(1)}" cy="${y(row.extraReadsPerSec).toFixed(1)}" r="${row.saturated ? 5 : 3}" fill="${row.saturated ? 'white' : color}" stroke="${color}"/>`
+				`<circle cx="${x(row.ratio).toFixed(1)}" cy="${y(row.extraReadsPerSec).toFixed(1)}" r="3" fill="${color}" stroke="${color}"/>`
+			);
+		}
+		for (const row of series.filter((row) => row.saturated)) {
+			const cx = x(row.ratio);
+			const cy = margin.top + 6;
+			parts.push(
+				`<path d="M${(cx - 5).toFixed(1)},${cy - 5} L${(cx + 5).toFixed(1)},${cy + 5} M${(cx - 5).toFixed(1)},${cy + 5} L${(cx + 5).toFixed(1)},${cy - 5}" stroke="${color}" stroke-width="2"/>`
 			);
 		}
 		parts.push(
@@ -350,7 +385,7 @@ export function svgChart(workload: string, rows: Row[], ceilingIops: number | nu
 		legendY += 18;
 	}
 	parts.push(
-		`<text x="${width - margin.right + 15}" y="${legendY + 14}" fill="#555">hollow point = saturated cell</text>`,
+		`<text x="${width - margin.right + 15}" y="${legendY + 14}" fill="#555">× on top edge = saturated cell</text>`,
 		'</svg>'
 	);
 	return parts.join('\n');
@@ -428,7 +463,9 @@ export function renderReport(
 			const row = byLabel.get(label);
 			if (!row) return '';
 			if (!row.valid) return 'invalid';
-			return `${fmt(row.extraReadsPerSec)} (${fmt(row.p99Ms)})${row.saturated ? ' ⚠' : ''}${row.clientLimited ? ' ‡' : ''}`;
+			if (row.saturated)
+				return `⚠ ${fmt(servedPct(row), 1)}% served (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
+			return `${fmt(row.extraReadsPerSec)} (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
 		});
 		lines.push(
 			`| ${group[0].pair} | ${group[0].workload} | ${group[0].skew} | ${fmt(group[0].offeredPerSec, 0)} | ${cells.join(' | ')} | ${knee(group).description} |`
@@ -436,7 +473,7 @@ export function renderReport(
 	}
 	lines.push(
 		'',
-		`⚠ = saturated: more than 0.1% of scheduled requests shed or timed out, or under 99% of the offered rate completed. ‡ = client-limited (load-generator CPU above 85% or schedule lag p99 above 10 ms); left out of knees, slopes and charts. Knee: largest memory step whose p99 is ≥ ${KNEE_FACTOR}× the series' lowest p99.`
+		`⚠ = saturated: more than 0.1% of scheduled requests shed or timed out, or under 99% of the offered rate completed; the cell shows the share of the offered rate served (p99 ms) instead of reads, and is left out of slopes. ‡ = client-limited (load-generator CPU above 85% or schedule lag p99 above 10 ms); left out of knees, slopes and charts. Knee: largest memory step whose p99 is ≥ ${KNEE_FACTOR}× the series' lowest p99.`
 	);
 	const missing = pairs.flatMap((pair) => {
 		const present = new Set(pair.cells.map((cell) => cell.cell.id));
@@ -462,7 +499,7 @@ export function renderReport(
 	const allSlopes = [...series.values()].flatMap(slopes).sort((a, b) => a.dataToMemory - b.dataToMemory);
 	for (const slope of allSlopes) {
 		lines.push(
-			`| ${fmt(slope.dataToMemory)} | ${slope.pair} | ${slope.workload} | ${slope.skew} | ${fmt(slope.fromGiB)} → ${fmt(slope.toGiB)} GB | ${fmt(slope.extraReadsPerGiBPer1k)}${slope.saturated ? ' ⚠' : ''} |`
+			`| ${fmt(slope.dataToMemory)} | ${slope.pair} | ${slope.workload} | ${slope.skew} | ${fmt(slope.fromGiB)} → ${fmt(slope.toGiB)} GB | ${fmt(slope.extraReadsPerGiBPer1k)} |`
 		);
 	}
 
@@ -504,12 +541,12 @@ export function renderReport(
 
 	lines.push('', '<details><summary>All cells</summary>', '');
 	lines.push(
-		'| pair | workload | skew | step | mem GB | mem/data | offered | ok/s | loss % | disk reads/s | 2nd vs 1st half % | reads/1k | extra/1k | read MB/s | read await ms | block-cache data hit % | major faults/s | p50 | p99 | p99.9 ms | CPU ms/req | PSI mem some % | PSI io some % | valid |'
+		'| pair | workload | skew | step | mem GB | mem/data | offered | ok/s | loss % | disk reads/s | 2nd vs 1st half % | reads/1k | extra/1k | read MB/s | read await ms | block-cache data hit % | major faults/s | all-device reads/s | all-device read MB/s | anon GB | page cache GB | p50 | p99 | p99.9 ms | CPU ms/req | PSI mem some % | PSI io some % | valid |'
 	);
-	lines.push(`|${' --- |'.repeat(24)}`);
+	lines.push(`|${' --- |'.repeat(28)}`);
 	for (const row of [...rows].sort((a, b) => seriesKey(a).localeCompare(seriesKey(b)) || b.memoryGiB - a.memoryGiB)) {
 		lines.push(
-			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsDriftPct, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.valid ? (row.clientLimited ? 'client-limited' : 'yes') : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
+			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsDriftPct, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.allDeviceReadsPerSec, 0)} | ${fmt(row.allDeviceReadMBPerSec)} | ${fmt(row.anonGiB)} | ${fmt(row.pageCacheGiB)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.valid ? (row.clientLimited ? 'client-limited' : 'yes') : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
 		);
 	}
 	lines.push('', '</details>');

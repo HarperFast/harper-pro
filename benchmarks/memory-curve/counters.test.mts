@@ -80,6 +80,7 @@ describe('parseServerSnapshot', () => {
 			ioMs: 4000,
 		});
 		assert.deepEqual(snapshot.cgroupIo, { rbytes: 7 * 4096, rios: 7, wbytes: 4096000, wios: 1000 });
+		assert.deepEqual(snapshot.cgroupIoAllDevices, { rbytes: 999 + 7 * 4096, rios: 9 + 7 });
 		assert.equal(snapshot.memoryStat.file, 2000000);
 		assert.equal(snapshot.memoryEvents.oom_kill, 0);
 		assert.equal(snapshot.memoryMax, 6442450944);
@@ -138,6 +139,7 @@ describe('windowMetrics', () => {
 		assert.equal(metrics.disk.readBytesPerSec, (8000 * 512) / 10);
 		assert.equal(metrics.disk.meanReadLatencyMs, 1);
 		assert.equal(metrics.cgroupIo!.readsPerSec, 95);
+		assert.equal(metrics.cgroupIoAllDevices.readsPerSec, 95);
 		assert.equal(metrics.majorFaultsPerSec, 5);
 		assert.equal(metrics.cpuCores, 2);
 		assert.equal(metrics.psi.memorySomePct, 5);

@@ -33,6 +33,8 @@ export interface ServerSnapshot {
 	device: string;
 	disk: DiskCounters;
 	cgroupIo: { rbytes: number; rios: number; wbytes: number; wios: number } | null;
+	/** The container's reads on every device, including image and code pages read back from the boot disk. */
+	cgroupIoAllDevices: { rbytes: number; rios: number };
 	memoryStat: Record<string, number>;
 	memoryEvents: Record<string, number>;
 	cpuStat: Record<string, number>;
@@ -96,18 +98,34 @@ export function parseDiskstatsLine(line: string): { device: string; counters: Di
 	};
 }
 
+function ioStatLine(line: string): { device: string; values: Record<string, number> } {
+	const [device, ...pairs] = line.split(/\s+/);
+	const values: Record<string, number> = {};
+	for (const pair of pairs) {
+		const [name, value] = pair.split('=');
+		values[name] = Number(value);
+	}
+	return { device, values };
+}
+
 export function parseIoStat(lines: string[], devnum: string): ServerSnapshot['cgroupIo'] {
 	for (const line of lines) {
-		const [key, ...pairs] = line.split(/\s+/);
-		if (key !== devnum) continue;
-		const values: Record<string, number> = {};
-		for (const pair of pairs) {
-			const [name, value] = pair.split('=');
-			values[name] = Number(value);
-		}
+		const { device, values } = ioStatLine(line);
+		if (device !== devnum) continue;
 		return { rbytes: values.rbytes ?? 0, rios: values.rios ?? 0, wbytes: values.wbytes ?? 0, wios: values.wios ?? 0 };
 	}
 	return null;
+}
+
+export function sumIoStatReads(lines: string[]): ServerSnapshot['cgroupIoAllDevices'] {
+	const total = { rbytes: 0, rios: 0 };
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		const { values } = ioStatLine(line);
+		total.rbytes += values.rbytes ?? 0;
+		total.rios += values.rios ?? 0;
+	}
+	return total;
 }
 
 export function parsePressure(lines: string[]): PressureCounters {
@@ -133,6 +151,7 @@ export function parseServerSnapshot(raw: string): ServerSnapshot {
 		device,
 		disk: counters,
 		cgroupIo: parseIoStat(map.get('io.stat') ?? [], devnum),
+		cgroupIoAllDevices: sumIoStatReads(map.get('io.stat') ?? []),
 		memoryStat: keyValueLines(required(map, 'memory.stat')),
 		memoryEvents: keyValueLines(required(map, 'memory.events')),
 		cpuStat: keyValueLines(required(map, 'cpu.stat')),
@@ -159,6 +178,7 @@ export interface WindowMetrics {
 		utilization: number;
 	};
 	cgroupIo: { readsPerSec: number; readBytesPerSec: number; writesPerSec: number; writeBytesPerSec: number } | null;
+	cgroupIoAllDevices: { readsPerSec: number; readBytesPerSec: number };
 	majorFaultsPerSec: number;
 	cpuCores: number;
 	psi: {
@@ -231,6 +251,13 @@ export function windowMetrics(before: ServerSnapshot, after: ServerSnapshot): Wi
 			utilization: delta(before.disk.ioMs, after.disk.ioMs, 'disk.ioMs') / 1000 / seconds,
 		},
 		cgroupIo,
+		cgroupIoAllDevices: {
+			readsPerSec:
+				delta(before.cgroupIoAllDevices.rios, after.cgroupIoAllDevices.rios, 'io.stat all devices rios') / seconds,
+			readBytesPerSec:
+				delta(before.cgroupIoAllDevices.rbytes, after.cgroupIoAllDevices.rbytes, 'io.stat all devices rbytes') /
+				seconds,
+		},
 		majorFaultsPerSec:
 			delta(before.memoryStat.pgmajfault ?? 0, after.memoryStat.pgmajfault ?? 0, 'memory.stat.pgmajfault') / seconds,
 		cpuCores:
