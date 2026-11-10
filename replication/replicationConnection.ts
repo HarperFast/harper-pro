@@ -13240,6 +13240,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						shardingProjection = true;
 						projectionRequested = true;
 					}
+					// a projection persists no cursor, so one here predates the restriction and asks for a copy this node refuses
+					if (copyCursor) {
+						logger.warn?.(
+							`Discarding the copy-resume cursor for ${node.name} on database ${databaseName}: this node owns sharding slots that peer cannot copy, so it resumes ${shardingProjection ? 'by projection' : 'from its floor'} instead`
+						);
+						if (nodeId !== undefined) dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
+						copyCursor = undefined;
+					}
 				}
 				const ownedCopyPending =
 					nodeId === undefined || copyCursor || restrictedOrigins

@@ -12,6 +12,8 @@
  * must log the refusal once, show it as `stuckCopy` in cluster_status, and hold its reconnects, and a write
  * through node 0 for a key node 1 owns returns 503 rather than an acknowledgement no owner will see.
  * Node 1's next subscription, once the forcing has stopped, clears the refusal in the same node 0 process.
+ * Last, node 0 restarts holding a copy-resume cursor from before the route was restricted: it discards the
+ * cursor instead of asking node 1 for a copy it would refuse.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -264,5 +266,22 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		ok(accepted);
 		await ownerHolds(1, OWNED_BY[1][0], 'after-refusal');
 		ok(await holds(nodes[1], OWNED_BY[1][1], 'while-0-down'), 'the refused write changed nothing on node 1');
+	});
+
+	test('a copy-resume cursor left from before the route was restricted asks node 1 for no copy (harper-pro#1315)', async () => {
+		await killHarper({ harper: nodes[0] });
+		const marks = await Promise.all(nodes.map(logMark));
+		const cursor = { copyStartTime: Date.now() - 60_000, currentTable: 'Rows', afterKey: OWNED_BY[0][0], copyOrder: 1 };
+		await start(0, { HARPER_TEST_INJECT_COPY_CURSOR_JSON: JSON.stringify({ db: 'data', cursor }) });
+		await waitForCondition(async (signal) => (await socketTo(nodes[0], nodes[1], signal))?.connected, {
+			timeoutMs: 90_000,
+			description: "node 0's leg from node 1 connected",
+		});
+		await delay(5000);
+		const refusals = await linesSince(nodes[0], marks[0], REFUSED);
+		equal(refusals.length, 0, `node 0 refused a copy it asked for:\n${refusals.join('\n')}`);
+		ok((await linesSince(nodes[0], marks[0], 'Discarding the copy-resume cursor')).length >= 1, 'cursor discarded');
+		await put(nodes[1], OWNED_BY[0][1], 'after-cursor');
+		await ownerHolds(0, OWNED_BY[0][1], 'after-cursor');
 	});
 });
