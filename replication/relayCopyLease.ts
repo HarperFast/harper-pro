@@ -87,8 +87,15 @@ export function holdRelayCopyLease(
 		renew() {
 			if (released) return;
 			if (!running()) return lease.release();
-			const expiry = millis(clock() + RELAY_COPY_LEASE_TTL_MS);
-			if (held && Atomics.compareExchange(slots, held.index, held.expiry, expiry) === held.expiry) held.expiry = expiry;
+			const now = clock();
+			const expiry = millis(now + RELAY_COPY_LEASE_TTL_MS);
+			// a lapsed slot claims again, which counts: a walk that started during the lapse must see that a pass ran
+			if (
+				held &&
+				held.expiry > millis(now) &&
+				Atomics.compareExchange(slots, held.index, held.expiry, expiry) === held.expiry
+			)
+				held.expiry = expiry;
 			else if (!claim()) {
 				lease.release();
 				onLost();

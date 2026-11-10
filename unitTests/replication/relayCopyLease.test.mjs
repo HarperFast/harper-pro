@@ -76,6 +76,20 @@ describe('relay copy lease', () => {
 		assert.strictEqual(relayCopyLeaseHeld(store, 'data', now + 1), false);
 	});
 
+	it('counts a renewal after its slot lapsed as a new claim', () => {
+		const store = sharedStore();
+		const lease = hold(store, 'data');
+		const claims = relayCopyLeaseClaims(store, 'data');
+		now += RELAY_COPY_LEASE_TTL_MS - 1;
+		lease.renew();
+		assert.strictEqual(relayCopyLeaseClaims(store, 'data'), claims);
+		now += RELAY_COPY_LEASE_TTL_MS + 1;
+		assert.strictEqual(relayCopyLeaseHeld(store, 'data', now), false);
+		lease.renew();
+		assert.strictEqual(relayCopyLeaseHeld(store, 'data', now), true);
+		assert.strictEqual(relayCopyLeaseClaims(store, 'data'), claims + 1n);
+	});
+
 	it('releases on the renewal after its pass stopped, and never claims again', () => {
 		const store = sharedStore();
 		let running = true;
