@@ -523,9 +523,10 @@ class Launcher {
 	}
 
 	async startOrchestrator(pair: PairRecord): Promise<void> {
-		await this.ssh(pair.client.externalIp!, `bash ${REMOTE}/client-ctl.sh start`);
+		// Recorded first: a start whose acknowledgement is lost may still be running.
 		pair.started = true;
 		await this.saveManifest();
+		await this.ssh(pair.client.externalIp!, `bash ${REMOTE}/client-ctl.sh start`);
 	}
 
 	async pairState(client: string): Promise<{ marker: 'DONE' | 'FAILED' | null; alive: boolean; status: any }> {

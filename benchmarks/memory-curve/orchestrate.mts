@@ -234,7 +234,10 @@ class Orchestrator {
 
 	async calibrate(workload: string, skew: string, policy: MemoryPolicy): Promise<number> {
 		const file = join(this.out, 'calibration', `${workload}-${skew}.json`);
-		if (existsSync(file)) return JSON.parse(await readFile(file, 'utf8')).maxPerSec;
+		if (existsSync(file)) {
+			const cached = JSON.parse(await readFile(file, 'utf8'));
+			if (cached.server.window.invalidReasons.length === 0) return cached.maxPerSec;
+		}
 		const { client, pair } = this.plan;
 		const { calibrateWarmupSec, calibrateMeasureSec } = pair.timing;
 		await this.log(`calibrate: ${workload} ${skew}`);
@@ -262,6 +265,10 @@ class Orchestrator {
 			);
 			const measure = phaseSummary(result.measure, calibrateMeasureSec);
 			if (result.measure.errors > 0) throw new Error(`calibration errors: ${result.measure.errorSamples.join('; ')}`);
+			// Every cell of this workload and skew subtracts the calibration's reads, so a bad window must not be saved.
+			if (server.window.invalidReasons.length > 0) {
+				throw new Error(`calibration window invalid: ${server.window.invalidReasons.join('; ')}`);
+			}
 			await writeJSON(file, {
 				schema: CALIBRATION_SCHEMA,
 				runId: this.plan.runId,

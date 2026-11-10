@@ -18,7 +18,10 @@ start)
 	echo $! >orchestrator.pid
 	;;
 stop)
-	if alive; then kill "$(cat orchestrator.pid)"; fi
+	if alive; then
+		kill "$(cat orchestrator.pid)"
+		for _ in $(seq 1 30); do alive || break; sleep 1; done
+	fi
 	;;
 status)
 	for marker in DONE FAILED; do
