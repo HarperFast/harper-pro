@@ -17,7 +17,7 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile, chmod, rm } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -80,8 +80,8 @@ interface PairRecord {
 	name: string;
 	server: VmRecord;
 	client: VmRecord;
-	/** How the pair's orchestrator ended, or `lost` when its client stopped answering. */
-	outcome?: 'DONE' | 'FAILED' | 'lost';
+	/** How the pair's orchestrator ended; `lost` when its client stopped answering, `crashed` when it kept dying. */
+	outcome?: 'DONE' | 'FAILED' | 'lost' | 'crashed';
 	/** Where its results are now: verified copy, or best-effort copy of an unfinished pair. */
 	saved?: 'fetched' | 'partial';
 }
@@ -158,6 +158,21 @@ function parseOptions(argv: string[]): Options {
 	};
 }
 
+/** Retries an ssh/scp call that failed before reaching the host, when the remote command never ran. */
+async function retryConnect<T>(operation: () => Promise<T>, attempts = 4): Promise<T> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await operation();
+		} catch (error) {
+			const stderr = String((error as { stderr?: string }).stderr ?? '');
+			const connectFailure =
+				/connect to host .* port \d+: |kex_exchange_identification|Connection closed by .* port \d+$/m.test(stderr);
+			if (!connectFailure || attempt >= attempts) throw error;
+			await delay(15_000 * attempt);
+		}
+	}
+}
+
 function exec(file: string, args: string[], timeoutMs = 10 * 60_000): Promise<string> {
 	return new Promise((resolve, reject) => {
 		execFile(file, args, { timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -220,28 +235,30 @@ class Launcher {
 	}
 
 	ssh(host: string, command: string, timeoutMs = 10 * 60_000): Promise<string> {
-		return exec('ssh', [...this.sshArgs(host), command], timeoutMs);
+		return retryConnect(() => exec('ssh', [...this.sshArgs(host), command], timeoutMs));
 	}
 
 	scp(sources: string[], destination: string, timeoutMs = 30 * 60_000): Promise<string> {
-		return exec(
-			'scp',
-			[
-				'-i',
-				this.key,
-				'-o',
-				'IdentitiesOnly=yes',
-				'-o',
-				'BatchMode=yes',
-				'-o',
-				'StrictHostKeyChecking=accept-new',
-				'-o',
-				`UserKnownHostsFile=${join(this.runDir, 'known_hosts')}`,
-				'-r',
-				...sources,
-				destination,
-			],
-			timeoutMs
+		return retryConnect(() =>
+			exec(
+				'scp',
+				[
+					'-i',
+					this.key,
+					'-o',
+					'IdentitiesOnly=yes',
+					'-o',
+					'BatchMode=yes',
+					'-o',
+					'StrictHostKeyChecking=accept-new',
+					'-o',
+					`UserKnownHostsFile=${join(this.runDir, 'known_hosts')}`,
+					'-r',
+					...sources,
+					destination,
+				],
+				timeoutMs
+			)
 		);
 	}
 
@@ -420,8 +437,6 @@ class Launcher {
 			})
 		);
 		await this.refreshAddresses();
-		this.manifest.state = 'running';
-		await this.saveManifest();
 	}
 
 	async refreshAddresses(): Promise<void> {
@@ -531,7 +546,7 @@ class Launcher {
 		for (;;) {
 			let pending = 0;
 			for (const pair of this.manifest.pairs) {
-				if (pair.saved === 'fetched' || pair.outcome === 'lost') continue;
+				if (pair.saved === 'fetched' || pair.outcome === 'lost' || pair.outcome === 'crashed') continue;
 				let state;
 				try {
 					state = await this.pairState(pair.client.externalIp!);
@@ -550,6 +565,7 @@ class Launcher {
 					continue;
 				}
 				const { marker, alive, status } = state;
+				if (!marker && alive) pending++;
 				log(
 					`${pair.name}: ${marker ?? status.phase ?? 'starting'} ${status.done ?? 0}/${status.total ?? '?'} ${status.current ?? ''}`
 				);
@@ -565,15 +581,18 @@ class Launcher {
 					}
 					continue;
 				}
-				pending++;
 				if (!alive) {
 					const count = (restarts.get(pair.name) ?? 0) + 1;
 					if (count > 3) {
-						throw new Error(
+						pair.outcome = 'crashed';
+						await this.saveManifest();
+						log(
 							`${pair.name}: orchestrator died ${count - 1} times; see ${REMOTE}/orchestrate.out on ${pair.client.name}`
 						);
+						continue;
 					}
 					restarts.set(pair.name, count);
+					pending++;
 					log(`${pair.name}: orchestrator not running and no result marker; restarting it (it resumes)`);
 					await this.startOrchestrator(pair.client.externalIp!);
 				}
@@ -614,7 +633,7 @@ class Launcher {
 		}
 	}
 
-	/** Pairs whose VMs hold results that exist nowhere else. */
+	/** Pairs whose VMs may hold results not copied here; a partial copy is taken only after the pair stopped. */
 	unsavedPairs(): string[] {
 		return this.manifest.pairs.filter((pair) => !pair.saved && pair.client.externalIp).map((pair) => pair.name);
 	}
@@ -735,22 +754,35 @@ async function main(): Promise<void> {
 			);
 	}
 	if (options.dryRun) return;
-	if (options.command === 'run' && existsSync(join(launcher.runDir, 'manifest.json'))) {
-		throw new Error(
-			`run ${options.runId} already exists; use resume, status or cleanup for it, or pick another --run-id`
-		);
+	if (options.command === 'run') {
+		await mkdir(join(HERE, 'runs'), { recursive: true });
+		// Non-recursive, so two launches with one run id cannot both own it.
+		await mkdir(launcher.runDir, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+			if (error.code !== 'EEXIST') throw error;
+			throw new Error(
+				`run ${options.runId} already exists; use resume, status or cleanup for it, or pick another --run-id`
+			);
+		});
 	}
 	let finished = false;
 	try {
 		if (options.command === 'run') {
-			await mkdir(launcher.runDir, { recursive: true });
-			await chmod(launcher.runDir, 0o700);
 			const tarball = await launcher.sourceTarball();
 			await launcher.create(plans);
 			await launcher.provision(plans, tarball);
 			for (const pair of launcher.manifest.pairs) await launcher.startOrchestrator(pair.client.externalIp!);
+			launcher.manifest.state = 'running';
+			await launcher.saveManifest();
 		} else {
 			await launcher.loadManifest();
+			if (launcher.manifest.state === 'creating') {
+				throw new Error(`run ${options.runId} never finished provisioning; delete it with cleanup and start a new run`);
+			}
+			for (const pair of launcher.manifest.pairs) {
+				// A resumed pair is polled afresh: a lost client may be reachable again, and an earlier partial copy is stale.
+				if (pair.outcome === 'lost' || pair.outcome === 'crashed') pair.outcome = undefined;
+				if (pair.saved === 'partial') pair.saved = undefined;
+			}
 			await launcher.refreshSshSource();
 			await launcher.refreshAddresses();
 		}
@@ -769,8 +801,10 @@ async function main(): Promise<void> {
 			const retry = `node benchmarks/memory-curve/run.mts resume --run-id ${options.runId} --project ${options.project}`;
 			try {
 				if (!launcher.manifest) await launcher.loadManifest();
-				if (!finished) await launcher.fetchPartial();
-				const unsaved = launcher.unsavedPairs();
+				// Before the orchestrators start, the VMs hold nothing measured.
+				const measuring = launcher.manifest.state !== 'creating';
+				if (!finished && measuring) await launcher.fetchPartial();
+				const unsaved = measuring ? launcher.unsavedPairs() : [];
 				if (unsaved.length > 0) {
 					log(
 						`keeping the run's resources: results of ${unsaved.join(', ')} exist only on their VMs (which delete themselves ` +

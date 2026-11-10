@@ -374,6 +374,8 @@ class Orchestrator {
 					(invalidReasons.length ? `, INVALID: ${invalidReasons.join('; ')}` : '')
 			);
 		} catch (error) {
+			// stop saves this container's log tail for `logs`
+			await this.ctl(['stop']).catch(() => {});
 			const logs = await this.ctl(['logs']).catch(() => '');
 			await writeJSON(file, {
 				...base,
