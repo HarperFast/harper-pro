@@ -7924,12 +7924,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			await settleCopyBounds(dbisDB, copiedVersionByOrigin, peerId, rootStore, pass, filled, passState?.startTime ?? 0);
 			settledPass = pass;
 			logger.debug?.(connectionId, 'settled copy bounds for', databaseName, Object.fromEntries(copiedVersionByOrigin));
-			try {
-				const earlier = earlierReservationSlots(dbisDB, peerId, pass);
-				if (earlier.length) await writeCopyBoundRows(dbisDB, peerId, rootStore, { release: earlier });
-			} catch (error) {
-				// they stay honored until the hold's timeout
-				logger.warn?.(connectionId, 'could not release earlier copy reservations for', databaseName, error);
+			// a pass that lost its socket during the settle leaves them to the next pass's settle: a clock stepped back
+			// can make a later attempt's token read as earlier
+			if (!wsClosed && !connectionSuperseded()) {
+				try {
+					const earlier = earlierReservationSlots(dbisDB, peerId, pass);
+					if (earlier.length) await writeCopyBoundRows(dbisDB, peerId, rootStore, { release: earlier });
+				} catch (error) {
+					// they stay honored until the hold's timeout
+					logger.warn?.(connectionId, 'could not release earlier copy reservations for', databaseName, error);
+				}
 			}
 			// the bounds that keep earlier starts void are committed above, so another peer's row can go now; a release
 			// that fails leaves its hole, which still refuses
@@ -10202,7 +10206,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							subscriptionToHdbNodes?.end();
 							wakeSender?.(); // an idle sender settles now rather than at the next transaction
 						});
-						/** Withholds relayed origins until this node's inbound base copy settles (harper-pro#1299). */
 						/** Whether to hold back relayed origins; undefined once unreadable copy bounds closed the session. */
 						const withholdingActive = (): boolean | undefined => {
 							try {
@@ -10214,6 +10217,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								close(1011, 'Replication could not read the copy bounds');
 							}
 						};
+						/** Withholds relayed origins until this node's inbound base copy settles (harper-pro#1299). */
 						const withholdRelayedOrigins = () => {
 							const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
 							const heldStarts = new Set<string>(nodeSubscriptions.map(({ name }) => name));

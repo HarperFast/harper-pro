@@ -95,6 +95,20 @@ describe('region topology state (harper-pro#1291)', function () {
 		);
 	});
 
+	it('keeps the topology and its caches when a rebuild finds the same links, and replaces them when links change', async () => {
+		await putRows(peers);
+		server.nodes = [...peers];
+		const first = currentRegionTopology();
+		// a node event replaces server.nodes without changing membership
+		server.nodes = [...peers];
+		assert.strictEqual(currentRegionTopology(), first);
+		env.setProperty('replication_gateway', false);
+		server.nodes = [...peers];
+		const changed = currentRegionTopology();
+		assert.notStrictEqual(changed, first);
+		assert.deepEqual(changed.gatewaysByRegion.get('east'), ['state-a2', 'state-a3']);
+	});
+
 	it('keeps the full mesh while a member has no region', async () => {
 		await putRows([...peers, { name: 'state-old', replicates: true }]);
 		server.nodes = [...peers, { name: 'state-old', replicates: true }];

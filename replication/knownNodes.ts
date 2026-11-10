@@ -14,7 +14,13 @@ import { logger } from '../core/utility/logging/logger.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 import { CONFIRMATION_STATUS_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
 import { createBackoff } from './backoff.ts';
-import { deriveRegionTopology, topologyAllowsDirect, validRegion, type RegionTopology } from './regionTopology.ts';
+import {
+	deriveRegionTopology,
+	topologyAllowsDirect,
+	topologySignature,
+	validRegion,
+	type RegionTopology,
+} from './regionTopology.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -1034,10 +1040,12 @@ export function currentRegionTopology(): RegionTopology {
 	)
 		return topologyCache.topology;
 	const selfName = getThisNodeName();
+	const labels = selfTopologyLabels();
+	// a member with no region turns the topology off before its replication is read
 	const self = {
 		name: selfName,
-		...selfTopologyLabels(),
-		replicates: selfNodeReplicates(getHDBNodeTable().primaryStore, selfName),
+		...labels,
+		replicates: labels.region !== null && selfNodeReplicates(getHDBNodeTable().primaryStore, selfName),
 	};
 	const members: any[] = [self];
 	// an unlabeled node decides the gate alone: the table cannot turn it on
@@ -1051,6 +1059,15 @@ export function currentRegionTopology(): RegionTopology {
 		(previous?.active !== topology.active || previous?.inactiveReason !== topology.inactiveReason)
 	)
 		logger.info?.(topology.active ? 'Region topology active' : `Region topology off: ${topology.inactiveReason}`);
+	// unchanged links keep the topology and its recipient and residency caches
+	if (
+		previous &&
+		previous.inactiveReason === topology.inactiveReason &&
+		topologySignature(previous) === topologySignature(topology)
+	) {
+		topologyCache = { ...topologyCache!, nodes, count: nodes.length, at: now };
+		return previous;
+	}
 	topologyCache = { nodes, count: nodes.length, at: now, topology, recipients: new WeakMap(), residency: new Map() };
 	return topology;
 }

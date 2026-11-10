@@ -44,7 +44,7 @@ describe('relay copy lease', () => {
 		now = T;
 	});
 	afterEach(() => {
-		for (const lease of leases ?? []) lease.release();
+		leases?.forEach((lease) => lease.release());
 	});
 
 	it('is held from the claim until the release, for its own database only', () => {
