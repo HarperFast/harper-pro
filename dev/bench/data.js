@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794210833351,
+  "lastUpdate": 1794296999963,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -7435,6 +7435,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2404.01,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "b64ae52aab39e612464f0fb5fd7b2e01fd5ff47e",
+          "message": "Stop the Gemini Code Assist app reviewing every PR when it opens (#1302)\n\nThe GEMINI_ALWAYS_ON variable only gates the label-opt-in gemini-review.yml\nworkflow. Reviews from gemini-code-assist[bot] come from the GitHub App,\nwhich reviews on pull_request_opened by default when the repo has no\n.gemini/config.yaml. Turn off the automatic help, summary and review; a\n`/gemini review` comment still requests one.\n\n\nDispatch-Task: harper-pro-gemini-app-autoreview-off\n\nCo-authored-by: Claude Sonnet 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-10T04:11:00Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/b64ae52aab39e612464f0fb5fd7b2e01fd5ff47e"
+        },
+        "date": 1794296997838,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 6718.89,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 17055.62,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 13443.57,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 7953.99,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 6122.89,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2567.76,
             "unit": "ops/sec"
           }
         ]
