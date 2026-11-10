@@ -109,6 +109,21 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			{ timeoutMs: 30_000, description: `node ${i} stores complete owned bodies` }
 		);
 	}
+	// A first delivery that carries several copies of one entry logs each once, which core cannot see before
+	// commit; re-logging on every re-delivery (harper-pro#1306) reaches thousands within one test.
+	async function assertNoEcho() {
+		for (const [i, { harper }] of contexts.entries()) {
+			const response = await fetch(`${harper.httpURL}/BootstrapEcho`, {
+				signal: AbortSignal.timeout(120_000),
+				headers: {
+					Authorization: 'Basic ' + Buffer.from(`${harper.admin.username}:${harper.admin.password}`).toString('base64'),
+				},
+			});
+			assert.equal(response.status, 200);
+			const longest = await response.json();
+			assert.ok(longest.count <= 3, `node ${i} logged one entry ${longest.count} times: ${JSON.stringify(longest)}`);
+		}
+	}
 	async function provision(i) {
 		const hostname = await getNextAvailableLoopbackAddress();
 		const dataRootDir = await mkdtemp(
@@ -566,6 +581,7 @@ export class BootstrapLocal extends Resource {
 				description: 'the lagging shard owner receives retained old-origin and fresh new-origin bodies after removal',
 			}
 		);
+		await assertNoEcho();
 	});
 	test('losing a whole shard requires a complete backup and cannot mint another empty baseline', async () => {
 		const paths = await Promise.all([0, 2].map(dataPath));
@@ -642,18 +658,6 @@ export class BootstrapLocal extends Resource {
 			updated.bootstrap.map((history) => history.localFloor),
 			starts
 		);
-		// peers relay a removed or restored origin's entries; a node that re-logs a re-delivered entry grows
-		// one (log, key, record) run that every peer forwards back (harper-pro#1306)
-		for (const [i, { harper }] of contexts.entries()) {
-			const response = await fetch(`${harper.httpURL}/BootstrapEcho`, {
-				signal: AbortSignal.timeout(30_000),
-				headers: {
-					Authorization: 'Basic ' + Buffer.from(`${harper.admin.username}:${harper.admin.password}`).toString('base64'),
-				},
-			});
-			assert.equal(response.status, 200);
-			const longest = await response.json();
-			assert.ok(longest.count <= 3, `node ${i} re-logged one entry ${longest.count} times: ${JSON.stringify(longest)}`);
-		}
+		await assertNoEcho();
 	});
 });
