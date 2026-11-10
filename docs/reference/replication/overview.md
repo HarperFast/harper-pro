@@ -379,7 +379,6 @@ Notes:
 - A write confirmed with `replicatedConfirmation` or `X-Replicate-To: ...;confirm=N` is acknowledged only by the nodes that subscribe to the writer: its own region's nodes, plus the remote gateways when the writer is a gateway. A larger count is refused before the write commits.
 - Client subscription checkpoints need a certified floor for every origin, which a node receiving an origin only through a relay does not hold, so they are not issued on such nodes.
 - `region` and `gateway` shape traffic only. They are not a security boundary: a node with valid cluster credentials can still subscribe to any peer that authorizes it.
-- When failover cannot use a region (no regions set, or a direct link breaks), it prefers the peer with the lowest measured latency, in doubling buckets; peers in the same bucket keep the name order failover used before.
 
 ## Monitoring Replication
 

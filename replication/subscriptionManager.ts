@@ -1855,8 +1855,7 @@ export async function startOnMainThread(options) {
 		// if a node is disconnected, we need to reassign the subscriptions to another node
 		// we try to do this in a deterministic way so that we don't end up with a cycle that short circuits
 		// a node that may have more recent updates, so we try to go to the next node in the list, using
-		// a sorted list of node names that all nodes should have and use. The nearest latency bucket goes
-		// first; within a bucket that ring order still decides, so a single-zone cluster fails over as before.
+		// a sorted list of node names that all nodes should have and use.
 		try {
 			logger.info('Disconnected from node', connection.name, connection.url, 'finished', !!connection.finished);
 			const nodeMapKeys = Array.from(nodeMap.keys());
@@ -1904,14 +1903,8 @@ export async function startOnMainThread(options) {
 			const shard = shardingFailoverShard(connection.database, mainNode.shard);
 			const entryFor = (name: string) =>
 				connectionReplicationMap.get(getNodeURL(nodeMap.get(name)))?.get(connection.database);
-			let candidates = orderFailoverCandidates(nodeNames, existingIndex, (name) => entryFor(name)?.latency);
 			const topology = regionTopologyFor(connection.database);
-			const originRegion = topology?.regionOf.get(nodeNames[existingIndex]);
-			if (originRegion !== undefined) {
-				// a peer in the origin's region has its writes over a LAN link
-				const inRegion = candidates.filter((name) => topology.regionOf.get(name) === originRegion);
-				candidates = [...inRegion, ...candidates.filter((name) => !inRegion.includes(name))];
-			}
+			const candidates = orderFailoverCandidates(nodeNames, existingIndex, topology?.regionOf);
 			for (const nextNodeName of candidates) {
 				const failoverWorkerEntry = entryFor(nextNodeName);
 				if (

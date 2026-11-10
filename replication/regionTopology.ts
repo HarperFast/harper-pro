@@ -94,29 +94,23 @@ export function topologySignature(topology: RegionTopology): string {
 	return JSON.stringify([[...topology.regionOf].sort(), [...topology.gatewaysByRegion].sort()]);
 }
 
-const LATENCY_BUCKET_CEILING = 30;
-
-/** Doubling buckets (≤1, ≤2, ≤4 … ms); an unmeasured link sorts last. */
-export function latencyBucket(latency: number | undefined): number {
-	if (latency === undefined || !(latency > 0) || !Number.isFinite(latency)) return LATENCY_BUCKET_CEILING;
-	return Math.min(LATENCY_BUCKET_CEILING - 1, Math.max(0, Math.ceil(Math.log2(latency))));
-}
-
 /**
- * Failover candidates for the origin at `originIndex` in `sortedNames`: ring order after the origin, stably sorted
- * by latency bucket, so peers that tie on bucket keep the deterministic ring order failover has always used.
+ * Failover candidates for the origin at `originIndex` in `sortedNames`: the shared ring order after the origin, with
+ * peers in the origin's region first when regions are set so a broken direct link prefers a LAN peer over a WAN one.
  */
 export function orderFailoverCandidates(
 	sortedNames: string[],
 	originIndex: number,
-	latencyOf: (name: string) => number | undefined
+	regionOf?: ReadonlyMap<string, string>
 ): string[] {
 	const ring: string[] = [];
 	for (let offset = 1; offset < sortedNames.length; offset++) {
 		ring.push(sortedNames[(originIndex + offset) % sortedNames.length]);
 	}
-	const buckets = new Map(ring.map((name) => [name, latencyBucket(latencyOf(name))]));
-	return ring.sort((a, b) => buckets.get(a)! - buckets.get(b)!);
+	const originRegion = regionOf?.get(sortedNames[originIndex]);
+	if (originRegion === undefined) return ring;
+	const inRegion = ring.filter((name) => regionOf.get(name) === originRegion);
+	return [...inRegion, ...ring.filter((name) => !inRegion.includes(name))];
 }
 
 /**

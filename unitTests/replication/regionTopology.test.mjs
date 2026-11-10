@@ -2,7 +2,6 @@ import assert from 'node:assert';
 import {
 	deriveRegionTopology,
 	isGateway,
-	latencyBucket,
 	orderFailoverCandidates,
 	settleSupplier,
 	supplierCandidates,
@@ -132,30 +131,21 @@ describe('regionTopology', () => {
 	});
 
 	describe('failover ordering', () => {
-		it('buckets latency by doubling and puts unmeasured links last', () => {
-			assert.equal(latencyBucket(0.4), 0);
-			assert.equal(latencyBucket(1), 0);
-			assert.equal(latencyBucket(1.5), 1);
-			assert.equal(latencyBucket(3.9), 2);
-			assert.ok(latencyBucket(undefined) > latencyBucket(10_000));
-			assert.equal(latencyBucket(0), latencyBucket(undefined));
-		});
-
-		it('keeps ring order after the origin when every candidate ties', () => {
+		it('keeps ring order after the origin when no regions are set', () => {
 			const names = ['n1', 'n2', 'n3', 'n4', 'n5'];
-			assert.deepEqual(
-				orderFailoverCandidates(names, 2, () => 0.5),
-				['n4', 'n5', 'n1', 'n2']
-			);
+			assert.deepEqual(orderFailoverCandidates(names, 2), ['n4', 'n5', 'n1', 'n2']);
 		});
 
-		it('prefers a lower latency bucket over ring position', () => {
-			const names = ['n1', 'n2', 'n3', 'n4'];
-			const latency = { n1: 40, n3: 30, n4: 2 };
-			assert.deepEqual(
-				orderFailoverCandidates(names, 1, (name) => latency[name]),
-				['n4', 'n3', 'n1']
-			);
+		it("puts peers in the origin's region first in ring order, then the rest in ring order", () => {
+			const names = ['a1', 'b1', 'b2', 'c1', 'a2'];
+			const regionOf = new Map([
+				['a1', 'east'],
+				['a2', 'east'],
+				['b1', 'west'],
+				['b2', 'west'],
+				['c1', 'eu'],
+			]);
+			assert.deepEqual(orderFailoverCandidates(names, 0, regionOf), ['a2', 'b1', 'b2', 'c1']);
 		});
 	});
 

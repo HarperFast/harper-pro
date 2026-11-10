@@ -1,10 +1,11 @@
 /**
- * Failover picks the lowest-latency live peer (harper-pro#1291) in a cluster with no regions.
+ * Failover keeps the shared name order in an unlabeled cluster so asymmetric cuts and latencies cannot form a cycle
+ * (harper-pro#1291).
  *
- * Four nodes, names sorted n1 < n2 < n3 < n4. On n1, `regionNetworkInjector.mjs` delays pings to and messages from n3
- * by 40 ms and n4 by 2 ms, so n1 measures n4 as nearest; the ring order failover used alone would take n3 first after
- * n2. Then the n1–n2 link is cut both ways while n2 keeps running: n1 must fail n2's log over to n4, and a write at
- * n2 must reach n1 through it.
+ * Four nodes, names sorted n1 < n2 < n3 < n4. On n2, `regionNetworkInjector.mjs` delays pings to and messages from n4
+ * by 40 ms and n1 by 2 ms, so n2 measures n1 as nearest. First n1's links to n3 and n4 are cut, so n1 fails n3 over to
+ * n2 (its only live peer). Then n2's link to n3 is cut: n2 must follow the shared ring order after n3 and fail n3 over
+ * to n4 rather than back to the nearer n1, and a write at n3 must reach both n2 and n1.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
@@ -18,17 +19,17 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 
 const INJECTOR = join(import.meta.dirname, 'regionNetworkInjector.mjs');
 
-suite('Failover orders candidates by latency', { timeout: 600_000 }, (ctx) => {
+suite('Failover ring order avoids a latency cycle', { timeout: 600_000 }, (ctx) => {
 	let workDir;
 	const contexts = [];
 	const nodes = () => contexts.map((context) => context.harper);
 
 	before(async () => {
-		workDir = await mkdtemp(join(tmpdir(), 'failover-latency-'));
+		workDir = await mkdtemp(join(tmpdir(), 'failover-order-'));
 		const hostnames = [];
 		for (let i = 0; i < 4; i++) hostnames.push(await getNextAvailableLoopbackAddress());
 		hostnames.sort();
-		const [observer, , far, near] = hostnames;
+		const [n1, n2, , n4] = hostnames;
 		for (const name of hostnames) await writeFile(join(workDir, `partition-${name}`), '[]');
 		const started = await Promise.allSettled(
 			hostnames.map(async (hostname) => {
@@ -40,7 +41,7 @@ suite('Failover orders candidates by latency', { timeout: 600_000 }, (ctx) => {
 							colors: false,
 							console: true,
 							stdStreams: false,
-							level: hostname === observer ? 'info' : 'warn',
+							level: hostname === n1 || hostname === n2 ? 'info' : 'warn',
 						},
 						replication: { securePort: hostname + ':9933', pingInterval: 1000, failover: true },
 						threads: { count: 1, preload: [INJECTOR] },
@@ -48,8 +49,8 @@ suite('Failover orders candidates by latency', { timeout: 600_000 }, (ctx) => {
 					env: {
 						HARPER_NO_FLUSH_ON_EXIT: true,
 						HARPER_TEST_PARTITION_FILE: join(workDir, `partition-${hostname}`),
-						...(hostname === observer && {
-							HARPER_TEST_PEER_LATENCY_MS: JSON.stringify({ [far]: 40, [near]: 2 }),
+						...(hostname === n2 && {
+							HARPER_TEST_PEER_LATENCY_MS: JSON.stringify({ [n1]: 2, [n4]: 40 }),
 						}),
 					},
 				});
@@ -88,63 +89,79 @@ suite('Failover orders candidates by latency', { timeout: 600_000 }, (ctx) => {
 		if (workDir) await rm(workDir, { recursive: true, force: true });
 	});
 
-	test('a cut link fails over to the nearest live peer, and writes arrive through it', async () => {
-		const [observer, origin, far, near] = nodes();
+	test('cutting n1 from n3 and n4 and then n2 from n3 fails n2 over to n4 rather than cycling with nearer n1', async () => {
+		const [n1, n2, n3, n4] = nodes();
 		await waitForCondition(
 			async (signal) => {
-				const status = await sendOperation(observer, { operation: 'cluster_status' }, { signal });
-				const socketOf = (name) =>
+				const [s1, s2] = await Promise.all([
+					sendOperation(n1, { operation: 'cluster_status' }, { signal }),
+					sendOperation(n2, { operation: 'cluster_status' }, { signal }),
+				]);
+				const socketOf = (status, name) =>
 					status.connections
 						.find((connection) => connection.name === name)
 						?.database_sockets.find((socket) => socket.database === 'data');
-				const live = (name) => socketOf(name)?.connected === true;
+				const live = (status, name) => socketOf(status, name)?.connected === true;
 				return (
-					live(origin.hostname) &&
-					live(near.hostname) &&
-					live(far.hostname) &&
-					socketOf(near.hostname).latency > 0 &&
-					socketOf(far.hostname).latency > 30
+					live(s1, n2.hostname) &&
+					live(s1, n3.hostname) &&
+					live(s1, n4.hostname) &&
+					live(s2, n1.hostname) &&
+					live(s2, n3.hostname) &&
+					live(s2, n4.hostname) &&
+					socketOf(s2, n1.hostname).latency > 0 &&
+					socketOf(s2, n4.hostname).latency > 30
 				);
 			},
 			{
 				timeoutMs: 300_000,
-				description: 'the observer holds live links to every peer and has measured the far one above 30 ms',
+				description: 'n1 and n2 hold live links to every peer and n2 has measured n4 above 30 ms',
 			}
 		);
-		const mark = await logMark(observer);
-		await writeFile(join(workDir, `partition-${observer.hostname}`), JSON.stringify([origin.hostname]));
-		await writeFile(join(workDir, `partition-${origin.hostname}`), JSON.stringify([observer.hostname]));
+		const mark1 = await logMark(n1);
+		await writeFile(join(workDir, `partition-${n1.hostname}`), JSON.stringify([n3.hostname, n4.hostname]));
+		await writeFile(join(workDir, `partition-${n3.hostname}`), JSON.stringify([n1.hostname]));
+		await writeFile(join(workDir, `partition-${n4.hostname}`), JSON.stringify([n1.hostname]));
 		await waitForCondition(
-			async () => (await readLogSince(observer, mark)).includes(`Failing over data from ${origin.hostname} to `),
-			{ timeoutMs: 60_000, description: 'the observer fails over the cut link' }
+			async () => (await readLogSince(n1, mark1)).includes(`Failing over data from ${n3.hostname} to ${n2.hostname}`),
+			{ timeoutMs: 60_000, description: 'n1 fails n3 over to n2 once n3 and n4 are cut' }
 		);
-		const log = await readLogSince(observer, mark);
+		const mark2 = await logMark(n2);
+		await writeFile(join(workDir, `partition-${n2.hostname}`), JSON.stringify([n3.hostname]));
+		await writeFile(join(workDir, `partition-${n3.hostname}`), JSON.stringify([n1.hostname, n2.hostname]));
+		await waitForCondition(
+			async () => (await readLogSince(n2, mark2)).includes(`Failing over data from ${n3.hostname} to `),
+			{ timeoutMs: 60_000, description: 'n2 fails over its cut link to n3' }
+		);
+		const log2 = await readLogSince(n2, mark2);
 		assert.ok(
-			log.includes(`Failing over data from ${origin.hostname} to ${near.hostname}`),
-			`expected failover to ${near.hostname}: ${log.match(/Failing over data from \S+ to \S+/g)}`
+			log2.includes(`Failing over data from ${n3.hostname} to ${n4.hostname}`),
+			`expected failover to ${n4.hostname} in ring order: ${log2.match(/Failing over data from \S+ to \S+/g)}`
 		);
-		await sendOperation(origin, {
+		await sendOperation(n3, {
 			operation: 'insert',
 			database: 'data',
 			table: 'latency',
-			records: [{ id: 'through-nearest' }],
+			records: [{ id: 'acyclic-failover' }],
 		});
-		await waitForCondition(
-			async (signal) =>
-				(
-					await sendOperation(
-						observer,
-						{
-							operation: 'search_by_id',
-							database: 'data',
-							table: 'latency',
-							ids: ['through-nearest'],
-							get_attributes: ['id'],
-						},
-						{ signal }
-					)
-				).length === 1,
-			{ timeoutMs: 60_000, description: 'the write at the cut-off origin reaches the observer' }
-		);
+		for (const receiver of [n2, n1]) {
+			await waitForCondition(
+				async (signal) =>
+					(
+						await sendOperation(
+							receiver,
+							{
+								operation: 'search_by_id',
+								database: 'data',
+								table: 'latency',
+								ids: ['acyclic-failover'],
+								get_attributes: ['id'],
+							},
+							{ signal }
+						)
+					).length === 1,
+				{ timeoutMs: 60_000, description: `the write at n3 reaches ${receiver.hostname}` }
+			);
+		}
 	});
 });
