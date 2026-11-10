@@ -266,6 +266,7 @@ import {
 	STUCK_COPY_OWNER_REFUSED,
 	STUCK_COPY_ORIGIN_REFUSED,
 	STUCK_COPY_HELD,
+	OWNED_SLOTS_COPY_REFUSAL,
 	copyStartKey,
 	describeStuckCopy,
 	type StuckCopyTransition,
@@ -770,6 +771,32 @@ export function predatesPurgeTracking(
 	trackedFrom: number
 ): boolean {
 	return (subscriptions.find(({ name }) => name === thisNodeName)?.startTime ?? mergedStart) < trackedFrom;
+}
+
+/**
+ * What a subscription's first pass does with a start this node cannot vouch for: one that may be below purged
+ * history (`retentionGap`), or a floor certified under another database generation. A receiver that owns sharding
+ * slots this node cannot copy (`restricted`) refuses every base copy, so that route replays what is retained
+ * instead (harper-pro#1278). Only the test hook still forces a copy there.
+ */
+export function retentionResumeDecision(
+	forceForTest: boolean,
+	otherGeneration: boolean,
+	retentionGap: boolean,
+	restricted: boolean
+): 'copy' | 'replay' | 'replay-unvouched' {
+	if (forceForTest) return 'copy';
+	if (!retentionGap && !otherGeneration) return 'replay';
+	return restricted ? 'replay-unvouched' : 'copy';
+}
+
+// the last reason each (database, peer) was warned for, so reconnects for the same reason stay quiet
+const unvouchedReplayWarned = new Map<string, string>();
+export function shouldWarnUnvouchedReplay(database: string, peer: string, reason: string): boolean {
+	const key = database + '\0' + peer;
+	if (unvouchedReplayWarned.get(key) === reason) return false;
+	unvouchedReplayWarned.set(key, reason);
+	return true;
 }
 
 // Integration tests force the retention copy for the named databases to exercise what a receiver does with
@@ -5799,6 +5826,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!stillCurrent()) return;
 								await dbisDB.flush({ allowWriteStall: true });
 								if (!stillCurrent()) return;
+								// owned origins replay only from the projection's start, so reconnect now rather than after the backoff
+								options.connection?.resetRetryBackoff?.();
 								wsClosed = true;
 								close(1011, 'Sharding projection complete; resuming owned origins separately');
 								return;
@@ -6885,9 +6914,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		wsClosed = true;
 		close(
 			1011,
-			copying
-				? 'Owned sharding slots require a complete co-owner or backup restore'
-				: `Sharded origin ${origin} requires its origin or a complete co-owner`
+			copying ? OWNED_SLOTS_COPY_REFUSAL : `Sharded origin ${origin} requires its origin or a complete co-owner`
 		);
 	}
 	function admitsIncomingOrigins(value: unknown): boolean {
@@ -10146,23 +10173,36 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const predatesTracking =
 													purgeBounds !== undefined &&
 													predatesPurgeTracking(nodeSubscriptions, getThisNodeName(), currentSequenceId, trackedFrom);
-												if (
-													forceRetentionCopyForTest(databaseName) ||
-													otherGeneration ||
-													(!(
+												const retentionGap =
+													!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
-														(purgeBounds
-															? purgedLog !== undefined || predatesTracking
-															: shouldForceBaseCopyForRetention(
-																	currentSequenceId,
-																	oldestRetainedTime,
-																	Date.now() - auditRetention,
-																	getAuditFloor(auditStore)
-																)))
-												) {
-													const purgedThrough = (bound: number | undefined) =>
-														bound === undefined ? 'unknown' : new Date(bound).toISOString();
+													(purgeBounds
+														? purgedLog !== undefined || predatesTracking
+														: shouldForceBaseCopyForRetention(
+																currentSequenceId,
+																oldestRetainedTime,
+																Date.now() - auditRetention,
+																getAuditFloor(auditStore)
+															));
+												const decision = retentionResumeDecision(
+													forceRetentionCopyForTest(databaseName),
+													otherGeneration,
+													retentionGap,
+													restrictedSendingOrigins
+												);
+												const purgedThrough = (bound: number | undefined) =>
+													bound === undefined ? 'unknown' : new Date(bound).toISOString();
+												if (decision === 'replay-unvouched') {
+													const from = new Date(currentSequenceId).toISOString();
+													const reason = otherGeneration
+														? 'from a floor this node certified under another database generation'
+														: `from ${from}, under transaction-log history purged through ${purgedThrough(purgedLog ? purgedLog.bound : predatesTracking ? trackedFrom : undefined)}`;
+													if (shouldWarnUnvouchedReplay(databaseName, remoteNodeName, reason))
+														logger.warn?.(
+															`Peer ${remoteNodeName} requested replication of database ${databaseName} ${reason}; it owns sharding slots this node cannot copy, so replay continues from ${from}, and writes from this node it has not received may be missing there.`
+														);
+												} else if (decision === 'copy') {
 													logger.warn?.(
 														otherGeneration
 															? `Peer ${remoteNodeName} requested replication of database ${databaseName} from a floor this node certified under another database generation; forcing a bounded base-copy resync.`
@@ -10177,11 +10217,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											}
 											// the copy filters rows at or below the start, which holds only for a position taken from this
 											// copy; another subscription's start of 0 can have made it a copy already
-											if (otherGeneration) {
+											if (otherGeneration && currentSequenceId === 0) {
 												const ownId = getThisNodeId(auditStore);
 												const own = subscribedNodeIds[ownId];
 												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
 											}
+											if (currentSequenceId > 0) subscriptionResidencySender?.replaying();
 											if (currentSequenceId === 0) {
 												copying = true;
 												const legacyCopy = await requiresLegacyCopyVerification(
@@ -11926,6 +11967,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		instanceRetired = true;
 		wsClosed = true;
 		stopShardingConfigurationWatch();
+		if (residencySender && code === 1011 && reasonBuffer?.toString() === OWNED_SLOTS_COPY_REFUSAL) {
+			try {
+				if (residencySender.refused())
+					logger.warn?.(
+						`${remoteNodeName} refuses replication of database ${databaseName} from this node; writes through this node for its sharding slots return 503 until it accepts a subscription`
+					);
+			} catch (error) {
+				logger.debug?.(connectionId, 'could not record the refusal', error);
+			}
+		}
 		residencySender?.close();
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
 		if (options.connection?.peerCapabilities === peerCapabilities) {

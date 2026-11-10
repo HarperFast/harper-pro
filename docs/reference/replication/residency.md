@@ -43,7 +43,7 @@ The slot is the unsigned FNV-1a 32-bit hash of the primary key's ordered-binary 
 
 Only primary-key hashing is supported. Schema declarations using `by` or `slotFrom` are refused. Attribute-derived placement and custom expressions await [concurrent-move design (#1178)](https://github.com/HarperFast/harper-pro/issues/1178).
 
-Declarative tables require [per-table audit logging](../database/transaction.md#enabling-the-transaction-log-per-table) and table replication. Harper refuses activation with `@table(audit: false)`, effective `logging.auditLog: false`, or `@table(replicate: false)`, and refuses disabling these table settings later. The replication route must reach an owner.
+Declarative tables require [per-table audit logging](../database/transaction.md#enabling-the-transaction-log-per-table) and table replication. Harper refuses activation with `@table(audit: false)`, effective `logging.auditLog: false`, or `@table(replicate: false)`, and refuses disabling these table settings later. The replication route must reach an owner. A write through a non-owner returns `503` while every owner of its key refuses replication from that node (a `refused` [stuck copy](./clustering.md#stuck-copies) on the owner); a write for an owner that is only disconnected is accepted and delivered when it reconnects.
 
 The policy is immutable once activated; changing its count or removing the directive is refused. Redeploying the same policy is idempotent. `setResidency` and `setResidencyById` are refused on declarative tables. Existing tables can adopt primary-key hashing only with a map that preserves their placement.
 

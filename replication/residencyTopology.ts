@@ -66,6 +66,7 @@ function digestFingerprint(digest: unknown): bigint {
 
 const senders = new WeakMap<object, Map<string, Map<string, BigUint64Array>>>();
 
+// [generation counter, active generation and receive time, refused generation, highest generation that replayed]
 function senderStatus(store: any, database: string, peer: string): BigUint64Array {
 	let databases = senders.get(store);
 	if (!databases) senders.set(store, (databases = new Map()));
@@ -73,7 +74,7 @@ function senderStatus(store: any, database: string, peer: string): BigUint64Arra
 	if (!peers) databases.set(database, (peers = new Map()));
 	let status = peers.get(peer);
 	if (!status) {
-		status = new BigUint64Array(store.getUserSharedBuffer(['residency-sending', database, peer], new ArrayBuffer(16)));
+		status = new BigUint64Array(store.getUserSharedBuffer(['residency-sending', database, peer], new ArrayBuffer(32)));
 		peers.set(peer, status);
 	}
 	return status;
@@ -100,7 +101,48 @@ export function registerResidencySender(store: any, database: string, peer: stri
 			const active = Atomics.load(status, 1);
 			if (active >> 32n === generation) Atomics.compareExchange(status, 1, active, 0n);
 		},
+		/** The receiver closed this sender's stream refusing it. True when no refusal was recorded before. */
+		refused(): boolean {
+			const wasRefused = Atomics.load(status, 2) !== 0n;
+			raiseStatusWord(status, 2, generation);
+			// a later sender already replaying supersedes this refusal: this load pairs with replaying()'s
+			if (Atomics.load(status, 3) >= generation) clearRefusalThrough(status, generation);
+			return !wasRefused && Atomics.load(status, 2) !== 0n;
+		},
+		/** This sender's subscription started replaying, which ends a refusal of it or of an earlier sender. */
+		replaying() {
+			raiseStatusWord(status, 3, generation);
+			clearRefusalThrough(status, generation);
+		},
 	};
+}
+
+function raiseStatusWord(status: BigUint64Array, index: number, value: bigint) {
+	let seen = Atomics.load(status, index);
+	while (seen < value) {
+		const previous = Atomics.compareExchange(status, index, seen, value);
+		if (previous === seen) return;
+		seen = previous;
+	}
+}
+
+function clearRefusalThrough(status: BigUint64Array, generation: bigint) {
+	let refused = Atomics.load(status, 2);
+	while (refused !== 0n && refused <= generation) {
+		const previous = Atomics.compareExchange(status, 2, refused, 0n);
+		if (previous === refused) return;
+		refused = previous;
+	}
+}
+
+/** Process memory only: a restart forgets a refusal until the owner refuses again. */
+export function residencyOwnerRefusing(store: any, database: string, peer: string): boolean {
+	return Atomics.load(senderStatus(store, database, peer), 2) !== 0n;
+}
+
+function databaseAuditStore(database: string): any {
+	const tables = databases[database];
+	for (const name in tables) if (tables[name].auditStore) return tables[name].auditStore;
 }
 
 function residencySenderConnected(store: any, database: string, peer: string): boolean {
@@ -249,14 +291,18 @@ setResidencyPlacementGuard((database, owners, requireConnected, shard, root, for
 	const reachable = recipients.filter((node) => owners.includes(node.name));
 	if (!reachable.length)
 		throw new ResidencyPlacementError(`No replication route reaches the owners of a record in ${database}`, 503);
+	const auditStore = databaseAuditStore(database);
 	if (requireConnected) {
-		const auditStore = Object.values(databases[database] ?? {}).find((Table) => Table.auditStore)?.auditStore;
 		if (!auditStore || !reachable.some((node) => residencySenderConnected(auditStore, database, node.name)))
 			throw new ResidencyPlacementError(
 				`No new shard owner is connected for ${database}; attribute-slot change refused`,
 				503
 			);
-	}
+	} else if (auditStore && reachable.every((node) => residencyOwnerRefusing(auditStore, database, node.name)))
+		throw new ResidencyPlacementError(
+			`Every owner of a record in ${database} is refusing replication from this node; retry the write once one accepts it`,
+			503
+		);
 });
 
 server.registerOperation?.({

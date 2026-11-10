@@ -14,6 +14,8 @@ import {
 	purgeBoundLogNames,
 	replayStartUnderPurge,
 	predatesPurgeTracking,
+	retentionResumeDecision,
+	shouldWarnUnvouchedReplay,
 	ORIGIN_CURSOR_OVERLAP_MS,
 } from '#src/replication/replicationConnection';
 
@@ -178,5 +180,40 @@ describe('predatesPurgeTracking', () => {
 	it('falls back to the merged start when the follower does not list this node', () => {
 		expect(predatesPurgeTracking([{ name: 'proxied', startTime: 100 }], 'relay', 100, TRACKED_FROM)).to.equal(true);
 		expect(predatesPurgeTracking([{ name: 'proxied', startTime: 6000 }], 'relay', 6000, TRACKED_FROM)).to.equal(false);
+	});
+});
+
+describe('retentionResumeDecision', () => {
+	// (forceForTest, otherGeneration, retentionGap, restricted)
+	it('replays a start this node can vouch for on any route', () => {
+		expect(retentionResumeDecision(false, false, false, false)).to.equal('replay');
+		expect(retentionResumeDecision(false, false, false, true)).to.equal('replay');
+	});
+
+	it('copies an unvouched start for a receiver that can take the copy', () => {
+		expect(retentionResumeDecision(false, false, true, false)).to.equal('copy');
+		expect(retentionResumeDecision(false, true, false, false)).to.equal('copy');
+	});
+
+	it('never copies to a receiver owning slots this node cannot copy, which would refuse it (harper-pro#1278)', () => {
+		expect(retentionResumeDecision(false, false, true, true)).to.equal('replay-unvouched');
+		expect(retentionResumeDecision(false, true, false, true)).to.equal('replay-unvouched');
+		expect(retentionResumeDecision(false, true, true, true)).to.equal('replay-unvouched');
+	});
+
+	it('still copies under the test hook, which exercises the refusal', () => {
+		expect(retentionResumeDecision(true, false, false, true)).to.equal('copy');
+		expect(retentionResumeDecision(true, false, false, false)).to.equal('copy');
+	});
+});
+
+describe('shouldWarnUnvouchedReplay', () => {
+	it('warns once per database, peer and reason', () => {
+		expect(shouldWarnUnvouchedReplay('warn-db', 'peer-a', 'under bound 1')).to.equal(true);
+		expect(shouldWarnUnvouchedReplay('warn-db', 'peer-a', 'under bound 1')).to.equal(false);
+		expect(shouldWarnUnvouchedReplay('warn-db', 'peer-b', 'under bound 1')).to.equal(true);
+		expect(shouldWarnUnvouchedReplay('other-db', 'peer-a', 'under bound 1')).to.equal(true);
+		expect(shouldWarnUnvouchedReplay('warn-db', 'peer-a', 'under bound 2')).to.equal(true);
+		expect(shouldWarnUnvouchedReplay('warn-db', 'peer-a', 'under bound 2')).to.equal(false);
 	});
 });
