@@ -29,7 +29,7 @@
  * kept in the per-(database, peer) shared status buffer so the owner can read it for a peer whose
  * socket lives on another thread.
  *
- * With `replication.recordLocks` off (the default) every replicated database gets a transport that
+ * With `replication.recordLocks` off (`false`, or LMDB) every replicated database gets a transport that
  * fails closed instead, so a cluster-scoped `lock()` reports the missing enablement rather than
  * quietly arbitrating on this node alone.
  */
@@ -559,7 +559,7 @@ export function forgetRecordLockHomesCache(database: string): void {
 	rowStates.delete(database);
 }
 
-async function refreshCache(database: string, freshBudget = false): Promise<void> {
+async function refreshCache(database: string, freshBudget = false, announce = true): Promise<void> {
 	let state = refreshState.get(database);
 	if (!state)
 		refreshState.set(
@@ -588,7 +588,7 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		// as a mismatch against no digest at all (and never checked for a second generation-1 map), and a
 		// socket that handshook then received none; both need the one just read. The backoff resets only
 		// once this is done, so a failure here re-arms the whole cycle.
-		if (state.backoff.attempts > 0 || before?.digest !== row?.active?.digest) {
+		if (state.backoff.attempts > 0 || (announce && before?.digest !== row?.active?.digest)) {
 			pushHomesDigestToPeers(database);
 			reconcileAllPeerHomesAgreement(database);
 		}
@@ -635,7 +635,7 @@ const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
  * racing an unawaited refresh (a real pre-push review finding).
  */
 async function applyHomesChanged(database: string): Promise<void> {
-	await refreshCache(database, true);
+	await refreshCache(database, true, false);
 	pushHomesDigestToPeers(database);
 	reconcileAllPeerHomesAgreement(database);
 }
@@ -697,7 +697,6 @@ async function broadcastHomesChangedAndWait(database: string, exclude?: any): Pr
 }
 
 onRecordLockHomesChanged(propagateHomesChanged);
-/** This thread's refresh and re-announce, then every other thread's, awaited. */
 async function propagateHomesChanged(database: string): Promise<void> {
 	await applyHomesChanged(database);
 	if (parentPort) {
@@ -1297,7 +1296,6 @@ export interface RecordLockDatabaseStats {
 	restartRecall?: RestartRecallStatus;
 	/** The coordinating thread's delegate epoch for the database (record-locks.md §4.5), once known. */
 	delegateEpoch?: number;
-	/** From the coordinating thread only. */
 	bootstrap?: BootstrapStatus;
 }
 

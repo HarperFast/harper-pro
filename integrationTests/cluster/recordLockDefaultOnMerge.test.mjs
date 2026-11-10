@@ -67,9 +67,9 @@ suite('two clusters with automatic home maps, joined', { timeout: 600_000 }, (ct
 		await waitForMesh(nodes);
 		let last;
 		await waitForCondition(
-			async () => {
+			async (signal) => {
 				last = [];
-				for (const node of nodes) last.push(await lockStatus(node, 'merged-' + Date.now()));
+				for (const node of nodes) last.push(await lockStatus(node, 'merged-' + Date.now(), signal));
 				return last.every((status) => status === 503) ? last : undefined;
 			},
 			{ timeoutMs: 60_000, description: () => `every node to refuse cluster locks; last ${JSON.stringify(last)}` }

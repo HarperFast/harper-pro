@@ -100,7 +100,8 @@ function checkReply(node: string, reply: SurveyReply): CheckedReply | string {
 }
 
 export type BootstrapPlan =
-	| { action: 'refuse'; reason: string }
+	/** `settled`: the refusal will not clear without an operator or a configuration change. */
+	| { action: 'refuse'; reason: string; settled: boolean }
 	| {
 			action: 'proceed';
 			kind: 'fresh' | 'resume';
@@ -115,7 +116,6 @@ function sameSet(a: string[], b: string[]): boolean {
 	return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
-/** A surveyed node that replicates with someone this node does not know of. */
 function outsideReplication(
 	self: string,
 	candidates: string[],
@@ -158,6 +158,7 @@ export function planBootstrap(
 		return {
 			action: 'refuse',
 			reason: `${withHistory.join(', ')} already hold home-map history beyond an automatic first generation, so the next generation is an operator's (record_lock_apply_homes)`,
+			settled: true,
 		};
 	const firstSets = new Map<string, string[]>();
 	for (const reply of checked.values()) if (reply.first) firstSets.set(reply.first.digest, reply.first.homes);
@@ -165,6 +166,7 @@ export function planBootstrap(
 		return {
 			action: 'refuse',
 			reason: `nodes hold different first generations (${[...firstSets.values()].map((homes) => homes.join(', ')).join(' | ')}); an operator reconciles them (record_lock_apply_homes)`,
+			settled: true,
 		};
 	if (firstSets.size === 1) {
 		const [[digest, homes]] = [...firstSets];
@@ -172,21 +174,24 @@ export function planBootstrap(
 			return {
 				action: 'refuse',
 				reason: `the first home map (${homes.join(', ')}) does not include ${self}; an operator adds it with record_lock_apply_homes`,
+				settled: true,
 			};
 		const missing = homes.filter((member) => !checked.has(member));
 		if (missing.length > 0)
 			return {
 				action: 'refuse',
 				reason: `not every member of the first home map answered: ${unanswered.filter((entry) => missing.some((member) => entry.startsWith(`${member} (`))).join(', ') || missing.join(', ')}`,
+				settled: false,
 			};
 		const unable = homes.filter((member) => checked.get(member)!.mode !== 'auto');
 		if (unable.length > 0)
 			return {
 				action: 'refuse',
 				reason: `${unable.join(', ')} no longer take part in the automatic first generation (replication.recordLocks is set or off there)`,
+				settled: true,
 			};
 		const outside = outsideReplication(self, candidates, checked);
-		if (outside) return { action: 'refuse', reason: outside };
+		if (outside) return { action: 'refuse', reason: outside, settled: false };
 		return {
 			action: 'proceed',
 			kind: 'resume',
@@ -196,23 +201,30 @@ export function planBootstrap(
 			awaitBackstop: homes.some((member) => checked.get(member)!.rowClass !== 'first-active'),
 		};
 	}
-	if (unanswered.length > 0) return { action: 'refuse', reason: `not every node answered: ${unanswered.join(', ')}` };
+	if (unanswered.length > 0)
+		return { action: 'refuse', reason: `not every node answered: ${unanswered.join(', ')}`, settled: false };
 	const participants = candidates.filter((node) => checked.get(node)!.mode !== 'off');
 	const operated = participants.filter((node) => checked.get(node)!.mode === 'operator');
 	if (operated.length > 0)
 		return {
 			action: 'refuse',
 			reason: `${operated.join(', ')} set replication.recordLocks: true, so their home maps are published by an operator (record_lock_apply_homes)`,
+			settled: true,
 		};
 	if (!participants.includes(self) || participants.length < 2)
-		return { action: 'refuse', reason: 'no other node replicating this database takes part in cluster record locks' };
+		return {
+			action: 'refuse',
+			reason: 'no other node replicating this database takes part in cluster record locks',
+			settled: true,
+		};
 	const outside = outsideReplication(self, candidates, checked);
-	if (outside) return { action: 'refuse', reason: outside };
+	if (outside) return { action: 'refuse', reason: outside, settled: false };
 	const disagreeing = participants.filter((node) => !sameSet(checked.get(node)!.view, candidates));
 	if (disagreeing.length > 0)
 		return {
 			action: 'refuse',
 			reason: `${disagreeing.join(', ')} do not yet replicate with every node ${self} does, so the replicating set is not agreed yet`,
+			settled: false,
 		};
 	return {
 		action: 'proceed',
@@ -236,7 +248,7 @@ const DEFAULT_BOOTSTRAP_TIMEOUTS: BootstrapTimeouts = { hopMs: 4_000, stageMs: 8
 export type BootstrapOutcome =
 	/** `changed` is false when every member was already active: the map is withheld for another reason. */
 	| { outcome: 'activated'; homes: string[]; changed: boolean }
-	| { outcome: 'refused'; reason: string }
+	| { outcome: 'refused'; reason: string; settled: boolean }
 	| { outcome: 'failed'; reason: string; planned: boolean }
 	| { outcome: 'cancelled' };
 
@@ -279,6 +291,7 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 			return {
 				outcome: 'refused',
 				reason: 'no other node replicating this database takes part in cluster record locks',
+				settled: true,
 			};
 		// A superseded or expired attempt sends nothing more; what it already sent the per-node planners judge.
 		const hop = (node: string, operation: TransitionOperation, ms: number): Promise<any> => {
@@ -305,7 +318,7 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 			}
 		});
 		const plan = planBootstrap(self, candidates, replies);
-		if (plan.action === 'refuse') return { outcome: 'refused', reason: plan.reason };
+		if (plan.action === 'refuse') return { outcome: 'refused', reason: plan.reason, settled: plan.settled };
 		if (!current()) return { outcome: 'cancelled' };
 		options.onPlanned?.();
 		const { homes, digest } = plan;
@@ -344,8 +357,6 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 		return { outcome: 'activated', homes, changed: plan.stage.length > 0 };
 	});
 }
-
-// ---- the trigger: which `homeMap()` call starts an attempt, and what it answers meanwhile ------------
 
 const BOOTSTRAP_JITTER_MS = 500;
 /** How long a node another attempt just staged waits for that attempt to activate it before resuming. */
@@ -408,9 +419,7 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 			if (outcome.changed) {
 				state.backoffMs = 0;
 				state.retryAt = 0;
-				deps.log.info?.(
-					`Record lock home map for ${database}: established generation 1 on ${outcome.homes.join(', ')}`
-				);
+				log('info', `Record lock home map for ${database}: established generation 1 on ${outcome.homes.join(', ')}`);
 			} else {
 				// Every member was already active: the map is withheld by agreement or a member's absence,
 				// which another survey would not change soon.
@@ -422,11 +431,20 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 		state.backoffMs = Math.min(RETRY_MAX_MS, state.backoffMs ? state.backoffMs * 2 : RETRY_INITIAL_MS);
 		state.retryAt = deps.now() + state.backoffMs;
 		state.lastFailure = outcome.reason;
-		// A failure after the survey admitted the attempt is transient (a hop), not a reason to refuse callers.
-		state.refusal = outcome.outcome === 'refused' || !outcome.planned ? outcome.reason : undefined;
+		// Only a refusal that will not clear by itself is answered with a 503; a cluster still converging, or
+		// a failed hop, rides core's wait.
+		state.refusal = outcome.outcome === 'refused' && outcome.settled ? outcome.reason : undefined;
 		if (outcome.reason !== state.lastLogged) {
-			deps.log.warn?.(`Record lock home map for ${database} was not established automatically: ${outcome.reason}`);
+			log('warn', `Record lock home map for ${database} was not established automatically: ${outcome.reason}`);
 			state.lastLogged = outcome.reason;
+		}
+	}
+
+	function log(level: 'info' | 'warn', message: string): void {
+		try {
+			deps.log[level]?.(message);
+		} catch {
+			// A failing log sink must not turn into the caller's error.
 		}
 	}
 
@@ -450,9 +468,7 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 				(error) =>
 					settle(database, state, token, { outcome: 'failed', reason: hopError(error), planned: running.planned })
 			)
-			.catch(() => {
-				// Only a throwing logger reaches here; the attempt's state is already settled.
-			});
+			.catch(() => {});
 	}
 
 	function start(database: string, state: TriggerState, row: BootstrapRowState): void {
@@ -496,11 +512,14 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 			let state = states.get(database);
 			if (!state) states.set(database, (state = { token: 0, retryAt: 0, backoffMs: 0 }));
 			const pristine = row.rowClass !== 'first-active';
+			// This thread's own attempt completed it; a withheld map now is agreement's or a member's absence.
+			if (state.activated && !pristine) return;
 			if (!state.running && deps.now() >= state.retryAt) {
 				if (row.rowClass === 'empty' && deps.candidates(database).length < 2)
 					settle(database, state, state.token, {
 						outcome: 'refused',
 						reason: 'no other node replicating this database takes part in cluster record locks',
+						settled: true,
 					});
 				else start(database, state, row);
 			}

@@ -158,8 +158,8 @@ suite('cluster record locks with no configuration (harper-pro#853)', { timeout: 
 		await sendOperation(nodes[0], { operation: 'remove_node', hostname: names[2], authorization: nodes[0].admin });
 		for (const id of ids) assert.equal(await lockStatus(nodes[0], id), 503, `${id} on the node that ran remove_node`);
 		await waitForCondition(
-			async () => {
-				for (const id of ids) if ((await lockStatus(nodes[1], id)) !== 503) return undefined;
+			async (signal) => {
+				for (const id of ids) if ((await lockStatus(nodes[1], id, signal)) !== 503) return undefined;
 				return true;
 			},
 			{ timeoutMs: 60_000, description: 'the other survivor to refuse once the removal replicated' }

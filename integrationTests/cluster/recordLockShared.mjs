@@ -319,8 +319,8 @@ export function apply(node, fields) {
  * Taken and released inside one request: a separate release could be served by another http worker
  * than the one holding the lock.
  */
-export async function lockStatus(node, id) {
-	return (await call(node, 'LockOnce/', { id, timeout: 2_000 })).status;
+export async function lockStatus(node, id, signal) {
+	return (await call(node, 'LockOnce/', { id, timeout: 2_000 }, signal)).status;
 }
 
 export async function assertLocks(nodes, expected, why) {

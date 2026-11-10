@@ -195,6 +195,7 @@ describe('planBootstrap: when generation 1 may be written without an operator', 
 		);
 		assert.strictEqual(plan.action, 'refuse');
 		assert.match(plan.reason, /^b do not yet replicate with every node a does/);
+		assert.strictEqual(plan.settled, false, 'a mesh still forming may agree on its next survey');
 	});
 
 	it('refuses when any participant is operator-managed', () => {
@@ -343,6 +344,7 @@ describe('planBootstrap: when generation 1 may be written without an operator', 
 		);
 		assert.strictEqual(plan.action, 'refuse');
 		assert.match(plan.reason, /does not include d; an operator adds it with record_lock_apply_homes/);
+		assert.strictEqual(plan.settled, true, 'a joiner stays refused until an operator acts');
 	});
 
 	it('refuses two different first generations, and a member that left automatic mode', () => {
@@ -633,10 +635,14 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		const h = harness();
 		h.trigger.missing('db');
 		h.fire();
-		h.runs[0].resolve({ outcome: 'refused', reason: 'b is unreachable' });
+		h.runs[0].resolve({ outcome: 'refused', reason: 'the map does not include a', settled: true });
 		await h.tick();
 		assert.throws(() => h.trigger.missing('db'), isRefusal);
-		assert.deepStrictEqual(h.trigger.status('db'), { state: 'refused', reason: 'b is unreachable', retryInMs: 1_000 });
+		assert.deepStrictEqual(h.trigger.status('db'), {
+			state: 'refused',
+			reason: 'the map does not include a',
+			retryInMs: 1_000,
+		});
 		h.advance(1_000);
 		assert.throws(() => h.trigger.missing('db'), isRefusal, 'the retry starts, and the refusal stands meanwhile');
 		h.fire();
@@ -646,19 +652,19 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		h.trigger.missing('db');
 		h.runs[1].resolve({ outcome: 'activated', homes: ['a', 'b'], changed: true });
 		await h.tick();
-		assert.strictEqual(h.logged.filter((line) => /b is unreachable/.test(line)).length, 1);
+		assert.strictEqual(h.logged.filter((line) => /does not include a/.test(line)).length, 1);
 	});
 
 	it('backs off exponentially, and a failure after the survey admitted the attempt does not refuse callers', async () => {
 		const h = harness();
 		h.trigger.missing('db');
 		h.fire();
-		h.runs[0].resolve({ outcome: 'refused', reason: 'x' });
+		h.runs[0].resolve({ outcome: 'refused', reason: 'x', settled: true });
 		await h.tick();
 		h.advance(1_000);
 		assert.throws(() => h.trigger.missing('db'));
 		h.fire();
-		h.runs[1].resolve({ outcome: 'refused', reason: 'x' });
+		h.runs[1].resolve({ outcome: 'refused', reason: 'x', settled: true });
 		await h.tick();
 		assert.strictEqual(h.trigger.status('db').retryInMs, 2_000);
 		h.advance(2_000);
@@ -669,6 +675,20 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		await h.tick();
 		h.trigger.missing('db');
 		assert.strictEqual(h.trigger.status('db').state, 'waiting');
+	});
+
+	it('a refusal that can clear by itself (a cluster still converging) rides the wait instead of a 503', async () => {
+		const h = harness();
+		h.trigger.missing('db');
+		h.fire();
+		h.runs[0].resolve({ outcome: 'refused', reason: 'b does not yet replicate with every node', settled: false });
+		await h.tick();
+		h.trigger.missing('db');
+		assert.deepStrictEqual(h.trigger.status('db'), {
+			state: 'waiting',
+			reason: 'b does not yet replicate with every node',
+			retryInMs: 1_000,
+		});
 	});
 
 	it('a node with no peers is refused at once, without an attempt', () => {
@@ -683,27 +703,24 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		h.trigger.missing('db');
 		h.fire();
 		assert.deepStrictEqual(h.runs[0].options.ownSet, ['a', 'b']);
-		h.runs[0].resolve({ outcome: 'refused', reason: 'b is unreachable' });
+		h.runs[0].resolve({ outcome: 'refused', reason: 'b is unreachable', settled: true });
 		await h.tick();
 		h.trigger.missing('db');
 		assert.strictEqual(h.trigger.status('db').retryInMs, 1_000);
 	});
 
-	it('a resume that found every member active neither logs nor surveys again for the full backoff', async () => {
+	it('once this thread completed the first generation, a withheld map starts no further attempt', async () => {
 		const h = harness({ row: { rowClass: 'first-active', firstSet: ['a', 'b'] } });
 		h.trigger.missing('db');
 		h.fire();
 		h.runs[0].resolve({ outcome: 'activated', homes: ['a', 'b'], changed: false });
 		await h.tick();
-		assert.deepStrictEqual(h.logged, []);
-		h.advance(29_000);
+		assert.deepStrictEqual(h.logged, [], 'nothing changed, so nothing is logged');
+		h.advance(60_000);
 		h.trigger.missing('db');
 		h.fire();
 		assert.strictEqual(h.runs.length, 1);
-		h.advance(1_000);
-		h.trigger.missing('db');
-		h.fire();
-		assert.strictEqual(h.runs.length, 2);
+		assert.strictEqual(h.trigger.status('db').state, 'activated');
 	});
 
 	it('a node already staged when its first lock arrives follows once, then resumes', () => {
@@ -724,7 +741,7 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 			automatic: true,
 			rowState: () => ({ rowClass: 'first-active', firstSet: ['a', 'b'] }),
 			candidates: () => ['a', 'b'],
-			run: async () => ({ outcome: 'refused', reason: 'x' }),
+			run: async () => ({ outcome: 'refused', reason: 'x', settled: true }),
 			now: () => 0,
 			random: () => 0,
 			setTimer: (callback) => (callback(), undefined),
