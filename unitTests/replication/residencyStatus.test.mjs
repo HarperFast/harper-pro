@@ -74,7 +74,11 @@ describe('cluster_status shard summary', function () {
 
 	it('names members that own no slot: no shard, a shard the map lacks, and this node itself', async () => {
 		const database = await declare([range(0, 10, 0)]);
-		server.nodes = [{ name: 'peer-owner' }, { name: 'peer-unsharded' }, { name: 'peer-other-shard' }];
+		server.nodes = [
+			{ name: 'peer-owner', shard: 0 },
+			{ name: 'peer-unsharded' },
+			{ name: 'peer-other-shard', shard: 7 },
+		];
 		server.shards = new Map([
 			[0, [{ name: 'peer-owner' }]],
 			[7, [{ name: 'peer-other-shard' }]],
@@ -82,6 +86,22 @@ describe('cluster_status shard summary', function () {
 		const entry = residencyStatus()[database];
 		assert.deepEqual(entry.shards, [{ shard: 0, slots: 10, owners: ['peer-owner'] }]);
 		assert.deepEqual(entry.nodesOwningNoSlots, [server.hostname, 'peer-other-shard', 'peer-unsharded'].sort());
+	});
+
+	it('does not call a peer slotless while the membership is still publishing its shard', async () => {
+		const database = await declare([range(0, 10, 0)]);
+		server.nodes = [
+			{ name: 'peer-joining', shard: 0 },
+			{ name: 'peer-owner', shard: 0 },
+		];
+		server.shards = new Map([[0, [{ name: 'peer-owner' }, { name: server.hostname }]]]);
+		const entry = residencyStatus()[database];
+		assert.deepEqual(entry.shards, [{ shard: 0, slots: 10, owners: ['peer-owner', server.hostname].sort() }]);
+		assert.deepEqual(
+			entry.nodesOwningNoSlots,
+			[],
+			'the joining peer is missing from owners, not listed as owning nothing'
+		);
 	});
 
 	it('keeps a mapped shard that has no member node, with no owners', async () => {

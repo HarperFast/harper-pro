@@ -267,11 +267,7 @@ server.registerOperation?.({
 	requiresSuperUser: true,
 });
 
-/**
- * Slots and owning nodes per shard of an installed map. Owners come from the membership view
- * residencyOwners() resolves a slot through; nodesOwningNoSlots names every known member that is
- * not an owner of any mapped shard. Counts only: a per-slot list would grow with the slot count.
- */
+/** Owners come from the membership residencyOwners() routes by. Counts only: a per-slot list grows with the slot count. */
 function shardSummary(snapshot: ResidencyMapSnapshot) {
 	const slots = new Map<number, number>();
 	for (const { start, end, shard } of snapshot.ranges) slots.set(shard, (slots.get(shard) ?? 0) + end - start);
@@ -284,13 +280,12 @@ function shardSummary(snapshot: ResidencyMapSnapshot) {
 		for (const owner of owners) assigned.add(owner);
 		return { shard, slots: count, owners: Array.from(owners).sort() };
 	}).sort((a, b) => a.shard - b.shard);
-	const members = new Set([server.hostname, ...(server.nodes ?? []).map((node) => node.name)]);
-	return {
-		shards,
-		nodesOwningNoSlots: Array.from(members)
-			.filter((name) => !assigned.has(name))
-			.sort(),
-	};
+	// server.nodes learns a peer before server.shards publishes its shard, so its own record decides
+	const noSlots = (server.nodes ?? [])
+		.filter((node) => !assigned.has(node.name) && (node.shard == null || !slots.has(node.shard)))
+		.map((node) => node.name);
+	if (!assigned.has(server.hostname)) noSlots.push(server.hostname);
+	return { shards, nodesOwningNoSlots: noSlots.sort() };
 }
 
 export function residencyStatus() {
