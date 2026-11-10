@@ -109,13 +109,13 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			{ timeoutMs: 30_000, description: `node ${i} stores complete owned bodies` }
 		);
 	}
-	async function assertNoEcho(lastWriteId) {
+	async function assertNoEcho(lastWrite, holdsLastWrite) {
 		await waitForCondition(
 			async (signal) => {
 				const states = await Promise.all(contexts.map((_, i) => local(i, signal)));
-				return states.every((state) => state.rows.some((row) => row.id === lastWriteId));
+				return states.every((state) => state.rows.some(holdsLastWrite));
 			},
-			{ timeoutMs: 60_000, description: `every node holds ${lastWriteId} before counting its log` }
+			{ timeoutMs: 60_000, description: `every node holds ${lastWrite} before counting its log` }
 		);
 		for (const [i, { harper }] of contexts.entries()) {
 			const response = await fetch(`${harper.httpURL}/BootstrapEcho`, {
@@ -589,7 +589,7 @@ export class BootstrapLocal extends Resource {
 				description: 'the lagging shard owner receives retained old-origin and fresh new-origin bodies after removal',
 			}
 		);
-		await assertNoEcho('after-rename1');
+		await assertNoEcho('after-rename1', (row) => row.id === 'after-rename1');
 	});
 	test('losing a whole shard requires a complete backup and cannot mint another empty baseline', async () => {
 		const paths = await Promise.all([0, 2].map(dataPath));
@@ -666,6 +666,9 @@ export class BootstrapLocal extends Resource {
 			updated.bootstrap.map((history) => history.localFloor),
 			starts
 		);
-		await assertNoEcho('after-backup');
+		await assertNoEcho(
+			'the update after the backup',
+			(row) => row.id === recovered.id && row.version > recovered.version
+		);
 	});
 });
