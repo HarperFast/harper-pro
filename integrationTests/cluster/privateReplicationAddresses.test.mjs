@@ -240,12 +240,19 @@ suite('replication over private network addresses', { timeout: 480_000 }, (ctx) 
 			});
 
 			const dialsBefore = ctx.forwarders.B.dialsFrom(A);
-			const bytesBefore = ctx.forwarders.B.bytesFromNode;
 			await ctx.forwarders.B.open();
 			await waitForPath(A, B, 'private', 180_000);
 			ok(ctx.forwarders.B.dialsFrom(A) > dialsBefore, "A dialed B's private address again");
-			await delay(2000);
-			ok(ctx.forwarders.B.bytesFromNode > bytesBefore, "B's writes cross its private address again");
+			// measured once the link is private, so the handshake and a public-path copy cannot account for it
+			const bytesBefore = ctx.forwarders.B.bytesFromNode;
+			const payload = 'r'.repeat(2048);
+			await insert(
+				B,
+				Array.from({ length: 50 }, (_, i) => ({ id: `recovered-${i}`, payload }))
+			);
+			await waitForCount(A, 'recovered-', 50);
+			const crossed = ctx.forwarders.B.bytesFromNode - bytesBefore;
+			ok(crossed > 50 * 2048 * 0.9, `B's writes cross its private address again (${crossed} bytes)`);
 		} finally {
 			writing = false;
 			await writer;
@@ -256,7 +263,8 @@ suite('replication over private network addresses', { timeout: 480_000 }, (ctx) 
 	test('an address that answers with another node is never used', async () => {
 		const [A, B, C] = ctx.nodes;
 		await ctx.forwarders.B.close();
-		// TCP connects, but C's certificate fails the check against B's name
+		// TCP connects, but C fails both the certificate check against B's name and the NODE_NAME check; the
+		// certificate check alone is covered by privatePaths.test.mjs and privateDial.test.mjs
 		ctx.forwarders.B.targetHost = C.hostname;
 		await ctx.forwarders.B.open();
 		await waitForPath(A, B, 'public-fallback');

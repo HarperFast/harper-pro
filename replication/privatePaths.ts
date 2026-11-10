@@ -227,6 +227,8 @@ export class PrivatePaths {
 			outage.probing = false;
 		}
 		if (this.#outages.get(pathKey) !== outage) return;
+		// a prober that left mid-probe aborts its own dial, which says nothing about the path
+		if (!reachable && !prober.isWaitingFor(pathKey)) return this.#probe(pathKey, outage);
 		if (!reachable) {
 			this.#scheduleProbe(pathKey, outage);
 			return;

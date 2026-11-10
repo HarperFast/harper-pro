@@ -365,6 +365,27 @@ describe('privatePaths', () => {
 			assert.strictEqual(other.probes, 0);
 		});
 
+		it('a prober that leaves mid-probe hands the probe to the next waiter without backing off', async () => {
+			const { paths, pending, fire } = harness();
+			const leaving = waiter('leaving');
+			const staying = waiter('staying', { reachable: false });
+			leaving.probePrivatePath = async function () {
+				this.probes++;
+				this.waiting = false;
+				return false;
+			};
+			paths.failed(KEY, PRIVATE, leaving);
+			paths.failed(KEY, PRIVATE, staying);
+			await fire(pending()[0]);
+			assert.strictEqual(leaving.probes, 1);
+			assert.strictEqual(staying.probes, 1, 'probed again at once');
+			assert.deepStrictEqual(
+				pending().map((timer) => timer.delay),
+				[5500],
+				"one backoff step, for the staying waiter's failed probe"
+			);
+		});
+
 		it('a probe that throws counts as unreachable', async () => {
 			const { paths, pending, fire } = harness();
 			const a = waiter('a');

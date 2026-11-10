@@ -188,6 +188,17 @@ describe('NodeReplicationConnection private dial', () => {
 			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PUBLIC_FALLBACK);
 		});
 
+		it('a redial for an address change before the peer identifies does not mark the old address down', async () => {
+			const privateUrl = await server(() => {});
+			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
+			const { connection, pathKey, retries } = connectionVia(privateUrl, publicUrl);
+			await connection.connect();
+			await waitFor(() => connection.socket?.readyState === 1, 'the private socket to open');
+			connection.redialForPathChange();
+			assert.strictEqual(retries.length, 1, 'the redial is scheduled');
+			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PRIVATE);
+		});
+
 		it('an unsubscribe during the private dial does not mark the path down', async () => {
 			const privateUrl = `ws://127.0.0.1:${await closedPort()}`;
 			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
@@ -224,7 +235,7 @@ describe('NodeReplicationConnection private dial', () => {
 			connection.dial = { url: 'wss://10.7.0.2:9933', path: PATH_PRIVATE, privateUrl: 'wss://10.7.0.2:9933' };
 			connection.session = privateAttempt;
 			const read = connection.getRecord({ id: 1 });
-			connection.sessionAbandonedForPath = privateAttempt;
+			connection.sessionsAbandonedForPath.add(privateAttempt);
 			connection.session = Promise.resolve({ getRecord: () => 'from the public socket' });
 			rejectPrivate(new Error('connect ECONNREFUSED'));
 			assert.strictEqual(await read, 'from the public socket');
@@ -256,7 +267,7 @@ describe('NodeReplicationConnection private dial', () => {
 			const privateAttempt = Promise.resolve();
 			connection.session = Promise.resolve();
 			connection.notePrivateSocketEnded({ dial, attemptSession: privateAttempt }, 'closed');
-			assert.strictEqual(connection.sessionAbandonedForPath, privateAttempt);
+			assert.ok(connection.sessionsAbandonedForPath.has(privateAttempt));
 		});
 
 		it('a read sent on a private socket that ended before identification is served by the public redial', async () => {
@@ -269,7 +280,7 @@ describe('NodeReplicationConnection private dial', () => {
 			connection.session = privateAttempt;
 			const read = connection.getRecord({ id: 1 });
 			await new Promise((resolve) => setImmediate(resolve));
-			connection.sessionAbandonedForPath = privateAttempt;
+			connection.sessionsAbandonedForPath.add(privateAttempt);
 			connection.session = Promise.resolve({ getRecord: () => 'from the public socket' });
 			failRead(new Error('closed: Unauthorized'));
 			assert.strictEqual(await read, 'from the public socket');
@@ -295,7 +306,7 @@ describe('NodeReplicationConnection private dial', () => {
 				connection.session = Promise.resolve({ getRecord: () => 'from the private socket' });
 			};
 			assert.strictEqual(connection.promoteToPrivatePath(key), true);
-			assert.strictEqual(connection.sessionAbandonedForPath, publicSession);
+			assert.ok(connection.sessionsAbandonedForPath.has(publicSession));
 			failRead(new Error('socket retired'));
 			assert.strictEqual(await read, 'from the private socket');
 		});
@@ -307,7 +318,7 @@ describe('NodeReplicationConnection private dial', () => {
 			const attempt = new Promise((_, reject) => (rejectAttempt = reject));
 			connection.session = attempt;
 			const read = connection.getRecord({ id: 1 });
-			connection.sessionAbandonedForPath = attempt;
+			connection.sessionsAbandonedForPath.add(attempt);
 			connection.session = Promise.resolve({ getRecord: () => 'unexpected' });
 			rejectAttempt(new Error('connect ECONNREFUSED'));
 			await assert.rejects(read, /ECONNREFUSED/);

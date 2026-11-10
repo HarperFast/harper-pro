@@ -4979,9 +4979,10 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	// this node dials from a private network, so a peer's advertisement can move this link at any time
 	onPrivateNetwork = false;
 	privateIdentifyTimeoutMs = PRIVATE_IDENTIFY_TIMEOUT_MS;
-	// the session of an attempt abandoned for another path (a failed private dial, a promotion off the
-	// public fallback, or a peer's changed address); reads waiting on it retry on the next session
-	sessionAbandonedForPath?: Promise<any>;
+	// sessions of attempts abandoned for another path (a failed private dial, a promotion off the public
+	// fallback, or a peer's changed address); reads waiting on one retry on the next session. Weak, so a
+	// retired session is not kept alive by its mark.
+	sessionsAbandonedForPath = new WeakSet<Promise<any>>();
 	constructor(url: string, subscription: any, databaseName: string, nodeName?: string, authorization?: string) {
 		super();
 		this.url = url;
@@ -5121,7 +5122,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		this.socket.on('error', (error: NodeJS.ErrnoException & { isHandled?: boolean }) => {
 			socketError = error.message;
 			const privateFailure = dial.path === PATH_PRIVATE && !socket.peerIdentified;
-			if (privateFailure) this.sessionAbandonedForPath = attemptSession;
+			if (privateFailure) this.abandonForPath(attemptSession);
 			sessionReject(error);
 			// reported once per outage, by the close
 			if (privateFailure) return;
@@ -5394,7 +5395,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		if (!this.onPrivateNetwork) return read;
 		// also covers a read sent on a socket that later ended for the path change
 		return read.catch((error) => {
-			if (attempt !== this.sessionAbandonedForPath || this.intentionallyUnsubscribed) throw error;
+			if (!this.sessionsAbandonedForPath.has(attempt) || this.intentionallyUnsubscribed) throw error;
 			// the abandoned socket's reconnect installs the next session
 			return new Promise((resolve) => setImmediate(resolve)).then(() => {
 				if (this.session === attempt || this.intentionallyUnsubscribed) throw error;
@@ -5452,7 +5453,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	}
 
 	privateDialFailed(dial: Dial, reason: string, attemptSession: Promise<any>) {
-		this.sessionAbandonedForPath = attemptSession;
+		this.abandonForPath(attemptSession);
 		if (privatePaths.failed(dial.pathKey, dial.privateUrl, this))
 			logger.warn?.(
 				`The private address ${dial.url} of ${this.configuredNodeName} did not connect (${reason}); replicating over ${this.url} until it does`
@@ -5489,9 +5490,15 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		return true;
 	}
 
+	abandonForPath(session: Promise<any> | undefined) {
+		if (session) this.sessionsAbandonedForPath.add(session);
+	}
+
 	redialForPathChange() {
 		if (this.reconnectScheduled) return;
-		this.sessionAbandonedForPath = this.session;
+		this.abandonForPath(this.session);
+		// a private socket left for another address mid-handshake says nothing about that address
+		if (this.socket) this.socket.privateFailureNoted = true;
 		this.forceReconnect();
 	}
 }
