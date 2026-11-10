@@ -5499,6 +5499,9 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		this.abandonForPath(this.session);
 		// a private socket left for another address mid-handshake says nothing about that address
 		if (this.socket) this.socket.privateFailureNoted = true;
+		// a planned move is not a failure: a retrieval connection's backoff is otherwise only reset by
+		// replication traffic it never carries, so each move would wait longer, up to MAX_RETRY_TIME
+		this.resetRetryBackoff();
 		this.forceReconnect();
 	}
 }

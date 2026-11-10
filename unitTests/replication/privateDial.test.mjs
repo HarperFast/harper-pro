@@ -199,6 +199,24 @@ describe('NodeReplicationConnection private dial', () => {
 			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PRIVATE);
 		});
 
+		it('a redial for a path change waits only the reconnect floor, however many failures came before', () => {
+			const { connection, retries } = connectionVia('ws://127.0.0.1:1', 'ws://127.0.0.1:2');
+			const delays = [];
+			connection.setReconnectTimer = (callback, delay) => {
+				retries.push(callback);
+				delays.push(delay);
+				return { unref() {} };
+			};
+			connection.random = () => 0.99;
+			for (let i = 0; i < 8; i++) {
+				connection.scheduleReconnect();
+				connection.reconnectScheduled = false;
+			}
+			assert.ok(delays.at(-1) > 20_000, `failures escalate the backoff (${delays.at(-1)} ms)`);
+			connection.redialForPathChange();
+			assert.ok(delays.at(-1) < 1_000, `the planned redial is not delayed by them (${delays.at(-1)} ms)`);
+		});
+
 		it('an unsubscribe during the private dial does not mark the path down', async () => {
 			const privateUrl = `ws://127.0.0.1:${await closedPort()}`;
 			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
