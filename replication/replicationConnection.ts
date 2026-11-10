@@ -7688,6 +7688,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let relayCopyLease: RelayCopyLease | undefined;
 	/** Senders withhold relayed origins while it is held (harper-pro#1299); false when no slot could be claimed. */
 	function holdRelayLeaseForPass(): boolean {
+		// node registrations reach new members through relayed system rows during the joins that copy it: holding them
+		// back stalls cluster formation, so the system database keeps only the copy-bound gate
+		if (databaseName === 'system') return true;
 		if (relayCopyLease) {
 			relayCopyLease.disarmSettleDeadline();
 			return true;
@@ -10755,6 +10758,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															`Peer ${remoteNodeName} requested replication of database ${databaseName} ${purged === undefined ? 'from a floor this node certified under another database generation' : `from ${from}, under transaction-log history purged through ${purged}`}; it owns sharding slots this node cannot copy, so replay continues from ${from}, and writes from this node it has not received may be missing there.`
 														);
 												} else if (decision === 'copy') {
+													// a copy served now would carry the inbound pass's partial rows and hand out cursors past them
+													if (relayWithheld) {
+														relayWithheld.parked = true;
+														logger.info?.(
+															connectionId,
+															`Deferring the base copy ${remoteNodeName} needs for ${databaseName} until this node's own base copy settles`
+														);
+														return;
+													}
 													logger.warn?.(
 														otherGeneration
 															? `Peer ${remoteNodeName} requested replication of database ${databaseName} from a floor this node certified under another database generation; forcing a bounded base-copy resync.`
