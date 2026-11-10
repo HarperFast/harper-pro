@@ -549,21 +549,57 @@ describe('A base copy never leaves a designated resident with only the stub of a
 
 describe('replayedStubPut', function () {
 	const tableId = 7;
-	const row = { key: ['region', 3], version: 1000 };
+	const copyStartTime = 1500;
 	const head = { type: 'put', tableId, recordId: ['region', 3], version: 1000, nodeId: 0, extendedType: 0 };
-	const storeAnswering = (answer) => ({
-		get(...args) {
-			if (answer instanceof Error) throw answer;
-			this.args = args;
-			return answer;
-		},
+	const row = (fields) => ({ key: ['region', 3], version: 1000, localTime: 1000, ...fields });
+	function store(entries) {
+		const reads = [];
+		return {
+			reads,
+			get(logKey, ...rest) {
+				reads.push([logKey, ...rest]);
+				const answer = entries[logKey];
+				if (answer instanceof Error) throw answer;
+				return answer;
+			},
+		};
+	}
+
+	it("answers the row's own local put at its head reference, reading it as committed state", () => {
+		const audit = store({ 2000: head });
+		assert.equal(
+			replayedStubPut(audit, tableId, row({ additionalAuditRefs: [{ version: 2000, nodeId: 0 }] }), copyStartTime, 4),
+			head
+		);
+		assert.deepEqual(audit.reads, [[2000, tableId, ['region', 3], 0, true]]);
 	});
 
-	it("answers the head entry when it is the row's own local put", () => {
-		const store = storeAnswering(head);
-		assert.equal(replayedStubPut(store, tableId, row, 2000, 4), head);
-		assert.deepEqual(store.args, [2000, tableId, row.key, 0, true]);
-		assert.equal(replayedStubPut(storeAnswering({ ...head, nodeId: 4 }), tableId, row, 2000, 4)?.nodeId, 4);
+	it('answers the put at the row log key when the row has no head reference', () => {
+		const local = { ...head, nodeId: 4 };
+		assert.equal(replayedStubPut(store({ 2000: local }), tableId, row({ localTime: 2000 }), copyStartTime, 4), local);
+	});
+
+	it('tries the row log key after a head reference that does not hold its put', () => {
+		const audit = store({ 2000: { ...head, type: 'invalidate' }, 3000: head });
+		const entry = row({ localTime: 3000, additionalAuditRefs: [{ version: 2000, nodeId: 0 }] });
+		assert.equal(replayedStubPut(audit, tableId, entry, copyStartTime, 4), head);
+		assert.deepEqual(
+			audit.reads.map(([logKey]) => logKey),
+			[2000, 3000]
+		);
+	});
+
+	it('reads nothing for a row whose log keys are all at or below copyStartTime, or come from another origin', () => {
+		const audit = store({ 1500: head, 2000: head });
+		const entry = row({
+			localTime: copyStartTime,
+			additionalAuditRefs: [
+				{ version: 1400, nodeId: 0 },
+				{ version: 2000, nodeId: 9 },
+			],
+		});
+		assert.equal(replayedStubPut(audit, tableId, entry, copyStartTime, 4), undefined);
+		assert.deepEqual(audit.reads, []);
 	});
 
 	for (const [label, answer] of [
@@ -578,6 +614,9 @@ describe('replayedStubPut', function () {
 		['a failed read', new Error('unreadable log')],
 	])
 		it(`answers nothing for ${label}, which keeps the stub`, () => {
-			assert.equal(replayedStubPut(storeAnswering(answer), tableId, row, 2000, 4), undefined);
+			assert.equal(
+				replayedStubPut(store({ 2000: answer }), tableId, row({ localTime: 2000 }), copyStartTime, 4),
+				undefined
+			);
 		});
 });

@@ -1062,22 +1062,30 @@ export function replayedStubPut(
 	auditStore: any,
 	tableId: number,
 	entry: any,
-	logKey: number,
+	copyStartTime: number,
 	localNodeId: number
 ): AuditRecord | undefined {
-	try {
-		const head = auditStore.get(logKey, tableId, entry.key, 0, true);
-		if (
-			head?.type === 'put' &&
-			head.tableId === tableId &&
-			head.version === entry.version &&
-			(!head.nodeId || head.nodeId === localNodeId) &&
-			!(head.extendedType & LOCAL_ONLY) &&
-			compareKeys(head.recordId, entry.key) === 0
-		)
-			return head;
-	} catch (error) {
-		logger.debug?.('could not read the head audit entry of a copied stub', tableId, logKey, error);
+	const isLocal = (nodeId?: number) => !nodeId || nodeId === localNodeId;
+	const logKeys: number[] = [];
+	if (entry.additionalAuditRefs)
+		for (const ref of entry.additionalAuditRefs)
+			if (isLocal(ref.nodeId) && ref.version > copyStartTime) logKeys.push(ref.version);
+	if (entry.localTime > copyStartTime) logKeys.push(entry.localTime);
+	for (const logKey of logKeys) {
+		try {
+			const head = auditStore.get(logKey, tableId, entry.key, 0, true);
+			if (
+				head?.type === 'put' &&
+				head.tableId === tableId &&
+				head.version === entry.version &&
+				isLocal(head.nodeId) &&
+				!(head.extendedType & LOCAL_ONLY) &&
+				compareKeys(head.recordId, entry.key) === 0
+			)
+				return head;
+		} catch (error) {
+			logger.debug?.('could not read the head audit entry of a copied stub', tableId, logKey, error);
+		}
 	}
 }
 // The receive-side watchdog fires after this much silence on a replication WS. Both client and
@@ -10555,13 +10563,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														const replayedPut =
 															isStub &&
 															!table.residency &&
-															copyTxnLogKey > copyStartTime &&
 															(!entry.nodeId || entry.nodeId === nodeId) &&
 															getResidence(entry.residencyId, table)?.includes(remoteNodeName)
-																? replayedStubPut(auditStore, table.tableId, entry, copyTxnLogKey, nodeId)
+																? replayedStubPut(auditStore, table.tableId, entry, copyStartTime, nodeId)
 																: undefined;
 														let encoded: Buffer | undefined;
-														if (replayedPut) await sendAuditRecord(replayedPut, copyTxnLogKey, nodeId);
+														if (replayedPut)
+															await sendAuditRecord(replayedPut, replayedPut.txnLogKey ?? copyTxnLogKey, nodeId);
 														else {
 															const stubAsInvalidation =
 																isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
