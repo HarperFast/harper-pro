@@ -332,6 +332,8 @@ const CAUGHT_UP = 151;
 const GATEWAY_REACH = 152;
 const GATEWAY_REACH_INTERVAL_MS = 1000;
 const RELAY_LEASE_POLL_MS = 1000;
+// the close reason with which a source vetoes completing a copy; the follower then discards its resume point
+const COPY_VETOED_REASON = 'A base copy into this node began during this copy';
 const MAX_REACH_REGIONS = 64;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
@@ -5772,6 +5774,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// resume from seqId with gaps.
 	let pendingCopyCursorRemovalNodeId: number | undefined;
 	let copyCursorRemovalRetryTimer: NodeJS.Timeout | undefined;
+	/**
+	 * The source's base copy under this copy's walk can have added rows behind its resume point, which a resumed walk
+	 * would never revisit: the next request copies afresh.
+	 */
+	function discardCopyResumePoint(): void {
+		try {
+			const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
+			const store = auditStore ?? databaseAuditStore;
+			const sourceId =
+				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined);
+			const cursor = sourceId === undefined ? undefined : readDbisCursorSync(dbisDB, 'copyCursor', sourceId);
+			if (!cursor || cursor.restartFullCopy) return;
+			dbisDB
+				.put([Symbol.for('copyCursor'), sourceId], { ...cursor, restartFullCopy: true })
+				?.catch?.((error: unknown) =>
+					logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error)
+				);
+		} catch (error) {
+			logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error);
+		}
+	}
 	function deferCopyCursorRemoval(nodeId: number): void {
 		pendingCopyCursorRemovalNodeId = nodeId;
 		if (!copyCursorRemovalRetryTimer && !connectionSuperseded()) {
@@ -10419,6 +10442,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										(rising ??= new Map()).set(name, encoded);
 									}
 									if (!rising || closed || wsClosed || restartAfterCopy?.()) return;
+									if (relayWithheld) {
+										for (const name of rising.keys()) if (name !== thisNodeName) rising.delete(name);
+										if (rising.size === 0) return;
+									}
 									ws.send(encode([SEQUENCE_ID_UPDATE, currentSequenceId, Object.fromEntries(rising)]));
 									for (const [name, encoded] of rising) {
 										if (encoded === 0) {
@@ -10484,8 +10511,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									if (epoch === sessionCopyEpoch) return false;
 									// a pass claims its lease before its reservation commits, and applies no row before that
 									if (relayCopyLeaseHeld(auditStore, databaseName)) {
-										withholdRelayedOrigins();
-										return false;
+										if (!currentTransaction.txnLogKey) {
+											withholdRelayedOrigins();
+											return false;
+										}
+										// a frame's remaining records would be withheld, and its end_txn would commit the part sent
+										logger.info?.(
+											connectionId,
+											`A base copy into this node began mid-transaction; closing so ${remoteNodeName} reconnects withheld`
+										);
+										wsClosed = true;
+										close(1011, 'Replication restarts after a base copy into this node');
+										return true;
 									}
 									sessionCopyEpoch = epoch;
 									let risen: string | undefined;
@@ -11154,7 +11191,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														`A base copy into this node began while copying ${databaseName} to ${remoteNodeName}; closing before completing so it copies again once that settles`
 													);
 													wsClosed = true;
-													close(1011, 'A base copy into this node began during this copy');
+													close(1011, COPY_VETOED_REASON);
 													return;
 												}
 												currentSequenceId = copyStartTime;
@@ -12490,6 +12527,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (instanceRetired) return;
 		instanceRetired = true;
 		wsClosed = true;
+		if (reasonBuffer?.toString() === COPY_VETOED_REASON) discardCopyResumePoint();
 		stopShardingConfigurationWatch();
 		if (residencySender && code === 1011 && reasonBuffer?.toString() === OWNED_SLOTS_COPY_REFUSAL) {
 			try {

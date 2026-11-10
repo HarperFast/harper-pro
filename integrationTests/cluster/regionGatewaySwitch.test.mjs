@@ -406,7 +406,6 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 			);
 			tailRows = await tail.stop();
 			tailStopped = true;
-			// while the relay is still the follower's only path
 			await waitForPhase([follower.harper], 'open-copied', COPIED_ROWS);
 			await waitForPhase([follower.harper], 'open-tail', tailRows);
 		} finally {
