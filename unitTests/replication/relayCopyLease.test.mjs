@@ -4,7 +4,12 @@
  */
 import assert from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { holdRelayCopyLease, relayCopyLeaseHeld, RELAY_COPY_LEASE_TTL_MS } from '#src/replication/relayCopyLease';
+import {
+	holdRelayCopyLease,
+	relayCopyLeaseClaims,
+	relayCopyLeaseHeld,
+	RELAY_COPY_LEASE_TTL_MS,
+} from '#src/replication/relayCopyLease';
 
 const T = 1_790_000_000_000;
 
@@ -46,6 +51,14 @@ describe('relay copy lease', () => {
 		assert.strictEqual(relayCopyLeaseHeld(store, 'other', now), false);
 		lease.release();
 		assert.strictEqual(relayCopyLeaseHeld(store, 'data', now), false);
+	});
+
+	it('counts every claim, so a pass that came and went is still visible', () => {
+		const store = sharedStore();
+		const before = relayCopyLeaseClaims(store, 'data');
+		hold(store, 'data').release();
+		assert.strictEqual(relayCopyLeaseHeld(store, 'data', now), false);
+		assert.strictEqual(relayCopyLeaseClaims(store, 'data'), before + 1n);
 	});
 
 	it('lapses when it is not renewed, and a renewal extends it', () => {

@@ -5,6 +5,8 @@
  * memory, persisted nowhere: a restart clears every slot, and the slot of a thread that stops renewing lapses.
  */
 const SLOTS = 8;
+// after the slots: how many claims this process has made, so a walk can tell a pass started and ended under it
+const CLAIMS = SLOTS;
 export const RELAY_COPY_LEASE_TTL_MS = 15_000;
 const RENEW_INTERVAL_MS = 3_000;
 /** From a pass's last applied row: a settle that never commits must not withhold relaying for the connection's life. */
@@ -17,7 +19,7 @@ function leaseSlots(auditStore: any, database: string): BigInt64Array {
 	let slots = byDatabase.get(database);
 	if (!slots) {
 		slots = new BigInt64Array(
-			auditStore.getUserSharedBuffer(['relay-copy-lease', database], new ArrayBuffer(SLOTS * 8))
+			auditStore.getUserSharedBuffer(['relay-copy-lease', database], new ArrayBuffer((SLOTS + 1) * 8))
 		);
 		byDatabase.set(database, slots);
 	}
@@ -32,6 +34,10 @@ export function relayCopyLeaseHeld(auditStore: any, database: string, now = Date
 	const at = millis(now);
 	for (let index = 0; index < SLOTS; index++) if (Atomics.load(slots, index) > at) return true;
 	return false;
+}
+
+export function relayCopyLeaseClaims(auditStore: any, database: string): bigint {
+	return auditStore?.getUserSharedBuffer ? Atomics.load(leaseSlots(auditStore, database), CLAIMS) : 0n;
 }
 
 export interface RelayCopyLease {
@@ -63,6 +69,7 @@ export function holdRelayCopyLease(
 		for (let index = 0; index < SLOTS; index++) {
 			const current = Atomics.load(slots, index);
 			if (current <= millis(now) && Atomics.compareExchange(slots, index, current, expiry) === current) {
+				Atomics.add(slots, CLAIMS, 1n);
 				held = { index, expiry };
 				return true;
 			}

@@ -237,6 +237,7 @@ import {
 import { isGateway, validRegion } from './regionTopology.ts';
 import {
 	holdRelayCopyLease,
+	relayCopyLeaseClaims,
 	relayCopyLeaseHeld,
 	RELAY_COPY_SETTLE_DEADLINE_MS,
 	type RelayCopyLease,
@@ -800,6 +801,16 @@ export function readRelayCopyBounds(dbisDB: DbisStore, idMapping: Record<string,
 		if (reservedById.has(id)) reserved.set(name, reservedById.get(id)!);
 	}
 	return { settled, reserved };
+}
+
+const copyBoundsByEpoch = new WeakMap<object, { epoch: number; bounds: RelayCopyBounds }>();
+/** One read per thread for each origin-state epoch, shared by every session that asks under it; never mutate it. */
+export function readRelayCopyBoundsAt(dbisDB: DbisStore, auditStore: any, epoch: number): RelayCopyBounds {
+	const cached = copyBoundsByEpoch.get(dbisDB);
+	if (cached?.epoch === epoch) return cached.bounds;
+	const bounds = readRelayCopyBounds(dbisDB, exportIdMapping(auditStore));
+	copyBoundsByEpoch.set(dbisDB, { epoch, bounds });
+	return bounds;
 }
 
 /**
@@ -5095,6 +5106,8 @@ export class NodeReplicationConnection extends EventEmitter {
 	 */
 	topologyExcluded?: string[];
 	topologyBorrow?: Record<string, string | null>;
+	/** Copy sources that vetoed completing a copy since this connection last asked them for one. */
+	vetoedCopySources?: Set<number>;
 	/** Whether the last subscription request on this route carried every table. */
 	routeFullCoverage?: boolean;
 	latency = 0;
@@ -5784,7 +5797,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const store = auditStore ?? databaseAuditStore;
 			const sourceId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined);
-			const cursor = sourceId === undefined ? undefined : readDbisCursorSync(dbisDB, 'copyCursor', sourceId);
+			if (sourceId === undefined) return;
+			// honored by the next request on this connection even if the write below fails
+			if (options.connection) (options.connection.vetoedCopySources ??= new Set()).add(sourceId);
+			const cursor = readDbisCursorSync(dbisDB, 'copyCursor', sourceId);
 			if (!cursor || cursor.restartFullCopy) return;
 			dbisDB
 				.put([Symbol.for('copyCursor'), sourceId], { ...cursor, restartFullCopy: true })
@@ -10188,8 +10204,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									logger.debug?.(connectionId, 'added log to iterator:', nodeName);
 								}
 							}
-							if (nodesToInclude.length && !relayWithheld && relayCopyLeaseHeld(auditStore, databaseName))
+							if (nodesToInclude.length && !relayWithheld && relayCopyLeaseHeld(auditStore, databaseName)) {
+								// as at a lease seen mid-transaction: the frame's end_txn would commit the part already sent
+								if (currentTransaction.txnLogKey) {
+									wsClosed = true;
+									close(1011, 'Replication restarts after a base copy into this node');
+									return;
+								}
 								withholdRelayedOrigins();
+							}
 							if (includeCursors?.size) {
 								let advancedBareOrigin = false;
 								for (const [nodeName, requestedCursor] of includeCursors) {
@@ -10474,9 +10497,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// Copy bounds at the start check, for an aggregate range only: a later rise reconnects the peer.
 								let sessionCopyBounds: RelayCopyBounds | undefined;
 								let sessionCopyEpoch: number | undefined;
-								const readSessionCopyBounds = (): RelayCopyBounds | undefined => {
+								let sessionLeaseClaims: bigint | undefined;
+								const readSessionCopyBounds = (epoch: number): RelayCopyBounds | undefined => {
 									const { dbisDB } = getDatabaseStores();
-									return dbisDB?.getRange ? readRelayCopyBounds(dbisDB, exportIdMapping(auditStore)) : undefined;
+									return dbisDB?.getRange ? readRelayCopyBoundsAt(dbisDB, auditStore, epoch) : undefined;
 								};
 								const isRelayedLog = (name: string) =>
 									name !== 'local' &&
@@ -10527,7 +10551,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									sessionCopyEpoch = epoch;
 									let risen: string | undefined;
 									try {
-										const bounds = readSessionCopyBounds();
+										const bounds = readSessionCopyBounds(epoch);
 										risen =
 											bounds && sessionCopyBounds
 												? copyBoundRoseForLogs(sessionCopyBounds, bounds, withCopiedOrigins([], bounds))
@@ -10546,21 +10570,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return true;
 								};
 								restartAfterCopy = restartAfterCopyIntoThisNode;
-								const inboundCopyDuringWalk = (): boolean => {
-									if (sessionCopyEpoch === undefined) return false;
-									if (readOriginStateEpoch(auditStore.rootStore) === sessionCopyEpoch) return false;
-									if (relayCopyLeaseHeld(auditStore, databaseName)) return true;
-									try {
-										const bounds = readSessionCopyBounds();
-										return Boolean(
-											bounds &&
-											sessionCopyBounds &&
-											copyBoundRoseForLogs(sessionCopyBounds, bounds, withCopiedOrigins([], bounds))
-										);
-									} catch {
-										return true;
-									}
-								};
+								// a pass that started and settled during the walk raises no bound when its rows were below one
+								const inboundCopyDuringWalk = (): boolean =>
+									sessionLeaseClaims !== undefined &&
+									(relayCopyLeaseHeld(auditStore, databaseName) ||
+										relayCopyLeaseClaims(auditStore, databaseName) !== sessionLeaseClaims);
 								// A `return` from inside the loop (close, rejection) still runs this finally, so a timer
 								// armed in the exiting pass can never outlive it to wake a later, superseding loop that
 								// reused the connection-wide `wakeSender`.
@@ -10579,8 +10593,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (excludedNodes) {
 												// read before the bounds, so a write between the two reads rechecks
 												sessionCopyEpoch = readOriginStateEpoch(auditStore.rootStore);
+												sessionLeaseClaims = relayCopyLeaseClaims(auditStore, databaseName);
 												try {
-													sessionCopyBounds = readSessionCopyBounds();
+													sessionCopyBounds = readSessionCopyBounds(sessionCopyEpoch);
 												} catch (error) {
 													// as the mid-session check does: a bound that cannot be read must not read as none
 													logger.warn?.(connectionId, 'could not read the copy bounds for', databaseName, error);
@@ -13574,6 +13589,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					),
 					databaseName
 				);
+				if (nodeId !== undefined && options.connection?.vetoedCopySources?.delete(nodeId) && copyCursor)
+					copyCursor = { ...copyCursor, restartFullCopy: true };
 				loadPersistedCopyBounds(copyCursor);
 				mergeCopyBoundRecordInto(copiedVersionByOrigin, copyCursor?.maxCopiedVersionByOrigin);
 				const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
