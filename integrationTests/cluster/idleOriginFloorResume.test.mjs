@@ -182,9 +182,12 @@ suite('Idle origins keep a certified resume floor (harper-pro#922)', { timeout: 
 		const onC = await floorsOn(C, B);
 		equal(onC.nodes[A.hostname].relayable, false, 'C does not receive A directly');
 		ok(onC.nodes[A.hostname].closedFloor <= (await floorFor(B, A, A)), "C's floor for A never passes B's");
-		equal(onC.nodes[B.hostname].relayable, true, "B's own floor is relayable on C");
-		ok(onC.nodes[B.hostname].closedFloor > 0, 'an origin with an empty log still certifies');
-		equal(onC.nodes[C.hostname]?.closedFloor ?? null, null, "a node's own floor is not a certificate for it");
+		// B's first certificate to a session can precede its own first floor, so B's floor can arrive a tick after A's
+		await waitForFloor(C, B, B, 0, "B's own floor");
+		const ownOnC = await floorsOn(C, B);
+		equal(ownOnC.nodes[B.hostname].relayable, true, "B's own floor is relayable on C");
+		ok(ownOnC.nodes[B.hostname].closedFloor > 0, 'an origin with an empty log still certifies');
+		equal(ownOnC.nodes[C.hostname]?.closedFloor ?? null, null, "a node's own floor is not a certificate for it");
 
 		// capability-off: nothing is stored on either side of the A–E link
 		await delay(3 * FLOOR_INTERVAL_MS);
