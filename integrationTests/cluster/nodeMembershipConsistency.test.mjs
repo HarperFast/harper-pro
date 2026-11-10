@@ -1,10 +1,4 @@
-/**
- * update_node keeps every node's membership in step with hdb_nodes, without a restart and without reopening a
- * replication connection, and cluster_status reports a node whose own row disagrees with replication.shard
- * (harper-pro#1318, #1321).
- *
- *   A, B: shard 0      C: shard 1      shards [0, 1], one sharded table
- */
+/** A, B: shard 0; C: shard 1; shards [0, 1]; one sharded table (harper-pro#1318, #1321). */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { cp, mkdtemp, writeFile } from 'node:fs/promises';

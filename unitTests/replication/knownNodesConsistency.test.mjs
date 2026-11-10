@@ -1,8 +1,3 @@
-/**
- * After any hdb_nodes event, server.nodes (peers) and server.shards (every row with a shard, this node's
- * included) equal what a fresh scan of hdb_nodes gives, and the watcher's listener has been told every
- * scanned row and every row that left the scan (harper-pro#1318).
- */
 import assert from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { server } from '#src/core/server/Server';
@@ -243,9 +238,21 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 				]),
 		});
 		assert.ok(told.includes('consistency-a'), 'an update to a known row that threw is delivered again');
+
+		told.length = 0;
+		const alwaysThrowsOnA = (node, id) => {
+			if (id === 'consistency-a') throw new Error('listener failure');
+			told.push(id);
+		};
+		await runNodeUpdateWatcher(alwaysThrowsOnA, {
+			key: WATCHER,
+			maxRestarts: 1,
+			subscribe: async () => asyncIterable([{ type: 'put', id: 'consistency-b', value: null }]),
+		});
+		assert.ok(told.includes('consistency-b'), 'a row that always throws does not hold up the rows after it');
 	});
 
-	it('orders the event against the stored row by version', async () => {
+	it('takes the stored row over a queued event for the same version', async () => {
 		const Nodes = getHDBNodeTable();
 		await Nodes.put('consistency-a', {
 			name: 'consistency-a',
@@ -262,10 +269,6 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 
 		await run([{ type: 'put', id: 'consistency-a', value: { name: 'consistency-a', shard: 9 }, version }]);
 		assert.equal(shardOfA(), 0, 'at an equal version the stored record wins');
-
-		await run([{ type: 'patch', id: 'consistency-a', value: { shard: 5 }, version: version + 1 }]);
-		assert.equal(shardOfA(), 5, 'a patch newer than the scan is merged over the stored row');
-		assert.equal(server.nodes.find((node) => node.name === 'consistency-a').url, 'wss://consistency-a:9933');
 	});
 
 	it('scans once when several watchers process the same event', async () => {

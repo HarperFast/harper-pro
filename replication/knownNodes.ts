@@ -446,10 +446,20 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 // (one missed while the watcher resubscribed), and the listener still has to hear of it.
 const deliveredNodeNames = new WeakMap<(node: any, id: string) => void, Set<string>>();
 
+function notifyOne(listener: (node: any, id: string) => void, node: any, name: string): boolean {
+	try {
+		listener(node, name);
+		return true;
+	} catch (error) {
+		logger.error?.('Error handling hdb_nodes row', name, error);
+		return false;
+	}
+}
+
 /**
  * Tells `listener` of each row that left `rows` since its last call (as a nullish node), then of `id`'s row
- * and each row it has not been told of, or of every row when `id` is undefined. A name counts as told only
- * once its call returns, so a listener that throws hears of that row again on the next event.
+ * and each row it has not been told of, or of every row when `id` is undefined. A row whose call throws is
+ * not counted as told, so it is retried on the next event without holding up the others.
  */
 function notifyNodeListener(
 	listener: (node: any, id: string) => void,
@@ -461,55 +471,41 @@ function notifyNodeListener(
 	const delivered = new Set(previous);
 	deliveredNodeNames.set(listener, delivered);
 	for (const name of previous) {
-		if (rows.has(name)) continue;
-		listener(undefined, name);
-		delivered.delete(name);
+		if (!rows.has(name) && notifyOne(listener, undefined, name)) delivered.delete(name);
 	}
 	for (const [name, node] of rows) {
 		if (id !== undefined && name !== id && previous.has(name)) continue;
 		delivered.delete(name);
-		listener(node, name);
-		delivered.add(name);
+		if (notifyOne(listener, node, name)) delivered.add(name);
 	}
-	if (deleted && id !== undefined && !rows.has(id) && !previous.has(id)) listener(undefined, id);
+	if (deleted && id !== undefined && !rows.has(id) && !previous.has(id)) notifyOne(listener, undefined, id);
 }
 
 let publishedRows = new Map<string, any>();
-// every watcher receives each event; the first to process it scans for all of them
-let publishedFor: string | undefined;
+// every watcher receives each event, so the first to handle it scans for the rest
+const publishedEvents = new Set<string>();
 
 /**
  * Publishes server.nodes (peers) and server.shards (every row with a shard, this node's included) from one
- * synchronous hdb_nodes scan, and returns the scanned rows by key. A row reconstructed from its key after a
- * decode miss keeps the fields it was last published with (harper-pro#460). An event newer than the stored
- * row or tombstone decides its own row, since the scan can read from before its commit; at an equal version
- * the event only replaces a decode-miss reconstruct.
+ * synchronous hdb_nodes scan, and returns the scanned rows by key. Core delivers an event only after its
+ * commit, resetting LMDB's read transaction first, so the scan already holds the event's write. A row
+ * reconstructed from its key after a decode miss takes the event's own decoded record when that is not
+ * older, else keeps the fields it was last published with (harper-pro#460).
  */
 function publishKnownNodes(event?: any): Map<string, any> {
 	const id = event?.id ?? event?.value?.name;
-	const eventKey = event?.version === undefined ? undefined : `${event.type} ${id} ${event.version}`;
-	if (eventKey !== undefined && eventKey === publishedFor) return publishedRows;
+	const eventKey = event?.version === undefined ? undefined : `${event.type} ${id} ${event.version} ${event.localTime}`;
+	if (eventKey !== undefined && publishedEvents.has(eventKey)) return publishedRows;
+	const decoded = event?.type === 'put' && isValidNodeRecord(event.value) ? event.value : undefined;
 	const rows = new Map<string, any>();
-	const versions = new Map<string, number>();
-	scanNodesForSubscription(
-		getHDBNodeTable().primaryStore,
-		(node, key, version) => {
-			// a real record always has a url and keeps its freshly decoded `replicates`
-			if (!node.url && publishedRows.has(key)) node = mergeReconstructedNode(node, publishedRows.get(key));
-			rows.set(key, node);
-			versions.set(key, version);
-		},
-		(key, version) => versions.set(key, version)
-	);
-	const stored = versions.get(id);
-	const eventDecides =
-		eventKey !== undefined &&
-		(stored === undefined || event.version > stored || (event.version === stored && !rows.get(id)?.url));
-	if (eventDecides) {
-		if (isGenuineNodeDeletion(event.type)) rows.delete(id);
-		else if (event.type === 'put' && isValidNodeRecord(event.value)) rows.set(id, event.value);
-		else if (event.type === 'patch' && rows.has(id) && event.value) rows.set(id, { ...rows.get(id), ...event.value });
-	}
+	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key, version) => {
+		// a real record always has a url and keeps its freshly decoded `replicates`
+		if (!node.url) {
+			if (decoded && key === id && !(version > event.version)) node = decoded;
+			else if (publishedRows.has(key)) node = mergeReconstructedNode(node, publishedRows.get(key));
+		}
+		rows.set(key, node);
+	});
 	const thisNodeName = getThisNodeName();
 	const nodes = [];
 	const shards = new Map();
@@ -524,7 +520,10 @@ function publishKnownNodes(event?: any): Map<string, any> {
 	server.nodes = nodes;
 	server.shards = shards;
 	publishedRows = rows;
-	publishedFor = eventKey;
+	if (eventKey !== undefined) {
+		publishedEvents.add(eventKey);
+		if (publishedEvents.size > 64) publishedEvents.delete(publishedEvents.values().next().value);
+	}
 	return rows;
 }
 
@@ -633,18 +632,11 @@ export function resolveScannedNode(
  * without standing up a server. publishKnownNodes owns the `server` bookkeeping.
  */
 const undecodedRowsWarned = new Set<unknown>();
-export function scanNodesForSubscription(
-	store: any,
-	onNode: (node: any, key: any, version?: number) => void,
-	onDeleted?: (key: any, version?: number) => void
-) {
+export function scanNodesForSubscription(store: any, onNode: (node: any, key: any, version?: number) => void) {
 	for (const entry of store.getRange({ versions: true })) {
 		const { value, key, version } = entry;
 		const node = resolveScannedNode(value, key, (probeKey) => probeNodeRow(store, probeKey));
-		if (!node) {
-			onDeleted?.(key, version);
-			continue;
-		}
+		if (!node) continue;
 		if (value) undecodedRowsWarned.delete(key);
 		else {
 			const log = undecodedRowsWarned.has(key) ? logger.trace : logger.warn;
