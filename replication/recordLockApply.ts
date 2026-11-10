@@ -232,15 +232,13 @@ export function planSurvey(
 
 	let floor = 0;
 	for (const reply of rows.values()) floor = Math.max(floor, floorOf(reply));
-	let generation = requestedGeneration;
-	if (generation === undefined) {
-		// Resume an interrupted transition to this exact set rather than opening a new generation past it.
-		let resumable = false;
-		for (const reply of rows.values())
-			for (const state of [reply.active, reply.staged])
-				if (state?.generation === floor && sameSet(state.homes, homes)) resumable = true;
-		generation = resumable ? floor : floor + 1;
-	}
+	// Resume an interrupted transition to this exact set rather than opening a new generation past it.
+	let resumable = false;
+	for (const reply of rows.values())
+		for (const state of [reply.active, reply.staged])
+			if (state?.generation === floor && sameSet(state.homes, homes)) resumable = true;
+	const resumeTarget = resumable ? floor : floor + 1;
+	const generation = requestedGeneration ?? resumeTarget;
 	const digest = digestOf(generation, homes);
 	// Anchor: an `active` ring holding the fenced node that a strict majority of its members report, or a
 	// fence an earlier call of this transition recorded at its target. Why a majority, not one
@@ -277,8 +275,24 @@ export function planSurvey(
 		return {
 			action: 'refuse',
 			status: 409,
-			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; apply without fenced once it is reachable, or use the per-node operations and keep it stopped until it is re-staged`,
+			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; apply without fenced once it is reachable, or ${manualRecovery(database, homes, quiesce, fenced, rows, [resumeTarget, floor + 1]) ?? 'use the per-node operations and keep it stopped until it is re-staged'}`,
 		};
+	const stages = planStages(database, homes, quiesce, rows, generation, digest);
+	if ('rejected' in stages)
+		return { action: 'refuse', status: 409, reason: `${stages.rejected} would refuse to stage: ${stages.reason}` };
+	return { action: 'proceed', generation, digest, ...stages };
+}
+
+type StagePlans = { rejected: string; reason: string } | { alreadyActive: Set<string>; alreadyStaged: Set<string> };
+
+function planStages(
+	database: string,
+	homes: string[],
+	quiesce: string[],
+	rows: Map<string, SurveyReply>,
+	generation: number,
+	digest: string
+): StagePlans {
 	const alreadyActive = new Set<string>();
 	const alreadyStaged = new Set<string>();
 	for (const [node, reply] of rows) {
@@ -294,11 +308,37 @@ export function planSurvey(
 			fenced: [],
 		};
 		const plan = planStage(row, database, generation, homes, digest, Date.now(), quiesce);
-		if (plan.action === 'reject')
-			return { action: 'refuse', status: 409, reason: `${node} would refuse to stage: ${plan.reason}` };
+		if (plan.action === 'reject') return { rejected: node, reason: plan.reason };
 		if (plan.action === 'noop') alreadyStaged.add(node);
 	}
-	return { action: 'proceed', generation, digest, alreadyActive, alreadyStaged };
+	return { alreadyActive, alreadyStaged };
+}
+
+/**
+ * The per-node runbook (RECORD_LOCK_HOMES_DESIGN.md "Minority survivors get a 409") for the surveyed
+ * rows, at the first candidate generation every surveyed node accepts. The resume target comes first:
+ * it stays put once the operator has staged it, so a re-sent call repeats the same steps through the
+ * drain wait. Undefined when no candidate fits or no node is left to stage.
+ */
+function manualRecovery(
+	database: string,
+	homes: string[],
+	quiesce: string[],
+	fenced: string[],
+	rows: Map<string, SurveyReply>,
+	candidates: number[]
+): string | undefined {
+	for (const generation of candidates) {
+		if (!Number.isSafeInteger(generation)) return undefined;
+		const stages = planStages(database, homes, quiesce, rows, generation, digestOf(generation, homes));
+		if ('rejected' in stages) continue;
+		const stageOn = canonicalizeHomes([...rows.keys()].filter((node) => !stages.alreadyActive.has(node)));
+		if (stageOn.length === 0) return undefined;
+		const stage = JSON.stringify({ operation: 'record_lock_stage_generation', database, generation, homes, quiesce });
+		const activate = JSON.stringify({ operation: 'record_lock_activate_generation', database, generation, homes });
+		return `if ${JSON.stringify(fenced)} will never run again from their current data, re-home without them by hand: send ${stage} to each of ${JSON.stringify(stageOn)}; after the last of those succeeds, wait ${DELEGATION_DRAIN_MS} ms, then send ${activate} to each of ${JSON.stringify(homes)}. Never activate after a failed stage; if interrupted, re-send this call for steps that match the current state`;
+	}
+	return undefined;
 }
 
 export type ActivationPlan =
