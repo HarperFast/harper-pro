@@ -108,7 +108,7 @@ export async function readLog(node) {
 	return '';
 }
 
-async function hdbLogPath(node) {
+export async function hdbLogPath(node) {
 	const { join } = await import('node:path');
 	return join(node.logDir || join(node.dataRootDir, 'log'), 'hdb.log');
 }
