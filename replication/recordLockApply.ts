@@ -316,8 +316,8 @@ function planStages(
 
 /**
  * The per-node runbook (RECORD_LOCK_HOMES_DESIGN.md "Minority survivors get a 409") for the surveyed
- * rows. One past `floor` is always accepted: the `unlisted` check already proved `quiesce` covers each
- * ring a row remembers.
+ * rows. One past `floor` is accepted whenever it is a safe integer: the `unlisted` check already proved
+ * `quiesce` covers each ring a row remembers.
  */
 function manualRecovery(
 	database: string,
