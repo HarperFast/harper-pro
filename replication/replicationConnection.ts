@@ -337,7 +337,6 @@ const CAUGHT_UP = 151;
 const GATEWAY_REACH = 152;
 const GATEWAY_REACH_INTERVAL_MS = 1000;
 const RELAY_LEASE_POLL_MS = 1000;
-// the close reason with which a source vetoes completing a copy; the follower then discards its resume point
 const COPY_VETOED_REASON = 'A base copy into this node began during this copy';
 const MAX_REACH_REGIONS = 64;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
@@ -6660,8 +6659,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// -1, not 0, so this socket's first post carries its own zero and clears whatever count the retired
 	// socket left on the main-thread entry.
 	let lastPostedUnknownCommandCount = -1;
-	// Region topology (harper-pro#1291): the regions the peer (a gateway in this node's region) last reported holding a
-	// caught-up link to, and what this session last posted of it; the topology exclusions it last sent its peer.
 	let receivedGatewayReach: string[] | undefined;
 	let lastPostedGatewayReach: string | undefined;
 	let lastSentTopologyExcluded = new Set<string>();
@@ -11461,6 +11458,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													continue;
 												}
 												if (action === 'park') {
+													if (currentTransaction.txnLogKey && key <= currentSequenceId) {
+														wsClosed = true;
+														close(1011, 'Replication restarts after a base copy into this node');
+														return;
+													}
 													relayWithheld.parked = true;
 													break;
 												}

@@ -7,8 +7,8 @@
  * The same nine nodes run once as a full mesh (no regions) and once labeled. `regionNetworkInjector.mjs` counts the
  * bytes each node receives from each peer and adds latency: 30 ms between regions, 1 ms within one. For a single
  * writer (a leaf, then a gateway) it reports the cross-region bytes per write and each node's egress, and it times a
- * leaf's write until a leaf in another region can read it. The labeled run is measured once suppliers have settled. Results go to REGION_TOPOLOGY_BENCH_OUT (default under the
- * OS tmpdir) and the test diagnostics.
+ * leaf's write until a leaf in another region can read it. The labeled run is measured once suppliers have settled.
+ * Results go to REGION_TOPOLOGY_BENCH_OUT (default under the OS tmpdir) and the test diagnostics.
  */
 import { suite, test, after } from 'node:test';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';

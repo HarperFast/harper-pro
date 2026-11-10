@@ -41,6 +41,7 @@ import {
 	currentRegionTopology,
 	regionTopologyFor,
 	selfTopologyLabels,
+	setResidencyVerdictListener,
 } from './knownNodes.ts';
 import {
 	isGateway,
@@ -139,11 +140,10 @@ type ReplicationConnectionStatus = {
 	// Explicit unsubscribe keeps the entry alive for iterator/URL cleanup, but it is no longer
 	// an active subscription and must not take the existing-entry reuse fast path.
 	unsubscribed?: boolean;
-	// Region topology (harper-pro#1291): when this link last came up; the regions the peer gateway reports a
-	// caught-up link to, and since when each; and a liveness hold through a reconnect this node caused.
 	liveSince?: number;
 	peerReach?: string[];
 	reachSince?: Map<string, number>;
+	// Holds liveness across a reconnect this node triggered.
 	topologyPinnedUntil?: number;
 	nodes: ({
 		name: string;
@@ -1481,15 +1481,20 @@ export async function startOnMainThread(options) {
 	let isFullyReplicating;
 	let appliedTopology: string | undefined;
 	let topologyReviewScheduled = false;
-	// A change to any row's region, gateway or membership can move links for every peer, not only the one whose
-	// row changed. Re-running onNodeUpdate over all rows is idempotent: links that stay are left alone.
+	// A change to any row's region, gateway or membership, or a database's residency verdict, can move links for every
+	// peer, not only the one whose row changed. Re-running onNodeUpdate over all rows is idempotent: links that stay are
+	// left alone.
 	function scheduleTopologyReview() {
 		if (topologyReviewScheduled) return;
 		topologyReviewScheduled = true;
 		const timer = setTimeout(() => {
 			topologyReviewScheduled = false;
 			try {
-				const signature = topologySignature(currentRegionTopology());
+				const managedDatabases = Object.getOwnPropertyNames(getDatabases())
+					.filter((db) => regionTopologyFor(db))
+					.sort()
+					.join(',');
+				const signature = `${topologySignature(currentRegionTopology())}|${managedDatabases}`;
 				if (signature === appliedTopology) return;
 				for (const row of getHDBNodeTable().search([])) {
 					if (row?.name) onNodeUpdate(row, row.name);
@@ -1502,6 +1507,7 @@ export async function startOnMainThread(options) {
 		}, 0);
 		timer.unref?.();
 	}
+	setResidencyVerdictListener(scheduleTopologyReview);
 	/**
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
@@ -2122,8 +2128,7 @@ export async function startOnMainThread(options) {
 		}
 	}
 	function reconcileWorkers() {
-		// not every hdb_nodes change reaches onNodeUpdate (only isLeader patches do), and the review is a cached
-		// comparison until the topology actually changes
+		// not every hdb_nodes change reaches onNodeUpdate (only isLeader patches do)
 		scheduleTopologyReview();
 		const now = Date.now();
 		const replicationPool = replicationWorkers();
@@ -2476,7 +2481,6 @@ export async function requestClusterStatus(message?, port?) {
 						peerCapabilities,
 						// Omitted on a healthy link (harper-pro#440), matching blobReplicationFailures.
 						unknownCommandFrames: unknownCommandFrames || undefined,
-						// the regions a gateway of this node's region reports a caught-up link to (region topology)
 						gatewayReach: peerReach,
 						nodes: nodes.filter((node) => !(node.endTime < Date.now())).map((node) => node.name),
 					});

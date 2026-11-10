@@ -367,7 +367,7 @@ replication:
 - While a node applies a [base copy](#when-a-peer-forces-a-base-copy) of a database other than `system`, it keeps sending its own writes but relays no other node's until the copy completes: the copy writes rows without transaction-log entries, which a relayed stream would skip. A gateway in that state reports no caught-up links, so the other nodes of its region move to the other gateway. A node that takes writes from it waits. If the copy is interrupted, by a disconnect or a restart, relaying stays held back until a later copy from the same source completes, for at most 30 minutes, after which the node logs an error and relays again. Up to eight copies into one database can run at once on a node; a ninth is closed and retried.
 - A route in `replication.routes` that sets `replicates`, `sendsTo`, `receivesFrom` or `subscriptions` keeps its link whatever the topology says. A plain route is a seed for discovery.
 
-Region topology turns on only when every node in `hdb_nodes` has a region and full (non-directional) replication, so it waits until the last node of a rolling upgrade is labeled. Until then, and whenever a node without a region joins, the cluster stays on the full mesh. It also stays off for:
+Region topology turns on only when every node in `hdb_nodes` has a region and full (non-directional) replication, so it waits until the last node of a rolling upgrade is labeled. Until then, and whenever a node without a region joins, the cluster stays on the full mesh. When a pruned link becomes direct again (for example, when the topology turns off or a node becomes a gateway), it resumes from its saved route cursor, which replays or forces a base copy if that cursor is past retention. It also stays off for:
 
 - nodes on LMDB, which do not publish their region, since switching suppliers needs per-origin transaction logs;
 - databases with sharding or residency, which keep direct links;
@@ -425,7 +425,7 @@ From v5.3.6, a peer records how far each prune of its transaction logs reached. 
 
 <VersionBadge version="v5.4.0" /> A peer never forces a base copy on a node that owns [sharding](./residency.md) slots the peer is not a complete co-owner of, because that node would refuse it. The peer replays what its transaction logs still hold from the node's position instead, and logs a warning once per database, node and reason, ending `so replay continues from <position>, and writes from this node it has not received may be missing there.` Whatever the peer purged before that node received it stays missing there, including rows of tables in that database that are not sharded.
 
-A copy that keeps failing is reported as [`stuckCopy`](./clustering.md#stuck-copies) in `cluster_status`, and its reconnects are held back instead of retried indefinitely.
+A copy that keeps failing is reported as [`stuckCopy`](./clustering.md#stuck-copies) in `cluster_status`, and its reconnects are held back instead of retried indefinitely. While a node applies a base copy of a database other than `system` on RocksDB, it withholds relaying other origins' entries until the copy settles and closes any outbound copy walk of that database that overlapped the inbound copy (`A base copy into this node began during this copy`), whether or not region topology is enabled.
 
 ### Rows From Unnamed Origins
 

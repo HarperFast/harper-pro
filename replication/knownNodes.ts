@@ -1041,7 +1041,6 @@ export function currentRegionTopology(): RegionTopology {
 		return topologyCache.topology;
 	const selfName = getThisNodeName();
 	const labels = selfTopologyLabels();
-	// a member with no region turns the topology off before its replication is read
 	const self = {
 		name: selfName,
 		...labels,
@@ -1059,7 +1058,6 @@ export function currentRegionTopology(): RegionTopology {
 		(previous?.active !== topology.active || previous?.inactiveReason !== topology.inactiveReason)
 	)
 		logger.info?.(topology.active ? 'Region topology active' : `Region topology off: ${topology.inactiveReason}`);
-	// unchanged links keep the topology and its recipient and residency caches
 	if (
 		previous &&
 		previous.inactiveReason === topology.inactiveReason &&
@@ -1072,8 +1070,15 @@ export function currentRegionTopology(): RegionTopology {
 	return topology;
 }
 
+let onResidencyVerdictsCleared: (() => void) | undefined;
+export function setResidencyVerdictListener(listener: (() => void) | undefined) {
+	onResidencyVerdictsCleared = listener;
+}
 // a table gaining or losing residency changes the verdict, which the topology cache would otherwise keep for 5 s
-const clearResidencyVerdicts = () => topologyCache?.residency.clear();
+const clearResidencyVerdicts = () => {
+	topologyCache?.residency.clear();
+	onResidencyVerdictsCleared?.();
+};
 databaseEventsEmitter.on('updateTable', clearResidencyVerdicts);
 databaseEventsEmitter.on('dropTable', clearResidencyVerdicts);
 databaseEventsEmitter.on('dropDatabase', clearResidencyVerdicts);
