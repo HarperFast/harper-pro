@@ -892,7 +892,6 @@ async function runStep(cluster, { body, nodes }, action) {
 describe('a fenced apply refused on a ring that names removed nodes reports the manual recovery', function () {
 	this.timeout(30_000);
 	const operator = { username: 'ops-admin' };
-	// The reported shape: a and b left the ring {a,b,c,d}, and e and f joined after it.
 	const departedRing = () => {
 		const rows = activeCluster(['a', 'b', 'c', 'd']);
 		delete rows.a;
