@@ -16,8 +16,9 @@
  *   while the leaf writes; the leaf's log is purged, so the restarted gateway catches up by a base copy, whose settle
  *   the test holds while the leaf keeps writing. The west gateway, able to reach only that gateway, is restarted into
  *   the open pass, and must end with every row the copy applied as well as the later ones.
- * - The same gateway killed while its pass is held at COPY_START, then restarted, settles a new pass and relays again:
- *   the lease lives in process memory, and an interrupted pass leaves nothing that withholds relaying.
+ * - The same gateway killed after its pass applied rows and logged its tail, then restarted cut off from its source:
+ *   the follower admitted before a new pass settles must still end with every row, since the reservation the killed
+ *   pass left holds relaying back until a later pass from that source settles.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
@@ -416,28 +417,60 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 		await waitForPhase(nodes(), 'open-tail', tailRows);
 	});
 
-	test('a gateway killed during its base copy settles a new one after its restart and relays again', async () => {
+	test('a follower admitted after its gateway restarts mid-copy, before a new copy settles, ends with every row', async () => {
 		const { relay, follower, leaf } = await stopRelayAndFollowerAcrossPurge('restart-copied');
-		const hold = await holdDirectory('start-hold');
+		const hold = await holdDirectory('restart-settle-hold');
 		await restart(relay, {
-			HARPER_TEST_HOLD_COPY_START_DIR: hold,
-			HARPER_TEST_HOLD_COPY_START_DB: 'data',
-			HARPER_TEST_HOLD_COPY_START_PEER: leaf.hostname,
+			HARPER_TEST_HOLD_COPY_SETTLE_DIR: hold,
+			HARPER_TEST_HOLD_COPY_SETTLE_DB: 'data',
+			HARPER_TEST_HOLD_COPY_SETTLE_PEER: leaf.hostname,
 		});
-		await waitForHold(hold, `${relay.harper.hostname} holding COPY_START from ${leaf.hostname}`);
+		await waitForHold(hold, `${relay.harper.hostname} holding the settle of its base copy from ${leaf.hostname}`);
+		// logged by the gateway as its copy's tail, above rows the copy applied without log entries
+		const tail = startRowWriter(leaf, 'restart-tail');
+		let tailRows;
+		let tailStopped = false;
 		try {
+			await delay(5000);
+			await killNode(relay.harper);
+			// cut off from its source, so no new copy starts before the follower is admitted
+			await writeFile(
+				partitionFile(workDir, relay.harper.hostname),
+				JSON.stringify(
+					nodes()
+						.map(({ hostname }) => hostname)
+						.filter((name) => name !== relay.harper.hostname)
+				)
+			);
+			await restart(relay);
 			await restart(follower);
 			await waitForLink(follower.harper, relay.harper);
-			await killNode(relay.harper);
-			await restart(relay);
-			const later = await insert(leaf, 'restart-later', leaf.hostname, 20);
-			// the follower reaches no other peer, so these rows came through the restarted gateway
-			await waitForPhase([follower.harper], 'restart-later', later.length);
+			await delay(8000);
+			const relayMark = await logMark(relay.harper);
+			await cutOffAllBut(relay.harper, leaf);
+			await waitForCondition(
+				async () =>
+					[...(await readLogSince(relay.harper, relayMark)).matchAll(FORCED_COPY)].some(
+						([, peer]) => peer === follower.harper.hostname
+					),
+				{
+					timeoutMs: 180_000,
+					description: `${relay.harper.hostname} forcing a base copy for ${follower.harper.hostname} once a new copy settled`,
+				}
+			);
+			tailRows = await tail.stop();
+			tailStopped = true;
 			await waitForPhase([follower.harper], 'restart-copied', COPIED_ROWS);
+			await waitForPhase([follower.harper], 'restart-tail', tailRows);
+			// the follower reaches no other peer, so these rows came through the restarted gateway
+			const later = await insert(leaf, 'restart-later', leaf.hostname, 20);
+			await waitForPhase([follower.harper], 'restart-later', later.length);
 		} finally {
+			if (!tailStopped) tailRows = await tail.stop();
 			await reconnectAll(relay, follower);
 		}
 		await waitForPhase(nodes(), 'restart-copied', COPIED_ROWS);
+		await waitForPhase(nodes(), 'restart-tail', tailRows);
 		await waitForPhase(nodes(), 'restart-later', 20);
 	});
 });

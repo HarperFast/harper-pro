@@ -239,6 +239,8 @@ import {
 	holdRelayCopyLease,
 	relayCopyLeaseClaims,
 	relayCopyLeaseHeld,
+	reservationHolds,
+	RESERVATION_HOLD_MS,
 	RELAY_COPY_SETTLE_DEADLINE_MS,
 	type RelayCopyLease,
 } from './relayCopyLease.ts';
@@ -776,8 +778,11 @@ export function replayStartUnderPurge(
 	return undefined;
 }
 
-/** Copy bounds by origin name: `settled` from completed passes, `reserved` by passes still applying rows. */
-export type RelayCopyBounds = { settled: Map<string, number>; reserved: Map<string, number> };
+/**
+ * Copy bounds by origin name: `settled` from completed passes, `reserved` by passes still applying rows or that ended
+ * without settling; `passes` are those reservations' pass tokens.
+ */
+export type RelayCopyBounds = { settled: Map<string, number>; reserved: Map<string, number>; passes?: string[] };
 
 /**
  * This node's copy bounds per origin name. Holes are left out: they name records a pass dropped, which no replay or
@@ -787,12 +792,16 @@ export function readRelayCopyBounds(dbisDB: DbisStore, idMapping: Record<string,
 	readCopyBounds(dbisDB);
 	const settledById = new Map<number, number>();
 	const reservedById = new Map<number, number>();
+	const passes: string[] = [];
 	for (const { key, value } of dbisDB.getRange!({
 		start: COPY_BOUND_KEY,
 		end: [COPY_BOUND_KEY, Buffer.from([0xff])],
 	}) as Iterable<{ key: any; value: unknown }>) {
 		if (key.length === 2) mergeCopyBoundRecordInto(settledById, value);
-		else if (key[2] === 'reserved') mergeCopyBoundRecordInto(reservedById, value);
+		else if (key[2] === 'reserved') {
+			mergeCopyBoundRecordInto(reservedById, value);
+			passes.push(String(key[3]));
+		}
 	}
 	const settled = new Map<string, number>();
 	const reserved = new Map<string, number>();
@@ -800,7 +809,51 @@ export function readRelayCopyBounds(dbisDB: DbisStore, idMapping: Record<string,
 		if (settledById.has(id)) settled.set(name, settledById.get(id)!);
 		if (reservedById.has(id)) reserved.set(name, reservedById.get(id)!);
 	}
-	return { settled, reserved };
+	return { settled, reserved, passes };
+}
+
+/**
+ * Senders hold back `databaseName`'s relayed origins while an inbound pass holds the lease, or while a reservation a
+ * pass left unsettled is still honored (harper-pro#1299). The system database takes neither: node registrations reach
+ * new members through its relayed rows during the joins that copy it.
+ */
+export function relayWithholdingActive(auditStore: any, databaseName: string, dbisDB?: DbisStore): boolean {
+	if (databaseName === 'system' || !auditStore) return false;
+	if (relayCopyLeaseHeld(auditStore, databaseName)) return true;
+	if (!dbisDB?.getRange || !auditStore.rootStore) return false;
+	const { passes } = readRelayCopyBoundsAt(dbisDB, auditStore, readOriginStateEpoch(auditStore.rootStore));
+	const holds = reservationHolds(databaseName, passes ?? [], (pass) =>
+		logger.error?.(
+			`Copy reservation ${pass} in ${databaseName} has not been settled by a later pass within ${RESERVATION_HOLD_MS / 60_000} minutes; relaying of ${databaseName} resumes without it, so a follower can miss rows that pass applied without log entries`
+		)
+	);
+	if (holds && !reportedReservationHolds.has(databaseName)) {
+		reportedReservationHolds.add(databaseName);
+		logger.info?.(
+			`Holding back relayed origins of ${databaseName}: copy reservations ${passes!.join(', ')} were left by passes that did not settle`
+		);
+	} else if (!holds) reportedReservationHolds.delete(databaseName);
+	return holds;
+}
+const reportedReservationHolds = new Set<string>();
+
+/**
+ * The reservation slots `peerId`'s earlier attempts left, other than `pass`'s. A settled pass from that peer walked
+ * what they applied (a resumed pass from their saved cursor, a fresh one from the start), so their slots can go.
+ */
+export function earlierReservationSlots(
+	dbisDB: DbisStore,
+	peerId: number,
+	pass: string | number
+): (string | number)[][] {
+	const slots: (string | number)[][] = [];
+	for (const { key } of dbisDB.getRange!({
+		start: COPY_BOUND_KEY,
+		end: [COPY_BOUND_KEY, Buffer.from([0xff])],
+	}) as Iterable<{ key: any }>) {
+		if (key[1] === peerId && key[2] === 'reserved' && key[3] !== pass) slots.push(key.slice(2));
+	}
+	return slots;
 }
 
 const copyBoundsByEpoch = new WeakMap<object, { epoch: number; bounds: RelayCopyBounds }>();
@@ -4459,14 +4512,19 @@ export function settleCopyBounds(
  * nothing to `subscriber`: the topology is off, this node is not a gateway, or the subscriber is in another region.
  * None while it applies an inbound base copy, when it relays nothing (harper-pro#1299).
  */
-export function gatewayReachFor(databaseName: string, subscriber: string, auditStore: any): string[] | undefined {
+export function gatewayReachFor(
+	databaseName: string,
+	subscriber: string,
+	auditStore: any,
+	dbisDB?: DbisStore
+): string[] | undefined {
 	const topology = regionTopologyFor(databaseName);
 	const selfName = getThisNodeName();
 	if (!topology || !auditStore || !isGateway(topology, selfName)) return;
 	const region = topology.regionOf.get(selfName);
 	if (topology.regionOf.get(subscriber) !== region) return;
 	const regions: string[] = [];
-	if (relayCopyLeaseHeld(auditStore, databaseName)) return regions;
+	if (relayWithholdingActive(auditStore, databaseName, dbisDB)) return regions;
 	for (const [otherRegion, gateways] of topology.gatewaysByRegion) {
 		if (otherRegion === region) continue;
 		for (const gateway of gateways) {
@@ -7719,6 +7777,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		relayCopyLease = undefined;
 	}
 	ws.once('close', releaseRelayLease);
+	// a pass that ends unsettled having applied no copied row covers nothing, so its reservation must not hold relaying
+	ws.once('close', () => {
+		if (!copyPassToken || settledPass === copyPassToken || copiedVersionByOrigin.size > 0) return;
+		const { dbisDB } = getDatabaseStores();
+		if (!dbisDB) return;
+		writeCopyBoundRows(dbisDB, ownCopyPeerId(), (auditStore ?? getDatabaseStores().auditStore)?.rootStore, {
+			release: [['reserved', copyPassToken]],
+		}).catch((error) =>
+			logger.warn?.(connectionId, 'could not release an empty copy reservation for', databaseName, error)
+		);
+	});
 	function loadPersistedCopyBounds(cursor?: DbisCursor): void {
 		if (!supportsCheckpointFloors()) return;
 		const { dbisDB } = getDatabaseStores();
@@ -7854,6 +7923,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			await settleCopyBounds(dbisDB, copiedVersionByOrigin, peerId, rootStore, pass, filled, passState?.startTime ?? 0);
 			settledPass = pass;
 			logger.debug?.(connectionId, 'settled copy bounds for', databaseName, Object.fromEntries(copiedVersionByOrigin));
+			try {
+				const earlier = earlierReservationSlots(dbisDB, peerId, pass);
+				if (earlier.length) await writeCopyBoundRows(dbisDB, peerId, rootStore, { release: earlier });
+			} catch (error) {
+				// they stay honored until the hold's timeout
+				logger.warn?.(connectionId, 'could not release earlier copy reservations for', databaseName, error);
+			}
 			// the bounds that keep earlier starts void are committed above, so another peer's row can go now; a release
 			// that fails leaves its hole, which still refuses
 			const elsewhere = new Map<number, (string | number)[][]>();
@@ -10137,7 +10213,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							);
 							const timer = setInterval(() => {
 								if (closed || wsClosed) return clearInterval(timer);
-								if (relayCopyLeaseHeld(auditStore, databaseName)) return;
+								if (relayWithholdingActive(auditStore, databaseName, getDatabaseStores().dbisDB)) return;
 								clearInterval(timer);
 								const withheld = relayWithheld;
 								relayWithheld = undefined;
@@ -10262,7 +10338,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return;
 								}
 							}
-							if (nodesToInclude.length && !relayWithheld && relayCopyLeaseHeld(auditStore, databaseName)) {
+							if (
+								nodesToInclude.length &&
+								!relayWithheld &&
+								relayWithholdingActive(auditStore, databaseName, getDatabaseStores().dbisDB)
+							) {
 								// as at a lease seen mid-transaction: the frame's end_txn would commit the part already sent
 								if (currentTransaction.txnLogKey) {
 									wsClosed = true;
@@ -10592,7 +10672,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									const epoch = readOriginStateEpoch(auditStore.rootStore);
 									if (epoch === sessionCopyEpoch) return false;
 									// a pass claims its lease before its reservation commits, and applies no row before that
-									if (relayCopyLeaseHeld(auditStore, databaseName)) {
+									if (relayWithholdingActive(auditStore, databaseName, getDatabaseStores().dbisDB)) {
 										if (!currentTransaction.txnLogKey) {
 											withholdRelayedOrigins();
 											return false;
@@ -10661,7 +10741,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													close(1011, 'Replication could not read the copy bounds');
 													return;
 												}
-												if (relayCopyLeaseHeld(auditStore, databaseName)) withholdRelayedOrigins();
+												if (relayWithholdingActive(auditStore, databaseName, getDatabaseStores().dbisDB))
+													withholdRelayedOrigins();
 											}
 											// If the requested incremental start predates the transaction-log history we still
 											// retain, the entries needed to catch up incrementally have been purged (retention is
@@ -14305,7 +14386,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const announce = () => {
 			try {
 				if (wsClosed) return stopGatewayReachAnnouncements();
-				const regions = gatewayReachFor(databaseName, remoteNodeName, auditStore);
+				const regions = gatewayReachFor(databaseName, remoteNodeName, auditStore, getDatabaseStores().dbisDB);
 				const signature = regions && JSON.stringify(regions);
 				if (signature === undefined || signature === lastSent) return;
 				ws.send(encode([GATEWAY_REACH, regions, databaseName]));

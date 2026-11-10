@@ -116,3 +116,43 @@ export function holdRelayCopyLease(
 	timer.unref?.();
 	return lease;
 }
+
+/**
+ * After a pass that ended without settling (its connection closed, or a restart), the copy reservation it committed
+ * stays, and the rows it applied without log entries may sit below later log entries. Relaying stays held back until
+ * a later pass from that source settles and releases it, but never for good: a reservation is honored for
+ * RESERVATION_HOLD_MS from when this process first saw it with no lease held, long enough for the source to come back
+ * and a resumed pass to claim the lease, and not at all once its pass started more than RESERVATION_MAX_AGE_MS ago, so
+ * one left by an older version never holds relaying after each restart.
+ */
+export const RESERVATION_HOLD_MS = 30 * 60_000;
+export const RESERVATION_MAX_AGE_MS = 24 * 60 * 60_000;
+const reservationFirstSeen = new Map<string, Map<string, number>>();
+
+/** `passes` are the database's unreleased reservation pass tokens (`<copy start>:<id>`); `onExpire` runs once per pass. */
+export function reservationHolds(
+	database: string,
+	passes: Iterable<string>,
+	onExpire: (pass: string) => void,
+	now = Date.now()
+): boolean {
+	let seen = reservationFirstSeen.get(database);
+	if (!seen) reservationFirstSeen.set(database, (seen = new Map()));
+	const current = new Set<string>();
+	let holds = false;
+	for (const pass of passes) {
+		const started = Number(String(pass).split(':')[0]);
+		if (!(started > 0) || now - started > RESERVATION_MAX_AGE_MS) continue;
+		current.add(pass);
+		let since = seen.get(pass);
+		if (since === undefined) seen.set(pass, (since = now));
+		if (now - since < RESERVATION_HOLD_MS) holds = true;
+		else if (since !== -1) {
+			seen.set(pass, -1);
+			onExpire(pass);
+		}
+	}
+	// a released reservation starts over if it ever comes back
+	for (const pass of seen.keys()) if (!current.has(pass)) seen.delete(pass);
+	return holds;
+}

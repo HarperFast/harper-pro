@@ -8,7 +8,10 @@ import {
 	holdRelayCopyLease,
 	relayCopyLeaseClaims,
 	relayCopyLeaseHeld,
+	reservationHolds,
 	RELAY_COPY_LEASE_TTL_MS,
+	RESERVATION_HOLD_MS,
+	RESERVATION_MAX_AGE_MS,
 } from '#src/replication/relayCopyLease';
 
 const T = 1_790_000_000_000;
@@ -135,5 +138,58 @@ describe('relay copy lease', () => {
 		await delay(40);
 		assert.strictEqual(expired, 1);
 		assert.strictEqual(relayCopyLeaseHeld(store, 'data', now), false);
+	});
+});
+
+describe('unsettled copy reservation hold', () => {
+	const pass = (started) => `${started}:id`;
+
+	it('holds from first sight until the timeout, then releases once with an error', () => {
+		const expired = [];
+		const p = pass(T);
+		assert.strictEqual(
+			reservationHolds('hold-a', [p], (x) => expired.push(x), T + 1000),
+			true
+		);
+		assert.strictEqual(
+			reservationHolds('hold-a', [p], (x) => expired.push(x), T + 1000 + RESERVATION_HOLD_MS - 1),
+			true
+		);
+		assert.strictEqual(
+			reservationHolds('hold-a', [p], (x) => expired.push(x), T + 1000 + RESERVATION_HOLD_MS),
+			false
+		);
+		assert.strictEqual(
+			reservationHolds('hold-a', [p], (x) => expired.push(x), T + 2000 + RESERVATION_HOLD_MS),
+			false
+		);
+		assert.deepStrictEqual(expired, [p]);
+	});
+
+	it('ignores a reservation whose pass started past the maximum age, or has no start', () => {
+		const expired = [];
+		const now = T + RESERVATION_MAX_AGE_MS + 1;
+		assert.strictEqual(
+			reservationHolds('hold-b', [pass(T), '0', 'x:id'], (x) => expired.push(x), now),
+			false
+		);
+		assert.deepStrictEqual(expired, []);
+	});
+
+	it('forgets a released reservation, so one that comes back is held again', () => {
+		const p = pass(T);
+		reservationHolds('hold-c', [p], () => {}, T);
+		assert.strictEqual(
+			reservationHolds('hold-c', [p], () => {}, T + RESERVATION_HOLD_MS),
+			false
+		);
+		assert.strictEqual(
+			reservationHolds('hold-c', [], () => {}, T + RESERVATION_HOLD_MS + 1),
+			false
+		);
+		assert.strictEqual(
+			reservationHolds('hold-c', [p], () => {}, T + RESERVATION_HOLD_MS + 2),
+			true
+		);
 	});
 });

@@ -10,6 +10,7 @@ import {
 	relayedCursorsForCopy,
 	copyBoundRoseForLogs,
 	withheldRecordAction,
+	earlierReservationSlots,
 	ORIGIN_CURSOR_OVERLAP_MS,
 } from '#src/replication/replicationConnection';
 
@@ -53,6 +54,20 @@ describe('relayedHeldFrom', () => {
 		assert.strictEqual(relayedHeldFrom(T, true, T + 5), T + ORIGIN_CURSOR_OVERLAP_MS);
 		assert.strictEqual(relayedHeldFrom(undefined, true, T + 5), 0);
 		assert.strictEqual(relayedHeldFrom(undefined, false, T + 5), T + 5);
+	});
+});
+
+describe('earlierReservationSlots', () => {
+	it("names every reservation slot of the peer but the settling pass's", () => {
+		const store = rowsStore([
+			[[COPY_BOUND, 6], { 2: T }],
+			[[COPY_BOUND, 6, 'reserved', 'p1'], { 2: T }],
+			[[COPY_BOUND, 6, 'reserved', 'p2'], { 2: T }],
+			[[COPY_BOUND, 6, 'hole', 'p1', 1, T], { 2: Number.MAX_VALUE }],
+			[[COPY_BOUND, 7, 'reserved', 'p3'], { 2: T }],
+		]);
+		assert.deepStrictEqual(earlierReservationSlots(store, 6, 'p2'), [['reserved', 'p1']]);
+		assert.deepStrictEqual(earlierReservationSlots(store, 8, 'p2'), []);
 	});
 });
 
