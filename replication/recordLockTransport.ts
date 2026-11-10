@@ -356,7 +356,6 @@ export function createRecordLockTransport(
 		if (!status) statusViews.set(peer, (status = getReplicationSharedStatus(auditStore, database, peer)));
 		return status;
 	};
-	// Checked at generation 1 only: see `markForeignRing`.
 	const foreignRingSeen = (auditStore: any): boolean => {
 		if (!deps.foreignRing || !auditStore) return false;
 		useStore(auditStore);
@@ -779,7 +778,7 @@ function foreignRingFlag(database: string, auditStore: any = auditStoreFor(datab
 	return auditStore ? foreignRingFlagFor(auditStore, database) : undefined;
 }
 /** Process-wide, never persisted: a restart re-learns it from the peers' announcements. */
-export function foreignRingFlagFor(auditStore: any, database: string): Float64Array {
+function foreignRingFlagFor(auditStore: any, database: string): Float64Array {
 	return new Float64Array(auditStore.getUserSharedBuffer(['recordLockForeignRing', database], new ArrayBuffer(8)));
 }
 
@@ -1069,7 +1068,6 @@ const restartRecall = createRestartRecall({
 	debug: (message, detail) => logger.debug?.(message, detail),
 });
 
-/** The automatic first generation, driven from the coordinating thread's `homeMap()` (`recordLockBootstrap.ts`). */
 const bootstrapTrigger = createBootstrapTrigger({
 	automatic: RECORD_LOCK_HOMES_AUTOMATIC,
 	rowState: (database) => rowStates.get(database),
@@ -1091,7 +1089,10 @@ const bootstrapTrigger = createBootstrapTrigger({
 const productionDeps: RecordLockTransportDeps = {
 	thisNodeName: getThisNodeName,
 	auditStore: auditStoreFor,
-	homeMapMissing: (database) => bootstrapTrigger.missing(database),
+	homeMapMissing(database) {
+		// Core reads `homeMap()` on the coordinating thread; an attempt runs there and nowhere else.
+		if (ownsRecordLockCoordination(database)) bootstrapTrigger.missing(database);
+	},
 	foreignRing: foreignRingFlagFor,
 	ownsDatabase: ownsRecordLockCoordination,
 	homeIncarnation: currentHomeIncarnation,
@@ -1295,7 +1296,7 @@ export interface RecordLockDatabaseStats {
 	restartRecall?: RestartRecallStatus;
 	/** The coordinating thread's delegate epoch for the database (record-locks.md §4.5), once known. */
 	delegateEpoch?: number;
-	/** The automatic first generation's attempts on the coordinating thread (`recordLockBootstrap.ts`). */
+	/** From the coordinating thread only. */
 	bootstrap?: BootstrapStatus;
 }
 

@@ -68,9 +68,9 @@ export async function startNode(suiteName, env, threadsCount = 1, preload) {
  * The install default is one worker per CPU less one; the harness pins one unless told. At least two, so a
  * `lock()` served off the coordinating worker relays to it; at most three, so a three-node suite fits a runner.
  */
-export const DEFAULT_THREADS = Math.min(3, Math.max(2, availableParallelism() - 1));
+const DEFAULT_THREADS = Math.min(3, Math.max(2, availableParallelism() - 1));
 
-/** No record-lock configuration and none of the record-lock test overrides: what a fresh install runs. */
+/** None of the record-lock test overrides `optionsFor` sets. */
 function defaultOptionsFor(hostname, { threadsCount = DEFAULT_THREADS, recordLocks, env = {} } = {}) {
 	const replication = {
 		securePort: hostname + ':9933',
@@ -90,7 +90,7 @@ function defaultOptionsFor(hostname, { threadsCount = DEFAULT_THREADS, recordLoc
 	};
 }
 
-/** `startNode` without any record-lock configuration; `recordLocks` sets the key (`null` clears it). */
+/** `recordLocks: null` clears a value an earlier start wrote. */
 export async function startDefaultNode(suiteName, options) {
 	const hostname = await getNextAvailableLoopbackAddress();
 	const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
@@ -100,7 +100,6 @@ export async function startDefaultNode(suiteName, options) {
 	return ctx;
 }
 
-/** Start a stopped node again on its data, with `startDefaultNode`'s options. */
 export async function restartDefaultNode(ctx, options) {
 	const { hostname, dataRootDir } = ctx.harper;
 	const restarted = { name: ctx.name, harper: { hostname, dataRootDir } };

@@ -31,7 +31,6 @@ const MAX_NODES = 256;
 const MAX_NODE_NAME_LENGTH = 256;
 const MODES: ReadonlySet<string> = new Set(['auto', 'operator', 'off']);
 
-/** What a home-map row allows the automatic first generation to do with it. */
 export type HomesRowClass = 'empty' | 'first-staged' | 'first-active' | 'other';
 
 interface RowShape {
@@ -80,7 +79,6 @@ interface CheckedReply {
 	mode: RecordLockMode;
 	view: string[];
 	rowClass: HomesRowClass;
-	/** Its generation-1 state, staged or active. */
 	first?: RecordLockGenerationState;
 }
 
@@ -108,7 +106,6 @@ export type BootstrapPlan =
 			kind: 'fresh' | 'resume';
 			homes: string[];
 			digest: string;
-			/** Members to stage: everyone not already active at the target. */
 			stage: string[];
 			/** Some member is, or is about to be, staged, so `planActivate`'s backstop must elapse first. */
 			awaitBackstop: boolean;
@@ -116,6 +113,20 @@ export type BootstrapPlan =
 
 function sameSet(a: string[], b: string[]): boolean {
 	return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/** A surveyed node that replicates with someone this node does not know of. */
+function outsideReplication(
+	self: string,
+	candidates: string[],
+	checked: Map<string, CheckedReply>
+): string | undefined {
+	for (const reply of checked.values()) {
+		const outside = reply.view.filter((node) => !candidates.includes(node));
+		if (outside.length > 0)
+			return `${reply.node} replicates with ${outside.join(', ')}, which ${self} does not, so the replicating set is not agreed yet`;
+	}
+	return undefined;
 }
 
 /**
@@ -174,6 +185,8 @@ export function planBootstrap(
 				action: 'refuse',
 				reason: `${unable.join(', ')} no longer take part in the automatic first generation (replication.recordLocks is set or off there)`,
 			};
+		const outside = outsideReplication(self, candidates, checked);
+		if (outside) return { action: 'refuse', reason: outside };
 		return {
 			action: 'proceed',
 			kind: 'resume',
@@ -193,14 +206,8 @@ export function planBootstrap(
 		};
 	if (!participants.includes(self) || participants.length < 2)
 		return { action: 'refuse', reason: 'no other node replicating this database takes part in cluster record locks' };
-	for (const reply of checked.values()) {
-		const outside = reply.view.filter((node) => !candidates.includes(node));
-		if (outside.length > 0)
-			return {
-				action: 'refuse',
-				reason: `${reply.node} replicates with ${outside.join(', ')}, which ${self} does not, so the replicating set is not agreed yet`,
-			};
-	}
+	const outside = outsideReplication(self, candidates, checked);
+	if (outside) return { action: 'refuse', reason: outside };
 	const disagreeing = participants.filter((node) => !sameSet(checked.get(node)!.view, candidates));
 	if (disagreeing.length > 0)
 		return {
@@ -218,17 +225,17 @@ export function planBootstrap(
 }
 
 export interface BootstrapTimeouts {
-	/** A survey or activate is one row read or write on the peer. */
 	hopMs: number;
 	/** A stage also runs the #856 drain on the peer, which is immediate where nothing was ever granted. */
 	stageMs: number;
-	/** The whole attempt, queue wait included. */
+	/** Queue wait included. */
 	attemptMs: number;
 }
-export const DEFAULT_BOOTSTRAP_TIMEOUTS: BootstrapTimeouts = { hopMs: 4_000, stageMs: 8_000, attemptMs: 25_000 };
+const DEFAULT_BOOTSTRAP_TIMEOUTS: BootstrapTimeouts = { hopMs: 4_000, stageMs: 8_000, attemptMs: 25_000 };
 
 export type BootstrapOutcome =
-	| { outcome: 'activated'; homes: string[] }
+	/** `changed` is false when every member was already active: the map is withheld for another reason. */
+	| { outcome: 'activated'; homes: string[]; changed: boolean }
 	| { outcome: 'refused'; reason: string }
 	| { outcome: 'failed'; reason: string; planned: boolean }
 	| { outcome: 'cancelled' };
@@ -236,11 +243,9 @@ export type BootstrapOutcome =
 export interface BootstrapRunOptions {
 	peers?: TransitionPeers;
 	timeouts?: BootstrapTimeouts;
-	/** The generation-1 set this node's own row holds, so its members are surveyed whatever `hdb_nodes` says now. */
+	/** Surveyed whatever `hdb_nodes` says now: a set already staged must be completed over its own members. */
 	ownSet?: string[];
-	/** False once a newer attempt or a release superseded this one; checked before each phase. */
 	current?: () => boolean;
-	/** Called once the survey admitted the attempt, before anything is written. */
 	onPlanned?: () => void;
 	sleep?: (ms: number) => Promise<void>;
 	now?: () => number;
@@ -258,11 +263,11 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 	const now = options.now ?? (() => performance.now());
 	const sleep = options.sleep ?? unrefSleep;
 	const deadline = now() + timeouts.attemptMs;
-	const remaining = (ms: number) => Math.max(1, Math.min(ms, deadline - now()));
+	const expired = () => deadline - now() <= 0;
+	const OUT_OF_TIME = 'the attempt ran out of time';
 	return withTransitionQueue(database, async (): Promise<BootstrapOutcome> => {
 		if (!current()) return { outcome: 'cancelled' };
-		if (deadline - now() <= 0)
-			return { outcome: 'failed', reason: 'another home-map transition held the queue', planned: false };
+		if (expired()) return { outcome: 'failed', reason: 'another home-map transition held the queue', planned: false };
 		const self = peers.self();
 		if (!self) return { outcome: 'failed', reason: 'this node has no resolved node name', planned: false };
 		const candidates = canonicalizeHomes([
@@ -275,8 +280,11 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 				outcome: 'refused',
 				reason: 'no other node replicating this database takes part in cluster record locks',
 			};
-		const hop = (node: string, operation: TransitionOperation, ms: number) => {
-			const bound = remaining(ms);
+		// A superseded or expired attempt sends nothing more; what it already sent the per-node planners judge.
+		const hop = (node: string, operation: TransitionOperation, ms: number): Promise<any> => {
+			if (!current()) return Promise.reject(new Error('superseded'));
+			if (expired()) return Promise.reject(new Error(OUT_OF_TIME));
+			const bound = Math.min(ms, deadline - now());
 			let sent: Promise<any>;
 			try {
 				sent = peers.send(node, operation, bound);
@@ -313,12 +321,13 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 				failures.push(`${node} stage: ${hopError(error)}`);
 			}
 		});
-		if (failures.length > 0) return { outcome: 'failed', reason: failures.join('; '), planned: true };
 		if (!current()) return { outcome: 'cancelled' };
+		if (failures.length > 0) return { outcome: 'failed', reason: failures.join('; '), planned: true };
 		// `planActivate` refuses an activate within MIN_DRAIN_BACKSTOP_MS of that node's own stage, which
 		// may be an earlier attempt's.
 		if (plan.awaitBackstop) await sleep(MIN_DRAIN_BACKSTOP_MS);
 		if (!current()) return { outcome: 'cancelled' };
+		if (expired()) return { outcome: 'failed', reason: OUT_OF_TIME, planned: true };
 		await forEachNode(homes, async (node) => {
 			try {
 				await hop(
@@ -330,32 +339,29 @@ export async function runBootstrap(database: string, options: BootstrapRunOption
 				failures.push(`${node} activate: ${hopError(error)}`);
 			}
 		});
+		if (!current()) return { outcome: 'cancelled' };
 		if (failures.length > 0) return { outcome: 'failed', reason: failures.join('; '), planned: true };
-		return { outcome: 'activated', homes };
+		return { outcome: 'activated', homes, changed: plan.stage.length > 0 };
 	});
 }
 
 // ---- the trigger: which `homeMap()` call starts an attempt, and what it answers meanwhile ------------
 
-export const BOOTSTRAP_JITTER_MS = 500;
+const BOOTSTRAP_JITTER_MS = 500;
 /** How long a node another attempt just staged waits for that attempt to activate it before resuming. */
 export const BOOTSTRAP_FOLLOW_MS = 4_000;
 const RETRY_INITIAL_MS = 1_000;
 const RETRY_MAX_MS = 30_000;
-/** A node already active at generation 1 is waiting on its peers' agreement, which core's ride-through covers. */
-const RESUME_RETRY_MAX_MS = 5_000;
 
 export interface BootstrapRowState {
 	rowClass: HomesRowClass;
-	/** The generation-1 set the row holds, staged or active. */
 	firstSet?: string[];
 }
 
 export interface BootstrapTriggerDeps {
 	automatic: boolean;
-	/** This thread's classification of the row from its last successful read; undefined after a failed one. */
+	/** From this thread's last successful read of the row; undefined after a failed one. */
 	rowState(database: string): BootstrapRowState | undefined;
-	/** This node and its replicating peers for the database, read synchronously. */
 	candidates(database: string): string[];
 	run(database: string, options: BootstrapRunOptions): Promise<BootstrapOutcome>;
 	now(): number;
@@ -382,6 +388,7 @@ interface TriggerState {
 	retryAt: number;
 	backoffMs: number;
 	activated?: boolean;
+	followed?: boolean;
 }
 
 export function bootstrapRefusedMessage(database: string): string {
@@ -391,45 +398,76 @@ export function bootstrapRefusedMessage(database: string): string {
 export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 	const states = new Map<string, TriggerState>();
 
-	function settle(database: string, state: TriggerState, token: number, pristine: boolean, outcome: BootstrapOutcome) {
+	function settle(database: string, state: TriggerState, token: number, outcome: BootstrapOutcome) {
 		if (states.get(database) !== state || state.token !== token) return;
 		state.running = undefined;
 		if (outcome.outcome === 'cancelled') return;
 		if (outcome.outcome === 'activated') {
 			state.refusal = state.lastFailure = undefined;
-			state.backoffMs = 0;
-			state.retryAt = 0;
 			state.activated = true;
-			deps.log.info?.(`Record lock home map for ${database}: established generation 1 on ${outcome.homes.join(', ')}`);
+			if (outcome.changed) {
+				state.backoffMs = 0;
+				state.retryAt = 0;
+				deps.log.info?.(
+					`Record lock home map for ${database}: established generation 1 on ${outcome.homes.join(', ')}`
+				);
+			} else {
+				// Every member was already active: the map is withheld by agreement or a member's absence,
+				// which another survey would not change soon.
+				state.backoffMs = RETRY_MAX_MS;
+				state.retryAt = deps.now() + RETRY_MAX_MS;
+			}
 			return;
 		}
-		state.backoffMs = Math.min(
-			pristine ? RETRY_MAX_MS : RESUME_RETRY_MAX_MS,
-			state.backoffMs ? state.backoffMs * 2 : RETRY_INITIAL_MS
-		);
+		state.backoffMs = Math.min(RETRY_MAX_MS, state.backoffMs ? state.backoffMs * 2 : RETRY_INITIAL_MS);
 		state.retryAt = deps.now() + state.backoffMs;
 		state.lastFailure = outcome.reason;
 		// A failure after the survey admitted the attempt is transient (a hop), not a reason to refuse callers.
 		state.refusal = outcome.outcome === 'refused' || !outcome.planned ? outcome.reason : undefined;
 		if (outcome.reason !== state.lastLogged) {
-			state.lastLogged = outcome.reason;
 			deps.log.warn?.(`Record lock home map for ${database} was not established automatically: ${outcome.reason}`);
+			state.lastLogged = outcome.reason;
 		}
+	}
+
+	function run(database: string, state: TriggerState, token: number, row: BootstrapRowState): void {
+		const running = state.running!;
+		let attempt: Promise<BootstrapOutcome>;
+		try {
+			attempt = deps.run(database, {
+				ownSet: row.firstSet,
+				current: () => states.get(database) === state && state.token === token,
+				onPlanned: () => {
+					running.planned = true;
+				},
+			});
+		} catch (error) {
+			attempt = Promise.reject(error);
+		}
+		attempt
+			.then(
+				(outcome) => settle(database, state, token, outcome),
+				(error) =>
+					settle(database, state, token, { outcome: 'failed', reason: hopError(error), planned: running.planned })
+			)
+			.catch(() => {
+				// Only a throwing logger reaches here; the attempt's state is already settled.
+			});
 	}
 
 	function start(database: string, state: TriggerState, row: BootstrapRowState): void {
 		const token = ++state.token;
 		const pristine = row.rowClass !== 'first-active';
-		const running = { token, planned: false };
-		state.running = running;
+		state.running = { token, planned: false };
 		state.activated = false;
 		state.timer = deps.setTimer(
 			() => {
 				state.timer = undefined;
 				if (states.get(database) !== state || state.token !== token) return;
 				const now = deps.rowState(database);
-				// Another node's attempt staged this one during the jitter: let it finish before resuming.
-				if (row.rowClass === 'empty' && now?.rowClass === 'first-staged') {
+				// Another node's attempt has staged this one: let it activate before resuming its set.
+				if (now?.rowClass === 'first-staged' && !state.followed) {
+					state.followed = true;
 					state.running = undefined;
 					state.retryAt = deps.now() + BOOTSTRAP_FOLLOW_MS;
 					return;
@@ -438,27 +476,7 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 					state.running = undefined;
 					return;
 				}
-				let attempt: Promise<BootstrapOutcome>;
-				try {
-					attempt = deps.run(database, {
-						ownSet: now.firstSet,
-						current: () => states.get(database) === state && state.token === token,
-						onPlanned: () => {
-							running.planned = true;
-						},
-					});
-				} catch (error) {
-					attempt = Promise.reject(error);
-				}
-				attempt.then(
-					(outcome) => settle(database, state, token, pristine, outcome),
-					(error) =>
-						settle(database, state, token, pristine, {
-							outcome: 'failed',
-							reason: hopError(error),
-							planned: running.planned,
-						})
-				);
+				run(database, state, token, now);
 			},
 			Math.floor(deps.random() * BOOTSTRAP_JITTER_MS)
 		);
@@ -467,32 +485,27 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 	return {
 		/**
 		 * Called by `homeMap()` when it has no map to answer. Starts or continues an attempt; throws the 503
-		 * a caller should see instead of riding core's wait through a refusal it cannot outlast.
+		 * a caller should see instead of riding core's wait through a refusal it cannot outlast. Only a node
+		 * that never held a generation throws: one that did may hold grants, and core reads `homeMap()` on
+		 * paths that must not throw for those.
 		 */
 		missing(database: string): void {
 			if (!deps.automatic) return;
 			const row = deps.rowState(database);
 			if (!row || row.rowClass === 'other') return;
-			const pristine = row.rowClass !== 'first-active';
 			let state = states.get(database);
 			if (!state) states.set(database, (state = { token: 0, retryAt: 0, backoffMs: 0 }));
-			const refuse = () => {
-				if (pristine && state!.refusal !== undefined) throw new ClientError(bootstrapRefusedMessage(database), 503);
-			};
-			if (state.running) {
-				if (!state.running.planned) refuse();
-				return;
+			const pristine = row.rowClass !== 'first-active';
+			if (!state.running && deps.now() >= state.retryAt) {
+				if (row.rowClass === 'empty' && deps.candidates(database).length < 2)
+					settle(database, state, state.token, {
+						outcome: 'refused',
+						reason: 'no other node replicating this database takes part in cluster record locks',
+					});
+				else start(database, state, row);
 			}
-			if (deps.now() < state.retryAt) return refuse();
-			if (row.rowClass === 'empty' && deps.candidates(database).length < 2) {
-				settle(database, state, state.token, true, {
-					outcome: 'refused',
-					reason: 'no other node replicating this database takes part in cluster record locks',
-				});
-				return refuse();
-			}
-			start(database, state, row);
-			refuse();
+			if (pristine && state.refusal !== undefined && !state.running?.planned)
+				throw new ClientError(bootstrapRefusedMessage(database), 503);
 		},
 		status(database: string): BootstrapStatus | undefined {
 			const state = states.get(database);

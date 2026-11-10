@@ -13,7 +13,6 @@ export type RecordLockMode = 'auto' | 'operator' | 'off';
 
 export interface RecordLockSetting {
 	mode: RecordLockMode;
-	/** Why an `off` node is off: its configuration, or its storage engine. */
 	offBecause?: 'config' | 'engine';
 }
 

@@ -313,6 +313,21 @@ describe('planBootstrap: when generation 1 may be written without an operator', 
 		assert.deepStrictEqual(plan.stage, abc);
 	});
 
+	it('a resume refuses too when a surveyed node replicates with someone this node does not know', () => {
+		const row = staged1(abc);
+		const plan = planBootstrap(
+			'a',
+			abc,
+			replies({
+				a: answer('a', { row }),
+				b: answer('b', { row, view: ['a', 'b', 'c', 'x'] }),
+				c: answer('c', { row }),
+			})
+		);
+		assert.strictEqual(plan.action, 'refuse');
+		assert.match(plan.reason, /b replicates with x/);
+	});
+
 	it('a joiner never resumes a set it is not in', () => {
 		const row = active1(abc);
 		const abcd = [...abc, 'd'];
@@ -414,7 +429,7 @@ describe('runBootstrap: survey, stage and activate over the transition hops', ()
 		peersOf.fresh = ['b', 'c'];
 		const mesh = fakeMesh(abc);
 		const outcome = await runBootstrap('fresh', { peers: mesh.peers('a'), sleep, timeouts: fastTimeouts });
-		assert.deepStrictEqual(outcome, { outcome: 'activated', homes: abc });
+		assert.deepStrictEqual(outcome, { outcome: 'activated', homes: abc, changed: true });
 		for (const node of abc) assert.strictEqual(mesh.rows.get(node).active.digest, digestOf(1, abc), node);
 		assert.deepStrictEqual(slept, [MIN_DRAIN_BACKSTOP_MS]);
 	});
@@ -496,6 +511,51 @@ describe('runBootstrap: survey, stage and activate over the transition hops', ()
 		assert.match(sync.reason, /b \(synchronous failure\)/);
 	});
 
+	it('a release during the stage fan-out sends no further hop, and an expired attempt activates nothing', async () => {
+		peersOf.midstage = ['b', 'c'];
+		let superseded = false;
+		const mesh = fakeMesh(abc);
+		const peers = mesh.peers('a');
+		const send = peers.send;
+		peers.send = (node, operation, ms) => {
+			if (operation.action === 'stage') superseded = true;
+			return send(node, operation, ms);
+		};
+		const cancelled = await runBootstrap('midstage', {
+			peers,
+			sleep,
+			timeouts: { ...fastTimeouts },
+			current: () => !superseded,
+		});
+		assert.deepStrictEqual(cancelled, { outcome: 'cancelled' });
+		assert.strictEqual(mesh.calls.filter((call) => call.startsWith('stage:')).length, 1, mesh.calls.join());
+		peersOf.expired = ['b', 'c'];
+		let clock = 0;
+		const late = fakeMesh(abc);
+		const expired = await runBootstrap('expired', {
+			peers: late.peers('a'),
+			timeouts: { hopMs: 200, stageMs: 200, attemptMs: 1_000 },
+			now: () => clock,
+			sleep: async () => {
+				clock += 5_000;
+			},
+		});
+		assert.deepStrictEqual(expired, { outcome: 'failed', reason: 'the attempt ran out of time', planned: true });
+		assert.ok(!late.calls.some((call) => call.startsWith('activate:')));
+	});
+
+	it('a resume where every member is already active reports nothing changed', async () => {
+		peersOf.allactive = ['b', 'c'];
+		const rows = { a: active1(abc), b: active1(abc), c: active1(abc) };
+		const outcome = await runBootstrap('allactive', {
+			peers: fakeMesh(abc, { rows }).peers('a'),
+			sleep,
+			timeouts: fastTimeouts,
+			ownSet: abc,
+		});
+		assert.deepStrictEqual(outcome, { outcome: 'activated', homes: abc, changed: false });
+	});
+
 	it('a joiner refuses and writes nothing to the existing members', async () => {
 		peersOf.joiner = ['b', 'c', 'd'];
 		const abcd = [...abc, 'd'];
@@ -563,9 +623,10 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		h.fire();
 		assert.strictEqual(h.runs.length, 1);
 		assert.strictEqual(h.trigger.status('db').state, 'running');
-		h.runs[0].resolve({ outcome: 'activated', homes: ['a', 'b'] });
+		h.runs[0].resolve({ outcome: 'activated', homes: ['a', 'b'], changed: true });
 		await h.tick();
 		assert.strictEqual(h.trigger.status('db').state, 'activated');
+		assert.deepStrictEqual(h.logged, ['Record lock home map for db: established generation 1 on a, b']);
 	});
 
 	it('after a refusal, callers get a 503 until a retry passes the survey', async () => {
@@ -583,7 +644,7 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		assert.throws(() => h.trigger.missing('db'), isRefusal);
 		h.runs[1].options.onPlanned();
 		h.trigger.missing('db');
-		h.runs[1].resolve({ outcome: 'activated', homes: ['a', 'b'] });
+		h.runs[1].resolve({ outcome: 'activated', homes: ['a', 'b'], changed: true });
 		await h.tick();
 		assert.strictEqual(h.logged.filter((line) => /b is unreachable/.test(line)).length, 1);
 	});
@@ -626,6 +687,67 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		await h.tick();
 		h.trigger.missing('db');
 		assert.strictEqual(h.trigger.status('db').retryInMs, 1_000);
+	});
+
+	it('a resume that found every member active neither logs nor surveys again for the full backoff', async () => {
+		const h = harness({ row: { rowClass: 'first-active', firstSet: ['a', 'b'] } });
+		h.trigger.missing('db');
+		h.fire();
+		h.runs[0].resolve({ outcome: 'activated', homes: ['a', 'b'], changed: false });
+		await h.tick();
+		assert.deepStrictEqual(h.logged, []);
+		h.advance(29_000);
+		h.trigger.missing('db');
+		h.fire();
+		assert.strictEqual(h.runs.length, 1);
+		h.advance(1_000);
+		h.trigger.missing('db');
+		h.fire();
+		assert.strictEqual(h.runs.length, 2);
+	});
+
+	it('a node already staged when its first lock arrives follows once, then resumes', () => {
+		const h = harness({ row: { rowClass: 'first-staged', firstSet: ['a', 'b'] } });
+		h.trigger.missing('db');
+		h.fire();
+		assert.strictEqual(h.runs.length, 0);
+		assert.strictEqual(h.trigger.status('db').retryInMs, BOOTSTRAP_FOLLOW_MS);
+		h.advance(BOOTSTRAP_FOLLOW_MS);
+		h.trigger.missing('db');
+		h.fire();
+		assert.strictEqual(h.runs.length, 1);
+	});
+
+	it('a logger that throws while settling is contained', async () => {
+		let thrown = 0;
+		const trigger = createBootstrapTrigger({
+			automatic: true,
+			rowState: () => ({ rowClass: 'first-active', firstSet: ['a', 'b'] }),
+			candidates: () => ['a', 'b'],
+			run: async () => ({ outcome: 'refused', reason: 'x' }),
+			now: () => 0,
+			random: () => 0,
+			setTimer: (callback) => (callback(), undefined),
+			clearTimer() {},
+			log: {
+				warn() {
+					thrown++;
+					throw new Error('log sink down');
+				},
+			},
+		});
+		const unhandled = [];
+		const onUnhandled = (reason) => unhandled.push(reason);
+		process.on('unhandledRejection', onUnhandled);
+		try {
+			trigger.missing('db');
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		} finally {
+			process.off('unhandledRejection', onUnhandled);
+		}
+		assert.strictEqual(thrown, 1);
+		assert.deepStrictEqual(unhandled, []);
+		assert.strictEqual(trigger.status('db').reason, 'x');
 	});
 
 	it('does nothing when not automatic, after a failed read, or on operator history', () => {

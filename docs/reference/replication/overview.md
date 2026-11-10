@@ -430,13 +430,13 @@ Check each management operation's replication default before using it in a singl
 
 On a replicated database, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. Conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default.
 
-Cluster record locks need a home map: the list of nodes that arbitrate a database's locks. From v5.4.0, with [`replication.recordLocks`](../configuration/options.md#replication) unset, Harper creates it the first time a node calls a cluster `lock()` on the database. The map lists every node that replicates the database and has record locks on. Harper creates it only when all of those nodes are reachable, run v5.4.0 or later, and agree on which nodes replicate the database. Until then, cluster `lock()` answers `503`; the first call waits up to 10 seconds within its timeout before it does. A node that replicates the database with no other node never creates one.
+Cluster record locks need a home map: the list of nodes that arbitrate a database's locks. From v5.4.0, with [`replication.recordLocks`](../configuration/options.md#replication) unset, Harper creates it the first time a node calls a cluster `lock()` on the database. The map lists every node that replicates the database and has record locks on. Harper creates it only when all of those nodes are reachable, run v5.4.0 or later, and agree on which nodes replicate the database. Until then, cluster `lock()` answers `503`, the first call after waiting up to 10 seconds within its timeout. A node that replicates the database with no other node never creates one.
 
 Harper writes the home map only once per database. After that, membership changes need an operator:
 
 - **A node added later** answers every cluster `lock()` and conditional write with `503` until a map that includes it is applied with `record_lock_apply_homes`. It never creates a map of its own. The other nodes keep locking.
 - **A removed node** stays in the map, and `remove_node` makes the other nodes stop trusting it, so every cluster `lock()` and conditional write on the database answers `503` until a map without it is applied (with `fenced` naming it when it is stopped).
-- **Two clusters joined**, each with a home map Harper created, stop granting cluster locks on both sides as soon as their nodes connect. An operator must apply one map to every node. A lock granted before they connected lasts until its lease ends.
+- **Two clusters joined**, each with a home map Harper created, stop granting cluster locks on both sides as soon as their nodes connect to each other, which they do in the default full mesh. An operator must apply one map to every node. A lock granted before they connected lasts until its lease ends.
 
 `cluster_status` reports each node's attempt under `recordLocks.<database>.bootstrap`.
 

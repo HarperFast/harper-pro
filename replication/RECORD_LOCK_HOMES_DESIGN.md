@@ -255,8 +255,10 @@ an attempt start, so a node whose read failed is never taken for one that never 
 their disjoint sets each passed on their own. At generation 1 nothing has ever left a ring, so a peer
 outside the ring announcing a different map, or any peer announcing the `withheld:` marker, is a second
 arbiter. The node sets a process-wide flag (`markForeignRing`), `homeMap()` withholds, and it announces
-the marker so every member mismatches it and does the same. Holds granted before detection keep their
-lease. At generation ≥ 2 departing and fenced nodes legitimately hold stale maps, so the check is off
+the marker so every member mismatches it and does the same. Detection needs a member of each ring to
+connect to one of the other, as the default full mesh does; two rings that meet only through a node in
+neither (an `off` node, or a joiner, relaying between restricted routes) are not detected. Holds granted
+before detection keep their lease. At generation ≥ 2 departing and fenced nodes legitimately hold stale maps, so the check is off
 there, and such a merge is the operator's, as it always was.
 
 **Not distinguishable:** a row lost on every member of a ring reads as never bootstrapped. Core's
