@@ -23,8 +23,11 @@ export interface RegionTopology {
 const MAX_REGION_LENGTH = 256;
 const AUTO_GATEWAYS_PER_REGION = 2;
 
+/** A region label, trimmed, so a stray space cannot make two regions of one. */
 export function validRegion(value: unknown): string | undefined {
-	return typeof value === 'string' && value.trim() !== '' && value.length <= MAX_REGION_LENGTH ? value : undefined;
+	if (typeof value !== 'string') return;
+	const region = value.trim();
+	return region !== '' && region.length <= MAX_REGION_LENGTH ? region : undefined;
 }
 
 function compareNames(a: string, b: string): number {

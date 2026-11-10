@@ -5803,7 +5803,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		vetoed.set(sourceId, copyModeStartTime);
 		try {
 			const cursor = readDbisCursorSync(dbisDB, 'copyCursor', sourceId);
-			if (cursor?.copyStartTime !== undefined) vetoed.set(sourceId, cursor.copyStartTime);
+			// an already-flagged cursor is an older walk's, not the one vetoed
+			if (cursor?.copyStartTime !== undefined && !cursor.restartFullCopy) vetoed.set(sourceId, cursor.copyStartTime);
 			if (cursor && !cursor.restartFullCopy) markCopyCursorRestart(sourceId, { ...cursor, restartFullCopy: true });
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error);
@@ -8765,7 +8766,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					case GATEWAY_REACH:
 						if (message[2] === databaseName && Array.isArray(data) && data.length <= MAX_REACH_REGIONS) {
-							const regions = [...new Set(data.filter((region) => validRegion(region) !== undefined))].sort();
+							const regions = [
+								...new Set(data.map(validRegion).filter((region): region is string => region !== undefined)),
+							].sort();
 							if (JSON.stringify(regions) !== JSON.stringify(receivedGatewayReach)) {
 								receivedGatewayReach = regions;
 								postConnectionMetadata();
@@ -11319,8 +11322,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (closed || wsClosed || restartAfterCopyIntoThisNode()) return;
 											if (relayWithheld) {
 												// a cache miss on a just-minted origin must not read as this node's own
+												const nodeId = auditRecord.nodeId;
 												const action = withheldRecordAction(
-													getNodeNameForId(auditStore, auditRecord.nodeId, true),
+													nodeId === 0 || nodeId === undefined
+														? getThisNodeName()
+														: (getNodeNameForId(auditStore, nodeId, true) ?? `node#${nodeId}`),
 													getThisNodeName(),
 													relayWithheld.heldStarts
 												);

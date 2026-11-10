@@ -31,6 +31,7 @@ describe('regionTopology', () => {
 	describe('validRegion', () => {
 		it('accepts a non-blank string and rejects everything else', () => {
 			assert.equal(validRegion('us-east'), 'us-east');
+			assert.equal(validRegion(' us-east '), 'us-east');
 			for (const bad of ['', '   ', 5, null, undefined, {}, 'x'.repeat(257)]) assert.equal(validRegion(bad), undefined);
 		});
 	});
