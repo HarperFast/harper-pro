@@ -52,6 +52,8 @@ export interface Row {
 	memorySomePct: number;
 	ioSomePct: number;
 	saturated: boolean;
+	/** The instance started but never answered a REST request: a saturated cell that served nothing. */
+	notReady: boolean;
 	clientLimited: boolean;
 	valid: boolean;
 	invalidReasons: string[];
@@ -88,6 +90,8 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 		offeredPerSec: cell.offeredRatePerSec,
 	};
 	if (!cell.client || !cell.server) {
+		// server-ctl.sh's readiness timeout: the instance started and never answered, an outcome of the policy.
+		const notReady = (cell.invalidReasons ?? []).some((reason: string) => / not ready after \d+ s/.test(reason));
 		return {
 			...base,
 			okPerSec: 0,
@@ -112,9 +116,10 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 			memorySomePct: 0,
 			ioSomePct: 0,
 			saturated: true,
+			notReady,
 			clientLimited: false,
-			valid: false,
-			invalidReasons: cell.invalidReasons ?? ['no measurements'],
+			valid: notReady,
+			invalidReasons: notReady ? [] : (cell.invalidReasons ?? ['no measurements']),
 		};
 	}
 	const measure = cell.client.measure;
@@ -148,6 +153,7 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 		memorySomePct: window.psi.memorySomePct,
 		ioSomePct: window.psi.ioSomePct,
 		saturated: cell.saturated,
+		notReady: false,
 		clientLimited: cell.clientLimited,
 		valid: cell.valid,
 		invalidReasons: cell.invalidReasons,
@@ -196,8 +202,12 @@ export function knee(series: Row[]): Knee {
 	const hit = points.find((row) => row.saturated || row.p99Ms! >= KNEE_FACTOR * baseline);
 	if (!hit)
 		return { description: `not reached down to ${fmt(points.at(-1)!.memoryGiB)} GB`, memoryGiB: null, ratio: null };
+	const latency = hit.p99Ms === null ? 'no request completed' : `p99 ${fmt(hit.p99Ms)} ms vs ${fmt(baseline)} ms`;
+	const outcome = hit.notReady
+		? 'did not start'
+		: `${latency}${hit.saturated ? `, saturated (${fmt(servedPct(hit), 1)}% served)` : ''}`;
 	return {
-		description: `${fmt(hit.memoryGiB)} GB (memory/data ${fmt(hit.ratio)}): ${hit.p99Ms === null ? 'no request completed' : `p99 ${fmt(hit.p99Ms)} ms vs ${fmt(baseline)} ms`}${hit.saturated ? `, saturated (${fmt(servedPct(hit), 1)}% served)` : ''}`,
+		description: `${fmt(hit.memoryGiB)} GB (memory/data ${fmt(hit.ratio)}): ${outcome}`,
 		memoryGiB: hit.memoryGiB,
 		ratio: hit.ratio,
 	};
@@ -283,7 +293,7 @@ export function mermaidChart(pair: string, workload: string, rows: Row[]): strin
 	const noBaseline = [
 		...new Set(
 			curve(rows)
-				.filter((row) => row.extraReadsPer1k === null)
+				.filter((row) => !row.saturated && row.extraReadsPer1k === null)
 				.map((row) => row.skew)
 		),
 	];
@@ -476,6 +486,7 @@ export function renderReport(
 			const row = byLabel.get(label);
 			if (!row) return '';
 			if (!row.valid) return 'invalid';
+			if (row.notReady) return '⚠ did not start';
 			if (row.saturated)
 				return `⚠ ${fmt(servedPct(row), 1)}% served (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
 			return `${row.extraReadsPerSec === null ? 'no baseline' : fmt(row.extraReadsPerSec)} (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
@@ -486,7 +497,7 @@ export function renderReport(
 	}
 	lines.push(
 		'',
-		`⚠ = saturated: more than 0.1% of scheduled requests shed or timed out, or under 99% of the offered rate completed; the cell shows the share of the offered rate served (p99 ms) instead of reads, and is left out of slopes. ‡ = client-limited (load-generator CPU above 85% or schedule lag p99 above 10 ms); left out of knees, slopes and charts. Knee: largest memory step whose p99 is ≥ ${KNEE_FACTOR}× the series' lowest p99.`
+		`⚠ = saturated: more than 0.1% of scheduled requests shed or timed out, or under 99% of the offered rate completed; the cell shows the share of the offered rate served (p99 ms) instead of reads, and is left out of slopes. ⚠ did not start = the instance never answered a REST request within 600 s of starting under that limit; it counts as a saturated cell that served nothing. ‡ = client-limited (load-generator CPU above 85% or schedule lag p99 above 10 ms); left out of knees, slopes and charts. Knee: largest memory step whose p99 is ≥ ${KNEE_FACTOR}× the series' lowest p99.`
 	);
 	const missing = pairs.flatMap((pair) => {
 		const present = new Set(pair.cells.map((cell) => cell.cell.id));
@@ -534,7 +545,11 @@ export function renderReport(
 				increase && increase > 0 && half && control
 					? (half.extraReadsPer1k - control.extraReadsPer1k) / increase
 					: null;
-			const controlCell = pinned.saturated ? `⚠ ${fmt(servedPct(pinned), 1)}% served` : fmt(pinned.extraReadsPer1k);
+			const controlCell = pinned.notReady
+				? '⚠ did not start'
+				: pinned.saturated
+					? `⚠ ${fmt(servedPct(pinned), 1)}% served`
+					: fmt(pinned.extraReadsPer1k);
 			lines.push(
 				`| ${pinned.pair} | ${pinned.workload} | ${pinned.skew} | ${fmt(full?.extraReadsPer1k)} | ${fmt(half?.extraReadsPer1k)} | ${controlCell} | ${share === null ? '–' : `${fmt(share * 100, 0)}%`} | ${fmt(half?.p99Ms)} / ${fmt(pinned.p99Ms)} |`
 			);
@@ -563,7 +578,7 @@ export function renderReport(
 	lines.push(`|${' --- |'.repeat(28)}`);
 	for (const row of [...rows].sort((a, b) => seriesKey(a).localeCompare(seriesKey(b)) || b.memoryGiB - a.memoryGiB)) {
 		lines.push(
-			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsDriftPct, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.allDeviceReadsPerSec, 0)} | ${fmt(row.allDeviceReadMBPerSec)} | ${fmt(row.anonGiB)} | ${fmt(row.pageCacheGiB)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.valid ? (row.clientLimited ? 'client-limited' : 'yes') : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
+			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsDriftPct, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.allDeviceReadsPerSec, 0)} | ${fmt(row.allDeviceReadMBPerSec)} | ${fmt(row.anonGiB)} | ${fmt(row.pageCacheGiB)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.notReady ? 'did not start' : row.valid ? (row.clientLimited ? 'client-limited' : 'yes') : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
 		);
 	}
 	lines.push('', '</details>');

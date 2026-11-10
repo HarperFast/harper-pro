@@ -49,6 +49,15 @@ function cell(
 	};
 }
 
+function notReady(step: number) {
+	return {
+		cell: cell(step, 0, 0).cell,
+		offeredRatePerSec: 10_000,
+		valid: false,
+		invalidReasons: ['cell failed: server-ctl start failed: Command failed: ssh …\nREST route not ready after 600 s'],
+	};
+}
+
 const calibration = {
 	workload: 'C',
 	skew: 'zipf-1',
@@ -78,6 +87,24 @@ describe('cellRow', () => {
 		const row = cellRow(failed, calibration, dataset, 'd2x-1k');
 		assert.equal(row.valid, false);
 		assert.deepEqual(row.invalidReasons, ['cell failed: OOM']);
+	});
+
+	it('keeps an instance that never became ready as a saturated cell that served nothing', () => {
+		const row = cellRow(notReady(0.25), calibration, dataset, 'd2x-1k');
+		assert.equal(row.valid, true);
+		assert.equal(row.notReady, true);
+		assert.equal(row.saturated, true);
+		assert.equal(row.okPerSec, 0);
+		const exited = cellRow(
+			{
+				...notReady(0.25),
+				invalidReasons: ['cell failed: server-ctl start failed: Harper container exited during startup'],
+			},
+			calibration,
+			dataset,
+			'd2x-1k'
+		);
+		assert.equal(exited.valid, false);
 	});
 });
 
@@ -118,6 +145,12 @@ describe('knee and slopes', () => {
 		const result = knee([rows[0], rows[1], stalled]);
 		assert.equal(result.memoryGiB, 3);
 		assert.match(result.description, /no request completed, saturated \(0\.0% served\)/);
+	});
+
+	it('treats an instance that never became ready as the knee', () => {
+		const result = knee([rows[0], rows[1], cellRow(notReady(0.5), calibration, dataset, 'p')]);
+		assert.equal(result.memoryGiB, 3);
+		assert.match(result.description, /3\.00 GB \(memory\/data 0\.25\): did not start$/);
 	});
 
 	it('computes extra reads per GiB removed between adjacent unsaturated steps', () => {
@@ -200,6 +233,15 @@ describe('renderReport', () => {
 		const chart = mermaidChart('d2x-1k', 'C', rows)!;
 		assert.equal(chart.match(/^\s+line \[/gm)?.length, 1);
 		assert.match(chart, /not drawn \(missing cells\): uniform/);
+	});
+
+	it('shows a cell whose instance never became ready as did not start', () => {
+		const { markdown } = renderReport([{ ...pair, cells: [cell(1, 100, 2), cell(0.5, 1500, 3), notReady(0.25)] }], {
+			runId: 'mctest',
+		});
+		assert.match(markdown, /\| ⚠ did not start \| 1\.50 GB \(memory\/data 0\.13\): did not start \|/);
+		assert.match(markdown, /\| did not start \|\n/);
+		assert.doesNotMatch(markdown, /no valid calibration baseline/);
 	});
 
 	it('gives no pinning share for a saturated pinned control', () => {
