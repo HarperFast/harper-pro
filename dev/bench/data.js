@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794296999963,
+  "lastUpdate": 1794297003280,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -17070,6 +17070,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 49.08,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "b64ae52aab39e612464f0fb5fd7b2e01fd5ff47e",
+          "message": "Stop the Gemini Code Assist app reviewing every PR when it opens (#1302)\n\nThe GEMINI_ALWAYS_ON variable only gates the label-opt-in gemini-review.yml\nworkflow. Reviews from gemini-code-assist[bot] come from the GitHub App,\nwhich reviews on pull_request_opened by default when the repo has no\n.gemini/config.yaml. Turn off the automatic help, summary and review; a\n`/gemini review` comment still requests one.\n\n\nDispatch-Task: harper-pro-gemini-app-autoreview-off\n\nCo-authored-by: Claude Sonnet 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-10T04:11:00Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/b64ae52aab39e612464f0fb5fd7b2e01fd5ff47e"
+        },
+        "date": 1794297003188,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 9.09,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 10.35,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 11.44,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 26.51,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 25.63,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 23.21,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 41.33,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 49.85,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 127.81,
             "unit": "ms"
           }
         ]
