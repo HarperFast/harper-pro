@@ -57,7 +57,7 @@ import {
 import { peerSupportsResidencySlots } from './protocolCapabilities.ts';
 import { onShardingConfigurationChange } from '../core/config/shardingConfiguration.ts';
 import type { Logger } from '../core/utility/logging/logger.ts';
-import { createHash, randomUUID, type Hash } from 'node:crypto';
+import { createHash, type Hash } from 'node:crypto';
 import { toBufferKey } from 'ordered-binary';
 import {
 	getDatabases,
@@ -237,6 +237,8 @@ import {
 import { isGateway, validRegion } from './regionTopology.ts';
 import {
 	holdRelayCopyLease,
+	newPassToken,
+	passCreatedAt,
 	relayCopyLeaseClaims,
 	relayCopyLeaseHeld,
 	reservationHolds,
@@ -838,20 +840,19 @@ export function relayWithholdingActive(auditStore: any, databaseName: string, db
 const reportedReservationHolds = new Set<string>();
 
 /**
- * The reservation slots `peerId`'s earlier attempts left, other than `pass`'s. A settled pass from that peer walked
- * what they applied (a resumed pass from their saved cursor, a fresh one from the start), so their slots can go.
+ * The reservation slots `peerId`'s attempts created before `pass` left. A settled pass from that peer walked what they
+ * applied (a resumed pass from their saved cursor, a fresh one from the start), so their slots can go; a later
+ * attempt's, which a retired settle can meet, cannot.
  */
-export function earlierReservationSlots(
-	dbisDB: DbisStore,
-	peerId: number,
-	pass: string | number
-): (string | number)[][] {
+export function earlierReservationSlots(dbisDB: DbisStore, peerId: number, pass: string): (string | number)[][] {
+	const created = passCreatedAt(pass);
 	const slots: (string | number)[][] = [];
 	for (const { key } of dbisDB.getRange!({
 		start: COPY_BOUND_KEY,
 		end: [COPY_BOUND_KEY, Buffer.from([0xff])],
 	}) as Iterable<{ key: any }>) {
-		if (key[1] === peerId && key[2] === 'reserved' && key[3] !== pass) slots.push(key.slice(2));
+		if (key[1] !== peerId || key[2] !== 'reserved' || key[3] === pass) continue;
+		if (created === undefined || !(passCreatedAt(String(key[3]))! >= created)) slots.push(key.slice(2));
 	}
 	return slots;
 }
@@ -8953,7 +8954,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// watchdog is armed — reproduces the stale-fire class the identity guard suppresses.
 						if (maybeLeakConnectionAfterCopyStartForTest(options.connection, ws, databaseName)) wedgedForTest = true;
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
-						copyPassToken = `${data}:${randomUUID()}`;
+						copyPassToken = newPassToken(data);
 						passHoles = 0;
 						const copyMarkOrigins = new Map<number, string | undefined>();
 						// only an engine that can certify a checkpoint has a route history to mark partial; a sharding
@@ -10202,6 +10203,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							wakeSender?.(); // an idle sender settles now rather than at the next transaction
 						});
 						/** Withholds relayed origins until this node's inbound base copy settles (harper-pro#1299). */
+						/** Whether to hold back relayed origins; undefined once unreadable copy bounds closed the session. */
+						const withholdingActive = (): boolean | undefined => {
+							try {
+								return relayWithholdingActive(auditStore, databaseName, getDatabaseStores().dbisDB);
+							} catch (error) {
+								// as admission does: a bound that cannot be read must not read as none
+								logger.warn?.(connectionId, 'could not read the copy bounds for', databaseName, error);
+								wsClosed = true;
+								close(1011, 'Replication could not read the copy bounds');
+							}
+						};
 						const withholdRelayedOrigins = () => {
 							const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
 							const heldStarts = new Set<string>(nodeSubscriptions.map(({ name }) => name));
@@ -10213,8 +10225,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							);
 							const timer = setInterval(() => {
 								if (closed || wsClosed) return clearInterval(timer);
-								if (relayWithholdingActive(auditStore, databaseName, getDatabaseStores().dbisDB)) return;
+								const active = withholdingActive();
+								if (active) return;
 								clearInterval(timer);
+								if (active === undefined) return;
 								const withheld = relayWithheld;
 								relayWithheld = undefined;
 								if (!withheld?.skipped && !withheld?.parked) return wakeSender?.();
@@ -10338,11 +10352,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return;
 								}
 							}
-							if (
-								nodesToInclude.length &&
-								!relayWithheld &&
-								relayWithholdingActive(auditStore, databaseName, getDatabaseStores().dbisDB)
-							) {
+							const withholdInclude = nodesToInclude.length && !relayWithheld ? withholdingActive() : false;
+							if (withholdInclude === undefined) return;
+							if (withholdInclude) {
 								// as at a lease seen mid-transaction: the frame's end_txn would commit the part already sent
 								if (currentTransaction.txnLogKey) {
 									wsClosed = true;
@@ -10672,7 +10684,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									const epoch = readOriginStateEpoch(auditStore.rootStore);
 									if (epoch === sessionCopyEpoch) return false;
 									// a pass claims its lease before its reservation commits, and applies no row before that
-									if (relayWithholdingActive(auditStore, databaseName, getDatabaseStores().dbisDB)) {
+									const active = withholdingActive();
+									if (active === undefined) return true;
+									if (active) {
 										if (!currentTransaction.txnLogKey) {
 											withholdRelayedOrigins();
 											return false;
@@ -10741,8 +10755,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													close(1011, 'Replication could not read the copy bounds');
 													return;
 												}
-												if (relayWithholdingActive(auditStore, databaseName, getDatabaseStores().dbisDB))
-													withholdRelayedOrigins();
+												const active = withholdingActive();
+												if (active === undefined) return;
+												if (active) withholdRelayedOrigins();
 											}
 											// If the requested incremental start predates the transaction-log history we still
 											// retain, the entries needed to catch up incrementally have been purged (retention is

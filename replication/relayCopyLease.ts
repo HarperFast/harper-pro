@@ -4,6 +4,8 @@
  * its database until it settles, and senders withhold other origins while any slot is live. Process-local shared
  * memory, persisted nowhere: a restart clears every slot, and the slot of a thread that stops renewing lapses.
  */
+import { randomUUID } from 'node:crypto';
+
 const SLOTS = 8;
 // after the slots: how many claims this process has made, so a walk can tell a pass started and ended under it
 const CLAIMS = SLOTS;
@@ -122,14 +124,29 @@ export function holdRelayCopyLease(
  * stays, and the rows it applied without log entries may sit below later log entries. Relaying stays held back until
  * a later pass from that source settles and releases it, but never for good: a reservation is honored for
  * RESERVATION_HOLD_MS from when this process first saw it with no lease held, long enough for the source to come back
- * and a resumed pass to claim the lease, and not at all once its pass started more than RESERVATION_MAX_AGE_MS ago, so
+ * and a resumed pass to claim the lease, and not at all once it was created more than RESERVATION_MAX_AGE_MS ago, so
  * one left by an older version never holds relaying after each restart.
  */
 export const RESERVATION_HOLD_MS = 30 * 60_000;
 export const RESERVATION_MAX_AGE_MS = 24 * 60 * 60_000;
 const reservationFirstSeen = new Map<string, Map<string, number>>();
 
-/** `passes` are the database's unreleased reservation pass tokens (`<copy start>:<id>`); `onExpire` runs once per pass. */
+/**
+ * `<copy start>:<id>:<created>`. The copy start is the source's last log key, which can be days old, so the age of a
+ * reservation is read from the time this node created its token.
+ */
+export function newPassToken(copyStart: number, now = Date.now()): string {
+	return `${copyStart}:${randomUUID()}:${Math.floor(now)}`;
+}
+
+/** When this node created the pass token; a token from before creation times were recorded gives its copy start. */
+export function passCreatedAt(pass: string): number | undefined {
+	const [copyStart, , created] = String(pass).split(':');
+	const time = Number(created ?? copyStart);
+	return time > 0 ? time : undefined;
+}
+
+/** `passes` are the database's unreleased reservation pass tokens; `onExpire` runs once per pass. */
 export function reservationHolds(
 	database: string,
 	passes: Iterable<string>,
@@ -141,8 +158,8 @@ export function reservationHolds(
 	const current = new Set<string>();
 	let holds = false;
 	for (const pass of passes) {
-		const started = Number(String(pass).split(':')[0]);
-		if (!(started > 0) || now - started > RESERVATION_MAX_AGE_MS) continue;
+		const created = passCreatedAt(pass);
+		if (created === undefined || now - created > RESERVATION_MAX_AGE_MS) continue;
 		current.add(pass);
 		let since = seen.get(pass);
 		if (since === undefined) seen.set(pass, (since = now));

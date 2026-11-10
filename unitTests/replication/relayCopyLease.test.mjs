@@ -6,6 +6,8 @@ import assert from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
 	holdRelayCopyLease,
+	newPassToken,
+	passCreatedAt,
 	relayCopyLeaseClaims,
 	relayCopyLeaseHeld,
 	reservationHolds,
@@ -42,7 +44,7 @@ describe('relay copy lease', () => {
 		now = T;
 	});
 	afterEach(() => {
-		for (const lease of leases) lease.release();
+		for (const lease of leases ?? []) lease.release();
 	});
 
 	it('is held from the claim until the release, for its own database only', () => {
@@ -166,14 +168,25 @@ describe('unsettled copy reservation hold', () => {
 		assert.deepStrictEqual(expired, [p]);
 	});
 
-	it('ignores a reservation whose pass started past the maximum age, or has no start', () => {
+	it('ignores a reservation created past the maximum age, or with no readable time', () => {
 		const expired = [];
 		const now = T + RESERVATION_MAX_AGE_MS + 1;
 		assert.strictEqual(
-			reservationHolds('hold-b', [pass(T), '0', 'x:id'], (x) => expired.push(x), now),
+			reservationHolds('hold-b', [pass(T), newPassToken(T + 5, T), '0', 'x:id'], (x) => expired.push(x), now),
 			false
 		);
 		assert.deepStrictEqual(expired, []);
+	});
+
+	it("ages a reservation from this node's creation time, not the source's copy start", () => {
+		// a source with no writes for days anchors its copy at its last log key
+		const token = newPassToken(T - 3 * RESERVATION_MAX_AGE_MS, T);
+		assert.strictEqual(passCreatedAt(token), T);
+		assert.strictEqual(passCreatedAt(pass(T - 5)), T - 5);
+		assert.strictEqual(
+			reservationHolds('hold-d', [token], () => {}, T + 1000),
+			true
+		);
 	});
 
 	it('forgets a released reservation, so one that comes back is held again', () => {

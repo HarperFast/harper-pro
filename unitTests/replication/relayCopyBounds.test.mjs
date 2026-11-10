@@ -58,16 +58,30 @@ describe('relayedHeldFrom', () => {
 });
 
 describe('earlierReservationSlots', () => {
-	it("names every reservation slot of the peer but the settling pass's", () => {
+	const token = (created) => `${T}:id-${created}:${created}`;
+	it('names the reservation slots the peer created before the settling pass', () => {
 		const store = rowsStore([
 			[[COPY_BOUND, 6], { 2: T }],
-			[[COPY_BOUND, 6, 'reserved', 'p1'], { 2: T }],
-			[[COPY_BOUND, 6, 'reserved', 'p2'], { 2: T }],
-			[[COPY_BOUND, 6, 'hole', 'p1', 1, T], { 2: Number.MAX_VALUE }],
-			[[COPY_BOUND, 7, 'reserved', 'p3'], { 2: T }],
+			[[COPY_BOUND, 6, 'reserved', token(T + 1)], { 2: T }],
+			// from before creation times were recorded: its copy start is all there is
+			[[COPY_BOUND, 6, 'reserved', `${T}:old`], { 2: T }],
+			[[COPY_BOUND, 6, 'reserved', token(T + 2)], { 2: T }],
+			[[COPY_BOUND, 6, 'hole', token(T + 1), 1, T], { 2: Number.MAX_VALUE }],
+			[[COPY_BOUND, 7, 'reserved', token(T)], { 2: T }],
 		]);
-		assert.deepStrictEqual(earlierReservationSlots(store, 6, 'p2'), [['reserved', 'p1']]);
-		assert.deepStrictEqual(earlierReservationSlots(store, 8, 'p2'), []);
+		assert.deepStrictEqual(earlierReservationSlots(store, 6, token(T + 2)), [
+			['reserved', token(T + 1)],
+			['reserved', `${T}:old`],
+		]);
+		assert.deepStrictEqual(earlierReservationSlots(store, 8, token(T + 2)), []);
+	});
+
+	it("keeps a later attempt's reservation, which a settle resumed after its socket closed can meet", () => {
+		const store = rowsStore([
+			[[COPY_BOUND, 6, 'reserved', token(T + 1)], { 2: T }],
+			[[COPY_BOUND, 6, 'reserved', token(T + 5)], { 2: T }],
+		]);
+		assert.deepStrictEqual(earlierReservationSlots(store, 6, token(T + 1)), []);
 	});
 });
 
