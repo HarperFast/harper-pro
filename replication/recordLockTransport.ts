@@ -1165,11 +1165,15 @@ export async function bumpHomeIncarnation(): Promise<number> {
 		// Mirrored onto the legacy field, so a rollback to a build that reads only that field continues
 		// the count rather than restarting it. Best effort: the row is the mesh's shared copy and a peer's
 		// rewrite can still erase it, which is why it is no longer authoritative. A node with no row yet
-		// gets a LOCAL_ONLY one, as the older build wrote (a url-less row must not replicate).
-		const existingRow = getHDBNodeTable().primaryStore.getSync(self);
-		await ensureNode(self, { recordLockIncarnation: next }, existingRow ? undefined : { localOnly: true }).catch(
-			(error) => logger.debug?.('Could not mirror the record lock incarnation onto the hdb_nodes self row', error)
-		);
+		// gets a LOCAL_ONLY one, as the older build wrote (a url-less row must not replicate). Only an
+		// explicitly enabled node, the one setting an earlier build honored: on by default, the write would
+		// rewrite every node's self row on every start, and recreate one a `remove_node` deleted.
+		if (!RECORD_LOCK_HOMES_AUTOMATIC) {
+			const existingRow = getHDBNodeTable().primaryStore.getSync(self);
+			await ensureNode(self, { recordLockIncarnation: next }, existingRow ? undefined : { localOnly: true }).catch(
+				(error) => logger.debug?.('Could not mirror the record lock incarnation onto the hdb_nodes self row', error)
+			);
+		}
 		setHomeIncarnation(next, first);
 		for (const worker of recordLockParticipantWorkers()) confer(worker, 'record-lock-incarnation', next, first);
 		logger.info?.(`Record lock home incarnation for ${self} is now ${next}`);
