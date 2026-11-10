@@ -125,6 +125,34 @@ export async function waitForLinks(nodes, expectedFor, description) {
 	);
 }
 
+/**
+ * Waits until no node has sent a `data` base copy for `quietMs`. Links report connected while the full copy each new
+ * link takes is still applying, and a copy vetoed by another copy into its source is retried a few seconds later.
+ */
+export async function waitForCopiesSettled(nodes, description, quietMs = 5000) {
+	let copying = [];
+	let quietSince;
+	await waitForCondition(
+		async (signal) => {
+			copying = [];
+			for (const node of nodes) {
+				const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
+				for (const connection of status.connections) {
+					for (const socket of connection.database_sockets) {
+						if (socket.database === 'data' && socket.sendingMessage === 'Copying') {
+							copying.push(`${node.hostname} to ${connection.name}`);
+						}
+					}
+				}
+			}
+			if (copying.length) quietSince = undefined;
+			else quietSince ??= Date.now();
+			return Date.now() - quietSince >= quietMs;
+		},
+		{ timeoutMs: 180_000, pollMs: 500, description: () => `${description}; copying: ${copying.join(', ')}` }
+	);
+}
+
 export function insert(node, phase, origin, count) {
 	const records = Array.from({ length: count }, (_, index) => ({ id: `${phase}-${index}`, phase, origin }));
 	return sendOperation(node, { operation: 'insert', database: 'data', table: TABLE, records }).then(() =>

@@ -40,6 +40,7 @@ import {
 	connectTo,
 	killNode,
 	phaseIds,
+	waitForCopiesSettled,
 	waitForLinks,
 	waitForPhase,
 	waitForSuppliers,
@@ -276,6 +277,8 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 		contexts.sort((a, b) => (a.harper.hostname < b.harper.hostname ? -1 : 1));
 		await connectTo(nodes()[0], nodes());
 		await waitForLinks(nodes(), layout.expectedLinks, 'region links');
+		// an increment written while a base copy applies can be counted twice (harper#4174), which these tests do not cover
+		await waitForCopiesSettled(nodes(), 'formation copies');
 	});
 
 	after(async () => {
