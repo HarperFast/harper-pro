@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Provisions the server VM: formats and mounts the data disk, installs Docker and fio, and builds
-# the Harper Pro image from the source tarball. Run as root: server-setup.sh <source.tgz> <password-file>
+# Run as root: server-setup.sh <source.tgz> <password-file>
 set -euo pipefail
 src_tgz="$1"
 password_file="$2"

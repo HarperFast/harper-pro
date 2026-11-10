@@ -36,7 +36,7 @@ wait_ready() {
 		[ $SECONDS -lt $deadline ] || { echo "Harper not ready after 600 s" >&2; return 1; }
 		sleep 1
 	done
-	until curl -sS -o /dev/null -m 5 "http://127.0.0.1:9926/usertable/"; do
+	until curl -sSf -o /dev/null -m 5 -u "admin:$ADMIN_PASSWORD" "http://127.0.0.1:9926/usertable/?id=ready-probe"; do
 		[ $SECONDS -lt $deadline ] || { echo "REST route not ready after 600 s" >&2; return 1; }
 		sleep 1
 	done
@@ -102,12 +102,14 @@ drop-caches)
 	echo 3 >/proc/sys/vm/drop_caches
 	;;
 init-root)
+	rm -f "$DATA_MOUNT/pristine.ok"
 	rm -rf "$ROOT" "$PRISTINE"
 	mkdir -p "$ROOT/components"
 	cp -r "$APP_DIR" "$ROOT/components/usertable"
 	chown -R 1000:1000 "$ROOT"
 	;;
 snapshot)
+	rm -f "$DATA_MOUNT/pristine.ok"
 	rm -rf "$PRISTINE"
 	cp -a --reflink=always "$ROOT" "$PRISTINE"
 	touch "$DATA_MOUNT/pristine.ok"

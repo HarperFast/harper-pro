@@ -491,22 +491,45 @@ if (!isMainThread && (workerData as WorkerData | undefined)?.memoryCurveWorker) 
 	);
 }
 
-function runWorker(target: HttpTarget, task: WorkerTask): Promise<WorkerReply> {
-	return new Promise((resolve, reject) => {
-		const worker = new Worker(new URL(import.meta.url), {
-			workerData: { memoryCurveWorker: true, target, task } satisfies WorkerData,
+/**
+ * One worker per task. When any worker fails, the others are terminated and awaited before the
+ * failure propagates, so no request generator outlives the group into the next cell.
+ */
+async function runWorkers(target: HttpTarget, tasks: WorkerTask[]): Promise<WorkerReply[]> {
+	const workers: Worker[] = [];
+	const runs = tasks.map(
+		(task) =>
+			new Promise<WorkerReply>((resolve, reject) => {
+				const worker = new Worker(new URL(import.meta.url), {
+					workerData: { memoryCurveWorker: true, target, task } satisfies WorkerData,
+				});
+				workers.push(worker);
+				let reply: WorkerReply | undefined;
+				let failure: unknown;
+				worker.once('message', (message: WorkerReply) => {
+					reply = message;
+				});
+				worker.once('error', (error: unknown) => {
+					failure = error;
+				});
+				worker.once('exit', (code) => {
+					if (failure !== undefined) reject(failure);
+					else if (reply?.kind === 'error') reject(new Error(`load worker failed: ${reply.message}`));
+					else if (reply) resolve(reply);
+					else reject(new Error(`load worker exited with code ${code} before reporting`));
+				});
+			})
+	);
+	let firstFailure: unknown;
+	for (const run of runs) {
+		run.catch((error: unknown) => {
+			firstFailure ??= error;
+			for (const worker of workers) void worker.terminate();
 		});
-		let reply: WorkerReply | undefined;
-		worker.once('message', (message: WorkerReply) => {
-			reply = message;
-		});
-		worker.once('error', reject);
-		worker.once('exit', (code) => {
-			if (reply?.kind === 'error') reject(new Error(`load worker failed: ${reply.message}`));
-			else if (reply) resolve(reply);
-			else reject(new Error(`load worker exited with code ${code} before reporting`));
-		});
-	});
+	}
+	const settled = await Promise.allSettled(runs);
+	if (firstFailure !== undefined) throw firstFailure;
+	return settled.map((result) => (result as PromiseFulfilledResult<WorkerReply>).value);
 }
 
 export interface ClientUsage {
@@ -521,7 +544,7 @@ export async function runPhaseWorkers(
 ): Promise<{ phases: Record<string, PhaseStats>; usage: ClientUsage }> {
 	const cpuBefore = process.cpuUsage();
 	const wallBefore = performance.now();
-	const replies = await Promise.all(tasks.map((task) => runWorker(target, task)));
+	const replies = await runWorkers(target, tasks);
 	const cpu = process.cpuUsage(cpuBefore);
 	const phases: Record<string, PhaseStats> = {};
 	for (const reply of replies) {
@@ -540,7 +563,7 @@ export async function runPhaseWorkers(
 }
 
 export async function runLoadWorkers(target: HttpTarget, tasks: WorkerTask[]): Promise<LoadRangeResult> {
-	const replies = await Promise.all(tasks.map((task) => runWorker(target, task)));
+	const replies = await runWorkers(target, tasks);
 	const total: LoadRangeResult = { ok: 0, failed: 0, errorSamples: [] };
 	for (const reply of replies) {
 		if (reply.kind !== 'load') throw new Error(`expected a load result, got ${reply.kind}`);

@@ -13,6 +13,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, rename, writeFile, appendFile } from 'node:fs/promises';
+import { availableParallelism } from 'node:os';
 import { join, relative } from 'node:path';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -72,11 +73,16 @@ class Orchestrator {
 	readonly out: string;
 	readonly target: HttpTarget;
 	readonly opBase: Omit<OpSpec, 'workload' | 'skew'>;
+	readonly workers: number;
 
 	constructor(plan: OrchestratorPlan, out: string) {
 		this.plan = plan;
 		this.out = out;
 		const { pair, client, adminPassword, server } = plan;
+		// 0 means one worker per vCPU but one, resolved here on the client.
+		this.workers = client.workers || availableParallelism() - 1;
+		if (!Number.isInteger(this.workers) || this.workers < 1)
+			throw new Error(`invalid client worker count ${this.workers}`);
 		this.target = {
 			baseUrl: `http://${server.host}:9926`,
 			authorization: 'Basic ' + Buffer.from(`admin:${adminPassword}`).toString('base64'),
@@ -159,7 +165,7 @@ class Orchestrator {
 		const file = join(this.out, 'fio.json');
 		if (existsSync(file)) return;
 		await this.log('fio: measuring the data disk');
-		await writeFile(file, await this.ctl(['fio'], 30 * 60_000));
+		await writeJSON(file, JSON.parse(await this.ctl(['fio'], 30 * 60_000)));
 	}
 
 	async load(): Promise<void> {
@@ -171,7 +177,7 @@ class Orchestrator {
 		await this.ctl(['init-root']);
 		await this.startHarper(unconstrainedOf(pair));
 		const started = Date.now();
-		const per = Math.ceil(pair.records / client.workers);
+		const per = Math.ceil(pair.records / this.workers);
 		const tasks: WorkerTask[] = [];
 		for (let low = 0; low < pair.records; low += per) {
 			tasks.push({
@@ -236,8 +242,8 @@ class Orchestrator {
 				{ name: 'warmup', seconds: calibrateWarmupSec },
 				{ name: 'measure', seconds: calibrateMeasureSec },
 			];
-			const concurrency = Math.ceil(client.calibrationConcurrency / client.workers);
-			const tasks: WorkerTask[] = Array.from({ length: client.workers }, (_, i) => ({
+			const concurrency = Math.ceil(client.calibrationConcurrency / this.workers);
+			const tasks: WorkerTask[] = Array.from({ length: this.workers }, (_, i) => ({
 				mode: 'closed',
 				concurrency,
 				phases,
@@ -312,9 +318,9 @@ class Orchestrator {
 				{ name: 'warmup', seconds: warmupSec },
 				{ name: 'measure', seconds: measureSec },
 			];
-			const tasks: WorkerTask[] = Array.from({ length: client.workers }, (_, i) => ({
+			const tasks: WorkerTask[] = Array.from({ length: this.workers }, (_, i) => ({
 				mode: 'open',
-				ratePerSec: offeredRatePerSec / client.workers,
+				ratePerSec: offeredRatePerSec / this.workers,
 				inFlightCap: client.inFlightCapPerWorker,
 				phases,
 				startMs,
@@ -432,12 +438,14 @@ async function main(): Promise<void> {
 	const plan: OrchestratorPlan = JSON.parse(await readFile(values.plan, 'utf8'));
 	const out = values.out;
 	for (const dir of [out, join(out, 'cells'), join(out, 'calibration')]) await mkdir(dir, { recursive: true });
+	const { adminPassword: _secret, ...publicPlan } = plan;
+	await writeJSON(join(out, 'plan.json'), publicPlan);
 	const orchestrator = new Orchestrator(plan, out);
 	try {
 		await orchestrator.run();
+		await orchestrator.log('done');
 		await writeChecksums(out);
 		await writeFile(join(out, 'DONE'), new Date().toISOString() + '\n');
-		await orchestrator.log('done');
 	} catch (error) {
 		await orchestrator.log(`FAILED: ${(error as Error).stack ?? error}`);
 		await orchestrator.status({ phase: 'failed', error: String((error as Error).message ?? error) });

@@ -54,6 +54,8 @@ export interface PairData {
 	fio: any;
 	calibrations: any[];
 	cells: any[];
+	/** Cell ids the pair's plan scheduled; empty when the plan was not saved with the results. */
+	plannedCellIds: string[];
 }
 
 function readsPerRequest(serverWindow: any, okPerSec: number): number {
@@ -138,9 +140,11 @@ export function seriesKey(row: Row): string {
 	return `${row.pair} ${row.workload} ${row.skew}`;
 }
 
-/** The curve's points: valid, non-pinned, non-repeat cells, largest memory first. */
+/** The curve's points, largest memory first. A client-limited cell measured the load generator, not Harper. */
 export function curve(rows: Row[]): Row[] {
-	return rows.filter((row) => row.valid && !row.pinned && !row.repeat).sort((a, b) => b.memoryGiB - a.memoryGiB);
+	return rows
+		.filter((row) => row.valid && !row.clientLimited && !row.pinned && !row.repeat)
+		.sort((a, b) => b.memoryGiB - a.memoryGiB);
 }
 
 export interface Knee {
@@ -239,16 +243,22 @@ export function fioSummary(fio: any): { iops: number | null; qd1LatencyMs: numbe
 
 /** A Mermaid xychart of extra reads per 1k requests against memory/data, one line per skew. */
 export function mermaidChart(pair: string, workload: string, rows: Row[]): string | null {
-	const bySkew = groupBy(curve(rows), (row) => row.skew);
-	const skews = [...bySkew.keys()].sort((a, b) => skewIndex(a) - skewIndex(b));
+	const points = curve(rows);
+	const ratios = [...new Set(points.map((row) => fmt(row.ratio, 2)))];
+	const bySkew = groupBy(points, (row) => row.skew);
+	// xychart has no gaps: a skew missing any step is left out rather than drawn through a fake zero.
+	const allSkews = [...bySkew.keys()].sort((a, b) => skewIndex(a) - skewIndex(b));
+	const skews = allSkews.filter((skew) => bySkew.get(skew)!.length === ratios.length);
+	const omitted = allSkews.filter((skew) => !skews.includes(skew));
 	if (skews.length === 0) return null;
-	const ratios = [...new Set(curve(rows).map((row) => fmt(row.ratio, 2)))];
 	const lines = skews.map((skew) => {
 		const byRatio = new Map(bySkew.get(skew)!.map((row) => [fmt(row.ratio, 2), row.extraReadsPer1k]));
-		return `    line [${ratios.map((ratio) => fmt(byRatio.get(ratio) ?? 0, 1)).join(', ')}]`;
+		return `    line [${ratios.map((ratio) => fmt(byRatio.get(ratio)!, 1)).join(', ')}]`;
 	});
-	const max = Math.max(1, ...curve(rows).map((row) => row.extraReadsPer1k));
-	const legend = skews.map((skew, i) => `${skew} = ${PALETTE[i]}`).join(', ');
+	const max = Math.max(1, ...points.map((row) => row.extraReadsPer1k));
+	const legend =
+		skews.map((skew, i) => `${skew} = ${PALETTE[i]}`).join(', ') +
+		(omitted.length > 0 ? `; not drawn (missing cells): ${omitted.join(', ')}` : '');
 	return [
 		'```mermaid',
 		`%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "${skews.map((_, i) => PALETTE[i]).join(', ')}"}}}}%%`,
@@ -342,6 +352,9 @@ export async function loadPair(dir: string, name: string): Promise<PairData> {
 		fio: existsSync(join(dir, 'fio.json')) ? await readJSON(join(dir, 'fio.json')) : null,
 		calibrations: await readAll('calibration'),
 		cells: await readAll('cells'),
+		plannedCellIds: existsSync(join(dir, 'plan.json'))
+			? (await readJSON(join(dir, 'plan.json'))).pair.cells.map((cell: { id: string }) => cell.id)
+			: [],
 	};
 }
 
@@ -395,7 +408,7 @@ export function renderReport(
 			const row = byLabel.get(label);
 			if (!row) return '';
 			if (!row.valid) return 'invalid';
-			return `${fmt(row.extraReadsPer1k)} (${fmt(row.p99Ms)})${row.saturated ? ' ⚠' : ''}`;
+			return `${fmt(row.extraReadsPer1k)} (${fmt(row.p99Ms)})${row.saturated ? ' ⚠' : ''}${row.clientLimited ? ' ‡' : ''}`;
 		});
 		lines.push(
 			`| ${group[0].pair} | ${group[0].workload} | ${group[0].skew} | ${fmt(group[0].offeredPerSec, 0)} | ${cells.join(' | ')} | ${knee(group).description} |`
@@ -403,8 +416,13 @@ export function renderReport(
 	}
 	lines.push(
 		'',
-		`⚠ = saturated: more than 0.1% of scheduled requests shed or timed out, or under 99% of the offered rate completed. Knee: largest memory step whose p99 is ≥ ${KNEE_FACTOR}× the series' lowest p99.`
+		`⚠ = saturated: more than 0.1% of scheduled requests shed or timed out, or under 99% of the offered rate completed. ‡ = client-limited (load-generator CPU above 85% or schedule lag p99 above 10 ms); left out of knees, slopes and charts. Knee: largest memory step whose p99 is ≥ ${KNEE_FACTOR}× the series' lowest p99.`
 	);
+	const missing = pairs.flatMap((pair) => {
+		const present = new Set(pair.cells.map((cell) => cell.cell.id));
+		return pair.plannedCellIds.filter((id) => !present.has(id)).map((id) => `${pair.name}/${id}`);
+	});
+	if (missing.length > 0) lines.push('', `**Cells with no result (${missing.length}):** ${missing.join(', ')}.`);
 
 	lines.push('', '## Charts', '');
 	for (const pair of pairs) {
@@ -428,7 +446,7 @@ export function renderReport(
 		);
 	}
 
-	const pinnedRows = rows.filter((row) => row.pinned && row.valid);
+	const pinnedRows = rows.filter((row) => row.pinned && row.valid && !row.clientLimited);
 	if (pinnedRows.length > 0) {
 		lines.push('', '## Block cache vs page cache (50% step, block cache pinned to the 100% size)', '');
 		lines.push(
@@ -437,8 +455,9 @@ export function renderReport(
 		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
 		for (const pinned of pinnedRows) {
 			const group = series.get(seriesKey(pinned)) ?? [];
-			const full = group.find((row) => row.step === 1 && !row.pinned && row.valid);
-			const half = group.find((row) => row.step === pinned.step && !row.pinned && row.valid);
+			const points = curve(group);
+			const full = points.find((row) => row.step === 1);
+			const half = points.find((row) => row.step === pinned.step);
 			const increase = full && half ? half.extraReadsPer1k - full.extraReadsPer1k : null;
 			const share =
 				increase && increase > 0 && half ? (half.extraReadsPer1k - pinned.extraReadsPer1k) / increase : null;
@@ -470,7 +489,7 @@ export function renderReport(
 	lines.push(`|${' --- |'.repeat(23)}`);
 	for (const row of [...rows].sort((a, b) => seriesKey(a).localeCompare(seriesKey(b)) || b.memoryGiB - a.memoryGiB)) {
 		lines.push(
-			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.valid ? 'yes' : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
+			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.valid ? (row.clientLimited ? 'client-limited' : 'yes') : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
 		);
 	}
 	lines.push('', '</details>');
@@ -481,7 +500,6 @@ export function renderReport(
 	return { markdown: lines.join('\n') + '\n', charts };
 }
 
-/** Writes report.md and the SVG charts into the run directory; returns the report path. */
 export async function writeReport(runDir: string): Promise<string> {
 	const entries = await readdir(runDir, { withFileTypes: true });
 	const pairs: PairData[] = [];

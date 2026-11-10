@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Provisions the client VM: installs Node (checksum-verified) and unpacks the benchmark source.
 # Run as root: client-setup.sh <source.tgz> <node version, e.g. v26.2.0> <owner user>
 set -euo pipefail
 src_tgz="$1"
@@ -8,6 +7,9 @@ owner="$3"
 export DEBIAN_FRONTEND=noninteractive
 
 systemctl stop unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+# The official Node binaries link libatomic, which the GCE Ubuntu image does not ship.
+apt-get update -q
+apt-get install -y -q libatomic1
 
 if [ "$(/opt/node/bin/node --version 2>/dev/null)" != "$node_version" ]; then
 	work=$(mktemp -d)
@@ -24,4 +26,6 @@ fi
 rm -rf /opt/memory-curve/src
 mkdir -p /opt/memory-curve/src /opt/memory-curve/results
 tar -xzf "$src_tgz" -C /opt/memory-curve/src
+install -m 0755 /opt/memory-curve/src/benchmarks/memory-curve/client-ctl.sh /opt/memory-curve/client-ctl.sh
 chown -R "$owner:$owner" /opt/memory-curve
+/opt/node/bin/node --version

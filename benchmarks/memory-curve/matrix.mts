@@ -152,12 +152,9 @@ export function pinnedPolicy(step: number, startLimitBytes: number): MemoryPolic
 	};
 }
 
-/**
- * Approximate on-disk bytes per record after compaction; measured 806 B for 10 × 100 B fields
- * (the random field text compresses by about a fifth). The report uses the measured size.
- */
+/** Approximate on-disk bytes per record (SST, after compaction); 1,071 B measured for 10 × 100 B fields. */
 export function estimatedRecordBytes(fieldCount: number, fieldLength: number): number {
-	return Math.round(0.78 * fieldCount * fieldLength + 30);
+	return fieldCount * (fieldLength + 5) + 20;
 }
 
 export function planPair(pair: PairSpec, profile: ProfileSpec): PairPlan {

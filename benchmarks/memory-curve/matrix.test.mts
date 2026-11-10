@@ -55,7 +55,7 @@ describe('planProfile', () => {
 			assert.ok(estimatedHours(plan) < 40, `${plan.name}: ${estimatedHours(plan)} h`);
 		}
 		const d4 = plans.find((plan) => plan.name === 'd4x-1k')!;
-		assert.ok(d4.records > 28_000_000 && d4.records < 34_000_000, `${d4.records}`);
+		assert.ok(d4.records > 22_000_000 && d4.records < 26_000_000, `${d4.records}`);
 		assert.equal(d4.keyWidth, String(d4.records - 1).length);
 	});
 

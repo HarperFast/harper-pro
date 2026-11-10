@@ -288,6 +288,45 @@ describe('workers over HTTP', () => {
 		assert.ok(puts.has('/usertable/user119'));
 	});
 
+	it('terminates the other workers when one fails, so none keeps sending', async () => {
+		let requests = 0;
+		const counting = http.createServer((req, res) => {
+			requests++;
+			req.resume();
+			req.on('end', () => res.end('{}'));
+		});
+		await new Promise<void>((resolve) => counting.listen(0, '127.0.0.1', resolve));
+		const target = {
+			baseUrl: `http://127.0.0.1:${(counting.address() as AddressInfo).port}`,
+			authorization: 'Basic test',
+			maxSockets: 8,
+			timeoutMs: 2000,
+		};
+		const phases = [{ name: 'measure', seconds: 30 }];
+		const started = Date.now();
+		await assert.rejects(
+			runPhaseWorkers(target, [
+				{ mode: 'open', ratePerSec: 200, inFlightCap: 8, phases, startMs: Date.now(), op, seed: 1 },
+				{
+					mode: 'open',
+					ratePerSec: 200,
+					inFlightCap: 8,
+					phases,
+					startMs: Date.now(),
+					op: { ...op, workload: 'nope' },
+					seed: 2,
+				},
+			]),
+			/unknown workload nope/
+		);
+		assert.ok(Date.now() - started < 10_000, `took ${Date.now() - started} ms`);
+		const afterRejection = requests;
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		assert.equal(requests, afterRejection);
+		counting.closeAllConnections();
+		counting.close();
+	});
+
 	it('times a hung request out at its deadline and reports a non-2xx status as an error', async () => {
 		const { execute, close } = createHttpExecutor({
 			baseUrl,

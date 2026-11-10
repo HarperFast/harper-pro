@@ -1,6 +1,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { cellRow, fioSummary, knee, mermaidChart, renderReport, slopes, svgChart, type PairData } from './report.mts';
+import {
+	cellRow,
+	fioSummary,
+	knee,
+	mermaidChart,
+	pairRows,
+	renderReport,
+	slopes,
+	svgChart,
+	type PairData,
+} from './report.mts';
 import { fabricPolicy, pinnedPolicy } from './matrix.mts';
 
 const GiB = 1024 ** 3;
@@ -15,17 +25,17 @@ function cell(
 	step: number,
 	readsPerSec: number,
 	p99Ms: number,
-	options: { pinned?: boolean; saturated?: boolean; valid?: boolean; skew?: string } = {}
+	options: { pinned?: boolean; saturated?: boolean; valid?: boolean; skew?: string; clientLimited?: boolean } = {}
 ) {
 	const policy = options.pinned ? pinnedPolicy(step, 6 * GiB) : fabricPolicy(`${step * 100}%`, step, 6 * GiB);
 	const skew = options.skew ?? 'zipf-1';
 	return {
-		cell: { id: `C-${skew}-${policy.label}`, workload: 'C', skew, policy },
+		cell: { id: `C-${skew}-${policy.label}`.replace(/%/g, 'pct'), workload: 'C', skew, policy },
 		offeredRatePerSec: 10_000,
 		valid: options.valid ?? true,
 		invalidReasons: options.valid === false ? ['container restarted during the window'] : [],
 		saturated: options.saturated ?? false,
-		clientLimited: false,
+		clientLimited: options.clientLimited ?? false,
 		client: { measure: { okPerSec: 10_000, lossFraction: 0, latencySummary: { p50Ms: 1, p99Ms, p999Ms: p99Ms * 2 } } },
 		server: {
 			window: {
@@ -86,6 +96,13 @@ describe('knee and slopes', () => {
 		assert.match(result.description, /p99 4\.50 ms vs 2\.00 ms/);
 	});
 
+	it('leaves client-limited cells out of knees and slopes', () => {
+		const limited = cellRow(cell(0.7, 500, 50, { clientLimited: true }), calibration, dataset, 'p');
+		const series = [rows[0], limited, rows[2]];
+		assert.equal(knee(series).memoryGiB, 3);
+		assert.equal(slopes(series).length, 1);
+	});
+
 	it('reports a series saturated at its largest step, and one with no knee', () => {
 		assert.match(
 			knee([cellRow(cell(1, 100, 50, { saturated: true }), calibration, dataset, 'p')]).description,
@@ -123,6 +140,7 @@ describe('renderReport', () => {
 			cell(0.5, 5000, 40, { skew: 'uniform', saturated: true }),
 			cell(0.25, 0, 0, { valid: false }),
 		],
+		plannedCellIds: ['C-zipf-1-100pct', 'C-zipf-1-50pct', 'C-zipf-1-35pct'],
 	};
 
 	it('produces every report section', () => {
@@ -141,7 +159,18 @@ describe('renderReport', () => {
 		assert.match(markdown, /1\.10 \/ 2\.50 ms/);
 		assert.match(markdown, /```mermaid/);
 		assert.match(markdown, /invalid/);
+		assert.match(markdown, /Cells with no result \(1\):\*\* d2x-1k\/C-zipf-1-35pct/);
 		assert.ok(charts['chart-C.svg'].startsWith('<svg'));
+	});
+
+	it('leaves a skew with a missing step out of the Mermaid chart instead of plotting a zero', () => {
+		const rows = pairRows({
+			...pair,
+			cells: [cell(1, 100, 2), cell(0.5, 1500, 4.5), cell(1, 800, 3, { skew: 'uniform' })],
+		});
+		const chart = mermaidChart('d2x-1k', 'C', rows)!;
+		assert.equal(chart.match(/^\s+line \[/gm)?.length, 1);
+		assert.match(chart, /not drawn \(missing cells\): uniform/);
 	});
 
 	it('summarizes fio output and tolerates a missing run', () => {

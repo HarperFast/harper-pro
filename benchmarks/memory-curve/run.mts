@@ -29,7 +29,9 @@ const HERE = import.meta.dirname;
 const REPO_ROOT = join(HERE, '..', '..');
 const REMOTE = '/opt/memory-curve';
 const USER = 'bench';
-const RUN_ID_PATTERN = /^[a-z][a-z0-9]{2,15}$/;
+const RUN_ID_PATTERN = /^[a-z][a-z0-9]{2,19}$/;
+const LOST_AFTER_FAILED_POLLS = 6;
+const FETCH_ATTEMPTS = 3;
 
 interface Options {
 	command: string;
@@ -67,10 +69,28 @@ interface Manifest {
 	profile: string;
 	createdAt: string;
 	harperCommit: string;
+	maxRunHours: number;
 	sshSource: string;
 	firewallRules: string[];
-	pairs: Array<{ name: string; server: VmRecord; client: VmRecord; fetched?: boolean }>;
+	pairs: PairRecord[];
 	state: 'creating' | 'running' | 'fetched' | 'cleaned';
+}
+
+interface PairRecord {
+	name: string;
+	server: VmRecord;
+	client: VmRecord;
+	/** How the pair's orchestrator ended, or `lost` when its client stopped answering. */
+	outcome?: 'DONE' | 'FAILED' | 'lost';
+	/** Where its results are now: verified copy, or best-effort copy of an unfinished pair. */
+	saved?: 'fetched' | 'partial';
+}
+
+/** Awaits every operation, so nothing is still creating resources when the first failure propagates. */
+async function settleAll(operations: Array<Promise<unknown>>): Promise<void> {
+	const results = await Promise.allSettled(operations);
+	const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+	if (failures.length > 0) throw new Error(failures.map((failure) => (failure.reason as Error).message).join('\n'));
 }
 
 function parseOptions(argv: string[]): Options {
@@ -103,7 +123,10 @@ function parseOptions(argv: string[]): Options {
 	if (!['run', 'resume', 'status', 'cleanup', 'report'].includes(command))
 		throw new Error(`unknown command ${command}`);
 	const runId =
-		values['run-id'] ?? (command === 'run' ? `mc${new Date().toISOString().slice(2, 16).replace(/\D/g, '')}` : '');
+		values['run-id'] ??
+		(command === 'run'
+			? `mc${new Date().toISOString().slice(2, 19).replace(/\D/g, '')}${randomBytes(2).toString('hex').slice(0, 2)}`
+			: '');
 	if (!RUN_ID_PATTERN.test(runId)) throw new Error(`--run-id must match ${RUN_ID_PATTERN} (got "${runId}")`);
 	if (command !== 'report' && !values.project) throw new Error('--project (or MEMORY_CURVE_PROJECT) is required');
 	const positive = (name: string, text: string): number => {
@@ -311,6 +334,7 @@ class Launcher {
 			zone: options.zone,
 			profile: options.profile,
 			createdAt: new Date().toISOString(),
+			maxRunHours: options.maxRunHours,
 			harperCommit: (await exec('git', ['-C', REPO_ROOT, 'rev-parse', 'HEAD'])).trim(),
 			sshSource,
 			firewallRules: [`mc-${options.runId}-harper`, `mc-${options.runId}-ssh`],
@@ -360,7 +384,7 @@ class Launcher {
 			`--max-run-duration=${Math.floor(options.maxRunHours)}h`,
 			'--instance-termination-action=DELETE',
 		];
-		await Promise.all(
+		await settleAll(
 			plans.map(async (plan) => {
 				const { server, client } = this.names(plan.name);
 				const labels = (role: string) =>
@@ -431,7 +455,7 @@ class Launcher {
 
 	async provision(plans: PairPlan[], tarball: string): Promise<void> {
 		const runKey = join(this.runDir, 'run_key');
-		await Promise.all(
+		await settleAll(
 			this.manifest.pairs.map(async (pair) => {
 				const plan = plans.find((candidate) => candidate.name === pair.name)!;
 				const server = pair.server.externalIp!;
@@ -457,7 +481,7 @@ class Launcher {
 				const planFile = join(this.runDir, `${pair.name}.plan.json`);
 				await writeFile(planFile, JSON.stringify(orchestratorPlan, null, '\t'), { mode: 0o600 });
 				log(`provision ${pair.name}: server (image build takes ~15 min) and client`);
-				await Promise.all([
+				await settleAll([
 					(async () => {
 						await this.scp([tarball, join(HERE, 'server-setup.sh'), passwordFile], `${USER}@${server}:/tmp/`);
 						await this.ssh(
@@ -482,18 +506,11 @@ class Launcher {
 	}
 
 	async startOrchestrator(client: string): Promise<void> {
-		await this.ssh(
-			client,
-			`cd ${REMOTE} && setsid nohup bash -c 'ulimit -n 65536; exec /opt/node/bin/node src/benchmarks/memory-curve/orchestrate.mts --plan plan.json --out results' >> orchestrate.out 2>&1 < /dev/null &`
-		);
+		await this.ssh(client, `bash ${REMOTE}/client-ctl.sh start`);
 	}
 
 	async pairState(client: string): Promise<{ marker: 'DONE' | 'FAILED' | null; alive: boolean; status: any }> {
-		const output = await this.ssh(
-			client,
-			`cd ${REMOTE}/results; for m in DONE FAILED; do [ -f $m ] && echo "marker=$m"; done; pgrep -f orchestrate.mts >/dev/null && echo alive=yes; cat status.json 2>/dev/null || echo '{}'`,
-			60_000
-		);
+		const output = await this.ssh(client, `bash ${REMOTE}/client-ctl.sh status`, 60_000);
 		const marker = /marker=(DONE|FAILED)/.exec(output)?.[1] as 'DONE' | 'FAILED' | undefined;
 		const json = output.slice(output.indexOf('{'));
 		let status: any = {};
@@ -505,18 +522,31 @@ class Launcher {
 		return { marker: marker ?? null, alive: output.includes('alive=yes'), status };
 	}
 
+	/** Polls until every pair has ended and been fetched, been lost, or the run's VM lifetime has passed. */
 	async waitForPairs(): Promise<void> {
 		const restarts = new Map<string, number>();
+		const failedPolls = new Map<string, number>();
+		const fetchFailures = new Map<string, number>();
+		const deadline = Date.parse(this.manifest.createdAt) + this.manifest.maxRunHours * 3600_000;
 		for (;;) {
 			let pending = 0;
 			for (const pair of this.manifest.pairs) {
-				if (pair.fetched) continue;
+				if (pair.saved === 'fetched' || pair.outcome === 'lost') continue;
 				let state;
 				try {
 					state = await this.pairState(pair.client.externalIp!);
+					failedPolls.set(pair.name, 0);
 				} catch (error) {
-					log(`${pair.name}: status unavailable (${(error as Error).message.split('\n')[0]})`);
-					pending++;
+					const count = (failedPolls.get(pair.name) ?? 0) + 1;
+					failedPolls.set(pair.name, count);
+					log(`${pair.name}: status unavailable ${count}x (${(error as Error).message.split('\n')[0]})`);
+					if (count >= LOST_AFTER_FAILED_POLLS) {
+						pair.outcome = 'lost';
+						await this.saveManifest();
+						log(`${pair.name}: client unreachable for ${count} polls; giving up on it`);
+					} else {
+						pending++;
+					}
 					continue;
 				}
 				const { marker, alive, status } = state;
@@ -524,45 +554,59 @@ class Launcher {
 					`${pair.name}: ${marker ?? status.phase ?? 'starting'} ${status.done ?? 0}/${status.total ?? '?'} ${status.current ?? ''}`
 				);
 				if (marker) {
-					await this.fetch(pair);
+					pair.outcome = marker;
+					try {
+						await this.fetch(pair);
+					} catch (error) {
+						const count = (fetchFailures.get(pair.name) ?? 0) + 1;
+						fetchFailures.set(pair.name, count);
+						log(`${pair.name}: fetch attempt ${count} failed: ${(error as Error).message.split('\n')[0]}`);
+						if (count < FETCH_ATTEMPTS) pending++;
+					}
 					continue;
 				}
 				pending++;
 				if (!alive) {
 					const count = (restarts.get(pair.name) ?? 0) + 1;
-					if (count > 3)
+					if (count > 3) {
 						throw new Error(
 							`${pair.name}: orchestrator died ${count - 1} times; see ${REMOTE}/orchestrate.out on ${pair.client.name}`
 						);
+					}
 					restarts.set(pair.name, count);
 					log(`${pair.name}: orchestrator not running and no result marker; restarting it (it resumes)`);
 					await this.startOrchestrator(pair.client.externalIp!);
 				}
 			}
-			if (pending === 0) return;
+			if (pending === 0) break;
+			if (Date.now() > deadline) throw new Error(`run passed its ${this.manifest.maxRunHours} h VM lifetime`);
 			await delay(this.options.pollMinutes * 60_000);
 		}
+		const unfetched = this.manifest.pairs.filter((pair) => pair.saved !== 'fetched').map((pair) => pair.name);
+		if (unfetched.length > 0) throw new Error(`results not fetched for ${unfetched.join(', ')}`);
 	}
 
-	async fetch(pair: Manifest['pairs'][number]): Promise<void> {
+	async fetch(pair: PairRecord): Promise<void> {
 		const destination = join(this.runDir, pair.name);
 		await rm(destination, { recursive: true, force: true });
 		await this.scp([`${USER}@${pair.client.externalIp}:${REMOTE}/results`], destination);
 		await verifyChecksums(destination);
-		pair.fetched = true;
+		pair.saved = 'fetched';
 		await this.saveManifest();
 		log(`${pair.name}: results fetched to ${destination} and checksums verified`);
 	}
 
-	/** Best-effort copy of whatever a pair produced, kept beside the run when it did not finish. */
+	/** Best-effort copy of whatever an unfinished pair produced, kept beside the run. */
 	async fetchPartial(): Promise<void> {
 		for (const pair of this.manifest.pairs) {
-			if (pair.fetched || !pair.client.externalIp) continue;
+			if (pair.saved || !pair.client.externalIp) continue;
 			const destination = join(this.runDir, `${pair.name}-partial`);
 			try {
 				await rm(destination, { recursive: true, force: true });
 				await this.scp([`${USER}@${pair.client.externalIp}:${REMOTE}/results`], destination);
 				await this.scp([`${USER}@${pair.client.externalIp}:${REMOTE}/orchestrate.out`], destination).catch(() => '');
+				pair.saved = 'partial';
+				await this.saveManifest();
 				log(`${pair.name}: partial results saved to ${destination}`);
 			} catch (error) {
 				log(`${pair.name}: could not fetch partial results: ${(error as Error).message.split('\n')[0]}`);
@@ -570,8 +614,16 @@ class Launcher {
 		}
 	}
 
+	/** Pairs whose VMs hold results that exist nowhere else. */
+	unsavedPairs(): string[] {
+		return this.manifest.pairs
+			.filter((pair) => !pair.saved && pair.outcome !== 'lost' && pair.client.externalIp)
+			.map((pair) => pair.name);
+	}
+
 	async cleanup(): Promise<void> {
-		const { runId, zone } = this.options;
+		const { runId } = this.options;
+		const { zone } = this.manifest;
 		const instanceNames = this.manifest.pairs.flatMap((pair) => [pair.server.name, pair.client.name]);
 		const listed = (
 			await this.gcloud(['compute', 'instances', 'list', `--filter=labels.run=${runId}`, '--format=value(name)'])
@@ -669,6 +721,11 @@ async function main(): Promise<void> {
 			);
 	}
 	if (options.dryRun) return;
+	if (options.command === 'run' && existsSync(join(launcher.runDir, 'manifest.json'))) {
+		throw new Error(
+			`run ${options.runId} already exists; use resume, status or cleanup for it, or pick another --run-id`
+		);
+	}
 	let finished = false;
 	try {
 		if (options.command === 'run') {
@@ -687,12 +744,26 @@ async function main(): Promise<void> {
 		await launcher.saveManifest();
 		finished = true;
 		log(`report: ${await writeReport(launcher.runDir)}`);
+		const failed = launcher.manifest.pairs.filter((pair) => pair.outcome !== 'DONE').map((pair) => pair.name);
+		if (failed.length > 0) {
+			log(`pairs that did not complete: ${failed.join(', ')} (see their orchestrate.log)`);
+			process.exitCode = 1;
+		}
 	} finally {
 		if (!options.keep && existsSync(join(launcher.runDir, 'manifest.json'))) {
+			const retry = `node benchmarks/memory-curve/run.mts resume --run-id ${options.runId} --project ${options.project}`;
 			try {
 				if (!launcher.manifest) await launcher.loadManifest();
 				if (!finished) await launcher.fetchPartial();
-				await launcher.cleanup();
+				const unsaved = launcher.unsavedPairs();
+				if (unsaved.length > 0) {
+					log(
+						`keeping the run's resources: results of ${unsaved.join(', ')} exist only on their VMs (which delete themselves ` +
+							`${launcher.manifest.maxRunHours} h after creation). Retry with: ${retry}; or discard with the cleanup command.`
+					);
+				} else {
+					await launcher.cleanup();
+				}
 			} catch (error) {
 				log(
 					`cleanup FAILED: ${(error as Error).message}; rerun: node benchmarks/memory-curve/run.mts cleanup --run-id ${options.runId} --project ${options.project}`

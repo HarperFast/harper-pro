@@ -8,8 +8,6 @@
 
 export type Uniform01 = () => number;
 
-export type SkewName = 'uniform' | `zipf-${number}`;
-
 /** Draws integer ranks in [1, n] with P(k) ∝ k^-s (Hörmann & Derflinger rejection-inversion). */
 export class ZipfSampler {
 	readonly n: number;
