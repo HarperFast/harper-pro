@@ -342,7 +342,9 @@ both receives and serves a subscription does not redial at the floor while its o
 loop stuck on an oversized frame does neither. Only the session that still owns the socket reports any of
 these. Without the receive signal, the ceiling carried across unrelated outages until every reconnect waited
 out the 30 s cap (`connectedBitRestartChurn.test.mjs`). Still open: a leg that receives nothing new between
-outages (idle, or mid-copy) carries its escalated ceiling into the next one.
+outages (idle, or mid-copy) carries its escalated ceiling into the next one. A planned move to another address (`redialForPathChange`: a
+promotion back to private, or a peer's changed advertisement) is not a failure and also resets it; the
+`privatePaths` probe backoff bounds how often a promotion can happen.
 
 **What is deliberately NOT on this schedule:** the receive/copy watchdogs and their thresholds, and the
 doubling copy-finalize _timeout bound_ alongside them (these _detect_ stalls or bound a wait; this
