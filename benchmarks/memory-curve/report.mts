@@ -241,7 +241,7 @@ export function fioSummary(fio: any): { iops: number | null; qd1LatencyMs: numbe
 	};
 }
 
-/** A Mermaid xychart of extra reads per 1k requests against memory/data, one line per skew. */
+/** A Mermaid xychart of extra disk reads/s against memory/data, one line per skew. */
 export function mermaidChart(pair: string, workload: string, rows: Row[]): string | null {
 	const points = curve(rows);
 	const ratios = [...new Set(points.map((row) => fmt(row.ratio, 2)))];
@@ -252,10 +252,10 @@ export function mermaidChart(pair: string, workload: string, rows: Row[]): strin
 	const omitted = allSkews.filter((skew) => !skews.includes(skew));
 	if (skews.length === 0) return null;
 	const lines = skews.map((skew) => {
-		const byRatio = new Map(bySkew.get(skew)!.map((row) => [fmt(row.ratio, 2), row.extraReadsPer1k]));
+		const byRatio = new Map(bySkew.get(skew)!.map((row) => [fmt(row.ratio, 2), row.extraReadsPerSec]));
 		return `    line [${ratios.map((ratio) => fmt(byRatio.get(ratio)!, 1)).join(', ')}]`;
 	});
-	const max = Math.max(1, ...points.map((row) => row.extraReadsPer1k));
+	const max = Math.max(1, ...points.map((row) => row.extraReadsPerSec));
 	const legend =
 		skews.map((skew, i) => `${skew} = ${PALETTE[i]}`).join(', ') +
 		(omitted.length > 0 ? `; not drawn (missing cells): ${omitted.join(', ')}` : '');
@@ -263,17 +263,20 @@ export function mermaidChart(pair: string, workload: string, rows: Row[]): strin
 		'```mermaid',
 		`%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "${skews.map((_, i) => PALETTE[i]).join(', ')}"}}}}%%`,
 		'xychart-beta',
-		`    title "${pair} workload ${workload}: extra disk reads per 1,000 requests"`,
+		`    title "${pair} workload ${workload}: extra disk reads/s"`,
 		`    x-axis "memory / data" [${ratios.map((ratio) => `"${ratio}"`).join(', ')}]`,
-		`    y-axis "reads per 1k req" 0 --> ${Math.ceil(max * 1.1)}`,
+		`    y-axis "extra reads/s" 0 --> ${Math.ceil(max * 1.1)}`,
 		...lines,
 		'```',
 		`<sub>Lines: ${legend}.</sub>`,
 	].join('\n');
 }
 
-/** SVG chart for one workload: log-scale memory/data on x, extra reads per 1k requests on y. */
-export function svgChart(workload: string, rows: Row[]): string {
+/**
+ * SVG chart for one workload: extra disk reads/s against memory / data, both on log scales (y as
+ * log10(1 + reads/s), so cells with no extra reads still plot), with the measured disk ceiling.
+ */
+export function svgChart(workload: string, rows: Row[], ceilingIops: number | null): string {
 	const points = curve(rows.filter((row) => row.workload === workload));
 	const width = 900;
 	const height = 520;
@@ -283,19 +286,19 @@ export function svgChart(workload: string, rows: Row[]): string {
 	const ratios = points.map((row) => row.ratio);
 	const minX = Math.log10(Math.min(...ratios, 1) * 0.8);
 	const maxX = Math.log10(Math.max(...ratios, 1) * 1.25);
-	const maxY = Math.max(1, ...points.map((row) => row.extraReadsPer1k)) * 1.1;
+	const maxY = Math.log10(1 + Math.max(10, ceilingIops ?? 0, ...points.map((row) => row.extraReadsPerSec))) * 1.05;
 	const x = (ratio: number) => margin.left + ((Math.log10(ratio) - minX) / (maxX - minX)) * plotWidth;
-	const y = (value: number) => margin.top + plotHeight - (value / maxY) * plotHeight;
+	const y = (value: number) => margin.top + plotHeight - (Math.log10(1 + Math.max(0, value)) / maxY) * plotHeight;
 	const pairs = [...new Set(points.map((row) => row.pair))];
 	const dashes = ['', '6 4', '2 3', '10 3 2 3'];
 	const parts: string[] = [
 		`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" font-family="sans-serif" font-size="12">`,
 		`<rect width="${width}" height="${height}" fill="white"/>`,
-		`<text x="${margin.left}" y="24" font-size="15" font-weight="bold">Workload ${workload}: extra disk reads per 1,000 requests vs memory / data size</text>`,
+		`<text x="${margin.left}" y="24" font-size="15" font-weight="bold">Workload ${workload}: extra disk reads/s vs memory / data size</text>`,
 		`<line x1="${margin.left}" y1="${margin.top + plotHeight}" x2="${margin.left + plotWidth}" y2="${margin.top + plotHeight}" stroke="#333"/>`,
 		`<line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${margin.top + plotHeight}" stroke="#333"/>`,
 		`<text x="${margin.left + plotWidth / 2}" y="${height - 15}" text-anchor="middle">container memory limit / on-disk data size (log scale)</text>`,
-		`<text transform="translate(18 ${margin.top + plotHeight / 2}) rotate(-90)" text-anchor="middle">extra disk reads per 1,000 requests</text>`,
+		`<text transform="translate(18 ${margin.top + plotHeight / 2}) rotate(-90)" text-anchor="middle">extra disk reads/s (log scale)</text>`,
 	];
 	for (const tick of [0.0625, 0.125, 0.25, 0.5, 1, 2]) {
 		if (Math.log10(tick) < minX || Math.log10(tick) > maxX) continue;
@@ -304,11 +307,17 @@ export function svgChart(workload: string, rows: Row[]): string {
 			`<text x="${x(tick)}" y="${margin.top + plotHeight + 18}" text-anchor="middle">${tick}</text>`
 		);
 	}
-	for (let i = 0; i <= 5; i++) {
-		const value = (maxY / 5) * i;
+	for (const tick of [0, 10, 100, 1000, 10000, 100000]) {
+		if (Math.log10(1 + tick) > maxY) break;
 		parts.push(
-			`<line x1="${margin.left}" y1="${y(value)}" x2="${margin.left + plotWidth}" y2="${y(value)}" stroke="#eee"/>`,
-			`<text x="${margin.left - 8}" y="${y(value) + 4}" text-anchor="end">${fmt(value, 0)}</text>`
+			`<line x1="${margin.left}" y1="${y(tick)}" x2="${margin.left + plotWidth}" y2="${y(tick)}" stroke="#eee"/>`,
+			`<text x="${margin.left - 8}" y="${y(tick) + 4}" text-anchor="end">${tick.toLocaleString('en-US')}</text>`
+		);
+	}
+	if (ceilingIops) {
+		parts.push(
+			`<line x1="${margin.left}" y1="${y(ceilingIops)}" x2="${margin.left + plotWidth}" y2="${y(ceilingIops)}" stroke="#888" stroke-dasharray="4 4"/>`,
+			`<text x="${margin.left + 6}" y="${y(ceilingIops) - 6}" fill="#555">disk ceiling ${fmt(ceilingIops, 0)} IOPS (fio, 4 KiB random read)</text>`
 		);
 	}
 	let legendY = margin.top;
@@ -317,12 +326,12 @@ export function svgChart(workload: string, rows: Row[]): string {
 		const color = PALETTE[skewIndex(skew) % PALETTE.length];
 		const dash = dashes[pairs.indexOf(pair) % dashes.length];
 		const path = series
-			.map((row, i) => `${i === 0 ? 'M' : 'L'}${x(row.ratio).toFixed(1)},${y(row.extraReadsPer1k).toFixed(1)}`)
+			.map((row, i) => `${i === 0 ? 'M' : 'L'}${x(row.ratio).toFixed(1)},${y(row.extraReadsPerSec).toFixed(1)}`)
 			.join(' ');
 		parts.push(`<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-dasharray="${dash}"/>`);
 		for (const row of series) {
 			parts.push(
-				`<circle cx="${x(row.ratio).toFixed(1)}" cy="${y(row.extraReadsPer1k).toFixed(1)}" r="${row.saturated ? 5 : 3}" fill="${row.saturated ? 'white' : color}" stroke="${color}"/>`
+				`<circle cx="${x(row.ratio).toFixed(1)}" cy="${y(row.extraReadsPerSec).toFixed(1)}" r="${row.saturated ? 5 : 3}" fill="${row.saturated ? 'white' : color}" stroke="${color}"/>`
 			);
 		}
 		parts.push(
@@ -391,7 +400,7 @@ export function renderReport(
 		const value = (label: string) => parseFloat(label) - (label.endsWith('pinned') ? 0.5 : 0);
 		return value(b) - value(a);
 	});
-	lines.push('', '## Extra disk reads per 1,000 requests (p99 ms)', '');
+	lines.push('', '## Extra disk reads/s (p99 ms) at the offered rate', '');
 	lines.push(`| pair | workload | skew | rate req/s | ${steps.join(' | ')} | p99 knee |`);
 	lines.push(`| --- | --- | --- | --- | ${steps.map(() => '---').join(' | ')} | --- |`);
 	const series = groupBy(
@@ -410,7 +419,7 @@ export function renderReport(
 			const row = byLabel.get(label);
 			if (!row) return '';
 			if (!row.valid) return 'invalid';
-			return `${fmt(row.extraReadsPer1k)} (${fmt(row.p99Ms)})${row.saturated ? ' ⚠' : ''}${row.clientLimited ? ' ‡' : ''}`;
+			return `${fmt(row.extraReadsPerSec)} (${fmt(row.p99Ms)})${row.saturated ? ' ⚠' : ''}${row.clientLimited ? ' ‡' : ''}`;
 		});
 		lines.push(
 			`| ${group[0].pair} | ${group[0].workload} | ${group[0].skew} | ${fmt(group[0].offeredPerSec, 0)} | ${cells.join(' | ')} | ${knee(group).description} |`
@@ -497,8 +506,11 @@ export function renderReport(
 	lines.push('', '</details>');
 
 	const charts: Record<string, string> = {};
-	for (const workload of new Set(rows.map((row) => row.workload)))
-		charts[`chart-${workload}.svg`] = svgChart(workload, rows);
+	const ceilings = pairs.map((pair) => fioSummary(pair.fio).iops).filter((iops): iops is number => iops !== null);
+	const ceiling = ceilings.length > 0 ? Math.min(...ceilings) : null;
+	for (const workload of new Set(rows.map((row) => row.workload))) {
+		charts[`chart-${workload}.svg`] = svgChart(workload, rows, ceiling);
+	}
 	return { markdown: lines.join('\n') + '\n', charts };
 }
 

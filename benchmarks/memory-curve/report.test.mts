@@ -147,7 +147,7 @@ describe('renderReport', () => {
 		const { markdown, charts } = renderReport([pair], { runId: 'mctest', harperCommit: 'abc123' });
 		for (const heading of [
 			'## Environment',
-			'## Extra disk reads per 1,000 requests',
+			'## Extra disk reads/s',
 			'## Charts',
 			'## Extra reads/s per GB',
 			'## Block cache vs page cache',
@@ -161,6 +161,7 @@ describe('renderReport', () => {
 		assert.match(markdown, /invalid/);
 		assert.match(markdown, /Cells with no result \(1\):\*\* d2x-1k\/C-zipf-1-35pct/);
 		assert.ok(charts['chart-C.svg'].startsWith('<svg'));
+		assert.match(charts['chart-C.svg'], /disk ceiling 5432 IOPS/);
 	});
 
 	it('subtracts no baseline from a calibration whose window was invalid', () => {
@@ -187,6 +188,6 @@ describe('renderReport', () => {
 	it('summarizes fio output and tolerates a missing run', () => {
 		assert.deepEqual(fioSummary(null), { iops: null, qd1LatencyMs: null, qd1P99Ms: null });
 		assert.equal(mermaidChart('p', 'C', []), null);
-		assert.ok(svgChart('C', []).includes('</svg>'));
+		assert.ok(svgChart('C', [], null).includes('</svg>'));
 	});
 });
