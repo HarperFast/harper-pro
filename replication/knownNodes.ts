@@ -141,6 +141,8 @@ type WatcherOptions = {
 	healthyUptimeMs?: number;
 	now?: () => number;
 	random?: () => number;
+	/** Runs after every subscribe that replaces an earlier one, whose events may have been missed. */
+	onResubscribe?: () => void;
 };
 
 // Generation tokens guarding against duplicate node-update watchers (harper-pro#460). A
@@ -200,6 +202,13 @@ export async function runNodeUpdateWatcher(
 		try {
 			const events = await subscribe();
 			if (!isCurrent()) break; // superseded while awaiting subscribe
+			if (restarts > 0) {
+				try {
+					options.onResubscribe?.();
+				} catch (error) {
+					logger.error?.('Error reconciling known nodes after resubscribing to hdb_nodes', error);
+				}
+			}
 			liveSince = now();
 			const iterator = events[Symbol.asyncIterator]();
 			watcherIterators.set(key, iterator);
@@ -646,7 +655,7 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 	// deploy_component reload re-running startOnMainThread, harper-pro#460) supersedes its prior
 	// watcher instead of stacking one, while the two distinct callers (subscription management vs
 	// replication-confirmation tracking) keep independent concurrent watchers.
-	runNodeUpdateWatcher(listener, { key: watcherKey });
+	runNodeUpdateWatcher(listener, { key: watcherKey, onResubscribe: () => rebuildKnownNodes(listener) });
 	rebuildKnownNodes(listener);
 	logger.debug?.(
 		'Known nodes at startup',

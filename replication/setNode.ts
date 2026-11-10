@@ -89,9 +89,10 @@ export async function setNode(req: any) {
 		return removeNodeFromTable(hostname, url, getHDBNodeTable(), sendOperationToNode);
 	}
 
-	if (!url) throw new ClientError('url required for this operation');
-
 	const thisUrl = getThisNodeUrl();
+	if (hostname === getThisNodeName() || (url && url === thisUrl))
+		assertOwnShard(req.operation ?? 'set_node', req.shard);
+	if (!url) throw new ClientError('url required for this operation');
 	if (thisUrl == null) throw new ClientError('replication url is missing from harperdb-config.yaml');
 
 	let rep;
@@ -431,6 +432,16 @@ export async function findExistingNodeRecord(hostname: string, url: string, hdbN
 	return undefined;
 }
 
+/** This node's own row follows replication.shard, which ensureThisNode writes back at every start. */
+function assertOwnShard(operation: string, shard: unknown) {
+	const configuredShard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+	if (shard !== undefined && shard !== configuredShard) {
+		throw new ClientError(
+			`${operation} cannot set this node's shard to ${shard}: it follows replication.shard (${configuredShard ?? 'not set'}); change replication.shard and restart instead`
+		);
+	}
+}
+
 const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization', 'start_time', 'force_signing'];
 
 /**
@@ -466,12 +477,7 @@ export async function updateNode(req: any) {
 
 	if (hostname) {
 		const found = await findExistingNodeRecord(hostname, url);
-		const configuredShard = get(CONFIG_PARAMS.REPLICATION_SHARD);
-		if ((found?.name ?? hostname) === getThisNodeName() && req.shard !== undefined && req.shard !== configuredShard) {
-			throw new ClientError(
-				`update_node cannot set this node's shard to ${req.shard}: it follows replication.shard (${configuredShard ?? 'not set'}); change replication.shard and restart instead`
-			);
-		}
+		if ((found?.name ?? hostname) === getThisNodeName()) assertOwnShard('update_node', req.shard);
 		if (found) {
 			// Normalize to the row's own identity regardless of which path runs below, so an alias or a
 			// custom port/scheme a caller used to reach the peer is never mistaken for a change to apply.

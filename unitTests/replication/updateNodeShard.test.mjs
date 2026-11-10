@@ -2,7 +2,7 @@ import assert from 'node:assert';
 import * as env from '#src/core/utility/environment/environmentManager';
 import { getThisNodeName } from '#src/core/server/nodeName';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
-import { updateNode } from '#src/replication/setNode';
+import { setNode, updateNode } from '#src/replication/setNode';
 
 const SELF_URL = 'wss://update-node-self.test:9933';
 const PEER = 'update-node-peer';
@@ -78,5 +78,15 @@ describe('update_node shard and metadata', function () {
 			/replication url is missing/,
 			'not a local no-op reported as success'
 		);
+	});
+
+	it("refuses set_node and add_node that would move this node's own row off replication.shard", async () => {
+		for (const operation of ['set_node', 'add_node']) {
+			await assert.rejects(setNode({ operation, hostname: getThisNodeName(), shard: 1 }), (error) => {
+				assert.equal(error.statusCode, 400);
+				assert.match(error.message, new RegExp(`${operation} cannot set this node's shard`));
+				return true;
+			});
+		}
 	});
 });
