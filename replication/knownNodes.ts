@@ -456,11 +456,7 @@ function notifyOne(listener: (node: any, id: string) => void, node: any, name: s
 	}
 }
 
-/**
- * Tells `listener` of each row that left `rows` since its last call (as a nullish node), then of `id`'s row
- * and each row it has not been told of, or of every row when `id` is undefined. A row whose call throws is
- * not counted as told, so it is retried on the next event without holding up the others.
- */
+/** A row whose call throws is not counted as told, so the next event retries it without holding up the others. */
 function notifyNodeListener(
 	listener: (node: any, id: string) => void,
 	rows: Map<string, any>,
@@ -486,15 +482,17 @@ let publishedRows = new Map<string, any>();
 const publishedEvents = new Set<string>();
 
 /**
- * Publishes server.nodes (peers) and server.shards (every row with a shard, this node's included) from one
- * synchronous hdb_nodes scan, and returns the scanned rows by key. Core delivers an event only after its
- * commit, resetting LMDB's read transaction first, so the scan already holds the event's write. A row
- * reconstructed from its key after a decode miss takes the event's own decoded record when that is not
- * older, else keeps the fields it was last published with (harper-pro#460).
+ * Core delivers an event only after its commit, resetting LMDB's read transaction first, so the scan already
+ * holds the event's write. A row reconstructed from its key after a decode miss takes the event's own decoded
+ * record when that is not older, else keeps the fields it was last published with (harper-pro#460).
  */
 function publishKnownNodes(event?: any): Map<string, any> {
 	const id = event?.id ?? event?.value?.name;
-	const eventKey = event?.version === undefined ? undefined : `${event.type} ${id} ${event.version} ${event.localTime}`;
+	// the same commit reaches each watcher as an equal event; distinct commits differ somewhere in it
+	const eventKey =
+		event?.version === undefined
+			? undefined
+			: `${event.type} ${id} ${event.version} ${event.localTime} ${JSON.stringify(event.value)}`;
 	if (eventKey !== undefined && publishedEvents.has(eventKey)) return publishedRows;
 	const decoded = event?.type === 'put' && isValidNodeRecord(event.value) ? event.value : undefined;
 	const rows = new Map<string, any>();
