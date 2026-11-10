@@ -359,7 +359,9 @@ export async function loadPair(dir: string, name: string): Promise<PairData> {
 }
 
 export function pairRows(pair: PairData): Row[] {
-	const calibration = new Map(pair.calibrations.map((c) => [`${c.workload}/${c.skew}`, c]));
+	// A calibration whose window failed its checks is no baseline; such cells report reads without subtracting one.
+	const valid = pair.calibrations.filter((c) => (c.server?.window?.invalidReasons ?? []).length === 0);
+	const calibration = new Map(valid.map((c) => [`${c.workload}/${c.skew}`, c]));
 	return pair.cells.map((cell) =>
 		cellRow(cell, calibration.get(`${cell.cell.workload}/${cell.cell.skew}`), pair.dataset, pair.name)
 	);

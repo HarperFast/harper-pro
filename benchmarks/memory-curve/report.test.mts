@@ -163,6 +163,17 @@ describe('renderReport', () => {
 		assert.ok(charts['chart-C.svg'].startsWith('<svg'));
 	});
 
+	it('subtracts no baseline from a calibration whose window was invalid', () => {
+		const badCalibration = {
+			...calibration,
+			server: {
+				window: { disk: { readsPerSec: 200 }, invalidReasons: ['server counters taken 90 s off the measured window'] },
+			},
+		};
+		const [row] = pairRows({ ...pair, calibrations: [badCalibration], cells: [cell(0.5, 3000, 4)] });
+		assert.equal(row.extraReadsPer1k, row.readsPer1k);
+	});
+
 	it('leaves a skew with a missing step out of the Mermaid chart instead of plotting a zero', () => {
 		const rows = pairRows({
 			...pair,
