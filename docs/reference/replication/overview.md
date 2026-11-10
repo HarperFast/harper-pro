@@ -350,7 +350,7 @@ Update a subscription with `update_node`:
 
 ## Region Topology
 
-<VersionBadge version="v5.4.0" />
+<VersionBadge version="v5.5.0" />
 
 By default every node subscribes to every other node, so a write crosses region boundaries once per remote node. Labeling each node with its region lets nodes link only within their region, with a few gateway nodes carrying traffic between regions:
 

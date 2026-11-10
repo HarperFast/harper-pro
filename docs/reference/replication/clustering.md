@@ -200,7 +200,7 @@ Returns an array of status objects from the cluster, including active WebSocket 
 | `lastReceivedLocalTime`  | Local time when the last transaction was received. A gap between this and `lastReceivedRemoteTime` suggests the node is catching up |
 | `sendingMessage`         | Timestamp of the transaction actively being sent. Absent when waiting for the next transaction                                      |
 
-<VersionBadge version="v5.4.0" /> A socket entry with `"subscribed": false` is one this node no longer subscribes to (for example, [region topology](./overview.md#region-topology) pruned the link, or replication was turned off for the database); it stays listed while the socket winds down. On a node with `replication.region` set, `region_topology` reports `active`, the node's `region`, and either whether it is a `gateway` and each region's `gateways`, or the `reason` the topology is off.
+<VersionBadge version="v5.5.0" /> A socket entry with `"subscribed": false` is one this node no longer subscribes to (for example, [region topology](./overview.md#region-topology) pruned the link, or replication was turned off for the database); it stays listed while the socket winds down. On a node with `replication.region` set, `region_topology` reports `active`, the node's `region`, and either whether it is a `gateway` and each region's `gateways`, or the `reason` the topology is off.
 
 While a database is taking its initial full copy, these timing fields hold the literal string `"Copying"` rather than a timestamp. Anything that parses them as dates needs to handle that value, since a node taking a full copy is exactly the node you are most likely to be watching.
 
