@@ -5106,8 +5106,8 @@ export class NodeReplicationConnection extends EventEmitter {
 	 */
 	topologyExcluded?: string[];
 	topologyBorrow?: Record<string, string | null>;
-	/** Copy sources that vetoed completing a copy since this connection last asked them for one. */
-	vetoedCopySources?: Set<number>;
+	/** Copy sources that vetoed completing a copy, each with the vetoed walk's copy start. */
+	vetoedCopySources?: Map<number, number | undefined>;
 	/** Whether the last subscription request on this route carried every table. */
 	routeFullCoverage?: boolean;
 	latency = 0;
@@ -5798,9 +5798,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const sourceId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined);
 			if (sourceId === undefined) return;
-			// honored by later requests on this connection until the write below lands
-			if (options.connection) (options.connection.vetoedCopySources ??= new Set()).add(sourceId);
 			const cursor = readDbisCursorSync(dbisDB, 'copyCursor', sourceId);
+			// honored by later requests on this connection until the write below lands
+			if (options.connection)
+				(options.connection.vetoedCopySources ??= new Map()).set(sourceId, cursor?.copyStartTime ?? copyModeStartTime);
 			if (cursor && !cursor.restartFullCopy) markCopyCursorRestart(sourceId, { ...cursor, restartFullCopy: true });
 			else options.connection?.vetoedCopySources?.delete(sourceId);
 		} catch (error) {
@@ -7360,7 +7361,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const dbisDB = getDatabaseStores().dbisDB;
 		if (projectionCopy || !dbisDB) return;
 		const persisted = dbisDB.put([Symbol.for('copyCursor'), nodeId], cursor);
-		const credit = () => noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
+		const credit = () => {
+			// another pass's cursor has replaced a vetoed walk's; a late write of that walk's own has not
+			const vetoed = options.connection?.vetoedCopySources;
+			if (vetoed?.has(nodeId) && vetoed.get(nodeId) !== cursor?.copyStartTime) vetoed.delete(nodeId);
+			noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
+		};
 		if (persisted?.then)
 			persisted.then(credit, (error: unknown) =>
 				logger.warn?.(connectionId, 'failed to persist the copy cursor', error)
@@ -7371,6 +7377,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const dbisDB = getDatabaseStores().dbisDB;
 		if (!dbisDB?.remove) return;
 		await dbisDB.remove([Symbol.for('copyCursor'), nodeId]);
+		options.connection?.vetoedCopySources?.delete(nodeId);
 		noteCopyStall((tracker) => tracker.noteDurableProgress());
 	}
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
@@ -8920,7 +8927,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyModeOrderVersion = message[2];
 						copyOriginAnchors = !projectionCopy && recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
-						options.connection?.vetoedCopySources?.delete(copyFromNodeId);
 						noteCopyStall((tracker) =>
 							tracker.noteCopyStart(
 								copyStartKey(readDbisCursorSync(getDatabaseStores().dbisDB, 'copyCursor', copyFromNodeId), encode)
@@ -13598,7 +13604,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					databaseName
 				);
 				if (nodeId !== undefined && options.connection?.vetoedCopySources?.has(nodeId)) {
-					// held until the saved walk is marked or a new pass from that source replaces it
+					// held until the saved walk is marked, or a new pass from that source persists its own cursor
 					if (copyCursor) {
 						copyCursor = { ...copyCursor, restartFullCopy: true };
 						markCopyCursorRestart(nodeId, copyCursor);
