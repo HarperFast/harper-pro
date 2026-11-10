@@ -58,7 +58,7 @@ import { peerSupportsResidencySlots } from './protocolCapabilities.ts';
 import { onShardingConfigurationChange } from '../core/config/shardingConfiguration.ts';
 import type { Logger } from '../core/utility/logging/logger.ts';
 import { createHash, randomUUID, type Hash } from 'node:crypto';
-import { toBufferKey } from 'ordered-binary';
+import { compareKeys, toBufferKey } from 'ordered-binary';
 import {
 	getDatabases,
 	databases,
@@ -1056,6 +1056,34 @@ export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number, r
 	// a snapshot, not a replayed transaction, so the bounded record clock preserves copy-apply behavior
 	// without making one expired reference permanently wedge bootstrap.
 	return entry.localTime;
+}
+/**
+ * A local stub row's head audit entry at `logKey`, when that entry is the row's own complete `put`.
+ * A base copy sends it in place of the stub: a receiver that logs a copied stub at the write's identity
+ * would drop the same `put` when the post-copy replay re-sends it. Any read failure answers undefined,
+ * which keeps the stub.
+ */
+export function replayedStubPut(
+	auditStore: any,
+	tableId: number,
+	entry: any,
+	logKey: number,
+	localNodeId: number
+): AuditRecord | undefined {
+	try {
+		const head = auditStore.get(logKey, tableId, entry.key, 0, true);
+		if (
+			head?.type === 'put' &&
+			head.tableId === tableId &&
+			head.version === entry.version &&
+			(!head.nodeId || head.nodeId === localNodeId) &&
+			!(head.extendedType & LOCAL_ONLY) &&
+			compareKeys(head.recordId, entry.key) === 0
+		)
+			return head;
+	} catch (error) {
+		logger.debug?.('could not read the head audit entry of a copied stub', tableId, logKey, error);
+	}
 }
 // The receive-side watchdog fires after this much silence on a replication WS. Both client and
 // server arm it: the client also runs an active 30s sendPing tick that should normally catch a
@@ -10529,72 +10557,83 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
 														const isReplica = Boolean(entry.metadataFlags & REPLICA);
 														const isStub = Boolean(entry.metadataFlags & (INVALIDATED | REPLICA));
-														const stubAsInvalidation =
-															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
-														const legacyStubCopy = isStub && !stubAsInvalidation;
-														if (legacyStubCopy && table.residency) continue;
-														const copyType = stubAsInvalidation ? 'invalidate' : 'put';
-														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
-														let copyValue = entry.value;
-														if (isReplica) {
-															// in core's demotion order (`residencyStub`), so it encodes as the demoted stub does
-															copyValue = table.primaryKey ? { [table.primaryKey]: entry.key } : {};
-															Object.assign(copyValue, residencyStubOf(table, entry.value));
-															const createdTimeName = table.createdTimeProperty?.name;
-															if (createdTimeName && entry.value[createdTimeName] != null)
-																copyValue[createdTimeName] = entry.value[createdTimeName];
-														}
-														const copyExtendedType =
-															(entry.metadataFlags &
-																~0xff &
-																~(HAS_RESIDENCY_SLOT | FULL_WRITE_HEAD) &
-																~(ACTION_32_BIT << 24) &
-																(isReplica ? ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS) : -1)) |
-															(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0);
-														const encodeCopyRecord = () =>
-															createAuditEntry({
-																version: entry.version,
-																tableId: table.tableId,
-																recordId: entry.key,
-																previousVersion: null,
-																nodeId: recordNodeId,
-																type: copyType,
-																encodedRecord: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
-																	sendBlobs(blob, entry.key)
-																),
-																extendedType: copyExtendedType,
-																residencyId: entry.residencyId,
-																residencySlot: entry.residencySlot,
-																previousResidencyId: null,
-																expiresAt: isReplica ? undefined : entry.expiresAt,
-															} as any);
+														const replayedPut =
+															isStub &&
+															!table.residency &&
+															copyTxnLogKey > copyStartTime &&
+															(!entry.nodeId || entry.nodeId === nodeId) &&
+															getResidence(entry.residencyId, table)?.includes(remoteNodeName)
+																? replayedStubPut(auditStore, table.tableId, entry, copyTxnLogKey, nodeId)
+																: undefined;
 														let encoded: Buffer | undefined;
-														const encodeCopy = () =>
-															(encoded =
-																entry.metadataFlags & HAS_BLOBS && copyValue === entry.value
-																	? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
-																	: encodeCopyRecord());
-														await sendAuditRecord(
-															{
-																// make it look like an audit record
-																recordId: entry.key,
-																tableId: table.tableId,
-																type: copyType,
-																getValue() {
-																	return copyValue;
+														if (replayedPut) await sendAuditRecord(replayedPut, copyTxnLogKey, nodeId);
+														else {
+															const stubAsInvalidation =
+																isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
+															const legacyStubCopy = isStub && !stubAsInvalidation;
+															if (legacyStubCopy && table.residency) continue;
+															const copyType = stubAsInvalidation ? 'invalidate' : 'put';
+															// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
+															let copyValue = entry.value;
+															if (isReplica) {
+																// in core's demotion order (`residencyStub`), so it encodes as the demoted stub does
+																copyValue = table.primaryKey ? { [table.primaryKey]: entry.key } : {};
+																Object.assign(copyValue, residencyStubOf(table, entry.value));
+																const createdTimeName = table.createdTimeProperty?.name;
+																if (createdTimeName && entry.value[createdTimeName] != null)
+																	copyValue[createdTimeName] = entry.value[createdTimeName];
+															}
+															const copyExtendedType =
+																(entry.metadataFlags &
+																	~0xff &
+																	~(HAS_RESIDENCY_SLOT | FULL_WRITE_HEAD) &
+																	~(ACTION_32_BIT << 24) &
+																	(isReplica ? ~(HAS_EXPIRATION_EXTENDED_TYPE | HAS_BLOBS) : -1)) |
+																(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0);
+															const encodeCopyRecord = () =>
+																createAuditEntry({
+																	version: entry.version,
+																	tableId: table.tableId,
+																	recordId: entry.key,
+																	previousVersion: null,
+																	nodeId: recordNodeId,
+																	type: copyType,
+																	encodedRecord: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
+																		sendBlobs(blob, entry.key)
+																	),
+																	extendedType: copyExtendedType,
+																	residencyId: entry.residencyId,
+																	residencySlot: entry.residencySlot,
+																	previousResidencyId: null,
+																	expiresAt: isReplica ? undefined : entry.expiresAt,
+																} as any);
+															const encodeCopy = () =>
+																(encoded =
+																	entry.metadataFlags & HAS_BLOBS && copyValue === entry.value
+																		? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
+																		: encodeCopyRecord());
+															await sendAuditRecord(
+																{
+																	// make it look like an audit record
+																	recordId: entry.key,
+																	tableId: table.tableId,
+																	type: copyType,
+																	getValue() {
+																		return copyValue;
+																	},
+																	encoded,
+																	version: entry.version,
+																	residencyId: entry.residencyId,
+																	residencySlot: entry.residencySlot,
+																	nodeId: recordNodeId,
+																	extendedType: copyExtendedType,
+																	expiresAt: isReplica ? undefined : entry.expiresAt,
 																},
-																encoded,
-																version: entry.version,
-																residencyId: entry.residencyId,
-																residencySlot: entry.residencySlot,
-																nodeId: recordNodeId,
-																extendedType: copyExtendedType,
-																expiresAt: isReplica ? undefined : entry.expiresAt,
-															},
-															copyTxnLogKey,
-															nodeId,
-															encodeCopy
-														);
+																copyTxnLogKey,
+																nodeId,
+																encodeCopy
+															);
+														}
 														if (closed || wsClosed) return;
 														logger.debug?.(
 															'sent record from table',
