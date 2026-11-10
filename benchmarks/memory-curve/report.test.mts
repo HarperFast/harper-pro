@@ -92,7 +92,7 @@ describe('cellRow', () => {
 	it('keeps an instance that never became ready as a saturated cell that served nothing', () => {
 		const row = cellRow(notReady(0.25), calibration, dataset, 'd2x-1k');
 		assert.equal(row.valid, true);
-		assert.equal(row.notReady, true);
+		assert.equal(row.notReady, 'REST route not ready after 600 s');
 		assert.equal(row.saturated, true);
 		assert.equal(row.okPerSec, 0);
 		const exited = cellRow(
@@ -240,7 +240,7 @@ describe('renderReport', () => {
 			runId: 'mctest',
 		});
 		assert.match(markdown, /\| ⚠ did not start \| 1\.50 GB \(memory\/data 0\.13\): did not start \|/);
-		assert.match(markdown, /\| did not start \|\n/);
+		assert.match(markdown, /\| did not start: REST route not ready after 600 s \|\n/);
 		assert.doesNotMatch(markdown, /no valid calibration baseline/);
 	});
 

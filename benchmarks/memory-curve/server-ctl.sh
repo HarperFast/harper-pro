@@ -25,18 +25,22 @@ ops() {
 		-X POST http://127.0.0.1:9925/ -d "$1"
 }
 
+# report.mts reads "not ready after" as an instance that stayed up, so both waits check for an exit first.
+exited_during_startup() {
+	[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ] && return 1
+	docker logs --tail 50 "$CONTAINER" >&2 || true
+	echo "Harper container exited during startup" >&2
+}
+
 wait_ready() {
 	local deadline=$((SECONDS + 600))
 	until ops '{"operation":"describe_table","database":"data","table":"usertable"}' 10 >/dev/null 2>&1; do
-		if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != true ]; then
-			docker logs --tail 50 "$CONTAINER" >&2 || true
-			echo "Harper container exited during startup" >&2
-			return 1
-		fi
+		exited_during_startup && return 1
 		[ $SECONDS -lt $deadline ] || { echo "Harper not ready after 600 s" >&2; return 1; }
 		sleep 1
 	done
 	until curl -sSf -o /dev/null -m 5 -u "admin:$ADMIN_PASSWORD" "http://127.0.0.1:9926/usertable/?id=ready-probe"; do
+		exited_during_startup && return 1
 		[ $SECONDS -lt $deadline ] || { echo "REST route not ready after 600 s" >&2; return 1; }
 		sleep 1
 	done

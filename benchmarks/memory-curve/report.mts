@@ -52,8 +52,8 @@ export interface Row {
 	memorySomePct: number;
 	ioSomePct: number;
 	saturated: boolean;
-	/** The instance started but never answered a REST request: a saturated cell that served nothing. */
-	notReady: boolean;
+	/** server-ctl.sh's readiness timeout when the instance stayed up and never answered: a saturated cell that served nothing. */
+	notReady: string | null;
 	clientLimited: boolean;
 	valid: boolean;
 	invalidReasons: string[];
@@ -90,8 +90,9 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 		offeredPerSec: cell.offeredRatePerSec,
 	};
 	if (!cell.client || !cell.server) {
-		// server-ctl.sh's readiness timeout: the instance started and never answered, an outcome of the policy.
-		const notReady = (cell.invalidReasons ?? []).some((reason: string) => / not ready after \d+ s/.test(reason));
+		// An outcome of the policy, not a failed measurement; server-ctl.sh reports an exit during startup separately.
+		const notReady: string | null =
+			(cell.invalidReasons ?? []).join('\n').match(/^.* not ready after \d+ s$/m)?.[0] ?? null;
 		return {
 			...base,
 			okPerSec: 0,
@@ -118,7 +119,7 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 			saturated: true,
 			notReady,
 			clientLimited: false,
-			valid: notReady,
+			valid: notReady !== null,
 			invalidReasons: notReady ? [] : (cell.invalidReasons ?? ['no measurements']),
 		};
 	}
@@ -153,7 +154,7 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 		memorySomePct: window.psi.memorySomePct,
 		ioSomePct: window.psi.ioSomePct,
 		saturated: cell.saturated,
-		notReady: false,
+		notReady: null,
 		clientLimited: cell.clientLimited,
 		valid: cell.valid,
 		invalidReasons: cell.invalidReasons,
@@ -578,7 +579,7 @@ export function renderReport(
 	lines.push(`|${' --- |'.repeat(28)}`);
 	for (const row of [...rows].sort((a, b) => seriesKey(a).localeCompare(seriesKey(b)) || b.memoryGiB - a.memoryGiB)) {
 		lines.push(
-			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsDriftPct, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.allDeviceReadsPerSec, 0)} | ${fmt(row.allDeviceReadMBPerSec)} | ${fmt(row.anonGiB)} | ${fmt(row.pageCacheGiB)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.notReady ? 'did not start' : row.valid ? (row.clientLimited ? 'client-limited' : 'yes') : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
+			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsDriftPct, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.allDeviceReadsPerSec, 0)} | ${fmt(row.allDeviceReadMBPerSec)} | ${fmt(row.anonGiB)} | ${fmt(row.pageCacheGiB)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.notReady ? `did not start: ${row.notReady}` : row.valid ? (row.clientLimited ? 'client-limited' : 'yes') : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
 		);
 	}
 	lines.push('', '</details>');
