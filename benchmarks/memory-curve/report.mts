@@ -29,6 +29,8 @@ export interface Row {
 	okPerSec: number;
 	lossPct: number;
 	readsPerSec: number;
+	/** Disk reads/s in the second half of the window relative to the first, in percent; shows unfinished warm-up. */
+	readsDriftPct: number | null;
 	readsPer1k: number;
 	extraReadsPer1k: number;
 	extraReadsPerSec: number;
@@ -84,6 +86,7 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 			okPerSec: 0,
 			lossPct: 100,
 			readsPerSec: 0,
+			readsDriftPct: null,
 			readsPer1k: 0,
 			extraReadsPer1k: 0,
 			extraReadsPerSec: 0,
@@ -116,6 +119,7 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 		okPerSec,
 		lossPct: measure.lossFraction * 100,
 		readsPerSec: window.disk.readsPerSec,
+		readsDriftPct: driftPct(cell.server.firstHalf?.disk.readsPerSec, cell.server.secondHalf?.disk.readsPerSec),
 		readsPer1k,
 		extraReadsPer1k,
 		extraReadsPerSec: (extraReadsPer1k * okPerSec) / 1000,
@@ -134,6 +138,11 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 		valid: cell.valid,
 		invalidReasons: cell.invalidReasons,
 	};
+}
+
+function driftPct(first: number | undefined, second: number | undefined): number | null {
+	if (first === undefined || second === undefined || first < 10) return null;
+	return ((second - first) / first) * 100;
 }
 
 export function seriesKey(row: Row): string {
@@ -495,12 +504,12 @@ export function renderReport(
 
 	lines.push('', '<details><summary>All cells</summary>', '');
 	lines.push(
-		'| pair | workload | skew | step | mem GB | mem/data | offered | ok/s | loss % | disk reads/s | reads/1k | extra/1k | read MB/s | read await ms | block-cache data hit % | major faults/s | p50 | p99 | p99.9 ms | CPU ms/req | PSI mem some % | PSI io some % | valid |'
+		'| pair | workload | skew | step | mem GB | mem/data | offered | ok/s | loss % | disk reads/s | 2nd vs 1st half % | reads/1k | extra/1k | read MB/s | read await ms | block-cache data hit % | major faults/s | p50 | p99 | p99.9 ms | CPU ms/req | PSI mem some % | PSI io some % | valid |'
 	);
-	lines.push(`|${' --- |'.repeat(23)}`);
+	lines.push(`|${' --- |'.repeat(24)}`);
 	for (const row of [...rows].sort((a, b) => seriesKey(a).localeCompare(seriesKey(b)) || b.memoryGiB - a.memoryGiB)) {
 		lines.push(
-			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.valid ? (row.clientLimited ? 'client-limited' : 'yes') : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
+			`| ${row.pair} | ${row.workload} | ${row.skew} | ${row.label}${row.repeat ? ' (repeat)' : ''} | ${fmt(row.memoryGiB)} | ${fmt(row.ratio)} | ${fmt(row.offeredPerSec, 0)} | ${fmt(row.okPerSec, 0)} | ${fmt(row.lossPct)} | ${fmt(row.readsPerSec, 0)} | ${fmt(row.readsDriftPct, 0)} | ${fmt(row.readsPer1k)} | ${fmt(row.extraReadsPer1k)} | ${fmt(row.readMBPerSec)} | ${fmt(row.readLatencyMs)} | ${fmt(row.dataHitPct, 1)} | ${fmt(row.majorFaultsPerSec)} | ${fmt(row.p50Ms)} | ${fmt(row.p99Ms)} | ${fmt(row.p999Ms)} | ${fmt(row.cpuMsPerReq, 3)} | ${fmt(row.memorySomePct)} | ${fmt(row.ioSomePct)} | ${row.valid ? (row.clientLimited ? 'client-limited' : 'yes') : `no: ${row.invalidReasons.join('; ').replace(/\|/g, '/')}`} |`
 		);
 	}
 	lines.push('', '</details>');
