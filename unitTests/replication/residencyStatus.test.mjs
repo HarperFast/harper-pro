@@ -161,6 +161,71 @@ describe('cluster_status shard summary', function () {
 		assert.doesNotMatch(JSON.stringify(residencyStatus()[database]), /wss:|PRIVATE/);
 	});
 
+	describe("write admission's self-membership check", () => {
+		const MISMATCH = 'local shard membership disagrees with replication.shard';
+		it('stays clear while this node is listed under exactly its configured shard', async () => {
+			const database = await declare([range(0, 5, 0), range(5, 10, 1)]);
+			server.nodes = [{ name: 'peer-a', shard: 1 }];
+			server.shards = new Map([
+				[0, [{ name: server.hostname }]],
+				[1, [{ name: 'peer-a' }]],
+			]);
+			const entry = residencyStatus()[database];
+			assert.ok(!entry.errors.includes(MISMATCH), JSON.stringify(entry.errors));
+		});
+
+		it('holds when this node is listed under another shard than replication.shard', async () => {
+			const database = await declare([range(0, 5, 0), range(5, 10, 1)]);
+			server.nodes = [{ name: 'peer-a', shard: 0 }];
+			server.shards = new Map([
+				[0, [{ name: 'peer-a' }]],
+				[1, [{ name: server.hostname }]],
+			]);
+			const entry = residencyStatus()[database];
+			assert.ok(entry.errors.includes(MISMATCH), JSON.stringify(entry.errors));
+			assert.equal(entry.blocked, true);
+			assert.equal(entry.state, 'held');
+		});
+
+		it('holds when its configured shard is mapped but lists no owner', async () => {
+			const database = await declare([range(0, 5, 0), range(5, 10, 1)]);
+			server.nodes = [{ name: 'peer-a', shard: 1 }];
+			server.shards = new Map([[1, [{ name: 'peer-a' }]]]);
+			assert.ok(residencyStatus()[database].errors.includes(MISMATCH));
+		});
+
+		it('holds when it is listed under its configured shard and another one too', async () => {
+			const database = await declare([range(0, 5, 0), range(5, 10, 1)]);
+			server.shards = new Map([
+				[0, [server.hostname]],
+				[1, [{ name: server.hostname }]],
+			]);
+			assert.ok(residencyStatus()[database].errors.includes(MISMATCH));
+		});
+
+		it('stays clear when its configured shard is not in the map and it is listed under none', async () => {
+			const database = await declare([range(0, 10, 1)]);
+			env.setProperty('replication_shards', [0, 1, 2]);
+			env.setProperty('replication_shard', 2);
+			server.nodes = [{ name: 'peer-a', shard: 1 }];
+			server.shards = new Map([
+				[1, [{ name: 'peer-a' }]],
+				[2, [{ name: server.hostname }]],
+			]);
+			assert.ok(!residencyStatus()[database].errors.includes(MISMATCH));
+		});
+
+		it('checks shard 0 like any other shard', async () => {
+			const database = await declare([range(0, 5, 0), range(5, 10, 1)]);
+			env.setProperty('replication_shard', 1);
+			server.shards = new Map([
+				[0, [{ name: server.hostname }]],
+				[1, [{ name: 'peer-a' }]],
+			]);
+			assert.ok(residencyStatus()[database].errors.includes(MISMATCH));
+		});
+	});
+
 	it('reports a node in shard 0 as the top-level shard of cluster_status', async () => {
 		const Nodes = getHDBNodeTable();
 		const name = server.hostname;

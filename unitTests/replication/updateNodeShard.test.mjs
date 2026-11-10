@@ -1,0 +1,67 @@
+import assert from 'node:assert';
+import * as env from '#src/core/utility/environment/environmentManager';
+import { getThisNodeName } from '#src/core/server/nodeName';
+import { getHDBNodeTable } from '#src/replication/knownNodes';
+import { updateNode } from '#src/replication/setNode';
+
+const SELF_URL = 'wss://update-node-self.test:9933';
+const PEER = 'update-node-peer';
+const PEER_URL = 'wss://update-node-peer.test:9933';
+
+describe('update_node shard and metadata', function () {
+	this.timeout(20_000);
+	let priorSelf;
+	let priorShard;
+	beforeEach(async () => {
+		const Nodes = getHDBNodeTable();
+		priorSelf = Nodes.primaryStore.getSync(getThisNodeName());
+		priorShard = env.get('replication_shard');
+		env.setProperty('replication_shard', 0);
+		await Nodes.put(getThisNodeName(), { name: getThisNodeName(), url: SELF_URL, shard: 0, replicates: true });
+		await Nodes.put(PEER, { name: PEER, url: PEER_URL, shard: 0, replicates: true, ca: 'PEER-CA' });
+	});
+	afterEach(async () => {
+		const Nodes = getHDBNodeTable();
+		await Nodes.delete(PEER);
+		if (priorSelf) await Nodes.put(getThisNodeName(), priorSelf);
+		else await Nodes.delete(getThisNodeName());
+		env.setProperty('replication_shard', priorShard);
+	});
+
+	it("refuses to move this node's own row off replication.shard, by name or by an alias of its url", async () => {
+		for (const request of [
+			{ operation: 'update_node', hostname: getThisNodeName(), shard: 1 },
+			{ operation: 'update_node', hostname: 'an-alias', url: SELF_URL, shard: 1 },
+			{ operation: 'update_node', hostname: getThisNodeName(), shard: 1, start_time: Date.now() },
+		]) {
+			await assert.rejects(updateNode(request), (error) => {
+				assert.equal(error.statusCode, 400);
+				assert.match(error.message, /follows replication\.shard \(0\)/);
+				return true;
+			});
+		}
+		assert.equal(getHDBNodeTable().primaryStore.getSync(getThisNodeName()).shard, 0, 'the row is unchanged');
+	});
+
+	it("accepts this node's own configured shard", async () => {
+		await updateNode({ operation: 'update_node', hostname: getThisNodeName(), shard: 0, revoked_certificates: ['aa'] });
+		const row = getHDBNodeTable().primaryStore.getSync(getThisNodeName());
+		assert.equal(row.shard, 0);
+		assert.deepEqual(row.revoked_certificates, ['aa']);
+	});
+
+	it("patches a peer's shard and revocations locally, without contacting it", async () => {
+		const message = await updateNode({
+			operation: 'update_node',
+			hostname: PEER,
+			shard: 1,
+			revoked_certificates: ['dead01'],
+		});
+		assert.equal(message, `Successfully updated '${PEER_URL}'`);
+		const row = getHDBNodeTable().primaryStore.getSync(PEER);
+		assert.equal(row.shard, 1, 'the requested shard is stored, not one a handshake reported');
+		assert.deepEqual(row.revoked_certificates, ['dead01']);
+		assert.equal(row.ca, 'PEER-CA', 'the stored CA survives');
+		assert.equal(row.url, PEER_URL);
+	});
+});

@@ -438,7 +438,7 @@ const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization'
  * peer contact. Anything else needs setNode(), which resets omitted topology to full mesh and
  * derives a default url from this node's own port -- both carried forward from the existing row.
  */
-async function updateNode(req: any) {
+export async function updateNode(req: any) {
 	const hostname = req.hostname || req.node_name || req.name || (req.url ? urlToNodeName(req.url) : undefined);
 	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
 	if (req.replicates !== undefined) {
@@ -452,9 +452,17 @@ async function updateNode(req: any) {
 		);
 	}
 	const requestHasTopology = Boolean(req.subscriptions || req.sendsTo || req.receivesFrom);
+	// decided from what the caller sent, before the stored url is filled in below
+	const metadataOnly = !requestHasTopology && !FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined);
 
 	if (hostname) {
 		const found = await findExistingNodeRecord(hostname, url);
+		const configuredShard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+		if ((found?.name ?? hostname) === getThisNodeName() && req.shard !== undefined && req.shard !== configuredShard) {
+			throw new ClientError(
+				`update_node cannot set this node's shard to ${req.shard}: it follows replication.shard (${configuredShard ?? 'not set'}); change replication.shard and restart instead`
+			);
+		}
 		if (found) {
 			// Normalize to the row's own identity regardless of which path runs below, so an alias or a
 			// custom port/scheme a caller used to reach the peer is never mistaken for a change to apply.
@@ -462,7 +470,7 @@ async function updateNode(req: any) {
 			req.url ??= found.record.url;
 
 			if (!requestHasTopology) {
-				if (!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined)) {
+				if (metadataOnly) {
 					const validation = validateBySchema(req, validationSchema);
 					if (validation) {
 						throw handleHDBError(
