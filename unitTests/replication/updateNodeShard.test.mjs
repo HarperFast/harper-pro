@@ -88,5 +88,10 @@ describe('update_node shard and metadata', function () {
 				return true;
 			});
 		}
+		await assert.rejects(
+			setNode({ operation: 'set_node', hostname: getThisNodeName(), shard: '0' }),
+			(error) => !/cannot set this node's shard/.test(error.message),
+			'a numeric-string shard equal to replication.shard passes the guard'
+		);
 	});
 });

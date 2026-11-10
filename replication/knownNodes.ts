@@ -448,8 +448,8 @@ const deliveredNodeNames = new WeakMap<(node: any, id: string) => void, Set<stri
 
 /**
  * Tells `listener` of each row that left `rows` since its last call (as a nullish node), then of `id`'s row
- * and each row it has not been told of, or of every row when `id` is undefined. A name is recorded only once
- * its call returns, so a throwing listener hears of it again on the next event.
+ * and each row it has not been told of, or of every row when `id` is undefined. A name counts as told only
+ * once its call returns, so a listener that throws hears of that row again on the next event.
  */
 function notifyNodeListener(
 	listener: (node: any, id: string) => void,
@@ -467,23 +467,28 @@ function notifyNodeListener(
 	}
 	for (const [name, node] of rows) {
 		if (id !== undefined && name !== id && previous.has(name)) continue;
+		delivered.delete(name);
 		listener(node, name);
 		delivered.add(name);
 	}
 	if (deleted && id !== undefined && !rows.has(id) && !previous.has(id)) listener(undefined, id);
 }
 
-// the rows the last scan published, this node's included
 let publishedRows = new Map<string, any>();
+// every watcher receives each event; the first to process it scans for all of them
+let publishedFor: string | undefined;
 
 /**
  * Publishes server.nodes (peers) and server.shards (every row with a shard, this node's included) from one
  * synchronous hdb_nodes scan, and returns the scanned rows by key. A row reconstructed from its key after a
- * decode miss keeps the fields it was last published with (harper-pro#460). The event's own row comes from
- * the event only when the event is not older than the stored row or tombstone: a patch carries only its
- * changed fields, so it always takes the stored row.
+ * decode miss keeps the fields it was last published with (harper-pro#460). An event newer than the stored
+ * row or tombstone decides its own row, since the scan can read from before its commit; at an equal version
+ * the event only replaces a decode-miss reconstruct.
  */
 function publishKnownNodes(event?: any): Map<string, any> {
+	const id = event?.id ?? event?.value?.name;
+	const eventKey = event?.version === undefined ? undefined : `${event.type} ${id} ${event.version}`;
+	if (eventKey !== undefined && eventKey === publishedFor) return publishedRows;
 	const rows = new Map<string, any>();
 	const versions = new Map<string, number>();
 	scanNodesForSubscription(
@@ -496,10 +501,14 @@ function publishKnownNodes(event?: any): Map<string, any> {
 		},
 		(key, version) => versions.set(key, version)
 	);
-	const id = event?.id ?? event?.value?.name;
-	if (id !== undefined && event.version !== undefined && !(versions.get(id) > event.version)) {
+	const stored = versions.get(id);
+	const eventDecides =
+		eventKey !== undefined &&
+		(stored === undefined || event.version > stored || (event.version === stored && !rows.get(id)?.url));
+	if (eventDecides) {
 		if (isGenuineNodeDeletion(event.type)) rows.delete(id);
 		else if (event.type === 'put' && isValidNodeRecord(event.value)) rows.set(id, event.value);
+		else if (event.type === 'patch' && rows.has(id) && event.value) rows.set(id, { ...rows.get(id), ...event.value });
 	}
 	const thisNodeName = getThisNodeName();
 	const nodes = [];
@@ -515,6 +524,7 @@ function publishKnownNodes(event?: any): Map<string, any> {
 	server.nodes = nodes;
 	server.shards = shards;
 	publishedRows = rows;
+	publishedFor = eventKey;
 	return rows;
 }
 
@@ -637,7 +647,6 @@ export function scanNodesForSubscription(
 		}
 		if (value) undecodedRowsWarned.delete(key);
 		else {
-			// every hdb_nodes event rescans
 			const log = undecodedRowsWarned.has(key) ? logger.trace : logger.warn;
 			undecodedRowsWarned.add(key);
 			log?.(

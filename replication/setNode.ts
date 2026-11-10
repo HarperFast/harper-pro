@@ -61,10 +61,11 @@ export async function setNode(req: any) {
 	let { url, hostname } = req;
 	if (!url) url = hostnameToUrl(hostname);
 	else if (!hostname) hostname = req.hostname = urlToNodeName(url);
-	const validation = validateBySchema(req, validationSchema);
+	const { error: validation, value: validated } = validateAndConvertBySchema(req, validationSchema);
 	if (validation) {
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
 	}
+	if (req.shard !== undefined) req.shard = validated.shard;
 
 	// Normalize and validate the optional data cutoff at the boundary, and persist a number so readers see
 	// one shape. Only a strict ISO 8601 UTC string or an epoch-ms number is accepted; anything else (a typo

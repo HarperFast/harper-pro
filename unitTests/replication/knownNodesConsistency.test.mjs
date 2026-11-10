@@ -230,5 +230,63 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 		});
 		assert.ok(told.includes('consistency-a'), 'the row the listener threw on is delivered again');
 		assert.ok(told.includes('consistency-b'));
+
+		told.length = 0;
+		failOnce = true;
+		await runNodeUpdateWatcher(listener, {
+			key: WATCHER,
+			maxRestarts: 1,
+			subscribe: async () =>
+				asyncIterable([
+					{ type: 'put', id: 'consistency-a', value: null },
+					{ type: 'put', id: 'consistency-b', value: null },
+				]),
+		});
+		assert.ok(told.includes('consistency-a'), 'an update to a known row that threw is delivered again');
+	});
+
+	it('orders the event against the stored row by version', async () => {
+		const Nodes = getHDBNodeTable();
+		await Nodes.put('consistency-a', {
+			name: 'consistency-a',
+			url: 'wss://consistency-a:9933',
+			shard: 0,
+			replicates: true,
+		});
+		const [{ version }] = Array.from(
+			Nodes.primaryStore.getRange({ start: 'consistency-a', end: 'consistency-a\uffff', versions: true })
+		);
+		const run = (events) =>
+			runNodeUpdateWatcher(() => {}, { key: WATCHER, maxRestarts: 1, subscribe: async () => asyncIterable(events) });
+		const shardOfA = () => server.nodes.find((node) => node.name === 'consistency-a')?.shard;
+
+		await run([{ type: 'put', id: 'consistency-a', value: { name: 'consistency-a', shard: 9 }, version }]);
+		assert.equal(shardOfA(), 0, 'at an equal version the stored record wins');
+
+		await run([{ type: 'patch', id: 'consistency-a', value: { shard: 5 }, version: version + 1 }]);
+		assert.equal(shardOfA(), 5, 'a patch newer than the scan is merged over the stored row');
+		assert.equal(server.nodes.find((node) => node.name === 'consistency-a').url, 'wss://consistency-a:9933');
+	});
+
+	it('scans once when several watchers process the same event', async () => {
+		const Nodes = getHDBNodeTable();
+		await Nodes.put('consistency-a', { name: 'consistency-a', url: 'wss://consistency-a:9933', replicates: true });
+		const event = { type: 'put', id: 'consistency-a', value: null, version: Date.now() };
+		const store = Nodes.primaryStore;
+		const getRange = store.getRange;
+		let scans = 0;
+		store.getRange = function (...args) {
+			scans++;
+			return getRange.apply(this, args);
+		};
+		try {
+			for (const key of [WATCHER, WATCHER + '-second']) {
+				await runNodeUpdateWatcher(() => {}, { key, maxRestarts: 1, subscribe: async () => asyncIterable([event]) });
+			}
+		} finally {
+			store.getRange = getRange;
+			stopNodeUpdateWatcher(WATCHER + '-second');
+		}
+		assert.equal(scans, 1);
 	});
 });
