@@ -2,6 +2,7 @@ import { peerSupportsShardingRecovery, type ResolvedPeerCapabilities } from './p
 import { assertShardingStartupReady, shardingBootstrapStatus } from './shardingBootstrap.ts';
 import { shardingWaitingOrigins } from './shardingRecovery.ts';
 import { compareResidencyPlacement } from '../core/resources/residencyConversion.ts';
+import type { ResidencyMapSnapshot } from '../core/resources/residencyPolicy.ts';
 import { getWorkerIndex } from '../core/server/threads/manageThreads.js';
 import { isDedicatedPoolWorker } from '../core/server/threads/workerPools.ts';
 import { databases, databaseResidencyBlockReason } from '../core/resources/databases.ts';
@@ -266,6 +267,32 @@ server.registerOperation?.({
 	requiresSuperUser: true,
 });
 
+/**
+ * Slots and owning nodes per shard of an installed map. Owners come from the membership view
+ * residencyOwners() resolves a slot through; nodesOwningNoSlots names every known member that is
+ * not an owner of any mapped shard. Counts only: a per-slot list would grow with the slot count.
+ */
+function shardSummary(snapshot: ResidencyMapSnapshot) {
+	const slots = new Map<number, number>();
+	for (const { start, end, shard } of snapshot.ranges) slots.set(shard, (slots.get(shard) ?? 0) + end - start);
+	const assigned = new Set<string>();
+	const shards = Array.from(slots, ([shard, count]) => {
+		const owners = new Set<string>();
+		// declared string[], but knownNodes stores the node records
+		const members: (string | { name: string })[] = server.shards?.get(shard) ?? [];
+		for (const member of members) owners.add(typeof member === 'string' ? member : member.name);
+		for (const owner of owners) assigned.add(owner);
+		return { shard, slots: count, owners: Array.from(owners).sort() };
+	}).sort((a, b) => a.shard - b.shard);
+	const members = new Set([server.hostname, ...(server.nodes ?? []).map((node) => node.name)]);
+	return {
+		shards,
+		nodesOwningNoSlots: Array.from(members)
+			.filter((name) => !assigned.has(name))
+			.sort(),
+	};
+}
+
 export function residencyStatus() {
 	const status = {};
 	let configuration;
@@ -280,10 +307,12 @@ export function residencyStatus() {
 		if (Object.values(tables).some((Table) => Table.residency)) declarations.add(database);
 	for (const database of declarations) {
 		let snapshot;
+		let summary: ReturnType<typeof shardSummary> | undefined;
 		const errors: string[] = [];
 		const quarantine = databaseResidencyBlockReason(database);
 		try {
 			snapshot = readResidencyMap(database);
+			if (snapshot) summary = shardSummary(snapshot);
 			errors.push(...residencyTopologyErrors(database));
 			assertResidencyEngine(database);
 		} catch (error) {
@@ -306,6 +335,7 @@ export function residencyStatus() {
 			checkpointHoles: checkpointHoles.length ? checkpointHoles : undefined,
 			version: snapshot?.version,
 			digest: snapshot?.digest,
+			...summary,
 			shardsDigest: configuration?.digest,
 			blocked: errors.length > 0 || (recovery !== undefined && recovery.phase !== 'ready'),
 			state: quarantine

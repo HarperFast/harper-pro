@@ -4,6 +4,7 @@ import assert from 'node:assert';
 import { basename, join } from 'node:path';
 import { cp, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { isDeepStrictEqual } from 'node:util';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import {
 	sendOperation,
@@ -254,6 +255,33 @@ suite(`Sharding (replication pool ${POOL ? 'on' : 'off'})`, { timeout: 600_000 }
 			assert.equal(result.mismatches, 0);
 			assert.equal(result.mapDigest, installed.digest);
 		}
+	});
+
+	test('cluster_status lists each shard with its slots and owners on every node, including shard 0', async () => {
+		const ownersOf = (shard) =>
+			nodes()
+				.filter((_, i) => SHARDS[i] === shard)
+				.map((node) => node.hostname)
+				.sort();
+		const expected = [0, 1].map((shard) => ({ shard, slots: 5, owners: ownersOf(shard) }));
+		let observed;
+		await waitForCondition(
+			async (signal) => {
+				observed = await Promise.all(
+					nodes().map(async (node) => {
+						const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
+						return { shard: status.shard, ...status.sharding?.data };
+					})
+				);
+				return observed.every(
+					(status, i) =>
+						status.shard === SHARDS[i] &&
+						isDeepStrictEqual(status.shards, expected) &&
+						isDeepStrictEqual(status.nodesOwningNoSlots, [])
+				);
+			},
+			{ description: () => `every node to report ${JSON.stringify(expected)}; last saw ${JSON.stringify(observed)}` }
+		);
 	});
 
 	test(
