@@ -197,8 +197,14 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		for (const [i, node] of nodes.entries()) {
 			const forced = await forcedCopies(node, marks[i]);
 			equal(forced.length, 0, `node ${i} forced a copy:\n${forced.join('\n')}`);
-			ok(!(await socketTo(node, nodes[i ^ 1]))?.stuckCopy, `node ${i} reports a stuck copy`);
 		}
+		// a projection the restarted node's own recovery interrupts reports `retrying` until a quiet session; a refusal stays
+		await waitForCondition(
+			async (signal) =>
+				!(await socketTo(nodes[0], nodes[1], signal))?.stuckCopy &&
+				!(await socketTo(nodes[1], nodes[0], signal))?.stuckCopy,
+			{ timeoutMs: 90_000, description: 'neither node to report a stuck copy' }
+		);
 		const resumed = await linesSince(nodes[1], marks[1], RESUMED_UNDER_PURGE);
 		ok(resumed.length >= 1, 'node 1 reports resuming node 0 under purged history');
 		await put(nodes[0], OWNED_BY[1][0], 'after-idle');
