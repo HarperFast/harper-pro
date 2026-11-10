@@ -109,6 +109,29 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 			{ timeoutMs: 30_000, description: `node ${i} stores complete owned bodies` }
 		);
 	}
+	async function assertNoEcho(lastWrite, holdsLastWrite) {
+		await waitForCondition(
+			async (signal) => {
+				const states = await Promise.all(contexts.map((_, i) => local(i, signal)));
+				return states.every((state) => state.rows.some(holdsLastWrite));
+			},
+			{ timeoutMs: 60_000, description: `every node holds ${lastWrite} before counting its log` }
+		);
+		for (const [i, { harper }] of contexts.entries()) {
+			const response = await fetch(`${harper.httpURL}/BootstrapEcho`, {
+				signal: AbortSignal.timeout(120_000),
+				headers: {
+					Authorization: 'Basic ' + Buffer.from(`${harper.admin.username}:${harper.admin.password}`).toString('base64'),
+				},
+			});
+			assert.equal(response.status, 200);
+			const longest = await response.json();
+			assert.ok(
+				longest.count <= 3,
+				`node ${i} logged one entry ${longest.count} times; a first delivery carrying copies logs at most a few, a re-log loop thousands: ${JSON.stringify(longest)}`
+			);
+		}
+	}
 	async function provision(i) {
 		const hostname = await getNextAvailableLoopbackAddress();
 		const dataRootDir = await mkdtemp(
@@ -170,6 +193,22 @@ export class BootstrapBlob extends Resource {
   if (!entry?.value?.payload) return { digest: null };
   const actual = Buffer.from(await entry.value.payload.arrayBuffer());
   return { digest: createHash('sha256').update(actual).digest('hex'), size: actual.length, version: entry.version };
+ }
+}
+export class BootstrapEcho extends Resource {
+ get() {
+  let longest = { count: 0 };
+  for (const Table of [tables.Rows, databases.system.hdb_nodes]) {
+   const counts = new Map();
+   for (const entry of Table.auditStore.getRange({ start: 1, includeLogName: true })) {
+    if (entry.tableId !== Table.tableId) continue;
+    const key = [entry.logName, entry.txnLogKey, entry.recordId, entry.type].join(' ');
+    const count = (counts.get(key) ?? 0) + 1;
+    counts.set(key, count);
+    if (count > longest.count) longest = { count, key, table: Table === tables.Rows ? 'Rows' : 'hdb_nodes' };
+   }
+  }
+  return longest;
  }
 }
 export class BootstrapLocal extends Resource {
@@ -550,6 +589,7 @@ export class BootstrapLocal extends Resource {
 				description: 'the lagging shard owner receives retained old-origin and fresh new-origin bodies after removal',
 			}
 		);
+		await assertNoEcho('after-rename1', (row) => row.id === 'after-rename1');
 	});
 	test('losing a whole shard requires a complete backup and cannot mint another empty baseline', async () => {
 		const paths = await Promise.all([0, 2].map(dataPath));
@@ -625,6 +665,10 @@ export class BootstrapLocal extends Resource {
 		assert.deepEqual(
 			updated.bootstrap.map((history) => history.localFloor),
 			starts
+		);
+		await assertNoEcho(
+			'the update after the backup',
+			(row) => row.id === recovered.id && row.version > recovered.version
 		);
 	});
 });
