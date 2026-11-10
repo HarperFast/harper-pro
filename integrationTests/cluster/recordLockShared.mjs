@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import { cp, mkdtemp } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
@@ -61,6 +61,51 @@ export async function startNode(suiteName, env, threadsCount = 1, preload) {
 	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
 	const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
 	await startHarper(ctx, optionsFor(hostname, env, threadsCount, preload));
+	return ctx;
+}
+
+/**
+ * The install default is one worker per CPU less one; the harness pins one unless told. At least two, so a
+ * `lock()` served off the coordinating worker relays to it; at most three, so a three-node suite fits a runner.
+ */
+export const DEFAULT_THREADS = Math.min(3, Math.max(2, availableParallelism() - 1));
+
+/** No record-lock configuration and none of the record-lock test overrides: what a fresh install runs. */
+function defaultOptionsFor(hostname, { threadsCount = DEFAULT_THREADS, recordLocks, env = {} } = {}) {
+	const replication = {
+		securePort: hostname + ':9933',
+		databases: [DB, 'system'],
+		pingInterval: 1000,
+		pingTimeout: 3000,
+	};
+	if (recordLocks !== undefined) replication.recordLocks = recordLocks;
+	return {
+		config: {
+			analytics: { aggregatePeriod: -1 },
+			logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
+			threads: { count: threadsCount },
+			replication,
+		},
+		env: { HARPER_NO_FLUSH_ON_EXIT: true, ...env },
+	};
+}
+
+/** `startNode` without any record-lock configuration; `recordLocks` sets the key (`null` clears it). */
+export async function startDefaultNode(suiteName, options) {
+	const hostname = await getNextAvailableLoopbackAddress();
+	const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
+	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
+	const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
+	await startHarper(ctx, defaultOptionsFor(hostname, options));
+	return ctx;
+}
+
+/** Start a stopped node again on its data, with `startDefaultNode`'s options. */
+export async function restartDefaultNode(ctx, options) {
+	const { hostname, dataRootDir } = ctx.harper;
+	const restarted = { name: ctx.name, harper: { hostname, dataRootDir } };
+	await startHarper(restarted, defaultOptionsFor(hostname, options));
+	ctx.harper = restarted.harper;
 	return ctx;
 }
 

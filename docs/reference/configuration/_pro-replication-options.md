@@ -18,6 +18,7 @@ replication:
 - `port` — Replication port
 - `securePort` — Secure replication port; _Default_: `9933` (changed from `9925` in v4.5.0)
 - `threads` — Worker threads dedicated to replication, which then own the replication port and every subscription and load no application code; requires `port` or `securePort`; see [Dedicated Replication Threads](../replication/overview.md#dedicated-replication-threads); _Default_: `0` (replication runs on the HTTP worker threads) (Added in: v5.4.0)
+- `recordLocks` <VersionBadge type="changed" version="v5.4.0" /> — Cluster-wide `lock()` on replicated databases; see [Cluster Record Locks](../replication/overview.md#cluster-record-locks). Unset, it is on, and Harper creates each database's first home map on the first cluster `lock()`. `true` turns it on with every home map published by an operator (`record_lock_apply_homes`), the behavior before v5.4.0. `false` turns it off. On LMDB it is always off; _Default_: unset (on). Before v5.4.0 the default was off
 - `enableRootCAs` — Verify against Node.js Mozilla CA store; _Default_: `true`
 - `pingInterval` — Interval between replication keep-alive pings (ms); _Default_: `30000`
 - `pingTimeout` — Time without received socket activity before a replication connection is considered dead (ms); _Default_: twice `pingInterval`.

@@ -212,82 +212,55 @@ pointer or `undefined`) on any error in between.
 
 ## Assembling a home map: `record_lock_propose_homes`
 
-A mutating bootstrap — a `record_lock_bootstrap_generation` that derives `homes` from `hdb_nodes`
-and writes `active` for generation 1 directly, skipping stage/drain/activate on the grounds that the
-node never had a home map — is easy to re-propose and wrong in both halves.
+`record_lock_propose_homes { database }`, `requiresSuperUser`, **read-only**: it returns the home set this
+node's `hdb_nodes` view suggests (this node plus every row `shouldReplicateFromNode(row, database)`
+accepts, canonicalized), the generation one past this node's floor, the digest, the current
+`active`/`staged`/`fenced`, `quiesce` (§4.3's `homes(g) ∪ homes(g+1)`: the union with this node's own
+rings, so a shrink still names the node leaving), and warnings. It writes and notifies nothing, and one
+node's view is not agreement. Its warnings state two limits. `quiesce` is only as complete as the node
+that answered: a node with no `active` cannot name the ring the cluster serves, so ask one that holds it.
+And a staged departing node stays unable to lock until a later generation names it. Compare `homes` across
+nodes, not `digest`, since each node proposes its own floor plus one.
 
-### Why deriving per node cannot be made safe by the digest check
+## Generation 1 without an operator (harper-pro#853)
 
-The rejected design rested on "if two nodes derive different sets their digests differ, so
-`homeMap()` is withheld on both." That is false. `homeMap()` iterates its **own** `active.homes`
-(`recordLockTransport.ts`), so a node whose derived set is `[A]` has no peers to check, skips the
-loop entirely, and serves its ring immediately. A and B with disjoint or merely incomplete views
-each get a usable map and both arbitrate the same key. **A digest cannot detect a participant
-omitted from the set being digested** — which is exactly what core §4.1 means by stated rather than
-derived, and the reason that rule is about the _set_, not about the hash.
+With `replication.recordLocks` unset (`RECORD_LOCK_MODE === 'auto'`, `recordLockConfig.ts`), the first
+cluster `lock()` on a database with no map establishes generation 1 (`recordLockBootstrap.ts`). Explicit
+`true` is operator-managed exactly as above; `false` and LMDB are off.
 
-### Why no local guard can authorize a direct activation
+**The invariant.** Harper writes a map without an operator only for generation 1, only after one attempt
+surveyed every node any member replicates the database with, and only through the unchanged per-node
+planners. Every generation after the first is §4.3's and the operator's.
 
-The rejected design's other half was a fresh-state guard: no `active`, no `staged`,
-`highestActedOn === 0`, therefore "this node has never granted, so there is nothing to quiesce."
-True but insufficient — it proves a fact about _this_ node and says nothing about the cluster. A
-node newly added to a cluster already active at generation 2 has an untouched row, passes the
-guard, and activates its own generation 1 while every other node serves 2. Losing or deleting a
-node's `LOCAL_ONLY` row reproduces the same false proof on a node that _had_ acted. Establishing
-"no prior authority exists anywhere" is single-decree agreement — the thing harper-pro#825 deleted.
+A per-node derived bootstrap is wrong in two ways, and the attempt answers both:
 
-### What was built instead
+- _A digest cannot detect a participant omitted from the set being digested._ `homeMap()` iterates its own
+  `active.homes`, so a node that derived `[A]` serves alone. `planBootstrap` refuses a singleton. It admits
+  a fresh set only when no surveyed node (`off` ones included) replicates with anyone outside the
+  candidates, and every participant's own replicating set (`view` on the survey reply) equals them. So a
+  node is left out only if no member replicates with it.
+- _No local state proves the absence of prior authority._ A node added to a cluster at generation 2 has an
+  untouched row. The guard is the survey of the whole replicating set, not the local row: any row with
+  history beyond a lone generation 1 (`classifyHomesRow` → `other`) refuses.
 
-`record_lock_propose_homes { database }`, `requiresSuperUser`, **read-only**. It returns the home
-set this node's `hdb_nodes` view suggests (this node plus every row `shouldReplicateFromNode(row,
-database)` accepts, canonicalized), the generation one past whatever this node has acted on, the
-digest that pair would produce, the current `active`/`staged` and the row's `fenced` audit list, `quiesce`, and warnings. It writes
-nothing and notifies nothing.
+Two different generation-1 sets that share a node cannot both activate: `planStage` admits one set per
+generation on a row, and activation waits for every member to stage. An attempt interrupted after staging
+is resumed, from any member including one already active, as **that durable set**, never a re-derived one.
+A node outside it (a joiner) refuses and writes nothing, so it fails closed until an operator applies a
+later generation. No drain is waited, since no member ever held a generation to drain. A refusal makes
+`homeMap()` throw a 503 while it stands (`createBootstrapTrigger`). Only a successful read of the row lets
+an attempt start, so a node whose read failed is never taken for one that never had a map.
 
-`quiesce` is §4.3's `homes(g) ∪ homes(g+1)` — the union of the proposal with this node's current
-active and staged rings — and it is returned as a field because staging only the nodes in `homes`
-omits, on a **shrink**, the node being removed. That node is never staged, keeps its old active generation, and keeps granting while the new ring grants too —
-two arbiters. A departing node must still be
-staged or `record_lock_fence_external`'d and drained; `quiesce` names exactly that set, and a
-warning names the leaving nodes explicitly.
+**Two generation-1 maps over the same data.** When two clusters that each established a map are joined,
+their disjoint sets each passed on their own. At generation 1 nothing has ever left a ring, so a peer
+outside the ring announcing a different map, or any peer announcing the `withheld:` marker, is a second
+arbiter. The node sets a process-wide flag (`markForeignRing`), `homeMap()` withholds, and it announces
+the marker so every member mismatches it and does the same. Holds granted before detection keep their
+lease. At generation ≥ 2 departing and fenced nodes legitimately hold stale maps, so the check is off
+there, and such a merge is the operator's, as it always was.
 
-Two further limits are stated in the response rather than left for an operator to discover:
-
-- **`quiesce` is only as complete as the node that answered.** It unions this node's own `active`
-  and `staged` rings, so a node that has neither — never bootstrapped, or already staged, since
-  staging retracts `active` — cannot name a ring the rest of the cluster is serving, and the union
-  silently omits it. The response warns when this node has no `active` generation and says to ask a
-  node that holds it and union the proposals. This is inherent to a single-node read, not a defect
-  to be patched: a proposal that reached across nodes to find the old ring would be the
-  cross-node agreement step §4.3 deliberately leaves with the operator.
-- **A staged departing node stays unable to lock.** It is never activated, because it is not in
-  `homes`; it holds `staged` with no `active` and refuses every cluster lock. That is what leaving
-  the ring means, and the warning says so, so it is not mistaken for a stuck transition. Bringing
-  such a node back is an ordinary later generation that names it again.
-
-That is the list-assembly step of the §4.3 runbook and only that: the operator captures one
-canonical list instead of typing it, then passes that exact list to `record_lock_stage_generation`
-on every node in `quiesce` and to `record_lock_activate_generation` on every node in `homes`,
-unchanged. What a script compares across nodes is `homes`, **not** the returned `digest`: the digest
-is taken over `(generation, homes)` and every node proposes its own floor plus one, so two nodes that
-agree on membership still differ here whenever their floors do. Pass the highest `generation` returned
-to every node; the digest they then agree on is the one computed from that single list, and that is
-the one `stage` and `activate` check. Because this operation is a read, none of the blockers
-above apply to it — a suggestion that is wrong costs an operator a re-run, not two arbiters.
-
-The generation it returns is one past this node's own floor, so the same operation serves a
-topology change as well as a first bootstrap. It is still only this node's view; agreement remains
-the operator's act.
-
-### Approaches considered
-
-| Axis                | Candidate                                                                                                                        | Ruling                                                                                                                                                                                                                   |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Different layer** | Derive the ring inside `homeMap()` when no row exists, so nothing has to be called.                                              | Rejected — §4.1's two-arbiter bug, and now with a concrete mechanism: the agreement loop cannot see a node it was never told about.                                                                                      |
-| **Deeper cause**    | A mutating bootstrap that writes `active` for generation 1 behind a fresh-state guard.                                           | Rejected on the two counterexamples above. Making it safe would require asking every derived peer whether it already has authority and failing closed on any unreachable one — single-decree agreement, deleted by #825. |
-| **Deeper cause**    | One orchestrating call that fans stage → wait → activate out to every node.                                                      | Built later as `record_lock_apply_homes` (next section): over an explicit node list, with a node-principal hop instead of delegated credentials.                                                                         |
-| **Do less**         | Document a script that reads `cluster_status` on each node and assembles the list.                                               | Close, and what an operator can do today; the operation adds canonicalization, the digest, the current state and the bounds validation in one authenticated call, with no new authority.                                 |
-| **Chosen**          | A read-only proposal: derive, canonicalize, hash, report — the operator still stages and activates the returned list everywhere. | Removes the typing, which was the actual ask, while leaving every authority-bearing step exactly where §4.3 already put it.                                                                                              |
+**Not distinguishable:** a row lost on every member of a ring reads as never bootstrapped. Core's
+in-process generation floor still refuses a backwards generation on a live coordinator.
 
 ## Applying a home map across the cluster: `record_lock_apply_homes` (harper-pro#862)
 
@@ -296,8 +269,8 @@ the operator's act.
 `record_lock_activate_generation` on every node in `homes(g+1)`, with the operator carrying one
 identical list to each and deciding when the drain is done. This section adds the single
 operator-facing call that drives that §4.3 transition, **given an explicitly supplied list of
-expected nodes**. Everything the two rejections above established still holds: the list is stated,
-never derived, and this operation orchestrates without ever authorizing policy.
+expected nodes**. The two objections to a derived map ("Generation 1 without an operator", above) still
+hold: the list is stated, never derived, and this operation orchestrates without ever authorizing policy.
 
 ### The invariant this change enforces
 
@@ -310,10 +283,10 @@ half-applied call leaves some nodes quiesced (their cluster locks 503) and none 
 
 ### Why the explicit list is what makes orchestration safe
 
-A digest cannot detect a participant omitted from the set being digested ("Why deriving per node
-cannot be made safe by the digest check", above). When the operator states the set there is nothing to omit, so "ask every named node, refuse if any does not
-answer" becomes a _complete_ check, and unreachable becomes a hard failure rather than a skipped
-peer. That is the whole difference between this operation and the rejected one.
+A digest cannot detect a participant omitted from the set being digested ("Generation 1 without an
+operator", above). When the operator states the set there is nothing to omit, so "ask every named node,
+refuse if any does not answer" becomes a _complete_ check, and unreachable becomes a hard failure rather
+than a skipped peer.
 
 ### The operation
 
@@ -524,17 +497,17 @@ boundary:
    run on a peer is a separate change, tracked in harper-pro#976. When #976 narrows node-principal
    operations, `record_lock_transition` remains the one node-principal route to a peer's home map
    (`hdb_record_lock_homes` is `LOCAL_ONLY`), so re-assess an operator proof (#869) at that point.
-4. **Nothing shipped is exposed by default.** `replication.recordLocks` is off by default and grants
-   nothing until an operator stages and activates a generation.
+4. **No longer a ground.** `replication.recordLocks` was off by default; since harper-pro#853 it is on,
+   and the automatic first generation runs over this same hop. Grounds 1–3 carry the argument unchanged.
 
-Accepted on that basis, by the task owner's ruling on #822.
+Accepted on grounds 1–4 by the task owner's ruling on #822; ground 4 lapsed with harper-pro#853.
 
 ### Approaches considered
 
 | Axis                | Candidate                                                                                                                                                                                                                                                                                                                         | Ruling                                                                                                                                                                                                                                                                                                                                 |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Different layer** | Orchestrate outside Harper: a script or CLI that authenticates to every node and drives the per-node operations, with a read-only survey added.                                                                                                                                                                                   | Valid as a manual fallback, and the per-node operations stay for exactly that. Not chosen because it cannot express "unreachable is a hard failure" for a node the script's credentials cannot reach, cannot persist the participant set anywhere the survey can find it again, and carries the operator's secret to N nodes per call. |
-| **Deeper cause**    | Derive the set (from `hdb_nodes`, or by agreement), so no list is needed.                                                                                                                                                                                                                                                         | Rejected twice already, above, with the mechanism recorded: a digest cannot detect an omitted participant, and no local state proves the absence of prior authority. Not reopened.                                                                                                                                                     |
+| **Deeper cause**    | Derive the set (from `hdb_nodes`, or by agreement), so no list is needed.                                                                                                                                                                                                                                                         | Rejected for every generation after the first: a digest cannot detect an omitted participant, and no local state proves the absence of prior authority ("Generation 1 without an operator").                                                                                                                                           |
 | **Do less**         | Forward the operator's credentials per hop and reuse the existing `requiresSuperUser` operations unchanged.                                                                                                                                                                                                                       | Rejected: the operator's secret in flight to N peers per call is a new exposure for no gain, and — the fact above — the hop is authenticated as a node principal anyway, so what actually has to exist is the receiving node's own re-validation, not a forwarded permission.                                                          |
 | **Do less**         | Stage-and-activate in one call with a fixed wait, no drain evidence.                                                                                                                                                                                                                                                              | Rejected: holds an HTTP request for ~6 minutes, and the drain (#856/#861) already exists to make that wait unnecessary in the planned case.                                                                                                                                                                                            |
 | **Manifest**        | A manifest-backed transition: persist `{generation, digest, homes, quiesce, transitionId}`, return a receipt, refuse an attested retry that staged anything new.                                                                                                                                                                  | Adopted except the identifier: `quiesce` is persisted on the staged row, the wait is relative, the attestation covers only nodes already staged at survey. A `transitionId` would be a second identity `planStage`/`planActivate` never check; `(generation, digest)` is already exact.                                                |
