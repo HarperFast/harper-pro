@@ -316,8 +316,8 @@ function planStages(
 
 /**
  * The per-node runbook (RECORD_LOCK_HOMES_DESIGN.md "Minority survivors get a 409") for the surveyed
- * rows, at the first of `preferred` every surveyed node accepts, else one past `floor`, which every
- * one does: the `unlisted` check already proved `quiesce` covers each ring a row remembers.
+ * rows. One past `floor` is always accepted: the `unlisted` check already proved `quiesce` covers each
+ * ring a row remembers.
  */
 function manualRecovery(
 	database: string,
@@ -332,15 +332,15 @@ function manualRecovery(
 		if (!Number.isSafeInteger(generation)) continue;
 		const stages = planStages(database, homes, quiesce, rows, generation, digestOf(generation, homes));
 		if ('rejected' in stages) continue;
+		const activate = JSON.stringify({ operation: 'record_lock_activate_generation', database, generation, homes });
 		const departing = canonicalizeHomes([...rows.keys()].filter((node) => !homes.includes(node)));
 		if (
 			homes.every((node) => stages.alreadyActive.has(node)) &&
 			departing.every((node) => stages.alreadyStaged.has(node))
 		)
-			return `the per-node recovery has already run: generation ${generation} is active on ${JSON.stringify(homes)}${departing.length > 0 ? ` and staged on ${JSON.stringify(departing)}` : ''}, so nothing is left to run`;
+			return `the per-node recovery has already run: generation ${generation} is active on ${JSON.stringify(homes)}${departing.length > 0 ? ` and staged on ${JSON.stringify(departing)}` : ''}. If a home still refuses cluster locks for this database, send ${activate} to it again: on an active node it only re-notifies the threads`;
 		const stageOn = canonicalizeHomes([...rows.keys()].filter((node) => !stages.alreadyActive.has(node)));
 		const stage = JSON.stringify({ operation: 'record_lock_stage_generation', database, generation, homes, quiesce });
-		const activate = JSON.stringify({ operation: 'record_lock_activate_generation', database, generation, homes });
 		return `apply without fenced once it is reachable, or, if ${JSON.stringify(fenced)} will never run again from their current data, re-home without them by hand: send ${stage} to each of ${JSON.stringify(stageOn)}; after the last of those succeeds, wait ${DELEGATION_DRAIN_MS} ms, then send ${activate} to each of ${JSON.stringify(homes)}. Never activate after a failed stage; if interrupted, re-send this call for steps that match the current state`;
 	}
 	return `apply without fenced once it is reachable; no generation above ${floor} is left to re-home them by hand`;

@@ -977,7 +977,7 @@ describe('a fenced apply refused on a ring that names removed nodes reports the 
 		assert.strictEqual(recoveryIn(finished.http_resp_msg.reason), undefined);
 		assert.match(
 			finished.http_resp_msg.reason,
-			/the per-node recovery has already run: generation 2 is active on \["c","d","e","f"\], so nothing is left to run$/
+			/the per-node recovery has already run: generation 2 is active on \["c","d","e","f"\]\. If a home still refuses cluster locks for this database, send \{"operation":"record_lock_activate_generation","database":"db","generation":2,"homes":\["c","d","e","f"\]\} to it again/
 		);
 		// Central Manager's next call: no row names a or b, so they are neither in quiesce nor fenced.
 		cluster.calls.length = 0;
@@ -1027,7 +1027,7 @@ describe('a fenced apply refused on a ring that names removed nodes reports the 
 		);
 		assert.match(
 			recovered.reason,
-			/generation 2 is active on \["c","e"\] and staged on \["x\\"y"\], so nothing is left/
+			/generation 2 is active on \["c","e"\] and staged on \["x\\"y"\]\. If a home still refuses/
 		);
 	});
 

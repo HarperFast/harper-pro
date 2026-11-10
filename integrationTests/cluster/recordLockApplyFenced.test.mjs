@@ -2,8 +2,7 @@
  * `record_lock_apply_homes { fenced }` on real nodes: a ring member is killed while holding
  * delegations from both survivors, one call with it fenced completes the transition, its exact keys
  * are served by their unchanged homes at once, and restarted with its old row it has no home map. A
- * lone survivor of the resulting two-node ring cannot fence the other: no majority of it answers, and
- * the refusal names the per-node steps that re-home it instead.
+ * lone survivor of the resulting two-node ring cannot fence the other: no majority of it answers.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
