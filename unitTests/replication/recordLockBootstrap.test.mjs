@@ -731,6 +731,17 @@ describe('createBootstrapTrigger: what homeMap() starts and answers meanwhile', 
 		assert.strictEqual(h.runs.length, 1, 'the refusal cleared as soon as a peer was there');
 	});
 
+	it('a pristine refusal is not reported once another node activated this one', async () => {
+		const h = harness();
+		h.trigger.missing('db');
+		h.fire();
+		h.runs[0].resolve({ outcome: 'refused', reason: 'not agreed yet', settled: false });
+		await h.tick();
+		assert.strictEqual(h.trigger.status('db').state, 'waiting');
+		h.rows.db = { rowClass: 'first-active', firstSet: ['a', 'b'] };
+		assert.strictEqual(h.trigger.status('db').state, 'activated');
+	});
+
 	it('a follower activated by another node can still resume until the whole ring has agreed once', () => {
 		const h = harness();
 		h.trigger.missing('db');
@@ -986,7 +997,7 @@ describe('a generation-1 ring meeting another map', () => {
 		);
 	});
 	after(() => {
-		setRecordLockHomesRowReader(previousReader);
+		if (previousReader) setRecordLockHomesRowReader(previousReader);
 		for (const database of ['foreignringa', 'foreignringb', 'foreignringc', 'foreignringd'])
 			forgetRecordLockHomesCache(database);
 	});

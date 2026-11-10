@@ -597,8 +597,9 @@ async function refreshCache(database: string, freshBudget = false, announce = tr
 		// socket that handshook then received none; both need the one just read. The backoff resets only
 		// once this is done, so a failure here re-arms the whole cycle.
 		if (state.backoff.attempts > 0 || (announce && before?.digest !== row?.active?.digest)) {
-			pushHomesDigestToPeers(database);
+			// Reconciled first, so a second generation-1 map heard earlier withholds this one before it is announced.
 			reconcileAllPeerHomesAgreement(database);
+			pushHomesDigestToPeers(database);
 		}
 		state.backoff.reset();
 	} catch (error) {
@@ -644,8 +645,8 @@ const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
  */
 async function applyHomesChanged(database: string): Promise<void> {
 	await refreshCache(database, true, false);
-	pushHomesDigestToPeers(database);
 	reconcileAllPeerHomesAgreement(database);
+	pushHomesDigestToPeers(database);
 }
 
 /**

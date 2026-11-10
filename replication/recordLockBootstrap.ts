@@ -415,6 +415,8 @@ interface TriggerState {
 	backoffMs: number;
 	activated?: boolean;
 	followed?: boolean;
+	/** The last outcome settled on a row that held no generation yet. */
+	settledPristine?: boolean;
 }
 
 export function bootstrapRefusedMessage(database: string): string {
@@ -428,6 +430,7 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 		if (states.get(database) !== state || state.token !== token) return;
 		state.running = undefined;
 		if (outcome.outcome === 'cancelled') return;
+		state.settledPristine = pristine;
 		if (outcome.outcome === 'activated') {
 			state.refusal = state.lastFailure = undefined;
 			state.backoffMs = 0;
@@ -562,7 +565,9 @@ export function createBootstrapTrigger(deps: BootstrapTriggerDeps) {
 			if (!state || !row || row.rowClass === 'other') return undefined;
 			const retryInMs = Math.max(0, Math.round(state.retryAt - deps.now()));
 			if (state.running) return { state: 'running', reason: state.lastFailure };
-			if (state.activated) return { state: 'activated' };
+			// A pristine attempt's refusal is stale once another node's attempt activated this one.
+			if (state.activated || (row.rowClass === 'first-active' && state.settledPristine !== false))
+				return { state: 'activated' };
 			if (state.refusal !== undefined) return { state: 'refused', reason: state.refusal, retryInMs };
 			if (retryInMs > 0) return { state: 'waiting', reason: state.lastFailure, retryInMs };
 			if (row.rowClass === 'first-active') return { state: 'activated' };
