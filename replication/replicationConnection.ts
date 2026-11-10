@@ -5792,18 +5792,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * would never revisit: the next request copies afresh.
 	 */
 	function discardCopyResumePoint(): void {
+		// only the subscribing side holds a resume point; the source sees the reason echoed back
+		if (!options.isSubscriptionConnection || !options.connection) return;
+		const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
+		const store = auditStore ?? databaseAuditStore;
+		const sourceId = copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined);
+		if (sourceId === undefined) return;
+		// set before the read, and kept when no saved walk is visible yet: another pass's cursor clears it
+		const vetoed = (options.connection.vetoedCopySources ??= new Map());
+		vetoed.set(sourceId, copyModeStartTime);
 		try {
-			const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
-			const store = auditStore ?? databaseAuditStore;
-			const sourceId =
-				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined);
-			if (sourceId === undefined) return;
 			const cursor = readDbisCursorSync(dbisDB, 'copyCursor', sourceId);
-			// honored by later requests on this connection until the write below lands
-			if (options.connection)
-				(options.connection.vetoedCopySources ??= new Map()).set(sourceId, cursor?.copyStartTime ?? copyModeStartTime);
+			if (cursor?.copyStartTime !== undefined) vetoed.set(sourceId, cursor.copyStartTime);
 			if (cursor && !cursor.restartFullCopy) markCopyCursorRestart(sourceId, { ...cursor, restartFullCopy: true });
-			else options.connection?.vetoedCopySources?.delete(sourceId);
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error);
 		}
@@ -10218,6 +10219,30 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									logger.debug?.(connectionId, 'added log to iterator:', nodeName);
 								}
 							}
+							if (nodesToInclude.length && auditStore?.rootStore) {
+								// a log re-admitted in-band replays from its cursor, as a reconnect would, so it owes the same check
+								let gap: unknown;
+								try {
+									const { dbisDB } = getDatabaseStores();
+									const bounds = dbisDB?.getRange
+										? readRelayCopyBoundsAt(dbisDB, auditStore, readOriginStateEpoch(auditStore.rootStore))
+										: undefined;
+									gap =
+										bounds &&
+										relayedStartBelowCopyBound(nodesToInclude, currentSequenceId, includeFloors, bounds.settled);
+								} catch (error) {
+									gap = error;
+								}
+								if (gap) {
+									logger.info?.(
+										connectionId,
+										`${remoteNodeName} re-admitted an origin below rows a base copy wrote here without log entries; closing so its start is checked`
+									);
+									wsClosed = true;
+									close(1011, 'Replication restarts after a base copy into this node');
+									return;
+								}
+							}
 							if (nodesToInclude.length && !relayWithheld && relayCopyLeaseHeld(auditStore, databaseName)) {
 								// as at a lease seen mid-transaction: the frame's end_txn would commit the part already sent
 								if (currentTransaction.txnLogKey) {
@@ -13608,7 +13633,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (copyCursor) {
 						copyCursor = { ...copyCursor, restartFullCopy: true };
 						markCopyCursorRestart(nodeId, copyCursor);
-					} else options.connection.vetoedCopySources.delete(nodeId);
+					}
 				}
 				loadPersistedCopyBounds(copyCursor);
 				mergeCopyBoundRecordInto(copiedVersionByOrigin, copyCursor?.maxCopiedVersionByOrigin);
