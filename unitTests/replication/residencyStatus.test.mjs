@@ -12,23 +12,27 @@ const json = (value) => JSON.parse(JSON.stringify(value));
 
 describe('cluster_status shard summary', function () {
 	this.timeout(10_000);
-	let priorNodes, priorShards, priorList, priorShard;
+	let restore;
 	let sequence = 0;
 	beforeEach(() => {
-		priorNodes = server.nodes;
-		priorShards = server.shards;
-		priorList = env.get('replication_shards');
-		priorShard = env.get('replication_shard');
+		const priorNodes = server.nodes;
+		const priorShards = server.shards;
+		const priorList = env.get('replication_shards');
+		const priorShard = env.get('replication_shard');
+		restore = () => {
+			server.nodes = priorNodes;
+			server.shards = priorShards;
+			env.setProperty('replication_shards', priorList);
+			env.setProperty('replication_shard', priorShard);
+		};
 		server.nodes = [];
 		server.shards = new Map();
 		env.setProperty('replication_shards', [0, 1]);
 		env.setProperty('replication_shard', 0);
 	});
 	afterEach(() => {
-		server.nodes = priorNodes;
-		server.shards = priorShards;
-		env.setProperty('replication_shards', priorList);
-		env.setProperty('replication_shard', priorShard);
+		restore?.();
+		restore = undefined;
 	});
 
 	async function declare(ranges, slots = 10) {
