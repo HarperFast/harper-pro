@@ -10,10 +10,10 @@ import { REPLICATION_APPLY } from '#src/core/resources/databaseLiveGuard';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { INVALIDATED, REPLICA } from '#src/core/resources/Table';
 import { table } from '#src/core/resources/databases';
-import { createAuditEntry, readAuditEntry, Decoder } from '#src/core/resources/auditStore';
+import { createAuditEntry, readAuditEntry, Decoder, LOCAL_ONLY } from '#src/core/resources/auditStore';
 import { initializeResidencySlots, getResidencyConfiguration } from '#src/core/resources/residencyMaps';
 import { setReplicator } from '#src/replication/replicator';
-import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
+import { databaseSubscriptions, replayedStubPut, replicateOverWS } from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { FrameWriter } from '#src/replication/frameWriter';
 import { advanceShardingHistory } from '#src/replication/shardingBootstrapState';
@@ -64,7 +64,6 @@ async function until(predicate, message = 'replication did not make progress') {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 }
-/** Every data frame in send order, with its frame key, its entries and any trailing sequence update. */
 function dataFrames(socket) {
 	const frames = [];
 	let phase = 'before-copy';
@@ -224,7 +223,6 @@ describe('A base copy never leaves a designated resident with only the stub of a
 
 	describe('a legacy-residency source fill on a node outside its residency', function () {
 		let fixtures = 0;
-		/** A read-through fill this node is not resident for: a stub row over a complete local `put`. */
 		async function fill(residents = [PEER]) {
 			const database = `stub_resident_fill_${++fixtures}`;
 			const Records = await replicatedTable(database);
@@ -313,7 +311,7 @@ describe('A base copy never leaves a designated resident with only the stub of a
 			);
 		});
 
-		it('leaves a resident receiving the real copy and replay frames with the body, at and above copyStartTime', async () => {
+		it('leaves a resident fed the real frames with the body once the copy completes, before any replay', async () => {
 			const { Records, database, below, logKey } = await fill();
 			for (const [label, copyStartTime] of [
 				['above', below],
@@ -329,8 +327,9 @@ describe('A base copy never leaves a designated resident with only the stub of a
 				replicateOverWS(receiver, {}, { name: PEER, replicates: true });
 				receiver.emit('message', encode([NODE_NAME, PEER, receiverDatabase, [], capabilities, {}]));
 				await until(() => receiver.sent.some((frame) => frame[0] === NODE_NAME));
-				for (const [index, raw] of sender.rawSent.entries()) {
+				const forward = (index) => {
 					const message = sender.sent[index];
+					const raw = sender.rawSent[index];
 					if (Buffer.isBuffer(message)) receiver.emit('message', raw);
 					else if (message[0] === NODE_NAME_TO_ID_MAP) {
 						const swap = { [getThisNodeName()]: PEER, [PEER]: getThisNodeName() };
@@ -340,17 +339,28 @@ describe('A base copy never leaves a designated resident with only the stub of a
 						receiver.emit('message', encode([RESIDENCY_LIST, [server.hostname, OTHER], message[2]]));
 					else if ([TABLE_FIXED_STRUCTURE, COPY_START, COPY_COMPLETE].includes(message[0]))
 						receiver.emit('message', raw);
-				}
+				};
+				const copyComplete = sender.sent.findIndex((message) => message[0] === COPY_COMPLETE);
+				for (let index = 0; index <= copyComplete; index++) forward(index);
+				await until(() => Resident.primaryStore.getEntry('filled') && Resident.primaryStore.getEntry('before'));
+				const copied = Resident.primaryStore.getEntry('filled');
+				if (label === 'above') {
+					assert.equal(copied.metadataFlags & INVALIDATED, 0, 'the copy left the resident a stub');
+					assert.equal(copied.value.body, 'complete filled');
+				} else assert.ok(copied.metadataFlags & INVALIDATED);
+				for (let index = copyComplete + 1; index < sender.sent.length; index++) forward(index);
 				await until(() => Resident.primaryStore.getEntry('sentinel'));
 				assert.deepEqual(receiver.closes, []);
 				const resident = Resident.primaryStore.getEntry('filled');
 				if (label === 'above') {
-					assert.equal(resident.metadataFlags & INVALIDATED, 0, 'the resident still holds only the stub');
+					assert.equal(resident.metadataFlags & INVALIDATED, 0, 'the replay left the resident a stub');
 					assert.equal(resident.value.body, 'complete filled');
-				} else {
-					// the anchor's own write is not replayed, so this sender only ever had the stub to give
-					assert.ok(resident.metadataFlags & INVALIDATED);
-				}
+					assert.deepEqual(
+						loggedFor(Resident, 'filled').map((entry) => entry.type),
+						['put'],
+						'the replayed duplicate was applied again'
+					);
+				} else assert.ok(resident.metadataFlags & INVALIDATED);
 				assert.equal(Resident.primaryStore.getEntry('before').value.body, 'kept');
 				sender.close();
 				receiver.close();
@@ -535,4 +545,39 @@ describe('A base copy never leaves a designated resident with only the stub of a
 			}
 		});
 	});
+});
+
+describe('replayedStubPut', function () {
+	const tableId = 7;
+	const row = { key: ['region', 3], version: 1000 };
+	const head = { type: 'put', tableId, recordId: ['region', 3], version: 1000, nodeId: 0, extendedType: 0 };
+	const storeAnswering = (answer) => ({
+		get(...args) {
+			if (answer instanceof Error) throw answer;
+			this.args = args;
+			return answer;
+		},
+	});
+
+	it("answers the head entry when it is the row's own local put", () => {
+		const store = storeAnswering(head);
+		assert.equal(replayedStubPut(store, tableId, row, 2000, 4), head);
+		assert.deepEqual(store.args, [2000, tableId, row.key, 0, true]);
+		assert.equal(replayedStubPut(storeAnswering({ ...head, nodeId: 4 }), tableId, row, 2000, 4)?.nodeId, 4);
+	});
+
+	for (const [label, answer] of [
+		['no entry', undefined],
+		['an invalidation', { ...head, type: 'invalidate' }],
+		['a patch', { ...head, type: 'patch' }],
+		['a local-only put', { ...head, extendedType: LOCAL_ONLY }],
+		["another origin's put", { ...head, nodeId: 9 }],
+		['another version', { ...head, version: 999 }],
+		['another table', { ...head, tableId: tableId + 1 }],
+		['another record at the same key', { ...head, recordId: ['region', 4] }],
+		['a failed read', new Error('unreadable log')],
+	])
+		it(`answers nothing for ${label}, which keeps the stub`, () => {
+			assert.equal(replayedStubPut(storeAnswering(answer), tableId, row, 2000, 4), undefined);
+		});
 });

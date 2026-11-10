@@ -1057,12 +1057,7 @@ export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number, r
 	// without making one expired reference permanently wedge bootstrap.
 	return entry.localTime;
 }
-/**
- * A local stub row's head audit entry at `logKey`, when that entry is the row's own complete `put`.
- * A base copy sends it in place of the stub: a receiver that logs a copied stub at the write's identity
- * would drop the same `put` when the post-copy replay re-sends it. Any read failure answers undefined,
- * which keeps the stub.
- */
+/** A receiver that logs a copied stub at the write's identity drops that write's `put` when the replay re-sends it. */
 export function replayedStubPut(
 	auditStore: any,
 	tableId: number,
