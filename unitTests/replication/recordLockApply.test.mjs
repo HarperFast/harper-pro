@@ -865,6 +865,235 @@ describe('applyHomes with fenced nodes (harper-pro#973)', function () {
 	});
 });
 
+function recoveryIn(reason) {
+	const steps = [...reason.matchAll(/[Ss]end (\{.*?\}) to each of (\[.*?\])/g)].map(([, body, nodes]) => ({
+		body: JSON.parse(body),
+		nodes: JSON.parse(nodes),
+	}));
+	if (steps.length === 0) return undefined;
+	const [stage, activate] = steps;
+	return { stage, activate };
+}
+
+async function runStep(cluster, { body, nodes }, action) {
+	const { generation, homes, quiesce } = body;
+	for (const node of nodes)
+		await cluster.peers.send(node, {
+			operation: 'record_lock_transition',
+			database: body.database,
+			action,
+			generation,
+			homes,
+			quiesce,
+			digest: digestOf(generation, homes),
+		});
+}
+
+describe('a fenced apply refused on a ring that names removed nodes reports the manual recovery', function () {
+	this.timeout(30_000);
+	const operator = { username: 'ops-admin' };
+	const departedRing = () => {
+		const rows = activeCluster(['a', 'b', 'c', 'd']);
+		delete rows.a;
+		delete rows.b;
+		return { ...rows, e: undefined, f: undefined };
+	};
+	const sweep = (fields = {}) => ({
+		database: 'db',
+		homes: ['c', 'd', 'e', 'f'],
+		quiesce: ['a', 'b', 'c', 'd', 'e', 'f'],
+		fenced: ['a', 'b'],
+		hdb_user: operator,
+		...fields,
+	});
+
+	it('refuses identically on every sweep, stages nothing, and names the exact steps', async () => {
+		const cluster = fakeCluster(departedRing());
+		const first = await refused(applyHomes(sweep(), cluster.peers));
+		const second = await refused(applyHomes(sweep(), cluster.peers));
+		const reordered = await refused(
+			applyHomes(
+				sweep({ homes: ['f', 'e', 'd', 'c'], quiesce: ['f', 'b', 'e', 'a', 'd', 'c'], fenced: ['b', 'a'] }),
+				cluster.peers
+			)
+		);
+		assert.strictEqual(first.statusCode, 409);
+		assert.deepStrictEqual(second.http_resp_msg, first.http_resp_msg);
+		assert.deepStrictEqual(reordered.http_resp_msg, first.http_resp_msg);
+		assert.ok(
+			cluster.calls.every((call) => call.startsWith('survey:')),
+			cluster.calls.join(', ')
+		);
+		const { reason } = first.http_resp_msg;
+		assert.match(reason, /^no active ring holding a, b is reported by a majority of its members/);
+		assert.ok(reason.includes('if ["a","b"] will never run again from their current data'), reason);
+		assert.ok(reason.includes(`wait ${DELEGATION_DRAIN_MS} ms`), reason);
+		assert.deepStrictEqual(recoveryIn(reason), {
+			stage: {
+				body: {
+					operation: 'record_lock_stage_generation',
+					database: 'db',
+					generation: 2,
+					homes: ['c', 'd', 'e', 'f'],
+					quiesce: ['a', 'b', 'c', 'd', 'e', 'f'],
+				},
+				nodes: ['c', 'd', 'e', 'f'],
+			},
+			activate: {
+				body: {
+					operation: 'record_lock_activate_generation',
+					database: 'db',
+					generation: 2,
+					homes: ['c', 'd', 'e', 'f'],
+				},
+				nodes: ['c', 'd', 'e', 'f'],
+			},
+		});
+	});
+
+	it('repeats the same steps through the drain wait, names only what is left after a partial activation, and converges', async () => {
+		const cluster = fakeCluster(departedRing());
+		const { reason } = (await refused(applyHomes(sweep(), cluster.peers))).http_resp_msg;
+		const { stage, activate } = recoveryIn(reason);
+		await runStep(cluster, stage, 'stage');
+		const midDrain = await refused(applyHomes(sweep(), cluster.peers));
+		assert.strictEqual(midDrain.http_resp_msg.reason, reason, 'a sweep inside the wait must not move the target');
+		await runStep(cluster, { ...activate, nodes: ['c'] }, 'activate');
+		const partial = recoveryIn((await refused(applyHomes(sweep(), cluster.peers))).http_resp_msg.reason);
+		assert.strictEqual(partial.stage.body.generation, 2);
+		assert.deepStrictEqual(partial.stage.nodes, ['d', 'e', 'f']);
+		assert.deepStrictEqual(partial.activate.nodes, ['c', 'd', 'e', 'f'], 'activating c again is a noop');
+		await runStep(cluster, partial.stage, 'stage');
+		await runStep(cluster, partial.activate, 'activate');
+		for (const node of ['c', 'd', 'e', 'f']) {
+			const row = cluster.rows.get(node);
+			assert.deepStrictEqual(
+				[row.active?.generation, row.active?.homes, row.staged],
+				[2, ['c', 'd', 'e', 'f'], undefined]
+			);
+		}
+		const finished = await refused(applyHomes(sweep(), cluster.peers));
+		assert.match(
+			finished.http_resp_msg.reason,
+			/the per-node recovery has already run: generation 2 is active on \["c","d","e","f"\]\. Send /
+		);
+		const replay = recoveryIn(finished.http_resp_msg.reason);
+		assert.deepStrictEqual(replay.stage, activate, 'the only step left is the activate replay, to every home');
+		assert.strictEqual(replay.activate, undefined);
+		// Central Manager's next call: no row names a or b, so they are neither in quiesce nor fenced.
+		cluster.calls.length = 0;
+		const next = await applyHomes(sweep({ quiesce: undefined, fenced: undefined }), cluster.peers);
+		assert.strictEqual(next.outcome, 'activated', next.reason);
+		for (const node of ['c', 'd', 'e', 'f']) assert.deepStrictEqual(next.nodes[node].activate, { action: 'noop' });
+		assert.ok(!cluster.calls.some((call) => call.startsWith('stage:')), cluster.calls.join(', '));
+	});
+
+	it('stages a departing live node without activating it, and escapes node names', () => {
+		const ring = state(1, ['a', 'b', 'c', 'x"y']);
+		const plan = planSurvey(
+			'd"b',
+			['c', 'e'],
+			['a', 'b', 'c', 'e', 'x"y'],
+			undefined,
+			replies({
+				'c': reply('c', { active: ring, highestActedOn: 1, supportsFenced: true }),
+				'e': reply('e', { supportsFenced: true }),
+				'x"y': reply('x"y', { active: ring, highestActedOn: 1, supportsFenced: true }),
+			}),
+			undefined,
+			['a', 'b']
+		);
+		assert.strictEqual(plan.status, 409, 'two of four is no majority');
+		const { stage, activate } = recoveryIn(plan.reason);
+		assert.strictEqual(stage.body.database, 'd"b');
+		assert.deepStrictEqual(stage.nodes, ['c', 'e', 'x"y']);
+		assert.deepStrictEqual(activate.nodes, ['c', 'e']);
+		const done = state(2, ['c', 'e']);
+		const recovered = planSurvey(
+			'd"b',
+			['c', 'e'],
+			['a', 'b', 'c', 'e', 'x"y'],
+			undefined,
+			replies({
+				'c': reply('c', { active: done, highestActedOn: 2, supportsFenced: true }),
+				'e': reply('e', { active: done, highestActedOn: 2, supportsFenced: true }),
+				'x"y': reply('x"y', {
+					staged: { ...done, quiesce: stage.body.quiesce },
+					highestActedOn: 2,
+					supportsFenced: true,
+				}),
+			}),
+			undefined,
+			['a', 'b']
+		);
+		assert.match(recovered.reason, /generation 2 is active on \["c","e"\] and staged on \["x\\"y"\]\. Send /);
+	});
+
+	it('moves past a resume target a node would refuse, and offers no generation past the largest safe one', () => {
+		const homes = ['c', 'd', 'e', 'f'];
+		const all = ['a', 'b', 'c', 'd', 'e', 'f'];
+		const conflicting = planSurvey(
+			'db',
+			homes,
+			all,
+			undefined,
+			replies({
+				c: reply('c', { staged: state(5, homes, { quiesce: all }), highestActedOn: 5, supportsFenced: true }),
+				d: reply('d', {
+					staged: state(5, ['a', 'c', 'd'], { quiesce: all }),
+					highestActedOn: 5,
+					supportsFenced: true,
+				}),
+				e: reply('e', { supportsFenced: true }),
+				f: reply('f', { supportsFenced: true }),
+			}),
+			undefined,
+			['a', 'b']
+		);
+		assert.strictEqual(conflicting.status, 409);
+		assert.strictEqual(recoveryIn(conflicting.reason).stage.body.generation, 6, 'd holds 5 for another home set');
+		const ring = state(1, ['a', 'b', 'c', 'd']);
+		const requested = planSurvey(
+			'db',
+			homes,
+			all,
+			9,
+			replies({
+				c: reply('c', { active: ring, highestActedOn: 1, supportsFenced: true }),
+				d: reply('d', { active: ring, highestActedOn: 1, supportsFenced: true }),
+				e: reply('e', { supportsFenced: true }),
+				f: reply('f', { supportsFenced: true }),
+			}),
+			undefined,
+			['a', 'b']
+		);
+		assert.strictEqual(recoveryIn(requested.reason).stage.body.generation, 9, 'the generation the caller asked for');
+		const exhausted = planSurvey(
+			'db',
+			['c', 'd'],
+			['a', 'b', 'c', 'd'],
+			undefined,
+			replies(
+				Object.fromEntries(
+					['c', 'd'].map((node) => [
+						node,
+						reply(node, {
+							active: state(1, ['a', 'b', 'c', 'd']),
+							highestActedOn: Number.MAX_SAFE_INTEGER,
+							supportsFenced: true,
+						}),
+					])
+				)
+			),
+			undefined,
+			['a', 'b']
+		);
+		assert.strictEqual(exhausted.status, 409);
+		assert.strictEqual(recoveryIn(exhausted.reason), undefined);
+		assert.match(exhausted.reason, /no generation above 9007199254740991 is left to re-home them by hand$/);
+	});
+});
+
 describe('record_lock_transition: the peer-callable hop', () => {
 	const peer = { name: 'peer-node', url: 'wss://peer-node:9933' };
 	const from = { name: 'peer-node' };

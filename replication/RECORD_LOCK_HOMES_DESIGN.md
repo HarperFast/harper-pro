@@ -454,17 +454,16 @@ replicated are lost or arrive late on either path.
 **Minority survivors get a 409.** A 2-node cluster that lost one node, or a 3-node cluster that lost
 two, cannot use `fenced`: no majority of the old ring answers. Without the majority rule, each side of a
 flip-flop (b down, a fences b; later a down, b restarts on its old row and fences a) would activate a
-ring of one, and both would grant. Such a cluster recovers through the per-node operations and the
-drain wait, and must keep every excluded node stopped until it is re-staged: a lease wait does not stop
-a restarted node from serving a ring of one. The majority is counted only over rings that
+ring of one, and both would grant. The majority is counted only over rings that
 `record_lock_apply_homes` activated; a ring activated with the per-node operations on a node set that
-never staged it (which §4.3's runbook already forbids) can still anchor wrongly.
+never staged it (which §4.3's runbook already forbids) can still anchor wrongly. A fenced call after an
+unfenced one is refused too: that call's stage erased the survivors' `active` ring and recorded no fence.
 
-**A fenced call after an unfenced one is refused too.** If an unfenced call staged the survivors and
-the node then died, their `active` ring is gone and no fence was recorded at that target, so a fenced
-retry is 409. Recover with the per-node operations: stage the target on any survivor that has not
-(`record_lock_stage_generation` with the same `quiesce`), wait the drain interval, then
-`record_lock_activate_generation` on each survivor in the target's `homes`. If the dead node is itself in those `homes`, do not activate a ring it never staged: stage a later generation without it the same way.
+The refusal names the per-node recovery (`manualRecovery`): the stage and activate bodies, their nodes
+and the drain wait, valid only while every fenced node stays down for good, since a lease wait does not
+stop a restarted one serving its old ring. Its generation is the call's resume target when every
+surveyed node accepts it, so a re-send during the wait names the same steps. `remove_node` retires no
+node from a ring: it stops replication, and a removed node that runs again still holds its `active` row.
 
 A fenced node that comes back is not re-admitted by this call: its `active` disagrees with the
 survivors', so a later apply that lists it refuses at survey ("nodes disagree about the active

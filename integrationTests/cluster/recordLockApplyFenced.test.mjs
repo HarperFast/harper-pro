@@ -189,4 +189,37 @@ suite('record_lock_apply_homes with a fenced node on a three-node cluster', { ti
 		assert.deepEqual(after.active, before.active);
 		assert.equal(after.staged, undefined);
 	});
+
+	test('every re-send of that refusal names the same per-node steps, and following them re-homes the survivor', async () => {
+		const survivors = names.slice(0, 2);
+		const fencedApply = {
+			operation: 'record_lock_apply_homes',
+			database: DB,
+			homes: [survivors[0]],
+			quiesce: survivors,
+			fenced: [survivors[1]],
+		};
+		const first = await operation(nodes[0], fencedApply);
+		const again = await operation(nodes[0], fencedApply);
+		assert.equal(first.status, 409, JSON.stringify(first.body));
+		assert.deepEqual(again.body, first.body);
+		const [stage, activate] = [...first.body.error.matchAll(/send (\{.*?\}) to each of (\[.*?\])/g)].map(
+			([, body, on]) => ({ body: JSON.parse(body), on: JSON.parse(on) })
+		);
+		assert.ok(activate, first.body.error);
+		assert.deepEqual(stage.on, [survivors[0]]);
+		assert.deepEqual(activate.on, [survivors[0]]);
+		assert.equal(stage.body.generation, 3);
+		const staged = await operation(nodes[0], stage.body);
+		assert.equal(staged.status, 200, JSON.stringify(staged.body));
+		const midDrain = await operation(nodes[0], fencedApply);
+		assert.equal(midDrain.body.error, first.body.error, 'a re-send during the wait repeats the same steps');
+		// Convergence and wiring only: the fixture zeroes activate's backstop and this does not wait out the drain.
+		const activated = await operation(nodes[0], activate.body);
+		assert.equal(activated.status, 200, JSON.stringify(activated.body));
+		assert.equal(await lockStatus(nodes[0], ids[0]), 200);
+		const unfenced = await apply(nodes[0], { homes: [survivors[0]] });
+		assert.equal(unfenced.outcome, 'activated', JSON.stringify(unfenced));
+		assert.deepEqual(unfenced.nodes[survivors[0]].activate, { action: 'noop' });
+	});
 });
