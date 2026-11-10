@@ -83,7 +83,7 @@ Outputs go to `benchmarks/memory-curve/runs/<run-id>/` (git-ignored): `manifest.
 ## Report definitions (`report.mts`)
 
 - **memory / data**: the cell's `memory.max` over the on-disk dataset (SST + blob files after load and compaction).
-- **reads per 1k**: data-disk reads per completed request × 1000, i.e. reads/s per 1,000 req/s. **Extra** subtracts the same figure from the unconstrained calibration of that workload and skew.
+- **reads per 1k**: data-disk reads per completed request × 1000, i.e. reads/s per 1,000 req/s. **Extra** subtracts the same figure from the unconstrained calibration of that workload and skew; without a valid calibration it is unavailable ("no baseline"), and the cell is left out of slopes and charts.
 - **p99 knee**: the largest memory step whose p99 is at least 2× the lowest p99 in its series, or that saturated (including one that completed no request).
 - **saturated cells** show the share of the offered rate served instead of reads: their reads are those of a server that stopped keeping up. Slopes skip them, and charts draw them as a cross on the top edge.
 - **reads per GB removed**: the change in extra reads per 1k between adjacent unsaturated steps divided by the memory removed, tagged with data / (mean memory of the two steps).

@@ -32,8 +32,9 @@ export interface Row {
 	/** Disk reads/s in the second half of the window relative to the first, in percent; shows unfinished warm-up. */
 	readsDriftPct: number | null;
 	readsPer1k: number;
-	extraReadsPer1k: number;
-	extraReadsPerSec: number;
+	/** Null when the workload and skew have no valid unconstrained calibration to subtract. */
+	extraReadsPer1k: number | null;
+	extraReadsPerSec: number | null;
 	readMBPerSec: number;
 	readLatencyMs: number | null;
 	dataHitPct: number | null;
@@ -94,8 +95,8 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 			readsPerSec: 0,
 			readsDriftPct: null,
 			readsPer1k: 0,
-			extraReadsPer1k: 0,
-			extraReadsPerSec: 0,
+			extraReadsPer1k: null,
+			extraReadsPerSec: null,
 			readMBPerSec: 0,
 			readLatencyMs: null,
 			dataHitPct: null,
@@ -120,10 +121,9 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 	const window = cell.server.window;
 	const okPerSec: number = measure.okPerSec;
 	const readsPer1k = readsPerRequest(window, okPerSec) * 1000;
-	const baseline = calibration
-		? readsPerRequest(calibration.server.window, calibration.client.measure.okPerSec) * 1000
-		: 0;
-	const extraReadsPer1k = Math.max(0, readsPer1k - baseline);
+	const extraReadsPer1k = calibration
+		? Math.max(0, readsPer1k - readsPerRequest(calibration.server.window, calibration.client.measure.okPerSec) * 1000)
+		: null;
 	return {
 		...base,
 		okPerSec,
@@ -132,7 +132,7 @@ export function cellRow(cell: any, calibration: any, dataset: any, pair: string)
 		readsDriftPct: driftPct(cell.server.firstHalf?.disk.readsPerSec, cell.server.secondHalf?.disk.readsPerSec),
 		readsPer1k,
 		extraReadsPer1k,
-		extraReadsPerSec: (extraReadsPer1k * okPerSec) / 1000,
+		extraReadsPerSec: extraReadsPer1k === null ? null : (extraReadsPer1k * okPerSec) / 1000,
 		readMBPerSec: window.disk.readBytesPerSec / 1e6,
 		readLatencyMs: window.disk.meanReadLatencyMs,
 		dataHitPct: cell.server.blockCache?.dataHitRate == null ? null : cell.server.blockCache.dataHitRate * 100,
@@ -168,6 +168,13 @@ export function curve(rows: Row[]): Row[] {
 	return rows
 		.filter((row) => row.valid && !row.clientLimited && !row.pinned && !row.repeat)
 		.sort((a, b) => b.memoryGiB - a.memoryGiB);
+}
+
+type Measured = Row & { extraReadsPer1k: number; extraReadsPerSec: number };
+
+/** Points with an extra-read figure: they served the offered load and had a baseline to subtract. */
+function measured(rows: Row[]): Measured[] {
+	return rows.filter((row): row is Measured => !row.saturated && row.extraReadsPer1k !== null);
 }
 
 export interface Knee {
@@ -211,7 +218,7 @@ export interface Slope {
  * a saturated cell measured a server that stopped serving the offered load.
  */
 export function slopes(series: Row[]): Slope[] {
-	const points = curve(series).filter((row) => !row.saturated);
+	const points = measured(curve(series));
 	const result: Slope[] = [];
 	for (let i = 1; i < points.length; i++) {
 		const higher = points[i - 1];
@@ -273,7 +280,14 @@ export function fioSummary(fio: any): { iops: number | null; qd1LatencyMs: numbe
 export function mermaidChart(pair: string, workload: string, rows: Row[]): string | null {
 	const stalled = curve(rows).filter((row) => row.saturated);
 	const stalledRatios = new Set(stalled.map((row) => fmt(row.ratio, 2)));
-	const points = curve(rows).filter((row) => !stalledRatios.has(fmt(row.ratio, 2)));
+	const noBaseline = [
+		...new Set(
+			curve(rows)
+				.filter((row) => row.extraReadsPer1k === null)
+				.map((row) => row.skew)
+		),
+	];
+	const points = measured(curve(rows)).filter((row) => !stalledRatios.has(fmt(row.ratio, 2)));
 	const ratios = [...new Set(points.map((row) => fmt(row.ratio, 2)))];
 	const bySkew = groupBy(points, (row) => row.skew);
 	// xychart has no gaps: a skew missing any step is left out rather than drawn through a fake zero.
@@ -291,7 +305,8 @@ export function mermaidChart(pair: string, workload: string, rows: Row[]): strin
 		(omitted.length > 0 ? `; not drawn (missing cells): ${omitted.join(', ')}` : '') +
 		(stalled.length > 0
 			? `; steps cut because a cell saturated: ${stalled.map((row) => `${row.skew} at ${fmt(row.ratio, 2)}`).join(', ')}`
-			: '');
+			: '') +
+		(noBaseline.length > 0 ? `; no valid calibration baseline: ${noBaseline.join(', ')}` : '');
 	return [
 		'```mermaid',
 		`%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "${skews.map((_, i) => PALETTE[i]).join(', ')}"}}}}%%`,
@@ -320,9 +335,7 @@ export function svgChart(workload: string, rows: Row[], ceilingIops: number | nu
 	const minX = Math.log10(Math.min(...ratios, 1) * 0.8);
 	const maxX = Math.log10(Math.max(...ratios, 1) * 1.25);
 	const maxY =
-		Math.log10(
-			1 + Math.max(10, ceilingIops ?? 0, ...points.filter((row) => !row.saturated).map((row) => row.extraReadsPerSec))
-		) * 1.05;
+		Math.log10(1 + Math.max(10, ceilingIops ?? 0, ...measured(points).map((row) => row.extraReadsPerSec))) * 1.05;
 	const x = (ratio: number) => margin.left + ((Math.log10(ratio) - minX) / (maxX - minX)) * plotWidth;
 	const y = (value: number) => margin.top + plotHeight - (Math.log10(1 + Math.max(0, value)) / maxY) * plotHeight;
 	const pairs = [...new Set(points.map((row) => row.pair))];
@@ -361,7 +374,7 @@ export function svgChart(workload: string, rows: Row[], ceilingIops: number | nu
 		const { pair, skew } = series[0];
 		const color = PALETTE[skewIndex(skew) % PALETTE.length];
 		const dash = dashes[pairs.indexOf(pair) % dashes.length];
-		const served = series.filter((row) => !row.saturated);
+		const served = measured(series);
 		const path = served
 			.map((row, i) => `${i === 0 ? 'M' : 'L'}${x(row.ratio).toFixed(1)},${y(row.extraReadsPerSec).toFixed(1)}`)
 			.join(' ');
@@ -465,7 +478,7 @@ export function renderReport(
 			if (!row.valid) return 'invalid';
 			if (row.saturated)
 				return `⚠ ${fmt(servedPct(row), 1)}% served (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
-			return `${fmt(row.extraReadsPerSec)} (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
+			return `${row.extraReadsPerSec === null ? 'no baseline' : fmt(row.extraReadsPerSec)} (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
 		});
 		lines.push(
 			`| ${group[0].pair} | ${group[0].workload} | ${group[0].skew} | ${fmt(group[0].offeredPerSec, 0)} | ${cells.join(' | ')} | ${knee(group).description} |`
@@ -512,12 +525,14 @@ export function renderReport(
 		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
 		for (const pinned of pinnedRows) {
 			const group = series.get(seriesKey(pinned)) ?? [];
-			const points = curve(group);
+			const points = measured(curve(group));
 			const full = points.find((row) => row.step === 1);
 			const half = points.find((row) => row.step === pinned.step);
 			const increase = full && half ? half.extraReadsPer1k - full.extraReadsPer1k : null;
 			const share =
-				increase && increase > 0 && half ? (half.extraReadsPer1k - pinned.extraReadsPer1k) / increase : null;
+				increase && increase > 0 && half && pinned.extraReadsPer1k !== null
+					? (half.extraReadsPer1k - pinned.extraReadsPer1k) / increase
+					: null;
 			lines.push(
 				`| ${pinned.pair} | ${pinned.workload} | ${pinned.skew} | ${fmt(full?.extraReadsPer1k)} | ${fmt(half?.extraReadsPer1k)} | ${fmt(pinned.extraReadsPer1k)} | ${share === null ? '–' : `${fmt(share * 100, 0)}%`} | ${fmt(half?.p99Ms)} / ${fmt(pinned.p99Ms)} |`
 			);

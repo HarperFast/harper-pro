@@ -182,8 +182,14 @@ describe('renderReport', () => {
 				window: { disk: { readsPerSec: 200 }, invalidReasons: ['server counters taken 90 s off the measured window'] },
 			},
 		};
-		const [row] = pairRows({ ...pair, calibrations: [badCalibration], cells: [cell(0.5, 3000, 4)] });
-		assert.equal(row.extraReadsPer1k, row.readsPer1k);
+		const withoutBaseline = { ...pair, calibrations: [badCalibration], cells: [cell(1, 100, 2), cell(0.5, 3000, 4)] };
+		const [row] = pairRows(withoutBaseline);
+		assert.equal(row.readsPer1k, 10);
+		assert.equal(row.extraReadsPer1k, null);
+		const { markdown, charts } = renderReport([withoutBaseline], { runId: 'mctest' });
+		assert.match(markdown, /\| no baseline \(2\.00\) \| no baseline \(4\.00\) \|/);
+		assert.doesNotMatch(markdown, /```mermaid/);
+		assert.doesNotMatch(charts['chart-C.svg'], /<circle/);
 	});
 
 	it('leaves a skew with a missing step out of the Mermaid chart instead of plotting a zero', () => {
