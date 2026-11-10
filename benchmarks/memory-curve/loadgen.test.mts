@@ -260,14 +260,15 @@ describe('workers over HTTP', () => {
 
 	it('runs an open-loop schedule in worker threads and sums their phases', async () => {
 		const target = { baseUrl, authorization: 'Basic test', maxSockets: 50, timeoutMs: 2000 };
-		const startMs = Date.now() + 300;
+		// Generous lead time: a worker thread that starts after startMs sends its overdue requests at once.
+		const startMs = Date.now() + 2000;
 		const phases = [
 			{ name: 'warmup', seconds: 0.2 },
 			{ name: 'measure', seconds: 0.4 },
 		];
 		const { phases: result, usage } = await runPhaseWorkers(target, [
-			{ mode: 'open', ratePerSec: 250, inFlightCap: 50, phases, startMs, op, seed: 1 },
-			{ mode: 'open', ratePerSec: 250, inFlightCap: 50, phases, startMs, op, seed: 2 },
+			{ mode: 'open', ratePerSec: 250, inFlightCap: 200, phases, startMs, op, seed: 1 },
+			{ mode: 'open', ratePerSec: 250, inFlightCap: 200, phases, startMs, op, seed: 2 },
 		]);
 		assert.equal(result.warmup.scheduled, 100);
 		assert.equal(result.measure.scheduled, 200);

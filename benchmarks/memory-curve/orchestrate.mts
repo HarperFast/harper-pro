@@ -56,6 +56,8 @@ export const CALIBRATION_SCHEMA = 'memory-curve-calibration/1';
 
 /** Fraction of scheduled requests that may be shed or time out before a cell counts as saturated. */
 const SATURATION_LOSS = 0.001;
+/** How far the server counter window may sit from the client's measured window. */
+const SCHEDULE_TOLERANCE_SEC = 15;
 
 export function phaseSummary(stats: PhaseStats, seconds: number) {
 	const failedOrShed = stats.shed + stats.timeouts;
@@ -295,14 +297,20 @@ class Orchestrator {
 	async windowSnapshots(windowStartMs: number, windowMs: number) {
 		const notes: string[] = [];
 		await delay(Math.max(0, windowStartMs - Date.now()));
-		const start = await this.snapshot();
-		const cacheStart = await this.cacheCounters(notes);
+		const [start, cacheStart] = await Promise.all([this.snapshot(), this.cacheCounters(notes)]);
 		await delay(Math.max(0, windowStartMs + windowMs / 2 - Date.now()));
 		const middle = await this.snapshot();
 		await delay(Math.max(0, windowStartMs + windowMs - Date.now()));
-		const end = await this.snapshot();
-		const cacheEnd = await this.cacheCounters(notes);
+		const [end, cacheEnd] = await Promise.all([this.snapshot(), this.cacheCounters(notes)]);
 		const window = windowMetrics(start, end);
+		const driftSec =
+			Math.max(
+				Math.abs(start.timeSeconds * 1000 - windowStartMs),
+				Math.abs(end.timeSeconds * 1000 - (windowStartMs + windowMs))
+			) / 1000;
+		if (driftSec > SCHEDULE_TOLERANCE_SEC) {
+			window.invalidReasons.push(`server counters taken ${driftSec.toFixed(0)} s off the measured window`);
+		}
 		return {
 			window,
 			firstHalf: windowMetrics(start, middle),

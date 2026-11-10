@@ -84,6 +84,8 @@ interface PairRecord {
 	outcome?: 'DONE' | 'FAILED' | 'lost' | 'crashed';
 	/** Where its results are now: verified copy, or best-effort copy of an unfinished pair. */
 	saved?: 'fetched' | 'partial';
+	/** Its orchestrator was started, so its VMs may hold measurements. */
+	started?: boolean;
 }
 
 /** Awaits every operation, so nothing is still creating resources when the first failure propagates. */
@@ -520,8 +522,10 @@ class Launcher {
 		);
 	}
 
-	async startOrchestrator(client: string): Promise<void> {
-		await this.ssh(client, `bash ${REMOTE}/client-ctl.sh start`);
+	async startOrchestrator(pair: PairRecord): Promise<void> {
+		await this.ssh(pair.client.externalIp!, `bash ${REMOTE}/client-ctl.sh start`);
+		pair.started = true;
+		await this.saveManifest();
 	}
 
 	async pairState(client: string): Promise<{ marker: 'DONE' | 'FAILED' | null; alive: boolean; status: any }> {
@@ -594,7 +598,7 @@ class Launcher {
 					restarts.set(pair.name, count);
 					pending++;
 					log(`${pair.name}: orchestrator not running and no result marker; restarting it (it resumes)`);
-					await this.startOrchestrator(pair.client.externalIp!);
+					await this.startOrchestrator(pair);
 				}
 			}
 			if (pending === 0) break;
@@ -621,6 +625,7 @@ class Launcher {
 			if (pair.saved || !pair.client.externalIp) continue;
 			const destination = join(this.runDir, `${pair.name}-partial`);
 			try {
+				await this.ssh(pair.client.externalIp, `bash ${REMOTE}/client-ctl.sh stop`, 60_000);
 				await rm(destination, { recursive: true, force: true });
 				await this.scp([`${USER}@${pair.client.externalIp}:${REMOTE}/results`], destination);
 				await this.scp([`${USER}@${pair.client.externalIp}:${REMOTE}/orchestrate.out`], destination).catch(() => '');
@@ -764,20 +769,23 @@ async function main(): Promise<void> {
 			);
 		});
 	}
+	if (options.command === 'resume') {
+		await launcher.loadManifest();
+		// Refused before the try, so the refusal never reaches the cleanup in its finally.
+		if (!launcher.manifest.pairs.some((pair) => pair.started)) {
+			throw new Error(`run ${options.runId} never started measuring; delete it with cleanup and start a new run`);
+		}
+	}
 	let finished = false;
 	try {
 		if (options.command === 'run') {
 			const tarball = await launcher.sourceTarball();
 			await launcher.create(plans);
 			await launcher.provision(plans, tarball);
-			for (const pair of launcher.manifest.pairs) await launcher.startOrchestrator(pair.client.externalIp!);
+			for (const pair of launcher.manifest.pairs) await launcher.startOrchestrator(pair);
 			launcher.manifest.state = 'running';
 			await launcher.saveManifest();
 		} else {
-			await launcher.loadManifest();
-			if (launcher.manifest.state === 'creating') {
-				throw new Error(`run ${options.runId} never finished provisioning; delete it with cleanup and start a new run`);
-			}
 			for (const pair of launcher.manifest.pairs) {
 				// A resumed pair is polled afresh: a lost client may be reachable again, and an earlier partial copy is stale.
 				if (pair.outcome === 'lost' || pair.outcome === 'crashed') pair.outcome = undefined;
@@ -802,7 +810,7 @@ async function main(): Promise<void> {
 			try {
 				if (!launcher.manifest) await launcher.loadManifest();
 				// Before the orchestrators start, the VMs hold nothing measured.
-				const measuring = launcher.manifest.state !== 'creating';
+				const measuring = launcher.manifest.pairs.some((pair) => pair.started);
 				if (!finished && measuring) await launcher.fetchPartial();
 				const unsaved = measuring ? launcher.unsavedPairs() : [];
 				if (unsaved.length > 0) {
