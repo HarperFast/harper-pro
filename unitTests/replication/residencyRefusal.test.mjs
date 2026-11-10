@@ -1,8 +1,4 @@
-/**
- * An owner's refusal of this node's stream, as the write guard reads it (harper-pro#1278): set when the owner closes
- * a sender's stream refusing it, cleared when a sender of that or a later generation starts replaying, and never set
- * again by an earlier sender whose close lands after its replacement replays.
- */
+// The refusal the write guard reads (harper-pro#1278), fenced by sender generation.
 import assert from 'node:assert';
 import { registerResidencySender, residencyOwnerRefusing } from '#src/replication/residencyTopology';
 
@@ -40,6 +36,14 @@ describe('residency owner refusal', () => {
 		later.replaying();
 		assert.strictEqual(earlier.refused(), false);
 		assert.strictEqual(residencyOwnerRefusing(store, 'data', 'owner'), false);
+	});
+
+	it('keeps a refusal that lands after the same sender started replaying', () => {
+		const store = fakeStore();
+		const sender = registerResidencySender(store, 'data', 'owner');
+		sender.replaying();
+		assert.strictEqual(sender.refused(), true);
+		assert.strictEqual(residencyOwnerRefusing(store, 'data', 'owner'), true);
 	});
 
 	it("keeps a later sender's refusal when an earlier sender replays", () => {

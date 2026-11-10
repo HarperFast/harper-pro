@@ -774,10 +774,8 @@ export function predatesPurgeTracking(
 }
 
 /**
- * What a subscription's first pass does with a start this node cannot vouch for: one that may be below purged
- * history (`retentionGap`), or a floor certified under another database generation. A receiver that owns sharding
- * slots this node cannot copy (`restricted`) refuses every base copy, so that route replays what is retained
- * instead (harper-pro#1278). Only the test hook still forces a copy there.
+ * A receiver that owns sharding slots this node cannot copy (`restricted`) refuses every base copy, so a start this
+ * node cannot vouch for replays what is retained there instead (harper-pro#1278).
  */
 export function retentionResumeDecision(
 	forceForTest: boolean,
@@ -790,7 +788,8 @@ export function retentionResumeDecision(
 	return restricted ? 'replay-unvouched' : 'copy';
 }
 
-// the last reason each (database, peer) was warned for, so reconnects for the same reason stay quiet
+const purgedThrough = (bound: number | undefined) => (bound === undefined ? 'unknown' : new Date(bound).toISOString());
+
 const unvouchedReplayWarned = new Map<string, string>();
 export function shouldWarnUnvouchedReplay(database: string, peer: string, reason: string): boolean {
 	const key = database + '\0' + peer;
@@ -800,10 +799,14 @@ export function shouldWarnUnvouchedReplay(database: string, peer: string, reason
 }
 
 // Integration tests force the retention copy for the named databases to exercise what a receiver does with
-// a copy it cannot accept (harper-pro#1231).
+// a copy it cannot accept (harper-pro#1231), until HARPER_TEST_FORCE_RETENTION_COPY_UNTIL (epoch ms) when set.
 const FORCE_RETENTION_COPY_DATABASES_FOR_TEST = process.env.HARPER_TEST_FORCE_RETENTION_COPY_DATABASES?.split(',');
+const FORCE_RETENTION_COPY_UNTIL_FOR_TEST = Number(process.env.HARPER_TEST_FORCE_RETENTION_COPY_UNTIL) || Infinity;
 function forceRetentionCopyForTest(databaseName: string): boolean {
-	return FORCE_RETENTION_COPY_DATABASES_FOR_TEST?.includes(databaseName) === true;
+	return (
+		FORCE_RETENTION_COPY_DATABASES_FOR_TEST?.includes(databaseName) === true &&
+		Date.now() < FORCE_RETENTION_COPY_UNTIL_FOR_TEST
+	);
 }
 
 // A peer naming more new origins than this on one connection is not sending orphan v4-era ids.
@@ -10191,16 +10194,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													retentionGap,
 													restrictedSendingOrigins
 												);
-												const purgedThrough = (bound: number | undefined) =>
-													bound === undefined ? 'unknown' : new Date(bound).toISOString();
 												if (decision === 'replay-unvouched') {
 													const from = new Date(currentSequenceId).toISOString();
-													const reason = otherGeneration
-														? 'from a floor this node certified under another database generation'
-														: `from ${from}, under transaction-log history purged through ${purgedThrough(purgedLog ? purgedLog.bound : predatesTracking ? trackedFrom : undefined)}`;
-													if (shouldWarnUnvouchedReplay(databaseName, remoteNodeName, reason))
+													const purged = otherGeneration
+														? undefined
+														: purgedThrough(purgedLog ? purgedLog.bound : predatesTracking ? trackedFrom : undefined);
+													if (shouldWarnUnvouchedReplay(databaseName, remoteNodeName, purged ?? 'another generation'))
 														logger.warn?.(
-															`Peer ${remoteNodeName} requested replication of database ${databaseName} ${reason}; it owns sharding slots this node cannot copy, so replay continues from ${from}, and writes from this node it has not received may be missing there.`
+															`Peer ${remoteNodeName} requested replication of database ${databaseName} ${purged === undefined ? 'from a floor this node certified under another database generation' : `from ${from}, under transaction-log history purged through ${purged}`}; it owns sharding slots this node cannot copy, so replay continues from ${from}, and writes from this node it has not received may be missing there.`
 														);
 												} else if (decision === 'copy') {
 													logger.warn?.(

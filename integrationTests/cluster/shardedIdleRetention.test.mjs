@@ -11,7 +11,7 @@
  * Then node 0 restarts with its retention copy forced (HARPER_TEST_FORCE_RETENTION_COPY_DATABASES): node 1
  * must log the refusal once, show it as `stuckCopy` in cluster_status, and hold its reconnects, and a write
  * through node 0 for a key node 1 owns returns 503 rather than an acknowledgement no owner will see.
- * Restarting node 0 without the forced copy clears the refusal.
+ * Node 1's next subscription, once the forcing has stopped, clears the refusal in the same node 0 process.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -208,7 +208,11 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 	test("an owner's refusal of a forced copy is logged once, reported, and backed off", async () => {
 		await killHarper({ harper: nodes[0] });
 		const marks = await Promise.all(nodes.map(logMark));
-		await start(0, { HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: 'data' });
+		// forced only before node 1's first hold ends, so its retry replays (test 3)
+		await start(0, {
+			HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: 'data',
+			HARPER_TEST_FORCE_RETENTION_COPY_UNTIL: String(Date.now() + 45_000),
+		});
 		const stuck = await waitForCondition(
 			async (signal) => {
 				const socket = await socketTo(nodes[1], nodes[0], signal);
@@ -236,17 +240,22 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		ok(forced.length >= 1 && forced.length <= 2, `node 0 forced ${forced.length} copies:\n${forced.join('\n')}`);
 	});
 
-	test('a restart clears the refusal, and writes through node 0 reach node 1 again', async () => {
+	test("node 1's next subscription clears the refusal in the running node 0, and writes reach node 1 again", async () => {
 		const held = await socketTo(nodes[1], nodes[0]);
-		await killHarper({ harper: nodes[0] });
-		await start(0);
-		// node 1 resubscribes only once its refusal hold ends
 		const holdMs = Math.max(0, (Date.parse(held?.stuckCopy?.retryAt) || 0) - Date.now());
-		await waitForCondition(async (signal) => (await socketTo(nodes[1], nodes[0], signal))?.connected, {
-			timeoutMs: holdMs + 90_000,
-			description: "node 1's leg from node 0 connected",
-		});
-		await put(nodes[0], OWNED_BY[1][0], 'after-refusal');
+		const accepted = await waitForCondition(
+			async (signal) => {
+				const response = await request(nodes[0], `Rows/${OWNED_BY[1][0]}`, {
+					method: 'PUT',
+					body: JSON.stringify({ id: OWNED_BY[1][0], body: 'after-refusal' }),
+					signal,
+				});
+				await response.text();
+				return response.status < 300;
+			},
+			{ timeoutMs: holdMs + 90_000, description: 'node 0 to accept a write for node 1 once node 1 resubscribes' }
+		);
+		ok(accepted);
 		await ownerHolds(1, OWNED_BY[1][0], 'after-refusal');
 		ok(await holds(nodes[1], OWNED_BY[1][1], 'while-0-down'), 'the refused write changed nothing on node 1');
 	});
