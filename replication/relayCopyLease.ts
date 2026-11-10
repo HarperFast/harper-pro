@@ -35,7 +35,7 @@ export function relayCopyLeaseHeld(auditStore: any, database: string, now = Date
 }
 
 export interface RelayCopyLease {
-	/** Extends the slot, or claims another if it lapsed and was taken; releases instead once the pass stopped. */
+	/** Extends the slot, or claims another if it lapsed and was taken; releases instead once the pass stopped. Calls `onLost` when no slot is left. */
 	renew(): void;
 	/** The pass applied its last row: release at the deadline unless it settles first. */
 	armSettleDeadline(onExpire: () => void): void;
@@ -49,7 +49,11 @@ export function holdRelayCopyLease(
 	auditStore: any,
 	database: string,
 	running: () => boolean,
-	{ clock = Date.now, settleDeadlineMs = RELAY_COPY_SETTLE_DEADLINE_MS } = {}
+	{
+		clock = Date.now,
+		settleDeadlineMs = RELAY_COPY_SETTLE_DEADLINE_MS,
+		onLost = () => {},
+	}: { clock?: () => number; settleDeadlineMs?: number; onLost?: () => void } = {}
 ): RelayCopyLease | undefined {
 	const slots = leaseSlots(auditStore, database);
 	let held: { index: number; expiry: bigint } | undefined;
@@ -76,7 +80,10 @@ export function holdRelayCopyLease(
 			if (!running()) return lease.release();
 			const expiry = millis(clock() + RELAY_COPY_LEASE_TTL_MS);
 			if (held && Atomics.compareExchange(slots, held.index, held.expiry, expiry) === held.expiry) held.expiry = expiry;
-			else claim();
+			else if (!claim()) {
+				lease.release();
+				onLost();
+			}
 		},
 		armSettleDeadline(onExpire) {
 			if (deadline || !held) return;

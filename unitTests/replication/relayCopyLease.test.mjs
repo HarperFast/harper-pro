@@ -89,6 +89,18 @@ describe('relay copy lease', () => {
 		assert.strictEqual(relayCopyLeaseHeld(store, 'data', now), false);
 	});
 
+	it('reports a stalled pass whose lapsed slot was taken when no other is free', () => {
+		const store = sharedStore();
+		let lost = 0;
+		const stalled = hold(store, 'data', () => true, { onLost: () => lost++ });
+		now += RELAY_COPY_LEASE_TTL_MS + 1;
+		for (let i = 0; i < 8; i++) assert.ok(hold(store, 'data'));
+		stalled.renew();
+		assert.strictEqual(lost, 1);
+		for (const lease of leases.slice(1)) lease.release();
+		assert.strictEqual(relayCopyLeaseHeld(store, 'data', now), false);
+	});
+
 	it('refuses a claim when every slot is live, and lets one in once a slot lapses', () => {
 		const store = sharedStore();
 		for (let i = 0; i < 8; i++) assert.ok(hold(store, 'data'));

@@ -387,6 +387,7 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 		// logged by the gateway as its log tail while the pass stays open
 		const tail = startRowWriter(leaf, 'open-tail');
 		let tailRows;
+		let tailStopped = false;
 		try {
 			await restart(follower);
 			await waitForLink(follower.harper, relay.harper);
@@ -403,8 +404,13 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 					description: `${relay.harper.hostname} forcing a base copy for ${follower.harper.hostname} once its own settled`,
 				}
 			);
-		} finally {
 			tailRows = await tail.stop();
+			tailStopped = true;
+			// while the relay is still the follower's only path
+			await waitForPhase([follower.harper], 'open-copied', COPIED_ROWS);
+			await waitForPhase([follower.harper], 'open-tail', tailRows);
+		} finally {
+			if (!tailStopped) tailRows = await tail.stop();
 			await reconnectAll(relay, follower);
 		}
 		await waitForPhase(nodes(), 'open-copied', COPIED_ROWS);
@@ -428,6 +434,7 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 			const later = await insert(leaf, 'restart-later', leaf.hostname, 20);
 			// the follower reaches no other peer, so these rows came through the restarted gateway
 			await waitForPhase([follower.harper], 'restart-later', later.length);
+			await waitForPhase([follower.harper], 'restart-copied', COPIED_ROWS);
 		} finally {
 			await reconnectAll(relay, follower);
 		}
