@@ -40,6 +40,8 @@ const IDLE_MS = (RETENTION_S + 25) * 1000;
 const FORCED_COPY = 'forcing a bounded base-copy resync';
 const OWN_LOG_PURGED_THROUGH =
 	/of database data, whose log local it would replay from \S+, under transaction-log history purged through (\S+);/;
+// log keys come from a performance.now()-based clock, which can trail Date.now() by milliseconds
+const CLOCK_SLACK_MS = 1000;
 
 for (const engine of ['rocksdb', 'lmdb']) {
 	suite(`retention base copy follows the purge bound (${engine})`, { timeout: 600_000 }, (ctx) => {
@@ -48,10 +50,17 @@ for (const engine of ['rocksdb', 'lmdb']) {
 		const options = (node) => ({
 			config: {
 				analytics: { aggregatePeriod: -1 },
-				logging: { colors: false, stdStreams: false, console: true, level: 'debug', auditRetention: RETENTION_S },
+				logging: {
+					colors: false,
+					stdStreams: false,
+					console: true,
+					level: 'debug',
+					auditRetention: RETENTION_S,
+					// marks into hdb.log assume it is only appended to
+					rotation: { enabled: false },
+				},
 				replication: { port: node.hostname + ':9933', securePort: null, databases: ['data'] },
 			},
-			// no HARPER_NO_FLUSH_ON_EXIT: A's restart must flush its log for retention to delete it
 			env: engine === 'lmdb' ? { HARPER_STORAGE_ENGINE: 'lmdb' } : {},
 		});
 
@@ -110,7 +119,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 
 		after(() => stopAndTeardownNodes([A, B]));
 
-		test('a follower that missed nothing resumes from an idle source without a copy', async () => {
+		test('a follower that missed nothing resumes from a source that purged its log without a copy', async () => {
 			await upsert(A, 'caught-up');
 			await arrives(B, 'caught-up');
 			await stop(B);
@@ -125,17 +134,20 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			equal(forced.length, 0, `A forced a copy for B:\n${forced.join('\n')}`);
 		});
 
-		test('a follower that missed a write A has since aged out gets a copy and the write', async () => {
+		test('a follower that missed a write A has since purged gets a copy and the write', async () => {
 			await stop(B);
+			const beforeMissed = Date.now();
 			await upsert(A, 'missed');
 			await purgeOwnLog(A);
 			const mark = await logMark(A);
 			await start(B);
 			await arrives(B, 'missed');
-			const forced = forcedCopiesTo(B, await readLogSince(A, mark));
+			const served = await readLogSince(A, mark);
+			ok(served.includes('subscription to'), 'the log read is of the process that served B');
+			const forced = forcedCopiesTo(B, served);
 			ok(
-				forced.some((line) => Number.isFinite(Date.parse(line.match(OWN_LOG_PURGED_THROUGH)?.[1]))),
-				`A forced the copy that carries the missed write for its own log's purge bound:\n${forced.join('\n')}`
+				forced.some((line) => Date.parse(line.match(OWN_LOG_PURGED_THROUGH)?.[1]) >= beforeMissed - CLOCK_SLACK_MS),
+				`A forced the copy for its own log, purged through the missed write:\n${forced.join('\n')}`
 			);
 		});
 	});
