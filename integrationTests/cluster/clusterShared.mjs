@@ -366,6 +366,29 @@ export async function waitForCondition(probe, opts = {}) {
 }
 
 /**
+ * The `.txnlog` segments of one of a RocksDB node's transaction logs. A missing directory throws instead of reading as
+ * a purged log.
+ */
+export async function logSegments(node, logName, database = 'data') {
+	const { readdir } = await import('node:fs/promises');
+	const files = await readdir(join(node.dataRootDir, 'database', database, 'transaction_logs', logName));
+	return files.filter((file) => file.endsWith('.txnlog'));
+}
+
+/**
+ * Wait until retention has deleted every segment of a RocksDB node's transaction log. Retention deletes a segment only
+ * once every entry in it is flushed to RocksDB, and an idle node can keep a write unflushed long past retention, so
+ * elapsed time does not establish a purge; a clean stop flushes.
+ */
+export function waitForLogPurged(node, logName, { database = 'data', timeoutMs = 180_000 } = {}) {
+	let remaining = [];
+	return waitForCondition(async () => (remaining = await logSegments(node, logName, database)).length === 0, {
+		timeoutMs,
+		description: () => `${logName}'s log purged on ${node.hostname} (still holds ${remaining.join(', ')})`,
+	});
+}
+
+/**
  * Snapshot of memory state on a single node. The shape is stable for tests so we don't
  * depend on `system_information`'s evolving structure: main-process RSS plus the most
  * informative per-thread heap metric. (Per-worker RSS isn't reported individually by
