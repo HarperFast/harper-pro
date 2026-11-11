@@ -179,13 +179,6 @@ export function curve(rows: Row[]): Row[] {
 		.sort((a, b) => b.memoryGiB - a.memoryGiB);
 }
 
-type Measured = Row & { extraReadsPer1k: number; extraReadsPerSec: number };
-
-/** Points with an extra-read figure: they served the offered load and had a baseline to subtract. */
-function measured(rows: Row[]): Measured[] {
-	return rows.filter((row): row is Measured => !row.saturated && row.extraReadsPer1k !== null);
-}
-
 /** Extra reads/s where an in-memory baseline exists, otherwise total data-disk reads/s. */
 function plotted(row: Row): number {
 	return row.extraReadsPerSec ?? row.readsPerSec;
@@ -545,22 +538,27 @@ export function renderReport(
 		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
 		for (const pinned of pinnedRows) {
 			const group = series.get(seriesKey(pinned)) ?? [];
-			const points = measured(curve(group));
-			const full = points.find((row) => row.step === 1);
-			const half = points.find((row) => row.step === pinned.step);
-			const increase = full && half ? half.extraReadsPer1k - full.extraReadsPer1k : null;
-			const [control] = measured([pinned]);
+			const served = curve(group).filter((row) => !row.saturated);
+			const full = served.find((row) => row.step === 1);
+			const half = served.find((row) => row.step === pinned.step);
+			const control = pinned.saturated ? undefined : pinned;
+			// The baseline cancels in this ratio, so raw reads also serve a series without one.
+			const increase = full && half ? half.readsPer1k - full.readsPer1k : null;
 			const share =
-				increase && increase > 0 && half && control
-					? (half.extraReadsPer1k - control.extraReadsPer1k) / increase
-					: null;
+				increase && increase > 0 && half && control ? (half.readsPer1k - control.readsPer1k) / increase : null;
+			const reads = (row: Row | undefined) =>
+				row === undefined
+					? '–'
+					: row.extraReadsPer1k === null
+						? `${fmt(row.readsPer1k)} total`
+						: fmt(row.extraReadsPer1k);
 			const controlCell = pinned.notReady
 				? '⚠ did not start'
 				: pinned.saturated
 					? `⚠ ${fmt(servedPct(pinned), 1)}% served`
-					: fmt(pinned.extraReadsPer1k);
+					: reads(pinned);
 			lines.push(
-				`| ${pinned.pair} | ${pinned.workload} | ${pinned.skew} | ${fmt(full?.extraReadsPer1k)} | ${fmt(half?.extraReadsPer1k)} | ${controlCell} | ${share === null ? '–' : `${fmt(share * 100, 0)}%`} | ${fmt(half?.p99Ms)} / ${fmt(pinned.p99Ms)} |`
+				`| ${pinned.pair} | ${pinned.workload} | ${pinned.skew} | ${reads(full)} | ${reads(half)} | ${controlCell} | ${share === null ? '–' : `${fmt(share * 100, 0)}%`} | ${fmt(half?.p99Ms)} / ${fmt(pinned.p99Ms)} |`
 			);
 		}
 	}

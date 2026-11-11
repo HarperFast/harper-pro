@@ -249,6 +249,22 @@ describe('renderReport', () => {
 		assert.doesNotMatch(markdown, /no valid calibration baseline/);
 	});
 
+	it('gives a pinning share from raw reads when the series has no in-memory baseline', () => {
+		const onDisk = { ...calibration, server: { window: { disk: { readsPerSec: 5000 }, invalidReasons: [] } } };
+		const { markdown } = renderReport(
+			[
+				{
+					...pair,
+					calibrations: [onDisk],
+					cells: [cell(1, 1000, 2), cell(0.5, 3000, 4.5), cell(0.5, 2000, 3, { pinned: true })],
+				},
+			],
+			{ runId: 'mctest' }
+		);
+		// (300 - 200) of the (300 - 100) reads per 1k increase.
+		assert.match(markdown, /\| 100 total \| 300 total \| 200 total \| 50% \|/);
+	});
+
 	it('gives no pinning share for a saturated pinned control', () => {
 		const { markdown } = renderReport(
 			[{ ...pair, cells: [cell(1, 100, 2), cell(0.5, 1500, 4.5), cell(0.5, 0, 0, { pinned: true, saturated: true })] }],
