@@ -372,7 +372,6 @@ export async function logSegments(node, logName, database = 'data') {
 	return files.filter((file) => file.endsWith('.txnlog'));
 }
 
-/** Wait until retention has deleted every segment of a RocksDB node's transaction log. */
 export function waitForLogPurged(node, logName, { database = 'data', timeoutMs = 180_000 } = {}) {
 	let remaining = [];
 	return waitForCondition(async () => (remaining = await logSegments(node, logName, database)).length === 0, {

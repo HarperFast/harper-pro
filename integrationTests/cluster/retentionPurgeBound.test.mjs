@@ -42,8 +42,8 @@ const KEEPALIVE_MS = 15_000;
 const FORCED_COPY = 'forcing a bounded base-copy resync';
 const OWN_LOG_PURGED_THROUGH =
 	/of database data, whose log local it would replay from \S+, under transaction-log history purged through (\S+);/;
-// log keys come from a performance.now()-based clock, which can trail Date.now() by milliseconds
-const CLOCK_SLACK_MS = 100;
+// log keys come from a performance.now()-based clock that can trail Date.now(); an earlier purge's bound is seconds older
+const CLOCK_SLACK_MS = 1000;
 
 for (const engine of ['rocksdb', 'lmdb']) {
 	suite(`retention base copy follows the purge bound (${engine})`, { timeout: 600_000 }, (ctx) => {
@@ -178,7 +178,7 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			const forced = forcedCopiesTo(B, served);
 			ok(
 				forced.some((line) => Date.parse(line.match(OWN_LOG_PURGED_THROUGH)?.[1]) >= beforeMissed - CLOCK_SLACK_MS),
-				`A forced the copy for its own log, purged through the missed write:\n${forced.join('\n')}`
+				`A forced the copy for its own log, purged through the missed write (written after ${new Date(beforeMissed).toISOString()}):\n${forced.join('\n')}`
 			);
 		});
 	});
