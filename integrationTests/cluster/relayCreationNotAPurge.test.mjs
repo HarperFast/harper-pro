@@ -8,11 +8,17 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert/strict';
-import { readdir } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition, readLog } from './clusterShared.mjs';
+import {
+	sendOperation,
+	stopAndTeardownNodes,
+	stopNodeProcess,
+	waitForCondition,
+	waitForLogPurged,
+	readLog,
+} from './clusterShared.mjs';
 
 const TEST_DIR = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 'dist', 'bin', 'harper.js');
@@ -143,17 +149,6 @@ function chain(ctx, auditRetention, env) {
 		await expectNoForcedCopy(B, C);
 	}
 
-	const segmentsOfLog = async (node, logName) => {
-		const files = await readdir(join(node.dataRootDir, 'database', 'data', 'transaction_logs', logName));
-		return files.filter((file) => file.endsWith('.txnlog'));
-	};
-
-	const logPurged = (node, logName) =>
-		waitForCondition(async () => (await segmentsOfLog(node, logName)).length === 0, {
-			timeoutMs: 180_000,
-			description: `${logName}'s log purged on ${node.hostname}`,
-		});
-
 	async function build({ joinFollower = true } = {}) {
 		const A = await create('A');
 		await delay(20);
@@ -187,7 +182,6 @@ function chain(ctx, auditRetention, env) {
 		lastDataSubscriptionCursors,
 		restartFollower,
 		restartRelay,
-		logPurged,
 		build,
 	};
 }
@@ -209,13 +203,13 @@ suite('a relay younger than the follower cursor it serves', { timeout: 900_000 }
 const RETENTION = { auditRetention: 40 };
 
 suite('a relayed log the relay purged after the follower held it', { timeout: 600_000 }, (ctx) => {
-	const { nodes, restartFollower, restartRelay, logPurged, build } = chain(ctx, RETENTION);
+	const { nodes, restartFollower, restartRelay, build } = chain(ctx, RETENTION);
 
 	before(build);
 	after(() => stopAndTeardownNodes(Object.values(nodes)));
 
 	test('forces no copy', async () => {
-		await logPurged(nodes.B, nodes.A.hostname);
+		await waitForLogPurged(nodes.B, nodes.A.hostname);
 		await restartFollower('after-purge-follower-restart');
 		await restartRelay('after-purge-relay-restart');
 	});
@@ -223,7 +217,7 @@ suite('a relayed log the relay purged after the follower held it', { timeout: 60
 
 suite('a relayed log the relay purged before the follower received all of it', { timeout: 600_000 }, (ctx) => {
 	const FLOOR_INTERVAL_MS = 2000;
-	const { nodes, start, stop, upsert, arrive, forcedCopies, logPurged, build } = chain(ctx, RETENTION, {
+	const { nodes, start, stop, upsert, arrive, forcedCopies, build } = chain(ctx, RETENTION, {
 		HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS: String(FLOOR_INTERVAL_MS),
 	});
 
@@ -244,7 +238,7 @@ suite('a relayed log the relay purged before the follower received all of it', {
 		// segment flush; stopping B flushes its open segment cleanly.
 		await stop(B);
 		await start(B);
-		await logPurged(B, A.hostname);
+		await waitForLogPurged(B, A.hostname);
 		await start(C);
 		await arrive(C, 'missed');
 		const forced = await forcedCopies(B, C);
