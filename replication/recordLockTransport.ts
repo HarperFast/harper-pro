@@ -393,7 +393,7 @@ export function createRecordLockTransport(
 		// that succeeded and found no active generation says the operator has not applied a map.
 		homeMapUnavailableReason(): string | undefined {
 			return mapConfirmedAbsent()
-				? 'apply one with record_lock_apply_homes, run on any node and naming every node that replicates the database'
+				? 'this node has read none applied: apply one with record_lock_apply_homes, run on any node and naming every node that replicates the database'
 				: undefined;
 		},
 		requestDelegation(node: string, db: string, table: string, request: DelegationRequest): Promise<DelegationReply> {

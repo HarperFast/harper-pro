@@ -113,13 +113,20 @@ suite('cluster record locks enabled with no home map applied', { timeout: 300_00
 		const etag = read.headers.get('etag');
 		assert.ok(etag, 'a read answers an ETag to condition on');
 		await read.text();
-		const write = await fetch(`${context.harper.httpURL}/Counter/${id}`, {
-			method: 'PUT',
-			headers: { 'Content-Type': 'application/json', 'If-Match': etag },
-			body: JSON.stringify({ id, n: 2 }),
-			signal: AbortSignal.timeout(30_000),
-		});
-		const body = await write.text();
+		const write = await waitForCondition(
+			async (signal) => {
+				const attempt = await fetch(`${context.harper.httpURL}/Counter/${id}`, {
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/json', 'If-Match': etag },
+					body: JSON.stringify({ id, n: 2 }),
+					signal,
+				});
+				const text = await attempt.text();
+				return /record_lock_apply_homes/.test(text) ? { status: attempt.status, text } : undefined;
+			},
+			{ timeoutMs: 60_000, description: 'a refused conditional PUT naming record_lock_apply_homes' }
+		);
+		const body = write.text;
 		assert.equal(write.status, 503, body);
 		assert.match(body, /record_lock_apply_homes/);
 		assert.equal((await counter(context.harper, id))?.n, 1);

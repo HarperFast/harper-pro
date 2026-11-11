@@ -110,7 +110,8 @@ runs had +0.5 ms (19.3 vs 18.8) and −0.9 ms (22.1 vs 23.0). The sign flips run
 difference is **inside noise**. (The `on` arm's 110 ms max was one batch in one run — a stall on the
 box, not a lock cost: the arm never runs a round.) That matches
 the code: the unlocked write path never consults the transport (`getClusterLockTransport` is reached
-only from `lock()` and from the replicated-entry sink), so there is nothing for the gate to cost.
+from `lock()`, the replicated-entry sink and, since harper#4279, a conditional REST write binding to a
+replicated table, which reads `disabled` once; these puts are unconditional), so there is nothing for the gate to cost.
 
 ## Caveat that shaped the harness
 
