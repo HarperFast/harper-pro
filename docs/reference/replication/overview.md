@@ -451,7 +451,7 @@ Cluster record locks are off unless you turn them on. While they are off, a clus
    - `incomplete`: a node did not finish staging or activating, so some nodes refuse locks. Repeat the same call.
    - `staged`: every node stopped granting, but one could not prove it holds no locks. Wait `retryAfterMs`, then repeat the call with the `generation` it returned and `"drained": true`.
 
-Until the map is applied, a cluster `lock()` waits up to 10 seconds within its timeout and then answers `503`.
+Between the two steps, a cluster `lock()` and a conditional write wait up to 10 seconds within their timeout and then answer `503`, so apply the map right after the restarts.
 
 The home map changes only when an operator applies a new one, so apply one after membership changes:
 
