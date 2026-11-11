@@ -157,6 +157,18 @@ export function peerSupportsTombstoneCopy(resolved: ResolvedPeerCapabilities): b
 	return resolved.tombstoneCopy >= TOMBSTONE_COPY_CAPABILITY;
 }
 
+/**
+ * Whether a subscription request declares `tombstoneCopy`. The sender reads it only while the receiver's bag is
+ * not learned, so a copy started then still sends delete tombstones as `delete` to a receiver that stores them.
+ */
+export function receiverDeclaresTombstoneCopy(entries: unknown): boolean {
+	if (!Array.isArray(entries)) return false;
+	return entries.some((entry) => {
+		const level = entry?.tombstoneCopy;
+		return typeof level === 'number' && Number.isFinite(level) && level >= TOMBSTONE_COPY_CAPABILITY;
+	});
+}
+
 export function peerSupportsResidencyNotResident(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.residencyNotResident >= RESIDENCY_NOT_RESIDENT_CAPABILITY;
 }

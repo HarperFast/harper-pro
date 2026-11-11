@@ -99,10 +99,14 @@ describe('delete tombstones in a base copy', function () {
 		}
 	}
 
-	async function copiedRecords(unlearned = false) {
+	async function copiedRecords(unlearned = false, declared = {}) {
 		socket.emit(
 			'message',
-			encode([SUBSCRIPTION_REQUEST, [{ name: PEER, startTime: 0, tables: [], replicateByDefault: true }], []])
+			encode([
+				SUBSCRIPTION_REQUEST,
+				[{ name: PEER, startTime: 0, tables: [], replicateByDefault: true, ...declared }],
+				[],
+			])
 		);
 		if (unlearned) {
 			// no safeCopyAudit either, so the copy first asks for the peer's version
@@ -183,4 +187,31 @@ describe('delete tombstones in a base copy', function () {
 			assert.deepEqual(deleted.bytes, nilPutEncoding('deleted', deleted.entry.nodeId));
 		});
 	}
+
+	it('sends a tombstone as a delete to a peer whose bag is not learned but whose request declares tombstoneCopy', async () => {
+		await connect();
+		const records = await copiedRecords(true, { tombstoneCopy: 1 });
+		const deleted = records.get('deleted')?.entry;
+		assert.equal(deleted?.type, 'delete');
+		assert.equal(deleted.version, Records.primaryStore.getEntry('deleted').version);
+		assert.equal(records.get('published')?.entry.type, 'put', 'a publish-only head is not a delete');
+	});
+
+	for (const tombstoneCopy of [0, '1', true, null]) {
+		it(`ignores a request declaring tombstoneCopy: ${JSON.stringify(tombstoneCopy)}`, async () => {
+			await connect();
+			const records = await copiedRecords(true, { tombstoneCopy });
+			const deleted = records.get('deleted');
+			assert.equal(deleted?.entry.type, 'put');
+			assert.deepEqual(deleted.bytes, nilPutEncoding('deleted', deleted.entry.nodeId));
+		});
+	}
+
+	it('follows a learned bag without tombstoneCopy over a request declaring it', async () => {
+		const bag = { ...buildLocalCapabilities(90_000, false, true) };
+		delete bag.tombstoneCopy;
+		await connect(bag);
+		const records = await copiedRecords(false, { tombstoneCopy: 1 });
+		assert.equal(records.get('deleted')?.entry.type, 'put');
+	});
 });

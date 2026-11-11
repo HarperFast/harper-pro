@@ -199,9 +199,11 @@ import {
 	peerSupportsResidencyStubCopy,
 	peerSupportsTombstoneCopy,
 	peerSupportsTableLifecycle,
+	receiverDeclaresTombstoneCopy,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
+	TOMBSTONE_COPY_CAPABILITY,
 	type ResolvedPeerCapabilities,
 } from './protocolCapabilities.ts';
 import {
@@ -9345,6 +9347,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							!!receiverLayout && shardingSourceCertificate(databaseName) !== receiverLayout;
 						// a peer too old to declare it: a wrong guess of copy is a held, reported refusal, a wrong replay loses rows
 						const refusesCopies = receiverRefusesCopies(data, getThisNodeName(), restrictedSendingOrigins);
+						const sendTombstonesAsDeletes = peerCapabilitiesLearned
+							? peerSupportsTombstoneCopy(peerCapabilities)
+							: receiverDeclaresTombstoneCopy(data);
 						const sendingProjection = data.some((node) => node.shardingProjection === true);
 						if (sendingProjection && !receiverLayout)
 							throw new Error('Sharding projection requires authenticated owned slots');
@@ -10792,8 +10797,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															entry.value == null &&
 															!isStub &&
 															Boolean(entry.metadataFlags & FULL_WRITE_HEAD) &&
-															peerCapabilitiesLearned &&
-															peerSupportsTombstoneCopy(peerCapabilities);
+															sendTombstonesAsDeletes;
 														const copyType = stubAsInvalidation ? 'invalidate' : tombstoneAsDelete ? 'delete' : 'put';
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;
@@ -13557,6 +13561,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					endTime: node.endTime,
 					shardingProjection,
 					refusesCopies: restrictedOrigins,
+					...(!TEST_OMIT_CAPABILITIES && { tombstoneCopy: TOMBSTONE_COPY_CAPABILITY }),
 					copyResume, // present only when resuming an interrupted bulk copy
 					...(floorOnlyStart !== undefined && startTime === floorOnlyStart && { floorGeneration: floorOnlyGeneration }),
 				};
