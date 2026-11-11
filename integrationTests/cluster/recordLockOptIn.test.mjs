@@ -107,8 +107,6 @@ suite('cluster record locks enabled with no home map applied', { timeout: 300_00
 		assert.match(JSON.stringify(result.body), /record_lock_apply_homes/);
 		assert.doesNotMatch(JSON.stringify(result.body), /not enabled on this node/);
 
-		// Only the disabled stand-in may run a conditional write unlocked: with locks on and no map
-		// the write is refused and the record is untouched.
 		const id = 'enabled-no-map-conditional';
 		await putCounter(context.harper, id, 1);
 		const read = await fetch(`${context.harper.httpURL}/Counter/${id}`, { headers: { Accept: 'application/json' } });
@@ -149,5 +147,28 @@ suite('cluster record locks on LMDB with the key unset', { timeout: 300_000 }, (
 		const result = await call(context.harper, 'LockOnce/', { id: 'lmdb', timeout: 2_000 });
 		assert.equal(result.status, 501);
 		assert.match(JSON.stringify(result.body), /not supported on LMDB/);
+	});
+
+	test('a conditional REST write takes no lock: a match succeeds, a stale ETag is 412', async () => {
+		const id = 'lmdb-conditional';
+		await putCounter(context.harper, id, 1);
+		const read = await fetch(`${context.harper.httpURL}/Counter/${id}`, { headers: { Accept: 'application/json' } });
+		const etag = read.headers.get('etag');
+		assert.ok(etag, 'a read answers an ETag to condition on');
+		await read.text();
+		const conditionalPut = async (n) => {
+			const write = await fetch(`${context.harper.httpURL}/Counter/${id}`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json', 'If-Match': etag },
+				body: JSON.stringify({ id, n }),
+				signal: AbortSignal.timeout(30_000),
+			});
+			return { status: write.status, body: await write.text() };
+		};
+		const matched = await conditionalPut(2);
+		assert.ok(matched.status >= 200 && matched.status < 300, `${matched.status} ${matched.body}`);
+		const stale = await conditionalPut(3);
+		assert.equal(stale.status, 412, stale.body);
+		assert.equal((await counter(context.harper, id))?.n, 2);
 	});
 });
