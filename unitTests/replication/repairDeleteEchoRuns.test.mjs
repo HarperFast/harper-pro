@@ -96,6 +96,24 @@ async function holdInChild(databasePath) {
 	};
 }
 
+// read-only, in a child: a writable handle can rewrite the record, and every handle in this process shares one store
+function purgeWatermark(databasePath) {
+	const result = spawnSync(
+		process.execPath,
+		[
+			'-e',
+			`const { RocksDatabase } = require('@harperfast/rocksdb-js');
+			const db = new RocksDatabase(${JSON.stringify(databasePath)}, { readOnly: true });
+			db.open();
+			process.stdout.write(JSON.stringify(db.useLog('local').getPurgeWatermark()));
+			db.close();`,
+		],
+		{ encoding: 'utf8' }
+	);
+	expect(result.status, result.stderr).to.equal(0);
+	return JSON.parse(result.stdout);
+}
+
 const sha256 = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
 const logDir = (databasePath) => join(databasePath, 'transaction_logs', 'local');
 
@@ -524,6 +542,25 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			expect(report.refused).to.match(/unrecognized file/);
 		});
 
+		it('a txn.purged that is not a regular file', async () => {
+			for (const replace of [
+				(path) => mkdirSync(path),
+				(path, bytes) => {
+					const elsewhere = join(root, `purged${counter++}`);
+					writeFileSync(elsewhere, bytes);
+					symlinkSync(elsewhere, path);
+				},
+			]) {
+				const databasePath = await runDatabase();
+				const record = join(logDir(databasePath), 'txn.purged');
+				const bytes = readFileSync(record);
+				rmSync(record);
+				replace(record, bytes);
+				const report = await repairDatabase(databasePath, { apply: true });
+				expect(report.refused).to.match(/txn\.purged is not a regular file/);
+			}
+		});
+
 		it('a log file with another hard link', async () => {
 			const databasePath = await runDatabase();
 			linkSync(join(logDir(databasePath), '1.txnlog'), join(root, `link${counter++}`));
@@ -740,6 +777,59 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			await repairDatabase(databasePath, { apply: true });
 			await writeTransactions(databasePath, [[T + 2, [putOf('later', T + 2)]]]);
 			expect((await rejection(restoreRepair(backupOf(databasePath)))).message).to.match(/written to since/);
+		});
+
+		it("keeps rocksdb-js's purge watermark true through the repair and a restore after a later purge", async () => {
+			const databasePath = newDatabase();
+			await writeTransactions(databasePath, [
+				[T - 10, [putOf('p', T - 10)]],
+				[T - 5, [putOf('q', T - 5)]],
+				[T, [firstDelete('z')]],
+				[T, [echoedDelete('z')]],
+			]);
+			const dir = logDir(databasePath);
+			const bytes = readFileSync(join(dir, '1.txnlog'));
+			const [, q, z] = entryOffsets(join(dir, '1.txnlog'));
+			const header = bytes.subarray(0, 13);
+			writeFileSync(join(dir, '1.txnlog'), bytes.subarray(0, q));
+			writeFileSync(join(dir, '2.txnlog'), Buffer.concat([header, bytes.subarray(q, z)]));
+			writeFileSync(join(dir, '3.txnlog'), Buffer.concat([header, bytes.subarray(z)]));
+			const state = Buffer.alloc(8);
+			state.writeUInt32LE(13, 0);
+			state.writeUInt32LE(3, 4);
+			writeFileSync(join(dir, 'txn.state'), state);
+			const record = join(dir, 'txn.purged');
+			// rocksdb-js's own retention, so the watermark is known and the sequences after it are accounted for
+			const purgeOlderThanADay = (name) => {
+				const fourDaysAgo = (Date.now() - 4 * 86400000) / 1000;
+				utimesSync(join(dir, name), fourDaysAgo, fourDaysAgo);
+				return withDatabase(databasePath, (db) => db.purgeLogs({ before: Date.now() - 86400000 }));
+			};
+			await purgeOlderThanADay('1.txnlog');
+			expect(existsSync(join(dir, '1.txnlog'))).to.equal(false);
+			const purgedFirst = purgeWatermark(databasePath);
+			expect(purgedFirst).to.deep.equal({ known: true, purgedThrough: T - 10 });
+			const beforeRepair = readFileSync(record);
+
+			const report = await repairDatabase(databasePath, { apply: true });
+			expect(report.logs[0].createdTailFile).to.equal('4.txnlog');
+			expect(readFileSync(record).equals(beforeRepair)).to.equal(true);
+			expect(purgeWatermark(databasePath)).to.deep.equal(purgedFirst);
+			const backupDir = backupOf(databasePath);
+			expect(readdirSync(join(backupDir, 'local'))).to.not.include('txn.purged');
+			expect(readFileSync(join(backupDir, 'manifest.json'), 'utf8')).to.not.include('txn.purged');
+
+			// Harper ran in between and retention deleted an untouched file: restoring the older record would lower
+			// the bound below the keys that file held
+			await purgeOlderThanADay('2.txnlog');
+			expect(existsSync(join(dir, '2.txnlog'))).to.equal(false);
+			const advanced = readFileSync(record);
+			expect(advanced.equals(beforeRepair)).to.equal(false);
+			await restoreRepair(backupDir);
+			expect(readFileSync(record).equals(advanced)).to.equal(true);
+			expect(purgeWatermark(databasePath)).to.deep.equal({ known: true, purgedThrough: T - 5 });
+			expect(existsSync(join(dir, '4.txnlog'))).to.equal(false);
+			expect((await readBack(databasePath)).map(({ id }) => id)).to.deep.equal(['z', 'z']);
 		});
 	});
 
