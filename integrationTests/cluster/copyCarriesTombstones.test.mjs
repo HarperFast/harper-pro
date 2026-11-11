@@ -69,7 +69,6 @@ function cluster(name) {
 		async startFresh(env) {
 			const hostname = await getNextAvailableLoopbackAddress();
 			const parentDir = process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir();
-			// removed by teardownHarper, through stopAndTeardownNodes
 			const dataRootDir = await mkdtemp(join(parentDir, 'harper-integration-test-'));
 			const context = { name, harper: { hostname, dataRootDir }, env };
 			contexts.push(context);
