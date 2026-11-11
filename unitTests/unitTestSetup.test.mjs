@@ -114,8 +114,7 @@ describe('unit-test storage root lifecycle', function () {
 
 	it('HARPER_NO_FLUSH_ON_EXIT disables rocksdb-js shutdownOnExit in bin/harper.js', async function () {
 		this.timeout(60_000);
-		// control: without the variable, the exit listener flushes txn.state, so its absence below is
-		// the setting's doing and not a probe that never reached the database
+		// control, so a rocksdb-js that never writes txn.state at exit cannot pass the check below
 		assert.deepStrictEqual(await exitAfterCommit(false), { logWritten: true, txnStateFlushed: true });
 		assert.deepStrictEqual(
 			await exitAfterCommit(true),
