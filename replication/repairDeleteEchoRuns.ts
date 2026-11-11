@@ -41,6 +41,7 @@ const BOUNDARY_MARKER_SIZE = 12;
 const BOUNDARY_DIR = '.append-boundaries';
 const TXN_STATE = 'txn.state';
 const TXN_STATE_SIZE = 8;
+const TXN_PURGED = 'txn.purged';
 // RocksTransactionLogStore's prelude flags, and the delete action of core's audit entry
 const HAS_PREVIOUS_RESIDENCY_ID = 0x40000000;
 const HAS_PREVIOUS_VERSION = 0x20000000;
@@ -493,6 +494,11 @@ function inventory(databasePath: string): LogStore[] {
 			if (file === TXN_STATE) {
 				if (!stats.isFile()) throw new RepairRefusedError(`${path} is not a regular file`);
 				store.txnState = readTxnState(path);
+				continue;
+			}
+			// valid across compaction: no sequence is removed (any new tail file is last + 1) and the purged key bound is unchanged
+			if (file === TXN_PURGED) {
+				if (!stats.isFile()) throw new RepairRefusedError(`${path} is not a regular file`);
 				continue;
 			}
 			const match = LOG_FILE_PATTERN.exec(file);

@@ -299,6 +299,7 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			expect(statSync(join(logDir(databasePath), '2.txnlog')).size).to.equal(13);
 			await withDatabase(databasePath, async (db, store) => {
 				const log = db.useLog('local');
+				expect(log.getPurgeWatermark()).to.deep.equal({ known: true, purgedThrough: 0 });
 				// a cursor between the header and the run must still start in the file that holds the run
 				expect(Array.from(log.query({ start: T - 5 }))).to.have.length(1);
 				expect(Array.from(log.query({ start: T + 1 }))).to.have.length(0);
