@@ -496,7 +496,7 @@ function inventory(databasePath: string): LogStore[] {
 				store.txnState = readTxnState(path);
 				continue;
 			}
-			// valid across compaction: no sequence is removed (any new tail file is last + 1) and the purged key bound is unchanged
+			// left as is: repair removes no sequence (any new tail file is last + 1) and leaves the purged key bound unchanged
 			if (file === TXN_PURGED) {
 				if (!stats.isFile()) throw new RepairRefusedError(`${path} is not a regular file`);
 				continue;

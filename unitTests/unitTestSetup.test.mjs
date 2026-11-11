@@ -6,7 +6,7 @@
 
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -59,12 +59,16 @@ describe('unit-test storage root lifecycle', function () {
 		assert.ok(!existsSync(testRoot), `child run left ${testRoot} behind${output}`);
 	});
 
-	it('HARPER_NO_FLUSH_ON_EXIT disables rocksdb-js shutdownOnExit in bin/harper.js', async function () {
-		this.timeout(60_000);
+	// Loads Pro's entry point, commits one transaction-log entry, then calls process.exit(); reports
+	// whether the log file was written and whether rocksdb-js's exit listener flushed txn.state.
+	async function exitAfterCommit(noFlushOnExit) {
 		const probeDir = mkdtempSync(join(tmpdir(), 'harper-no-flush-on-exit-'));
 		const storageRoot = join(probeDir, 'root');
 		const dbDir = join(probeDir, 'db');
 		mkdirSync(storageRoot, { recursive: true });
+		const env = { ...process.env, STORAGE_PATH: storageRoot };
+		delete env.HARPER_NO_FLUSH_ON_EXIT;
+		if (noFlushOnExit) env.HARPER_NO_FLUSH_ON_EXIT = '1';
 		try {
 			const child = spawn(
 				process.execPath,
@@ -84,11 +88,7 @@ describe('unit-test storage root lifecycle', function () {
 						process.exit(0);
 					`,
 				],
-				{
-					cwd: root,
-					env: { ...process.env, STORAGE_PATH: storageRoot, HARPER_NO_FLUSH_ON_EXIT: '1' },
-					stdio: ['ignore', 'pipe', 'pipe'],
-				}
+				{ cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] }
 			);
 			let stderr = '';
 			child.stderr.setEncoding('utf8').on('data', (chunk) => (stderr += chunk));
@@ -104,13 +104,25 @@ describe('unit-test storage root lifecycle', function () {
 			}
 			assert.strictEqual(result.signal, null, `child had to be killed: ${stderr}`);
 			assert.strictEqual(result.code, 0, `child did not exit 0: ${stderr}`);
-			assert.strictEqual(
-				existsSync(join(dbDir, 'transaction_logs/local/txn.state')),
-				false,
-				'process.exit(0) under HARPER_NO_FLUSH_ON_EXIT must leave txn.state unflushed'
-			);
+			const logDir = join(dbDir, 'transaction_logs/local');
+			return {
+				logWritten: existsSync(logDir) && readdirSync(logDir).some((file) => file.endsWith('.txnlog')),
+				txnStateFlushed: existsSync(join(logDir, 'txn.state')),
+			};
 		} finally {
 			rmSync(probeDir, { recursive: true, force: true });
 		}
+	}
+
+	it('HARPER_NO_FLUSH_ON_EXIT disables rocksdb-js shutdownOnExit in bin/harper.js', async function () {
+		this.timeout(60_000);
+		// control: without the variable, the exit listener flushes txn.state, so its absence below is
+		// the setting's doing and not a probe that never reached the database
+		assert.deepStrictEqual(await exitAfterCommit(false), { logWritten: true, txnStateFlushed: true });
+		assert.deepStrictEqual(
+			await exitAfterCommit(true),
+			{ logWritten: true, txnStateFlushed: false },
+			'process.exit(0) under HARPER_NO_FLUSH_ON_EXIT must leave txn.state unflushed'
+		);
 	});
 });
