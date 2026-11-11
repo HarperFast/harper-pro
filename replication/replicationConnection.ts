@@ -267,6 +267,7 @@ import {
 	STUCK_COPY_OWNER_REFUSED,
 	STUCK_COPY_ORIGIN_REFUSED,
 	STUCK_COPY_HELD,
+	OWNED_SLOTS_COPY_REFUSAL,
 	copyStartKey,
 	describeStuckCopy,
 	type StuckCopyTransition,
@@ -773,11 +774,49 @@ export function predatesPurgeTracking(
 	return (subscriptions.find(({ name }) => name === thisNodeName)?.startTime ?? mergedStart) < trackedFrom;
 }
 
+/**
+ * A receiver that owns sharding slots this node cannot copy (`restricted`) refuses every base copy, so a start this
+ * node cannot vouch for replays what is retained there instead (harper-pro#1278).
+ */
+export function retentionResumeDecision(
+	forceForTest: boolean,
+	otherGeneration: boolean,
+	retentionGap: boolean,
+	restricted: boolean
+): 'copy' | 'replay' | 'replay-unvouched' {
+	if (forceForTest) return 'copy';
+	if (!retentionGap && !otherGeneration) return 'replay';
+	return restricted ? 'replay-unvouched' : 'copy';
+}
+
+export function receiverRefusesCopies(
+	entries: { name?: string; refusesCopies?: unknown }[],
+	thisNodeName: string,
+	inferred: boolean
+): boolean {
+	const declared = entries.find((entry) => entry?.name === thisNodeName)?.refusesCopies;
+	return typeof declared === 'boolean' ? declared : inferred;
+}
+
+const purgedThrough = (bound: number | undefined) => (bound === undefined ? 'unknown' : new Date(bound).toISOString());
+
+const unvouchedReplayWarned = new Map<string, string>();
+export function shouldWarnUnvouchedReplay(database: string, peer: string, reason: string): boolean {
+	const key = database + '\0' + peer;
+	if (unvouchedReplayWarned.get(key) === reason) return false;
+	unvouchedReplayWarned.set(key, reason);
+	return true;
+}
+
 // Integration tests force the retention copy for the named databases to exercise what a receiver does with
-// a copy it cannot accept (harper-pro#1231).
+// a copy it cannot accept (harper-pro#1231), until HARPER_TEST_FORCE_RETENTION_COPY_UNTIL (epoch ms) when set.
 const FORCE_RETENTION_COPY_DATABASES_FOR_TEST = process.env.HARPER_TEST_FORCE_RETENTION_COPY_DATABASES?.split(',');
+const FORCE_RETENTION_COPY_UNTIL_FOR_TEST = Number(process.env.HARPER_TEST_FORCE_RETENTION_COPY_UNTIL) || Infinity;
 function forceRetentionCopyForTest(databaseName: string): boolean {
-	return FORCE_RETENTION_COPY_DATABASES_FOR_TEST?.includes(databaseName) === true;
+	return (
+		FORCE_RETENTION_COPY_DATABASES_FOR_TEST?.includes(databaseName) === true &&
+		Date.now() < FORCE_RETENTION_COPY_UNTIL_FOR_TEST
+	);
 }
 
 // A peer naming more new origins than this on one connection is not sending orphan v4-era ids.
@@ -5806,6 +5845,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!stillCurrent()) return;
 								await dbisDB.flush({ allowWriteStall: true });
 								if (!stillCurrent()) return;
+								// owned origins replay only from the projection's start, so reconnect now rather than after the backoff
+								options.connection?.resetRetryBackoff?.();
 								wsClosed = true;
 								close(1011, 'Sharding projection complete; resuming owned origins separately');
 								return;
@@ -6892,9 +6933,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		wsClosed = true;
 		close(
 			1011,
-			copying
-				? 'Owned sharding slots require a complete co-owner or backup restore'
-				: `Sharded origin ${origin} requires its origin or a complete co-owner`
+			copying ? OWNED_SLOTS_COPY_REFUSAL : `Sharded origin ${origin} requires its origin or a complete co-owner`
 		);
 	}
 	function admitsIncomingOrigins(value: unknown): boolean {
@@ -9115,6 +9154,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							receiverShard === undefined ? undefined : shardingSourceAgreement(databaseName, receiverShard);
 						const restrictedSendingOrigins =
 							!!receiverLayout && shardingSourceCertificate(databaseName) !== receiverLayout;
+						// a peer too old to declare it: a wrong guess of copy is a held, reported refusal, a wrong replay loses rows
+						const refusesCopies = receiverRefusesCopies(data, getThisNodeName(), restrictedSendingOrigins);
 						const sendingProjection = data.some((node) => node.shardingProjection === true);
 						if (sendingProjection && !receiverLayout)
 							throw new Error('Sharding projection requires authenticated owned slots');
@@ -10157,23 +10198,34 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const predatesTracking =
 													purgeBounds !== undefined &&
 													predatesPurgeTracking(nodeSubscriptions, getThisNodeName(), currentSequenceId, trackedFrom);
-												if (
-													forceRetentionCopyForTest(databaseName) ||
-													otherGeneration ||
-													(!(
+												const retentionGap =
+													!(
 														receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId)
 													) &&
-														(purgeBounds
-															? purgedLog !== undefined || predatesTracking
-															: shouldForceBaseCopyForRetention(
-																	currentSequenceId,
-																	oldestRetainedTime,
-																	Date.now() - auditRetention,
-																	getAuditFloor(auditStore)
-																)))
-												) {
-													const purgedThrough = (bound: number | undefined) =>
-														bound === undefined ? 'unknown' : new Date(bound).toISOString();
+													(purgeBounds
+														? purgedLog !== undefined || predatesTracking
+														: shouldForceBaseCopyForRetention(
+																currentSequenceId,
+																oldestRetainedTime,
+																Date.now() - auditRetention,
+																getAuditFloor(auditStore)
+															));
+												const decision = retentionResumeDecision(
+													forceRetentionCopyForTest(databaseName),
+													otherGeneration,
+													retentionGap,
+													refusesCopies
+												);
+												if (decision === 'replay-unvouched') {
+													const from = new Date(currentSequenceId).toISOString();
+													const purged = otherGeneration
+														? undefined
+														: purgedThrough(purgedLog ? purgedLog.bound : predatesTracking ? trackedFrom : undefined);
+													if (shouldWarnUnvouchedReplay(databaseName, remoteNodeName, purged ?? 'another generation'))
+														logger.warn?.(
+															`Peer ${remoteNodeName} requested replication of database ${databaseName} ${purged === undefined ? 'from a floor this node certified under another database generation' : `from ${from}, under transaction-log history purged through ${purged}`}; it owns sharding slots this node cannot copy, so replay continues from ${from}, and writes from this node it has not received may be missing there.`
+														);
+												} else if (decision === 'copy') {
 													logger.warn?.(
 														otherGeneration
 															? `Peer ${remoteNodeName} requested replication of database ${databaseName} from a floor this node certified under another database generation; forcing a bounded base-copy resync.`
@@ -10188,11 +10240,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											}
 											// the copy filters rows at or below the start, which holds only for a position taken from this
 											// copy; another subscription's start of 0 can have made it a copy already
-											if (otherGeneration) {
+											if (otherGeneration && currentSequenceId === 0) {
 												const ownId = getThisNodeId(auditStore);
 												const own = subscribedNodeIds[ownId];
 												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
 											}
+											// a projection goes only to a receiver that asked for it, so it is accepted too
+											if (currentSequenceId > 0 || sendingProjection) subscriptionResidencySender?.replaying();
 											if (currentSequenceId === 0) {
 												copying = true;
 												const legacyCopy = await requiresLegacyCopyVerification(
@@ -11937,6 +11991,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		instanceRetired = true;
 		wsClosed = true;
 		stopShardingConfigurationWatch();
+		if (residencySender && code === 1011 && reasonBuffer?.toString() === OWNED_SLOTS_COPY_REFUSAL) {
+			try {
+				if (residencySender.refused())
+					logger.warn?.(
+						`${remoteNodeName} refuses replication of database ${databaseName} from this node; writes through this node for its sharding slots return 503 until it accepts a subscription`
+					);
+			} catch (error) {
+				logger.debug?.(connectionId, 'could not record the refusal', error);
+			}
+		}
 		residencySender?.close();
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
 		if (options.connection?.peerCapabilities === peerCapabilities) {
@@ -13199,6 +13263,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						shardingProjection = true;
 						projectionRequested = true;
 					}
+					// a projection persists no cursor, so one here predates the restriction and asks for a copy this node refuses
+					if (copyCursor) {
+						logger.warn?.(
+							`Discarding the copy-resume cursor for ${node.name} on database ${databaseName}: this node owns sharding slots that peer cannot copy, so it resumes ${shardingProjection ? 'by projection' : 'from its floor'} instead`
+						);
+						copyCursor = undefined;
+						if (nodeId !== undefined)
+							Promise.resolve()
+								.then(() => connectionSuperseded() || dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]))
+								.catch((error) =>
+									logger.warn?.(connectionId, 'could not remove the copy-resume cursor for', databaseName, error)
+								);
+					}
 				}
 				const ownedCopyPending =
 					nodeId === undefined || copyCursor || restrictedOrigins
@@ -13281,6 +13358,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					isLeader: node.isLeader,
 					endTime: node.endTime,
 					shardingProjection,
+					refusesCopies: restrictedOrigins,
 					copyResume, // present only when resuming an interrupted bulk copy
 					...(floorOnlyStart !== undefined && startTime === floorOnlyStart && { floorGeneration: floorOnlyGeneration }),
 				};

@@ -391,6 +391,8 @@ From v5.3.6, a peer records how far each prune of its transaction logs reached. 
 - The peer has no record of what was removed from a transaction log that was already purged empty before it first ran v5.3.6 or later. After that upgrade, such a log can force one more base copy of that database for each node returning with a position older than that purge.
 - On RocksDB, the storage engine also purges transaction logs on its own after three days. If the peer itself was stopped for longer than that, a node whose position is older than three days gets one base copy of the database from it.
 
+<VersionBadge version="v5.4.0" /> A peer never forces a base copy on a node that owns [sharding](./residency.md) slots the peer is not a complete co-owner of, because that node would refuse it. The peer replays what its transaction logs still hold from the node's position instead, and logs a warning once per database, node and reason, ending `so replay continues from <position>, and writes from this node it has not received may be missing there.` Whatever the peer purged before that node received it stays missing there, including rows of tables in that database that are not sharded.
+
 A copy that keeps failing is reported as [`stuckCopy`](./clustering.md#stuck-copies) in `cluster_status`, and its reconnects are held back instead of retried indefinitely.
 
 ### Rows From Unnamed Origins

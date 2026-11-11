@@ -1,14 +1,7 @@
 /**
- * A sharded database idle past auditRetention resumes after a restart, and an owner's refusal of a copy it
- * cannot accept is reported once and backed off (harper-pro#1231).
- *
- * Two nodes, one per shard, `@sharded(slots: 2)` on `data`. After writes, both sit idle past a retention of
- * seconds and restart. Before harper-pro#1229 each sender forced a base copy on the other's old resume
- * point; the receiver owns slots, so it refused with 1011 ("Owned sharding slots require a complete
- * co-owner or backup restore") and reconnected every few seconds forever, logging only at debug.
- *
- * Then node 0 restarts with its retention copy forced (HARPER_TEST_FORCE_RETENTION_COPY_DATABASES): node 1
- * must log the refusal once, show it as `stuckCopy` in cluster_status, and hold its reconnects.
+ * Owners of one shard each, idle past auditRetention (harper-pro#1231, #1278, #1315). A sender never forces a base
+ * copy on a node whose owned slots it cannot copy, since that node refuses it; while an owner does refuse, a write
+ * through the refused node for the owner's key returns 503 instead of an acknowledgement no owner will see.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -26,6 +19,9 @@ const FIXTURE = join(TEST_DIR, 'fixture-sharding-quarantine');
 const RETENTION_S = 20;
 const IDLE_MS = (RETENTION_S + 25) * 1000;
 const FORCED_COPY = 'forcing a bounded base-copy resync';
+// the system database is not sharded, so it may take a copy (harper-pro#1308)
+const DATA_DATABASE = 'database data';
+const RESUMED_UNDER_PURGE = 'so replay continues from';
 const REFUSED = 'refused a copy this node cannot accept';
 // with slots: 2, shard 1 owns ids '0' and '2', shard 0 owns '1' and '3' (shardingBootstrap.test.mjs)
 const OWNED_BY = [
@@ -113,6 +109,8 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 
 	const linesSince = async (node, mark, text) =>
 		(await readLogSince(node, mark)).split('\n').filter((line) => line.includes(text));
+	const forcedCopies = async (node, mark) =>
+		(await linesSince(node, mark, FORCED_COPY)).filter((line) => line.includes(DATA_DATABASE));
 
 	async function ready() {
 		await waitForCondition(
@@ -171,8 +169,11 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 	});
 
 	test('both nodes restart after an idle interval longer than retention and replicate with no base copy', async () => {
+		// node 0 misses node 1's last write, so once retention passes it, node 0's start is below node 1's purge bound
+		await killHarper({ harper: nodes[0] });
+		await put(nodes[1], OWNED_BY[1][1], 'while-0-down');
 		await delay(IDLE_MS);
-		for (const node of nodes) await killHarper({ harper: node });
+		await killHarper({ harper: nodes[1] });
 		const marks = await Promise.all(nodes.map(logMark));
 		for (let i = 0; i < 2; i++) await start(i);
 		await ready();
@@ -184,10 +185,18 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		);
 		await delay(5000);
 		for (const [i, node] of nodes.entries()) {
-			const forced = await linesSince(node, marks[i], FORCED_COPY);
+			const forced = await forcedCopies(node, marks[i]);
 			equal(forced.length, 0, `node ${i} forced a copy:\n${forced.join('\n')}`);
-			ok(!(await socketTo(node, nodes[i ^ 1]))?.stuckCopy, `node ${i} reports a stuck copy`);
 		}
+		// a projection the restarted node's own recovery interrupts reports `retrying` until a quiet session; a refusal stays
+		await waitForCondition(
+			async (signal) =>
+				!(await socketTo(nodes[0], nodes[1], signal))?.stuckCopy &&
+				!(await socketTo(nodes[1], nodes[0], signal))?.stuckCopy,
+			{ timeoutMs: 90_000, description: 'neither node to report a stuck copy' }
+		);
+		const resumed = await linesSince(nodes[1], marks[1], RESUMED_UNDER_PURGE);
+		ok(resumed.length >= 1, 'node 1 reports resuming node 0 under purged history');
 		await put(nodes[0], OWNED_BY[1][0], 'after-idle');
 		await ownerHolds(1, OWNED_BY[1][0], 'after-idle');
 	});
@@ -195,7 +204,11 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 	test("an owner's refusal of a forced copy is logged once, reported, and backed off", async () => {
 		await killHarper({ harper: nodes[0] });
 		const marks = await Promise.all(nodes.map(logMark));
-		await start(0, { HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: 'data' });
+		// forced only before node 1's first hold ends, so its retry replays (test 3)
+		await start(0, {
+			HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: 'data',
+			HARPER_TEST_FORCE_RETENTION_COPY_UNTIL: String(Date.now() + 45_000),
+		});
 		const stuck = await waitForCondition(
 			async (signal) => {
 				const socket = await socketTo(nodes[1], nodes[0], signal);
@@ -205,11 +218,57 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		);
 		equal(stuck.reason, 'Owned sharding slots require a complete co-owner or backup restore');
 		ok(Date.parse(stuck.retryAt) > Date.now(), `retries at ${stuck.retryAt}`);
+		await ready();
+		const refused = await request(nodes[0], `Rows/${OWNED_BY[1][1]}`, {
+			method: 'PUT',
+			body: JSON.stringify({ id: OWNED_BY[1][1], body: 'while-refused' }),
+		});
+		const refusal = await refused.text();
+		equal(refused.status, 503, refusal);
+		ok(refusal.includes('refusing replication from this node'), refusal);
+		await put(nodes[0], OWNED_BY[0][0], 'while-refused');
 		await delay(45_000);
 		const refusals = await linesSince(nodes[1], marks[1], REFUSED);
 		equal(refusals.length, 1, `one refusal line:\n${refusals.join('\n')}`);
 		// the hold floor is 60 s: the sender forced the copy at most twice in that window, not every few seconds
-		const forced = await linesSince(nodes[0], marks[0], FORCED_COPY);
+		const forced = await forcedCopies(nodes[0], marks[0]);
 		ok(forced.length >= 1 && forced.length <= 2, `node 0 forced ${forced.length} copies:\n${forced.join('\n')}`);
+	});
+
+	test("node 1's next subscription clears the refusal in the running node 0, and writes reach node 1 again", async () => {
+		const held = await socketTo(nodes[1], nodes[0]);
+		const holdMs = Math.max(0, (Date.parse(held?.stuckCopy?.retryAt) || 0) - Date.now());
+		const accepted = await waitForCondition(
+			async (signal) => {
+				const response = await request(nodes[0], `Rows/${OWNED_BY[1][0]}`, {
+					method: 'PUT',
+					body: JSON.stringify({ id: OWNED_BY[1][0], body: 'after-refusal' }),
+					signal,
+				});
+				await response.text();
+				return response.status < 300;
+			},
+			{ timeoutMs: holdMs + 90_000, description: 'node 0 to accept a write for node 1 once node 1 resubscribes' }
+		);
+		ok(accepted);
+		await ownerHolds(1, OWNED_BY[1][0], 'after-refusal');
+		ok(await holds(nodes[1], OWNED_BY[1][1], 'while-0-down'), 'the refused write changed nothing on node 1');
+	});
+
+	test('a copy-resume cursor left from before the route was restricted asks node 1 for no copy (harper-pro#1315)', async () => {
+		await killHarper({ harper: nodes[0] });
+		const marks = await Promise.all(nodes.map(logMark));
+		const cursor = { copyStartTime: Date.now() - 60_000, currentTable: 'Rows', afterKey: OWNED_BY[0][0], copyOrder: 1 };
+		await start(0, { HARPER_TEST_INJECT_COPY_CURSOR_JSON: JSON.stringify({ db: 'data', cursor }) });
+		await waitForCondition(async (signal) => (await socketTo(nodes[0], nodes[1], signal))?.connected, {
+			timeoutMs: 90_000,
+			description: "node 0's leg from node 1 connected",
+		});
+		await delay(5000);
+		const refusals = await linesSince(nodes[0], marks[0], REFUSED);
+		equal(refusals.length, 0, `node 0 refused a copy it asked for:\n${refusals.join('\n')}`);
+		ok((await linesSince(nodes[0], marks[0], 'Discarding the copy-resume cursor')).length >= 1, 'cursor discarded');
+		await put(nodes[1], OWNED_BY[0][1], 'after-cursor');
+		await ownerHolds(0, OWNED_BY[0][1], 'after-cursor');
 	});
 });

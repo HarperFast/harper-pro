@@ -1,4 +1,5 @@
 import { shardingFailoverShard, shardingPeerCanRelay, recordShardingWait, shardingLayout } from './shardingRecovery.ts';
+import { anchorResidencySender } from './residencyTopology.ts';
 /**
  * This module is responsible for managing the subscriptions for replication. It determines the connections and
  * subscriptions that are needed and delegates them to the available threads. It also manages when connections are
@@ -461,7 +462,9 @@ function resolveSharedStatus(databaseName: string, nodeName: string | undefined)
 	if (!nodeName) return;
 	try {
 		const auditStore = getAuditStoreForDatabase(databaseName);
-		if (auditStore) return getReplicationSharedStatus(auditStore, databaseName, nodeName);
+		if (!auditStore) return;
+		anchorResidencySender(auditStore, databaseName, nodeName);
+		return getReplicationSharedStatus(auditStore, databaseName, nodeName);
 	} catch (error) {
 		logger.warn('Error resolving replication connection truth for', databaseName, nodeName, error);
 	}

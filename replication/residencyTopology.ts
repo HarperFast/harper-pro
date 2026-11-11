@@ -65,23 +65,37 @@ function digestFingerprint(digest: unknown): bigint {
 	return 3n + (BigInt('0x' + digest.slice(0, 16)) % 0xfffffffffffffffdn);
 }
 
-const senders = new WeakMap<object, Map<string, Map<string, BigUint64Array>>>();
+const senders = new WeakMap<object, Map<string, Map<string, SenderState>>>();
 
-function senderStatus(store: any, database: string, peer: string): BigUint64Array {
+// `status`: [generation counter, active generation and receive time]; `refusal`: [refused generation, highest
+// generation that replayed], as uint32 so the write path reads it without allocating
+type SenderState = { status: BigUint64Array; refusal: Uint32Array };
+const REFUSED = 0;
+const REPLAYED = 1;
+function senderState(store: any, database: string, peer: string): SenderState {
 	let databases = senders.get(store);
 	if (!databases) senders.set(store, (databases = new Map()));
 	let peers = databases.get(database);
 	if (!peers) databases.set(database, (peers = new Map()));
-	let status = peers.get(peer);
-	if (!status) {
-		status = new BigUint64Array(store.getUserSharedBuffer(['residency-sending', database, peer], new ArrayBuffer(16)));
-		peers.set(peer, status);
+	let state = peers.get(peer);
+	if (!state) {
+		const buffer = store.getUserSharedBuffer(['residency-sending', database, peer], new ArrayBuffer(24));
+		state = { status: new BigUint64Array(buffer, 0, 2), refusal: new Uint32Array(buffer, 16, 2) };
+		peers.set(peer, state);
 	}
-	return status;
+	return state;
+}
+
+/**
+ * Holds this thread's view of a peer's sender state for the store's lifetime. RocksDB frees a user-shared buffer
+ * with its last view, so without one on the main thread, replacing the replication worker would forget a refusal.
+ */
+export function anchorResidencySender(store: any, database: string, peer: string): void {
+	senderState(store, database, peer);
 }
 
 export function registerResidencySender(store: any, database: string, peer: string, receivedAt = Date.now()) {
-	const status = senderStatus(store, database, peer);
+	const { status, refusal } = senderState(store, database, peer);
 	let generation = (Atomics.add(status, 0, 1n) + 1n) & 0xffffffffn;
 	if (!generation) generation = (Atomics.add(status, 0, 1n) + 1n) & 0xffffffffn;
 	const identity = generation << 32n;
@@ -90,6 +104,7 @@ export function registerResidencySender(store: any, database: string, peer: stri
 	// Publish identity and receive time together. Separate stores let a new connection borrow
 	// the previous connection's heartbeat, and a late touch could overwrite its successor's time.
 	Atomics.store(status, 1, stamp(receivedAt));
+	const ordinal = Number(generation);
 	return {
 		touch(receivedAt = Date.now()) {
 			if (closed) return;
@@ -101,11 +116,54 @@ export function registerResidencySender(store: any, database: string, peer: stri
 			const active = Atomics.load(status, 1);
 			if (active >> 32n === generation) Atomics.compareExchange(status, 1, active, 0n);
 		},
+		refused(): boolean {
+			const before = raiseRefusalWord(refusal, REFUSED, ordinal);
+			const replayed = Atomics.load(refusal, REPLAYED);
+			return ordinal >= replayed && !(before !== 0 && before >= replayed);
+		},
+		replaying() {
+			raiseRefusalWord(refusal, REPLAYED, ordinal);
+		},
 	};
 }
 
+function raiseRefusalWord(refusal: Uint32Array, index: number, value: number): number {
+	let seen = Atomics.load(refusal, index);
+	while (seen < value) {
+		const previous = Atomics.compareExchange(refusal, index, seen, value);
+		if (previous === seen) return seen;
+		seen = previous;
+	}
+	return seen;
+}
+
+/**
+ * A refusal no later sender has replayed past. Process memory only: a restart forgets it until the owner refuses
+ * again. Read in this order, a replay that lands between the reads can only end the refusal.
+ */
+export function residencyOwnerRefusing(store: any, database: string, peer: string): boolean {
+	const { refusal } = senderState(store, database, peer);
+	const refused = Atomics.load(refusal, REFUSED);
+	return refused !== 0 && refused >= Atomics.load(refusal, REPLAYED);
+}
+
+function acceptingOwnerReachable(store: any, database: string, reachable: { name: string }[], connected: boolean) {
+	for (const node of reachable)
+		if (
+			!residencyOwnerRefusing(store, database, node.name) &&
+			(!connected || residencySenderConnected(store, database, node.name))
+		)
+			return true;
+	return false;
+}
+
+function databaseAuditStore(database: string): any {
+	const tables = databases[database];
+	for (const name in tables) if (tables[name].auditStore) return tables[name].auditStore;
+}
+
 function residencySenderConnected(store: any, database: string, peer: string): boolean {
-	const active = Atomics.load(senderStatus(store, database, peer), 1);
+	const active = Atomics.load(senderState(store, database, peer).status, 1);
 	return active !== 0n && (Date.now() - Number(active & 0xffffffffn)) >>> 0 < PING_TIMEOUT;
 }
 
@@ -250,14 +308,18 @@ setResidencyPlacementGuard((database, owners, requireConnected, shard, root, for
 	const reachable = recipients.filter((node) => owners.includes(node.name));
 	if (!reachable.length)
 		throw new ResidencyPlacementError(`No replication route reaches the owners of a record in ${database}`, 503);
+	const auditStore = (root as any)?.auditStore ?? databaseAuditStore(database);
 	if (requireConnected) {
-		const auditStore = Object.values(databases[database] ?? {}).find((Table) => Table.auditStore)?.auditStore;
-		if (!auditStore || !reachable.some((node) => residencySenderConnected(auditStore, database, node.name)))
+		if (!auditStore || !acceptingOwnerReachable(auditStore, database, reachable, true))
 			throw new ResidencyPlacementError(
-				`No new shard owner is connected for ${database}; attribute-slot change refused`,
+				`No new shard owner is connected and accepting replication from this node for ${database}; attribute-slot change refused`,
 				503
 			);
-	}
+	} else if (auditStore && !acceptingOwnerReachable(auditStore, database, reachable, false))
+		throw new ResidencyPlacementError(
+			`Every owner of a record in ${database} is refusing replication from this node; retry the write once one accepts it`,
+			503
+		);
 });
 
 server.registerOperation?.({

@@ -15,10 +15,12 @@ const STATE_NAMES = ['', 'retrying', 'held', 'refused'] as const;
 const STUCK_COPY_NO_PROGRESS = 1;
 export const STUCK_COPY_OWNER_REFUSED = 2;
 export const STUCK_COPY_ORIGIN_REFUSED = 3;
+// also the receiver's close reason, by which the sender learns it was refused
+export const OWNED_SLOTS_COPY_REFUSAL = 'Owned sharding slots require a complete co-owner or backup restore';
 const REASONS = [
 	'',
 	'the copy made no durable progress from its start position',
-	'Owned sharding slots require a complete co-owner or backup restore',
+	OWNED_SLOTS_COPY_REFUSAL,
 	'a sharded origin requires its origin or a complete co-owner',
 ];
 
