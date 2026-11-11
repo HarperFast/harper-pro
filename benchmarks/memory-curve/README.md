@@ -83,10 +83,10 @@ Outputs go to `benchmarks/memory-curve/runs/<run-id>/` (git-ignored): `manifest.
 ## Report definitions (`report.mts`)
 
 - **memory / data**: the cell's `memory.max` over the on-disk dataset (SST + blob files after load and compaction).
-- **reads per 1k**: data-disk reads per completed request × 1000, i.e. reads/s per 1,000 req/s. **Extra** subtracts the same figure from the unconstrained calibration of that workload and skew; without a valid calibration it is unavailable ("no baseline"), and the cell is left out of slopes and charts.
+- **reads per 1k**: data-disk reads per completed request × 1000, i.e. reads/s per 1,000 req/s. **Extra** subtracts the same figure from the unconstrained calibration of that workload and skew. That calibration is a baseline only if its window was valid and it read at most 1 disk read per 1,000 requests, i.e. it held the dataset in memory; at 4× data the server's 32 GB does not, and such cells show total reads ("total", hollow points in the charts) instead.
 - **p99 knee**: the largest memory step whose p99 is at least 2× the lowest p99 in its series, or that saturated (including one that completed no request).
 - **saturated cells** show the share of the offered rate served (or "did not start") instead of reads: their reads are those of a server that stopped keeping up. Slopes skip them, and charts draw them as a cross on the top edge.
-- **reads per GB removed**: the change in extra reads per 1k between adjacent unsaturated steps divided by the memory removed, tagged with data / (mean memory of the two steps).
+- **reads per GB removed**: the change in reads per 1k between adjacent unsaturated steps divided by the memory removed, tagged with data / (mean memory of the two steps). The baseline cancels in the difference, so series without one have slopes too.
 - **pinned share**: the fraction of the 100% → 50% increase in extra reads that pinning the block cache at its 100% size removes, i.e. the block cache's part of the loss, with the page cache's part as the remainder.
 
 ## What it does not represent

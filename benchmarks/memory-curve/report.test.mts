@@ -62,15 +62,15 @@ const calibration = {
 	workload: 'C',
 	skew: 'zipf-1',
 	client: { measure: { okPerSec: 20_000 } },
-	server: { window: { disk: { readsPerSec: 200 } } },
+	server: { window: { disk: { readsPerSec: 20 } } },
 };
 
 describe('cellRow', () => {
 	it('normalizes disk reads per 1,000 completed requests and subtracts the unconstrained baseline', () => {
 		const row = cellRow(cell(0.5, 3000, 4), calibration, dataset, 'd2x-1k');
 		assert.equal(row.readsPer1k, 300);
-		assert.equal(row.extraReadsPer1k, 290);
-		assert.equal(row.extraReadsPerSec, 2900);
+		assert.equal(row.extraReadsPer1k, 299);
+		assert.equal(row.extraReadsPerSec, 2990);
 		assert.equal(row.memoryGiB, 3);
 		assert.equal(row.ratio, 0.25);
 		assert.equal(row.cpuMsPerReq, 0.2);
@@ -208,21 +208,26 @@ describe('renderReport', () => {
 		assert.match(markdown, /steps cut because a cell saturated: uniform at 0\.25/);
 	});
 
-	it('subtracts no baseline from a calibration whose window was invalid', () => {
-		const badCalibration = {
+	it('subtracts no baseline from a calibration whose window was invalid or that read from disk', () => {
+		const invalidWindow = {
 			...calibration,
 			server: {
-				window: { disk: { readsPerSec: 200 }, invalidReasons: ['server counters taken 90 s off the measured window'] },
+				window: { disk: { readsPerSec: 0 }, invalidReasons: ['server counters taken 90 s off the measured window'] },
 			},
 		};
-		const withoutBaseline = { ...pair, calibrations: [badCalibration], cells: [cell(1, 100, 2), cell(0.5, 3000, 4)] };
-		const [row] = pairRows(withoutBaseline);
-		assert.equal(row.readsPer1k, 10);
-		assert.equal(row.extraReadsPer1k, null);
-		const { markdown, charts } = renderReport([withoutBaseline], { runId: 'mctest' });
-		assert.match(markdown, /\| no baseline \(2\.00\) \| no baseline \(4\.00\) \|/);
-		assert.doesNotMatch(markdown, /```mermaid/);
-		assert.doesNotMatch(charts['chart-C.svg'], /<circle/);
+		const onDisk = { ...calibration, server: { window: { disk: { readsPerSec: 5000 }, invalidReasons: [] } } };
+		for (const badCalibration of [invalidWindow, onDisk]) {
+			const withoutBaseline = { ...pair, calibrations: [badCalibration], cells: [cell(1, 100, 2), cell(0.5, 3000, 4)] };
+			const rows = pairRows(withoutBaseline);
+			assert.equal(rows[0].readsPer1k, 10);
+			assert.equal(rows[0].extraReadsPer1k, null);
+			// The baseline cancels in a slope: (300 - 10) reads per 1k over 3 GiB.
+			assert.ok(Math.abs(slopes(rows)[0].extraReadsPerGiBPer1k - 290 / 3) < 0.01);
+			const { markdown, charts } = renderReport([withoutBaseline], { runId: 'mctest' });
+			assert.match(markdown, /\| 100 total \(2\.00\) \| 3000 total \(4\.00\) \|/);
+			assert.match(markdown, /total reads\/s, no in-memory baseline: zipf-1/);
+			assert.match(charts['chart-C.svg'], /<circle [^>]*fill="white"/);
+		}
 	});
 
 	it('leaves a skew with a missing step out of the Mermaid chart instead of plotting a zero', () => {

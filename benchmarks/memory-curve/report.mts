@@ -13,6 +13,8 @@ import { parseArgs } from 'node:util';
 
 const GiB = 1024 ** 3;
 export const KNEE_FACTOR = 2;
+/** A calibration reading more than this from disk did not hold the dataset in memory, so it is no baseline. */
+export const IN_MEMORY_READS_PER_1K = 1;
 
 export interface Row {
 	pair: string;
@@ -184,6 +186,11 @@ function measured(rows: Row[]): Measured[] {
 	return rows.filter((row): row is Measured => !row.saturated && row.extraReadsPer1k !== null);
 }
 
+/** Extra reads/s where an in-memory baseline exists, otherwise total data-disk reads/s. */
+function plotted(row: Row): number {
+	return row.extraReadsPerSec ?? row.readsPerSec;
+}
+
 export interface Knee {
 	description: string;
 	memoryGiB: number | null;
@@ -226,10 +233,11 @@ export interface Slope {
 
 /**
  * Extra reads/s per GiB of memory removed, per 1,000 req/s, between adjacent unsaturated curve points;
- * a saturated cell measured a server that stopped serving the offered load.
+ * a saturated cell measured a server that stopped serving the offered load. The series' baseline cancels
+ * in the difference, so a series without one still has slopes.
  */
 export function slopes(series: Row[]): Slope[] {
-	const points = measured(curve(series));
+	const points = curve(series).filter((row) => !row.saturated);
 	const result: Slope[] = [];
 	for (let i = 1; i < points.length; i++) {
 		const higher = points[i - 1];
@@ -241,7 +249,7 @@ export function slopes(series: Row[]): Slope[] {
 			fromGiB: higher.memoryGiB,
 			toGiB: lower.memoryGiB,
 			dataToMemory: lower.dataGiB / ((higher.memoryGiB + lower.memoryGiB) / 2),
-			extraReadsPerGiBPer1k: (lower.extraReadsPer1k - higher.extraReadsPer1k) / (higher.memoryGiB - lower.memoryGiB),
+			extraReadsPerGiBPer1k: (lower.readsPer1k - higher.readsPer1k) / (higher.memoryGiB - lower.memoryGiB),
 		});
 	}
 	return result;
@@ -291,14 +299,8 @@ export function fioSummary(fio: any): { iops: number | null; qd1LatencyMs: numbe
 export function mermaidChart(pair: string, workload: string, rows: Row[]): string | null {
 	const stalled = curve(rows).filter((row) => row.saturated);
 	const stalledRatios = new Set(stalled.map((row) => fmt(row.ratio, 2)));
-	const noBaseline = [
-		...new Set(
-			curve(rows)
-				.filter((row) => !row.saturated && row.extraReadsPer1k === null)
-				.map((row) => row.skew)
-		),
-	];
-	const points = measured(curve(rows)).filter((row) => !stalledRatios.has(fmt(row.ratio, 2)));
+	const points = curve(rows).filter((row) => !row.saturated && !stalledRatios.has(fmt(row.ratio, 2)));
+	const noBaseline = [...new Set(points.filter((row) => row.extraReadsPer1k === null).map((row) => row.skew))];
 	const ratios = [...new Set(points.map((row) => fmt(row.ratio, 2)))];
 	const bySkew = groupBy(points, (row) => row.skew);
 	// xychart has no gaps: a skew missing any step is left out rather than drawn through a fake zero.
@@ -307,17 +309,17 @@ export function mermaidChart(pair: string, workload: string, rows: Row[]): strin
 	const omitted = allSkews.filter((skew) => !skews.includes(skew));
 	if (skews.length === 0) return null;
 	const lines = skews.map((skew) => {
-		const byRatio = new Map(bySkew.get(skew)!.map((row) => [fmt(row.ratio, 2), row.extraReadsPerSec]));
+		const byRatio = new Map(bySkew.get(skew)!.map((row) => [fmt(row.ratio, 2), plotted(row)]));
 		return `    line [${ratios.map((ratio) => fmt(byRatio.get(ratio)!, 1)).join(', ')}]`;
 	});
-	const max = Math.max(1, ...points.map((row) => row.extraReadsPerSec));
+	const max = Math.max(1, ...points.map(plotted));
 	const legend =
 		skews.map((skew, i) => `${skew} = ${PALETTE[i]}`).join(', ') +
 		(omitted.length > 0 ? `; not drawn (missing cells): ${omitted.join(', ')}` : '') +
 		(stalled.length > 0
 			? `; steps cut because a cell saturated: ${stalled.map((row) => `${row.skew} at ${fmt(row.ratio, 2)}`).join(', ')}`
 			: '') +
-		(noBaseline.length > 0 ? `; no valid calibration baseline: ${noBaseline.join(', ')}` : '');
+		(noBaseline.length > 0 ? `; total reads/s, no in-memory baseline: ${noBaseline.join(', ')}` : '');
 	return [
 		'```mermaid',
 		`%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "${skews.map((_, i) => PALETTE[i]).join(', ')}"}}}}%%`,
@@ -346,7 +348,7 @@ export function svgChart(workload: string, rows: Row[], ceilingIops: number | nu
 	const minX = Math.log10(Math.min(...ratios, 1) * 0.8);
 	const maxX = Math.log10(Math.max(...ratios, 1) * 1.25);
 	const maxY =
-		Math.log10(1 + Math.max(10, ceilingIops ?? 0, ...measured(points).map((row) => row.extraReadsPerSec))) * 1.05;
+		Math.log10(1 + Math.max(10, ceilingIops ?? 0, ...points.filter((row) => !row.saturated).map(plotted))) * 1.05;
 	const x = (ratio: number) => margin.left + ((Math.log10(ratio) - minX) / (maxX - minX)) * plotWidth;
 	const y = (value: number) => margin.top + plotHeight - (Math.log10(1 + Math.max(0, value)) / maxY) * plotHeight;
 	const pairs = [...new Set(points.map((row) => row.pair))];
@@ -385,14 +387,14 @@ export function svgChart(workload: string, rows: Row[], ceilingIops: number | nu
 		const { pair, skew } = series[0];
 		const color = PALETTE[skewIndex(skew) % PALETTE.length];
 		const dash = dashes[pairs.indexOf(pair) % dashes.length];
-		const served = measured(series);
+		const served = series.filter((row) => !row.saturated);
 		const path = served
-			.map((row, i) => `${i === 0 ? 'M' : 'L'}${x(row.ratio).toFixed(1)},${y(row.extraReadsPerSec).toFixed(1)}`)
+			.map((row, i) => `${i === 0 ? 'M' : 'L'}${x(row.ratio).toFixed(1)},${y(plotted(row)).toFixed(1)}`)
 			.join(' ');
 		parts.push(`<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-dasharray="${dash}"/>`);
 		for (const row of served) {
 			parts.push(
-				`<circle cx="${x(row.ratio).toFixed(1)}" cy="${y(row.extraReadsPerSec).toFixed(1)}" r="3" fill="${color}" stroke="${color}"/>`
+				`<circle cx="${x(row.ratio).toFixed(1)}" cy="${y(plotted(row)).toFixed(1)}" r="3" fill="${row.extraReadsPerSec === null ? 'white' : color}" stroke="${color}"/>`
 			);
 		}
 		for (const row of series.filter((row) => row.saturated)) {
@@ -410,6 +412,8 @@ export function svgChart(workload: string, rows: Row[], ceilingIops: number | nu
 	}
 	parts.push(
 		`<text x="${width - margin.right + 15}" y="${legendY + 14}" fill="#555">× on top edge = saturated cell</text>`,
+		`<text x="${width - margin.right + 15}" y="${legendY + 30}" fill="#555">hollow = total reads/s (no in-memory</text>`,
+		`<text x="${width - margin.right + 15}" y="${legendY + 44}" fill="#555">baseline to subtract)</text>`,
 		'</svg>'
 	);
 	return parts.join('\n');
@@ -436,8 +440,12 @@ export async function loadPair(dir: string, name: string): Promise<PairData> {
 }
 
 export function pairRows(pair: PairData): Row[] {
-	// A calibration whose window failed its checks is no baseline; such cells report reads without subtracting one.
-	const valid = pair.calibrations.filter((c) => (c.server?.window?.invalidReasons ?? []).length === 0);
+	// A calibration whose window failed its checks, or whose dataset did not fit in memory, is no baseline.
+	const valid = pair.calibrations.filter(
+		(c) =>
+			(c.server?.window?.invalidReasons ?? []).length === 0 &&
+			readsPerRequest(c.server.window, c.client.measure.okPerSec) * 1000 <= IN_MEMORY_READS_PER_1K
+	);
 	const calibration = new Map(valid.map((c) => [`${c.workload}/${c.skew}`, c]));
 	return pair.cells.map((cell) =>
 		cellRow(cell, calibration.get(`${cell.cell.workload}/${cell.cell.skew}`), pair.dataset, pair.name)
@@ -490,7 +498,7 @@ export function renderReport(
 			if (row.notReady) return '⚠ did not start';
 			if (row.saturated)
 				return `⚠ ${fmt(servedPct(row), 1)}% served (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
-			return `${row.extraReadsPerSec === null ? 'no baseline' : fmt(row.extraReadsPerSec)} (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
+			return `${row.extraReadsPerSec === null ? `${fmt(row.readsPerSec)} total` : fmt(row.extraReadsPerSec)} (${fmt(row.p99Ms)})${row.clientLimited ? ' ‡' : ''}`;
 		});
 		lines.push(
 			`| ${group[0].pair} | ${group[0].workload} | ${group[0].skew} | ${fmt(group[0].offeredPerSec, 0)} | ${cells.join(' | ')} | ${knee(group).description} |`
@@ -498,7 +506,7 @@ export function renderReport(
 	}
 	lines.push(
 		'',
-		`⚠ = saturated: more than 0.1% of scheduled requests shed or timed out, or under 99% of the offered rate completed; the cell shows the share of the offered rate served (p99 ms) instead of reads, and is left out of slopes. ⚠ did not start = the instance never answered a REST request within 600 s of starting under that limit; it counts as a saturated cell that served nothing. ‡ = client-limited (load-generator CPU above 85% or schedule lag p99 above 10 ms); left out of knees, slopes and charts. Knee: largest memory step whose p99 is ≥ ${KNEE_FACTOR}× the series' lowest p99.`
+		`⚠ = saturated: more than 0.1% of scheduled requests shed or timed out, or under 99% of the offered rate completed; the cell shows the share of the offered rate served (p99 ms) instead of reads, and is left out of slopes. ⚠ did not start = the instance never answered a REST request within 600 s of starting under that limit; it counts as a saturated cell that served nothing. total = no in-memory baseline: the unconstrained calibration was invalid or read more than ${IN_MEMORY_READS_PER_1K} disk read per 1,000 requests (the dataset did not fit in the host's page cache), so the cell shows all data-disk reads/s. ‡ = client-limited (load-generator CPU above 85% or schedule lag p99 above 10 ms); left out of knees, slopes and charts. Knee: largest memory step whose p99 is ≥ ${KNEE_FACTOR}× the series' lowest p99.`
 	);
 	const missing = pairs.flatMap((pair) => {
 		const present = new Set(pair.cells.map((cell) => cell.cell.id));
