@@ -32,6 +32,8 @@ The `setResidency`, `setResidencyById`, `getResidency` and residency-list APIs b
 
 **Static sharding** — each node is assigned to a specific numbered shard, and each record is replicated to the nodes in that shard based on the primary key, regardless of where the data was written or accessed. More predictable than dynamic sharding: data location is always determinable from the primary key.
 
+Legacy residency has a [known limitation](./residency.md#known-limitation-of-legacy-residency) for a record that a node first held only as a stub.
+
 ## Dynamic Sharding
 
 The configuration, REST, Operations API and programmatic `replicateTo` examples below control legacy residency. On `@sharded` tables, `replicateTo` does not override the installed map: only the map determines owners. See [ownership, reads, and writes](./residency.md#ownership-reads-and-writes).
