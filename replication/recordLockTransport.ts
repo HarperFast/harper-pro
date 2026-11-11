@@ -446,7 +446,7 @@ export function createRecordLockTransport(
 }
 
 export const RECORD_LOCKS_DISABLED_MESSAGE =
-	"cluster record locks are not enabled on this node (replication.recordLocks); lock with { scope: 'node' } for a node-local lock";
+	"cluster record locks are not enabled on this node: set replication.recordLocks: true on every node, restart, and apply a home map with record_lock_apply_homes; or lock with { scope: 'node' } for a node-local lock, or set rest.preconditionLocks: false so conditional REST writes skip the lock";
 
 /**
  * Registered while `replication.recordLocks` is off: `ownsCoordination` is true so core reaches
