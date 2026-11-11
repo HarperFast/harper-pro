@@ -365,6 +365,21 @@ export async function waitForCondition(probe, opts = {}) {
 	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: lastError ?? signal.reason });
 }
 
+/** A missing directory throws instead of reading as purged. */
+export async function logSegments(node, logName, database = 'data') {
+	const { readdir } = await import('node:fs/promises');
+	const files = await readdir(join(node.dataRootDir, 'database', database, 'transaction_logs', logName));
+	return files.filter((file) => file.endsWith('.txnlog'));
+}
+
+export function waitForLogPurged(node, logName, { database = 'data', timeoutMs = 180_000 } = {}) {
+	let remaining = [];
+	return waitForCondition(async () => (remaining = await logSegments(node, logName, database)).length === 0, {
+		timeoutMs,
+		description: () => `${logName}'s log purged on ${node.hostname} (still holds ${remaining.join(', ')})`,
+	});
+}
+
 /**
  * Snapshot of memory state on a single node. The shape is stable for tests so we don't
  * depend on `system_information`'s evolving structure: main-process RSS plus the most

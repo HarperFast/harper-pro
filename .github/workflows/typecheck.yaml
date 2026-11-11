@@ -5,9 +5,8 @@ name: Typecheck
 # suite. This job runs `tsc --noEmit`, whose only product is that exit code,
 # as a fast check that fires on every PR.
 #
-# No `paths:` filter, for the same reason as `validate-caller-workflows.yml`: a
-# required status check that only fires on some PRs stays permanently pending on
-# the rest.
+# No `paths:` filter: a required status check that only fires on some PRs stays
+# permanently pending on the rest.
 #
 # Enforcement lives in branch protection, not here: this file only produces the
 # `typecheck` status, which has to be a required check on `main` to block a merge.
