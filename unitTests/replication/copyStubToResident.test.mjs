@@ -604,6 +604,12 @@ describe('replayedStubPut', function () {
 		assert.throws(() => replayedStubPut(audit, tableId, row({ localTime: 2000 }), copyStartTime, 4), /unreadable log/);
 	});
 
+	it('answers the put another key holds even when an earlier key cannot be read', () => {
+		const audit = store({ 2000: new Error('unreadable log'), 3000: head });
+		const entry = row({ localTime: 3000, additionalAuditRefs: [{ version: 2000, nodeId: 0 }] });
+		assert.deepEqual(replayedStubPut(audit, tableId, entry, copyStartTime, 4), { head, logKey: 3000 });
+	});
+
 	it('reads nothing for a row whose log keys are all at or below copyStartTime, or come from another origin', () => {
 		const audit = store({ 1500: head, 2000: head });
 		const entry = row({

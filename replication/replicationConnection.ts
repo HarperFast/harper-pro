@@ -1065,30 +1065,36 @@ export function replayedStubPut(
 	copyStartTime: number,
 	localNodeId: number
 ): { head: AuditRecord; logKey: number } | undefined {
+	let readError: unknown;
 	let probedLocalTime = false;
+	const probe = (logKey: number, log: number) => {
+		try {
+			const head = auditStore.get(logKey, tableId, entry.key, log, true);
+			if (
+				head?.type === 'put' &&
+				head.tableId === tableId &&
+				head.version === entry.version &&
+				(!head.nodeId || head.nodeId === localNodeId) &&
+				!(head.extendedType & LOCAL_ONLY) &&
+				compareKeys(head.recordId, entry.key) === 0
+			)
+				return { head: head as AuditRecord, logKey };
+		} catch (error) {
+			readError ??= error;
+		}
+	};
 	if (entry.additionalAuditRefs)
 		for (const ref of entry.additionalAuditRefs) {
 			if ((ref.nodeId && ref.nodeId !== localNodeId) || !(ref.version > copyStartTime)) continue;
 			if (ref.version === entry.localTime) probedLocalTime = true;
-			const head = readLocalPut(auditStore, tableId, entry, ref.version, ref.nodeId ?? 0, localNodeId);
-			if (head) return { head, logKey: ref.version };
+			const found = probe(ref.version, ref.nodeId ?? 0);
+			if (found) return found;
 		}
 	if (!probedLocalTime && entry.localTime > copyStartTime) {
-		const head = readLocalPut(auditStore, tableId, entry, entry.localTime, entry.nodeId ?? 0, localNodeId);
-		if (head) return { head, logKey: entry.localTime };
+		const found = probe(entry.localTime, entry.nodeId ?? 0);
+		if (found) return found;
 	}
-}
-function readLocalPut(auditStore: any, tableId: number, entry: any, logKey: number, log: number, localNodeId: number) {
-	const head = auditStore.get(logKey, tableId, entry.key, log, true);
-	if (
-		head?.type === 'put' &&
-		head.tableId === tableId &&
-		head.version === entry.version &&
-		(!head.nodeId || head.nodeId === localNodeId) &&
-		!(head.extendedType & LOCAL_ONLY) &&
-		compareKeys(head.recordId, entry.key) === 0
-	)
-		return head as AuditRecord;
+	if (readError) throw readError;
 }
 // The receive-side watchdog fires after this much silence on a replication WS. Both client and
 // server arm it: the client also runs an active 30s sendPing tick that should normally catch a
@@ -10565,6 +10571,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															isStub &&
 															!table.residency &&
 															(!entry.nodeId || entry.nodeId === nodeId) &&
+															(entry.localTime > copyStartTime || entry.additionalAuditRefs?.length > 0) &&
 															getResidence(entry.residencyId, table)?.includes(remoteNodeName)
 																? replayedStubPut(auditStore, table.tableId, entry, copyStartTime, nodeId)
 																: undefined;
