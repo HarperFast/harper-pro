@@ -160,6 +160,16 @@ describe('NodeReplicationConnection private dial', () => {
 			await waitFor(() => retries.length === 2, 'the retry after the refused public dial');
 		});
 
+		it('a local failure creating the socket for a private dial does not start an outage', async () => {
+			// ws refuses a URL with a fragment before any socket exists, as a missing certificate would
+			const privateUrl = 'ws://127.0.0.1:1/#local-failure';
+			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
+			const { connection, pathKey, retries } = connectionVia(privateUrl, publicUrl);
+			await connection.connect();
+			await waitFor(() => retries.length === 1, 'the retry after the failed socket creation');
+			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PRIVATE);
+		});
+
 		it('a peer that closes after the WebSocket opens, before identifying, is a private failure', async () => {
 			const privateUrl = await server((ws) => ws.close(1008, 'Unauthorized'));
 			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
