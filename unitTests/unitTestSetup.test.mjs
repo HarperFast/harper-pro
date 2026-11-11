@@ -59,8 +59,6 @@ describe('unit-test storage root lifecycle', function () {
 		assert.ok(!existsSync(testRoot), `child run left ${testRoot} behind${output}`);
 	});
 
-	// Loads Pro's entry point, commits one transaction-log entry, then calls process.exit(); reports
-	// whether the log file was written and whether rocksdb-js's exit listener flushed txn.state.
 	async function exitAfterCommit(noFlushOnExit) {
 		const probeDir = mkdtempSync(join(tmpdir(), 'harper-no-flush-on-exit-'));
 		const storageRoot = join(probeDir, 'root');
