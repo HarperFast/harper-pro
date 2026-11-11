@@ -1,11 +1,10 @@
 /**
- * A base copy carries deletions (harper-pro#1331, and harper-pro#1307 on hdb_nodes).
- *
- * The scenario needs no fault injection. A, B and D form a mesh. A stops; B writes to rows A will
- * delete and rewrites D's hdb_nodes row; B and D stop. A restarts, deletes those rows and removes D.
- * C joins by copy from A. With A stopped again, B returns and delivers its older writes to C: C
- * resumes B's log from the cursor A's copy gave it, which sits below writes A never received. A
- * rejects them against its own tombstones; C must too, or the rows (and D's membership) come back.
+ * harper-pro#1331, and harper-pro#1307 on hdb_nodes. No fault injection: A, B and D form a mesh.
+ * A stops; B writes to rows A will delete and rewrites D's hdb_nodes row; B and D stop. A
+ * restarts, deletes those rows and removes D. C joins by copy from A. With A stopped again, B
+ * returns and delivers its older writes to C: C resumes B's log from the cursor A's copy gave it,
+ * which sits below writes A never received. A rejects them against its own tombstones; C must too,
+ * or the rows (and D's membership) come back.
  *
  * Each of B's batches commits in one transaction with a witness row, so the witness reaching C proves
  * C processed the stale writes in the same frame. A is down while B delivers: up, it would apply only
@@ -183,8 +182,11 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 		C = await nodes.startFresh();
 		await nodes.join(C, A);
 		await waitFor(async (signal) => (await dataRow(C.harper, 'sentinel', signal)).present, 'the copy to reach C');
-		// B's row reaches C only through A's system copy; add_node writes A's row on C itself
-		await waitFor(async (signal) => (await nodeRow(C.harper, B.harper.hostname, signal)).present, 'the system copy');
+		// only A's system copy brings D's tombstone, and it sorts after B's row, which arrives first
+		await waitFor(
+			async (signal) => (await nodeRow(C.harper, D.harper.hostname, signal)).stored,
+			"D's copied tombstone"
+		);
 		const expectTombstones = async (when) => {
 			for (const [id, read] of [
 				['k-put', dataRow],
