@@ -11,7 +11,6 @@ import {
 	currentRegionTopology,
 	selfTopologyLabels,
 } from './knownNodes.ts';
-import { isGateway } from './regionTopology.ts';
 import {
 	CONFIRMATION_STATUS_POSITION,
 	RECEIVED_VERSION_POSITION,
@@ -113,8 +112,13 @@ export async function clusterStatus() {
 			? {
 					active: true,
 					region,
-					gateway: isGateway(topology, response.node_name),
-					gateways: Object.fromEntries(topology.gatewaysByRegion),
+					column: topology.columnOf.get(response.node_name),
+					columns: Object.fromEntries(
+						[...topology.membersByRegion].map(([name, members]) => [
+							name,
+							Object.fromEntries(members.map((member) => [member, topology.columnOf.get(member)])),
+						])
+					),
 					suppliers: response.regionSuppliers ?? {},
 				}
 			: { active: false, region, reason: topology.inactiveReason };

@@ -24,7 +24,7 @@ import {
 	type TopologyLink,
 	type TopologyLinks,
 } from './replicator.ts';
-import { peerSupportsRegionTopology } from './protocolCapabilities.ts';
+import { peerSupportsRegionGrid } from './protocolCapabilities.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
 import { parentPort } from 'worker_threads';
 import {
@@ -44,11 +44,10 @@ import {
 	setResidencyVerdictListener,
 } from './knownNodes.ts';
 import {
-	isGateway,
 	orderFailoverCandidates,
+	receivesDirect,
 	settleSupplier,
 	supplierCandidates,
-	topologyAllowsDirect,
 	topologySignature,
 	type SupplierAssignment,
 	type SupplierState,
@@ -141,10 +140,8 @@ type ReplicationConnectionStatus = {
 	// an active subscription and must not take the existing-entry reuse fast path.
 	unsubscribed?: boolean;
 	liveSince?: number;
-	peerReach?: string[];
-	reachSince?: Map<string, number>;
-	// Holds liveness across a reconnect this node triggered.
-	topologyPinnedUntil?: number;
+	// Holds a supplier link eligible across the reconnect this node caused by assigning it an origin.
+	topologySwitchingUntil?: number;
 	nodes: ({
 		name: string;
 		url: string;
@@ -536,12 +533,7 @@ export function describeIdentityMismatch(
  * (`newSocket`) closes the same gap earlier, for the window before any fenced post arrives.
  */
 export function applyConnectionMetadata(entry: any, connection: any): boolean {
-	if (
-		connection.peerCapabilities === undefined &&
-		connection.unknownCommandFrames === undefined &&
-		connection.gatewayReach === undefined
-	)
-		return false;
+	if (connection.peerCapabilities === undefined && connection.unknownCommandFrames === undefined) return false;
 	const owningThreadId = entry.worker?.threadId;
 	if (owningThreadId !== undefined && connection.threadId !== owningThreadId) return false;
 	// The ordinal orders sessions only within one worker, so it is consulted only when the reporting
@@ -557,8 +549,6 @@ export function applyConnectionMetadata(entry: any, connection: any): boolean {
 		entry.metadataThreadId !== connection.threadId || entry.metadataSessionOrdinal !== connection.sessionOrdinal;
 	entry.metadataThreadId = connection.threadId;
 	entry.metadataSessionOrdinal = connection.sessionOrdinal;
-	// gateway reach is per session too: a new socket has reported none yet
-	if (newSession) entry.peerReach = entry.reachSince = undefined;
 	if (connection.peerCapabilities !== undefined) entry.peerCapabilities = connection.peerCapabilities;
 	else if (newSession) entry.peerCapabilities = undefined;
 	if (connection.unknownCommandFrames !== undefined) entry.unknownCommandFrames = connection.unknownCommandFrames;
@@ -1000,10 +990,11 @@ export function getConfiguredRoutes(): Route[] {
 }
 
 /**
- * The receive decision plus the region link rule (harper-pro#1291). Every main-thread desire point uses it, so
- * subscription setup, exclusion and the reconcile nets agree on which peers are direct: a pruned peer is neither
+ * The receive decision plus the region grid's receive rule (harper-pro#1343). Every main-thread desire point uses it,
+ * so subscription setup, exclusion and the reconcile nets agree on which peers are direct: a pruned peer is neither
  * subscribed to, re-driven, nor counted as direct coverage (which would exclude its writes from every relay). A
- * route with explicit replication settings, and a leader bootstrapping a database this node lacks, keep the link.
+ * route with explicit replication settings, a leader bootstrapping a database this node lacks, and an origin this
+ * node has taken over by a temporary direct link keep the link.
  */
 export function wantsDirectSubscription(node: any, databaseName: string): boolean {
 	if (!shouldReplicateFromNode(node, databaseName)) return false;
@@ -1011,7 +1002,10 @@ export function wantsDirectSubscription(node: any, databaseName: string): boolea
 	if (!topology) return true;
 	if (routes.find((route) => route.name === node.name)?.explicitReplication) return true;
 	if (node.isLeader && !getDatabases()[databaseName]) return true;
-	return topologyAllowsDirect(topology, getThisNodeName(), node.name);
+	return (
+		receivesDirect(topology, getThisNodeName(), node.name) ||
+		topologyAssignments.get(databaseName)?.get(node.name)?.supplier === node.name
+	);
 }
 
 /**
@@ -1072,11 +1066,15 @@ function updateShardingFailover(database: string): void {
 
 const TOPOLOGY_HOLD_MS = 3_000;
 const TOPOLOGY_STABLE_MS = 10_000;
-const TOPOLOGY_PIN_MS = 30_000;
+const TOPOLOGY_SWITCH_GRACE_MS = 30_000;
 type TopologyAssignment = SupplierAssignment & { relieved?: string | null };
 const topologyAssignments = new Map<string, Map<string, TopologyAssignment>>();
+// Per database, the origins this node now subscribes to itself that it last took through a supplier, with that
+// supplier: the origin's own link has no record of what the supplier delivered, so it borrows its start from it.
+const directBorrows = new Map<string, Map<string, string | null>>();
 let topologyRecheckTimer: ReturnType<typeof setTimeout> | undefined;
 let topologyRecheckAt = Infinity;
+let onDirectTakeoverChange: (() => void) | undefined;
 
 function topologyEntry(name: string, database: string): any {
 	const node = nodeMap.get(name);
@@ -1098,57 +1096,79 @@ function scheduleTopologyRecheck(at: number) {
 	topologyRecheckTimer.unref?.();
 }
 
-/**
- * A supplier must speak region topology and be connected, except through a reconnect this node caused by assigning
- * it an origin: that reconnect reports DOWN and drops the reach the old session reported, and treating either as a
- * failure would move the origin straight back. The hold ends when the new session reports reach, or at its deadline,
- * and it keeps only the origins already assigned to that link: a pinned link that is down must not draw others.
- */
-const speaksRegionTopology = (entry: any): boolean =>
-	!!entry.peerCapabilities && peerSupportsRegionTopology(entry.peerCapabilities);
+const speaksRegionGrid = (entry: any): boolean =>
+	!!entry.peerCapabilities && peerSupportsRegionGrid(entry.peerCapabilities);
 
+/**
+ * A supplier must speak the region grid and be connected, except through a reconnect this node caused by assigning it
+ * an origin: that reconnect reports DOWN and drops the capabilities the old session reported, and treating either as
+ * a failure would move the origin straight back. The grace ends when the new session reports its capabilities, or at
+ * its deadline, and it covers only the origins already assigned to that link: a link that is down must not draw
+ * others.
+ */
 function topologySupplierState(database: string, now: number, current: string | undefined): SupplierState {
-	const pinned = (name: string, entry: any) => name === current && entry?.topologyPinnedUntil > now;
 	return {
-		isLive(name) {
+		qualifies(name) {
 			const entry = topologyEntry(name, database);
-			if (!entry) return false;
-			if (pinned(name, entry)) return true;
-			return entry.connected === true && speaksRegionTopology(entry);
+			if (!entry || entry.unsubscribed) return false;
+			if (name === current && entry.topologySwitchingUntil > now) return true;
+			return entry.connected === true && speaksRegionGrid(entry);
 		},
-		liveSince: (name) => topologyEntry(name, database)?.liveSince ?? now,
-		reaches(name, region) {
-			const entry = topologyEntry(name, database);
-			return pinned(name, entry) || entry?.peerReach?.includes(region) === true;
-		},
-		reachSince: (name, region) => topologyEntry(name, database)?.reachSince?.get(region) ?? now,
+		qualifiedSince: (name) => topologyEntry(name, database)?.liveSince ?? now,
 	};
 }
 
 /**
- * Settles the supplier of every topology-managed origin for `database` (harper-pro#1291) and derives each link's
- * exclusions: an origin is excluded on every link but its supplier's, and nowhere when it has none. Undefined when
- * the database replicates as a full mesh. Each origin newly assigned to a link pins that link's liveness until it
- * reconnects, since admitting the origin there is what makes the worker reconnect it.
+ * Settles the supplier of every topology-managed origin for `database` (harper-pro#1343) and derives each link's
+ * exclusions: an origin is excluded on every link but its supplier's, and nowhere while it has none. Undefined when
+ * the database replicates as a full mesh. An origin whose supplier is its own name is one this node subscribes to
+ * directly until a region-mate can supply it again; `wantsDirectSubscription` reads that. Each origin moved onto a
+ * link from another supplier starts that link's switch grace, since admitting the origin there is what makes the
+ * worker reconnect it.
  */
 export function computeTopologyLinks(database: string, now = Date.now()): TopologyLinks | undefined {
 	const topology = regionTopologyFor(database);
+	let borrows = directBorrows.get(database);
+	const becameDirect = (origin: string, assignment: TopologyAssignment) => {
+		const last = assignment.supplier === origin ? undefined : (assignment.supplier ?? assignment.relieved);
+		if (!last) return;
+		if (!borrows) directBorrows.set(database, (borrows = new Map()));
+		borrows.set(origin, last);
+	};
+	const borrowLinks = (byUrl: Record<string, TopologyLink>) => {
+		for (const [origin, last] of borrows ?? []) {
+			const node = nodeMap.get(origin);
+			if (!node) continue;
+			const link = (byUrl[getNodeURL(node)] ??= {});
+			(link.borrow ??= {})[origin] = last;
+		}
+		return byUrl;
+	};
 	if (!topology) {
-		topologyAssignments.delete(database);
-		return;
+		const ended = topologyAssignments.get(database);
+		if (ended) {
+			// the database is back on the full mesh: every origin a supplier carried is direct from here on
+			for (const [origin, assignment] of ended) becameDirect(origin, assignment);
+			topologyAssignments.delete(database);
+			onDirectTakeoverChange?.();
+		}
+		return borrows?.size ? { byUrl: borrowLinks({}), managed: [], active: false } : undefined;
 	}
 	const selfName = getThisNodeName();
 	let assignments = topologyAssignments.get(database);
 	if (!assignments) topologyAssignments.set(database, (assignments = new Map()));
 	const managed: string[] = [];
+	let directChanged = false;
 	for (const origin of topology.regionOf.keys()) {
 		if (routes.find((route) => route.name === origin)?.explicitReplication) continue;
 		const candidates = supplierCandidates(topology, selfName, origin);
 		if (!candidates) continue;
 		managed.push(origin);
+		borrows?.delete(origin);
 		const previous = assignments.get(origin);
 		const next: TopologyAssignment = settleSupplier(
 			candidates,
+			origin,
 			topologySupplierState(database, now, previous?.supplier),
 			previous,
 			now,
@@ -1157,28 +1177,38 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 		);
 		if (next.supplier === previous?.supplier) next.relieved = previous?.relieved;
 		else {
-			// a move through failing open still borrows from the last real supplier
+			// a move through having no supplier still borrows from the last real one
 			next.relieved = previous?.supplier ?? previous?.relieved ?? null;
+			if (next.supplier === origin || previous?.supplier === origin) directChanged = true;
 			// only a move off another supplier reconnects the new link (the origin was excluded there); a first
-			// assignment, or one out of failing open, finds the origin already admitted and no reconnect to cover
+			// assignment finds the origin already admitted, and a direct link is a new subscription
 			const entry =
-				next.supplier === undefined || previous?.supplier === undefined
+				next.supplier === undefined || next.supplier === origin || previous?.supplier === undefined
 					? undefined
 					: topologyEntry(next.supplier, database);
-			if (entry) entry.topologyPinnedUntil = now + TOPOLOGY_PIN_MS;
+			if (entry) entry.topologySwitchingUntil = now + TOPOLOGY_SWITCH_GRACE_MS;
 			logger.info(
-				`Region topology: ${database} takes ${origin} from ${next.supplier ?? 'any peer'}` +
-					(previous?.supplier ? ` instead of ${previous.supplier}` : '')
+				`Region topology: ${database} takes ${origin} ${next.supplier === origin ? 'by a direct link' : `from ${next.supplier ?? 'any peer'}`}` +
+					(previous?.supplier
+						? ` instead of ${previous.supplier === origin ? 'its direct link' : previous.supplier}`
+						: '')
 			);
 		}
 		if (next.recheckAt !== undefined) scheduleTopologyRecheck(next.recheckAt);
-		// requested on every pass: the timer keeps only the earliest time, so a pin's expiry asked for once is lost
-		const pinnedUntil =
-			next.supplier === undefined ? undefined : topologyEntry(next.supplier, database)?.topologyPinnedUntil;
-		if (pinnedUntil > now) scheduleTopologyRecheck(pinnedUntil);
+		// requested on every pass: the timer keeps only the earliest time, so a grace's expiry asked for once is lost
+		const switchingUntil =
+			next.supplier === undefined ? undefined : topologyEntry(next.supplier, database)?.topologySwitchingUntil;
+		if (switchingUntil > now) scheduleTopologyRecheck(switchingUntil);
 		assignments.set(origin, next);
 	}
-	for (const origin of assignments.keys()) if (!managed.includes(origin)) assignments.delete(origin);
+	for (const [origin, assignment] of assignments) {
+		if (managed.includes(origin)) continue;
+		// a lane moved and this node now carries the origin's column, or the origin left
+		if (assignment.supplier === origin) directChanged = true;
+		else if (topology.regionOf.has(origin)) becameDirect(origin, assignment);
+		assignments.delete(origin);
+	}
+	if (directChanged) onDirectTakeoverChange?.();
 	const byUrl: Record<string, TopologyLink> = {};
 	for (const [name, node] of nodeMap) {
 		const url = getNodeURL(node);
@@ -1188,7 +1218,7 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 		for (const origin of managed) {
 			const { supplier, relieved } = assignments.get(origin)!;
 			if (supplier === undefined) {
-				// failing open re-admits the origin on every link, each resuming from where the last supplier left it
+				// with no supplier the origin is admitted on every link, each resuming from where the last supplier left it
 				if (relieved) borrow[origin] = relieved;
 				continue;
 			}
@@ -1197,10 +1227,20 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 		}
 		byUrl[url] = { excluded, borrow };
 	}
-	return { byUrl, managed };
+	return { byUrl: borrowLinks(byUrl), managed, active: true };
 }
 
-/** Per database, the peer each topology-managed origin is taken from (null: from any peer). */
+/** The origins each database has taken over by a temporary direct link, for the link review's signature. */
+function directTakeovers(): string {
+	const taken: string[] = [];
+	for (const [database, assignments] of topologyAssignments) {
+		for (const [origin, assignment] of assignments)
+			if (assignment.supplier === origin) taken.push(`${database}/${origin}`);
+	}
+	return taken.sort().join(',');
+}
+
+/** Per database, the peer each topology-managed origin is taken from (its own name: by a direct link; null: from any peer). */
 function topologySuppliers(): Record<string, Record<string, string | null>> | undefined {
 	if (topologyAssignments.size === 0) return;
 	const suppliers: Record<string, Record<string, string | null>> = {};
@@ -1210,26 +1250,6 @@ function topologySuppliers(): Record<string, Record<string, string | null>> | un
 		);
 	}
 	return suppliers;
-}
-
-/** Accepts reach only from a gateway of this node's own region, and only regions the topology knows. */
-function acceptGatewayReach(entry: any, connection: any): boolean {
-	const topology = regionTopologyFor(connection.database);
-	const selfName = getThisNodeName();
-	const region = topology?.regionOf.get(selfName);
-	if (!topology || !isGateway(topology, connection.name) || topology.regionOf.get(connection.name) !== region)
-		return false;
-	const regions = connection.gatewayReach.filter(
-		(reached: unknown) => typeof reached === 'string' && reached !== region && topology.gatewaysByRegion.has(reached)
-	);
-	const now = Date.now();
-	const reachSince = new Map<string, number>();
-	for (const reached of regions) reachSince.set(reached, entry.reachSince?.get(reached) ?? now);
-	// a session's first report is a change even when empty: it ends the pin on the reconnect that awaited it
-	const changed = entry.peerReach === undefined || JSON.stringify(regions) !== JSON.stringify(entry.peerReach);
-	entry.peerReach = regions;
-	entry.reachSince = reachSince;
-	return changed;
 }
 
 // Re-derive the exclusion-origin set for every database with a live subscription entry and push it to
@@ -1434,13 +1454,12 @@ export async function startOnMainThread(options) {
 				// `mainThreadInitialized`, harper-pro#460), and replication routes are process config, so a
 				// route change takes effect on the next restart — where this rewrite fires.
 				const selfReplicates = computeSelfReplicates(iterateRoutes(options));
-				const { region, gateway } = selfTopologyLabels();
+				const { region } = selfTopologyLabels();
 				if (
 					existing === undefined ||
 					existing.url !== url ||
 					existing.shard !== options.shard ||
 					(existing.region ?? null) !== region ||
-					(existing.gateway ?? null) !== gateway ||
 					!replicatesEqual(existing.replicates, selfReplicates)
 				) {
 					return ensureNode(thisName, {
@@ -1448,7 +1467,6 @@ export async function startOnMainThread(options) {
 						url,
 						shard: options.shard,
 						region,
-						gateway,
 						replicates: selfReplicates,
 					});
 				}
@@ -1481,9 +1499,9 @@ export async function startOnMainThread(options) {
 	let isFullyReplicating;
 	let appliedTopology: string | undefined;
 	let topologyReviewScheduled = false;
-	// A change to any row's region, gateway or membership, or a database's residency verdict, can move links for every
-	// peer, not only the one whose row changed. Re-running onNodeUpdate over all rows is idempotent: links that stay are
-	// left alone.
+	// A change to any row's region, shard or membership, a database's residency verdict, or an origin taken over by
+	// (or returned from) a temporary direct link can move links for every peer, not only the one whose row changed.
+	// Re-running onNodeUpdate over all rows is idempotent: links that stay are left alone.
 	function scheduleTopologyReview() {
 		if (topologyReviewScheduled) return;
 		topologyReviewScheduled = true;
@@ -1494,7 +1512,7 @@ export async function startOnMainThread(options) {
 					.filter((db) => regionTopologyFor(db))
 					.sort()
 					.join(',');
-				const signature = `${topologySignature(currentRegionTopology())}|${managedDatabases}`;
+				const signature = `${topologySignature(currentRegionTopology())}|${managedDatabases}|${directTakeovers()}`;
 				if (signature === appliedTopology) return;
 				for (const row of getHDBNodeTable().search([])) {
 					if (row?.name) onNodeUpdate(row, row.name);
@@ -1508,6 +1526,7 @@ export async function startOnMainThread(options) {
 		timer.unref?.();
 	}
 	setResidencyVerdictListener(scheduleTopologyReview);
+	onDirectTakeoverChange = scheduleTopologyReview;
 	/**
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
@@ -1842,6 +1861,11 @@ export async function startOnMainThread(options) {
 				if (existingEntry) {
 					clearTimeout(existingEntry.reDriveTimer);
 					existingEntry.reDriveTimer = undefined;
+					// a failover subscription lists this origin, so no exclusion would stop it from another peer
+					for (const [otherUrl, otherEntries] of connectionReplicationMap) {
+						const failover = otherUrl === getNodeURL(node) ? undefined : otherEntries.get(databaseName);
+						if (failover?.nodes?.length > 1) removeRestoredNodeFromFailoverEntry(failover, node, databaseName);
+					}
 				}
 				const request = {
 					type: 'unsubscribe-from-node',
@@ -1881,7 +1905,6 @@ export async function startOnMainThread(options) {
 			// from one that is briefly mid-retry; don't reset it on repeated disconnect notifications.
 			if (existingWorkerEntry.connected !== false) existingWorkerEntry.disconnectedAt = Date.now();
 			existingWorkerEntry.connected = false;
-			existingWorkerEntry.peerReach = existingWorkerEntry.reachSince = undefined;
 			if (regionTopologyFor(connection.database)) scheduleExclusionOriginsBroadcast();
 			if (connection.finished) {
 				return;
@@ -1910,7 +1933,7 @@ export async function startOnMainThread(options) {
 			const entryFor = (name: string) =>
 				connectionReplicationMap.get(getNodeURL(nodeMap.get(name)))?.get(connection.database);
 			const topology = regionTopologyFor(connection.database);
-			const candidates = orderFailoverCandidates(nodeNames, existingIndex, topology?.regionOf);
+			const candidates = orderFailoverCandidates(nodeNames, existingIndex, topology, getThisNodeName());
 			for (const nextNodeName of candidates) {
 				const failoverWorkerEntry = entryFor(nextNodeName);
 				if (
@@ -1963,28 +1986,21 @@ export async function startOnMainThread(options) {
 		}
 		const wasConnected = mainWorkerEntry.connected === true;
 		mainWorkerEntry.connected = true;
-		if (!wasConnected) {
-			mainWorkerEntry.liveSince = Date.now();
-			// only a gateway of this node's own region reports reach; any other supplier is back once connected
-			const topology = regionTopologyFor(connection.database);
-			if (topology?.regionOf.get(connection.name) !== topology?.regionOf.get(getThisNodeName()))
-				mainWorkerEntry.topologyPinnedUntil = undefined;
-		}
+		if (!wasConnected) mainWorkerEntry.liveSince = Date.now();
 		if (connectReportAdvancesGeneration(mainWorkerEntry, connection))
 			advanceConnectGeneration(mainWorkerEntry, Date.now(), RECEIVE_STALL_THRESHOLD_MS);
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
 		if (canClearCapabilitiesForNewSocket(mainWorkerEntry, connection)) mainWorkerEntry.peerCapabilities = undefined;
-		const couldSupply = speaksRegionTopology(mainWorkerEntry);
-		const metadataApplied = applyConnectionMetadata(mainWorkerEntry, connection);
-		const reachChanged =
-			metadataApplied && Array.isArray(connection.gatewayReach) && acceptGatewayReach(mainWorkerEntry, connection);
-		if (reachChanged) mainWorkerEntry.topologyPinnedUntil = undefined;
+		const couldSupply = speaksRegionGrid(mainWorkerEntry);
+		applyConnectionMetadata(mainWorkerEntry, connection);
 		// capabilities usually arrive after the connect report, and until then the peer cannot be a supplier
-		const canSupplyChanged = couldSupply !== speaksRegionTopology(mainWorkerEntry);
-		if ((!wasConnected || reachChanged || canSupplyChanged) && regionTopologyFor(connection.database))
-			scheduleExclusionOriginsBroadcast();
+		const canSupply = speaksRegionGrid(mainWorkerEntry);
+		const supplyChanged = !wasConnected || couldSupply !== canSupply;
+		// only the session that follows the reconnect ends its grace, not a late report from the one it replaced
+		if (supplyChanged && canSupply) mainWorkerEntry.topologySwitchingUntil = undefined;
+		if (supplyChanged && regionTopologyFor(connection.database)) scheduleExclusionOriginsBroadcast();
 		const restoredNode = mainWorkerEntry.nodes[0];
 		if (!restoredNode) {
 			logger.warn('Newly connected node has no node subscriptions', connection.database, mainWorkerEntry);
@@ -2040,7 +2056,8 @@ export async function startOnMainThread(options) {
 				const links = computeTopologyLinks(database);
 				if (!links) return null;
 				// a proxied socket carries only `node`'s own origin; a direct one (the restore path) is any other link
-				return connectingNode === node ? (links.byUrl[getNodeURL(node)] ?? null) : { excluded: links.managed };
+				if (connectingNode === node) return links.byUrl[getNodeURL(node)] ?? null;
+				return links.active ? { excluded: links.managed } : null;
 			})(),
 		};
 		if (dispatchSubscriptionRequest({ worker }, request, replicationPool, true, subscribeToNode) === 'deferred')
@@ -2463,7 +2480,6 @@ export async function requestClusterStatus(message?, port?) {
 						peerCapabilities,
 						unknownCommandFrames,
 						unsubscribed,
-						peerReach,
 					},
 				] of dbReplicationMap) {
 					databases.push({
@@ -2481,7 +2497,6 @@ export async function requestClusterStatus(message?, port?) {
 						peerCapabilities,
 						// Omitted on a healthy link (harper-pro#440), matching blobReplicationFailures.
 						unknownCommandFrames: unknownCommandFrames || undefined,
-						gatewayReach: peerReach,
 						nodes: nodes.filter((node) => !(node.endTime < Date.now())).map((node) => node.name),
 					});
 				}

@@ -143,15 +143,4 @@ describe('applyConnectionMetadata', () => {
 		assert.strictEqual(applyConnectionMetadata(entry, post(3, 2, { peerCapabilities: CAPABILITIES_LEGACY })), true);
 		assert.strictEqual(entry.peerCapabilities, CAPABILITIES_LEGACY);
 	});
-
-	it('accepts a reach-only post from the owning session and drops reach when a new session reports', () => {
-		const entry = entryOwnedBy(3);
-		assert.strictEqual(applyConnectionMetadata(entry, post(3, 1, { gatewayReach: ['west'] })), true);
-		entry.peerReach = ['west'];
-		entry.reachSince = new Map([['west', 1]]);
-		assert.strictEqual(applyConnectionMetadata(entry, post(9, 1, { gatewayReach: ['eu'] })), false);
-		assert.deepStrictEqual(entry.peerReach, ['west'], 'another worker does not speak for the entry');
-		assert.strictEqual(applyConnectionMetadata(entry, post(3, 2, { peerCapabilities: CAPABILITIES_A })), true);
-		assert.strictEqual(entry.peerReach, undefined, 'a new session has reported no reach yet');
-	});
 });

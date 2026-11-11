@@ -876,14 +876,20 @@ export function releaseSharedStatusOnUnsubscribe(connection) {
 // subscriptionManager broadcast) to every live subscription connection for the database. Each session
 // diffs against the list it last sent, so a set that changes nothing sends nothing.
 export interface TopologyLink {
-	excluded: string[];
+	/** Undefined on a link of a database the topology no longer manages, which carries only a borrow. */
+	excluded?: string[];
 	borrow?: Record<string, string | null>;
 }
 
-/** Region-topology exclusions for one database (harper-pro#1291): each primary link's by its URL; `managed` for a failover link. */
+/**
+ * Region-topology exclusions for one database (harper-pro#1343): each primary link's by its URL; `managed` for a
+ * failover link. Not `active` once the database is back on the full mesh, when it only carries the borrows of links
+ * that became direct.
+ */
 export interface TopologyLinks {
 	byUrl: Record<string, TopologyLink>;
 	managed: string[];
+	active: boolean;
 }
 
 function applyTopologyLink(connection: any, link: TopologyLink | null) {
@@ -907,14 +913,8 @@ export function updateExclusionOrigins({
 		try {
 			connection.exclusionOrigins = origins;
 			const proxied = connection.subscriptionUrl !== undefined && connection.subscriptionUrl !== connection.url;
-			applyTopologyLink(
-				connection,
-				topology
-					? proxied
-						? { excluded: topology.managed }
-						: (topology.byUrl[connection.url] ?? { excluded: [] })
-					: null
-			);
+			const unmanaged = topology?.active ? { excluded: proxied ? topology.managed : [] } : null;
+			applyTopologyLink(connection, proxied ? unmanaged : (topology?.byUrl[connection.url] ?? unmanaged));
 			connection.emit('exclusion-origins-updated', origins);
 		} catch (error) {
 			logger.error('Error applying exclusion origins for', database, connection.url, error);

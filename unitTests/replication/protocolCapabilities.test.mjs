@@ -12,7 +12,7 @@ import {
 	RESIDENCY_NOT_RESIDENT_CAPABILITY,
 	RESIDENCY_SLOTS_CAPABILITY,
 	SHARDING_RECOVERY_CAPABILITY,
-	REGION_TOPOLOGY_CAPABILITY,
+	REGION_GRID_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
@@ -25,7 +25,7 @@ import {
 	peerSupportsResidencyStubCopy,
 	peerSupportsResidencySlots,
 	peerSupportsShardingRecovery,
-	peerSupportsRegionTopology,
+	peerSupportsRegionGrid,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -51,7 +51,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				residencyNotResident: 0,
 				residencySlots: 0,
 				shardingRecovery: 0,
-				regionTopology: 0,
+				regionGrid: 0,
 			}
 		);
 	});
@@ -75,7 +75,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 			'originFloors',
 			'protocolVersion',
 			'recordLocks',
-			'regionTopology',
+			'regionGrid',
 			'residencyNotResident',
 			'residencySlots',
 			'residencyStubCopy',
@@ -261,7 +261,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
-				regionTopology: REGION_TOPOLOGY_CAPABILITY,
+				regionGrid: REGION_GRID_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -307,7 +307,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
-				regionTopology: REGION_TOPOLOGY_CAPABILITY,
+				regionGrid: REGION_GRID_CAPABILITY,
 			}
 		);
 	});
@@ -568,15 +568,15 @@ describe('Sharding recovery capability', () => {
 });
 
 describe('Region topology capability', () => {
-	it('needs the region topology level and origin cursors, and is advertised only with per-origin logs', () => {
-		assert.equal(peerSupportsRegionTopology(resolvePeerCapabilities({})), false);
-		assert.equal(peerSupportsRegionTopology(resolvePeerCapabilities({ regionTopology: 1 })), false);
-		assert.equal(peerSupportsRegionTopology(resolvePeerCapabilities({ regionTopology: 1, originCursors: 1 })), true);
+	it('needs the region grid level and origin cursors, and is advertised only with per-origin logs', () => {
+		assert.equal(peerSupportsRegionGrid(resolvePeerCapabilities({})), false);
+		assert.equal(peerSupportsRegionGrid(resolvePeerCapabilities({ regionGrid: 1 })), false);
+		assert.equal(peerSupportsRegionGrid(resolvePeerCapabilities({ regionGrid: 1, originCursors: 1 })), true);
 		assert.equal(
-			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ regionTopology: 1 })),
+			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ regionGrid: 1 })),
 			false
 		);
-		assert.equal(buildLocalCapabilities(1000, false, true).regionTopology, REGION_TOPOLOGY_CAPABILITY);
-		assert.equal(buildLocalCapabilities(1000, false, false).regionTopology, 0);
+		assert.equal(buildLocalCapabilities(1000, false, true).regionGrid, REGION_GRID_CAPABILITY);
+		assert.equal(buildLocalCapabilities(1000, false, false).regionGrid, 0);
 	});
 });

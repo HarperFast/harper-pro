@@ -148,7 +148,6 @@ import {
 	FIRE_COUNTER_BASE_POSITION,
 	PEER_CERTIFIES_FLOORS_POSITION,
 	LAST_SEND_LOG_BREAK_RECONNECT_TIME_POSITION,
-	CAUGHT_UP_TIME_POSITION,
 } from './sharedStatusSlots.ts';
 import {
 	recordPeerLockCapability,
@@ -180,7 +179,6 @@ import {
 	noteUnknownCommand,
 	peerSupportsOriginCursors,
 	peerSupportsOriginFloors,
-	peerSupportsRegionTopology,
 	peerCertifiesCheckpointFloors,
 	peerSupportsRecordLocks,
 	peerSupportsResidencyNotResident,
@@ -231,10 +229,7 @@ import {
 	isGenuineNodeDeletion,
 	probeNodeRow,
 	SEND_AUTH_UNCHANGED,
-	regionTopologyFor,
-	selfTopologyLabels,
 } from './knownNodes.ts';
-import { isGateway, validRegion } from './regionTopology.ts';
 import {
 	holdRelayCopyLease,
 	newPassToken,
@@ -330,15 +325,8 @@ const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; 
 // (e.g. sendSubscriptionRequestUpdate). Sent at initial handshake alongside NODE_NAME, and standalone
 // whenever this node's own active home-map digest for the database changes (on activate).
 const RECORD_LOCK_HOMES_DIGEST = 150;
-// Region topology (harper-pro#1291), sent only to a peer advertising `regionTopology`: `[CAUGHT_UP, database]` once per
-// session when the sender's historical scan first goes idle; `[GATEWAY_REACH, regions, database]` from a gateway to a
-// subscriber in its own region whenever the set of regions it holds a caught-up link to changes.
-const CAUGHT_UP = 151;
-const GATEWAY_REACH = 152;
-const GATEWAY_REACH_INTERVAL_MS = 1000;
 const RELAY_LEASE_POLL_MS = 1000;
 const COPY_VETOED_REASON = 'A base copy into this node began during this copy';
-const MAX_REACH_REGIONS = 64;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -4508,37 +4496,6 @@ export function settleCopyBounds(
 }
 
 /**
- * The regions this gateway holds a caught-up link to for `databaseName` (harper-pro#1291), or undefined when it reports
- * nothing to `subscriber`: the topology is off, this node is not a gateway, or the subscriber is in another region.
- * None while it applies an inbound base copy, when it relays nothing (harper-pro#1299).
- */
-export function gatewayReachFor(
-	databaseName: string,
-	subscriber: string,
-	auditStore: any,
-	dbisDB?: DbisStore
-): string[] | undefined {
-	const topology = regionTopologyFor(databaseName);
-	const selfName = getThisNodeName();
-	if (!topology || !auditStore || !isGateway(topology, selfName)) return;
-	const region = topology.regionOf.get(selfName);
-	if (topology.regionOf.get(subscriber) !== region) return;
-	const regions: string[] = [];
-	if (relayWithholdingActive(auditStore, databaseName, dbisDB)) return regions;
-	for (const [otherRegion, gateways] of topology.gatewaysByRegion) {
-		if (otherRegion === region) continue;
-		for (const gateway of gateways) {
-			const status = getReplicationSharedStatus(auditStore, databaseName, gateway);
-			if (deriveConnectionTruth(status).connected && status[CAUGHT_UP_TIME_POSITION] > 0) {
-				regions.push(otherRegion);
-				break;
-			}
-		}
-	}
-	return regions.sort();
-}
-
-/**
  * Never borrows another peer's row: that subscription can cover a different table scope. A removed origin (its
  * `hdb_nodes` row deleted) was excluded on every relay while it was a direct peer, so only its own connection's
  * row records what this node holds of it: its own-origin cursor, or `seqId` on a row older than origin cursors.
@@ -5529,7 +5486,6 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.isConnected = false;
 		if (this.sharedStatus && this.nodeSubscriptions !== undefined) {
 			this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
-			this.sharedStatus[CAUGHT_UP_TIME_POSITION] = 0;
 			if (closeCode !== undefined) {
 				this.sharedStatus[LAST_ERROR_CODE_POSITION] = closeCode;
 				this.sharedStatus[LAST_ERROR_TIME_POSITION] = Date.now();
@@ -6659,11 +6615,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// -1, not 0, so this socket's first post carries its own zero and clears whatever count the retired
 	// socket left on the main-thread entry.
 	let lastPostedUnknownCommandCount = -1;
-	let receivedGatewayReach: string[] | undefined;
-	let lastPostedGatewayReach: string | undefined;
 	let lastSentTopologyExcluded = new Set<string>();
-	let caughtUpSent = false;
-	let gatewayReachTimer: ReturnType<typeof setInterval> | undefined;
 	// Outbound-only application setup guard (harper-pro#642). Unlike receiveWatchdog it deliberately
 	// ignores ping/pong bytes: those prove the socket is alive, not that the peer entered its replay loop.
 	let subscriptionSetupWatchdog:
@@ -7067,9 +7019,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 */
 	const ownsPeerCertifiesFloorsSlot = () =>
 		peerCapabilitiesLearned && options.connection?.nodeSubscriptions?.[0]?.name === remoteNodeName;
-	/** The caught-up slot has the same single owner, the live direct subscription session. */
-	const ownsCaughtUpSlot = () =>
-		!instanceRetired && !connectionSuperseded() && options.connection?.nodeSubscriptions?.[0]?.name === remoteNodeName;
 	function publishPeerCertifiesFloors(status: Float64Array) {
 		if (instanceRetired || !ownsPeerCertifiesFloorsSlot()) return;
 		status[PEER_CERTIFIES_FLOORS_POSITION] = peerCertifiesCheckpointFloors(peerCapabilities)
@@ -8837,23 +8786,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							rootStore: table.primaryStore.rootStore,
 						};
 						break;
-					case CAUGHT_UP:
-						if (data === databaseName && ownsCaughtUpSlot()) {
-							const status = getSharedStatus();
-							if (status && !(status[CAUGHT_UP_TIME_POSITION] > 0)) status[CAUGHT_UP_TIME_POSITION] = Date.now();
-						}
-						break;
-					case GATEWAY_REACH:
-						if (message[2] === databaseName && Array.isArray(data) && data.length <= MAX_REACH_REGIONS) {
-							const regions = [
-								...new Set(data.map(validRegion).filter((region): region is string => region !== undefined)),
-							].sort();
-							if (JSON.stringify(regions) !== JSON.stringify(receivedGatewayReach)) {
-								receivedGatewayReach = regions;
-								postConnectionMetadata();
-							}
-						}
-						break;
 					case RECORD_LOCK_HOMES_DIGEST:
 						// `data` (`message[1]`) is the digest; `message[2]` names the database — the same slot
 						// NODE_NAME uses for it — since one socket carries every database's traffic and the
@@ -10438,7 +10370,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								);
 								recordPeerLockCapabilityFromHandshake();
 								sendRecordLockHomesDigestFrame();
-								startGatewayReachAnnouncements();
 								tableById = tableSubscriptionToReplicator.tableById.map(tableToTableEntry);
 								subscribedNodeIds = [];
 								if (excludedNodes) {
@@ -11608,16 +11539,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 										getSharedStatus()[SENDING_TIME_POSITION] = 0;
 										if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
-										// a withheld session is not caught up on the origins it holds back
-										if (
-											!caughtUpSent &&
-											!relayWithheld &&
-											!supersededOrClosed() &&
-											peerSupportsRegionTopology(peerCapabilities)
-										) {
-											caughtUpSent = true;
-											ws.send(encode([CAUGHT_UP, databaseName]));
-										}
 										// a timed wake can land after the socket was marked closed, before the close event
 										if (closed || wsClosed) return;
 										// A commit that landed during the scan rotated the promise captured before it: rescan
@@ -12667,10 +12588,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			metadata.unknownCommandFrames = unknownCommands.count;
 			changed = true;
 		}
-		if (receivedGatewayReach !== undefined && JSON.stringify(receivedGatewayReach) !== lastPostedGatewayReach) {
-			metadata.gatewayReach = receivedGatewayReach;
-			changed = true;
-		}
 		if (!changed) return undefined;
 		metadata.threadId = threadId;
 		metadata.sessionOrdinal = sessionOrdinal;
@@ -12684,7 +12601,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			lastPostedPeerCapabilities = metadata.peerCapabilities as ResolvedPeerCapabilities;
 		if (metadata.unknownCommandFrames !== undefined)
 			lastPostedUnknownCommandCount = metadata.unknownCommandFrames as number;
-		if (metadata.gatewayReach !== undefined) lastPostedGatewayReach = JSON.stringify(metadata.gatewayReach);
 	}
 	function postConnectionMetadata() {
 		// Only a subscription connection owns the main thread's (database, peer) entry, and a socket that
@@ -13465,9 +13381,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	let lastSentExcludedNodes: string[] = [];
 	/**
+	 * This node's record of `originId` on the link that supplied it before. The origin's own link keeps its position
+	 * as the row's `seqId`, not as a per-origin key.
+	 */
+	function relievedOriginState(relievedRow: DbisCursor | undefined, relievedId: number | undefined, originId: number) {
+		const nodes = relievedRow?.nodes;
+		const state = Array.isArray(nodes) ? nodes.find((node) => node?.id === originId) : undefined;
+		return relievedId === originId && relievedRow && !isValidFrameTxnLogKey(state?.originLogKey)
+			? { ...state, originLogKey: relievedRow.seqId }
+			: state;
+	}
+	/**
 	 * A managed origin this link newly supplies has no continuous record on this route, so its cursor comes from the
 	 * link that supplied it before (`topologyBorrow`) or from a floor core certifies across routes, whichever is higher
-	 * (harper-pro#1291). The topology gate guarantees every managed route carries the whole database, which is what lets
+	 * (harper-pro#1343). The topology gate guarantees every managed route carries the whole database, which is what lets
 	 * another route's position stand in here.
 	 */
 	function borrowTopologyCursors(
@@ -13487,11 +13414,36 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (id === undefined) continue;
 			qualified ??= readQualifiedOriginFloors(store, dbisDB).floors;
 			const relievedId = idOf(relieved);
-			const relievedNodes = relievedId === undefined ? undefined : seqRows.get(relievedId)?.nodes;
-			const relievedState = Array.isArray(relievedNodes) ? relievedNodes.find((node) => node?.id === id) : undefined;
+			const relievedState = relievedOriginState(
+				relievedId === undefined ? undefined : seqRows.get(relievedId),
+				relievedId,
+				id
+			);
 			const cursor = borrowedOriginCursor(relievedState, qualified.get(id));
 			if (cursor !== undefined && !(vector[name] >= cursor)) vector[name] = cursor;
 		}
+	}
+	/**
+	 * Where a temporary direct link to a managed origin starts that origin's own log: this node held the origin only
+	 * through a supplier, so its start is the supplier's position for it or a certified floor, as for any switch, less
+	 * the overlap a relayed cursor gets from its sender (a direct start gets none). Null when this link is not one;
+	 * undefined when neither source has a position, which leaves the start to a base copy.
+	 */
+	function borrowedDirectStart(name: string, id: number, store: any, dbisDB: any): number | undefined | null {
+		const borrow: Record<string, string | null> | undefined = options.connection?.topologyBorrow;
+		if (!borrow || restrictedOrigins || !Object.hasOwn(borrow, name)) return null;
+		const nameToId = exportIdMapping(store);
+		const relieved = borrow[name];
+		const relievedId =
+			relieved !== null && Object.hasOwn(nameToId, relieved) && typeof nameToId[relieved] === 'number'
+				? nameToId[relieved]
+				: undefined;
+		const relievedRow = relievedId === undefined ? undefined : readDbisCursorSync(dbisDB, 'seq', relievedId);
+		const cursor = borrowedOriginCursor(
+			relievedId === id ? undefined : relievedOriginState(relievedRow, relievedId, id),
+			readQualifiedOriginFloors(store, dbisDB).floors.get(id)
+		);
+		return cursor === undefined ? undefined : Math.max(cursor - ORIGIN_CURSOR_OVERLAP_MS, 2);
 	}
 	/**
 	 * A managed origin excluded here is supplied by another link, so this route's record of it stops being continuous:
@@ -14018,11 +13970,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (nodeId === undefined) {
 					logger.warn('Starting subscription request from node', node, 'but no node id found');
 				} else receivingDataFromNodeIds.push(nodeId);
+				const takeoverStart =
+					connectedNode === node && nodeId !== undefined && auditStore
+						? borrowedDirectStart(node.name, nodeId, auditStore, dbisDB)
+						: null;
+				if (takeoverStart !== null) {
+					// never the any-route transaction time below: another route's can sit above writes this node lacks
+					if (!forceFullCopyOnWidening && floorOnlyStart === undefined && takeoverStart > startTime) {
+						startTime = takeoverStart;
+						logger.debug?.('Starting a takeover link from the borrowed cursor', connectedNode.name, startTime);
+					}
+				}
 				// if another node had previously acted as a proxy, it may not have the same sequence ids, but we can use the last
 				// originating txn time, and sequence ids should always be higher than their originating txn time, and starting from them should overlap
 				// a floor-only start is the proven one; a recorded transaction time above it would let the sender filter
 				// what committed between them, the gap the floor exists to close
-				if (!forceFullCopyOnWidening && floorOnlyStart === undefined && lastTxnTimes.get(nodeId) > startTime) {
+				else if (!forceFullCopyOnWidening && floorOnlyStart === undefined && lastTxnTimes.get(nodeId) > startTime) {
 					startTime = lastTxnTimes.get(nodeId);
 					logger.debug?.('Updating start time from more recent txn recorded', connectedNode.name, startTime);
 				}
@@ -14223,10 +14186,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			clearTimeout(delayedClose);
 			if (nodeSubscriptions.length > 0) {
 				const requestId = peerSupportsSubscriptionSetupAck ? ++nextSubscriptionSetupRequestId : undefined;
-				if (!subscriptionRequestSent && ownsCaughtUpSlot()) {
-					const status = getSharedStatus();
-					if (status) status[CAUGHT_UP_TIME_POSITION] = 0;
-				}
 				const originCursors = currentOriginCursorVector(true);
 				logger.debug?.(connectionId, 'per-origin resume cursors', originCursors);
 				// a downgraded peer sends no update to carry a revocation, so the marks ride one of this node's own
@@ -14388,42 +14347,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			});
 		}
 		return definitions;
-	}
-	/**
-	 * A gateway tells each subscriber in its own region which other regions it holds a caught-up link to, so the
-	 * subscriber takes those regions' origins from a gateway that has them. Polled, because the links it reads are
-	 * other sessions', possibly on other threads; sent on change.
-	 */
-	function startGatewayReachAnnouncements() {
-		// only a labeled node can be a gateway; unlabeled full-mesh clusters run no reach timer per session
-		if (
-			gatewayReachTimer ||
-			!peerCapabilitiesLearned ||
-			!peerSupportsRegionTopology(peerCapabilities) ||
-			selfTopologyLabels().region === null
-		)
-			return;
-		let lastSent: string | undefined;
-		const announce = () => {
-			try {
-				if (wsClosed) return stopGatewayReachAnnouncements();
-				const regions = gatewayReachFor(databaseName, remoteNodeName, auditStore, getDatabaseStores().dbisDB);
-				const signature = regions && JSON.stringify(regions);
-				if (signature === undefined || signature === lastSent) return;
-				ws.send(encode([GATEWAY_REACH, regions, databaseName]));
-				lastSent = signature;
-			} catch (error) {
-				logger.warn?.(connectionId, 'could not report gateway reach for', databaseName, error);
-			}
-		};
-		gatewayReachTimer = setInterval(announce, GATEWAY_REACH_INTERVAL_MS);
-		gatewayReachTimer.unref?.();
-		ws.once('close', stopGatewayReachAnnouncements);
-		announce();
-	}
-	function stopGatewayReachAnnouncements() {
-		clearInterval(gatewayReachTimer);
-		gatewayReachTimer = undefined;
 	}
 	function sendNodeDBName(thisNodeName, databaseName) {
 		const tableDefinitions = tableDefinitionsForPeer(databaseName);

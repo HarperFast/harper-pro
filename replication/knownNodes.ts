@@ -16,7 +16,7 @@ import { CONFIRMATION_STATUS_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from '.
 import { createBackoff } from './backoff.ts';
 import {
 	deriveRegionTopology,
-	topologyAllowsDirect,
+	receivesDirect,
 	topologySignature,
 	validRegion,
 	type RegionTopology,
@@ -996,10 +996,10 @@ const STORAGE_IS_ROCKSDB = (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_
 let warnedRegionOnLmdb = false;
 
 /**
- * This node's labels as it publishes them. A node on LMDB publishes no region: supplier switches resume from
- * per-origin cursors, which only RocksDB keeps, and one unlabeled member keeps the whole cluster on full mesh.
+ * This node's region as it publishes it. A node on LMDB publishes none: supplier switches resume from per-origin
+ * cursors, which only RocksDB keeps, and one unlabeled member keeps the whole cluster on full mesh.
  */
-export function selfTopologyLabels(): { region: string | null; gateway: boolean | null } {
+export function selfTopologyLabels(): { region: string | null } {
 	let region = validRegion(env.get(CONFIG_PARAMS.REPLICATION_REGION)) ?? null;
 	if (region !== null && !STORAGE_IS_ROCKSDB) {
 		if (!warnedRegionOnLmdb) {
@@ -1008,8 +1008,7 @@ export function selfTopologyLabels(): { region: string | null; gateway: boolean 
 		}
 		region = null;
 	}
-	const gateway = env.get(CONFIG_PARAMS.REPLICATION_GATEWAY);
-	return { region, gateway: typeof gateway === 'boolean' ? gateway : null };
+	return { region };
 }
 
 const TOPOLOGY_CACHE_MS = 5_000;
@@ -1040,23 +1039,26 @@ export function currentRegionTopology(): RegionTopology {
 	)
 		return topologyCache.topology;
 	const selfName = getThisNodeName();
-	const labels = selfTopologyLabels();
-	const self = {
+	const { region } = selfTopologyLabels();
+	const self: any = {
 		name: selfName,
-		...labels,
-		replicates: labels.region !== null && selfNodeReplicates(getHDBNodeTable().primaryStore, selfName),
+		region,
+		shard: env.get(CONFIG_PARAMS.REPLICATION_SHARD),
+		replicates: region !== null && selfNodeReplicates(getHDBNodeTable().primaryStore, selfName),
 	};
 	const members: any[] = [self];
 	// an unlabeled node decides the gate alone: the table cannot turn it on
-	if (self.region !== null) {
-		for (const row of getHDBNodeTable().search([])) if (row?.name && row.name !== selfName) members.push(row);
+	if (region !== null) {
+		for (const row of getHDBNodeTable().search([])) {
+			if (!row?.name) continue;
+			// the shard its row publishes is the one every other node ranks it by
+			if (row.name === selfName) self.shard = row.shard ?? self.shard;
+			else members.push(row);
+		}
 	}
 	const topology = deriveRegionTopology(members);
 	const previous = topologyCache?.topology;
-	if (
-		self.region !== null &&
-		(previous?.active !== topology.active || previous?.inactiveReason !== topology.inactiveReason)
-	)
+	if (region !== null && (previous?.active !== topology.active || previous?.inactiveReason !== topology.inactiveReason))
 		logger.info?.(topology.active ? 'Region topology active' : `Region topology off: ${topology.inactiveReason}`);
 	if (
 		previous &&
@@ -1098,20 +1100,20 @@ function databaseUsesResidency(databaseName: string): boolean {
 export function regionTopologyFor(databaseName: string): RegionTopology | undefined {
 	const topology = currentRegionTopology();
 	if (!topology.active) return undefined;
-	// cached with the topology: confirmed writes and every sending session's reach tick ask, and the walk covers every table
+	// cached with the topology: every confirmed write asks, and the walk covers every table
 	const residency = topologyCache!.residency;
 	let usesResidency = residency.get(databaseName);
 	if (usesResidency === undefined) residency.set(databaseName, (usesResidency = databaseUsesResidency(databaseName)));
 	return usesResidency ? undefined : topology;
 }
 
-/** Peers whose own link rule subscribes them to this node: only they acknowledge its writes. */
+/** Peers that subscribe to this node itself: only they acknowledge its writes. */
 function topologyRecipients(topology: RegionTopology, nodes: any[]): any[] {
 	const cache = topologyCache?.topology === topology ? topologyCache.recipients : undefined;
 	let recipients = cache?.get(nodes);
 	if (!recipients) {
 		const selfName = getThisNodeName();
-		recipients = nodes.filter((node) => topologyAllowsDirect(topology, node.name, selfName));
+		recipients = nodes.filter((node) => receivesDirect(topology, node.name, selfName));
 		cache?.set(nodes, recipients);
 	}
 	return recipients;

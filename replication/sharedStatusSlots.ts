@@ -60,9 +60,6 @@ export const STUCK_COPY_REASON_POSITION = allocate();
 export const STUCK_COPY_COUNT_POSITION = allocate();
 export const STUCK_COPY_SINCE_POSITION = allocate();
 export const STUCK_COPY_RETRY_AT_POSITION = allocate();
-// Epoch ms at which the current outbound session's peer said its historical scan first went idle (`CAUGHT_UP`);
-// 0 while catching up or down. A gateway reports reach to a region only through a link that has caught up.
-export const CAUGHT_UP_TIME_POSITION = allocate();
 
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
 export const ALLOCATED_SLOTS = cursor;

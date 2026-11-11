@@ -39,13 +39,10 @@ const ISO_8601_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-
 
 const REMOVE_NODE_BACK_TIMEOUT_MS = 30_000;
 
-/** A peer's region labels as it sent them, validated; a peer that sent none (an older build) is left unlabeled. */
-function peerTopologyLabels(source: any): { region?: string | null; gateway?: boolean | null } {
-	if (!source || !('region' in source || 'gateway' in source)) return {};
-	return {
-		region: validRegion(source.region) ?? null,
-		gateway: typeof source.gateway === 'boolean' ? source.gateway : null,
-	};
+/** A peer's region as it sent it, validated; a peer that sent none (an older build) is left unlabeled. */
+function peerTopologyLabels(source: any): { region?: string | null } {
+	if (!source || !('region' in source)) return {};
+	return { region: validRegion(source.region) ?? null };
 }
 
 /**

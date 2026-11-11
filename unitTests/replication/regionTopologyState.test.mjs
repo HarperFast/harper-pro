@@ -18,7 +18,7 @@ const peers = [
 	{ name: 'state-b3', region: 'west', replicates: true },
 ];
 
-describe('region topology state (harper-pro#1291)', function () {
+describe('region topology state (harper-pro#1343)', function () {
 	this.timeout(10_000);
 	let rows = [];
 	let stubbed;
@@ -44,28 +44,21 @@ describe('region topology state (harper-pro#1291)', function () {
 	};
 	beforeEach(() => {
 		rows = [];
-		prior = {
-			nodes: server.nodes,
-			region: env.get('replication_region'),
-			gateway: env.get('replication_gateway'),
-		};
+		prior = { nodes: server.nodes, region: env.get('replication_region') };
 		env.setProperty('replication_region', 'east');
-		env.setProperty('replication_gateway', true);
 	});
 	afterEach(() => {
 		rows = [];
 		if (!prior) return;
 		server.nodes = prior.nodes;
 		env.setProperty('replication_region', prior.region);
-		env.setProperty('replication_gateway', prior.gateway);
 		prior = undefined;
 	});
 
-	it('publishes the configured labels', () => {
-		assert.deepEqual(selfTopologyLabels(), { region: 'east', gateway: true });
+	it('publishes the configured region', () => {
+		assert.deepEqual(selfTopologyLabels(), { region: 'east' });
 		env.setProperty('replication_region', '  ');
-		env.setProperty('replication_gateway', 'yes');
-		assert.deepEqual(selfTopologyLabels(), { region: null, gateway: null });
+		assert.deepEqual(selfTopologyLabels(), { region: null });
 	});
 
 	it('reads members from hdb_nodes, and recomputes when server.nodes grows in place as a full rescan grows it', async () => {
@@ -76,23 +69,29 @@ describe('region topology state (harper-pro#1291)', function () {
 		server.nodes.push(...peers.slice(1));
 		const topology = currentRegionTopology();
 		assert.equal(topology.active, true);
-		assert.deepEqual(topology.gatewaysByRegion.get('west'), ['state-b1', 'state-b2']);
+		assert.deepEqual(topology.membersByRegion.get('west'), ['state-b1', 'state-b2', 'state-b3']);
 	});
 
-	it('counts as acknowledging recipients only the peers whose links reach this node', async () => {
+	it('counts as acknowledging recipients only the peers that subscribe to this node itself', async () => {
+		// this node sorts before its two region-mates, so it is in east's first column, which state-b1 carries in west
+		assert.ok(getThisNodeName() < 'state-a2', `the test node ${getThisNodeName()} must sort before state-a2`);
 		await putRows(peers);
 		server.nodes = [...peers];
 		assert.deepEqual(
 			getReplicationRecipients('data').map((node) => node.name),
-			['state-a2', 'state-a3', 'state-b1', 'state-b2']
+			['state-a2', 'state-a3', 'state-b1']
 		);
-		env.setProperty('replication_gateway', false);
-		await putRows([{ name: 'state-a1', region: 'east', replicates: true }]);
-		server.nodes = [...peers, { name: 'state-a1', region: 'east', replicates: true }];
-		assert.deepEqual(
-			getReplicationRecipients('data').map((node) => node.name),
-			['state-a2', 'state-a3', 'state-a1']
-		);
+	});
+
+	it('ranks this node by the shard its own row publishes', async () => {
+		await putRows(peers);
+		server.nodes = [...peers];
+		const selfName = getThisNodeName();
+		assert.equal(currentRegionTopology().columnOf.get(selfName), 0);
+		// a shard of its own puts this node in a column no region-mate shares
+		await putRows([{ name: selfName, region: 'east', replicates: true, shard: 7 }]);
+		server.nodes = [...peers];
+		assert.equal(currentRegionTopology().columnOf.get(selfName), 3);
 	});
 
 	it('keeps the topology and its caches when a rebuild finds the same links, and replaces them when links change', async () => {
@@ -102,11 +101,12 @@ describe('region topology state (harper-pro#1291)', function () {
 		// a node event replaces server.nodes without changing membership
 		server.nodes = [...peers];
 		assert.strictEqual(currentRegionTopology(), first);
-		env.setProperty('replication_gateway', false);
-		server.nodes = [...peers];
+		const joined = { name: 'state-a0', region: 'east', replicates: true };
+		await putRows([joined]);
+		server.nodes = [...peers, joined];
 		const changed = currentRegionTopology();
 		assert.notStrictEqual(changed, first);
-		assert.deepEqual(changed.gatewaysByRegion.get('east'), ['state-a2', 'state-a3']);
+		assert.deepEqual(changed.membersByRegion.get('east'), [getThisNodeName(), 'state-a0', 'state-a2', 'state-a3']);
 	});
 
 	it('keeps the full mesh while a member has no region', async () => {
