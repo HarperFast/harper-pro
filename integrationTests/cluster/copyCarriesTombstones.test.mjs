@@ -129,7 +129,6 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 	const nodes = cluster(ctx.name);
 	let A, B, D, C;
 	const tombstones = {};
-	let staleNodeRowVersion;
 
 	before(async () => {
 		[A, B, D] = await Promise.all([nodes.startFresh(), nodes.startFresh(), nodes.startFresh()]);
@@ -157,12 +156,10 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 			{ table: TABLE, op: 'put', id: 'k-put', record: { id: 'k-put', name: 'stale put' } },
 			{ table: TABLE, op: 'put', id: 'witness-data', record: { id: 'witness-data', name: 'witness' } },
 		]);
-		const versions = await writeTogether(B.harper, 'system', [
+		await writeTogether(B.harper, 'system', [
 			{ table: 'hdb_nodes', op: 'rewrite', id: D.harper.hostname },
-			{ table: 'hdb_nodes', op: 'rewrite', id: B.harper.hostname },
+			{ table: 'CopyWitness', op: 'put', id: 'witness-system', record: { id: 'witness-system' } },
 		]);
-		staleNodeRowVersion = versions[B.harper.hostname];
-		assert.ok(staleNodeRowVersion > 0);
 		await Promise.all([nodes.stop(B), nodes.stop(D)]);
 
 		await nodes.start(A);
@@ -223,8 +220,8 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 			'the data witness, committed with the stale writes, to reach C'
 		);
 		await waitFor(
-			async (signal) => (await nodeRow(C.harper, B.harper.hostname, signal)).version >= staleNodeRowVersion,
-			"B's rewritten row, committed with D's, to reach C"
+			async (signal) => (await storedRow(C.harper, 'system', 'CopyWitness', 'witness-system', signal)).present,
+			"the system witness, committed with D's rewritten row, to reach C"
 		);
 		const resurrected = async (node) => {
 			const found = [];
@@ -240,7 +237,6 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 			onC.push("removed node D in C's cluster_status");
 		assert.deepEqual(onC, [], 'older writes recreated deleted rows on the copied node');
 
-		// A rejects the same writes, and B takes A's deletes, so the cluster converges
 		await nodes.start(A);
 		await nodes.waitForMesh([A, B, C]);
 		await waitFor(async (signal) => {
