@@ -70,6 +70,7 @@ function cluster(name) {
 		async startFresh(env) {
 			const hostname = await getNextAvailableLoopbackAddress();
 			const parentDir = process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir();
+			// removed by teardownHarper, through stopAndTeardownNodes
 			const dataRootDir = await mkdtemp(join(parentDir, 'harper-integration-test-'));
 			const context = { name, harper: { hostname, dataRootDir }, env };
 			contexts.push(context);
@@ -182,7 +183,8 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 		C = await nodes.startFresh();
 		await nodes.join(C, A);
 		await waitFor(async (signal) => (await dataRow(C.harper, 'sentinel', signal)).present, 'the copy to reach C');
-		await waitFor(async (signal) => (await nodeRow(C.harper, A.harper.hostname, signal)).present, 'the system copy');
+		// B's row reaches C only through A's system copy; add_node writes A's row on C itself
+		await waitFor(async (signal) => (await nodeRow(C.harper, B.harper.hostname, signal)).present, 'the system copy');
 		const expectTombstones = async (when) => {
 			for (const [id, read] of [
 				['k-put', dataRow],
@@ -268,7 +270,6 @@ suite('base-copy deletions at the edges', { timeout: 600_000, skip: isLMDB && 'c
 	});
 
 	test('a receiver without tombstoneCopy completes the copy as before, storing no tombstone', async () => {
-		// no capability bag: what a build from before the key looks like to the sender
 		const older = await nodes.startFresh({ HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' });
 		await nodes.join(older, A);
 		await waitFor(async (signal) => (await dataRow(older.harper, 'sentinel', signal)).present, 'the copy to finish');
