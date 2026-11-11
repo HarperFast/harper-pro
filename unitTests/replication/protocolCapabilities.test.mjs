@@ -29,6 +29,7 @@ import {
 	peerSupportsResidencySlots,
 	peerSupportsShardingRecovery,
 	peerSupportsTombstoneCopy,
+	receiverDeclaresTombstoneCopy,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -610,5 +611,32 @@ describe('Confirmation markers capability (harper-pro#1351)', () => {
 			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ confirmationMarkers: 1 })),
 			false
 		);
+	});
+});
+
+describe('receiverDeclaresTombstoneCopy', () => {
+	it('reads a numeric level of at least the local one on any request entry', () => {
+		assert.equal(
+			receiverDeclaresTombstoneCopy([{ name: 'a' }, { name: 'b', tombstoneCopy: TOMBSTONE_COPY_CAPABILITY }]),
+			true
+		);
+		assert.equal(receiverDeclaresTombstoneCopy([{ tombstoneCopy: TOMBSTONE_COPY_CAPABILITY + 1 }]), true);
+	});
+
+	it('declares nothing for an absent, non-numeric or malformed value', () => {
+		for (const entries of [
+			undefined,
+			null,
+			{},
+			[],
+			[null],
+			[{ name: 'a' }],
+			[{ tombstoneCopy: 0 }],
+			[{ tombstoneCopy: '1' }],
+			[{ tombstoneCopy: true }],
+			[{ tombstoneCopy: NaN }],
+			[{ tombstoneCopy: Infinity }],
+		])
+			assert.equal(receiverDeclaresTombstoneCopy(entries), false, inspect(entries));
 	});
 });
