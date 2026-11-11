@@ -22,6 +22,11 @@ const { values } = parseArgs({
 // pulls in nothing that reads config before the base path is set. The read is idempotent — the
 // secretCustody component later retrieves the same cached PEM.
 require('../security/custodyState.js').consumeInjectedKeyMaterial();
+// rocksdb-js has its own process-exit flush, separate from core's HARPER_NO_FLUSH_ON_EXIT check; turn it
+// off too so a crash-recovery test's process.exit() leaves memtables and txn.state unflushed.
+if (process.env.HARPER_NO_FLUSH_ON_EXIT) {
+	require('@harperfast/rocksdb-js').RocksDatabase.config({ shutdownOnExit: false });
+}
 
 const HDB_LEADER_URL = values['leader-url'] || process.env.HDB_LEADER_URL || values['HDB_LEADER_URL'];
 
