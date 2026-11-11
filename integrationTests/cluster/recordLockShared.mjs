@@ -29,7 +29,6 @@ function poolEnv(threadsCount) {
 	};
 }
 
-/** `recordLocks: null` omits the key, as a fresh install does. */
 function optionsFor(hostname, env = {}, threadsCount = 1, preload, recordLocks = true) {
 	const options = {
 		config: {

@@ -428,9 +428,9 @@ Check each management operation's replication default before using it in a singl
 
 ## Cluster Record Locks
 
-On a replicated table, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. From v5.4.0, conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default. A table declared with `replicate: false` takes a node-local lock instead.
+On a replicated table, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. From v5.4.0, with cluster record locks on, conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default. A table declared with `replicate: false` takes a node-local lock instead.
 
-Cluster record locks are off unless you turn them on. While they are off, a cluster `lock()` and a conditional write on a replicated table answer `503` with a message naming the fix. `{ scope: 'node' }` still takes a node-local lock, and `rest.preconditionLocks: false` makes conditional writes skip the lock.
+Cluster record locks are off unless you turn them on. While they are off, a cluster `lock()` on a replicated table answers `503` with a message naming the fix, and `{ scope: 'node' }` still takes a node-local lock. Conditional writes do not take a lock: they check their precondition against this node's copy of the record, as in v5.3, so a matching `If-Match` succeeds and a stale one answers `412`. Two requests that saw the same ETag can then both succeed, on one node or on two. With cluster record locks on, conditional writes are checked one at a time per record, which is stronger but still has [limits](../rest/headers.md#conditional-writes); unconditional writes are never excluded, and a conditional write on a node that has them off is not serialized against writes on nodes that have them on, so set the key on every node before relying on them.
 
 **On Harper Fabric**, Fabric turns cluster record locks on for a cluster and publishes its home map; you do not configure them.
 

@@ -319,7 +319,8 @@ export interface RecordLockTransportDeps {
 export function createRecordLockTransport(
 	database: string,
 	deps: RecordLockTransportDeps,
-	cacheFor: () => RecordLockGenerationState | undefined
+	cacheFor: () => RecordLockGenerationState | undefined,
+	mapConfirmedAbsent: () => boolean = () => false
 ): ClusterLockTransport {
 	const statusViews = new Map<string, Float64Array>();
 	let statusViewsStore: any;
@@ -388,6 +389,13 @@ export function createRecordLockTransport(
 		ownsCoordination(): boolean {
 			return deps.ownsDatabase(database) && transport.coordinationIncarnation() !== undefined;
 		},
+		// `cacheFor()` is also undefined before the first read and after a failed one, so only a read
+		// that succeeded and found no active generation says the operator has not applied a map.
+		homeMapUnavailableReason(): string | undefined {
+			return mapConfirmedAbsent()
+				? 'apply one with record_lock_apply_homes, run on any node and naming every node that replicates the database'
+				: undefined;
+		},
 		requestDelegation(node: string, db: string, table: string, request: DelegationRequest): Promise<DelegationReply> {
 			const operation: DelegateOperation = {
 				operation: DELEGATE_OPERATION,
@@ -446,16 +454,18 @@ export function createRecordLockTransport(
 }
 
 export const RECORD_LOCKS_DISABLED_MESSAGE =
-	"cluster record locks are not enabled on this node: set replication.recordLocks: true on every node, restart, and apply a home map with record_lock_apply_homes; or lock with { scope: 'node' } for a node-local lock, or set rest.preconditionLocks: false so conditional REST writes skip the lock";
+	"cluster record locks are not enabled on this node: set replication.recordLocks: true on every node, restart, and apply a home map with record_lock_apply_homes; or lock with { scope: 'node' } for a node-local lock";
 
 /**
  * Registered while `replication.recordLocks` is off: `ownsCoordination` is true so core reaches
  * `homeMap()`, which refuses — a 503 naming the switch instead of the off-owner retry advice — and
- * a received request or entry finds no map, so this node never grants.
+ * a received request or entry finds no map, so this node never grants. `disabled` lets a conditional
+ * REST write skip the lock; the setting is read once at module load, so it holds for the process.
  */
 export function createDisabledRecordLockTransport(): ClusterLockTransport {
 	const disabled = () => Promise.reject(new ClientError(RECORD_LOCKS_DISABLED_MESSAGE, 503));
 	return {
+		disabled: true,
 		homeMap(): LockHomeMap | undefined {
 			throw new ClientError(RECORD_LOCKS_DISABLED_MESSAGE, 503);
 		},
@@ -471,6 +481,7 @@ export function createDisabledRecordLockTransport(): ClusterLockTransport {
 // ---- per-thread active-generation cache, refreshed only on change --------------------------------
 
 const activeCache = new Map<string, RecordLockGenerationState | undefined>();
+const confirmedNoMap = new Set<string>();
 
 function cacheForDatabase(database: string): RecordLockGenerationState | undefined {
 	return activeCache.get(database);
@@ -504,11 +515,15 @@ export function refreshRecordLockHomesCache(database: string, freshBudget = fals
 export function cachedActiveGeneration(database: string): number | undefined {
 	return activeCache.get(database)?.generation;
 }
+export function homeMapConfirmedAbsent(database: string): boolean {
+	return confirmedNoMap.has(database);
+}
 export function forgetRecordLockHomesCache(database: string): void {
 	const state = refreshState.get(database);
 	if (state) clearTimeout(state.timer);
 	refreshState.delete(database);
 	activeCache.delete(database);
+	confirmedNoMap.delete(database);
 }
 
 async function refreshCache(database: string, freshBudget = false): Promise<void> {
@@ -535,6 +550,8 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		const row = await readHomesRow(database);
 		if (!current()) return;
 		activeCache.set(database, row?.active);
+		if (row?.active) confirmedNoMap.delete(database);
+		else confirmedNoMap.add(database);
 		// A peer digest that arrived while the row was unreadable was recorded as a mismatch against
 		// no digest at all, and a socket that handshook then received none; both need the recovered one.
 		// The backoff resets only once this is done, so a failure here re-arms the whole cycle.
@@ -548,6 +565,7 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		// A storage error must not leave a stale (possibly superseded) generation cached; undefined is
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
+		confirmedNoMap.delete(database);
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
 		state.timer = setTimeout(() => {
 			if (current())
@@ -1091,7 +1109,13 @@ export function ensureRecordLockTransport(database: string, buildTransport?: () 
 	const builder =
 		buildTransport ??
 		(CLUSTER_RECORD_LOCKS_ENABLED
-			? () => createRecordLockTransport(database, productionDeps, () => cacheForDatabase(database))
+			? () =>
+					createRecordLockTransport(
+						database,
+						productionDeps,
+						() => cacheForDatabase(database),
+						() => homeMapConfirmedAbsent(database)
+					)
 			: undefined);
 	if (builder) transportBuilders.set(database, builder);
 	const transport = builder ? builder() : createDisabledRecordLockTransport();
