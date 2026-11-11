@@ -30,8 +30,8 @@ suite('Node membership follows hdb_nodes and replication.shard', { timeout: 600_
 			{ operation: 'insert', database: 'data', table: 'Rows', records: [{ id, body: id }] },
 			{ signal: AbortSignal.timeout(15_000) }
 		);
-	// a replication socket closing on a worker thread; operation sockets live on the main thread
-	const REPLICATION_CLOSE = /\[http\/\d+\] \[debug\] \[replication\]: \S+ \d+ closed \d+/;
+	// A replication socket closing; the thread tag is [http/N], [replication/N] with the worker pool on, or [main/0].
+	const REPLICATION_CLOSE = /\[[\w-]+\/\d+\] \[debug\] \[replication\]: \S+ \d+ closed \d+/;
 	const REPLICATION_CONNECT = /Connecting to wss?:\/\//;
 	// bootstrap keeps closing and retrying connections for a while after every owner reports ready
 	async function waitForQuietConnections() {
