@@ -344,7 +344,6 @@ function shardSummary(snapshot: ResidencyMapSnapshot, localShard: number | undef
 		if (owners.has(server.hostname) !== (shard === localShard)) selfMembershipAgrees = false;
 		return { shard, slots: count, owners: Array.from(owners).sort() };
 	}).sort((a, b) => a.shard - b.shard);
-	// server.nodes learns a peer before server.shards publishes its shard, so its own record decides
 	const noSlots = (server.nodes ?? [])
 		.filter((node) => !assigned.has(node.name) && (node.shard == null || !slots.has(node.shard)))
 		.map((node) => node.name);

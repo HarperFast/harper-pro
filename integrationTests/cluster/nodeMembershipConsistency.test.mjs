@@ -1,4 +1,3 @@
-/** A, B: shard 0; C: shard 1; shards [0, 1]; one sharded table (harper-pro#1318, #1321). */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { cp, mkdtemp, writeFile } from 'node:fs/promises';
