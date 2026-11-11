@@ -160,14 +160,26 @@ describe('NodeReplicationConnection private dial', () => {
 			await waitFor(() => retries.length === 2, 'the retry after the refused public dial');
 		});
 
-		it('a local failure creating the socket for a private dial does not start an outage', async () => {
-			// ws refuses a URL with a fragment before any socket exists, as a missing certificate would
-			const privateUrl = 'ws://127.0.0.1:1/#local-failure';
-			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
-			const { connection, pathKey, retries } = connectionVia(privateUrl, publicUrl);
+		// ws refuses a URL with a fragment before any socket exists, as a missing certificate would
+		const localFailureUrl = 'ws://127.0.0.1:1/#local-failure';
+
+		it('a local failure creating the socket for a private dial does not start an outage when the public dial needs the same certificate', async () => {
+			const publicUrl = `wss://127.0.0.1:${await closedPort()}`;
+			const { connection, pathKey, retries } = connectionVia(localFailureUrl, publicUrl);
 			await connection.connect();
 			await waitFor(() => retries.length === 1, 'the retry after the failed socket creation');
-			assert.strictEqual(privatePaths.choose(publicUrl, privateUrl, pathKey, connection).path, PATH_PRIVATE);
+			assert.strictEqual(privatePaths.choose(publicUrl, localFailureUrl, pathKey, connection).path, PATH_PRIVATE);
+		});
+
+		it('a local failure creating the socket for a private dial fails over to a public ws: URL, which needs no certificate', async () => {
+			const publicUrl = `ws://127.0.0.1:${await closedPort()}`;
+			const { connection, pathKey, retries } = connectionVia(localFailureUrl, publicUrl);
+			await connection.connect();
+			await waitFor(() => retries.length === 1, 'the retry after the failed socket creation');
+			assert.strictEqual(
+				privatePaths.choose(publicUrl, localFailureUrl, pathKey, connection).path,
+				PATH_PUBLIC_FALLBACK
+			);
 		});
 
 		it('a peer that closes after the WebSocket opens, before identifying, is a private failure', async () => {

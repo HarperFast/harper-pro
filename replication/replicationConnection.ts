@@ -5009,7 +5009,10 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 			socket = await createWebSocket(dial.url, this.dialOptions(dial));
 		} catch (error) {
 			if (this.session !== attemptSession || this.intentionallyUnsubscribed) return;
-			// No private outage: the public dial rejects the same way, so this says nothing about the private address.
+			// A wss: public dial rejects the same way, so this says nothing about the private address; a ws: public
+			// dial needs no certificate and is the way out.
+			if (dial.path === PATH_PRIVATE && !this.url.includes('wss://'))
+				this.privateDialFailed(dial, error.message, attemptSession);
 			// createWebSocket can reject before any socket exists or any open/error/close listener is
 			// attached — e.g. no valid replication certificate yet, or SNICallback.initialize() failing
 			// while a freshly-restarted peer rebuilds its TLS secure contexts. This connect() is invoked
