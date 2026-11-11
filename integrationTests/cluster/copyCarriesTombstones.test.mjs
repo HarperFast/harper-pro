@@ -13,7 +13,7 @@
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
-import { cp, mkdtemp, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -253,7 +253,7 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 
 suite('base-copy deletions at the edges', { timeout: 600_000, skip: isLMDB && 'copy-apply is RocksDB-only' }, (ctx) => {
 	const nodes = cluster(ctx.name);
-	let A;
+	let A, holdDirectory;
 
 	before(async () => {
 		A = await nodes.startFresh();
@@ -262,7 +262,10 @@ suite('base-copy deletions at the edges', { timeout: 600_000, skip: isLMDB && 'c
 		await put(A.harper, 'sentinel', { name: 'seeded' });
 	});
 
-	after(() => nodes.teardown());
+	after(async () => {
+		await nodes.teardown();
+		if (holdDirectory) await rm(holdDirectory, { recursive: true, force: true });
+	});
 
 	test('a receiver without tombstoneCopy completes the copy as before, storing no tombstone', async () => {
 		// no capability bag: what a build from before the key looks like to the sender
@@ -274,9 +277,7 @@ suite('base-copy deletions at the edges', { timeout: 600_000, skip: isLMDB && 'c
 	});
 
 	test('a delete that lands during the copy is kept', async () => {
-		const holdDirectory = await mkdtemp(
-			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'hold-')
-		);
+		holdDirectory = await mkdtemp(join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'hold-'));
 		const joiner = await nodes.startFresh({
 			HARPER_TEST_HOLD_COPY_START_DB: 'data',
 			HARPER_TEST_HOLD_COPY_START_DIR: holdDirectory,
