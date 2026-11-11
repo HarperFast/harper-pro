@@ -168,9 +168,9 @@ Owner recovery requires the [sources described above](#recovery-sources). Arbitr
 
 This applies to tables that set residency with `setResidency` or `setResidencyById` (deprecated as of v5.4), not to `@sharded` tables.
 
-With legacy residency, a node outside a record's residency stores a stub (the primary key and indexed fields only), and peers send it `invalidate` entries. If that node later becomes a resident, or a base copy (initial or resumed) sends a resident the stub before the replayed full `put` at the same identity, the resident can keep the stub: the equal-identity `put` is treated as already applied. Reads of non-indexed fields on that record then fail until a newer write to it. This is most visible with `sourcedFrom` read-through fills on LMDB residents.
+With legacy residency, a node outside a record's residency can store a stub (the primary key and indexed fields only). `setResidency` sends such nodes `invalidate` entries; `setResidencyById` does so only when replication runs on [dedicated replication threads](./overview.md#dedicated-replication-threads), where the setter is not loaded. If that node later becomes a resident, or a base copy (initial or resumed) sends a resident the stub before the replayed full `put` of the same version and origin, the resident can keep the stub: a `put` with the same version and origin as the stub is treated as already applied. Reads of non-indexed fields on that record then fail until a newer full-record `put` replaces it. This is most visible with `sourcedFrom` read-through fills on LMDB residents.
 
-A newer write to an affected record repairs it. To remove the cause, [migrate to `@sharded`](#convert-an-existing-by-id-table-without-moving-records), which refuses an `invalidate` into an owned slot.
+A newer full-record `put` to an affected record repairs it; a `patch` may not, because it applies onto the stub. To remove the cause, [migrate to `@sharded`](#convert-an-existing-by-id-table-without-moving-records), which refuses an `invalidate` into an owned slot.
 
 ## Convert an existing by-id table without moving records
 
