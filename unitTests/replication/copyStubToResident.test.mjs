@@ -592,6 +592,18 @@ describe('replayedStubPut', function () {
 		);
 	});
 
+	it('reads a key once when a head reference is the row log key, in the log the reference names', () => {
+		const audit = store({ 2000: { ...head, type: 'invalidate' } });
+		const entry = row({ localTime: 2000, additionalAuditRefs: [{ version: 2000, nodeId: 4 }] });
+		assert.equal(replayedStubPut(audit, tableId, entry, copyStartTime, 4), undefined);
+		assert.deepEqual(audit.reads, [[2000, tableId, ['region', 3], 4, true]]);
+	});
+
+	it('lets a failed head read fail the copy, which then resumes, rather than sending the stub', () => {
+		const audit = store({ 2000: new Error('unreadable log') });
+		assert.throws(() => replayedStubPut(audit, tableId, row({ localTime: 2000 }), copyStartTime, 4), /unreadable log/);
+	});
+
 	it('reads nothing for a row whose log keys are all at or below copyStartTime, or come from another origin', () => {
 		const audit = store({ 1500: head, 2000: head });
 		const entry = row({
@@ -614,7 +626,6 @@ describe('replayedStubPut', function () {
 		['another version', { ...head, version: 999 }],
 		['another table', { ...head, tableId: tableId + 1 }],
 		['another record at the same key', { ...head, recordId: ['region', 4] }],
-		['a failed read', new Error('unreadable log')],
 	])
 		it(`answers nothing for ${label}, which keeps the stub`, () => {
 			assert.equal(
