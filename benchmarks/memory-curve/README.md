@@ -87,7 +87,7 @@ Outputs go to `benchmarks/memory-curve/runs/<run-id>/` (git-ignored): `manifest.
 - **p99 knee**: the largest memory step whose p99 is at least 2× the lowest p99 in its series, or that saturated (including one that completed no request).
 - **saturated cells** show the share of the offered rate served (or "did not start") instead of reads: their reads are those of a server that stopped keeping up. Slopes skip them, and charts draw them as a cross on the top edge.
 - **reads per GB removed**: the change in reads per 1k between adjacent unsaturated steps divided by the memory removed, tagged with data / (mean memory of the two steps). The baseline cancels in the difference, so series without one have slopes too.
-- **pinned share**: the fraction of the 100% → 50% increase in extra reads that pinning the block cache at its 100% size removes, i.e. the block cache's part of the loss, with the page cache's part as the remainder.
+- **pinned share**: the fraction of the 100% → 50% increase in disk reads per 1k that pinning the block cache at its 100% size removes, i.e. the block cache's part of the loss, with the page cache's part as the remainder.
 
 ## What it does not represent
 

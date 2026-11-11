@@ -533,7 +533,7 @@ export function renderReport(
 	if (pinnedRows.length > 0) {
 		lines.push('', '## Block cache vs page cache (50% step, block cache pinned to the 100% size)', '');
 		lines.push(
-			'| pair | workload | skew | extra reads/1k at 100% | at 50% | at 50% pinned | share of the 100→50% increase removed by pinning | p99 50% / pinned |'
+			'| pair | workload | skew | disk reads/1k at 100% | at 50% | at 50% pinned | share of the 100→50% increase removed by pinning | p99 50% / pinned |'
 		);
 		lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
 		for (const pinned of pinnedRows) {
@@ -542,16 +542,11 @@ export function renderReport(
 			const full = served.find((row) => row.step === 1);
 			const half = served.find((row) => row.step === pinned.step);
 			const control = pinned.saturated ? undefined : pinned;
-			// The baseline cancels in this ratio, so raw reads also serve a series without one.
+			// Raw reads: the baseline cancels in this ratio, so a series without one still gets a share.
 			const increase = full && half ? half.readsPer1k - full.readsPer1k : null;
 			const share =
 				increase && increase > 0 && half && control ? (half.readsPer1k - control.readsPer1k) / increase : null;
-			const reads = (row: Row | undefined) =>
-				row === undefined
-					? '–'
-					: row.extraReadsPer1k === null
-						? `${fmt(row.readsPer1k)} total`
-						: fmt(row.extraReadsPer1k);
+			const reads = (row: Row | undefined) => fmt(row?.readsPer1k);
 			const controlCell = pinned.notReady
 				? '⚠ did not start'
 				: pinned.saturated

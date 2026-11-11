@@ -262,7 +262,7 @@ describe('renderReport', () => {
 			{ runId: 'mctest' }
 		);
 		// (300 - 200) of the (300 - 100) reads per 1k increase.
-		assert.match(markdown, /\| 100 total \| 300 total \| 200 total \| 50% \|/);
+		assert.match(markdown, /\| 100 \| 300 \| 200 \| 50% \|/);
 	});
 
 	it('gives no pinning share for a saturated pinned control', () => {
