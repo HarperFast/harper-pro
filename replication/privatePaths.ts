@@ -128,6 +128,7 @@ interface Outage {
 	canary?: PrivatePathWaiter;
 	probing?: boolean;
 	timer?: ReturnType<typeof setTimeout>;
+	dueAt?: number;
 }
 
 // Per-thread outage state; replication/DESIGN.md non-obvious behavior 38 has the recovery rules.
@@ -136,11 +137,20 @@ export class PrivatePaths {
 	#setTimer: typeof setTimeout;
 	#clearTimer: typeof clearTimeout;
 	#random: () => number;
+	#now: () => number;
 
-	constructor(options: { setTimer?: typeof setTimeout; clearTimer?: typeof clearTimeout; random?: () => number } = {}) {
+	constructor(
+		options: {
+			setTimer?: typeof setTimeout;
+			clearTimer?: typeof clearTimeout;
+			random?: () => number;
+			now?: () => number;
+		} = {}
+	) {
 		this.#setTimer = options.setTimer ?? setTimeout;
 		this.#clearTimer = options.clearTimer ?? clearTimeout;
 		this.#random = options.random ?? Math.random;
+		this.#now = options.now ?? Date.now;
 	}
 
 	choose(publicUrl: string, privateUrl: string | undefined, pathKey: string, waiter: PrivatePathWaiter): Dial {
@@ -175,8 +185,14 @@ export class PrivatePaths {
 		if (!outage || outage.canary) return;
 		outage.backoff.reset();
 		if (!outage.timer) return;
+		const delay = outage.backoff.nextDelay() ?? 0;
+		// only ever brings the pending probe forward: reports from many connections must not keep pushing it out
+		if (this.#now() + delay >= (outage.dueAt ?? 0)) {
+			outage.backoff.reset();
+			return;
+		}
 		this.#clearTimer(outage.timer);
-		this.#scheduleProbe(pathKey, outage);
+		this.#scheduleProbe(pathKey, outage, delay);
 	}
 
 	identified(pathKey: string): boolean {
@@ -213,14 +229,15 @@ export class PrivatePaths {
 		outage.timer = undefined;
 	}
 
-	#scheduleProbe(pathKey: string, outage: Outage) {
+	#scheduleProbe(pathKey: string, outage: Outage, delay = outage.backoff.nextDelay()) {
+		outage.dueAt = this.#now() + (delay ?? 0);
 		outage.timer = this.#setTimer(() => {
 			outage.timer = undefined;
 			// nothing awaits this: a throw after the probe must leave the outage recoverable, not unhandled
 			this.#probe(pathKey, outage).catch(() => {
 				if (this.#outages.get(pathKey) === outage) this.#scheduleProbe(pathKey, outage);
 			});
-		}, outage.backoff.nextDelay());
+		}, delay);
 		outage.timer.unref?.();
 	}
 

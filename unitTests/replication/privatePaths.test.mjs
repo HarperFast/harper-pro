@@ -149,7 +149,9 @@ describe('privatePaths', () => {
 		const KEY = privatePathKey(PRIVATE, 'node-b.example.com');
 		function harness() {
 			const timers = [];
+			const clock = { now: 0 };
 			const paths = new PrivatePaths({
+				now: () => clock.now,
 				setTimer: (callback, delay) => {
 					const timer = { callback, delay, cleared: false, unref() {} };
 					timers.push(timer);
@@ -166,7 +168,7 @@ describe('privatePaths', () => {
 				timer.callback();
 				await new Promise((resolve) => setImmediate(resolve));
 			};
-			return { paths, pending, fire };
+			return { paths, pending, fire, clock };
 		}
 
 		function waiter(name, { reachable = true, promotable = true, waiting = true } = {}) {
@@ -397,7 +399,7 @@ describe('privatePaths', () => {
 			assert.strictEqual(pending().length, 1, 'the next probe is scheduled; nothing awaits the timer-started one');
 		});
 
-		it('a public dial that fails too resets the probe backoff, since the peer itself is down', async () => {
+		it('a public dial that fails too brings the probe forward, since the peer itself is down', async () => {
 			const { paths, pending, fire } = harness();
 			const a = waiter('a', { reachable: false });
 			paths.failed(KEY, PRIVATE, a);
@@ -409,6 +411,17 @@ describe('privatePaths', () => {
 			assert.strictEqual(pending().length, 1, 'one probe pending: the grown one is replaced');
 			assert.strictEqual(pending()[0].delay, first, 'the next probe waits the initial delay again');
 			paths.publicDialFailed('no-such-path');
+		});
+
+		it('public dial failures never push a pending probe out', () => {
+			const { paths, pending, clock } = harness();
+			paths.failed(KEY, PRIVATE, waiter('a'));
+			const [probe] = pending();
+			for (let i = 0; i < 120; i++) {
+				clock.now += 500;
+				paths.publicDialFailed(KEY);
+			}
+			assert.deepStrictEqual(pending(), [probe], 'the probe due first stays scheduled, and is not cleared');
 		});
 
 		it('a probe that throws counts as unreachable', async () => {
