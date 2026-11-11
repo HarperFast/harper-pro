@@ -43,7 +43,6 @@ for (const [label, recordLocks] of [
 				const result = await call(node, 'LockOnce/', { id: 'off-' + label, timeout: 2_000 });
 				assert.equal(result.status, 503, node.hostname);
 				assert.match(JSON.stringify(result.body), FIX);
-				// Read the catalog: record_lock_propose_homes would itself create the table being checked for.
 				const system = await operation(node, { operation: 'describe_database', database: 'system' });
 				assert.equal(system.status, 200, JSON.stringify(system.body));
 				assert.ok(system.body.hdb_nodes, 'describe_database lists system tables by name');
