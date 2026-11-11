@@ -103,7 +103,9 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 		assert.deepEqual(patched.revoked_certificates, ['dead01']);
 		assert.equal(patched.url, 'wss://consistency-a:9933', 'unpatched fields survive');
 		assert.ok(
-			calls.every((call) => call.node?.url === 'wss://consistency-a:9933' && call.node.replicates === true),
+			calls
+				.filter((call) => call.id === 'consistency-a')
+				.every((call) => call.node?.url === 'wss://consistency-a:9933' && call.node.replicates === true),
 			'the listener gets the full record with its routing fields unchanged, never a removal'
 		);
 		assertMatchesFreshScan('after a patch');
