@@ -712,7 +712,7 @@ export async function proposeHomes(request: any): Promise<
 	const self = membership.thisNodeName();
 	if (!self) throw new ClientError('this node has no resolved node name', 503);
 	const peers = membership.replicatingPeers(database);
-	const existing = await readRow(database);
+	const existing = await existingRow(database);
 	return {
 		database,
 		...planProposal(self, peers, existing, database),

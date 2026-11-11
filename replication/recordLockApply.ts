@@ -17,8 +17,8 @@ import {
 	STAGE_DRAIN_BUDGET_MS,
 	activateGeneration,
 	canonicalizeHomes,
-	currentRow,
 	digestOf,
+	existingRow,
 	operatorPrincipal,
 	planStage,
 	provesQuiescence,
@@ -631,7 +631,7 @@ export async function executeTransitionLocally(
 	const self = getThisNodeName();
 	if (!self) throw new ClientError('this node has no resolved node name', 503);
 	if (action === 'survey') {
-		const row = await currentRow(database);
+		const row = await existingRow(database);
 		return {
 			node: self,
 			active: row?.active,
