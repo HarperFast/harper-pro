@@ -130,7 +130,7 @@ interface Outage {
 	timer?: ReturnType<typeof setTimeout>;
 }
 
-// Per-thread outage state; replication/DESIGN.md non-obvious behavior 37 has the recovery rules.
+// Per-thread outage state; replication/DESIGN.md non-obvious behavior 38 has the recovery rules.
 export class PrivatePaths {
 	#outages = new Map<string, Outage>();
 	#setTimer: typeof setTimeout;
