@@ -7,7 +7,6 @@ function originName(auditStore, nodeId) {
 	return null;
 }
 
-// The row as this node stores it, a tombstone included.
 export class StoredRow extends Resource {
 	static loadAsInstance = false;
 
