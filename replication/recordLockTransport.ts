@@ -481,7 +481,6 @@ export function createDisabledRecordLockTransport(): ClusterLockTransport {
 // ---- per-thread active-generation cache, refreshed only on change --------------------------------
 
 const activeCache = new Map<string, RecordLockGenerationState | undefined>();
-const confirmedNoMap = new Set<string>();
 
 function cacheForDatabase(database: string): RecordLockGenerationState | undefined {
 	return activeCache.get(database);
@@ -515,15 +514,15 @@ export function refreshRecordLockHomesCache(database: string, freshBudget = fals
 export function cachedActiveGeneration(database: string): number | undefined {
 	return activeCache.get(database)?.generation;
 }
+// A successful read stores the row's `active` even when it is undefined; a failed read deletes the entry.
 export function homeMapConfirmedAbsent(database: string): boolean {
-	return confirmedNoMap.has(database);
+	return activeCache.has(database) && activeCache.get(database) === undefined;
 }
 export function forgetRecordLockHomesCache(database: string): void {
 	const state = refreshState.get(database);
 	if (state) clearTimeout(state.timer);
 	refreshState.delete(database);
 	activeCache.delete(database);
-	confirmedNoMap.delete(database);
 }
 
 async function refreshCache(database: string, freshBudget = false): Promise<void> {
@@ -550,8 +549,6 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		const row = await readHomesRow(database);
 		if (!current()) return;
 		activeCache.set(database, row?.active);
-		if (row?.active) confirmedNoMap.delete(database);
-		else confirmedNoMap.add(database);
 		// A peer digest that arrived while the row was unreadable was recorded as a mismatch against
 		// no digest at all, and a socket that handshook then received none; both need the recovered one.
 		// The backoff resets only once this is done, so a failure here re-arms the whole cycle.
@@ -565,7 +562,6 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		// A storage error must not leave a stale (possibly superseded) generation cached; undefined is
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
-		confirmedNoMap.delete(database);
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
 		state.timer = setTimeout(() => {
 			if (current())
