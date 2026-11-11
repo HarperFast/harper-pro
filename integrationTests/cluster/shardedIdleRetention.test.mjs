@@ -10,18 +10,27 @@ import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, waitForCondition, logMark, readLogSince } from './clusterShared.mjs';
+import {
+	sendOperation,
+	stopAndTeardownNodes,
+	stopNodeProcess,
+	waitForCondition,
+	logMark,
+	readLogSince,
+	logSegments,
+	waitForLogPurged,
+} from './clusterShared.mjs';
 
 const TEST_DIR = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 'dist', 'bin', 'harper.js');
 const FIXTURE = join(TEST_DIR, 'fixture-sharding-quarantine');
 
 const RETENTION_S = 20;
-const IDLE_MS = (RETENTION_S + 25) * 1000;
 const FORCED_COPY = 'forcing a bounded base-copy resync';
 // the system database is not sharded, so it may take a copy (harper-pro#1308)
 const DATA_DATABASE = 'database data';
-const RESUMED_UNDER_PURGE = 'so replay continues from';
+const RESUMED_UNDER_PURGE =
+	/Peer (\S+) requested replication of database data from (\S+), under transaction-log history purged through (\S+); it owns sharding slots this node cannot copy, so replay continues from/;
 const REFUSED = 'refused a copy this node cannot accept';
 // with slots: 2, shard 1 owns ids '0' and '2', shard 0 owns '1' and '3' (shardingBootstrap.test.mjs)
 const OWNED_BY = [
@@ -33,7 +42,7 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 	const nodes = [];
 
 	const options = (node, shard, env = {}) => ({
-		env: { HARPER_NO_FLUSH_ON_EXIT: true, ...env },
+		env,
 		config: {
 			threads: { count: 1 },
 			analytics: { aggregatePeriod: -1 },
@@ -60,6 +69,12 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		const node = nodes[i];
 		const started = (await startHarper({ name: ctx.name, harper: node }, options(node, i, env))).harper;
 		return Object.assign(node, started);
+	}
+
+	// the pid file's process too: one killed seconds after it started can outlive the spawned handle
+	async function stop(i, killOptions) {
+		await killHarper({ harper: nodes[i] }, killOptions);
+		await stopNodeProcess(nodes[i]);
 	}
 
 	async function request(node, path, init = {}) {
@@ -138,6 +153,7 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 				`type Rows @table @export @sharded(slots: 2) {
 					id: ID @primaryKey
 					body: String
+					version: Float @updatedTime
 				}`
 			);
 			await start(i);
@@ -168,14 +184,33 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		}
 	});
 
-	test('both nodes restart after an idle interval longer than retention and replicate with no base copy', async () => {
-		// node 0 misses node 1's last write, so once retention passes it, node 0's start is below node 1's purge bound
-		await killHarper({ harper: nodes[0] });
-		await put(nodes[1], OWNED_BY[1][1], 'while-0-down');
-		await delay(IDLE_MS);
-		await killHarper({ harper: nodes[1] });
+	test('node 0 restarts after node 1 purged the write it missed, and both replicate with no base copy', async () => {
+		await stop(0);
+		const missedId = OWNED_BY[1][1];
+		await put(nodes[1], missedId, 'while-0-down');
+		// a local write's version is its log key
+		const [{ version: missedVersion }] = await sendOperation(
+			nodes[1],
+			{
+				operation: 'search_by_id',
+				database: 'data',
+				table: 'Rows',
+				ids: [missedId],
+				get_attributes: ['version'],
+				replicateFrom: false,
+			},
+			{ signal: AbortSignal.timeout(30_000) }
+		);
+		const missedAt = Math.floor(missedVersion);
+		ok(missedAt > 0, `the missed write has a version: ${missedVersion}`);
+		// RocksDB purges only flushed entries: a clean exit flushes, then retention deletes the segment once it ages out
+		ok((await logSegments(nodes[1], 'local')).length > 0, "node 1's own log has a segment to purge");
+		await stop(1, { graceMs: 30_000 });
+		await start(1);
+		await waitForLogPurged(nodes[1], 'local');
+		ok(await holds(nodes[1], missedId, 'while-0-down'), 'node 1 kept the row whose log entry it purged');
 		const marks = await Promise.all(nodes.map(logMark));
-		for (let i = 0; i < 2; i++) await start(i);
+		await start(0);
 		await ready();
 		await waitForCondition(
 			async (signal) =>
@@ -195,14 +230,24 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 				!(await socketTo(nodes[1], nodes[0], signal))?.stuckCopy,
 			{ timeoutMs: 90_000, description: 'neither node to report a stuck copy' }
 		);
-		const resumed = await linesSince(nodes[1], marks[1], RESUMED_UNDER_PURGE);
-		ok(resumed.length >= 1, 'node 1 reports resuming node 0 under purged history');
-		await put(nodes[0], OWNED_BY[1][0], 'after-idle');
-		await ownerHolds(1, OWNED_BY[1][0], 'after-idle');
+		const warnings = (await readLogSince(nodes[1], marks[1]))
+			.split('\n')
+			.filter((line) => RESUMED_UNDER_PURGE.test(line));
+		ok(
+			warnings.some((line) => {
+				const [, peer, from, purgedThrough] = line.match(RESUMED_UNDER_PURGE);
+				return peer === nodes[0].hostname && Date.parse(from) < missedAt && Date.parse(purgedThrough) >= missedAt;
+			}),
+			`node 1 resumed node 0 from before the missed write (${new Date(missedAt).toISOString()}), under history purged through it:\n${warnings.join('\n')}`
+		);
+		await put(nodes[1], OWNED_BY[0][0], 'after-purge');
+		await ownerHolds(0, OWNED_BY[0][0], 'after-purge');
+		await put(nodes[0], OWNED_BY[1][0], 'after-purge');
+		await ownerHolds(1, OWNED_BY[1][0], 'after-purge');
 	});
 
 	test("an owner's refusal of a forced copy is logged once, reported, and backed off", async () => {
-		await killHarper({ harper: nodes[0] });
+		await stop(0);
 		const marks = await Promise.all(nodes.map(logMark));
 		// forced only before node 1's first hold ends, so its retry replays (test 3)
 		await start(0, {
@@ -256,7 +301,7 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 	});
 
 	test('a copy-resume cursor left from before the route was restricted asks node 1 for no copy (harper-pro#1315)', async () => {
-		await killHarper({ harper: nodes[0] });
+		await stop(0);
 		const marks = await Promise.all(nodes.map(logMark));
 		const cursor = { copyStartTime: Date.now() - 60_000, currentTable: 'Rows', afterKey: OWNED_BY[0][0], copyOrder: 1 };
 		await start(0, { HARPER_TEST_INJECT_COPY_CURSOR_JSON: JSON.stringify({ db: 'data', cursor }) });
