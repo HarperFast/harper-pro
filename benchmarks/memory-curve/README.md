@@ -91,6 +91,7 @@ Outputs go to `benchmarks/memory-curve/runs/<run-id>/` (git-ignored): `manifest.
 
 ## What it does not represent
 
+- host-manager's `memory.high` below 6 GB: it sets limit − 1 GB, which equals the 5/6 used here only at 6 GB. At smaller limits that leaves less room above anon memory, so a production instance would reach the cliff at a larger limit than these steps show.
 - Real key popularity: production access is not a stationary Zipf over one table.
 - Scans, secondary-index reads, multi-table transactions and large blobs.
 - Write amplification from compaction at production write rates (workload B updates 5% of requests only).

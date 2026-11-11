@@ -206,6 +206,7 @@ describe('renderReport', () => {
 		assert.match(charts['chart-C.svg'], /disk ceiling 5432 IOPS/);
 		assert.match(markdown, /\| ⚠ 100\.0% served \(40\.0\) \|/);
 		assert.match(markdown, /steps cut because a cell saturated: uniform at 0\.25/);
+		assert.match(markdown, /lowest p99, or that saturated\./);
 	});
 
 	it('subtracts no baseline from a calibration whose window was invalid or that read from disk', () => {
