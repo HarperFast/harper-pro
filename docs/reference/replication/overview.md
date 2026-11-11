@@ -352,22 +352,25 @@ Update a subscription with `update_node`:
 
 <VersionBadge version="v5.5.0" />
 
-By default every node subscribes to every other node, so a write crosses region boundaries once per remote node. Labeling each node with its region lets nodes link only within their region, with a few gateway nodes carrying traffic between regions:
+By default every node subscribes to every other node, so a write crosses region boundaries once per remote node. Labeling each node with its region arranges the cluster as a grid of regions and columns instead:
 
 ```yaml
 replication:
   region: us-east
-  gateway: true # optional
 ```
 
-- A node subscribes to every node in its own region. A gateway also subscribes to every gateway in the other regions. A non-gateway node opens no cross-region subscription, and gossip discovery does not add one.
-- A region's gateways are the nodes that set `gateway: true`, topped up to two with the lowest-named nodes that do not set `gateway: false`. To use exactly one gateway, set `gateway: true` on it and `gateway: false` on the rest of the region (no failover then). Adding a node whose name sorts first to a region that relies on automatic selection moves a gateway role to it; set `gateway: true` to pin the role.
-- Each node takes the writes of an origin it does not link to from one peer and asks every other peer to leave them out. A non-gateway takes another region's writes from the lowest-named gateway of its own region that holds a caught-up link to that region. A gateway takes them from a lower-named gateway of its own region that has that link, else directly from that region's gateways. So with everything up, each node receives each write once, a non-gateway's write crosses into each other region once, and a gateway's own write reaches every remote gateway directly.
-- When a node's supplier for an origin goes down, or a gateway loses its links to a region while staying reachable in its own, the node switches after 3 seconds to the next candidate, resuming that origin from where it left off. A switch can resend up to the last 60 seconds of the origin's writes, the same overlap a reconnecting node uses: a transaction from that origin that commits more than 60 seconds after it started, during the switch, can be missed. With no candidate, the node accepts the origin's writes from any peer.
-- While a node applies a [base copy](#when-a-peer-forces-a-base-copy) of a database other than `system`, it keeps sending its own writes but relays no other node's until the copy completes: the copy writes rows without transaction-log entries, which a relayed stream would skip. A gateway in that state reports no caught-up links, so the other nodes of its region move to the other gateway. A node that takes writes from it waits. If the copy is interrupted, by a disconnect or a restart, relaying stays held back until a later copy from the same source completes, for at most 30 minutes, after which the node logs an error and relays again. Up to eight copies into one database can run at once on a node; a ninth is closed and retried.
+- **Columns.** Within a region, nodes are ranked by name; a node's rank is its lane. Nodes that also set `replication.shard` are ranked within their shard. A node's column is its shard and lane, so the first-named node of each region shares a column, the second-named another, and so on.
+- **Links.** A node subscribes to every node in its own region, and in each other region to the node in its own column. So a write crosses into each other region once, to the writer's column there, and that node passes it on to the rest of its region: every node is at most one relay away from the writer. Gossip discovery does not add other cross-region links.
+- **Regions of different sizes.** A region with no node in some column has one of its nodes carry it: with `m` nodes, the node in lane `c mod m` (in column order) also receives column `c`. A region smaller than the others therefore has nodes that receive several columns. The larger region receives each of the smaller region's nodes only through that node's own column.
+- **One supplier per origin.** Each node takes the writes of an origin it does not subscribe to from one node of its own region, the one that receives that origin's column, and asks every other peer to leave them out. So with everything up, each node receives each write once.
+- **Losing a node.** When the node that receives a column goes down, the lowest-named remaining node of its region subscribes directly to that column's origins after 3 seconds, and the region's other nodes take them from it, resuming each origin from where it left off. A node that sees no other node of its region subscribes to the origin itself. When the lost node has been back for 10 seconds, the region returns to it and the temporary links close. A switch can resend up to the last 60 seconds of the origin's writes, the same overlap a reconnecting node uses: a transaction from that origin that commits more than 60 seconds after it started, during the switch, can be missed.
+- **Losing a link.** A node that loses only its link to an origin it receives directly takes that origin through another node that receives it directly: one in the origin's region, or the origin's column in a third region. With no such peer connected (two regions of equal size, for example), the node's region waits for the link to return.
+- **Base copies.** While a node applies a [base copy](#when-a-peer-forces-a-base-copy) of a database other than `system`, it keeps sending its own writes but relays no other node's until the copy completes: the copy writes rows without transaction-log entries, which a relayed stream would skip. The nodes that take writes through it wait. If the copy is interrupted, by a disconnect or a restart, relaying stays held back until a later copy from the same source completes, for at most 30 minutes, after which the node logs an error and relays again. Up to eight copies into one database can run at once on a node; a ninth is closed and retried.
 - A route in `replication.routes` that sets `replicates`, `sendsTo`, `receivesFrom` or `subscriptions` keeps its link whatever the topology says. A plain route is a seed for discovery.
 
-Region topology turns on only when every node in `hdb_nodes` has a region and full (non-directional) replication, so it waits until the last node of a rolling upgrade is labeled. Until then, and whenever a node without a region joins, the cluster stays on the full mesh. When a pruned link becomes direct again (for example, when the topology turns off or a node becomes a gateway), it resumes from its saved route cursor, which replays or forces a base copy if that cursor is past retention. It also stays off for:
+For example, three regions of three nodes hold 18 links (9 across regions) instead of the full mesh's 36 (27), and each write crosses regions twice instead of six times.
+
+Region topology turns on only when every node in `hdb_nodes` has a region and full (non-directional) replication, and the cluster has at least two regions, so it waits until the last node of a rolling upgrade is labeled. Until then, and whenever a node without a region joins, the cluster stays on the full mesh. A link that becomes direct again (for example, when the topology turns off or a lane moves) resumes from the position of the node that supplied that origin before. It also stays off for:
 
 - nodes on LMDB, which do not publish their region, since switching suppliers needs per-origin transaction logs;
 - databases with sharding or residency, which keep direct links;
@@ -375,10 +378,12 @@ Region topology turns on only when every node in `hdb_nodes` has a region and fu
 
 Notes:
 
-- Every gateway must replicate every database that crosses regions.
-- A write confirmed with `replicatedConfirmation` or `X-Replicate-To: ...;confirm=N` is acknowledged only by the nodes that subscribe to the writer: its own region's nodes, plus the remote gateways when the writer is a gateway. A larger count is refused before the write commits.
+- Lanes follow node names. Adding or removing a node moves the lanes of the nodes named after it in its region, and their cross-region links move with them. Give a new node a name that sorts last in its region to leave the existing links in place.
+- Every node relays the column it receives, so every node must replicate every database that crosses regions.
+- A write confirmed with `replicatedConfirmation` or `X-Replicate-To: ...;confirm=N` is acknowledged only by the nodes that subscribe to the writer: its own region's nodes, plus one node in each other region. A larger count is refused before the write commits.
+- Writes a node made just before it went down may have reached its own region and not yet the others. They stay in its region until the node returns.
 - Client subscription checkpoints need a certified floor for every origin, which a node receiving an origin only through a relay does not hold, so they are not issued on such nodes.
-- `region` and `gateway` shape traffic only. They are not a security boundary: a node with valid cluster credentials can still subscribe to any peer that authorizes it.
+- `region` shapes traffic only. It is not a security boundary: a node with valid cluster credentials can still subscribe to any peer that authorizes it.
 
 ## Monitoring Replication
 
