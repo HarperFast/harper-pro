@@ -1,0 +1,185 @@
+import assert from 'node:assert';
+import { EventEmitter } from 'node:events';
+import { decode, encode } from 'msgpackr';
+import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
+import { table } from '#src/core/resources/databases';
+import { transaction } from '#src/core/resources/transaction';
+import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
+import { ACTION_32_BIT, createAuditEntry, Decoder, readAuditEntry } from '#src/core/resources/auditStore';
+import { FULL_WRITE_HEAD } from '#src/core/resources/Table';
+import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
+import { databaseSubscriptions, encodeCopyRecordValue, replicateOverWS } from '#src/replication/replicationConnection';
+import { setReplicator } from '#src/replication/replicator';
+
+const SUBSCRIPTION_REQUEST = 129;
+const NODE_NAME = 140;
+const OPERATION_REQUEST = 136;
+const OPERATION_RESPONSE = 137;
+const COPY_START = 148;
+const COPY_COMPLETE = 149;
+const DATABASE = 'copyTombstoneWire';
+const PEER = 'copy-tombstone-wire-peer';
+
+class Socket extends EventEmitter {
+	readyState = 1;
+	sent = [];
+	_socket = { bytesRead: 0, bytesWritten: 0, setMaxListeners() {} };
+	send(data) {
+		this.sent.push(data[0] > 127 ? decode(Buffer.from(data)) : Buffer.from(data));
+	}
+	close(code = 1000, reason = '') {
+		if (this.readyState === 3) return;
+		this.readyState = 3;
+		this.emit('close', code, Buffer.from(reason));
+	}
+	terminate() {
+		this.close(1006);
+	}
+	ping() {}
+	pause() {}
+	resume() {}
+}
+
+async function until(predicate) {
+	const deadline = Date.now() + 15_000;
+	while (!predicate()) {
+		assert.ok(Date.now() < deadline, 'replication response timed out');
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+// harper-pro#1331: a base copy must carry a delete, or a later older write recreates the row on the receiver
+describe('delete tombstones in a base copy', function () {
+	this.timeout(30_000);
+	let Records, socket;
+
+	before(async () => {
+		setHdbBasePath(process.env.STORAGE_PATH);
+		Records = table({
+			database: DATABASE,
+			table: 'Records',
+			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'name' }],
+			audit: true,
+		});
+		await Records.put('live', { id: 'live', name: 'live' });
+		await Records.put('deleted', { id: 'deleted', name: 'gone' });
+		await Records.delete('deleted');
+		await Records.publish('published', { message: 'no record' });
+		// what a node that itself joined by copy holds: an audit-less tombstone
+		const version = Date.now() - 1000;
+		const context = { source: {}, sourceApply: true, timestamp: version };
+		await transaction(context, async () => {
+			const resource = await Records.getResource('copied-deleted', context, { ensureLoaded: false });
+			await resource._writeDelete('copied-deleted', {
+				isNotification: true,
+				isCopyApply: true,
+				nodeId: getIdOfRemoteNode('copy-tombstone-origin', Records.auditStore),
+				version,
+			});
+		});
+		setReplicator(DATABASE, Records, {});
+		await until(() => databaseSubscriptions.get(DATABASE)?.auditStore);
+		const tombstone = Records.primaryStore.getEntry('deleted');
+		assert.equal(tombstone.value, null);
+		assert.ok(tombstone.metadataFlags & FULL_WRITE_HEAD, 'premise: a flagged tombstone');
+		const published = Records.primaryStore.getEntry('published');
+		assert.equal(published.value, null);
+		assert.equal(published.metadataFlags & FULL_WRITE_HEAD, 0, 'premise: a publish-only head is unflagged');
+	});
+
+	afterEach(() => socket?.close());
+
+	async function connect(bag) {
+		socket = new Socket();
+		replicateOverWS(socket, bag ? {} : { database: DATABASE }, { name: PEER, replicates: true });
+		if (bag) {
+			socket.emit('message', encode([NODE_NAME, PEER, DATABASE, [], bag]));
+			await until(() => socket.sent.some((frame) => frame[0] === NODE_NAME));
+		}
+	}
+
+	async function copiedRecords(unlearned = false) {
+		socket.emit(
+			'message',
+			encode([SUBSCRIPTION_REQUEST, [{ name: PEER, startTime: 0, tables: [], replicateByDefault: true }], []])
+		);
+		if (unlearned) {
+			// no safeCopyAudit either, so the copy first asks for the peer's version
+			await until(() => socket.sent.some((frame) => frame[0] === OPERATION_REQUEST));
+			const { requestId } = socket.sent.find((frame) => frame[0] === OPERATION_REQUEST)[1];
+			socket.emit('message', encode([OPERATION_RESPONSE, { requestId, version: '5.3.0' }]));
+		}
+		await until(() => socket.sent.some((frame) => frame[0] === COPY_COMPLETE));
+		const start = socket.sent.findIndex((frame) => frame[0] === COPY_START);
+		const end = socket.sent.findIndex((frame) => frame[0] === COPY_COMPLETE);
+		assert.ok(start >= 0 && end > start, 'must exercise the base-copy row walk');
+		const records = new Map();
+		for (const frame of socket.sent.slice(start + 1, end)) {
+			if (!Buffer.isBuffer(frame)) continue;
+			const decoder = new Decoder(frame.buffer, frame.byteOffset, frame.byteLength);
+			decoder.position = 8;
+			while (decoder.position < frame.length) {
+				const length = decoder.readInt();
+				const offset = decoder.position;
+				decoder.position += length;
+				if (length === 9 && frame[offset] === 11) continue;
+				const entry = readAuditEntry(frame, offset, offset + length);
+				if (entry.tableId === Records.tableId)
+					records.set(entry.recordId, { entry, bytes: Buffer.from(frame.subarray(offset, offset + length)) });
+			}
+		}
+		return records;
+	}
+
+	// what the copy sent for a null row before tombstoneCopy existed
+	function nilPutEncoding(key, nodeId) {
+		const stored = [...Records.primaryStore.getRange({ versions: true, snapshot: false })].find(
+			(entry) => entry.key === key
+		);
+		return Buffer.from(
+			createAuditEntry({
+				version: stored.version,
+				tableId: Records.tableId,
+				recordId: key,
+				previousVersion: null,
+				nodeId,
+				type: 'put',
+				encodedRecord: encodeCopyRecordValue(Records.primaryStore, stored.value, () => {}),
+				extendedType: stored.metadataFlags & ~0xff & ~FULL_WRITE_HEAD & ~(ACTION_32_BIT << 24),
+				residencyId: stored.residencyId,
+				previousResidencyId: null,
+				expiresAt: stored.expiresAt,
+			})
+		);
+	}
+
+	it('sends a tombstone as a bodyless delete at its version to a peer advertising tombstoneCopy', async () => {
+		await connect(buildLocalCapabilities(90_000, false, true));
+		const records = await copiedRecords();
+		const deleted = records.get('deleted')?.entry;
+		assert.equal(deleted?.type, 'delete');
+		assert.equal(deleted.version, Records.primaryStore.getEntry('deleted').version);
+		assert.equal(deleted.getValue(Records.primaryStore), undefined, 'a delete carries no body');
+		assert.equal(deleted.extendedType & FULL_WRITE_HEAD, 0, 'a record-only bit must not reach the audit flags');
+		const copiedDeleted = records.get('copied-deleted')?.entry;
+		assert.equal(copiedDeleted?.type, 'delete', 'a tombstone this node took from a copy is copied on');
+		assert.equal(copiedDeleted.version, Records.primaryStore.getEntry('copied-deleted').version);
+		assert.equal(records.get('live')?.entry.type, 'put');
+		assert.equal(records.get('published')?.entry.type, 'put', 'a publish-only head is not a delete');
+	});
+
+	for (const peer of ['a pre-key capability bag', 'unlearned capabilities']) {
+		it(`sends a tombstone exactly as before the gate to a peer with ${peer}`, async () => {
+			let bag;
+			if (peer === 'a pre-key capability bag') {
+				bag = { ...buildLocalCapabilities(90_000, false, true) };
+				delete bag.tombstoneCopy;
+			}
+			await connect(bag);
+			const records = await copiedRecords(!bag);
+			const deleted = records.get('deleted');
+			assert.equal(deleted?.entry.type, 'put');
+			assert.deepEqual(deleted.bytes, nilPutEncoding('deleted', deleted.entry.nodeId));
+		});
+	}
+});

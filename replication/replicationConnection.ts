@@ -197,6 +197,7 @@ import {
 	peerSupportsRecordLocks,
 	peerSupportsResidencyNotResident,
 	peerSupportsResidencyStubCopy,
+	peerSupportsTombstoneCopy,
 	peerSupportsTableLifecycle,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
@@ -10786,7 +10787,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
 														const legacyStubCopy = isStub && !stubAsInvalidation;
 														if (legacyStubCopy && table.residency) continue;
-														const copyType = stubAsInvalidation ? 'invalidate' : 'put';
+														// a delete's tombstone; a publish-only head also holds no record, but is unflagged
+														const tombstoneAsDelete =
+															entry.value == null &&
+															!isStub &&
+															Boolean(entry.metadataFlags & FULL_WRITE_HEAD) &&
+															peerCapabilitiesLearned &&
+															peerSupportsTombstoneCopy(peerCapabilities);
+														const copyType = stubAsInvalidation ? 'invalidate' : tombstoneAsDelete ? 'delete' : 'put';
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;
 														if (isReplica) {
@@ -10812,9 +10820,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																previousVersion: null,
 																nodeId: recordNodeId,
 																type: copyType,
-																encodedRecord: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
-																	sendBlobs(blob, entry.key)
-																),
+																encodedRecord: tombstoneAsDelete
+																	? undefined
+																	: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
+																			sendBlobs(blob, entry.key)
+																		),
 																extendedType: copyExtendedType,
 																residencyId: entry.residencyId,
 																residencySlot: entry.residencySlot,
