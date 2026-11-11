@@ -1,17 +1,17 @@
 /**
  * A source forces a retention base copy only when it purged history the follower needs (harper-pro#1229).
  *
- * Two nodes on `data`, retention in seconds. B is stopped while A purges its own log past retention, so no live
- * traffic or certified floor can freshen B's resume point:
- * - when B had everything A wrote before the purge, and A writes again just before B returns, A resumes B
+ * Two nodes on `data`, retention in seconds. B is stopped while A's history ages past retention, so no live traffic
+ * or certified floor can freshen B's resume point:
+ * - when B had everything A wrote before A purged its log, and A writes again just before B returns, A resumes B
  *   incrementally: no forced copy;
+ * - when B missed a write that is past retention but still in A's log (RocksDB), A resumes B incrementally too;
  * - when B missed a tagged write that A has since purged, A forces the copy and B recovers the tag.
  * Before the fix the guard compared B's start against `now - auditRetention` alone and forced a full copy
- * in both cases.
+ * in the first two cases.
  *
  * On RocksDB the purge bound is the largest key retention actually deleted, and retention deletes a segment only once
- * every entry in it is flushed, which an idle node may not do for minutes. Waiting past retention purges nothing
- * there, so A restarts cleanly (its exit flushes) and the tests wait for its log to have no segments left.
+ * every entry in it is flushed, which an idle node may not do for minutes; a clean exit flushes.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -35,13 +35,15 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIR, '..', '..', 
 const TABLE = 'purge_bound';
 // long enough for B to restart and subscribe while A still retains the write made just before
 const RETENTION_S = 40;
-// LMDB removes entries one by one: past retention plus two cleanup passes
+// past retention plus two cleanup passes (the RocksDB pass runs at least every 10 s)
 const IDLE_MS = (RETENTION_S + 25) * 1000;
+// well under retention, so a log written this often keeps its segment
+const KEEPALIVE_MS = 15_000;
 const FORCED_COPY = 'forcing a bounded base-copy resync';
 const OWN_LOG_PURGED_THROUGH =
 	/of database data, whose log local it would replay from \S+, under transaction-log history purged through (\S+);/;
 // log keys come from a performance.now()-based clock, which can trail Date.now() by milliseconds
-const CLOCK_SLACK_MS = 1000;
+const CLOCK_SLACK_MS = 100;
 
 for (const engine of ['rocksdb', 'lmdb']) {
 	suite(`retention base copy follows the purge bound (${engine})`, { timeout: 600_000 }, (ctx) => {
@@ -101,6 +103,11 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			});
 		const forcedCopiesTo = (node, servedLog) =>
 			servedLog.split('\n').filter((line) => line.includes(FORCED_COPY) && line.includes(`Peer ${node.hostname} `));
+		// a copy the follower asks for itself, resuming one it never finished, logs no forced-copy line
+		const copiesTo = (node, servedLog) => [
+			...forcedCopiesTo(node, servedLog),
+			...servedLog.split('\n').filter((line) => line.endsWith(`Finished copy table ${TABLE} ${node.hostname}`)),
+		];
 
 		before(async () => {
 			A = await start({ hostname: await getNextAvailableLoopbackAddress() });
@@ -130,9 +137,33 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			await arrives(B, 'after-idle');
 			const served = await readLogSince(A, mark);
 			ok(served.includes('subscription to'), 'the log read is of the process that served B');
-			const forced = forcedCopiesTo(B, served);
-			equal(forced.length, 0, `A forced a copy for B:\n${forced.join('\n')}`);
+			const copies = copiesTo(B, served);
+			equal(copies.length, 0, `A copied to B:\n${copies.join('\n')}`);
 		});
+
+		test(
+			'a follower that missed a write past retention that A still holds resumes without a copy',
+			{ skip: engine === 'lmdb' && 'LMDB removes each entry once it is past retention' },
+			async () => {
+				await stop(B);
+				const retainedAt = Date.now();
+				await upsert(A, 'retained');
+				let keepalives = 0;
+				while (Date.now() - retainedAt < IDLE_MS) {
+					await delay(KEEPALIVE_MS);
+					await upsert(A, `keepalive-${++keepalives}`);
+				}
+				ok((await logSegments(A, 'local')).length > 0, "A's log still holds the write B missed");
+				const mark = await logMark(A);
+				await start(B);
+				await arrives(B, `keepalive-${keepalives}`);
+				ok(await has(B, 'retained'), 'B received the write past retention from A');
+				const served = await readLogSince(A, mark);
+				ok(served.includes('subscription to'), 'the log read is of the process that served B');
+				const copies = copiesTo(B, served);
+				equal(copies.length, 0, `A copied to B:\n${copies.join('\n')}`);
+			}
+		);
 
 		test('a follower that missed a write A has since purged gets a copy and the write', async () => {
 			await stop(B);
