@@ -1,22 +1,24 @@
 /**
- * Region topology supplier switches under load (harper-pro#1291), on the 3 regions × 3 nodes of
- * `regionTopologyShared.mjs`.
+ * Region grid supplier switches under load (harper-pro#1343), on the 3 regions × 3 nodes of
+ * `regionTopologyShared.mjs`. A carrier is the node of a region that receives a column's origins from the other
+ * regions and relays them to its region-mates.
  *
- * - Each region's preferred gateway is killed (SIGKILL) and restarted in turn while a leaf and the standby gateway of
- *   every region write without pause. While each gateway is down every live node must catch up with every writer, so
- *   its region has moved to the standby. At the end every node holds exactly the rows written, and each writer's
- *   counter, raised by one `add` per row, equals its row count: a frame applied twice would show there.
- * - A leaf's link to its preferred gateway is slowed until its cursors for the remote origins it takes through that
- *   gateway are older than the 60 s per-origin overlap, while frames keep arriving. Both east gateways then
- *   purge their transaction logs to a bound past those cursors and the preferred gateway is killed, dropping the held
- *   frames. The standby must force a base copy (the purge-recovery path) rather than replay from history it no longer
- *   accounts for, and the leaf must end with every row.
- * - A gateway whose own catch-up base copy is still open must relay nothing to a follower it admits meanwhile
- *   (harper-pro#1299). East's preferred gateway and the west gateway that takes east's leaf through it are stopped
- *   while the leaf writes; the leaf's log is purged, so the restarted gateway catches up by a base copy, whose settle
- *   the test holds while the leaf keeps writing. The west gateway, able to reach only that gateway, is restarted into
- *   the open pass, and must end with every row the copy applied as well as the later ones.
- * - The same gateway killed after its pass applied rows and logged its tail, then restarted cut off from its source:
+ * - One node of each region, the carrier of a column whose two remote nodes write, is killed (SIGKILL) and restarted
+ *   in turn while two nodes of every region write without pause. While each is down every live node must catch up with
+ *   every writer, so its region's lowest-named node has taken the column by direct links. At the end every node holds
+ *   exactly the rows written, and each writer's counter, raised by one `add` per row, equals its row count: a frame
+ *   applied twice would show there.
+ * - A follower's link to its carrier is slowed until its cursors for the remote origin it takes through that carrier
+ *   are older than the 60 s per-origin overlap, while frames keep arriving. The carrier and the node that will stand
+ *   in for it then purge their transaction logs to a bound past those cursors and the carrier is killed, dropping the
+ *   held frames. The stand-in must force a base copy (the purge-recovery path) rather than replay from history it no
+ *   longer accounts for, and the follower must end with every row.
+ * - A carrier whose own catch-up base copy is still open must relay nothing to a follower it admits meanwhile
+ *   (harper-pro#1299). An origin's carrier in another region and a follower of that carrier are stopped while the
+ *   origin writes; the origin's log is purged, so the restarted carrier catches up by a base copy, whose settle the
+ *   test holds while the origin keeps writing. The follower, able to reach only that carrier, is restarted into the
+ *   open pass, and must end with every row the copy applied as well as the later ones.
+ * - The same carrier killed after its pass applied rows and logged its tail, then restarted cut off from its source:
  *   the follower admitted before a new pass settles must still end with every row, since the reservation the killed
  *   pass left holds relaying back until a later pass from that source settles.
  */
@@ -58,11 +60,19 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 
 const OPTIONS = { replicationLogLevel: 'info' };
 const WRITE_INTERVAL_MS = 200;
-const KILL_ORDER = ['east', 'west', 'eu', 'east'];
-// The leaf's link to its gateway is slowed a little more each second (latency RAMP × elapsed), so frames keep
-// arriving and the link stays live, yet after LAG_MS the leaf holds the gateway's frames from (1 - 1 / (1 + RAMP)) ×
+// [region, lane] of each node killed in turn; the other two nodes of every region write, so each killed node's column
+// has a writer in both other regions
+const KILL_ORDER = [
+	['east', 2],
+	['west', 0],
+	['eu', 1],
+	['east', 2],
+];
+const WRITER_LANES = { east: [0, 1], west: [1, 2], eu: [0, 2] };
+// The follower's link to its carrier is slowed a little more each second (latency RAMP × elapsed), so frames keep
+// arriving and the link stays live, yet after LAG_MS the follower holds the carrier's frames from (1 - 1 / (1 + RAMP)) ×
 // LAG_MS ago: 90 s, more than the 60 s per-origin overlap plus the margin below the purge bound. A flat delay over
-// 60 s would leave the link silent long enough for the leaf to mark it down and switch before the purge.
+// 60 s would leave the link silent long enough for the follower to mark it down and switch before the purge.
 const RAMP = 3;
 const LAG_MS = 120_000;
 const PURGE_MARGIN_MS = 10_000;
@@ -247,7 +257,7 @@ async function assertExactlyWritten(nodes, writes) {
 		);
 }
 
-suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
+suite('Region grid switches under load', { timeout: 2_700_000 }, (ctx) => {
 	let workDir;
 	const contexts = [];
 	const nodes = () => contexts.map((context) => context.harper);
@@ -269,34 +279,45 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 			)
 		);
 	/**
-	 * East's preferred gateway and west's, which can reach only it, are stopped while east's leaf writes `phase`; the
-	 * leaf's log is then purged past the gateway's cursor. The gateway, which can then reach only the leaf, catches up by
-	 * a base copy from it: no other peer's log can hand it those rows first.
+	 * West's carrier of an east node's column, and a follower of it that can reach only it, are stopped while that east
+	 * node writes `phase`; its log is then purged past the carrier's cursor. The carrier, which can then reach only that
+	 * origin, catches up by a base copy from it: no other peer's log can hand it those rows first.
 	 */
 	async function stopRelayAndFollowerAcrossPurge(phase) {
-		const relay = layout.named('east', 0);
+		const origin = layout.named('east', 2);
+		const relay = layout.named('west', 2);
 		const follower = layout.named('west', 0);
-		const leaf = layout.named('east', 2);
 		await waitForSuppliers(nodes(), layout.steadySuppliers(), 'settled suppliers');
-		// a route that never carried the leaf's origin starts it at the merged start on a switch (harper-pro#1300)
-		await insert(leaf, `${phase}-seed`, leaf.hostname, 1);
+		// a route that never carried the origin starts it at the merged start on a switch (harper-pro#1300)
+		await insert(origin, `${phase}-seed`, origin.hostname, 1);
 		await waitForPhase(nodes(), `${phase}-seed`, 1);
 		await cutOffAllBut(follower, relay);
 		await waitForSuppliers(
 			nodes(),
-			(node) => new Map(node === follower ? [[leaf.hostname, [relay.hostname]]] : []),
-			`${follower.hostname} takes ${leaf.hostname} from ${relay.hostname}`
+			(node) => new Map(node === follower ? [[origin.hostname, [relay.hostname]]] : []),
+			`${follower.hostname} takes ${origin.hostname} from ${relay.hostname}`
 		);
 		await killNode(relay);
 		await killNode(follower);
-		await insert(leaf, phase, leaf.hostname, COPIED_ROWS);
+		// west's remaining node takes both columns by direct links before the purge, so only the stopped pair needs a copy
+		const down = new Set([relay.hostname, follower.hostname]);
+		await waitForSuppliers(
+			nodes().filter((node) => !down.has(node.hostname)),
+			layout.steadySuppliers(down),
+			`suppliers without ${relay.hostname} and ${follower.hostname}`
+		);
+		await insert(origin, phase, origin.hostname, COPIED_ROWS);
 		// a copy starts at the source's last transaction and applies that one with a log entry: keep `phase` below it
-		await insert(leaf, `${phase}-after`, leaf.hostname, 1);
+		await insert(origin, `${phase}-after`, origin.hostname, 1);
 		await waitForPhase([layout.named('east', 1)], `${phase}-after`, 1);
 		await delay(1000);
-		await sendOperation(leaf, { operation: 'delete_transaction_logs_before', database: 'data', timestamp: Date.now() });
-		await cutOffAllBut(relay, leaf);
-		return { relay: contextOf(relay), follower: contextOf(follower), leaf };
+		await sendOperation(origin, {
+			operation: 'delete_transaction_logs_before',
+			database: 'data',
+			timestamp: Date.now(),
+		});
+		await cutOffAllBut(relay, origin);
+		return { relay: contextOf(relay), follower: contextOf(follower), origin };
 	}
 	const reconnectAll = (...contexts) =>
 		Promise.all(contexts.map(({ harper }) => writeFile(partitionFile(workDir, harper.hostname), '[]')));
@@ -337,23 +358,23 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 		if (workDir) await rm(workDir, { recursive: true, force: true });
 	});
 
-	test("a follower admitted during a gateway's own base copy ends with every row the copy applied", async () => {
-		const { relay, follower, leaf } = await stopRelayAndFollowerAcrossPurge('open-copied');
+	test("a follower admitted during a carrier's own base copy ends with every row the copy applied", async () => {
+		const { relay, follower, origin } = await stopRelayAndFollowerAcrossPurge('open-copied');
 		const hold = await holdDirectory('settle-hold');
-		const leafMark = await logMark(leaf);
+		const leafMark = await logMark(origin);
 		await restart(relay, {
 			HARPER_TEST_HOLD_COPY_SETTLE_DIR: hold,
 			HARPER_TEST_HOLD_COPY_SETTLE_DB: 'data',
-			HARPER_TEST_HOLD_COPY_SETTLE_PEER: leaf.hostname,
+			HARPER_TEST_HOLD_COPY_SETTLE_PEER: origin.hostname,
 		});
-		await waitForHold(hold, `${relay.harper.hostname} holding the settle of its base copy from ${leaf.hostname}`);
-		const forcedOnRelay = [...(await readLogSince(leaf, leafMark)).matchAll(FORCED_COPY)];
+		await waitForHold(hold, `${relay.harper.hostname} holding the settle of its base copy from ${origin.hostname}`);
+		const forcedOnRelay = [...(await readLogSince(origin, leafMark)).matchAll(FORCED_COPY)];
 		assert.ok(
 			forcedOnRelay.some(([, peer]) => peer === relay.harper.hostname),
-			`${leaf.hostname} forced no base copy for ${relay.harper.hostname}`
+			`${origin.hostname} forced no base copy for ${relay.harper.hostname}`
 		);
-		// logged by the gateway as its log tail while the pass stays open
-		const tail = startRowWriter(leaf, 'open-tail');
+		// logged by the carrier as its log tail while the pass stays open
+		const tail = startRowWriter(origin, 'open-tail');
 		let tailRows;
 		let tailStopped = false;
 		try {
@@ -384,17 +405,17 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 		await waitForPhase(nodes(), 'open-tail', tailRows);
 	});
 
-	test('a follower admitted after its gateway restarts mid-copy, before a new copy settles, ends with every row', async () => {
-		const { relay, follower, leaf } = await stopRelayAndFollowerAcrossPurge('restart-copied');
+	test('a follower admitted after its carrier restarts mid-copy, before a new copy settles, ends with every row', async () => {
+		const { relay, follower, origin } = await stopRelayAndFollowerAcrossPurge('restart-copied');
 		const hold = await holdDirectory('restart-settle-hold');
 		await restart(relay, {
 			HARPER_TEST_HOLD_COPY_SETTLE_DIR: hold,
 			HARPER_TEST_HOLD_COPY_SETTLE_DB: 'data',
-			HARPER_TEST_HOLD_COPY_SETTLE_PEER: leaf.hostname,
+			HARPER_TEST_HOLD_COPY_SETTLE_PEER: origin.hostname,
 		});
-		await waitForHold(hold, `${relay.harper.hostname} holding the settle of its base copy from ${leaf.hostname}`);
-		// logged by the gateway as its copy's tail, above rows the copy applied without log entries
-		const tail = startRowWriter(leaf, 'restart-tail');
+		await waitForHold(hold, `${relay.harper.hostname} holding the settle of its base copy from ${origin.hostname}`);
+		// logged by the carrier as its copy's tail, above rows the copy applied without log entries
+		const tail = startRowWriter(origin, 'restart-tail');
 		let tailRows;
 		let tailStopped = false;
 		try {
@@ -414,7 +435,7 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 			await waitForLink(follower.harper, relay.harper);
 			await delay(8000);
 			const relayMark = await logMark(relay.harper);
-			await cutOffAllBut(relay.harper, leaf);
+			await cutOffAllBut(relay.harper, origin);
 			await waitForCondition(
 				async () =>
 					[...(await readLogSince(relay.harper, relayMark)).matchAll(FORCED_COPY)].some(
@@ -429,8 +450,8 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 			tailStopped = true;
 			await waitForPhase([follower.harper], 'restart-copied', COPIED_ROWS);
 			await waitForPhase([follower.harper], 'restart-tail', tailRows);
-			// the follower reaches no other peer, so these rows came through the restarted gateway
-			const later = await insert(leaf, 'restart-later', leaf.hostname, 20);
+			// the follower reaches no other peer, so these rows came through the restarted carrier
+			const later = await insert(origin, 'restart-later', origin.hostname, 20);
 			await waitForPhase([follower.harper], 'restart-later', later.length);
 		} finally {
 			if (!tailStopped) tailRows = await tail.stop();
@@ -441,30 +462,32 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 		await waitForPhase(nodes(), 'restart-later', 20);
 	});
 
-	test('repeated kills of a preferred gateway under writes from every region lose and duplicate nothing', async () => {
-		const writers = ['east', 'west', 'eu'].flatMap((name) => [layout.named(name, 1), layout.named(name, 2)]);
+	test('repeated kills of a carrier under writes from every region lose and duplicate nothing', async () => {
+		const writers = Object.entries(WRITER_LANES).flatMap(([name, lanes]) =>
+			lanes.map((lane) => layout.named(name, lane))
+		);
 		await waitForCopiesSettled(nodes(), 'base copies the earlier tests forced');
 		const writes = await startWriters(nodes(), writers, 'churn');
 		try {
-			for (const regionName of KILL_ORDER) {
+			for (const [regionName, lane] of KILL_ORDER) {
 				await waitForSuppliers(
 					nodes(),
 					layout.steadySuppliers(),
-					`settled suppliers before killing ${regionName}'s gateway`
+					`settled suppliers before killing ${regionName} ${lane}`
 				);
-				const context = contextOf(layout.named(regionName, 0));
-				const gateway = context.harper;
-				await killNode(gateway);
-				// rows written after the kill reach the region's leaf only through the standby
+				const context = contextOf(layout.named(regionName, lane));
+				const carrier = context.harper;
+				await killNode(carrier);
+				// rows written after the kill reach the rest of the region only through the node that takes the column
 				await delay(5000);
 				await waitForRows(
-					nodes().filter((node) => node !== gateway),
+					nodes().filter((node) => node !== carrier),
 					writes,
 					new Map(writes.acked),
-					`every live node caught up while ${regionName}'s preferred gateway ${gateway.hostname} is down`
+					`every live node caught up while ${regionName}'s carrier ${carrier.hostname} is down`
 				);
 				await restart(context);
-				await waitForRows(nodes(), writes, new Map(writes.acked), `${gateway.hostname} caught up after its restart`);
+				await waitForRows(nodes(), writes, new Map(writes.acked), `${carrier.hostname} caught up after its restart`);
 			}
 		} finally {
 			await writes.stop();
@@ -472,57 +495,57 @@ suite('Region gateway switches under load', { timeout: 2_700_000 }, (ctx) => {
 		await assertExactlyWritten(nodes(), writes);
 	});
 
-	test('a leaf behind purged history moves to the standby through a base copy and loses nothing', async () => {
-		const primary = layout.named('east', 0);
-		const standby = layout.named('east', 1);
-		const leaf = layout.named('east', 2);
+	test('a follower behind purged history moves to the stand-in through a base copy and loses nothing', async () => {
+		const carrier = layout.named('east', 2);
+		const standIn = layout.named('east', 0);
+		const follower = layout.named('east', 1);
 		const writer = layout.named('west', 2);
-		const context = contextOf(primary);
+		const context = contextOf(carrier);
 		await waitForSuppliers(nodes(), layout.steadySuppliers(), 'settled suppliers');
-		// the standby's own rows keep the leaf's position on its link to the standby current
-		const writes = await startWriters(nodes(), [writer, standby], 'held');
+		// the stand-in's own rows keep the follower's position on its link to the stand-in current
+		const writes = await startWriters(nodes(), [writer, standIn], 'held');
 		const slowedAt = Date.now();
 		const slow = setInterval(
 			() =>
 				writeFile(
-					latencyFile(workDir, leaf.hostname),
-					JSON.stringify({ [primary.hostname]: (Date.now() - slowedAt) * RAMP })
+					latencyFile(workDir, follower.hostname),
+					JSON.stringify({ [carrier.hostname]: (Date.now() - slowedAt) * RAMP })
 				).catch(() => {}),
 			1000
 		);
 		let killed = false;
 		try {
 			await delay(LAG_MS);
-			const mark = await logMark(standby);
+			const mark = await logMark(standIn);
 			const bound = Date.now() - PURGE_MARGIN_MS;
-			for (const gateway of [primary, standby]) {
-				await sendOperation(gateway, {
+			for (const relay of [carrier, standIn]) {
+				await sendOperation(relay, {
 					operation: 'delete_transaction_logs_before',
 					database: 'data',
 					timestamp: bound,
 				});
 			}
-			await killNode(primary);
+			await killNode(carrier);
 			killed = true;
 			await delay(5000);
 			await waitForRows(
-				nodes().filter((node) => node !== primary),
+				nodes().filter((node) => node !== carrier),
 				writes,
 				new Map(writes.acked),
-				`every live node holds the held rows after ${leaf.hostname} moved to ${standby.hostname}`
+				`every live node holds the held rows after ${follower.hostname} moved to ${standIn.hostname}`
 			).catch(async (error) => {
-				const status = await sendOperation(leaf, { operation: 'cluster_status' }).catch((cause) => cause.message);
-				error.message += `; ${leaf.hostname} cluster_status: ${JSON.stringify(status)}`;
+				const status = await sendOperation(follower, { operation: 'cluster_status' }).catch((cause) => cause.message);
+				error.message += `; ${follower.hostname} cluster_status: ${JSON.stringify(status)}`;
 				throw error;
 			});
-			const forced = [...(await readLogSince(standby, mark)).matchAll(FORCED_COPY)];
+			const forced = [...(await readLogSince(standIn, mark)).matchAll(FORCED_COPY)];
 			assert.ok(
-				forced.some(([, peer]) => peer === leaf.hostname),
-				`${standby.hostname} forced no base copy for ${leaf.hostname}: ${JSON.stringify(forced.map(([line]) => line))}`
+				forced.some(([, peer]) => peer === follower.hostname),
+				`${standIn.hostname} forced no base copy for ${follower.hostname}: ${JSON.stringify(forced.map(([line]) => line))}`
 			);
 		} finally {
 			clearInterval(slow);
-			await writeFile(latencyFile(workDir, leaf.hostname), '{}');
+			await writeFile(latencyFile(workDir, follower.hostname), '{}');
 			await writes.stop();
 			if (killed) await restart(context);
 		}

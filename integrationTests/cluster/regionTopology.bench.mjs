@@ -1,13 +1,14 @@
 /**
- * What region topology (harper-pro#1291) saves, on 3 regions × 3 nodes: a measurement, not a gate, and the file name
+ * What region topology (harper-pro#1343) saves, on 3 regions × 3 nodes: a measurement, not a gate, and the file name
  * keeps it out of the *.test.* globs.
  *
  *   npm run test:integration -- integrationTests/cluster/regionTopology.bench.mjs
  *
  * The same nine nodes run once as a full mesh (no regions) and once labeled. `regionNetworkInjector.mjs` counts the
  * bytes each node receives from each peer and adds latency: 30 ms between regions, 1 ms within one. For a single
- * writer (a leaf, then a gateway) it reports the cross-region bytes per write and each node's egress, and it times a
- * leaf's write until a leaf in another region can read it. The labeled run is measured once suppliers have settled.
+ * writer it reports the cross-region bytes per write and each node's egress, and it times a write until a node in
+ * another region can read it: one in the writer's column, which receives it directly, and one that takes it through
+ * that node. The labeled run is measured once suppliers have settled.
  * Results go to REGION_TOPOLOGY_BENCH_OUT (default under the OS tmpdir) and the test diagnostics.
  */
 import { suite, test, after } from 'node:test';
@@ -183,11 +184,11 @@ suite('Region topology cost', { timeout: 3_600_000 }, (ctx) => {
 			for (let i = 0; i < 9; i++) hostnames.push(await getNextAvailableLoopbackAddress());
 			hostnames.sort();
 			current = await startCluster(ctx.name, hostnames, labeled, workDir);
-			const [, , eastLeaf, westGateway, , westLeaf] = current.nodes;
+			const [, , writer, westFollower, , westColumnMate] = current.nodes;
 			const scenario = {
-				leafWriter: await measureWriter(workDir, labeled, current, eastLeaf, `${labeled}-leaf`),
-				gatewayWriter: await measureWriter(workDir, labeled, current, westGateway, `${labeled}-gateway`),
-				remoteLeafVisibleMs: await measureLatency(eastLeaf, westLeaf, `${labeled}-latency`),
+				writer: await measureWriter(workDir, labeled, current, writer, `${labeled}-writer`),
+				columnMateVisibleMs: await measureLatency(writer, westColumnMate, `${labeled}-direct`),
+				relayedVisibleMs: await measureLatency(writer, westFollower, `${labeled}-relayed`),
 			};
 			results[labeled ? 'regionTopology' : 'fullMesh'] = scenario;
 			t.diagnostic(JSON.stringify(scenario));

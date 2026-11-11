@@ -1,7 +1,7 @@
 /**
- * Cluster setup and probes shared by the region topology suites (harper-pro#1291): 3 regions × 3 nodes, regions set
- * by `replication.region`. Addresses are sorted and grouped in threes, so each region's two lowest names are its
- * automatic gateways and the third is a leaf.
+ * Cluster setup and probes shared by the region topology suites (harper-pro#1343): 3 regions × 3 nodes, regions set
+ * by `replication.region`. Addresses are sorted and grouped in threes, so a node's lane is its position in its
+ * region, and each lane is a column across the three regions.
  *
  * `regionNetworkInjector.mjs` (a threads preload) reads each node's partition and latency files, so a test can cut
  * or slow chosen links while the rest stay up.
@@ -235,52 +235,55 @@ export async function markAll(nodes) {
 }
 
 /**
- * Region and role of each of nine sorted hostnames, and what the topology should derive from them. `nodes` returns
- * the live node handles, which a restart replaces.
+ * What the grid should derive for `hostnames`, which `regionOf` (a Map) places in regions; without it, nine sorted
+ * hostnames are grouped in threes. A node's lane is its rank by name in its region, and a region with no node in a
+ * lane has its member `lane mod size` carry it. `nodes` returns the live node handles, which a restart replaces.
  */
-export function regionLayout(hostnames, nodes) {
-	const region = new Map(hostnames.map((name, index) => [name, REGIONS[Math.floor(index / 3)]]));
-	const gateways = new Set(hostnames.filter((_, index) => index % 3 !== 2));
-	const isGatewayName = (name) => gateways.has(name);
+export function regionLayout(hostnames, nodes, regionOf) {
+	const sorted = [...hostnames].sort();
+	const region = regionOf ?? new Map(sorted.map((name, index) => [name, REGIONS[Math.floor(index / 3)]]));
+	const inRegion = (regionName) => sorted.filter((name) => region.get(name) === regionName);
+	const lane = new Map(sorted.map((name) => [name, inRegion(region.get(name)).indexOf(name)]));
 	const byName = (name) => nodes().find((node) => node.hostname === name);
+	const carrier = (regionName, origin) => {
+		const members = inRegion(regionName);
+		return members[lane.get(origin)] ?? members[lane.get(origin) % members.length];
+	};
+	const receivesDirect = (name, origin) =>
+		region.get(name) === region.get(origin) || carrier(region.get(name), origin) === name;
 	return {
 		region,
-		gateways,
-		isGatewayName,
+		lane,
 		byName,
-		// east: [primary, standby, leaf], and so on
-		named: (regionName, index) => byName(hostnames.filter((name) => region.get(name) === regionName)[index]),
+		carrier,
+		receivesDirect,
+		// east: [lane 0, lane 1, lane 2], and so on
+		named: (regionName, index) => byName(inRegion(regionName)[index]),
+		/** The peers a node subscribes to itself: its region, and the origins whose column it carries. */
 		expectedLinks: (node) =>
 			new Set(
 				nodes()
-					.filter(
-						(peer) =>
-							peer !== node &&
-							(region.get(peer.hostname) === region.get(node.hostname) ||
-								(isGatewayName(peer.hostname) && isGatewayName(node.hostname)))
-					)
+					.filter((peer) => peer !== node && region.has(peer.hostname) && receivesDirect(node.hostname, peer.hostname))
 					.map((peer) => peer.hostname)
 			),
 		/**
-		 * Settled suppliers with `down` stopped: a leaf, and a gateway that is not its region's first live one, take
-		 * every remote origin they do not link to from that first live gateway; that gateway takes a remote leaf from
-		 * any live gateway of the leaf's region.
+		 * Settled suppliers with `down` stopped: a node takes a remote origin it does not receive itself from its
+		 * region's carrier of that column. With the carrier down, the region's lowest-named live node takes the origin
+		 * by a direct link (its supplier is then the origin itself) and the others take it from that node.
 		 */
 		steadySuppliers:
 			(down = new Set()) =>
 			(node) => {
-				const own = region.get(node.hostname);
-				const gatewaysOf = (regionName) =>
-					[...gateways].filter((name) => region.get(name) === regionName && !down.has(name)).sort();
-				const firstGateway = gatewaysOf(own)[0];
+				const mates = inRegion(region.get(node.hostname));
 				const want = new Map();
-				for (const origin of nodes()) {
-					const originRegion = region.get(origin.hostname);
-					if (!originRegion || originRegion === own || down.has(origin.hostname)) continue;
-					const originIsLeaf = !isGatewayName(origin.hostname);
-					if (!isGatewayName(node.hostname)) want.set(origin.hostname, [firstGateway]);
-					else if (originIsLeaf)
-						want.set(origin.hostname, node.hostname === firstGateway ? gatewaysOf(originRegion) : [firstGateway]);
+				for (const origin of sorted) {
+					if (down.has(origin) || receivesDirect(node.hostname, origin)) continue;
+					const carries = carrier(region.get(node.hostname), origin);
+					if (!down.has(carries)) want.set(origin, [carries]);
+					else {
+						const standIn = mates.find((name) => name !== carries && !down.has(name));
+						want.set(origin, [standIn === node.hostname ? origin : standIn]);
+					}
 				}
 				return want;
 			},
