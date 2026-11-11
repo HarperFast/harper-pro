@@ -1,0 +1,5 @@
+type Tombstoned @table(audit: true) @export {
+	id: ID @primaryKey
+	name: String
+	count: Int
+}
