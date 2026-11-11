@@ -216,6 +216,33 @@ Setup exchanges include a digest of the list. Nodes with different lists refuse 
 
 To see which nodes own which shard once a map is installed, read `cluster_status.sharding.<database>.shards` and `nodesOwningNoSlots`; see [Sharding Status](./clustering.md#sharding-status).
 
+### Replica nodes in a spare shard
+
+<VersionBadge version="v5.4.0" />
+
+A cluster can hold its data in one shard and add read capacity without copying full records. Install a custom map that puts every slot on one shard, and list spare shard IDs up front:
+
+```yaml
+replication:
+  shard: 0
+  shards: [0, 1, 2, 3, 4, 5, 6, 7] # 0 owns every slot; 1-7 are spare
+```
+
+```json
+{
+	"operation": "initialize_shard_map",
+	"database": "data",
+	"slots": 10,
+	"ranges": [{ "start": 0, "end": 10, "shard": 0 }]
+}
+```
+
+Install the map yourself: the default map spreads slots across every listed ID, spares included. List the spare IDs before you need them, because a change to `replication.shards` holds sharded writes until every node agrees. Listing an ID moves no records.
+
+Clone a replica node with `--shard replica` (or `CLONE_SHARD=replica`) from any member. It joins a spare shard, owns no slots, copies only the projections that indexed tables need, and reads full records from the owners, keeping local replicas that invalidations keep current. Joining a spare shard ID, not no shard, matters because a shard is node identity: slots can later be moved into that ID, which makes its members owners without a new node. Clones with `--shard auto` skip spares and join the shard that owns slots. A replica node appears in [`cluster_status.sharding.<database>.nodesOwningNoSlots`](./clustering.md#sharding-status).
+
+Writes on a replica node commit locally and reach the owners asynchronously, unless the request asks for [confirmation](#replication-control-via-rest-header), which counts only owners. Every write still reaches every owner, so this adds read capacity, not write capacity.
+
 ### Other shard configuration
 
 Shards can also be assigned per route:

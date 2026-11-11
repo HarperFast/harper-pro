@@ -6,7 +6,9 @@ import {
 	leaderShardMembers,
 	parseShardOption,
 	pickAutoShard,
+	pickReplicaShard,
 	requireLeaderMaps,
+	slotOwningShards,
 } from '#src/cloneNode/cloneShard';
 
 const refuses = (input, message) =>
@@ -24,7 +26,8 @@ const SHARDED = { leaderShard: 0, leaderShards: [0, 1] };
 
 describe('cloneShard', () => {
 	describe('parseShardOption', () => {
-		it('reads a number, including 0, and "auto"; unset and empty mean no option', () => {
+		it('reads a number, including 0, "auto" and "replica"; unset and empty mean no option', () => {
+			assert.strictEqual(parseShardOption('replica'), 'replica');
 			assert.strictEqual(parseShardOption('1'), 1);
 			assert.strictEqual(parseShardOption('0'), 0);
 			assert.strictEqual(parseShardOption(2), 2);
@@ -72,6 +75,70 @@ describe('cloneShard', () => {
 
 		it('answers nothing when every shard has only offline members', () => {
 			assert.strictEqual(pickAutoShard([0, 1], [offline(0), offline(1)]), undefined);
+		});
+
+		it('skips a spare shard owning no slots, however few members it has', () => {
+			const owning = new Set([0]);
+			assert.strictEqual(pickAutoShard([0, 1, 2, 3], [live(0), live(0), live(0)], owning), 0);
+			assert.strictEqual(pickAutoShard([0, 1, 2], [live(0), live(2), live(2)], new Set([0, 2])), 0);
+			assert.strictEqual(pickAutoShard([0, 1, 2], [live(0), live(0), live(2)], new Set([0, 2])), 2);
+		});
+
+		it('answers nothing when every owning shard has only offline members, spares or not', () => {
+			assert.strictEqual(pickAutoShard([0, 1], [offline(0), live(1)], new Set([0])), undefined);
+		});
+	});
+
+	describe('pickReplicaShard', () => {
+		const live = (shard) => ({ shard, live: true });
+		const offline = (shard) => ({ shard, live: false });
+		const owning = new Set([0]);
+
+		it('takes the spare with the most live members, so replica nodes group', () => {
+			assert.strictEqual(pickReplicaShard([0, 1, 2, 3], [live(0), live(2), live(2), live(3)], owning), 2);
+		});
+
+		it('takes the lowest spare on a tie, whatever the list order', () => {
+			assert.strictEqual(pickReplicaShard([3, 0, 2, 1], [live(0)], owning), 1);
+			assert.strictEqual(pickReplicaShard([0, 1, 2], [live(1), live(2)], owning), 1);
+		});
+
+		it('counts only live members, and keeps a spare whose members are all offline', () => {
+			assert.strictEqual(pickReplicaShard([0, 1, 2], [live(1), offline(2), offline(2)], owning), 1);
+			assert.strictEqual(pickReplicaShard([0, 1], [offline(1)], owning), 1);
+		});
+
+		it('never picks a shard owning slots', () => {
+			assert.strictEqual(pickReplicaShard([0, 1], [live(1)], new Set([0, 1])), undefined);
+		});
+	});
+
+	describe('slotOwningShards', () => {
+		const map = (database, ranges) => ({ database, slots: 10, ranges });
+
+		it('collects the shards owning slots across every map', () => {
+			assert.deepStrictEqual(
+				[
+					...slotOwningShards([
+						map('a', [{ start: 0, end: 10, shard: 0 }]),
+						map('b', [
+							{ start: 0, end: 4, shard: 0 },
+							{ start: 4, end: 10, shard: 2 },
+						]),
+					]),
+				].sort(),
+				[0, 2]
+			);
+		});
+
+		it('has nothing to read with no maps', () => {
+			assert.strictEqual(slotOwningShards([]), undefined);
+			assert.strictEqual(slotOwningShards(undefined), undefined);
+		});
+
+		it('refuses a malformed map rather than reading it as owning nothing', () => {
+			assert.throws(() => slotOwningShards([{ database: 'a' }]), /'a' has no slot ranges/);
+			assert.throws(() => slotOwningShards([map('a', [{ start: 0, end: 10 }])]), /'a' has a range with no shard/);
 		});
 	});
 
@@ -189,6 +256,95 @@ describe('cloneShard', () => {
 				},
 				/"auto" found no listed shard with a live member/
 			);
+		});
+
+		describe('with spare shard IDs listed', () => {
+			const BACKBONE = {
+				leaderShard: 0,
+				leaderShards: [0, 1, 2, 3],
+				leaderMaps: [{ database: 'data', slots: 10, ranges: [{ start: 0, end: 10, shard: 0 }] }],
+			};
+			const status = (...shards) => ({
+				connections: shards.map((shard, i) => ({
+					name: `peer-${i}`,
+					shard,
+					database_sockets: [{ connected: true }],
+				})),
+			});
+
+			it('"auto" joins the shard owning slots, not an empty spare', () => {
+				const result = chooseCloneShard({
+					...BACKBONE,
+					requested: 'auto',
+					thisNode: 'new-node',
+					leaderStatus: status(0, 0),
+				});
+				assert.strictEqual(result.shard, 0);
+				assert.strictEqual(
+					result.description,
+					'shard 0 from "auto"; live members: 0=3, 1=0, 2=0, 3=0; shards owning slots: [0]'
+				);
+			});
+
+			it('"replica" joins the lowest spare when no spare has members', () => {
+				assert.strictEqual(chosen({ ...BACKBONE, requested: 'replica', leaderStatus: status(0, 0) }), 1);
+			});
+
+			it('"replica" joins the spare other replica nodes already hold', () => {
+				assert.strictEqual(chosen({ ...BACKBONE, requested: 'replica', leaderStatus: status(0, 3, 3, 2) }), 3);
+			});
+
+			it('keeps this node\'s configured shard on "replica", as on "auto"', () => {
+				assert.strictEqual(chosen({ ...BACKBONE, requested: 'replica', configured: 2, leaderStatus: status() }), 2);
+			});
+
+			it('refuses "replica" when every listed shard owns slots, naming the owners', () => {
+				refuses(
+					{
+						...BACKBONE,
+						leaderShards: [0, 1],
+						leaderMaps: [
+							{
+								database: 'data',
+								slots: 10,
+								ranges: [
+									{ start: 0, end: 5, shard: 0 },
+									{ start: 5, end: 10, shard: 1 },
+								],
+							},
+						],
+						requested: 'replica',
+						leaderStatus: status(),
+					},
+					/"replica" found no listed shard owning no slots.*\[0, 1\].*shards owning slots: \[0, 1\]; list a spare/
+				);
+			});
+
+			it('refuses "replica" with no map: the default map gives every listed shard slots', () => {
+				refuses({ ...BACKBONE, leaderMaps: [], requested: 'replica', leaderStatus: status() }, /no shard map/);
+			});
+
+			it('refuses "replica" with no list, as "auto" does', () => {
+				refuses({ leaderShard: 0, requested: 'replica' }, /"replica" only fills shards listed/);
+				refuses({ requested: 'replica' }, /"replica" only fills shards listed/);
+			});
+
+			it('"auto" refuses when every owning shard is offline, rather than picking a spare', () => {
+				refuses(
+					{
+						...BACKBONE,
+						leaderShard: undefined,
+						requested: 'auto',
+						leaderStatus: {
+							connections: [
+								{ name: 'b', shard: 0, database_sockets: [] },
+								{ name: 'c', shard: 2, database_sockets: [{ connected: true }] },
+							],
+						},
+					},
+					/"auto" found no listed shard with a live member.*shards owning slots: \[0\]/
+				);
+			});
 		});
 
 		it('refuses a malformed shard from the leader or the configuration', () => {
