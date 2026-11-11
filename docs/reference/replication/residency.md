@@ -164,6 +164,14 @@ Owner recovery requires the [sources described above](#recovery-sources). Arbitr
 
 `setResidency`, `setResidencyById`, `getResidency`, and residency lists retain their names and remain the older per-record mechanism. Use the conversion procedure below when adopting schema-defined sharding for an existing by-id table.
 
+### Known limitation of legacy residency
+
+This applies to tables that set residency with `setResidency` or `setResidencyById` (deprecated as of v5.4), not to `@sharded` tables.
+
+With legacy residency, a node outside a record's residency stores a stub (the primary key and indexed fields only), and peers send it `invalidate` entries. If that node later becomes a resident, or a base copy (initial or resumed) sends a resident the stub before the replayed full `put` at the same identity, the resident can keep the stub: the equal-identity `put` is treated as already applied. Reads of non-indexed fields on that record then fail until a newer write to it. This is most visible with `sourcedFrom` read-through fills on LMDB residents.
+
+A newer write to an affected record repairs it. To remove the cause, [migrate to `@sharded`](#convert-an-existing-by-id-table-without-moving-records), which refuses an `invalidate` into an owned slot.
+
 ## Convert an existing by-id table without moving records
 
 Check eligibility before installing a map: the legacy function must agree with the primary-key hash and proposed ranges for every record. Last-digit or modulo recipes are not generally equivalent to this hash. Compare the functions offline first; custom `slotFrom` policies remain unsupported pending [#1178](https://github.com/HarperFast/harper-pro/issues/1178). An installed map cannot be deleted.
