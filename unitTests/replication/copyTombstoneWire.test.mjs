@@ -48,12 +48,13 @@ async function until(predicate) {
 	}
 }
 
-// harper-pro#1331: a base copy must carry a delete, or a later older write recreates the row on the receiver
 describe('delete tombstones in a base copy', function () {
 	this.timeout(30_000);
 	let Records, socket;
 
-	before(async () => {
+	before(async function () {
+		// FULL_WRITE_HEAD and copy-apply are RocksDB-only
+		if (process.env.HARPER_STORAGE_ENGINE === 'lmdb') return this.skip();
 		setHdbBasePath(process.env.STORAGE_PATH);
 		Records = table({
 			database: DATABASE,
