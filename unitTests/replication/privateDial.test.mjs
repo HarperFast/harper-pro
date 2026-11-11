@@ -255,15 +255,38 @@ describe('NodeReplicationConnection private dial', () => {
 			const privateUrl = 'wss://10.4.0.2:9933';
 			const pathKey = privatePathKey(privateUrl, 'peer');
 			const dial = { url: privateUrl, path: PATH_PRIVATE, privateUrl, pathKey };
-			connection.notePrivateSocketEnded({ dial, peerIdentified: true }, 'closed');
+			connection.noteUnidentifiedSocketEnded({ dial, peerIdentified: true }, 'closed');
 			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
-			connection.notePrivateSocketEnded({ dial: { url: 'wss://peer:9933', path: PATH_PUBLIC } }, 'closed');
+			connection.noteUnidentifiedSocketEnded({ dial: { url: 'wss://peer:9933', path: PATH_PUBLIC } }, 'closed');
 			assert.strictEqual(privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path, PATH_PRIVATE);
-			connection.notePrivateSocketEnded({ dial }, '1008 after open');
+			connection.noteUnidentifiedSocketEnded({ dial }, '1008 after open');
 			assert.strictEqual(
 				privatePaths.choose('wss://peer:9933', privateUrl, pathKey, connection).path,
 				PATH_PUBLIC_FALLBACK
 			);
+		});
+
+		it('a public fallback socket that ends before its peer identifies resets the outage probe backoff', () => {
+			const connection = new NodeReplicationConnection('wss://peer:9933', null, 'data', 'peer');
+			connections.push(connection);
+			const privateUrl = 'wss://10.4.0.2:9933';
+			const pathKey = privatePathKey(privateUrl, 'peer');
+			const dial = { url: 'wss://peer:9933', path: PATH_PUBLIC_FALLBACK, privateUrl, pathKey };
+			const reset = [];
+			const original = privatePaths.publicDialFailed;
+			privatePaths.publicDialFailed = (key) => reset.push(key);
+			try {
+				connection.noteUnidentifiedSocketEnded({ dial, peerIdentified: true }, 'closed');
+				connection.noteUnidentifiedSocketEnded({ dial, privateFailureNoted: true }, 'redialed for a path change');
+				connection.noteUnidentifiedSocketEnded({ dial: { url: 'wss://peer:9933', path: PATH_PUBLIC } }, 'closed');
+				assert.deepStrictEqual(reset, [], 'an identified, planned or private-free socket says nothing about the peer');
+				const socket = { dial };
+				connection.noteUnidentifiedSocketEnded(socket, 'ECONNREFUSED');
+				connection.noteUnidentifiedSocketEnded(socket, 'closed after the error');
+				assert.deepStrictEqual(reset, [pathKey], 'once per socket');
+			} finally {
+				privatePaths.publicDialFailed = original;
+			}
 		});
 
 		it('a read waiting on a failed private dial is served by the public redial', async () => {
@@ -306,7 +329,7 @@ describe('NodeReplicationConnection private dial', () => {
 			const dial = { url: privateUrl, path: PATH_PRIVATE, privateUrl, pathKey: privatePathKey(privateUrl, 'peer') };
 			const privateAttempt = Promise.resolve();
 			connection.session = Promise.resolve();
-			connection.notePrivateSocketEnded({ dial, attemptSession: privateAttempt }, 'closed');
+			connection.noteUnidentifiedSocketEnded({ dial, attemptSession: privateAttempt }, 'closed');
 			assert.ok(connection.sessionsAbandonedForPath.has(privateAttempt));
 		});
 

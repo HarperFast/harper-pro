@@ -73,7 +73,7 @@ Each node publishes its `privateUrls` on its own `hdb_nodes` record, so peers le
 
 - **Only `wss://`.** A private URL must use TLS. Peers identify a TLS connection by its certificate, which does not depend on the address dialed.
 - **Certificates do not change.** A node dialing a private address presents the same TLS server name (SNI) and checks the peer's certificate against the same name as when it dials `url`. Do not add private IP addresses to certificates.
-- **Fallback.** If a private address does not connect, or the peer there does not identify as the expected node within 30 seconds, the node replicates over `url` instead. It checks the private address again on a backoff of up to five minutes. When it answers, one connection moves back first; once that peer identifies itself, the others follow, each reconnecting once. The public port must stay reachable.
+- **Fallback.** If a private address does not connect, or the peer there does not identify as the expected node within 30 seconds, the node replicates over `url` instead. It checks the private address again on a backoff of up to five minutes, which starts over while the peer itself is down. When it answers, one connection moves back first; once that peer identifies itself, the others follow, each reconnecting once. The public port must stay reachable.
 - **Changes.** A node publishes a change to its own `privateUrls` when it restarts. Its peers then reconnect to it at the new address.
 - **Status.** [`cluster_status`](./clustering.md#cluster-status) reports which address each connection uses in its `path` field.
 

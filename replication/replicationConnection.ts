@@ -5146,7 +5146,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 			// an open socket that answers pings but never identifies would otherwise hold this link off public
 			const identifyDeadline = setTimeout(() => {
 				if (socket.peerIdentified) return;
-				this.notePrivateSocketEnded(
+				this.noteUnidentifiedSocketEnded(
 					socket,
 					`the peer did not identify itself within ${this.privateIdentifyTimeoutMs} ms`
 				);
@@ -5162,7 +5162,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 			// finally propagated its close. Acting on it would wrongly tear down the live connection (mark it
 			// disconnected, drop its subscription listener, reset its session). See harper-pro#420.
 			if (this.socket !== socket) return;
-			this.notePrivateSocketEnded(socket, socketError ?? (reasonBuffer?.toString() || `code ${code}`));
+			this.noteUnidentifiedSocketEnded(socket, socketError ?? (reasonBuffer?.toString() || `code ${code}`));
 			// This socket's own close listener (retireInstance) has already torn the instance down.
 			if (this.liveSession === session) this.liveSession = undefined;
 			// Only treat the close as terminal when something explicitly marked it as a deliberate
@@ -5379,7 +5379,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 		// below is best-effort and the 'close' it should trigger may never deliver, which is exactly why
 		// this cannot be left to the close listener. retireInstance is idempotent.
 		this.retireSession('superseded by forceReconnect');
-		if (socket) this.notePrivateSocketEnded(socket, 'no response from the peer');
+		if (socket) this.noteUnidentifiedSocketEnded(socket, 'no response from the peer');
 		// Sets reconnectScheduled and arms one backoff retry (matching the close-handler backoff so a
 		// repeatedly-wedging peer backs off the same way, #339). connect() clears reconnectScheduled once
 		// the new socket is installed, which keeps a late close from the old socket from double-scheduling.
@@ -5446,13 +5446,15 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 			logger.info?.(`Replicating with ${this.configuredNodeName} over its private address ${dial.url} again`);
 	}
 
-	notePrivateSocketEnded(socket: ReplicationWebSocket, reason: string) {
+	noteUnidentifiedSocketEnded(socket: ReplicationWebSocket, reason: string) {
 		const { dial } = socket;
-		if (dial?.path !== PATH_PRIVATE || socket.peerIdentified || socket.privateFailureNoted) return;
+		if (!dial?.pathKey || socket.peerIdentified || socket.privateFailureNoted) return;
 		if (this.intentionallyUnsubscribed) return;
 		// forceReconnect and the socket's later close both end it
 		socket.privateFailureNoted = true;
-		this.privateDialFailed(dial, reason, socket.attemptSession);
+		if (dial.path === PATH_PRIVATE) this.privateDialFailed(dial, reason, socket.attemptSession);
+		// the public dial failed too, so the peer itself is down
+		else if (dial.path === PATH_PUBLIC_FALLBACK) privatePaths.publicDialFailed(dial.pathKey);
 	}
 
 	privateDialFailed(dial: Dial, reason: string, attemptSession: Promise<any>) {

@@ -168,6 +168,17 @@ export class PrivatePaths {
 		return started;
 	}
 
+	// The peer is down altogether, not only unreachable at its private address: the probe backoff its failures
+	// grew says nothing about that address, so probe again soon once the peer is back.
+	publicDialFailed(pathKey: string): void {
+		const outage = this.#outages.get(pathKey);
+		if (!outage || outage.canary) return;
+		outage.backoff.reset();
+		if (!outage.timer) return;
+		this.#clearTimer(outage.timer);
+		this.#scheduleProbe(pathKey, outage);
+	}
+
 	identified(pathKey: string): boolean {
 		const outage = this.#outages.get(pathKey);
 		if (!outage) return false;
@@ -205,7 +216,10 @@ export class PrivatePaths {
 	#scheduleProbe(pathKey: string, outage: Outage) {
 		outage.timer = this.#setTimer(() => {
 			outage.timer = undefined;
-			this.#probe(pathKey, outage);
+			// nothing awaits this: a throw after the probe must leave the outage recoverable, not unhandled
+			this.#probe(pathKey, outage).catch(() => {
+				if (this.#outages.get(pathKey) === outage) this.#scheduleProbe(pathKey, outage);
+			});
 		}, outage.backoff.nextDelay());
 		outage.timer.unref?.();
 	}

@@ -386,6 +386,31 @@ describe('privatePaths', () => {
 			);
 		});
 
+		it('a promotion that throws after the probe leaves the outage probed again', async () => {
+			const { paths, pending, fire } = harness();
+			const a = waiter('a');
+			a.promoteToPrivatePath = () => {
+				throw new Error('boom');
+			};
+			paths.failed(KEY, PRIVATE, a);
+			await fire(pending()[0]);
+			assert.strictEqual(pending().length, 1, 'the next probe is scheduled; nothing awaits the timer-started one');
+		});
+
+		it('a public dial that fails too resets the probe backoff, since the peer itself is down', async () => {
+			const { paths, pending, fire } = harness();
+			const a = waiter('a', { reachable: false });
+			paths.failed(KEY, PRIVATE, a);
+			const first = pending()[0].delay;
+			await fire(pending()[0]);
+			await fire(pending()[0]);
+			assert.ok(pending()[0].delay > first, 'failed probes grow the backoff');
+			paths.publicDialFailed(KEY);
+			assert.strictEqual(pending().length, 1, 'one probe pending: the grown one is replaced');
+			assert.strictEqual(pending()[0].delay, first, 'the next probe waits the initial delay again');
+			paths.publicDialFailed('no-such-path');
+		});
+
 		it('a probe that throws counts as unreachable', async () => {
 			const { paths, pending, fire } = harness();
 			const a = waiter('a');

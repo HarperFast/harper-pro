@@ -393,25 +393,31 @@ export function monitorNodeCAs(listener: () => void) {
 		}
 	}, 'ca-monitor');
 }
+// Newest advertisement seen per peer: a queued redial must not act on one a later update replaced.
+const advertisedPrivateUrls = new Map<string, string | undefined>();
 /**
  * A peer's advertised private URLs changed (it restarted with new config, or its row just replicated here):
  * redial each connection to it whose address choice is now different, rather than waiting for a reconnect
  * that a healthy link may never make. Staggered, as opening many TLS connections at once spikes memory.
  */
-function redialOnPrivateUrlChange(node: any, name: string) {
+export function redialOnPrivateUrlChange(node: any, name: string, candidates = peerConnections(name)) {
 	if (!node) return;
 	const privateUrl = privateUrlOn(node, localNetworks());
+	advertisedPrivateUrls.set(name, privateUrl);
 	let delay = 0;
-	const redial = (connection: NodeReplicationConnection) => {
-		if (connection.configuredNodeName !== name || !connection.dial || connection.dial.privateUrl === privateUrl) return;
+	for (const connection of candidates) {
+		if (!connection.dial || connection.dial.privateUrl === privateUrl) continue;
 		setTimeout(() => {
-			// it may have reconnected to that address on its own meanwhile
-			if (connection.dial?.privateUrl !== privateUrl) connection.redialForPathChange();
+			// it may have reconnected to that address on its own meanwhile, or the advertisement may have moved again
+			if (connection.dial?.privateUrl !== advertisedPrivateUrls.get(name)) connection.redialForPathChange();
 		}, delay).unref();
 		delay += PROMOTION_STAGGER_MS;
-	};
-	for (const dbConnections of connections.values()) for (const connection of dbConnections.values()) redial(connection);
-	for (const connection of nodeNameToRetrievalConnections.get(name)?.values() ?? []) redial(connection);
+	}
+}
+function* peerConnections(name: string) {
+	for (const dbConnections of connections.values())
+		for (const connection of dbConnections.values()) if (connection.configuredNodeName === name) yield connection;
+	for (const connection of nodeNameToRetrievalConnections.get(name)?.values() ?? []) yield connection;
 }
 export function disableReplication(disabled = true) {
 	replicationDisabled = disabled;
