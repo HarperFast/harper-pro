@@ -134,6 +134,11 @@ function lastLogKey(Table) {
 	const last = Array.from(Table.auditStore.getRange({ start: 1 })).at(-1);
 	return last.txnLogKey ?? last.version;
 }
+/** A write keyed above `copyStartTime`, so the post-copy replay sends it. */
+async function writeAfter(Table, id, copyStartTime) {
+	while (Date.now() <= copyStartTime + 1) await new Promise((resolve) => setTimeout(resolve, 2));
+	await Table.put(id, { id, region: 'r', body: 'last' });
+}
 function loggedFor(Table, id) {
 	return Array.from(Table.auditStore.getRange({ start: 1 })).filter(
 		(entry) => entry.tableId === Table.tableId && entry.recordId === id
@@ -246,8 +251,8 @@ describe('A base copy never leaves a designated resident with only the stub of a
 			assert.ok(logKey > below);
 			return { Records, database, below, version: stub.version, logKey };
 		}
-		async function replayReaches(socket, Records) {
-			await Records.put('sentinel', { id: 'sentinel', region: 'r', body: 'last' });
+		async function replayReaches(socket, Records, copyStartTime) {
+			await writeAfter(Records, 'sentinel', copyStartTime);
 			await until(
 				() => sentFor(socket, Records, 'sentinel', 'replay').length > 0,
 				'the post-copy replay did not reach a later write'
@@ -285,7 +290,7 @@ describe('A base copy never leaves a designated resident with only the stub of a
 				assert.deepEqual(sentFor(socket, Records, 'filled', 'copy'), [
 					{ type: 'invalidate', version, key: isRocksDB ? logKey : version, body: undefined },
 				]);
-				await replayReaches(socket, Records);
+				await replayReaches(socket, Records, copyStartTime);
 				assert.deepEqual(sentFor(socket, Records, 'filled', 'replay'), []);
 				socket.close();
 			}
@@ -319,7 +324,7 @@ describe('A base copy never leaves a designated resident with only the stub of a
 			]) {
 				const sender = await copyFrom(database, resumeAt(copyStartTime));
 				assert.deepEqual(sender.closes, []);
-				await replayReaches(sender, Records);
+				await replayReaches(sender, Records, copyStartTime);
 				const receiverDatabase = `${database}_resident_${label}`;
 				const Resident = await replicatedTable(receiverDatabase);
 				const receiver = new Socket();
@@ -377,7 +382,7 @@ describe('A base copy never leaves a designated resident with only the stub of a
 			const below = lastLogKey(Records);
 			const residencyId = Records.primaryStore.getEntry('before').residencyId;
 			const origin = getIdOfRemoteNode(WRITER, Records.auditStore);
-			const version = Date.now() + 50;
+			const version = Math.max(Date.now(), Math.floor(below) + 1);
 			const context = { source: {}, sourceApply: true, timestamp: version };
 			await transaction(context, async () => {
 				const row = await Records.getResource('stub', context);
@@ -396,7 +401,7 @@ describe('A base copy never leaves a designated resident with only the stub of a
 					[{ type: 'invalidate', version, body: undefined }]
 				);
 				const sentinel = `sentinel-${copyStartTime}`;
-				await Records.put(sentinel, { id: sentinel, region: 'r' });
+				await writeAfter(Records, sentinel, copyStartTime);
 				await until(() => sentFor(socket, Records, sentinel, 'replay').length > 0);
 				for (const replayed of sentFor(socket, Records, 'stub', 'replay')) {
 					assert.equal(replayed.type, 'invalidate');
