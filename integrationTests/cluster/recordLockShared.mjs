@@ -29,8 +29,9 @@ function poolEnv(threadsCount) {
 	};
 }
 
-function optionsFor(hostname, env = {}, threadsCount = 1, preload) {
-	return {
+/** `recordLocks: null` omits the key, as a fresh install does. */
+function optionsFor(hostname, env = {}, threadsCount = 1, preload, recordLocks = true) {
+	const options = {
 		config: {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
@@ -38,7 +39,7 @@ function optionsFor(hostname, env = {}, threadsCount = 1, preload) {
 			replication: {
 				securePort: hostname + ':9933',
 				databases: [DB, 'system'],
-				recordLocks: true,
+				recordLocks,
 				pingInterval: 1000,
 				pingTimeout: 3000,
 			},
@@ -50,37 +51,26 @@ function optionsFor(hostname, env = {}, threadsCount = 1, preload) {
 			...env,
 		},
 	};
+	if (recordLocks === null) delete options.config.replication.recordLocks;
+	return options;
 }
 
 /** A node with the fixture pre-installed, bound to a pre-allocated address (see cacheReplicationSource).
  * `threadsCount > 1` runs several http workers, so a cluster lock() served on a non-owner worker relays
  * its admission to the coordinating worker (harper-pro#852). */
-export async function startNode(suiteName, env, threadsCount = 1, preload) {
+export async function startNode(suiteName, env, threadsCount = 1, preload, recordLocks = true) {
 	const hostname = await getNextAvailableLoopbackAddress();
 	const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
 	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
-	const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
-	await startHarper(ctx, optionsFor(hostname, env, threadsCount, preload));
-	return ctx;
-}
-
-/** `startNode` with `replication.recordLocks` set to `recordLocks`, or absent when it is undefined. */
-export async function startNodeWithRecordLocks(suiteName, recordLocks, env) {
-	const hostname = await getNextAvailableLoopbackAddress();
-	const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
-	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
-	const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
-	const options = optionsFor(hostname, env);
-	if (recordLocks === undefined) delete options.config.replication.recordLocks;
-	else options.config.replication.recordLocks = recordLocks;
-	await startHarper(ctx, options);
+	const ctx = { name: suiteName, harper: { hostname, dataRootDir }, recordLocks };
+	await startHarper(ctx, optionsFor(hostname, env, threadsCount, preload, recordLocks));
 	return ctx;
 }
 
 export async function restartStoppedNode(ctx, env, threadsCount = 1) {
 	const { hostname, dataRootDir } = ctx.harper;
 	const restarted = { name: ctx.name, harper: { hostname, dataRootDir } };
-	await startHarper(restarted, optionsFor(hostname, env, threadsCount));
+	await startHarper(restarted, optionsFor(hostname, env, threadsCount, undefined, ctx.recordLocks));
 	ctx.harper = restarted.harper;
 	return ctx;
 }

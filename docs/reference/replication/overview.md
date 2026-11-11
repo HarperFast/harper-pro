@@ -426,9 +426,9 @@ Check each management operation's replication default before using it in a singl
 
 ## Cluster Record Locks
 
-On a replicated database, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. Conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default.
+On a replicated table, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. Conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default. A table declared with `replicate: false` takes a node-local lock instead.
 
-Cluster record locks are off unless you turn them on. While they are off, a cluster `lock()` and a conditional write on a replicated database answer `503` with a message naming the fix. `{ scope: 'node' }` still takes a node-local lock, and `rest.preconditionLocks: false` makes conditional writes skip the lock.
+Cluster record locks are off unless you turn them on. While they are off, a cluster `lock()` and a conditional write on a replicated table answer `503` with a message naming the fix. `{ scope: 'node' }` still takes a node-local lock, and `rest.preconditionLocks: false` makes conditional writes skip the lock.
 
 **On Harper Fabric**, Fabric turns cluster record locks on for a cluster and publishes its home map; you do not configure them.
 
@@ -456,7 +456,7 @@ Until the map is applied, a cluster `lock()` waits up to 10 seconds within its t
 The home map changes only when an operator applies a new one, so apply one after membership changes:
 
 - **A node added later** answers every cluster `lock()` and conditional write with `503` until a map that includes it is applied. The other nodes keep locking.
-- **A removed node** stays in the map, and `remove_node` makes the other nodes stop trusting it, so every cluster `lock()` and conditional write on the database answers `503` until a map without it is applied. Before removing it, apply a map without it, with `quiesce` listing the old map's nodes and the new ones, so the departing node stops granting too. If the node is already stopped, also name it in `fenced`.
+- **A removed node** stays in the map, and `remove_node` makes the other nodes stop trusting it, so every cluster `lock()` and conditional write on the database answers `503` until a map without it is applied. Apply a map without it before running `remove_node`, while the node is still reachable, with `quiesce` listing the old map's nodes and the new ones, so the departing node stops granting too. A node that is already unreachable can be left out only by naming it in `fenced`, which attests that it is stopped and needs a majority of the old map's nodes to answer; if the call is refused, its `reason` names the per-node steps that recover.
 
 Cluster record locks need the RocksDB storage engine. On LMDB `lock()` is not available, and conditional writes do not take a lock.
 

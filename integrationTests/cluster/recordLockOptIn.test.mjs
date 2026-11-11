@@ -1,8 +1,3 @@
-/**
- * Cluster record locks are opt-in (harper-pro#853): with `replication.recordLocks` unset, as on a fresh
- * install, or `false`, a cluster `lock()` and a lock-backed conditional REST write on a replicated database
- * answer a 503 that names the fix, change nothing, and write no home map. An LMDB node answers core's 501.
- */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -11,9 +6,9 @@ import {
 	clusterStatusOf,
 	connectMesh,
 	counter,
-	currentRow,
+	operation,
 	putCounter,
-	startNodeWithRecordLocks,
+	startNode,
 	stopNode,
 	waitForCounter,
 } from './recordLockShared.mjs';
@@ -21,7 +16,7 @@ import {
 const FIX = /replication\.recordLocks: true.*record_lock_apply_homes/;
 
 for (const [label, recordLocks] of [
-	['unset', undefined],
+	['unset', null],
 	['false', false],
 ]) {
 	suite(`cluster record locks with replication.recordLocks ${label}`, { timeout: 300_000 }, (ctx) => {
@@ -30,7 +25,7 @@ for (const [label, recordLocks] of [
 
 		before(async () => {
 			const started = await Promise.allSettled(
-				Array.from({ length: 2 }, () => startNodeWithRecordLocks(ctx.name, recordLocks))
+				Array.from({ length: 2 }, () => startNode(ctx.name, {}, 1, undefined, recordLocks))
 			);
 			for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
 			const failed = started.find((result) => result.status === 'rejected');
@@ -43,12 +38,16 @@ for (const [label, recordLocks] of [
 			for (const c of contexts) await stopNode(c);
 		});
 
-		test('a cluster lock() answers 503 naming the fix, and no home map is written', async () => {
+		test('a cluster lock() answers 503 naming the fix, and no home-map table is created', async () => {
 			for (const node of nodes) {
 				const result = await call(node, 'LockOnce/', { id: 'off-' + label, timeout: 2_000 });
 				assert.equal(result.status, 503, node.hostname);
 				assert.match(JSON.stringify(result.body), FIX);
-				assert.equal((await currentRow(node))?.active, undefined, node.hostname);
+				// Read the catalog: record_lock_propose_homes would itself create the table being checked for.
+				const system = await operation(node, { operation: 'describe_database', database: 'system' });
+				assert.equal(system.status, 200, JSON.stringify(system.body));
+				assert.ok(system.body.hdb_nodes, 'describe_database lists system tables by name');
+				assert.equal(system.body.hdb_record_lock_homes, undefined, node.hostname);
 			}
 		});
 
@@ -83,7 +82,7 @@ suite('cluster record locks on LMDB with the key unset', { timeout: 300_000 }, (
 	let context;
 
 	before(async () => {
-		context = await startNodeWithRecordLocks(ctx.name, undefined, { HARPER_STORAGE_ENGINE: 'lmdb' });
+		context = await startNode(ctx.name, { HARPER_STORAGE_ENGINE: 'lmdb' }, 1, undefined, null);
 	});
 
 	after(async () => {
