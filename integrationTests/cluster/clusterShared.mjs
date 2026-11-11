@@ -365,7 +365,7 @@ export async function waitForCondition(probe, opts = {}) {
 	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: lastError ?? signal.reason });
 }
 
-/** The `.txnlog` segments of a RocksDB node's transaction log; a missing directory throws instead of reading as purged. */
+/** A missing directory throws instead of reading as purged. */
 export async function logSegments(node, logName, database = 'data') {
 	const { readdir } = await import('node:fs/promises');
 	const files = await readdir(join(node.dataRootDir, 'database', database, 'transaction_logs', logName));

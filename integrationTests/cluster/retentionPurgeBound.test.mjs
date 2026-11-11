@@ -148,12 +148,16 @@ for (const engine of ['rocksdb', 'lmdb']) {
 				await stop(B);
 				const retainedAt = Date.now();
 				await upsert(A, 'retained');
+				const retainedSegment = (await logSegments(A, 'local')).sort((a, b) => parseInt(a) - parseInt(b)).at(-1);
 				let keepalives = 0;
 				while (Date.now() - retainedAt < IDLE_MS) {
 					await delay(KEEPALIVE_MS);
 					await upsert(A, `keepalive-${++keepalives}`);
 				}
-				ok((await logSegments(A, 'local')).length > 0, "A's log still holds the write B missed");
+				ok(
+					(await logSegments(A, 'local')).includes(retainedSegment),
+					`A still holds ${retainedSegment}, with the write B missed`
+				);
 				const mark = await logMark(A);
 				await start(B);
 				await arrives(B, `keepalive-${keepalives}`);
