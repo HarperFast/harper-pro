@@ -180,8 +180,19 @@ suite('Node membership follows hdb_nodes and replication.shard', { timeout: 600_
 			},
 			{ description: 'node C reports its row disagreeing with replication.shard' }
 		);
-		const refused = await insert(c, 'membership-held');
-		assert.equal(refused.status, 503, 'write admission refuses while C is held: ' + JSON.stringify(refused.body));
+		const refusedTargetShard = await insert(c, 'membership-held-0');
+		assert.equal(
+			refusedTargetShard.status,
+			503,
+			'write admission refuses the rewritten shard while C is held: ' + JSON.stringify(refusedTargetShard.body)
+		);
+		assert.match(refusedTargetShard.body?.error ?? '', new RegExp(MISMATCH));
+		const refusedAbandonedShard = await insert(c, 'membership-held-1');
+		assert.equal(
+			refusedAbandonedShard.status,
+			503,
+			'write admission refuses the abandoned shard while C is held: ' + JSON.stringify(refusedAbandonedShard.body)
+		);
 
 		await sendOperation(a, { operation: 'update_node', hostname: c.hostname, shard: 1 });
 		await waitForCondition(

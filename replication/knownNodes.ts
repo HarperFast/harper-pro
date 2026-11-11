@@ -490,7 +490,7 @@ function publishKnownNodes(event?: any): Map<string, any> {
 	const decoded = event?.type === 'put' && isValidNodeRecord(event.value) ? event.value : undefined;
 	const rows = new Map<string, any>();
 	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key, version) => {
-		// a real record always has a url and keeps its freshly decoded `replicates`
+		// url distinguishes a full record from a reconstructNodeFromKey stub, keeping its freshly decoded replicates
 		if (!node.url) {
 			if (decoded && key === id && !(version > event.version)) node = decoded;
 			else if (publishedRows.has(key)) node = mergeReconstructedNode(node, publishedRows.get(key));

@@ -201,6 +201,41 @@ describe('hdb_nodes membership follows a fresh scan after every event', function
 		assertMatchesFreshScan('after a stale put');
 	});
 
+	it('delivers a queued delete before a committed re-add so the listener tears down the old membership first', async () => {
+		const Nodes = getHDBNodeTable();
+		const oldRecord = { name: 'consistency-a', url: 'wss://consistency-a:9933', shard: 0, replicates: true };
+		const newRecord = { name: 'consistency-a', url: 'wss://consistency-a:9933', shard: 1, replicates: true };
+		await Nodes.put('consistency-a', oldRecord);
+		const calls = [];
+		const listener = (node, id) => calls.push({ node, id });
+		await runNodeUpdateWatcher(listener, {
+			key: WATCHER,
+			maxRestarts: 1,
+			subscribe: async () => asyncIterable([{ type: 'put', id: 'consistency-a', value: oldRecord }]),
+		});
+		await Nodes.delete('consistency-a');
+		await Nodes.put('consistency-a', newRecord);
+		const [{ version: readdVersion }] = Array.from(
+			Nodes.primaryStore.getRange({ start: 'consistency-a', end: 'consistency-a\uffff', versions: true })
+		);
+		calls.length = 0;
+		await runNodeUpdateWatcher(listener, {
+			key: WATCHER,
+			maxRestarts: 1,
+			subscribe: async () =>
+				asyncIterable([
+					{ type: 'delete', id: 'consistency-a', value: null, version: readdVersion - 1 },
+					{ type: 'put', id: 'consistency-a', value: newRecord, version: readdVersion },
+				]),
+		});
+		assert.deepEqual(
+			calls.filter((call) => call.id === 'consistency-a').map((call) => call.node?.shard ?? null),
+			[null, 1],
+			'the delete tears down the departed membership before the queued re-add restores it'
+		);
+		assertMatchesFreshScan('after remove_node then add_node');
+	});
+
 	it('tells a listener that threw of the rows it missed on the next event', async () => {
 		const Nodes = getHDBNodeTable();
 		await Nodes.put('consistency-a', { name: 'consistency-a', url: 'wss://consistency-a:9933', replicates: true });

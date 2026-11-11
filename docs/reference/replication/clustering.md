@@ -88,8 +88,8 @@ Modifies an existing Harper instance in the cluster. Will attempt to add the nod
 
 - `operation` _(required)_ — must be `update_node`
 - `hostname` _(required)_ — hostname of the remote node to update
-- `revoked_certificates` _(optional)_ — array of revoked certificate serial numbers
-- `shard` _(optional)_ — shard number to assign to this node. On the responding node's own hostname it must equal that node's `replication.shard`; any other value returns 400, since the node's own record follows its configuration. Change `replication.shard` and restart instead.
+- `revoked_certificates` _(optional)_ — array of revoked certificate serial numbers rejected when a new connection authenticates (already-open connections are not closed)
+- `shard` _(optional)_ — shard number to assign to this node. On the responding node's own hostname it must equal that node's `replication.shard`; any other value returns 400, since the node's own record follows its configuration. Change `replication.shard` and restart instead. Setting a peer's `shard` to a value other than its `replication.shard` leaves that peer `held` (refusing sharded writes) until its `replication.shard` matches, and restarting the peer beforehand rewrites its record from `replication.shard`.
 - `subscriptions` _(optional)_ — array of subscription objects (same structure as `add_node`)
 - `sendsTo` / `receivesFrom` _(optional)_ — same structure and directional meaning as in [Add Node](#add-node) above: they describe the `hostname` node's perspective, not this node's. See Add Node for the v5.1/v5.2 gating history and the `add_node_back` peer-rewrite caveat. As with Add Node, if both `subscriptions` and `sendsTo`/`receivesFrom` are provided, `subscriptions` takes precedence and `sendsTo`/`receivesFrom` are ignored.
 
@@ -102,7 +102,7 @@ Modifies an existing Harper instance in the cluster. Will attempt to add the nod
 }
 ```
 
-A request that carries `revoked_certificates` and/or `shard` and none of `url`, `isLeader`, `retain_authorization`, `start_time`, `force_signing`, `subscriptions`, `sendsTo` or `receivesFrom` is written to this node's record of `hostname` without contacting it, and replicates to the cluster from there. Any other request runs the full `add_node` exchange with that node.
+A request for an existing `hostname` record that carries `revoked_certificates` and/or `shard` and none of `url`, `isLeader`, `retain_authorization`, `start_time`, `force_signing`, `subscriptions`, `sendsTo` or `receivesFrom` is written to this node's record of `hostname` without contacting it, and replicates to the cluster from there. Any other request, including one for a `hostname` with no local record yet, runs the full `add_node` exchange with that node.
 
 **Response**:
 
