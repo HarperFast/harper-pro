@@ -784,6 +784,10 @@ describe('createDisabledRecordLockTransport', () => {
 		// independently found by the delegation cost bench (harper-pro#824's follow-up).
 		const transport = createDisabledRecordLockTransport();
 		assert.strictEqual(transport.ownsCoordination(), true);
+		// The prefix is matched by the cost bench; the rest is the fix an operator needs.
+		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /^cluster record locks are not enabled on this node/);
+		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /replication\.recordLocks: true/);
+		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /record_lock_apply_homes/);
 		assert.throws(
 			() => transport.homeMap('data'),
 			(error) => error.message === RECORD_LOCKS_DISABLED_MESSAGE && error.statusCode === 503

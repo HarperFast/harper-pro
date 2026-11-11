@@ -1,80 +1,48 @@
-import { isMainThread } from 'node:worker_threads';
 import { getConfigObj } from '../core/config/configUtils.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 
 /**
- * `auto`: on, and the first home-map generation is established automatically (unset, the default).
- * `operator`: on, every generation is published by an operator (`true`, the 5.3 meaning).
- * `off`: cluster-scoped `lock()` fails closed (`false`, LMDB, or a value this node cannot read as a boolean).
- */
-export type RecordLockMode = 'auto' | 'operator' | 'off';
-
-export interface RecordLockSetting {
-	mode: RecordLockMode;
-	offBecause?: 'config' | 'engine';
-}
-
-interface SettingLog {
-	info?: (message: string) => void;
-	warn?: (message: string) => void;
-	error?: (message: string) => void;
-}
-
-/**
- * Successor freshness is proven in the transaction-log-key domain the RocksDB receiver adopts
- * (harper-pro#790); the deprecated LMDB engine keys replicated writes by its own local clock, so no
- * barrier would ever match there, and LMDB stays off whatever the setting says.
+ * `replication.recordLocks: true` admits this node to cluster-wide record locks (harper-pro#438); off,
+ * a cluster-scoped `lock()` fails closed rather than silently arbitrating on one node.
  *
- * A configuration that cannot be read at all resolves to off, not to the default: only a successfully
- * read, absent key means "unset". A module-loading unit-test process has no boot properties file, so
- * `getConfigObj()` throws there.
+ * Read from the raw config tree, NOT `env.get`: `env.get` resolves only keys registered in core's
+ * `CONFIG_PARAM_MAP` (`knownNodes.ts` notes the same limit for other replication knobs), and this key
+ * is harper-pro's own — registering it would be a core change. Read once: a value that changed
+ * between threads would make one worker advertise a capability the process does not honor.
+ *
+ * `getConfigObj()` throws when no boot properties file exists yet (a module-loading unit-test
+ * process, unlike a real server, never boots one). Every other `getConfigObj()` call site in the
+ * codebase defers the call into a function body for exactly this reason; this one can't, because
+ * the result is a module-scoped constant read by other modules at their own import time. Treat the
+ * throw the same as "not configured": fail closed, matching this module's own default.
  */
-export function resolveRecordLockSetting(
-	readConfigured: () => unknown,
-	engine: string | undefined,
-	log: SettingLog = {}
-): RecordLockSetting {
-	let configured: unknown;
-	try {
-		configured = readConfigured();
-	} catch {
-		return { mode: 'off', offBecause: 'config' };
-	}
-	const lmdb = engine === 'lmdb';
-	if (configured === undefined || configured === null) {
-		if (!lmdb) return { mode: 'auto' };
-		log.info?.(
-			'Cluster record locks are off on this node: they need the RocksDB storage engine, and this node uses LMDB'
-		);
-		return { mode: 'off', offBecause: 'engine' };
-	}
-	if (configured === true) {
-		if (!lmdb) return { mode: 'operator' };
-		log.error?.(
+let configured: unknown;
+try {
+	configured = getConfigObj()?.replication?.recordLocks;
+} catch {
+	configured = undefined;
+}
+// Only a real boolean `true` enables it; a truthy non-boolean (a YAML `1`, a quoted `"true"`) would
+// leave the node advertising `recordLocks: 0` and registering the fail-closed transport, so warn
+// rather than let an operator believe the switch is on.
+if (configured && typeof configured !== 'boolean')
+	logger.warn?.(
+		`replication.recordLocks is set to ${JSON.stringify(configured)}, which is not the boolean true; cluster record locks stay disabled`
+	);
+// Successor freshness is proven in the transaction-log-key domain the RocksDB receiver adopts
+// (harper-pro#790); the deprecated LMDB engine keys replicated writes by its own local clock, so no
+// barrier would ever match there. Refuse the switch outright rather than advertise a level every
+// handoff then times out on.
+let engineSupported = true;
+if (configured === true) {
+	const engine = process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_PARAMS.STORAGE_ENGINE);
+	if (engine === 'lmdb') {
+		engineSupported = false;
+		logger.error?.(
 			'replication.recordLocks requires the RocksDB storage engine; cluster record locks stay disabled on this LMDB node'
 		);
-		return { mode: 'off', offBecause: 'engine' };
 	}
-	// A truthy non-boolean (a YAML `1`, a quoted "true") or a quoted "false" is not read either way.
-	if (configured !== false)
-		log.warn?.(
-			`replication.recordLocks is set to ${JSON.stringify(configured)}, which is not a boolean; cluster record locks stay disabled`
-		);
-	return { mode: 'off', offBecause: 'config' };
 }
-
-/**
- * Read once, from the raw config tree rather than `env.get`, at module load: other modules read the
- * result at their own import time, and a value that changed between threads would make one worker
- * advertise a capability the process does not honor.
- */
-const setting = resolveRecordLockSetting(
-	() => getConfigObj()?.replication?.recordLocks,
-	process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_PARAMS.STORAGE_ENGINE),
-	isMainThread ? logger : {}
-);
-export const RECORD_LOCK_MODE: RecordLockMode = setting.mode;
-export const CLUSTER_RECORD_LOCKS_ENABLED: boolean = setting.mode !== 'off';
-export const RECORD_LOCK_HOMES_AUTOMATIC: boolean = setting.mode === 'auto';
+export const CLUSTER_RECORD_LOCKS_ENABLED: boolean = configured === true && engineSupported;

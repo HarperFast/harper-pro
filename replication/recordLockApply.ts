@@ -19,7 +19,6 @@ import {
 	canonicalizeHomes,
 	digestOf,
 	existingRow,
-	homesMembership,
 	operatorPrincipal,
 	planStage,
 	provesQuiescence,
@@ -31,7 +30,6 @@ import {
 	type StageFence,
 } from './recordLockHomes.ts';
 import { principalNodeName, sendRecordLockOperation } from './recordLockRpc.ts';
-import { RECORD_LOCK_MODE, type RecordLockMode } from './recordLockConfig.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
 
 export const APPLY_OPERATION = 'record_lock_apply_homes';
@@ -69,10 +67,6 @@ export interface SurveyReply {
 	/** This node records a stage's `fenced` list. An older node would accept the field and drop it. */
 	supportsFenced?: boolean;
 	fenced?: FenceEntry[];
-	/** This node's own canonical `{self} ∪ replicatingPeers(database)`; read by the automatic first generation. */
-	view?: string[];
-	/** This node's own `replication.recordLocks` mode; read by the automatic first generation. */
-	recordLocks?: RecordLockMode;
 }
 export interface StageReply {
 	staged: RecordLockGenerationState;
@@ -397,18 +391,18 @@ const applySchema = Joi.object({
 	fenced: Joi.array().optional(),
 });
 
-export function hopError(error: unknown): string {
+function hopError(error: unknown): string {
 	return (error as Error)?.message ?? String(error);
 }
 
-export function withHopDeadline<T>(hop: Promise<T>, ms: number, what: string): Promise<T> {
+function withHopDeadline<T>(hop: Promise<T>, ms: number, what: string): Promise<T> {
 	return new Promise<T>((resolve, reject) => {
 		const timer = setTimeout(() => reject(new Error(`${what} did not answer within ${ms}ms`)), ms).unref();
 		hop.then(resolve, reject).finally(() => clearTimeout(timer));
 	});
 }
 
-export async function forEachNode(nodes: string[], task: (node: string) => Promise<void>): Promise<void> {
+async function forEachNode(nodes: string[], task: (node: string) => Promise<void>): Promise<void> {
 	let next = 0;
 	const lanes = Array.from({ length: Math.min(HOP_CONCURRENCY, nodes.length) }, async () => {
 		while (next < nodes.length) await task(nodes[next++]);
@@ -416,22 +410,8 @@ export async function forEachNode(nodes: string[], task: (node: string) => Promi
 	await Promise.all(lanes);
 }
 
-/**
- * One home-map transition at a time per database on this worker — an operator apply or the automatic
- * first generation; the per-node planners keep a concurrent one elsewhere safe.
- */
-const transitionQueues = new Map<string, Promise<unknown>>();
-export function withTransitionQueue<T>(database: string, run: () => Promise<T>): Promise<T> {
-	const prior = transitionQueues.get(database) ?? Promise.resolve();
-	const result = prior.then(run);
-	const queued = result
-		.catch(() => {})
-		.finally(() => {
-			if (transitionQueues.get(database) === queued) transitionQueues.delete(database);
-		});
-	transitionQueues.set(database, queued);
-	return result;
-}
+/** One apply at a time per database on this worker; the per-node planners keep a concurrent apply elsewhere safe. */
+const applyQueues = new Map<string, Promise<unknown>>();
 
 const FAIL_BEFORE_ACTIVATE = process.env.HARPER_TEST_RECORD_LOCK_APPLY_FAIL_BEFORE_ACTIVATE === '1';
 const MAX_OPERATOR_LENGTH = 512;
@@ -467,7 +447,15 @@ export async function applyHomes(
 		if (fence.operator.length > MAX_OPERATOR_LENGTH)
 			throw new ClientError(`a fenced call needs an operator name of at most ${MAX_OPERATOR_LENGTH} characters`, 400);
 	}
-	return withTransitionQueue(database, () => runApply(request, database, homes, quiesce, fence, peers, timeouts));
+	const prior = applyQueues.get(database) ?? Promise.resolve();
+	const run = prior.then(() => runApply(request, database, homes, quiesce, fence, peers, timeouts));
+	const queued = run
+		.catch(() => {})
+		.finally(() => {
+			if (applyQueues.get(database) === queued) applyQueues.delete(database);
+		});
+	applyQueues.set(database, queued);
+	return run;
 }
 
 function validateFenced(fenced: unknown, homes: string[], quiesce: string[], self: string | undefined): string[] {
@@ -651,8 +639,6 @@ export async function executeTransitionLocally(
 			highestActedOn: row?.highestActedOn ?? 0,
 			supportsFenced: true,
 			fenced: row?.fenced,
-			view: canonicalizeHomes([self, ...homesMembership().replicatingPeers(database)]),
-			recordLocks: RECORD_LOCK_MODE,
 		};
 	}
 	validateGenerationInput(request.generation, request.homes);
@@ -687,7 +673,7 @@ export async function executeTransition(request: any) {
 	return executeTransitionLocally(request, principal);
 }
 
-export const productionPeers: TransitionPeers = {
+const productionPeers: TransitionPeers = {
 	self: getThisNodeName,
 	send(node, operation, timeoutMs) {
 		if (node === getThisNodeName()) return executeTransitionLocally(operation);

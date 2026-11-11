@@ -29,7 +29,7 @@
  * kept in the per-(database, peer) shared status buffer so the owner can read it for a peer whose
  * socket lives on another thread.
  *
- * With `replication.recordLocks` off (`false`, or LMDB) every replicated database gets a transport that
+ * With `replication.recordLocks` off (the default) every replicated database gets a transport that
  * fails closed instead, so a cluster-scoped `lock()` reports the missing enablement rather than
  * quietly arbitrating on this node alone.
  */
@@ -68,11 +68,10 @@ import {
 } from './sharedStatusSlots.ts';
 import { isReplicationWorker } from './replicationWorkers.ts';
 import { ClientError, LockUnavailableError } from '../core/utility/errors/hdbError.ts';
-import { CLUSTER_RECORD_LOCKS_ENABLED, RECORD_LOCK_HOMES_AUTOMATIC } from './recordLockConfig.ts';
+import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { tableReplicates as declarationReplicates } from './replicatedDatabases.ts';
 import { createBackoff, type Backoff } from './backoff.ts';
 import {
-	canonicalizeHomes,
 	currentRow,
 	onRecordLockHomesChanged,
 	type RecordLockHomesRow,
@@ -113,13 +112,6 @@ import {
 import { getRepairConnectionsForDB } from './replicator.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import './recordLockApply.ts';
-import {
-	classifyHomesRow,
-	createBootstrapTrigger,
-	runBootstrap,
-	type BootstrapRowState,
-	type BootstrapStatus,
-} from './recordLockBootstrap.ts';
 
 export { RECORD_LOCKS_CAPABILITY_POSITION, RECORD_LOCK_HOMES_AGREEMENT_POSITION, RECORD_LOCK_LEVEL_POSITION };
 export const LOCK_CAPABILITY_UNKNOWN = 0;
@@ -304,15 +296,6 @@ export interface RecordLockTransportDeps {
 	monotonicNow(): number;
 	/** The successor-freshness barrier for the database, built over this transport's own `homeMap()`. */
 	freshness(database: string, homeMap: () => LockHomeMap | undefined): FreshnessBarrier;
-	/**
-	 * `homeMap()` found no map to answer: may start the automatic first generation, and throws the 503 a
-	 * caller should see when that has been refused (`recordLockBootstrap.ts`).
-	 */
-	homeMapMissing?(database: string): void;
-	/** Called once per transport, the first time `homeMap()` answers a map. */
-	homeMapAvailable?(database: string): void;
-	/** The per-database flag a generation-1 ring sets when it meets a different map (`markForeignRing`). */
-	foreignRing?(auditStore: any, database: string): Float64Array;
 	/** harper-pro#852: obtain an admission from the owner worker for an off-owner `lock()`. */
 	acquireOnOwner(database: string, table: string, key: unknown, leaseMs: number, waitMs: number): Promise<LockRound>;
 	/** harper-pro#852: release a relayed admission on the owner worker. */
@@ -327,11 +310,6 @@ export interface RecordLockTransportDeps {
 	restartRecovering?(database: string): boolean;
 }
 
-export interface RecordLockTransport extends ClusterLockTransport {
-	/** `homeMap()` for harper-pro's own readers: never starts the automatic first generation, never throws. */
-	peekHomeMap(): LockHomeMap | undefined;
-}
-
 /**
  * Pure over its dependencies and the injected cache reader so `homeMap()` is unit-testable without
  * a cluster or storage. `cacheFor` returns the frozen, already-current active generation for the
@@ -342,50 +320,17 @@ export function createRecordLockTransport(
 	database: string,
 	deps: RecordLockTransportDeps,
 	cacheFor: () => RecordLockGenerationState | undefined
-): RecordLockTransport {
+): ClusterLockTransport {
 	const statusViews = new Map<string, Float64Array>();
 	let statusViewsStore: any;
-	let foreignView: Float64Array | undefined;
-	const useStore = (auditStore: any): void => {
-		if (statusViewsStore === auditStore) return;
-		statusViews.clear();
-		foreignView = undefined;
-		statusViewsStore = auditStore;
-	};
 	const statusFor = (auditStore: any, peer: string): Float64Array => {
-		useStore(auditStore);
+		if (statusViewsStore !== auditStore) {
+			statusViews.clear();
+			statusViewsStore = auditStore;
+		}
 		let status = statusViews.get(peer);
 		if (!status) statusViews.set(peer, (status = getReplicationSharedStatus(auditStore, database, peer)));
 		return status;
-	};
-	const foreignRingSeen = (auditStore: any): boolean => {
-		if (!deps.foreignRing || !auditStore) return false;
-		useStore(auditStore);
-		return (foreignView ??= deps.foreignRing(auditStore, database))[0] === 1;
-	};
-	const readHomeMap = (): LockHomeMap | undefined => {
-		const active = cacheFor();
-		if (!active) return undefined;
-		const homeIncarnation = deps.homeIncarnation();
-		if (!(homeIncarnation > 0)) return undefined;
-		const self = deps.thisNodeName();
-		const auditStore = deps.auditStore(database);
-		if (active.generation === 1 && foreignRingSeen(auditStore)) return undefined;
-		for (const peer of active.homes) {
-			if (peer === self) continue;
-			if (!auditStore) return undefined;
-			const status = statusFor(auditStore, peer);
-			// Digest agreement (the operator-stated topology matches) and wire-protocol capability
-			// (the peer can actually speak this level's delegation/recall/lockRelease shape) are
-			// independent: a coincidentally-matching digest from a peer at the wrong protocol level
-			// is not enough — see `RECORD_LOCKS_CAPABILITY`'s mutual-exclusion comment. Fails closed
-			// on `UNKNOWN` for either one too: a peer this node has not yet heard from is exactly as
-			// unsafe to treat as agreeing as one that actively disagrees (§4.1: "a digest check is
-			// not a freshness check").
-			if (readPeerLockCapability(status) !== LOCK_CAPABILITY_SUPPORTED) return undefined;
-			if (readPeerHomesAgreement(status) !== HOMES_AGREEMENT_MATCH) return undefined;
-		}
-		return { generation: active.generation, homes: active.homes, homeIncarnation };
 	};
 	// Read once, at transport construction, matching when core reads it (`LockCoordinator`'s
 	// constructor, once per coordinator build): a fresh node that has never incarnated before has
@@ -395,8 +340,7 @@ export function createRecordLockTransport(
 	// own default quarantine applies — that is the correct, safe default core already enforces.
 	const grantableAfterMono = deps.isFirstIncarnation() ? deps.monotonicNow() : undefined;
 	let freshness: FreshnessBarrier | undefined;
-	let answered = false;
-	const transport: RecordLockTransport = {
+	const transport: ClusterLockTransport = {
 		grantableAfterMono,
 		coordinationIncarnation() {
 			const incarnation = deps.homeIncarnation();
@@ -415,24 +359,32 @@ export function createRecordLockTransport(
 			return deps.restartRecovering?.(database) === true;
 		},
 		establishLockFreshness(db: string, table: string, _key: unknown, dependencies, deadlineMs: number) {
-			freshness ??= deps.freshness(db, readHomeMap);
+			freshness ??= deps.freshness(db, () => transport.homeMap(db));
 			return freshness.establish(table, dependencies, deadlineMs);
 		},
 		homeMap(): LockHomeMap | undefined {
-			const map = readHomeMap();
-			if (map !== undefined) {
-				if (!answered) {
-					answered = true;
-					deps.homeMapAvailable?.(database);
-				}
-			} else if (deps.homeMapMissing) {
-				// A generation-1 ring withheld for meeting another map is an operator's to reconcile, not resumable.
-				const active = cacheFor();
-				if (!(active?.generation === 1 && foreignRingSeen(deps.auditStore(database)))) deps.homeMapMissing(database);
+			const active = cacheFor();
+			if (!active) return undefined;
+			const homeIncarnation = deps.homeIncarnation();
+			if (!(homeIncarnation > 0)) return undefined;
+			const self = deps.thisNodeName();
+			const auditStore = deps.auditStore(database);
+			for (const peer of active.homes) {
+				if (peer === self) continue;
+				if (!auditStore) return undefined;
+				const status = statusFor(auditStore, peer);
+				// Digest agreement (the operator-stated topology matches) and wire-protocol capability
+				// (the peer can actually speak this level's delegation/recall/lockRelease shape) are
+				// independent: a coincidentally-matching digest from a peer at the wrong protocol level
+				// is not enough — see `RECORD_LOCKS_CAPABILITY`'s mutual-exclusion comment. Fails closed
+				// on `UNKNOWN` for either one too: a peer this node has not yet heard from is exactly as
+				// unsafe to treat as agreeing as one that actively disagrees (§4.1: "a digest check is
+				// not a freshness check").
+				if (readPeerLockCapability(status) !== LOCK_CAPABILITY_SUPPORTED) return undefined;
+				if (readPeerHomesAgreement(status) !== HOMES_AGREEMENT_MATCH) return undefined;
 			}
-			return map;
+			return { generation: active.generation, homes: active.homes, homeIncarnation };
 		},
-		peekHomeMap: readHomeMap,
 		ownsCoordination(): boolean {
 			return deps.ownsDatabase(database) && transport.coordinationIncarnation() !== undefined;
 		},
@@ -494,7 +446,7 @@ export function createRecordLockTransport(
 }
 
 export const RECORD_LOCKS_DISABLED_MESSAGE =
-	"cluster record locks are not enabled on this node (replication.recordLocks); lock with { scope: 'node' } for a node-local lock";
+	"cluster record locks are not enabled on this node: set replication.recordLocks: true on every node, restart, and apply a home map with record_lock_apply_homes; or lock with { scope: 'node' } for a node-local lock";
 
 /**
  * Registered while `replication.recordLocks` is off: `ownsCoordination` is true so core reaches
@@ -519,22 +471,15 @@ export function createDisabledRecordLockTransport(): ClusterLockTransport {
 // ---- per-thread active-generation cache, refreshed only on change --------------------------------
 
 const activeCache = new Map<string, RecordLockGenerationState | undefined>();
-/** Absent after a failed read: only a successful one lets the automatic first generation start. */
-const rowStates = new Map<string, BootstrapRowState>();
 
 function cacheForDatabase(database: string): RecordLockGenerationState | undefined {
 	return activeCache.get(database);
 }
 
 /** This thread's currently-cached active-generation digest, for the handshake/re-announce send path
- * in `replicationConnection.ts` — never storage I/O; whatever `refreshCache` last populated. A
- * generation-1 ring that met another map announces a withheld marker instead (`markForeignRing`). */
+ * in `replicationConnection.ts` — never storage I/O; whatever `refreshCache` last populated. */
 export function currentHomesDigest(database: string): string | undefined {
-	const active = activeCache.get(database);
-	if (!active) return undefined;
-	return active.generation === 1 && foreignRingFlag(database)?.[0] === 1
-		? WITHHELD_DIGEST_PREFIX + active.digest
-		: active.digest;
+	return activeCache.get(database)?.digest;
 }
 
 interface RefreshState {
@@ -564,10 +509,9 @@ export function forgetRecordLockHomesCache(database: string): void {
 	if (state) clearTimeout(state.timer);
 	refreshState.delete(database);
 	activeCache.delete(database);
-	rowStates.delete(database);
 }
 
-async function refreshCache(database: string, freshBudget = false, announce = true): Promise<void> {
+async function refreshCache(database: string, freshBudget = false): Promise<void> {
 	let state = refreshState.get(database);
 	if (!state)
 		refreshState.set(
@@ -591,24 +535,19 @@ async function refreshCache(database: string, freshBudget = false, announce = tr
 		const row = await readHomesRow(database);
 		if (!current()) return;
 		activeCache.set(database, row?.active);
-		rowStates.set(database, { rowClass: classifyHomesRow(row), firstSet: (row?.active ?? row?.staged)?.homes });
-		// A peer digest that arrived while the row was unreadable, or before this first read, was recorded
-		// as a mismatch against no digest at all (and never checked for a second generation-1 map), and a
-		// socket that handshook then received none; both need the one just read. The backoff resets only
-		// once this is done, so a failure here re-arms the whole cycle.
-		if (state.backoff.attempts > 0 || (announce && before?.digest !== row?.active?.digest)) {
-			// Reconciled first, so a second generation-1 map heard earlier withholds this one before it is announced.
-			reconcileAllPeerHomesAgreement(database);
+		// A peer digest that arrived while the row was unreadable was recorded as a mismatch against
+		// no digest at all, and a socket that handshook then received none; both need the recovered one.
+		// The backoff resets only once this is done, so a failure here re-arms the whole cycle.
+		if (state.backoff.attempts > 0) {
 			pushHomesDigestToPeers(database);
+			reconcileAllPeerHomesAgreement(database);
 		}
 		state.backoff.reset();
 	} catch (error) {
 		if (!current()) return;
 		// A storage error must not leave a stale (possibly superseded) generation cached; undefined is
-		// the fail-closed default `homeMap()` already treats as "not available." Nor may it read as a
-		// node that never had a map: only a successful read lets the automatic first generation run.
+		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
-		rowStates.delete(database);
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
 		state.timer = setTimeout(() => {
 			if (current())
@@ -644,9 +583,9 @@ const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
  * racing an unawaited refresh (a real pre-push review finding).
  */
 async function applyHomesChanged(database: string): Promise<void> {
-	await refreshCache(database, true, false);
-	reconcileAllPeerHomesAgreement(database);
+	await refreshCache(database, true);
 	pushHomesDigestToPeers(database);
+	reconcileAllPeerHomesAgreement(database);
 }
 
 /**
@@ -705,8 +644,7 @@ async function broadcastHomesChangedAndWait(database: string, exclude?: any): Pr
 	);
 }
 
-onRecordLockHomesChanged(propagateHomesChanged);
-async function propagateHomesChanged(database: string): Promise<void> {
+onRecordLockHomesChanged(async (database) => {
 	await applyHomesChanged(database);
 	if (parentPort) {
 		// Ask main to relay and wait for it to confirm every thread (including main's own state and
@@ -725,7 +663,7 @@ async function propagateHomesChanged(database: string): Promise<void> {
 	} else {
 		await broadcastHomesChangedAndWait(database);
 	}
-}
+});
 
 /** Re-announces this node's new digest on every live outbound connection for the database — an
  * already-connected peer otherwise never sees an activation (§6: the digest is sent at handshake
@@ -763,13 +701,6 @@ function reconcilePeerHomesAgreement(database: string, peer: string): void {
 	if (theirs === undefined) return; // nothing heard from this peer yet; leave the buffer's UNKNOWN default
 	const auditStore = auditStoreFor(database);
 	if (!auditStore) return;
-	const active = activeCache.get(database);
-	if (
-		active?.generation === 1 &&
-		theirs &&
-		(theirs.startsWith(WITHHELD_DIGEST_PREFIX) || (!active.homes.includes(peer) && theirs !== active.digest))
-	)
-		markForeignRing(database, auditStore, peer);
 	const ours = currentHomesDigest(database);
 	const matches = ours !== undefined && ours === theirs;
 	recordPeerHomesAgreement(getReplicationSharedStatus(auditStore, database, peer), matches);
@@ -777,38 +708,6 @@ function reconcilePeerHomesAgreement(database: string, peer: string): void {
 	// at its next backoff, which after a few mapless attempts can be most of a lock's timeout away.
 	if (matches && CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF && ownedDatabases.has(database))
 		restartRecall.schedule(database);
-}
-
-// ---- two generation-1 maps meeting -------------------------------------------------------------------
-
-export const WITHHELD_DIGEST_PREFIX = 'withheld:';
-
-function foreignRingFlag(database: string, auditStore: any = auditStoreFor(database)): Float64Array | undefined {
-	return auditStore ? foreignRingFlagFor(auditStore, database) : undefined;
-}
-/** Process-wide, never persisted: a restart re-learns it from the peers' announcements. */
-function foreignRingFlagFor(auditStore: any, database: string): Float64Array {
-	return new Float64Array(auditStore.getUserSharedBuffer(['recordLockForeignRing', database], new ArrayBuffer(8)));
-}
-
-/**
- * At generation 1 there has never been a transition, so a peer outside the ring that announces a
- * different active map is not a departed or fenced member of this lineage: it is a second map over the
- * same replicated data — two clusters that each established one, joined. Withhold this node's map for
- * the life of the process, and announce a withheld marker so every member of this ring mismatches it
- * and withholds too, and passes the marker on (a member that receives one sets the same flag). At
- * generation ≥ 2 departing and fenced nodes legitimately hold stale maps, so the check is off there.
- */
-function markForeignRing(database: string, auditStore: any, peer: string): void {
-	const flag = foreignRingFlagFor(auditStore, database);
-	if (flag[0] === 1) return;
-	flag[0] = 1;
-	logger.error?.(
-		`Record lock home map for ${database}: ${peer} serves a different home map over the same replicated data; cluster record locks for ${database} are withheld on this node until an operator applies one map to every node (record_lock_apply_homes)`
-	);
-	propagateHomesChanged(database).catch((error) =>
-		logger.warn?.(`Could not re-announce the withheld record lock home map for ${database}`, error)
-	);
 }
 
 /** Our own digest just changed (a fresh activation): every peer we have EVER heard a digest from for
@@ -825,14 +724,6 @@ function reconcileAllPeerHomesAgreement(database: string): void {
 
 const ownedDatabases = new Set<string>();
 const transports = new Map<string, ClusterLockTransport>();
-function peekHomeMap(database: string): LockHomeMap | undefined {
-	const transport = transports.get(database) as Partial<RecordLockTransport> | undefined;
-	try {
-		return transport?.peekHomeMap ? transport.peekHomeMap() : transport?.homeMap?.(database);
-	} catch {
-		return undefined;
-	}
-}
 const transportBuilders = new Map<string, () => ClusterLockTransport>();
 /**
  * The thread that coordinates each database, as this thread last learned it from main (harper-pro#852).
@@ -921,7 +812,6 @@ export function setRecordLockOwnership(database: string, owned: boolean): void {
 		coordinationIntervals.delete(database);
 		onRecordLockOwnershipLost(database);
 		restartRecall.cancel(database);
-		bootstrapTrigger.release(database);
 	}
 }
 
@@ -1067,7 +957,13 @@ const restartRecall = createRestartRecall({
 	homeIncarnation: currentHomeIncarnation,
 	isFirstIncarnation,
 	ownsDatabase: ownsRecordLockCoordination,
-	homeMap: peekHomeMap,
+	homeMap(database) {
+		try {
+			return transports.get(database)?.homeMap(database);
+		} catch {
+			return undefined;
+		}
+	},
 	send: sendRecordLockOperation,
 	recallLocally: recallDelegationsFromHome,
 	delegateEpoch: delegateEpochOf,
@@ -1076,33 +972,9 @@ const restartRecall = createRestartRecall({
 	debug: (message, detail) => logger.debug?.(message, detail),
 });
 
-const bootstrapTrigger = createBootstrapTrigger({
-	automatic: RECORD_LOCK_HOMES_AUTOMATIC,
-	rowState: (database) => rowStates.get(database),
-	candidates(database) {
-		const self = getThisNodeName();
-		return self ? canonicalizeHomes([self, ...replicatingPeersOf(database)]) : [];
-	},
-	run: runBootstrap,
-	now: () => performance.now(),
-	random: Math.random,
-	setTimer: (callback, ms) => setTimeout(callback, ms).unref(),
-	clearTimer: (timer) => clearTimeout(timer as NodeJS.Timeout),
-	log: {
-		info: (message) => logger.info?.(message),
-		warn: (message) => logger.warn?.(message),
-	},
-});
-
 const productionDeps: RecordLockTransportDeps = {
 	thisNodeName: getThisNodeName,
 	auditStore: auditStoreFor,
-	homeMapMissing(database) {
-		// Core reads `homeMap()` on the coordinating thread; an attempt runs there and nowhere else.
-		if (ownsRecordLockCoordination(database)) bootstrapTrigger.missing(database);
-	},
-	homeMapAvailable: (database) => bootstrapTrigger.available(database),
-	foreignRing: foreignRingFlagFor,
 	ownsDatabase: ownsRecordLockCoordination,
 	homeIncarnation: currentHomeIncarnation,
 	send: sendRecordLockOperation,
@@ -1165,15 +1037,11 @@ export async function bumpHomeIncarnation(): Promise<number> {
 		// Mirrored onto the legacy field, so a rollback to a build that reads only that field continues
 		// the count rather than restarting it. Best effort: the row is the mesh's shared copy and a peer's
 		// rewrite can still erase it, which is why it is no longer authoritative. A node with no row yet
-		// gets a LOCAL_ONLY one, as the older build wrote (a url-less row must not replicate). Only an
-		// explicitly enabled node, the one setting an earlier build honored: on by default, the write would
-		// rewrite every node's self row on every start, and recreate one a `remove_node` deleted.
-		if (!RECORD_LOCK_HOMES_AUTOMATIC) {
-			const existingRow = getHDBNodeTable().primaryStore.getSync(self);
-			await ensureNode(self, { recordLockIncarnation: next }, existingRow ? undefined : { localOnly: true }).catch(
-				(error) => logger.debug?.('Could not mirror the record lock incarnation onto the hdb_nodes self row', error)
-			);
-		}
+		// gets a LOCAL_ONLY one, as the older build wrote (a url-less row must not replicate).
+		const existingRow = getHDBNodeTable().primaryStore.getSync(self);
+		await ensureNode(self, { recordLockIncarnation: next }, existingRow ? undefined : { localOnly: true }).catch(
+			(error) => logger.debug?.('Could not mirror the record lock incarnation onto the hdb_nodes self row', error)
+		);
 		setHomeIncarnation(next, first);
 		for (const worker of recordLockParticipantWorkers()) confer(worker, 'record-lock-incarnation', next, first);
 		logger.info?.(`Record lock home incarnation for ${self} is now ${next}`);
@@ -1260,7 +1128,6 @@ function recreateRecordLockTransport(database: string): void {
 
 /** The database is no longer replicated here. Cluster scope keeps failing closed (core's rule). */
 export function releaseRecordLockTransport(database: string): void {
-	bootstrapTrigger.release(database);
 	forgetRecordLockHomesCache(database);
 	transportBuilders.delete(database);
 	if (!transports.delete(database)) return;
@@ -1309,7 +1176,6 @@ export interface RecordLockDatabaseStats {
 	restartRecall?: RestartRecallStatus;
 	/** The coordinating thread's delegate epoch for the database (record-locks.md §4.5), once known. */
 	delegateEpoch?: number;
-	bootstrap?: BootstrapStatus;
 }
 
 /** Summed `LockCoordinator.stats` over the database's tables on this thread. */
@@ -1348,10 +1214,9 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 	if (ownedDatabases.has(database)) {
 		total.restartRecall = restartRecall.status(database);
 		total.delegateEpoch = delegateEpochOf(database);
-		total.bootstrap = bootstrapTrigger.status(database);
 	}
 	try {
-		total.members = peekHomeMap(database)?.homes;
+		total.members = transports.get(database)?.homeMap(database)?.homes;
 		total.freshness = freshnessBarriers.get(database)?.stats();
 		try {
 			total.poisoned = poisonedPairs(database);
@@ -1819,7 +1684,6 @@ export async function collectRecordLockStatus(
 				entry.unprovenMs = stats.unprovenMs;
 				entry.restartRecall = stats.restartRecall;
 				entry.delegateEpoch = stats.delegateEpoch;
-				entry.bootstrap = stats.bootstrap;
 				entry.relayedControlEntries = stats.relayedControlEntries;
 				entry.outbound = stats.outbound;
 			}
@@ -1861,16 +1725,18 @@ export async function collectRecordLockStatus(
 
 setHomesDrainReader((database, deadlineMs) => quiesceOnOwner(database, deadlineMs));
 
-function replicatingPeersOf(database: string): string[] {
-	const self = getThisNodeName();
-	const peers: string[] = [];
-	for (const node of getHDBNodeTable().search([])) {
-		if (!node?.name || node.name === self) continue;
-		if (shouldReplicateFromNode(node as any, database)) peers.push(node.name);
-	}
-	return peers;
-}
-setHomesMembershipReaders({ thisNodeName: getThisNodeName, replicatingPeers: replicatingPeersOf });
+setHomesMembershipReaders({
+	thisNodeName: getThisNodeName,
+	replicatingPeers(database) {
+		const self = getThisNodeName();
+		const peers: string[] = [];
+		for (const node of getHDBNodeTable().search([])) {
+			if (!node?.name || node.name === self) continue;
+			if (shouldReplicateFromNode(node as any, database)) peers.push(node.name);
+		}
+		return peers;
+	},
+});
 
 setRecordLockOwnershipReaders({
 	ownsDatabase: ownsRecordLockCoordination,
@@ -1882,8 +1748,14 @@ setRecordLockOwnershipReaders({
 	mainOwns: (database) => recordLockOwners.get(database) === MAIN_OWNER,
 	ownerThreadId: (database) => ownerThreadByDatabase.get(database),
 	delegateEpoch: delegateEpochOf,
-	activeGeneration: (database) => peekHomeMap(database)?.generation,
-	isMember: (database, node) => peekHomeMap(database)?.homes.includes(node) === true,
+	activeGeneration: (database) => {
+		try {
+			return transports.get(database)?.homeMap(database)?.generation;
+		} catch {
+			return undefined;
+		}
+	},
+	isMember: (database, node) => transports.get(database)?.homeMap(database)?.homes.includes(node) === true,
 	peerLevel: (database, node) => {
 		const auditStore = auditStoreFor(database);
 		return auditStore ? readPeerLockLevel(getReplicationSharedStatus(auditStore, database, node)) : 0;
@@ -1959,13 +1831,7 @@ if (!parentPort) {
 	onMessageByType('record-lock-homes-changed-ack', (message) => {
 		pendingHomesChangedAcks.get(message.requestId)?.(message.ok === true);
 	});
-	if (RECORD_LOCK_HOMES_AUTOMATIC)
-		whenThreadsStarted.then(() => {
-			logger.info?.(
-				`Cluster record locks are on (replication.recordLocks is unset): the first cluster lock() on a replicated database establishes its home map over the nodes that replicate it, and a node that joins afterwards refuses cluster locks until an operator applies a map that includes it (record_lock_apply_homes). Every peer advertises record lock capability level ${RECORD_LOCKS_CAPABILITY}.`
-			);
-		});
-	else if (CLUSTER_RECORD_LOCKS_ENABLED)
+	if (CLUSTER_RECORD_LOCKS_ENABLED)
 		whenThreadsStarted.then(() => {
 			// Operator-visible at the point the switch takes effect, not only in repo design docs. The
 			// switch alone grants nothing: the home map is stated by an operator, never derived here

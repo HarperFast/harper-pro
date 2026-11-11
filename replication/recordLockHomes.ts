@@ -1,11 +1,8 @@
 /**
  * The operator-agreed home map (harper-pro#825, `docs/record-lock-ownership.md` §4), inside
  * PR #822. Durable, per-database `{active, staged}` state and the operations that transition
- * it — never derived from `hdb_nodes` membership or liveness at run time (§4.1: "no node ever
- * derives, proposes or advances one from what it observes"). The one exception is generation 1
- * in `replication.recordLocks`'s automatic mode (`recordLockBootstrap.ts`): written once, through
- * the transitions below, only after every node any member replicates with agreed on the set and
- * held no home-map history; RECORD_LOCK_HOMES_DESIGN.md "Generation 1 without an operator".
+ * it — never derived from `hdb_nodes` membership or liveness (§4.1: "no node ever derives,
+ * proposes or advances one from what it observes").
  *
  * Storage is a dedicated, `LOCAL_ONLY` system table, `hdb_record_lock_homes` — never
  * replicated or LWW-merged with a peer's copy, exactly like `recordLockIncarnation`'s existing
@@ -599,9 +596,6 @@ let membership: MembershipReaders = {
 };
 export function setHomesMembershipReaders(readers: MembershipReaders): void {
 	membership = readers;
-}
-export function homesMembership(): MembershipReaders {
-	return membership;
 }
 
 /**

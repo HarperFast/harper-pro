@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import { cp, mkdtemp } from 'node:fs/promises';
-import { availableParallelism, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
@@ -64,46 +64,16 @@ export async function startNode(suiteName, env, threadsCount = 1, preload) {
 	return ctx;
 }
 
-/**
- * The install default is one worker per CPU less one; the harness pins one unless told. At least two, so a
- * `lock()` served off the coordinating worker relays to it; at most three, so a three-node suite fits a runner.
- */
-const DEFAULT_THREADS = Math.min(3, Math.max(2, availableParallelism() - 1));
-
-function defaultOptionsFor(hostname, { threadsCount = DEFAULT_THREADS, recordLocks, env = {} } = {}) {
-	const replication = {
-		securePort: hostname + ':9933',
-		databases: [DB, 'system'],
-		pingInterval: 1000,
-		pingTimeout: 3000,
-	};
-	if (recordLocks !== undefined) replication.recordLocks = recordLocks;
-	return {
-		config: {
-			analytics: { aggregatePeriod: -1 },
-			logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
-			threads: { count: threadsCount },
-			replication,
-		},
-		env: { HARPER_NO_FLUSH_ON_EXIT: true, ...env },
-	};
-}
-
-/** `recordLocks: null` clears a value an earlier start wrote. */
-export async function startDefaultNode(suiteName, options) {
+/** `startNode` with `replication.recordLocks` set to `recordLocks`, or absent when it is undefined. */
+export async function startNodeWithRecordLocks(suiteName, recordLocks, env) {
 	const hostname = await getNextAvailableLoopbackAddress();
 	const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
 	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
 	const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
-	await startHarper(ctx, defaultOptionsFor(hostname, options));
-	return ctx;
-}
-
-export async function restartDefaultNode(ctx, options) {
-	const { hostname, dataRootDir } = ctx.harper;
-	const restarted = { name: ctx.name, harper: { hostname, dataRootDir } };
-	await startHarper(restarted, defaultOptionsFor(hostname, options));
-	ctx.harper = restarted.harper;
+	const options = optionsFor(hostname, env);
+	if (recordLocks === undefined) delete options.config.replication.recordLocks;
+	else options.config.replication.recordLocks = recordLocks;
+	await startHarper(ctx, options);
 	return ctx;
 }
 
@@ -318,8 +288,8 @@ export function apply(node, fields) {
  * Taken and released inside one request: a separate release could be served by another http worker
  * than the one holding the lock.
  */
-export async function lockStatus(node, id, signal) {
-	return (await call(node, 'LockOnce/', { id, timeout: 2_000 }, signal)).status;
+export async function lockStatus(node, id) {
+	return (await call(node, 'LockOnce/', { id, timeout: 2_000 })).status;
 }
 
 export async function assertLocks(nodes, expected, why) {
