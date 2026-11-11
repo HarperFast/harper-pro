@@ -524,11 +524,11 @@ describe('tombstoneCopy', () => {
 			assert.strictEqual(peerSupportsTombstoneCopy(resolvePeerCapabilities(bag)), false, JSON.stringify(bag));
 	});
 
-	it('is advertised by every build and clamped to the level this build implements', () => {
+	it('is advertised only with per-origin logs (RocksDB) and clamped to the level this build implements', () => {
 		for (const perOriginLogs of [true, false])
 			assert.strictEqual(
 				peerSupportsTombstoneCopy(resolvePeerCapabilities(buildLocalCapabilities(1, false, perOriginLogs))),
-				true
+				perOriginLogs
 			);
 		assert.strictEqual(resolvePeerCapabilities({ tombstoneCopy: 5 }).tombstoneCopy, TOMBSTONE_COPY_CAPABILITY);
 	});

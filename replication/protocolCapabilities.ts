@@ -157,10 +157,7 @@ export function peerSupportsTombstoneCopy(resolved: ResolvedPeerCapabilities): b
 	return resolved.tombstoneCopy >= TOMBSTONE_COPY_CAPABILITY;
 }
 
-/**
- * Whether a subscription request declares `tombstoneCopy`. The sender reads it only while the receiver's bag is
- * not learned, so a copy started then still sends delete tombstones as `delete` to a receiver that stores them.
- */
+/** Read only while the receiver's bag is not learned; a learned bag decides. */
 export function receiverDeclaresTombstoneCopy(entries: unknown): boolean {
 	if (!Array.isArray(entries)) return false;
 	return entries.some((entry) => {
@@ -237,7 +234,8 @@ export function buildLocalCapabilities(
 		originFloors: perOriginLogs ? (durableFloors ? ORIGIN_FLOORS_CAPABILITY : 1) : 0,
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 		residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
-		tombstoneCopy: TOMBSTONE_COPY_CAPABILITY,
+		// LMDB applies a copied delete as an ordinary replicated delete, not as a copy-applied tombstone
+		tombstoneCopy: perOriginLogs ? TOMBSTONE_COPY_CAPABILITY : 0,
 		residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 		residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 		shardingRecovery: perOriginLogs ? SHARDING_RECOVERY_CAPABILITY : 0,

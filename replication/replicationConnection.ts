@@ -13561,7 +13561,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					endTime: node.endTime,
 					shardingProjection,
 					refusesCopies: restrictedOrigins,
-					...(!TEST_OMIT_CAPABILITIES && { tombstoneCopy: TOMBSTONE_COPY_CAPABILITY }),
+					...(!TEST_OMIT_CAPABILITIES && STORAGE_IS_ROCKSDB && { tombstoneCopy: TOMBSTONE_COPY_CAPABILITY }),
 					copyResume, // present only when resuming an interrupted bulk copy
 					...(floorOnlyStart !== undefined && startTime === floorOnlyStart && { floorGeneration: floorOnlyGeneration }),
 				};
