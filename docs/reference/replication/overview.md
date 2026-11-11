@@ -426,7 +426,7 @@ Check each management operation's replication default before using it in a singl
 
 ## Cluster Record Locks
 
-On a replicated table, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. Conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default. A table declared with `replicate: false` takes a node-local lock instead.
+On a replicated table, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. From v5.4.0, conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default. A table declared with `replicate: false` takes a node-local lock instead.
 
 Cluster record locks are off unless you turn them on. While they are off, a cluster `lock()` and a conditional write on a replicated table answer `503` with a message naming the fix. `{ scope: 'node' }` still takes a node-local lock, and `rest.preconditionLocks: false` makes conditional writes skip the lock.
 

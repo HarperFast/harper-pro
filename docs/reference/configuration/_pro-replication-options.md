@@ -18,7 +18,7 @@ replication:
 - `port` — Replication port
 - `securePort` — Secure replication port; _Default_: `9933` (changed from `9925` in v4.5.0)
 - `threads` — Worker threads dedicated to replication, which then own the replication port and every subscription and load no application code; requires `port` or `securePort`; see [Dedicated Replication Threads](../replication/overview.md#dedicated-replication-threads); _Default_: `0` (replication runs on the HTTP worker threads) (Added in: v5.4.0)
-- `recordLocks` — Cluster-wide `lock()` and lock-backed conditional REST writes on replicated databases; set it on every node, then apply a home map with `record_lock_apply_homes`; see [Cluster Record Locks](../replication/overview.md#cluster-record-locks). Fabric turns it on itself. Requires RocksDB; _Default_: `false` (Added in: v5.3.0)
+- `recordLocks` — Cluster-wide `lock()` on replicated databases, and from v5.4.0 lock-backed conditional REST writes; set it on every node, then apply a home map with `record_lock_apply_homes`; see [Cluster Record Locks](../replication/overview.md#cluster-record-locks). Fabric turns it on itself. Requires RocksDB; _Default_: `false` (Added in: v5.3.0)
 - `enableRootCAs` — Verify against Node.js Mozilla CA store; _Default_: `true`
 - `pingInterval` — Interval between replication keep-alive pings (ms); _Default_: `30000`
 - `pingTimeout` — Time without received socket activity before a replication connection is considered dead (ms); _Default_: twice `pingInterval`.
