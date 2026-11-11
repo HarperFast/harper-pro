@@ -3,7 +3,7 @@
  *
  * Two nodes on `data`, retention in seconds. B is stopped while A's history ages past retention, so no live traffic
  * or certified floor can freshen B's resume point:
- * - when B had everything A wrote before A purged its log, and A writes again just before B returns, A resumes B
+ * - when B had everything A wrote before the idle interval, and A writes again just before B returns, A resumes B
  *   incrementally: no forced copy;
  * - when B missed a write that is past retention but still in A's log (RocksDB), A resumes B incrementally too;
  * - when B missed a tagged write that A has since purged, A forces the copy and B recovers the tag.
@@ -11,7 +11,9 @@
  * in the first two cases.
  *
  * On RocksDB the purge bound is the largest key retention actually deleted, and retention deletes a segment only once
- * every entry in it is flushed, which an idle node may not do for minutes; a clean exit flushes.
+ * every entry in it is flushed, which an idle node may not do for minutes; a clean exit flushes. The first case does
+ * not force a purge: A can append an entry with no record just after B's last one, which B never receives if it stops
+ * first, and purging that entry rightly forces a copy.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -42,8 +44,6 @@ const KEEPALIVE_MS = 15_000;
 const FORCED_COPY = 'forcing a bounded base-copy resync';
 const OWN_LOG_PURGED_THROUGH =
 	/of database data, whose log local it would replay from \S+, under transaction-log history purged through (\S+);/;
-// log keys come from a performance.now()-based clock that can trail Date.now(); an earlier purge's bound is seconds older
-const CLOCK_SLACK_MS = 1000;
 
 for (const engine of ['rocksdb', 'lmdb']) {
 	suite(`retention base copy follows the purge bound (${engine})`, { timeout: 600_000 }, (ctx) => {
@@ -126,11 +126,11 @@ for (const engine of ['rocksdb', 'lmdb']) {
 
 		after(() => stopAndTeardownNodes([A, B]));
 
-		test('a follower that missed nothing resumes from a source that purged its log without a copy', async () => {
+		test('a follower that missed nothing resumes from an idle source without a copy', async () => {
 			await upsert(A, 'caught-up');
 			await arrives(B, 'caught-up');
 			await stop(B);
-			await purgeOwnLog(A);
+			await delay(IDLE_MS);
 			const mark = await logMark(A);
 			await upsert(A, 'after-idle');
 			await start(B);
@@ -167,8 +167,15 @@ for (const engine of ['rocksdb', 'lmdb']) {
 
 		test('a follower that missed a write A has since purged gets a copy and the write', async () => {
 			await stop(B);
-			const beforeMissed = Date.now();
 			await upsert(A, 'missed');
+			// a local write's version is its log key
+			const [{ __updatedtime__: missedVersion }] = await sendOperation(A, {
+				operation: 'search_by_id',
+				database: 'data',
+				table: TABLE,
+				ids: ['missed'],
+				get_attributes: ['__updatedtime__'],
+			});
 			await purgeOwnLog(A);
 			const mark = await logMark(A);
 			await start(B);
@@ -177,8 +184,8 @@ for (const engine of ['rocksdb', 'lmdb']) {
 			ok(served.includes('subscription to'), 'the log read is of the process that served B');
 			const forced = forcedCopiesTo(B, served);
 			ok(
-				forced.some((line) => Date.parse(line.match(OWN_LOG_PURGED_THROUGH)?.[1]) >= beforeMissed - CLOCK_SLACK_MS),
-				`A forced the copy for its own log, purged through the missed write (written after ${new Date(beforeMissed).toISOString()}):\n${forced.join('\n')}`
+				forced.some((line) => Date.parse(line.match(OWN_LOG_PURGED_THROUGH)?.[1]) >= new Date(missedVersion).getTime()),
+				`A forced the copy for its own log, purged through the missed write (version ${missedVersion}):\n${forced.join('\n')}`
 			);
 		});
 	});
