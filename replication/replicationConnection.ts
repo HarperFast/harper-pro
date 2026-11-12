@@ -844,6 +844,37 @@ export function earlierReservationSlots(dbisDB: DbisStore, peerId: number, pass:
 	return slots;
 }
 
+/**
+ * A link this node unsubscribed (its peer was removed, or the topology stopped linking to it) runs no later pass, so
+ * nothing would settle what its passes reserved and relaying would stay held back for the whole reservation hold.
+ * Their bounds become the peer's settled bound instead, where the start check enforces them, and the reservations go
+ * in the same commit: `copied` for the pass that was running, which knows the versions it received, and the reserved
+ * value for every earlier attempt.
+ */
+export function settleAbandonedReservations(
+	dbisDB: DbisStore | undefined,
+	peerId: number,
+	rootStore: any,
+	pass: string,
+	copied: ReadonlyMap<number, number>
+): Promise<boolean> {
+	if (!dbisDB?.put || !dbisDB.getRange) return Promise.resolve(false);
+	const raise = new Map<number, number>();
+	const release: (string | number)[][] = [];
+	for (const { key, value } of dbisDB.getRange({
+		start: COPY_BOUND_KEY,
+		end: [COPY_BOUND_KEY, Buffer.from([0xff])],
+	}) as Iterable<{ key: any; value: unknown }>) {
+		if (key[1] !== peerId || key[2] !== 'reserved') continue;
+		release.push(key.slice(2));
+		if (key[3] === pass) {
+			for (const [originId, bound] of copied) if (!(raise.get(originId)! >= bound)) raise.set(originId, bound);
+		} else mergeCopyBoundRecordInto(raise, value);
+	}
+	if (release.length === 0) return Promise.resolve(false);
+	return writeCopyBoundRows(dbisDB, peerId, rootStore, { raise: validBounds(raise), release });
+}
+
 const copyBoundsByEpoch = new WeakMap<object, { epoch: number; bounds: RelayCopyBounds }>();
 /** One read per thread for each origin-state epoch, shared by every session that asks under it; never mutate it. */
 export function readRelayCopyBoundsAt(dbisDB: DbisStore, auditStore: any, epoch: number): RelayCopyBounds {
@@ -3483,30 +3514,37 @@ export function cursorBelowFloor(floor: number): number {
 }
 
 /**
- * The cursor a region-topology supplier switch (harper-pro#1291) resumes a managed origin from on its new link: the
- * relieved supplier's own position for it, or a floor core certifies across routes, whichever is higher. A relieved
- * state that marks the origin revoked, holed or partial, or names another generation than the certified floor,
- * contributes nothing. Undefined when neither source has one.
+ * The cursor a region-topology supplier switch (harper-pro#1291) resumes a managed origin from on its new link: where
+ * the relieved supplier's own link would have resumed it (its position for the origin, or the floor it certified for
+ * it, whichever is higher), or a floor core certifies across routes if that is higher still. A relieved state that
+ * marks the origin revoked, holed or partial, or names another generation than the certified floor, contributes
+ * nothing. Undefined when no source has one.
+ *
+ * `positionOverlap` lowers the position, never a floor: a position can sit above an entry that landed late in the
+ * origin's log, and a floor cannot. A relay applies that overlap itself to every cursor it is sent; the origin's own
+ * link applies none, so a start borrowed for it passes `ORIGIN_CURSOR_OVERLAP_MS`.
  */
 export function borrowedOriginCursor(
 	relievedState: any,
-	qualified: { floor: number; generation: string } | undefined
+	qualified: { floor: number; generation: string } | undefined,
+	positionOverlap = 0
 ): number | undefined {
 	let cursor = qualified ? cursorBelowFloor(qualified.floor) : undefined;
 	if (
-		relievedState &&
-		relievedState.floorRevoked !== true &&
-		relievedState.hole !== true &&
-		relievedState.partialHistory !== true &&
-		isValidFrameTxnLogKey(relievedState.originLogKey)
-	) {
-		const generation = relievedState.originGeneration ?? relievedState.lastGeneration;
-		if (
-			(!qualified || generation === undefined || generation === qualified.generation) &&
-			!(cursor >= relievedState.originLogKey)
-		)
-			cursor = relievedState.originLogKey;
-	}
+		!relievedState ||
+		relievedState.floorRevoked === true ||
+		relievedState.hole === true ||
+		relievedState.partialHistory === true
+	)
+		return cursor;
+	const generation = relievedState.originGeneration ?? relievedState.lastGeneration;
+	if (qualified && generation !== undefined && generation !== qualified.generation) return cursor;
+	const raise = (candidate: number) => {
+		if (!(cursor! >= candidate)) cursor = candidate;
+	};
+	if (isValidFloor(relievedState.closedFloor)) raise(cursorBelowFloor(relievedState.closedFloor));
+	if (isValidFrameTxnLogKey(relievedState.originLogKey))
+		raise(Math.max(relievedState.originLogKey - positionOverlap, 2));
 	return cursor;
 }
 
@@ -7724,14 +7762,28 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		relayCopyLease = undefined;
 	}
 	ws.once('close', releaseRelayLease);
-	// a pass that ends unsettled having applied no copied row covers nothing, so its reservation must not hold relaying
 	ws.once('close', () => {
-		if (!copyPassToken || settledPass === copyPassToken || copiedVersionByOrigin.size > 0) return;
+		const abandoned = options.connection?.intentionallyUnsubscribed === true;
+		const unsettled = copyPassToken !== '' && settledPass !== copyPassToken;
 		const { dbisDB } = getDatabaseStores();
+		const rootStore = (auditStore ?? getDatabaseStores().auditStore)?.rootStore;
 		if (!dbisDB) return;
-		writeCopyBoundRows(dbisDB, ownCopyPeerId(), (auditStore ?? getDatabaseStores().auditStore)?.rootStore, {
-			release: [['reserved', copyPassToken]],
-		}).catch((error) =>
+		// peer 0 stands for a source this session never identified, which other sessions may share
+		if (abandoned && ownCopyPeerId() !== 0) {
+			settleAbandonedReservations(
+				dbisDB,
+				ownCopyPeerId(),
+				rootStore,
+				unsettled ? copyPassToken : '',
+				copiedVersionByOrigin
+			).catch((error) =>
+				logger.warn?.(connectionId, 'could not settle the copy reservations of an ended link for', databaseName, error)
+			);
+			return;
+		}
+		// a pass that ends unsettled having applied no copied row covers nothing, so its reservation must not hold relaying
+		if (!unsettled || copiedVersionByOrigin.size > 0) return;
+		writeCopyBoundRows(dbisDB, ownCopyPeerId(), rootStore, { release: [['reserved', copyPassToken]] }).catch((error) =>
 			logger.warn?.(connectionId, 'could not release an empty copy reservation for', databaseName, error)
 		);
 	});
@@ -13425,9 +13477,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	/**
 	 * Where a temporary direct link to a managed origin starts that origin's own log: this node held the origin only
-	 * through a supplier, so its start is the supplier's position for it or a certified floor, as for any switch, less
-	 * the overlap a relayed cursor gets from its sender (a direct start gets none). Null when this link is not one;
-	 * undefined when neither source has a position, which leaves the start to a base copy.
+	 * through a supplier, so its start is where that supplier's link would have resumed it, as for any switch. Null when
+	 * this link is not one; undefined when the supplier's link recorded neither a position nor a floor for the origin,
+	 * which leaves the start to a base copy.
 	 */
 	function borrowedDirectStart(name: string, id: number, store: any, dbisDB: any): number | undefined | null {
 		const borrow: Record<string, string | null> | undefined = options.connection?.topologyBorrow;
@@ -13439,11 +13491,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				? nameToId[relieved]
 				: undefined;
 		const relievedRow = relievedId === undefined ? undefined : readDbisCursorSync(dbisDB, 'seq', relievedId);
-		const cursor = borrowedOriginCursor(
+		return borrowedOriginCursor(
 			relievedId === id ? undefined : relievedOriginState(relievedRow, relievedId, id),
-			readQualifiedOriginFloors(store, dbisDB).floors.get(id)
+			readQualifiedOriginFloors(store, dbisDB).floors.get(id),
+			ORIGIN_CURSOR_OVERLAP_MS
 		);
-		return cursor === undefined ? undefined : Math.max(cursor - ORIGIN_CURSOR_OVERLAP_MS, 2);
 	}
 	/**
 	 * A managed origin excluded here is supplied by another link, so this route's record of it stops being continuous:

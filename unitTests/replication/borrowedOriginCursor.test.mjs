@@ -42,6 +42,34 @@ describe('borrowedOriginCursor (harper-pro#1291 supplier switch)', () => {
 		assert.strictEqual(borrowedOriginCursor({ originLogKey: 12000, originGeneration: 'g0' }, undefined), 12000);
 	});
 
+	it('takes the floor the relieved supplier certified, alone or when it is above the position', () => {
+		assert.strictEqual(borrowedOriginCursor({ id: 4, closedFloor: 7000 }, undefined), cursorBelowFloor(7000));
+		assert.strictEqual(
+			borrowedOriginCursor({ id: 4, closedFloor: 7000, originLogKey: 5000 }, undefined),
+			cursorBelowFloor(7000)
+		);
+		assert.strictEqual(borrowedOriginCursor({ id: 4, closedFloor: 7000, originLogKey: 8000 }, undefined), 8000);
+		for (const flag of ['floorRevoked', 'hole', 'partialHistory'])
+			assert.strictEqual(borrowedOriginCursor({ id: 4, closedFloor: 7000, [flag]: true }, undefined), undefined, flag);
+		assert.strictEqual(
+			borrowedOriginCursor({ closedFloor: 12000, originGeneration: 'g0' }, { floor: 9000, generation: 'g1' }),
+			cursorBelowFloor(9000)
+		);
+	});
+
+	it('lowers a position by the overlap, and never a floor', () => {
+		assert.strictEqual(borrowedOriginCursor({ originLogKey: 100_000 }, undefined, 60_000), 40_000);
+		assert.strictEqual(borrowedOriginCursor({ originLogKey: 5000 }, undefined, 60_000), 2);
+		assert.strictEqual(
+			borrowedOriginCursor({ originLogKey: 100_000, closedFloor: 90_000 }, undefined, 60_000),
+			cursorBelowFloor(90_000)
+		);
+		assert.strictEqual(
+			borrowedOriginCursor({ originLogKey: 100_000 }, { floor: 70_000, generation: 'g1' }, 60_000),
+			cursorBelowFloor(70_000)
+		);
+	});
+
 	it('has no cursor with neither source', () => {
 		assert.strictEqual(borrowedOriginCursor(undefined, undefined), undefined);
 	});

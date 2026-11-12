@@ -12,6 +12,7 @@ import assert from 'node:assert';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import {
 	restartNode,
@@ -48,6 +49,9 @@ suite('Region grid topology', { timeout: 1_500_000 }, (ctx) => {
 	const region = (name) => layout.region.get(name);
 	const named = (regionName, index) => layout.named(regionName, index);
 	const FULL_COPY = /Requesting full copy of database data\b/;
+	const FORCED_COPY = /Peer (\S+) requested replication of database data\b[^\n]*forcing a bounded base-copy resync/g;
+	// a carrier certifies a floor for each origin it relays at this interval (30 s by default)
+	const FLOOR_INTERVAL_MS = 1000;
 
 	/** Counts the frames of `ids` each live node was sent, and by whom, since `marks`. */
 	async function framesByReceiver(live, marks, ids) {
@@ -67,7 +71,11 @@ suite('Region grid topology', { timeout: 1_500_000 }, (ctx) => {
 		hostnames.sort();
 		layout = regionLayout(hostnames, nodes);
 		const started = await Promise.allSettled(
-			hostnames.map((name) => startNode(ctx.name, name, layout.region.get(name), workDir))
+			hostnames.map((name) =>
+				startNode(ctx.name, name, layout.region.get(name), workDir, {
+					env: { HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS: String(FLOOR_INTERVAL_MS) },
+				})
+			)
 		);
 		for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
 		const failed = started.find((result) => result.status === 'rejected');
@@ -128,7 +136,11 @@ suite('Region grid topology', { timeout: 1_500_000 }, (ctx) => {
 		const writer = named('west', 2);
 		const otherOrigin = named('eu', 2);
 		await insert(writer, 'before-kill', writer.hostname, 20);
-		const marksAtKill = await markAll([standIn, follower]);
+		await waitForPhase(nodes(), 'before-kill', 20);
+		// otherOrigin has written nothing, so east holds no position for it: the stand-in can start its link only from
+		// the floor the carrier certified, which no operation reports
+		await delay(3 * FLOOR_INTERVAL_MS);
+		const marksAtKill = await markAll([standIn, follower, writer, otherOrigin]);
 		await stopNodeProcess(carrier);
 		await insert(writer, 'after-kill', writer.hostname, 20);
 		await insert(follower, 'after-kill-east', follower.hostname, 20);
@@ -143,10 +155,16 @@ suite('Region grid topology', { timeout: 1_500_000 }, (ctx) => {
 		const followerLinks = await dataLinks(follower);
 		for (const origin of [writer, otherOrigin])
 			assert.ok(!followerLinks.has(origin.hostname), `${follower.hostname} linked to ${origin.hostname} as well`);
-		// the takeover resumes from the lost carrier's position: no base copy on either node
+		// the takeover resumes from where the lost carrier's link stood: nobody asks for a base copy or is sent one
 		for (const node of [standIn, follower]) {
 			const log = await readLogSince(node, marksAtKill.get(node.hostname));
 			assert.ok(!FULL_COPY.test(log), `${node.hostname} requested a base copy during the takeover`);
+		}
+		for (const sender of [writer, otherOrigin, standIn]) {
+			const forced = [...(await readLogSince(sender, marksAtKill.get(sender.hostname))).matchAll(FORCED_COPY)]
+				.map(([, peer]) => peer)
+				.filter((peer) => peer === standIn.hostname || peer === follower.hostname);
+			assert.deepEqual(forced, [], `${sender.hostname} forced a base copy during the takeover`);
 		}
 		// settled on the stand-in, a new remote write enters the region once, through it
 		const marks = await markAll(live);
