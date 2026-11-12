@@ -209,7 +209,7 @@ Removal zeroes the buffer from the main thread in `onNodeUpdate(null)`, via `cle
 
 ### `hdb_nodes` system table (`getHDBNodeTable` in `knownNodes.ts`)
 
-Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`, `url`, `routes`, `ca`, `ca_info`, `replicates`, `revoked_certificates`, plus `__createdtime__` / `__updatedtime__`. `recordLockIncarnation` (harper-pro#438) is not a declared attribute and is no longer authoritative: the counter lives in `hdb_record_lock_node` (see the record-lock section) and `bumpHomeIncarnation` only mirrors it here, best effort, for a rollback to a build that reads this field. Subscription updates flow through `subscribeToNodeUpdates`, which fans out to `monitorNodeCAs` → refresh `replicationCertificateAuthorities` (exported from `replicator.ts`).
+Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`, `url`, `routes`, `ca`, `ca_info`, `replicates`, `revoked_certificates`, plus `__createdtime__` / `__updatedtime__`. `recordLockIncarnation` (harper-pro#438) is not a declared attribute and is no longer authoritative: the counter lives in `hdb_record_lock_node` (see the record-lock section) and `bumpHomeIncarnation` only mirrors it here, best effort, for a rollback to a build that reads this field. Each event republishes `server.nodes`/`server.shards` from one scan (`publishKnownNodes`); a listener hears its row and rows entering or leaving it (`notifyNodeListener`).
 
 ---
 

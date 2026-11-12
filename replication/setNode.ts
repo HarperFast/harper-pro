@@ -6,7 +6,7 @@ import {
 	getReplicationCertAuth,
 	loadForge,
 } from '../security/certificate.ts';
-import { validateBySchema } from '../core/validation/validationWrapper.js';
+import { validateBySchema, validateAndConvertBySchema } from '../core/validation/validationWrapper.js';
 import Joi from 'joi';
 import { get } from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -27,7 +27,7 @@ const validationSchema = Joi.object({
 	receivesFrom: Joi.array(),
 	subscriptions: Joi.array(),
 	revoked_certificates: Joi.array(),
-	shard: Joi.number(),
+	shard: Joi.number().integer().min(0).max(65535),
 	isLeader: Joi.boolean(),
 });
 
@@ -61,10 +61,11 @@ export async function setNode(req: any) {
 	let { url, hostname } = req;
 	if (!url) url = hostnameToUrl(hostname);
 	else if (!hostname) hostname = req.hostname = urlToNodeName(url);
-	const validation = validateBySchema(req, validationSchema);
+	const { error: validation, value: validated } = validateAndConvertBySchema(req, validationSchema);
 	if (validation) {
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
 	}
+	if (req.shard !== undefined) req.shard = validated.shard;
 
 	// Normalize and validate the optional data cutoff at the boundary, and persist a number so readers see
 	// one shape. Only a strict ISO 8601 UTC string or an epoch-ms number is accepted; anything else (a typo
@@ -89,9 +90,10 @@ export async function setNode(req: any) {
 		return removeNodeFromTable(hostname, url, getHDBNodeTable(), sendOperationToNode);
 	}
 
-	if (!url) throw new ClientError('url required for this operation');
-
 	const thisUrl = getThisNodeUrl();
+	if (hostname === getThisNodeName() || (url && url === thisUrl))
+		assertOwnShard(req.operation ?? 'set_node', req.shard);
+	if (!url) throw new ClientError('url required for this operation');
 	if (thisUrl == null) throw new ClientError('replication url is missing from harperdb-config.yaml');
 
 	let rep;
@@ -431,6 +433,16 @@ export async function findExistingNodeRecord(hostname: string, url: string, hdbN
 	return undefined;
 }
 
+/** This node's own row follows replication.shard, which ensureThisNode writes back at every start. */
+function assertOwnShard(operation: string, shard: unknown) {
+	const configuredShard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+	if (shard !== undefined && shard !== configuredShard) {
+		throw new ClientError(
+			`${operation} cannot set this node's shard to ${shard}: it follows replication.shard (${configuredShard ?? 'not set'}); change replication.shard and restart instead`
+		);
+	}
+}
+
 const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization', 'start_time', 'force_signing'];
 
 /**
@@ -438,7 +450,7 @@ const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization'
  * peer contact. Anything else needs setNode(), which resets omitted topology to full mesh and
  * derives a default url from this node's own port -- both carried forward from the existing row.
  */
-async function updateNode(req: any) {
+export async function updateNode(req: any) {
 	const hostname = req.hostname || req.node_name || req.name || (req.url ? urlToNodeName(req.url) : undefined);
 	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
 	if (req.replicates !== undefined) {
@@ -451,10 +463,22 @@ async function updateNode(req: any) {
 			`update_node does not support top-level 'subscribe'/'publish' without 'subscriptions'; supply a subscriptions array, or use set_node`
 		);
 	}
+	if (req.shard !== undefined) {
+		const { error, value } = validateAndConvertBySchema({ shard: req.shard }, validationSchema);
+		if (error) throw new ClientError(error.message);
+		req.shard = value.shard;
+	}
 	const requestHasTopology = Boolean(req.subscriptions || req.sendsTo || req.receivesFrom);
+	// Classified before req.url is filled from the stored row below, which would make every request look
+	// like a url change.
+	const metadataOnly =
+		!requestHasTopology &&
+		(req.revoked_certificates !== undefined || req.shard !== undefined) &&
+		!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined);
 
 	if (hostname) {
 		const found = await findExistingNodeRecord(hostname, url);
+		if ((found?.name ?? hostname) === getThisNodeName()) assertOwnShard('update_node', req.shard);
 		if (found) {
 			// Normalize to the row's own identity regardless of which path runs below, so an alias or a
 			// custom port/scheme a caller used to reach the peer is never mistaken for a change to apply.
@@ -462,7 +486,7 @@ async function updateNode(req: any) {
 			req.url ??= found.record.url;
 
 			if (!requestHasTopology) {
-				if (!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined)) {
+				if (metadataOnly) {
 					const validation = validateBySchema(req, validationSchema);
 					if (validation) {
 						throw handleHDBError(
