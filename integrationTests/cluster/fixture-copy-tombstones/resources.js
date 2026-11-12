@@ -66,18 +66,17 @@ export class WriteTogether extends Resource {
 	}
 }
 
-// A write older than the row's stored version, from the origin that wrote it, as replication applies one.
+// A write at `version` from the origin of row `likeId`, as replication applies one.
 export class Redeliver extends Resource {
 	static loadAsInstance = false;
 
-	async post(target, { database, table, id, record, behind }) {
+	async post(target, { database, table, id, likeId, record, version }) {
 		const Table = databases[database][table];
-		const { version, nodeId } = Table.primaryStore.getEntry(id);
-		const olderVersion = version - behind;
-		const context = { source: {}, sourceApply: true, timestamp: olderVersion };
+		const { nodeId } = Table.primaryStore.getEntry(likeId);
+		const context = { source: {}, sourceApply: true, timestamp: version };
 		await transaction(context, async () => {
 			const row = await Table.getResource(id, context);
-			row._writeUpdate(id, record, true, { isNotification: true, nodeId, version: olderVersion });
+			await row._writeUpdate(id, record, true, { isNotification: true, nodeId, version });
 		});
 	}
 }
