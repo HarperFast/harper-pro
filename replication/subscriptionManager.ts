@@ -153,6 +153,7 @@ type ReplicationConnectionStatus = {
 		connected?: boolean;
 		recheck?: ReturnType<typeof setTimeout>;
 	};
+	originFallbackTimer?: ReturnType<typeof setTimeout>;
 	nodes: ({
 		name: string;
 		url: string;
@@ -1893,11 +1894,34 @@ export async function startOnMainThread(options) {
 		}
 	}
 	// only assign these if we are on the main thread
+	type LinkReport = { url: string; subscriptionUrl?: string; database: string };
+	const fallbackKey = (url: string, originUrl: string, database: string) => `${url}\0${originUrl}\0${database}`;
+	// A closed fallback's socket still reports its close, under its peer's URL: that must not reach the peer's entry.
+	const retiredOriginFallbacks = new Set<string>();
 	/** The entry whose origin `report`'s socket carries as a fallback link, when it is one. */
-	function originFallbackOwner(report: { url: string; subscriptionUrl?: string; database: string }): any {
+	function originFallbackOwner(report: LinkReport): any {
 		if (!report.subscriptionUrl || report.subscriptionUrl === report.url) return;
 		const owner = connectionReplicationMap.get(report.subscriptionUrl)?.get(report.database);
 		return owner?.originFallback?.url === report.url ? owner : undefined;
+	}
+	const fromRetiredOriginFallback = (report: LinkReport) =>
+		!!report.subscriptionUrl &&
+		retiredOriginFallbacks.has(fallbackKey(report.url, report.subscriptionUrl, report.database));
+	/**
+	 * Opens the fallback once the origin's link has been down for TOPOLOGY_HOLD_MS, the hold a supplier gets: a first
+	 * dial that fails while a cluster forms, or a reconnect, is back before then. True when this origin has region-mates
+	 * to fall back to, so the caller leaves it to that.
+	 */
+	function scheduleOriginFallback(entry: any, database: string): boolean {
+		if (entry.originFallback || entry.originFallbackTimer) return true;
+		if (originFallbackCandidates(entry, database).length === 0) return false;
+		entry.originFallbackTimer = setTimeout(() => {
+			entry.originFallbackTimer = undefined;
+			const current = connectionReplicationMap.get(entry.url)?.get(database);
+			if (current === entry && entry.connected === false && !entry.unsubscribed) openOriginFallback(entry, database);
+		}, TOPOLOGY_HOLD_MS);
+		entry.originFallbackTimer.unref?.();
+		return true;
 	}
 	/**
 	 * Under the grid a node that receives an origin from another region links to nothing else of that origin's region.
@@ -1920,6 +1944,7 @@ export async function startOnMainThread(options) {
 		logger.info(
 			`Region topology: ${database} takes ${origin.name} from ${mate} while its link to ${origin.name} is down`
 		);
+		retiredOriginFallbacks.delete(fallbackKey(getNodeURL(mateNode), origin.url, database));
 		connectToNextWorker(origin, database, mateNode);
 		entry.originFallback = {
 			name: mate,
@@ -1954,11 +1979,21 @@ export async function startOnMainThread(options) {
 		openOriginFallback(entry, database, next);
 	}
 	function closeOriginFallback(entry: any, database: string): void {
+		clearTimeout(entry.originFallbackTimer);
+		entry.originFallbackTimer = undefined;
 		const fallback = entry.originFallback;
 		if (!fallback) return;
 		entry.originFallback = undefined;
 		clearTimeout(fallback.recheck);
-		const request = { type: 'unsubscribe-from-node', database, url: fallback.url, nodes: [fallback.node] };
+		retiredOriginFallbacks.add(fallbackKey(fallback.url, fallback.node.url, database));
+		// `clearStatus`: its close must not stamp DOWN into a status buffer the peer's own link may share
+		const request = {
+			type: 'unsubscribe-from-node',
+			database,
+			url: fallback.url,
+			nodes: [fallback.node],
+			clearStatus: true,
+		};
 		if (fallback.worker) fallback.worker.postMessage(request);
 		else unsubscribeFromNode(request);
 	}
@@ -1975,6 +2010,7 @@ export async function startOnMainThread(options) {
 				if (!connection.finished) rotateOriginFallback(fallbackOwner, connection.database);
 				return;
 			}
+			if (fromRetiredOriginFallback(connection)) return;
 			const nodeMapKeys = Array.from(nodeMap.keys());
 			const nodeNames = nodeMapKeys.sort();
 			const existingIndex = nodeNames.indexOf(connection.name || urlToNodeName(connection.url));
@@ -2000,7 +2036,7 @@ export async function startOnMainThread(options) {
 				updateShardingFailover(connection.database);
 				return;
 			}
-			if (openOriginFallback(existingWorkerEntry, connection.database)) return;
+			if (scheduleOriginFallback(existingWorkerEntry, connection.database)) return;
 			if (!env.get(CONFIG_PARAMS.REPLICATION_FAILOVER)) {
 				for (const node of existingWorkerEntry.nodes) recordShardingWait(connection.database, node.name, true);
 				// if failover is disabled, immediately return
@@ -2067,6 +2103,7 @@ export async function startOnMainThread(options) {
 			fallbackOwner.originFallback.connected = true;
 			return;
 		}
+		if (fromRetiredOriginFallback(connection)) return;
 		// Basically undo what we did in disconnectedFromNode and also update the latency
 		const dbReplicationWorkers = connectionReplicationMap.get(connection.url);
 		const mainWorkerEntry = dbReplicationWorkers?.get(connection.database);
