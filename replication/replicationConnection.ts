@@ -10792,12 +10792,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
 														const legacyStubCopy = isStub && !stubAsInvalidation;
 														if (legacyStubCopy && table.residency) continue;
-														// a delete's tombstone; a publish-only head also holds no record, but is unflagged
+														// a delete's tombstone, or a record-less head (a publish) over a delete this node took by copy
+														const retainedDelete =
+															entry.value == null && !isStub && !(entry.metadataFlags & FULL_WRITE_HEAD)
+																? entry.copiedDeleteBoundary
+																: undefined;
 														const tombstoneAsDelete =
 															entry.value == null &&
 															!isStub &&
-															Boolean(entry.metadataFlags & FULL_WRITE_HEAD) &&
+															Boolean(entry.metadataFlags & FULL_WRITE_HEAD || retainedDelete) &&
 															sendTombstonesAsDeletes;
+														const copyVersion =
+															tombstoneAsDelete && retainedDelete ? retainedDelete.version : entry.version;
+														const copyNodeId =
+															tombstoneAsDelete && retainedDelete ? retainedDelete.nodeId || nodeId : recordNodeId;
+														if (
+															tombstoneAsDelete &&
+															retainedDelete &&
+															withheldOriginNodeId !== undefined &&
+															copyNodeId === withheldOriginNodeId
+														)
+															continue;
 														const copyType = stubAsInvalidation ? 'invalidate' : tombstoneAsDelete ? 'delete' : 'put';
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;
@@ -10818,11 +10833,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0);
 														const encodeCopyRecord = () =>
 															createAuditEntry({
-																version: entry.version,
+																version: copyVersion,
 																tableId: table.tableId,
 																recordId: entry.key,
 																previousVersion: null,
-																nodeId: recordNodeId,
+																nodeId: copyNodeId,
 																type: copyType,
 																encodedRecord: tombstoneAsDelete
 																	? undefined
@@ -10851,10 +10866,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																	return copyValue;
 																},
 																encoded,
-																version: entry.version,
+																version: copyVersion,
 																residencyId: entry.residencyId,
 																residencySlot: entry.residencySlot,
-																nodeId: recordNodeId,
+																nodeId: copyNodeId,
 																extendedType: copyExtendedType,
 																expiresAt: isReplica ? undefined : entry.expiresAt,
 															},

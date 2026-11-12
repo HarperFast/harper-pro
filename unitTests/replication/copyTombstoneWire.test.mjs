@@ -50,7 +50,7 @@ async function until(predicate) {
 
 describe('delete tombstones in a base copy', function () {
 	this.timeout(30_000);
-	let Records, socket;
+	let Records, socket, boundaryVersion;
 
 	before(async function () {
 		// FULL_WRITE_HEAD and copy-apply are RocksDB-only
@@ -67,17 +67,22 @@ describe('delete tombstones in a base copy', function () {
 		await Records.delete('deleted');
 		await Records.publish('published', { message: 'no record' });
 		// what a node that itself joined by copy holds: an audit-less tombstone
-		const version = Date.now() - 1000;
-		const context = { source: {}, sourceApply: true, timestamp: version };
-		await transaction(context, async () => {
-			const resource = await Records.getResource('copied-deleted', context, { ensureLoaded: false });
-			await resource._writeDelete('copied-deleted', {
-				isNotification: true,
-				isCopyApply: true,
-				nodeId: getIdOfRemoteNode('copy-tombstone-origin', Records.auditStore),
-				version,
+		const takeCopiedDelete = async (key, version) => {
+			const context = { source: {}, sourceApply: true, timestamp: version };
+			await transaction(context, async () => {
+				const resource = await Records.getResource(key, context, { ensureLoaded: false });
+				await resource._writeDelete(key, {
+					isNotification: true,
+					isCopyApply: true,
+					nodeId: getIdOfRemoteNode('copy-tombstone-origin', Records.auditStore),
+					version,
+				});
 			});
-		});
+		};
+		await takeCopiedDelete('copied-deleted', Date.now() - 1000);
+		boundaryVersion = Date.now() - 2000;
+		await takeCopiedDelete('published-over-delete', boundaryVersion);
+		await Records.publish('published-over-delete', { message: 'no record' });
 		setReplicator(DATABASE, Records, {});
 		await until(() => databaseSubscriptions.get(DATABASE)?.auditStore);
 		const tombstone = Records.primaryStore.getEntry('deleted');
@@ -86,6 +91,11 @@ describe('delete tombstones in a base copy', function () {
 		const published = Records.primaryStore.getEntry('published');
 		assert.equal(published.value, null);
 		assert.equal(published.metadataFlags & FULL_WRITE_HEAD, 0, 'premise: a publish-only head is unflagged');
+		const covered = Records.primaryStore.getEntry('published-over-delete');
+		assert.equal(covered.value, null);
+		assert.equal(covered.metadataFlags & FULL_WRITE_HEAD, 0, 'premise: a publish clears the flag');
+		assert.equal(covered.copiedDeleteBoundary?.version, boundaryVersion, 'premise: the delete outlives the publish');
+		assert.ok(covered.version > boundaryVersion);
 	});
 
 	afterEach(() => socket?.close());
@@ -171,6 +181,11 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(copiedDeleted.version, Records.primaryStore.getEntry('copied-deleted').version);
 		assert.equal(records.get('live')?.entry.type, 'put');
 		assert.equal(records.get('published')?.entry.type, 'put', 'a publish-only head is not a delete');
+		const covered = records.get('published-over-delete')?.entry;
+		assert.equal(covered?.type, 'delete', 'a delete under a later publish is copied as that delete');
+		assert.equal(covered.version, boundaryVersion, "at the delete's version, not the publish's");
+		assert.equal(covered.nodeId, copiedDeleted.nodeId, "from the delete's origin");
+		assert.equal(covered.getValue(Records.primaryStore), undefined);
 	});
 
 	for (const peer of ['a pre-key capability bag', 'unlearned capabilities']) {
@@ -185,6 +200,9 @@ describe('delete tombstones in a base copy', function () {
 			const deleted = records.get('deleted');
 			assert.equal(deleted?.entry.type, 'put');
 			assert.deepEqual(deleted.bytes, nilPutEncoding('deleted', deleted.entry.nodeId));
+			const covered = records.get('published-over-delete');
+			assert.equal(covered?.entry.type, 'put');
+			assert.deepEqual(covered.bytes, nilPutEncoding('published-over-delete', covered.entry.nodeId));
 		});
 	}
 
@@ -195,6 +213,7 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(deleted?.type, 'delete');
 		assert.equal(deleted.version, Records.primaryStore.getEntry('deleted').version);
 		assert.equal(records.get('published')?.entry.type, 'put', 'a publish-only head is not a delete');
+		assert.equal(records.get('published-over-delete')?.entry.type, 'delete');
 	});
 
 	for (const tombstoneCopy of [0, '1', true, null]) {

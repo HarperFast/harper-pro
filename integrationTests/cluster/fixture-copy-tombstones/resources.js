@@ -20,6 +20,10 @@ export class StoredRow extends Resource {
 			version: entry.version,
 			origin: originName(Table.auditStore, entry.nodeId),
 			fullWriteHead: Boolean(entry.metadataFlags & FULL_WRITE_HEAD),
+			boundary: entry.copiedDeleteBoundary && {
+				version: entry.copiedDeleteBoundary.version,
+				origin: originName(Table.auditStore, entry.copiedDeleteBoundary.nodeId),
+			},
 			history: (await Table.getHistoryOfRecord(id)).length,
 		};
 	}
@@ -35,6 +39,7 @@ export class WriteTogether extends Resource {
 			for (const { table, op, id, record } of writes) {
 				const Table = databases[database][table];
 				if (op === 'patch') await Table.patch(id, record, context);
+				else if (op === 'publish') await Table.publish(id, record, context);
 				else if (op === 'rewrite')
 					await Table.put(id, JSON.parse(JSON.stringify(await Table.get(id, context))), context);
 				else await Table.put(id, record, context);
@@ -43,5 +48,21 @@ export class WriteTogether extends Resource {
 		const versions = {};
 		for (const { table, id } of writes) versions[id] = databases[database][table].primaryStore.getEntry(id)?.version;
 		return versions;
+	}
+}
+
+// A write older than the row's stored version, from the origin that wrote it, as replication applies one.
+export class Redeliver extends Resource {
+	static loadAsInstance = false;
+
+	async post(target, { database, table, id, record, behind }) {
+		const Table = databases[database][table];
+		const { version, nodeId } = Table.primaryStore.getEntry(id);
+		const olderVersion = version - behind;
+		const context = { source: {}, sourceApply: true, timestamp: olderVersion };
+		await transaction(context, async () => {
+			const row = await Table.getResource(id, context);
+			row._writeUpdate(id, record, true, { isNotification: true, nodeId, version: olderVersion });
+		});
 	}
 }

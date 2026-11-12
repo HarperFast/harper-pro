@@ -46,6 +46,11 @@ const storedRow = (node, database, table, id, signal) =>
 	request(node, 'StoredRow', { method: 'POST', body: JSON.stringify({ database, table, id }), signal });
 const dataRow = (node, id, signal) => storedRow(node, 'data', TABLE, id, signal);
 const nodeRow = (node, name, signal) => storedRow(node, 'system', 'hdb_nodes', name, signal);
+const redeliver = (node, id, record, behind) =>
+	request(node, 'Redeliver', {
+		method: 'POST',
+		body: JSON.stringify({ database: 'data', table: TABLE, id, record, behind }),
+	});
 const writeTogether = (node, database, writes) =>
 	request(node, 'WriteTogether', { method: 'POST', body: JSON.stringify({ database, writes }) });
 const put = (node, id, record) =>
@@ -251,6 +256,60 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 			return rows.every((row) => !row.present);
 		}, 'B to apply the deletes it missed');
 		assert.deepEqual([...(await resurrected(A)), ...(await resurrected(C))], []);
+	});
+});
+
+suite('a delete under a later publish', { timeout: 600_000, skip: isLMDB && 'copy-apply is RocksDB-only' }, (ctx) => {
+	const nodes = cluster(ctx.name);
+	let A, X, E;
+	let deleted;
+
+	before(async () => {
+		A = await nodes.startFresh();
+		await put(A.harper, 'covered', { name: 'v1' });
+		await sendOperation(A.harper, { operation: 'delete', database: 'data', table: TABLE, ids: ['covered'] });
+		await put(A.harper, 'sentinel', { name: 'seeded' });
+		deleted = await dataRow(A.harper, 'covered');
+		assert.ok(deleted.fullWriteHead && !deleted.present, 'premise: A holds a flagged tombstone');
+		X = await nodes.startFresh();
+		await nodes.join(X, A);
+		await waitFor(async (signal) => (await dataRow(X.harper, 'sentinel', signal)).present, 'the copy to reach X');
+		await waitFor(async (signal) => (await dataRow(X.harper, 'covered', signal)).stored, "A's copied tombstone on X");
+	});
+
+	after(() => nodes.teardown());
+
+	test('a node that copies from a holder of publish-over-delete keeps the delete', async () => {
+		// down, so E can only learn the delete from X's copy
+		await nodes.stop(A);
+		await writeTogether(X.harper, 'data', [{ table: TABLE, op: 'publish', id: 'covered', record: { message: 'm' } }]);
+		const held = await dataRow(X.harper, 'covered');
+		assert.equal(held.present, false);
+		assert.equal(held.fullWriteHead, false, 'premise: the publish cleared the flag');
+		assert.deepEqual(
+			held.boundary,
+			{ version: deleted.version, origin: A.harper.hostname },
+			'premise: X holds the delete only as the boundary under the publish'
+		);
+
+		E = await nodes.startFresh();
+		await nodes.join(E, X);
+		await waitFor(async (signal) => (await dataRow(E.harper, 'sentinel', signal)).present, 'the copy to reach E');
+		await waitFor(async (signal) => (await dataRow(E.harper, 'covered', signal)).stored, 'the delete on E');
+		assert.deepEqual(
+			await dataRow(E.harper, 'covered'),
+			{
+				stored: true,
+				present: false,
+				version: deleted.version,
+				origin: A.harper.hostname,
+				fullWriteHead: true,
+				history: 0,
+			},
+			'E holds the delete at its version and origin'
+		);
+		await redeliver(E.harper, 'covered', { id: 'covered', name: 'older write' }, 1000);
+		assert.equal((await dataRow(E.harper, 'covered')).present, false, 'an older write recreated the deleted row on E');
 	});
 });
 
