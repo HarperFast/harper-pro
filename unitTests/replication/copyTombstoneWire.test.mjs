@@ -11,7 +11,6 @@ import { FULL_WRITE_HEAD } from '#src/core/resources/Table';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import {
 	boundaryOutranksHead,
-	cursorBelowFloor,
 	databaseSubscriptions,
 	encodeCopyRecordValue,
 	replicateOverWS,
@@ -57,7 +56,15 @@ async function until(predicate) {
 
 describe('delete tombstones in a base copy', function () {
 	this.timeout(30_000);
-	let Records, socket, boundaryVersion, nativeDeleteVersion, strongerVersion, tieVersion, tieOrigins, aheadVersion;
+	let Records,
+		socket,
+		boundaryVersion,
+		nativeDeleteVersion,
+		strongerVersion,
+		tieVersion,
+		tieOrigins,
+		aheadVersion,
+		laterBoundaryVersion;
 
 	before(async function () {
 		// FULL_WRITE_HEAD and copy-apply are RocksDB-only
@@ -135,7 +142,8 @@ describe('delete tombstones in a base copy', function () {
 		await takeCopiedDelete('ahead-under-publish', aheadVersion);
 		await Records.publish('ahead-under-publish', { message: 'no record' });
 		// a publish keyed past this node's own log, from such an origin, over an older delete
-		await takeCopiedDelete('under-later-publish', Date.now() - 3000);
+		laterBoundaryVersion = Date.now() - 3000;
+		await takeCopiedDelete('under-later-publish', laterBoundaryVersion);
 		const laterPublish = { source: {}, sourceApply: true, timestamp: Date.now() + 60_000 };
 		await transaction(laterPublish, async () => {
 			const row = await Records.getResource('under-later-publish', laterPublish, { ensureLoaded: false });
@@ -287,44 +295,63 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(records.sent.get('native-covered'), 1);
 	});
 
-	it("keys a delete it sends for a publish below the copy anchor, whatever the delete's own clock", async () => {
+	it("keys a delete it sends for a publish over it at the delete's own clock", async () => {
 		await connect(buildLocalCapabilities(90_000, false, true));
 		const records = await copiedRecords();
+		// past the anchor, so the receiver logs it and the replay of a delete made during the copy ties with it
 		const ahead = records.get('ahead-under-publish');
 		assert.ok(aheadVersion > records.anchor, "premise: the delete's version is past the anchor");
 		assert.equal(ahead?.entry.type, 'delete');
-		assert.equal(ahead.entry.version, aheadVersion);
-		assert.equal(ahead.frameKey, cursorBelowFloor(records.anchor), 'a pre-anchor snapshot row, so copy-applied');
+		assert.equal(ahead.frameKey, aheadVersion);
 		const later = records.get('under-later-publish');
-		assert.equal(later?.entry.type, 'delete');
 		assert.ok(
-			Records.primaryStore.getEntry('under-later-publish').version > records.anchor,
+			Records.primaryStore.getEntry('under-later-publish').localTime > records.anchor,
 			'premise: the publish is past the anchor'
 		);
-		assert.equal(
-			later.frameKey,
-			cursorBelowFloor(records.anchor),
-			'clamped below the anchor, not keyed at the publish'
-		);
-		assert.equal(
-			records.get('published-over-delete').frameKey,
-			Records.primaryStore.getEntry('published-over-delete').localTime,
-			"below the anchor, the publish's own log key"
-		);
-		for (const key of ['stronger-boundary', 'tie-boundary', 'native-covered'])
-			assert.ok(records.get(key).frameKey < records.anchor, key);
+		assert.equal(later?.entry.type, 'delete');
+		assert.equal(later.frameKey, laterBoundaryVersion, "the delete's clock, not the publish's");
+		assert.equal(records.get('published-over-delete').frameKey, boundaryVersion);
 	});
 
-	it("selects that delete for this node's subscription at the publish's log key", async () => {
-		await connect(buildLocalCapabilities(90_000, false, true));
-		// past the anchor and below the later publish; the peer's start of 0 still makes it a copy
-		const startTime = Date.now();
-		const records = await copiedRecords(false, {}, [
-			{ name: getThisNodeName(), startTime, tables: [], replicateByDefault: true },
-		]);
-		assert.ok(records.anchor < startTime, 'premise: the capped frame key is below the start');
-		assert.equal(records.get('under-later-publish')?.entry.type, 'delete');
-		assert.equal(records.get('ahead-under-publish'), undefined, 'premise: the start filters copy rows');
+	it("selects that delete for this node's subscription at either its own clock or the publish's", async () => {
+		const laterHead = Records.primaryStore.getEntry('under-later-publish').localTime;
+		const windows = [
+			{ startTime: Date.now() },
+			{ startTime: laterBoundaryVersion - 1, endTime: laterBoundaryVersion + 1 },
+			{ startTime: laterHead - 1, endTime: laterHead + 1 },
+		];
+		for (const window of windows) {
+			await connect(buildLocalCapabilities(90_000, false, true));
+			// the peer's start of 0 still makes it a copy
+			const records = await copiedRecords(false, {}, [
+				{ name: getThisNodeName(), tables: [], replicateByDefault: true, ...window },
+			]);
+			assert.equal(records.get('published-over-delete'), undefined, 'premise: the window filters copy rows');
+			assert.equal(records.get('under-later-publish')?.entry.type, 'delete', JSON.stringify(window));
+			socket.close();
+		}
+	});
+
+	it('logs nothing for a replayed delete that ties with a copy-applied one, so a copy must not apply a live one', async () => {
+		const origin = getIdOfRemoteNode('copy-tombstone-origin', Records.auditStore);
+		const version = Date.now() - 500;
+		const deleteAs = async (key, isCopyApply) => {
+			const context = { source: {}, sourceApply: true, timestamp: version };
+			await transaction(context, async () => {
+				const row = await Records.getResource(key, context, { ensureLoaded: false });
+				await row._writeDelete(key, { isNotification: true, isCopyApply, nodeId: origin, version });
+			});
+		};
+		const logged = (key) =>
+			[...Records.auditStore.getRange({ start: 0 })].filter(
+				(entry) => entry.tableId === Records.tableId && entry.recordId === key && entry.type === 'delete'
+			).length;
+		await deleteAs('replayed-after-copy', true);
+		await deleteAs('replayed-after-copy', false);
+		await deleteAs('replayed-after-live', false);
+		await deleteAs('replayed-after-live', false);
+		await until(() => logged('replayed-after-live') === 1);
+		assert.equal(logged('replayed-after-copy'), 0);
 	});
 
 	for (const peer of ['a pre-key capability bag', 'unlearned capabilities']) {
