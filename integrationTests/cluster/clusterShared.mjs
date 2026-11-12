@@ -199,7 +199,12 @@ export async function restartNode(node, opts) {
  * @param {number} [opts.timeoutMs]
  */
 export async function restartHttpWorkers(node, { timeoutMs = 120_000 } = {}) {
-	const { job_id: id } = await sendOperation(node, { operation: 'restart_service', service: 'http_workers' });
+	const deadline = Date.now() + timeoutMs;
+	const { job_id: id } = await sendOperation(
+		node,
+		{ operation: 'restart_service', service: 'http_workers' },
+		{ signal: AbortSignal.timeout(timeoutMs) }
+	);
 	if (!id) throw new Error(`restart_service on ${node.hostname} returned no job id`);
 	let job;
 	await waitForCondition(
@@ -212,7 +217,10 @@ export async function restartHttpWorkers(node, { timeoutMs = 120_000 } = {}) {
 			job = current ?? job;
 			return job?.status === 'COMPLETE' || job?.status === 'ERROR';
 		},
-		{ timeoutMs, description: () => `the HTTP-worker restart on ${node.hostname} (job ${JSON.stringify(job)})` }
+		{
+			timeoutMs: Math.max(deadline - Date.now(), 1),
+			description: () => `the HTTP-worker restart on ${node.hostname} (job ${JSON.stringify(job)})`,
+		}
 	);
 	equal(job.status, 'COMPLETE', `HTTP-worker restart on ${node.hostname}: ${JSON.stringify(job)}`);
 }
