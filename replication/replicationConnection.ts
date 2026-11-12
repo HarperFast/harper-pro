@@ -9600,7 +9600,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							auditRecord,
 							cursor,
 							subscriptionNodeId = auditRecord.nodeId,
-							encodeCopy?: () => Buffer
+							encodeCopy?: () => Buffer,
+							// a copy row whose frame key is capped below the anchor is still selected at its head's log key
+							copySelectionKey?: number
 						) => {
 							if (closed || wsClosed) return;
 							if (sourceReadiness.some(sourceNotReady)) throw new Error('Sharding source completeness was revoked');
@@ -9660,7 +9662,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const txnLogKey = STORAGE_IS_ROCKSDB
 								? (auditRecord.txnLogKey ?? cursor ?? auditRecord.version)
 								: auditRecord.version;
-							const subscriptionPosition = STORAGE_IS_ROCKSDB ? txnLogKey : cursor;
+							const subscriptionPosition = STORAGE_IS_ROCKSDB ? (copySelectionKey ?? txnLogKey) : cursor;
 							// Force a reload the first time this connection touches each table:
 							// `primaryStore.encoder` is a process-wide singleton, so its typedStructs
 							// may have been populated to a stale length by prior activity on this
@@ -10556,7 +10558,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// An empty log (anchorKey 0) still sends the wall clock, never a sentinel below every key: the
 												// follower persists it, and shouldForceBaseCopyForRetention reads such a cursor as purged history.
 												const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
-												// the frame key of a delete sent in place of a publish over it: a snapshot row, so below the anchor
 												const belowCopyStart = cursorBelowFloor(copyStartTime);
 												// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
 												const relayedAnchors =
@@ -10905,7 +10906,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															},
 															copyTxnLogKey,
 															nodeId,
-															encodeCopy
+															encodeCopy,
+															headTxnLogKey
 														);
 														if (closed || wsClosed) return;
 														logger.debug?.(

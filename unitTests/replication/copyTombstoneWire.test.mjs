@@ -5,11 +5,13 @@ import { setHdbBasePath } from '#src/core/utility/environment/environmentManager
 import { table } from '#src/core/resources/databases';
 import { transaction } from '#src/core/resources/transaction';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
+import { getThisNodeName } from '#src/core/server/nodeName';
 import { ACTION_32_BIT, createAuditEntry, Decoder, readAuditEntry } from '#src/core/resources/auditStore';
 import { FULL_WRITE_HEAD } from '#src/core/resources/Table';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import {
 	boundaryOutranksHead,
+	cursorBelowFloor,
 	databaseSubscriptions,
 	encodeCopyRecordValue,
 	replicateOverWS,
@@ -185,12 +187,12 @@ describe('delete tombstones in a base copy', function () {
 		}
 	}
 
-	async function copiedRecords(unlearned = false, declared = {}) {
+	async function copiedRecords(unlearned = false, declared = {}, subscriptions = []) {
 		socket.emit(
 			'message',
 			encode([
 				SUBSCRIPTION_REQUEST,
-				[{ name: PEER, startTime: 0, tables: [], replicateByDefault: true, ...declared }],
+				[{ name: PEER, startTime: 0, tables: [], replicateByDefault: true, ...declared }, ...subscriptions],
 				[],
 			])
 		);
@@ -292,14 +294,18 @@ describe('delete tombstones in a base copy', function () {
 		assert.ok(aheadVersion > records.anchor, "premise: the delete's version is past the anchor");
 		assert.equal(ahead?.entry.type, 'delete');
 		assert.equal(ahead.entry.version, aheadVersion);
-		assert.ok(ahead.frameKey < records.anchor, 'a pre-anchor snapshot row, so the receiver copy-applies it');
+		assert.equal(ahead.frameKey, cursorBelowFloor(records.anchor), 'a pre-anchor snapshot row, so copy-applied');
 		const later = records.get('under-later-publish');
 		assert.equal(later?.entry.type, 'delete');
 		assert.ok(
 			Records.primaryStore.getEntry('under-later-publish').version > records.anchor,
 			'premise: the publish is past the anchor'
 		);
-		assert.ok(later.frameKey < records.anchor, 'clamped below the anchor, not keyed at the publish');
+		assert.equal(
+			later.frameKey,
+			cursorBelowFloor(records.anchor),
+			'clamped below the anchor, not keyed at the publish'
+		);
 		assert.equal(
 			records.get('published-over-delete').frameKey,
 			Records.primaryStore.getEntry('published-over-delete').localTime,
@@ -307,6 +313,18 @@ describe('delete tombstones in a base copy', function () {
 		);
 		for (const key of ['stronger-boundary', 'tie-boundary', 'native-covered'])
 			assert.ok(records.get(key).frameKey < records.anchor, key);
+	});
+
+	it("selects that delete for this node's subscription at the publish's log key", async () => {
+		await connect(buildLocalCapabilities(90_000, false, true));
+		// past the anchor and below the later publish; the peer's start of 0 still makes it a copy
+		const startTime = Date.now();
+		const records = await copiedRecords(false, {}, [
+			{ name: getThisNodeName(), startTime, tables: [], replicateByDefault: true },
+		]);
+		assert.ok(records.anchor < startTime, 'premise: the capped frame key is below the start');
+		assert.equal(records.get('under-later-publish')?.entry.type, 'delete');
+		assert.equal(records.get('ahead-under-publish'), undefined, 'premise: the start filters copy rows');
 	});
 
 	for (const peer of ['a pre-key capability bag', 'unlearned capabilities']) {
