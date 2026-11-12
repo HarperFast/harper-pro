@@ -121,7 +121,6 @@ async function clusterConnected(nodes, signal) {
 	);
 }
 
-// `interrupt` returns the publisher's first number sent after the interrupted side is back
 async function deliversOnce(ctx, topic, interrupt) {
 	const { A, B } = ctx;
 	const publisher = startPublisher(A, topic);
@@ -166,8 +165,6 @@ async function deliversOnce(ctx, topic, interrupt) {
 			Object.keys(logged).length >= publisher.n - backUpN,
 			`B logged ${Object.keys(logged).length} of A's messages, fewer than the ${publisher.n - backUpN} sent after it was back`
 		);
-		const { certifiedFrom } = await postToFixture(B, 'RouteState', { peer: A.hostname });
-		ok(certifiedFrom > 0, 'B resumed from A at least once floor-only');
 		deepEqual(
 			Object.entries(logged).filter(([, count]) => count > 1),
 			[],
@@ -186,10 +183,15 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 		await Promise.all(
 			roots.map((root) => cp(FIXTURE, join(root, 'components', basename(FIXTURE)), { recursive: true }))
 		);
-		const contexts = hostnames.map((hostname, i) => ({ name: ctx.name, harper: { hostname, dataRootDir: roots[i] } }));
-		// assigned before starting, so after() tears down a node that started even when the other did not
-		[ctx.A, ctx.B] = contexts.map((nodeCtx) => nodeCtx.harper);
-		await Promise.all(contexts.map((nodeCtx) => startHarper(nodeCtx, nodeOptions(nodeCtx.harper.hostname))));
+		const nodes = hostnames.map((hostname, i) => ({ hostname, dataRootDir: roots[i] }));
+		[ctx.A, ctx.B] = nodes;
+		const starts = await Promise.allSettled(
+			nodes.map(async (node) =>
+				Object.assign(node, (await startHarper({ name: ctx.name, harper: node }, nodeOptions(node.hostname))).harper)
+			)
+		);
+		const failed = starts.find((start) => start.status === 'rejected');
+		if (failed) throw failed.reason;
 		await sendOperation(ctx.B, {
 			operation: 'add_node',
 			hostname: ctx.A.hostname,
@@ -204,8 +206,8 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 
 	after(() => stopAndTeardownNodes([ctx.A, ctx.B]));
 
-	test('the publishing node restarts while a subscriber on the other node stays connected', () =>
-		deliversOnce(ctx, 'origin-restart', async () => {
+	test('the publishing node restarts while a subscriber on the other node stays connected', async () => {
+		await deliversOnce(ctx, 'origin-restart', async () => {
 			const since = Date.now();
 			await restartNode(ctx.A);
 			await waitForCondition((signal) => clusterConnected([ctx.A, ctx.B], signal), {
@@ -213,7 +215,11 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 				description: 'the cluster to reconnect',
 			});
 			return nextNAfter(ctx.publisher.connections, since, 'the publisher to reconnect to A');
-		}));
+		});
+		// the lowest start a route certifies stays, so only this first resume shows it was floor-only
+		const { certifiedFrom } = await postToFixture(ctx.B, 'RouteState', { peer: ctx.A.hostname });
+		ok(certifiedFrom > 0, 'B resumed from A floor-only');
+	});
 
 	test("the receiving node's HTTP workers restart", () =>
 		deliversOnce(ctx, 'worker-restart', async (onB) => {
