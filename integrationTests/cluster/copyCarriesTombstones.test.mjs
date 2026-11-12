@@ -297,9 +297,9 @@ suite('a delete under a later publish', { timeout: 600_000, skip: isLMDB && 'cop
 		await nodes.join(E, X);
 		await waitFor(async (signal) => (await dataRow(E.harper, 'sentinel', signal)).present, 'the copy to reach E');
 		await waitFor(async (signal) => (await dataRow(E.harper, 'covered', signal)).stored, 'the delete on E');
-		// E never connected to A, so it has no name for the delete's origin; the id must still be a remote one
-		const { originId, origin: _origin, ...onE } = await dataRow(E.harper, 'covered');
+		const { originId, origin, ...onE } = await dataRow(E.harper, 'covered');
 		assert.ok(originId, "the delete keeps a remote origin on E, not E's own");
+		if (origin !== null) assert.equal(origin, A.harper.hostname, "the delete keeps A's origin, not the copy source's");
 		assert.deepEqual(
 			onE,
 			{ stored: true, present: false, version: deleted.version, fullWriteHead: true, history: 0 },
