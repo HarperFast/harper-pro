@@ -45,6 +45,7 @@ import {
 } from './knownNodes.ts';
 import {
 	orderFailoverCandidates,
+	originFallbackMates,
 	receivesDirect,
 	settleSupplier,
 	supplierCandidates,
@@ -142,6 +143,16 @@ type ReplicationConnectionStatus = {
 	liveSince?: number;
 	// Holds a supplier link eligible across the reconnect this node caused by assigning it an origin.
 	topologySwitchingUntil?: number;
+	/** The region-mate of this entry's origin whose link carries the origin's log while the origin's own link is down. */
+	originFallback?: {
+		name: string;
+		url: string;
+		node: any;
+		worker?: any;
+		openedAt: number;
+		connected?: boolean;
+		recheck?: ReturnType<typeof setTimeout>;
+	};
 	nodes: ({
 		name: string;
 		url: string;
@@ -1857,6 +1868,7 @@ export async function startOnMainThread(options) {
 				// Keep the entry for URL/iterator cleanup, but bypass the reuse fast path after an
 				// explicit unsubscribe so restoring membership can schedule subscribe-to-node again.
 				if (existingEntry) existingEntry.unsubscribed = true;
+				if (existingEntry) closeOriginFallback(existingEntry, databaseName);
 				subscribeSetupScheduler.cancel(getNodeURL(node), databaseName);
 				if (existingEntry) {
 					clearTimeout(existingEntry.reDriveTimer);
@@ -1881,6 +1893,75 @@ export async function startOnMainThread(options) {
 		}
 	}
 	// only assign these if we are on the main thread
+	/** The entry whose origin `report`'s socket carries as a fallback link, when it is one. */
+	function originFallbackOwner(report: { url: string; subscriptionUrl?: string; database: string }): any {
+		if (!report.subscriptionUrl || report.subscriptionUrl === report.url) return;
+		const owner = connectionReplicationMap.get(report.subscriptionUrl)?.get(report.database);
+		return owner?.originFallback?.url === report.url ? owner : undefined;
+	}
+	/**
+	 * Under the grid a node that receives an origin from another region links to nothing else of that origin's region.
+	 * When that link drops, this opens a link to one of the origin's region-mates that carries the origin's log alone,
+	 * until the origin's own link returns (harper-pro#1343). Without it, writes the origin made just before it was lost
+	 * stay in its region. It does not wait for `replication.failover`: the grid pruned the links a full mesh would use.
+	 */
+	function originFallbackCandidates(entry: any, database: string): string[] {
+		const topology = regionTopologyFor(database);
+		const origin = entry.nodes[0]?.name;
+		if (!topology || !origin) return [];
+		const nodeNames = Array.from(nodeMap.keys()).sort();
+		return originFallbackMates(nodeNames, nodeNames.indexOf(origin), topology, getThisNodeName());
+	}
+	function openOriginFallback(entry: any, database: string, mate = originFallbackCandidates(entry, database)[0]) {
+		if (entry.originFallback) return true;
+		const mateNode = mate === undefined ? undefined : nodeMap.get(mate);
+		if (!mateNode) return false;
+		const origin = entry.nodes[0];
+		logger.info(
+			`Region topology: ${database} takes ${origin.name} from ${mate} while its link to ${origin.name} is down`
+		);
+		connectToNextWorker(origin, database, mateNode);
+		entry.originFallback = {
+			name: mate,
+			url: getNodeURL(mateNode),
+			node: origin,
+			worker: origin.worker,
+			openedAt: Date.now(),
+		};
+		return true;
+	}
+	/**
+	 * A fallback link that is down retries on its own, with backoff. Another region-mate may be reachable sooner, but a
+	 * move opens a new connection with no backoff, so a link is given TOPOLOGY_STABLE_MS before the next mate is tried.
+	 * The wait is timed here: a connection reports its first failed dial only once.
+	 */
+	function rotateOriginFallback(entry: any, database: string): void {
+		const fallback = entry.originFallback;
+		if (!fallback || fallback.connected || entry.connected !== false) return;
+		const mates = originFallbackCandidates(entry, database);
+		const next = mates[(mates.indexOf(fallback.name) + 1) % mates.length];
+		if (next === undefined || next === fallback.name) return;
+		const wait = fallback.openedAt + TOPOLOGY_STABLE_MS - Date.now();
+		if (wait > 0) {
+			fallback.recheck ??= setTimeout(() => {
+				fallback.recheck = undefined;
+				if (entry.originFallback === fallback) rotateOriginFallback(entry, database);
+			}, wait);
+			fallback.recheck.unref?.();
+			return;
+		}
+		closeOriginFallback(entry, database);
+		openOriginFallback(entry, database, next);
+	}
+	function closeOriginFallback(entry: any, database: string): void {
+		const fallback = entry.originFallback;
+		if (!fallback) return;
+		entry.originFallback = undefined;
+		clearTimeout(fallback.recheck);
+		const request = { type: 'unsubscribe-from-node', database, url: fallback.url, nodes: [fallback.node] };
+		if (fallback.worker) fallback.worker.postMessage(request);
+		else unsubscribeFromNode(request);
+	}
 	disconnectedFromNode = function (connection) {
 		// if a node is disconnected, we need to reassign the subscriptions to another node
 		// we try to do this in a deterministic way so that we don't end up with a cycle that short circuits
@@ -1888,6 +1969,12 @@ export async function startOnMainThread(options) {
 		// a sorted list of node names that all nodes should have and use.
 		try {
 			logger.info('Disconnected from node', connection.name, connection.url, 'finished', !!connection.finished);
+			const fallbackOwner = originFallbackOwner(connection);
+			if (fallbackOwner) {
+				fallbackOwner.originFallback.connected = false;
+				if (!connection.finished) rotateOriginFallback(fallbackOwner, connection.database);
+				return;
+			}
 			const nodeMapKeys = Array.from(nodeMap.keys());
 			const nodeNames = nodeMapKeys.sort();
 			const existingIndex = nodeNames.indexOf(connection.name || urlToNodeName(connection.url));
@@ -1913,6 +2000,7 @@ export async function startOnMainThread(options) {
 				updateShardingFailover(connection.database);
 				return;
 			}
+			if (openOriginFallback(existingWorkerEntry, connection.database)) return;
 			if (!env.get(CONFIG_PARAMS.REPLICATION_FAILOVER)) {
 				for (const node of existingWorkerEntry.nodes) recordShardingWait(connection.database, node.name, true);
 				// if failover is disabled, immediately return
@@ -1973,6 +2061,12 @@ export async function startOnMainThread(options) {
 	};
 
 	connectedToNode = function (connection) {
+		// a fallback link's socket speaks for neither its peer's entry nor the origin's
+		const fallbackOwner = originFallbackOwner(connection);
+		if (fallbackOwner) {
+			fallbackOwner.originFallback.connected = true;
+			return;
+		}
 		// Basically undo what we did in disconnectedFromNode and also update the latency
 		const dbReplicationWorkers = connectionReplicationMap.get(connection.url);
 		const mainWorkerEntry = dbReplicationWorkers?.get(connection.database);
@@ -1987,6 +2081,9 @@ export async function startOnMainThread(options) {
 		const wasConnected = mainWorkerEntry.connected === true;
 		mainWorkerEntry.connected = true;
 		if (!wasConnected) mainWorkerEntry.liveSince = Date.now();
+		// only the origin's own socket ends its fallback, not another origin's failover socket over the same URL
+		if (!connection.subscriptionUrl || connection.subscriptionUrl === connection.url)
+			closeOriginFallback(mainWorkerEntry, connection.database);
 		if (connectReportAdvancesGeneration(mainWorkerEntry, connection))
 			advanceConnectGeneration(mainWorkerEntry, Date.now(), RECEIVE_STALL_THRESHOLD_MS);
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);

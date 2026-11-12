@@ -175,6 +175,26 @@ export function orderFailoverCandidates(
 }
 
 /**
+ * The origin's region-mates a node of another region takes the origin's log from when its own link to the origin
+ * drops, in failover order. They receive the origin directly and before any other region does, so only they are sure
+ * to hold what it wrote last. Empty within the origin's own region, where a region-mate is already linked.
+ */
+export function originFallbackMates(
+	sortedNames: string[],
+	originIndex: number,
+	topology: RegionTopology,
+	selfName: string
+): string[] {
+	if (!topology.active) return [];
+	const originRegion = topology.regionOf.get(sortedNames[originIndex]);
+	const selfRegion = topology.regionOf.get(selfName);
+	if (originRegion === undefined || selfRegion === undefined || originRegion === selfRegion) return [];
+	return orderFailoverCandidates(sortedNames, originIndex, topology, selfName).filter(
+		(name) => topology.regionOf.get(name) === originRegion
+	);
+}
+
+/**
  * Who may supply `originName`'s writes to `selfName` when it does not receive that origin directly, best first, or
  * undefined when the origin is not topology-managed. First the carrier of the origin's column in this node's region,
  * which receives the origin directly; then this node's lower-named region-mates, one of which takes the origin by a

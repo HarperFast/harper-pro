@@ -4,6 +4,7 @@ import {
 	deriveRegionTopology,
 	gridLinks,
 	orderFailoverCandidates,
+	originFallbackMates,
 	receivesDirect,
 	settleSupplier,
 	supplierCandidates,
@@ -439,6 +440,21 @@ describe('regionTopology', () => {
 				'r2-n1',
 				'r0-n1',
 			]);
+		});
+
+		it("gives a node of another region the origin's region-mates to take a lost origin's log from", () => {
+			const members = layout([3, 3, 1]);
+			const topology = deriveRegionTopology(members);
+			const sorted = names(members).sort();
+			const mates = (origin, self) => originFallbackMates(sorted, sorted.indexOf(origin), topology, self);
+			assert.deepEqual(mates('r1-n1', 'r0-n1'), ['r1-n2', 'r1-n0']);
+			// a follower that took the origin over by a temporary link is covered too
+			assert.deepEqual(mates('r1-n1', 'r0-n0'), ['r1-n2', 'r1-n0']);
+			// within the origin's region a region-mate is already linked
+			assert.deepEqual(mates('r1-n1', 'r1-n0'), []);
+			// an origin alone in its region has nobody else holding its last writes
+			assert.deepEqual(mates('r2-n0', 'r0-n0'), []);
+			assert.deepEqual(originFallbackMates(sorted, 0, deriveRegionTopology([member('a', 'r0')]), 'r0-n0'), []);
 		});
 	});
 });

@@ -210,7 +210,7 @@ suite('Region grid topology', { timeout: 1_500_000 }, (ctx) => {
 		}
 	});
 
-	test('a carrier cut off from one origin takes it through its column in a third region', async () => {
+	test("a carrier cut off from one origin takes it through one of the origin's region-mates", async () => {
 		const carrier = named('east', 1);
 		const origin = named('west', 1);
 		const follower = named('east', 2);

@@ -5518,6 +5518,8 @@ export class NodeReplicationConnection extends EventEmitter {
 				name: this.nodeName,
 				database: this.databaseName,
 				url: this.url,
+				// names the origin a failover or fallback socket carries; the main thread tells it from the peer's own link
+				...(this.subscriptionUrl !== undefined && { subscriptionUrl: this.subscriptionUrl }),
 				finished,
 			});
 		}
