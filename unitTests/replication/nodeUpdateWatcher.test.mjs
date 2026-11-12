@@ -59,6 +59,18 @@ function makeAsyncIterableFromArray(items) {
 }
 
 describe('runNodeUpdateWatcher restart loop', () => {
+	it('reconciles after every resubscribe, not after the first subscribe', async () => {
+		let resyncs = 0;
+		await runNodeUpdateWatcher(() => {}, {
+			subscribe: async () => makeAsyncIterableFromArray([]),
+			processEvent: () => {},
+			restartDelayMs: 1,
+			maxRestarts: 3,
+			onResubscribe: () => resyncs++,
+		});
+		expect(resyncs).to.equal(2);
+	});
+
 	it('restarts the watcher after subscribe() throws', async () => {
 		let subscribeCalls = 0;
 		const subscribe = async () => {

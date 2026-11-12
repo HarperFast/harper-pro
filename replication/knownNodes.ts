@@ -148,6 +148,8 @@ type WatcherOptions = {
 	healthyUptimeMs?: number;
 	now?: () => number;
 	random?: () => number;
+	/** Runs after every subscribe that replaces an earlier one, whose events may have been missed. */
+	onResubscribe?: () => void;
 };
 
 // Generation tokens guarding against duplicate node-update watchers (harper-pro#460). A
@@ -207,6 +209,13 @@ export async function runNodeUpdateWatcher(
 		try {
 			const events = await subscribe();
 			if (!isCurrent()) break; // superseded while awaiting subscribe
+			if (restarts > 0) {
+				try {
+					options.onResubscribe?.();
+				} catch (error) {
+					logger.error?.('Error reconciling known nodes after resubscribing to hdb_nodes', error);
+				}
+			}
 			liveSince = now();
 			const iterator = events[Symbol.asyncIterator]();
 			watcherIterators.set(key, iterator);
@@ -435,87 +444,84 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		rebuildKnownNodes(listener);
 		return;
 	}
-	// remove any nodes that have been updated or deleted
-	const node_name = event?.value?.name || event?.id;
-	logger.debug?.('adding node', node_name, 'on  node', getThisNodeName(), ' on process', process.pid);
-	// Capture the prior in-memory node before we drop it, so a transient decode miss can be
-	// reconstructed WITH its connection fields (url/shard/ca/etc.) instead of a bare {name}
-	// (harper-pro#460 review). name + replicates from the reconstruct still win on merge.
-	const oldNode = server.nodes.find((node) => node && node.name !== undefined && node.name === node_name);
-	server.nodes = server.nodes.filter((node) => node && node.name !== node_name);
-	if (event.type === 'put' && node_name !== getThisNodeName()) {
-		// add any new nodes
-		if (event.value) server.nodes.push(event.value);
-		else {
-			// put event with no decodable value — reconstruct a minimal descriptor from the key so
-			// server.nodes (and the outbound subscription fired below) still reflect the peer
-			// (harper-pro#460). A genuine delete is handled separately via isGenuineNodeDeletion.
-			let reconstructed = reconstructNodeFromKey(node_name);
-			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
-			// Cast: this is a deliberate partial recovery descriptor (name + replicates, plus any
-			// enriched fields from oldNode); the next decodable update supplies the rest.
-			if (reconstructed) server.nodes.push(reconstructed as any);
-			else console.error('Invalid node update event', event);
-		}
-	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
-		// add_node { isLeader: true } reaches us as a patch event; read the merged
-		// record so server.nodes reflects the full record (including isLeader). Sync read
-		// (getSync): RocksDB get() is a MaybePromise (Promise on a block-cache miss); an un-awaited
-		// get() here would push a pending Promise into server.nodes. See selfNodeReplicates.
-		const fullRecord = getHDBNodeTable().primaryStore.getSync(node_name);
-		if (fullRecord) server.nodes.push(fullRecord as any);
+	const id = event.id ?? event.value?.name;
+	logger.debug?.('hdb_nodes', event.type, 'for', id, 'on node', getThisNodeName(), 'process', process.pid);
+	notifyNodeListener(listener, publishKnownNodes(event), id, isGenuineNodeDeletion(event.type));
+}
+
+// Row names each listener was last told exist: a row can enter or leave the scan without an event of its own
+// (one missed while the watcher resubscribed), and the listener still has to hear of it.
+const deliveredNodeNames = new WeakMap<(node: any, id: string) => void, Set<string>>();
+
+function notifyOne(listener: (node: any, id: string) => void, node: any, name: string): boolean {
+	try {
+		listener(node, name);
+		return true;
+	} catch (error) {
+		logger.error?.('Error handling hdb_nodes row', name, error);
+		return false;
 	}
+}
+
+/** A row whose call throws is not counted as told, so the next event retries it without holding up the others. */
+function notifyNodeListener(
+	listener: (node: any, id: string) => void,
+	rows: Map<string, any>,
+	id?: string,
+	deleted?: boolean
+) {
+	const previous = deliveredNodeNames.get(listener) ?? new Set();
+	const delivered = new Set(previous);
+	deliveredNodeNames.set(listener, delivered);
+	for (const name of previous) {
+		if (!rows.has(name) && notifyOne(listener, undefined, name)) delivered.delete(name);
+	}
+	for (const [name, node] of rows) {
+		if (id !== undefined && name !== id && previous.has(name)) continue;
+		delivered.delete(name);
+		if (notifyOne(listener, node, name)) delivered.add(name);
+	}
+	if (deleted && id !== undefined && !rows.has(id) && !previous.has(id)) notifyOne(listener, undefined, id);
+}
+
+let publishedRows = new Map<string, any>();
+
+/**
+ * Core delivers an event only after its commit, resetting LMDB's read transaction first, so the scan already
+ * holds the event's write; a genuine delete still removes its row whatever the scan read (see
+ * isGenuineNodeDeletion). A row reconstructed from its key after a decode miss takes the event's own decoded
+ * record when that is not older, else keeps the fields it was last published with (harper-pro#460).
+ */
+function publishKnownNodes(event?: any): Map<string, any> {
+	const id = event?.id ?? event?.value?.name;
+	const decoded = event?.type === 'put' && isValidNodeRecord(event.value) ? event.value : undefined;
+	const rows = new Map<string, any>();
+	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key, version) => {
+		// url distinguishes a full record from a reconstructNodeFromKey stub, keeping its freshly decoded replicates
+		if (!node.url) {
+			if (decoded && key === id && !(version > event.version)) node = decoded;
+			else if (publishedRows.has(key)) node = mergeReconstructedNode(node, publishedRows.get(key));
+		}
+		rows.set(key, node);
+	});
+	if (event && isGenuineNodeDeletion(event.type)) rows.delete(id);
+	const thisNodeName = getThisNodeName();
+	const nodes = [];
 	const shards = new Map();
-	for await (const node of getHDBNodeTable().search({})) {
-		if (!node) continue;
+	for (const node of rows.values()) {
+		if (node.name === undefined || node.name !== thisNodeName) nodes.push(node);
 		if (node.shard != undefined) {
 			let nodesForShard = shards.get(node.shard);
-			if (!nodesForShard) {
-				shards.set(node.shard, (nodesForShard = []));
-			}
+			if (!nodesForShard) shards.set(node.shard, (nodesForShard = []));
 			nodesForShard.push(node);
 		}
 	}
+	server.nodes = nodes;
 	server.shards = shards;
-	if (event.type === 'put' || event.type === 'delete') {
-		if (event.value != null) {
-			// normal upsert with a decoded value
-			listener(event.value, event.id);
-		} else if (isGenuineNodeDeletion(event.type)) {
-			// genuine deletion — forward the nullish value so the listener tears the node down
-			listener(event.value, event.id);
-		} else {
-			// A put/patch with no decodable value is a transient decode failure (e.g. stale
-			// msgpackr shared-structures, harper#1163) — NOT a node removal. We must NOT forward the
-			// nullish value (onNodeUpdate would treat it as a deletion and unsubscribe the peer from
-			// every database). But dropping it entirely left a put-event-driven peer with no outbound
-			// subscription (harper-pro#460). Reconstruct a minimal descriptor from the key and forward
-			// THAT instead, so the outbound subscription is (re)created; the next decodable event
-			// replaces it with the full record.
-			let reconstructed = reconstructNodeFromKey(event.id);
-			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
-			if (reconstructed) {
-				logger.warn?.(
-					'hdb_nodes change event for',
-					event.id,
-					'had no decodable value; subscribing to the peer by name so outbound replication is not lost (see harper-pro#460), treating it as a transient decode failure (see harper#1163), not a node deletion'
-				);
-				listener(reconstructed, event.id);
-			} else {
-				logger.warn?.(
-					'hdb_nodes change event for',
-					event.id,
-					'had no decodable value and no usable key; treating as a transient decode failure (see harper#1163), not a node deletion'
-				);
-			}
-		}
-	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
-		// isLeader patches need to drive subscription bootstrap; pass the merged record.
-		// Sync read (getSync) — RocksDB get() is a MaybePromise; see selfNodeReplicates.
-		const fullRecord = getHDBNodeTable().primaryStore.getSync(event.id);
-		if (fullRecord) listener(fullRecord, event.id);
-	}
+	publishedRows = rows;
+	return rows;
 }
+
 /**
  * Distinguish a genuine `remove_node` tombstone from a transient decode failure for a range-visible
  * hdb_nodes row whose scan value was nullish (harper-pro#460 review). A deleted node leaves a row
@@ -614,26 +620,30 @@ export function resolveScannedNode(
 	return reconstructNodeFromKey(key);
 }
 
+const undecodedRowsWarned = new Set<unknown>();
+
 /**
  * Iterate the hdb_nodes range and drive `onNode(node, key)` for each peer, reconstructing a minimal
  * descriptor for any range-visible-but-undecodable row while skipping genuine tombstones
  * (harper-pro#460). Takes the store explicitly so it can be unit-tested against a fake/real store
- * without standing up a server. The shard/server bookkeeping stays in subscribeToNodeUpdates (its
- * concern, and it owns the `server` global).
+ * without standing up a server. publishKnownNodes owns the `server` bookkeeping.
  */
-export function scanNodesForSubscription(store: any, onNode: (node: any, key: any) => void) {
-	for (const entry of store.getRange({})) {
-		const { value, key } = entry;
+export function scanNodesForSubscription(store: any, onNode: (node: any, key: any, version?: number) => void) {
+	for (const entry of store.getRange({ versions: true })) {
+		const { value, key, version } = entry;
 		const node = resolveScannedNode(value, key, (probeKey) => probeNodeRow(store, probeKey));
 		if (!node) continue;
-		if (!value) {
-			logger.warn?.(
+		if (value) undecodedRowsWarned.delete(key);
+		else {
+			const log = undecodedRowsWarned.has(key) ? logger.trace : logger.warn;
+			undecodedRowsWarned.add(key);
+			log?.(
 				'hdb_nodes record for',
 				key,
 				'did not decode to a live record at the subscription scan but is present (not a tombstone); subscribing to the peer so outbound replication is not lost (see harper-pro#460). The full record self-heals on the next decodable update.'
 			);
 		}
-		onNode(node, key);
+		onNode(node, key, version);
 	}
 }
 
@@ -642,7 +652,7 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 	// deploy_component reload re-running startOnMainThread, harper-pro#460) supersedes its prior
 	// watcher instead of stacking one, while the two distinct callers (subscription management vs
 	// replication-confirmation tracking) keep independent concurrent watchers.
-	runNodeUpdateWatcher(listener, { key: watcherKey });
+	runNodeUpdateWatcher(listener, { key: watcherKey, onResubscribe: () => rebuildKnownNodes(listener) });
 	rebuildKnownNodes(listener);
 	logger.debug?.(
 		'Known nodes at startup',
@@ -651,52 +661,12 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 }
 
 /**
- * Rebuild server.nodes / server.shards from a full hdb_nodes scan, firing `listener` for every node.
- * Drives the initial subscription scan and the reaction to a table-reload marker after a copyApply
- * base copy of the system DB, whose per-row snapshot writes carry no change events (harper-pro#489).
- * Prior in-memory nodes are kept so a reconstructed decode-miss descriptor (which has no url/shard) is
- * re-enriched instead of transiently dropping those fields (harper-pro#460). Empty on first boot
- * (nothing to enrich from), which is correct.
+ * Rebuild server.nodes / server.shards from a full hdb_nodes scan, firing `listener` for every node. Drives the
+ * initial subscription scan and the reaction to a table-reload marker after a copyApply base copy of the system
+ * DB, whose per-row snapshot writes carry no change events (harper-pro#489).
  */
 function rebuildKnownNodes(listener: (node: any, id: string) => void) {
-	const oldNodes = server.nodes || [];
-	server.nodes = [];
-	server.shards = new Map();
-
-	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key) => {
-		// Only a decode-miss RECONSTRUCT descriptor (reconstructNodeFromKey → no url) needs enrichment;
-		// gate strictly on `!node.url`, NOT `node.shard === undefined`. On an unsharded cluster every real,
-		// fully-decoded record has `shard === undefined`, so the looser guard would run mergeReconstructedNode
-		// over REAL records and revert their freshly-decoded `replicates` to a stale in-memory value during a
-		// copyApply base-copy reload (harper-pro#489) — dropping user-database records for a peer that just
-		// widened, or over-connecting to one that narrowed. A real record always has a url, so it skips this
-		// branch and its fresh `replicates` is honored. (PR #572 review — Chris Barber.)
-		if (!node.url) {
-			const targetName = node.name ?? key;
-			const oldNode =
-				targetName !== undefined ? oldNodes.find((n) => n && n.name !== undefined && n.name === targetName) : undefined;
-			// name from the reconstruct wins and oldNode supplies url/shard/ca/etc., but a directional
-			// `replicates` from oldNode is preserved (mergeReconstructedNode) rather than clobbered by the
-			// reconstruct's `true` — otherwise a transient decode miss during this scan would widen a
-			// constrained peer back to full mesh. Same treatment as the two processNodeUpdateEvent reconstruct
-			// sites. systemdb-routing / harper-pro#489.
-			if (oldNode) node = mergeReconstructedNode(node, oldNode);
-		}
-		// server.nodes holds PEERS, never this node itself — mirror processNodeUpdateEvent's
-		// `node_name !== getThisNodeName()` guard. The per-row event path always excluded self; the scan
-		// path latently did not, which was harmless while it only ran on an empty table at boot. A copyApply
-		// reload now runs it over a populated hdb_nodes (incl. the self row), so without this guard self leaks
-		// into server.nodes and the node treats itself as a replication/deploy peer (harper-pro#489).
-		if (node.name === undefined || node.name !== getThisNodeName()) server.nodes.push(node);
-		if (node.shard != undefined) {
-			let nodesForShard = server.shards.get(node.shard);
-			if (!nodesForShard) {
-				server.shards.set(node.shard, (nodesForShard = []));
-			}
-			nodesForShard.push(node);
-		}
-		listener(node, key);
-	});
+	notifyNodeListener(listener, publishKnownNodes());
 }
 
 export function shouldReplicateFromNode(node: Node, databaseName: string) {

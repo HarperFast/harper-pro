@@ -239,7 +239,7 @@ export function recordResidencyConfiguration(peer: string, digest: unknown): voi
 		fingerprint !== digestFingerprint(residencyConfigurationDigest()) &&
 		Atomics.compareExchange(status, 1, 0n, 1n) === 0n
 	)
-		logger.warn?.(`Sharding blocked: replication.shards differs from peer ${peer}`);
+		logger.warn?.(`Sharding blocked: replication.shards differs from peer ${peer} (shard or spare list)`);
 }
 
 export function recordResidencyMapAgreement(database: string, peer: string, error?: unknown): void {
@@ -285,7 +285,7 @@ export function residencyTopologyErrors(database = '*', includeRecovery = true, 
 			recoveryErrors.push(`peer ${node.name} does not support sharding recovery admission`);
 		const observed = Atomics.load(peerDigest(store, node.name), 0);
 		if (observed !== 0n && observed !== local)
-			agreementErrors.push(`replication.shards differs from peer ${node.name}`);
+			agreementErrors.push(`replication.shards differs from peer ${node.name} (shard or spare list)`);
 		if (database !== '*') {
 			const flags = Atomics.load(agreement(node.name, database), 0);
 			if (flags & 1) agreementErrors.push(`shard map agreement with ${node.name} is blocked`);
@@ -330,24 +330,25 @@ server.registerOperation?.({
 });
 
 /** Owners come from the membership residencyOwners() routes by. */
-function shardSummary(snapshot: ResidencyMapSnapshot) {
+function shardSummary(snapshot: ResidencyMapSnapshot, localShard: number | undefined) {
 	const slots = new Map<number, number>();
 	for (const { start, end, shard } of snapshot.ranges) slots.set(shard, (slots.get(shard) ?? 0) + end - start);
 	const assigned = new Set<string>();
+	let selfMembershipAgrees = true;
 	const shards = Array.from(slots, ([shard, count]) => {
 		const owners = new Set<string>();
 		// declared string[], but knownNodes stores the node records
 		const members: (string | { name: string })[] = server.shards?.get(shard) ?? [];
 		for (const member of members) owners.add(typeof member === 'string' ? member : member.name);
 		for (const owner of owners) assigned.add(owner);
+		if (owners.has(server.hostname) !== (shard === localShard)) selfMembershipAgrees = false;
 		return { shard, slots: count, owners: Array.from(owners).sort() };
 	}).sort((a, b) => a.shard - b.shard);
-	// server.nodes learns a peer before server.shards publishes its shard, so its own record decides
 	const noSlots = (server.nodes ?? [])
 		.filter((node) => !assigned.has(node.name) && (node.shard == null || !slots.has(node.shard)))
 		.map((node) => node.name);
 	if (!assigned.has(server.hostname)) noSlots.push(server.hostname);
-	return { shards, nodesOwningNoSlots: noSlots.sort() };
+	return { summary: { shards, nodesOwningNoSlots: noSlots.sort() }, selfMembershipAgrees };
 }
 
 export function residencyStatus() {
@@ -364,12 +365,17 @@ export function residencyStatus() {
 		if (Object.values(tables).some((Table) => Table.residency)) declarations.add(database);
 	for (const database of declarations) {
 		let snapshot;
-		let summary: ReturnType<typeof shardSummary> | undefined;
+		let summary: ReturnType<typeof shardSummary>['summary'] | undefined;
 		const errors: string[] = [];
 		const quarantine = databaseResidencyBlockReason(database);
 		try {
 			snapshot = readResidencyMap(database);
-			if (snapshot) summary = shardSummary(snapshot);
+			if (snapshot) {
+				const result = shardSummary(snapshot, configuration?.shard);
+				summary = result.summary;
+				if (configuration && !result.selfMembershipAgrees)
+					errors.push('local shard membership disagrees with replication.shard');
+			}
 			errors.push(...residencyTopologyErrors(database));
 			assertResidencyEngine(database);
 		} catch (error) {
