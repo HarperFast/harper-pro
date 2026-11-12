@@ -1,19 +1,10 @@
 /**
- * A replicated MQTT message reaches a node's live subscribers once, however that node's replication resumes.
- *
- * A checkpoint-grade route resumes exactly below the origin's certified floor, which trails what the receiver
- * already applied by up to an `originFloors` interval (Non-obvious behaviors 33), so the origin re-sends that
- * stretch of its log. A re-sent record write is dropped as a duplicate; a re-sent publish has no record version to
- * tie against, and before core's fix it was logged and delivered again.
- *
- * Two nodes: A publishes numbered QoS 0 messages, clean-session QoS 0 subscribers listen on B and, as the
- * control, on A. Each case interrupts B's replication from A once the route holds a floor: A restarts (B's
- * subscriber stays connected through the resume), B's HTTP workers restart (the replication worker goes with
- * them), and B restarts. A subscriber on a restarted B can miss what B applied before it resubscribed, which is
- * clean-session behaviour, so B's own log is the oracle that holds in every case: B logged each message once.
+ * A checkpoint-grade route resumes below the origin's certified floor (replication/DESIGN.md note 33), so the origin
+ * re-sends messages the receiver already applied. A clean-session subscriber on a restarted B can miss what B
+ * applied before it resubscribed, so B's own log is the oracle that holds in every case.
  */
 import { suite, test, before, after } from 'node:test';
-import { deepEqual } from 'node:assert/strict';
+import { deepEqual, ok } from 'node:assert/strict';
 import { cp, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
@@ -78,7 +69,6 @@ function connectOptions(node, clientId) {
 	};
 }
 
-/** Publishes `{ n }` to `Message/<topic>` on A at a fixed rate while connected; `n` counts only what was sent. */
 function startPublisher(node, topic) {
 	const client = mqtt.connect(`mqtt://${node.hostname}:1883`, connectOptions(node, `pub-${topic}`));
 	const publisher = { n: 0, client, connections: [] };
@@ -90,7 +80,6 @@ function startPublisher(node, topic) {
 	return publisher;
 }
 
-/** Counts each message number a clean-session subscriber receives, and notes each (re)subscription. */
 function subscribe(node, topic, publisher, label) {
 	const wsUrl = `${node.httpURL.replace(/^http/, 'ws')}/mqtt`;
 	const client = mqtt.connect(wsUrl, connectOptions(node, `${label}-${topic}`));
@@ -111,16 +100,20 @@ const duplicates = (subscriber) => [...subscriber.seen].filter(([, count]) => co
 const missingFrom = (subscriber, from, to) =>
 	Array.from({ length: Math.max(to - from, 0) }, (_, i) => from + i).filter((n) => !subscriber.seen.has(n));
 
-/** The publisher's next number at the first of `events` after `since`. */
 async function nextNAfter(events, since, description) {
 	return (await waitForCondition(() => events.find((event) => event.at > since), { timeoutMs: WAIT_MS, description }))
 		.nextN;
 }
 
 async function clusterConnected(nodes, signal) {
-	const statuses = await Promise.all(
-		nodes.map((node) => sendOperation(node, { operation: 'cluster_status' }, { signal }))
-	);
+	let statuses;
+	try {
+		statuses = await Promise.all(nodes.map((node) => sendOperation(node, { operation: 'cluster_status' }, { signal })));
+	} catch (error) {
+		// a restarted node writes its pid before it listens
+		if (signal.aborted) throw error;
+		return false;
+	}
 	return statuses.every(
 		(status) =>
 			status.connections.length === nodes.length - 1 &&
@@ -128,11 +121,7 @@ async function clusterConnected(nodes, signal) {
 	);
 }
 
-/**
- * Publishes on A until B holds a checkpoint-grade floor for A from this run, interrupts B's replication with
- * `interrupt` (which returns the publisher's first number sent after the interrupted side is back), keeps
- * publishing, then checks both subscribers and B's log.
- */
+// `interrupt` returns the publisher's first number sent after the interrupted side is back
 async function deliversOnce(ctx, topic, interrupt) {
 	const { A, B } = ctx;
 	const publisher = startPublisher(A, topic);
@@ -149,9 +138,17 @@ async function deliversOnce(ctx, topic, interrupt) {
 		await waitForCondition(
 			async (signal) => {
 				route = await postToFixture(B, 'RouteState', { peer: A.hostname }, signal);
-				return route.closedFloor > caseStart && typeof route.originGeneration === 'string' && route.fullCoverage;
+				return (
+					route.closedFloor > caseStart &&
+					route.closedFloor < route.seqId &&
+					typeof route.originGeneration === 'string' &&
+					route.fullCoverage
+				);
 			},
-			{ timeoutMs: WAIT_MS, description: () => `a checkpoint-grade floor for A on B, last ${JSON.stringify(route)}` }
+			{
+				timeoutMs: WAIT_MS,
+				description: () => `a checkpoint-grade floor for A on B below its position, last ${JSON.stringify(route)}`,
+			}
 		);
 		const backUpN = await interrupt(onB);
 		await sleep(AFTER_RESUME_MS);
@@ -165,6 +162,12 @@ async function deliversOnce(ctx, topic, interrupt) {
 		deepEqual(duplicates(onA), [], 'message numbers the subscriber on A received more than once');
 		deepEqual(missingFrom(onB, backUpN, publisher.n), [], `numbers from ${backUpN} B never delivered`);
 		const logged = await postToFixture(B, 'LoggedMessages', { peer: A.hostname, topic });
+		ok(
+			Object.keys(logged).length >= publisher.n - backUpN,
+			`B logged ${Object.keys(logged).length} of A's messages, fewer than the ${publisher.n - backUpN} sent after it was back`
+		);
+		const { certifiedFrom } = await postToFixture(B, 'RouteState', { peer: A.hostname });
+		ok(certifiedFrom > 0, 'B resumed from A at least once floor-only');
 		deepEqual(
 			Object.entries(logged).filter(([, count]) => count > 1),
 			[],
@@ -184,8 +187,9 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 			roots.map((root) => cp(FIXTURE, join(root, 'components', basename(FIXTURE)), { recursive: true }))
 		);
 		const contexts = hostnames.map((hostname, i) => ({ name: ctx.name, harper: { hostname, dataRootDir: roots[i] } }));
-		await Promise.all(contexts.map((nodeCtx) => startHarper(nodeCtx, nodeOptions(nodeCtx.harper.hostname))));
+		// assigned before starting, so after() tears down a node that started even when the other did not
 		[ctx.A, ctx.B] = contexts.map((nodeCtx) => nodeCtx.harper);
+		await Promise.all(contexts.map((nodeCtx) => startHarper(nodeCtx, nodeOptions(nodeCtx.harper.hostname))));
 		await sendOperation(ctx.B, {
 			operation: 'add_node',
 			hostname: ctx.A.hostname,
