@@ -382,7 +382,7 @@ Notes:
 - Lanes follow node names. Adding or removing a node moves the lanes of the nodes named after it in its region, and their cross-region links move with them. Give a new node a name that sorts last in its region to leave the existing links in place.
 - Every node relays the column it receives, so every node must replicate every database that crosses regions.
 - A write confirmed with `replicatedConfirmation` or `X-Replicate-To: ...;confirm=N` is acknowledged only by the nodes that subscribe to the writer: its own region's nodes, plus one node in each other region. A larger count is refused before the write commits.
-- Writes a node made just before it went down may have reached its own region and not yet the others. They stay in its region until the node returns.
+- Writes a node made just before it went down may have reached its own region and not yet the others. The other regions fetch them from one of its region-mates after 3 seconds (see Losing a link or an origin). They wait for the node to return only when it is alone in its region, or when none of its region-mates can be reached.
 - Client subscription checkpoints need a certified floor for every origin, which a node receiving an origin only through a relay does not hold, so they are not issued on such nodes.
 - `region` shapes traffic only. It is not a security boundary: a node with valid cluster credentials can still subscribe to any peer that authorizes it.
 

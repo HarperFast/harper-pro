@@ -1242,7 +1242,6 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 	return { byUrl: borrowLinks(byUrl), managed, active: true };
 }
 
-/** The origins each database has taken over by a temporary direct link, for the link review's signature. */
 function directTakeovers(): string {
 	const taken: string[] = [];
 	for (const [database, assignments] of topologyAssignments) {
@@ -1592,6 +1591,7 @@ export async function startOnMainThread(options) {
 			for (const [database, entry] of dbReplicationWorkers) {
 				const { worker, nodes } = entry;
 				clearTimeout(entry.reDriveTimer);
+				closeOriginFallback(entry, database);
 				dbReplicationWorkers.delete(database);
 				logger.warn('Node was deleted, unsubscribing from node', hostname, database, url);
 				// `clearStatus` has the owning session drop its claim on the shared buffer, so nothing it writes
@@ -1766,6 +1766,7 @@ export async function startOnMainThread(options) {
 			if (existingEntry && replicationPool.length > 0 && !replicationPool.includes(existingEntry.worker as any)) {
 				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
 				clearTimeout(existingEntry.reDriveTimer);
+				closeOriginFallback(existingEntry, databaseName);
 				dbReplicationWorkers.delete(databaseName);
 				carriedSharedStatus = existingEntry.sharedStatus;
 				existingEntry = undefined;
@@ -1898,7 +1899,6 @@ export async function startOnMainThread(options) {
 	const fallbackKey = (url: string, originUrl: string, database: string) => `${url}\0${originUrl}\0${database}`;
 	// A closed fallback's socket still reports its close, under its peer's URL: that must not reach the peer's entry.
 	const retiredOriginFallbacks = new Set<string>();
-	/** The entry whose origin `report`'s socket carries as a fallback link, when it is one. */
 	function originFallbackOwner(report: LinkReport): any {
 		if (!report.subscriptionUrl || report.subscriptionUrl === report.url) return;
 		const owner = connectionReplicationMap.get(report.subscriptionUrl)?.get(report.database);
@@ -1918,7 +1918,8 @@ export async function startOnMainThread(options) {
 		entry.originFallbackTimer = setTimeout(() => {
 			entry.originFallbackTimer = undefined;
 			const current = connectionReplicationMap.get(entry.url)?.get(database);
-			if (current === entry && entry.connected === false && !entry.unsubscribed) openOriginFallback(entry, database);
+			if (current !== entry || entry.connected !== false || entry.unsubscribed) return;
+			if (!openOriginFallback(entry, database)) scheduleOriginFallback(entry, database);
 		}, TOPOLOGY_HOLD_MS);
 		entry.originFallbackTimer.unref?.();
 		return true;
@@ -1944,8 +1945,9 @@ export async function startOnMainThread(options) {
 		logger.info(
 			`Region topology: ${database} takes ${origin.name} from ${mate} while its link to ${origin.name} is down`
 		);
+		// nothing was opened while the replication pool restarts; the caller's timer tries again
+		if (!connectToNextWorker(origin, database, mateNode)) return false;
 		retiredOriginFallbacks.delete(fallbackKey(getNodeURL(mateNode), origin.url, database));
-		connectToNextWorker(origin, database, mateNode);
 		entry.originFallback = {
 			name: mate,
 			url: getNodeURL(mateNode),
@@ -2194,8 +2196,10 @@ export async function startOnMainThread(options) {
 				return links.active ? { excluded: links.managed } : null;
 			})(),
 		};
-		if (dispatchSubscriptionRequest({ worker }, request, replicationPool, true, subscribeToNode) === 'deferred')
-			logger.warn('No replication workers available to fail over', database, 'to node', connectingNode.name);
+		if (dispatchSubscriptionRequest({ worker }, request, replicationPool, true, subscribeToNode) !== 'deferred')
+			return true;
+		logger.warn('No replication workers available to fail over', database, 'to node', connectingNode.name);
+		return false;
 	}
 	// Read the per-(database, node) replication progress out of the process-shared status buffer the owning
 	// worker writes (the same buffer cluster_status reports from). Used by findStalledReceivingNodeUrls to
@@ -2248,6 +2252,15 @@ export async function startOnMainThread(options) {
 			)
 				reconcileWorkers();
 			reportUnstamped('worker exit', unstamped);
+			// a fallback socket died with its worker, and no report says so
+			for (const entries of connectionReplicationMap.values()) {
+				for (const [databaseName, entry] of entries) {
+					if (entry.originFallback?.worker !== worker) continue;
+					clearTimeout(entry.originFallback.recheck);
+					entry.originFallback = undefined;
+					if (entry.connected === false) scheduleOriginFallback(entry, databaseName);
+				}
+			}
 		});
 	}
 	// Ownership is the CALLER's guard; this only refuses to overwrite a state that is not CONNECTED. Never
