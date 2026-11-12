@@ -10763,7 +10763,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																.includes(remoteNodeName)
 														)
 															continue;
-														// a record-less head over a delete this node took by copy; the delete is what is sent
+														// a record-less head over a delete keeps the delete's identity (`copiedDeleteBoundary`)
 														const retainedDelete =
 															sendTombstonesAsDeletes &&
 															entry.value == null &&
@@ -10805,8 +10805,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															!isStub &&
 															Boolean(entry.metadataFlags & FULL_WRITE_HEAD || retainedDelete) &&
 															sendTombstonesAsDeletes;
-														// the delete keeps its own version, origin and frame clock: a head that crossed the copy anchor
-														// must not turn the delete into a live write
+														// its own frame clock, so a head newer than the copy anchor cannot make it a live write
 														const copyVersion = retainedDelete ? retainedDelete.version : entry.version;
 														const copyNodeId = retainedDelete ? retainedDelete.nodeId || nodeId : recordNodeId;
 														const copyTxnLogKey = retainedDelete ? retainedDelete.version : headTxnLogKey;

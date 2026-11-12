@@ -1,14 +1,8 @@
 /**
- * harper-pro#1331, and harper-pro#1307 on hdb_nodes. No fault injection: A, B and D form a mesh.
- * A stops; B writes to rows A will delete and rewrites D's hdb_nodes row; B and D stop. A
- * restarts, deletes those rows and removes D. C joins by copy from A. With A stopped again, B
- * returns and delivers its older writes to C: C resumes B's log from the cursor A's copy gave it,
- * which sits below writes A never received. A rejects them against its own tombstones; C must too,
- * or the rows (and D's membership) come back.
- *
- * Each of B's batches commits in one transaction with a witness row, so the witness reaching C proves
- * C processed the stale writes in the same frame. A is down while B delivers: up, it would apply only
- * the witness and relay it, moving C's cursor for B past the transaction before B could send it.
+ * harper-pro#1331 and #1307 (hdb_nodes): a node that joins by base copy rejects the older writes its source
+ * rejects against a deletion. B's stale writes commit with a witness row, so the witness reaching C proves C
+ * processed them in the same frame; A stays down while B delivers, since up it would relay only the witness
+ * and move C's cursor for B past the stale writes.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
@@ -260,53 +254,68 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 	});
 });
 
-suite('a delete under a later publish', { timeout: 600_000, skip: isLMDB && 'copy-apply is RocksDB-only' }, (ctx) => {
+suite('a delete under a later publish', { timeout: 900_000, skip: isLMDB && 'copy-apply is RocksDB-only' }, (ctx) => {
 	const nodes = cluster(ctx.name);
-	let A, X, E;
-	let deleted;
+	let A, X, E1, E2;
+	const deleted = {};
 
 	before(async () => {
 		A = await nodes.startFresh();
-		await put(A.harper, 'covered', { name: 'v1' });
-		await sendOperation(A.harper, { operation: 'delete', database: 'data', table: TABLE, ids: ['covered'] });
+		for (const id of ['native', 'covered']) await put(A.harper, id, { name: 'v1' });
+		for (const id of ['native', 'covered'])
+			await sendOperation(A.harper, { operation: 'delete', database: 'data', table: TABLE, ids: [id] });
 		await put(A.harper, 'sentinel', { name: 'seeded' });
-		deleted = await dataRow(A.harper, 'covered');
-		assert.ok(deleted.fullWriteHead && !deleted.present, 'premise: A holds a flagged tombstone');
-		X = await nodes.startFresh();
-		await nodes.join(X, A);
-		await waitFor(async (signal) => (await dataRow(X.harper, 'sentinel', signal)).present, 'the copy to reach X');
-		await waitFor(async (signal) => (await dataRow(X.harper, 'covered', signal)).stored, "A's copied tombstone on X");
+		for (const id of ['native', 'covered']) {
+			const row = await dataRow(A.harper, id);
+			assert.ok(row.fullWriteHead && !row.present, `premise: A holds ${id} as a flagged tombstone`);
+			deleted[id] = row.version;
+		}
 	});
 
 	after(() => nodes.teardown());
 
-	test('a node that copies from a holder of publish-over-delete keeps the delete', async () => {
-		// down, so E can only learn the delete from X's copy
-		await nodes.stop(A);
+	const expectDeleteOn = async (node, id) => {
+		await waitFor(async (signal) => (await dataRow(node.harper, id, signal)).stored, `the delete of ${id} on E`);
+		const { originId, origin, ...row } = await dataRow(node.harper, id);
+		assert.ok(originId, `the delete of ${id} keeps a remote origin on ${node.harper.hostname}`);
+		assert.equal(origin, A.harper.hostname, `the delete of ${id} keeps A's origin, not the copy source's`);
+		assert.deepEqual(
+			row,
+			{ stored: true, present: false, version: deleted[id], fullWriteHead: true, history: 0 },
+			`${id} on ${node.harper.hostname} holds the delete at its version`
+		);
+		await redeliver(node.harper, id, { id, name: 'older write' }, 1000);
+		assert.equal((await dataRow(node.harper, id)).present, false, `an older write recreated ${id}`);
+	};
+
+	test('a node copying from a node that deleted a row and then published to it keeps the delete', async () => {
+		await writeTogether(A.harper, 'data', [{ table: TABLE, op: 'publish', id: 'native', record: { message: 'm' } }]);
+		const held = await dataRow(A.harper, 'native');
+		assert.equal(held.present, false);
+		assert.equal(held.fullWriteHead, false, 'premise: the publish cleared the flag');
+		assert.equal(held.boundary?.version, deleted.native, 'premise: A keeps its own delete as the boundary');
+		E1 = await nodes.startFresh();
+		await nodes.join(E1, A);
+		await waitFor(async (signal) => (await dataRow(E1.harper, 'sentinel', signal)).present, 'the copy to reach E1');
+		await expectDeleteOn(E1, 'native');
+	});
+
+	test('a node copying from a node that took the delete by copy and then published to it keeps the delete', async () => {
+		X = await nodes.startFresh();
+		await nodes.join(X, A);
+		await waitFor(async (signal) => (await dataRow(X.harper, 'sentinel', signal)).present, 'the copy to reach X');
+		await waitFor(async (signal) => (await dataRow(X.harper, 'covered', signal)).stored, "A's copied tombstone on X");
+		// down, so E2 can only learn the delete from X's copy
+		await Promise.all([nodes.stop(A), nodes.stop(E1)]);
 		await writeTogether(X.harper, 'data', [{ table: TABLE, op: 'publish', id: 'covered', record: { message: 'm' } }]);
 		const held = await dataRow(X.harper, 'covered');
 		assert.equal(held.present, false);
 		assert.equal(held.fullWriteHead, false, 'premise: the publish cleared the flag');
-		assert.deepEqual(
-			held.boundary,
-			{ version: deleted.version, origin: A.harper.hostname },
-			'premise: X holds the delete only as the boundary under the publish'
-		);
-
-		E = await nodes.startFresh();
-		await nodes.join(E, X);
-		await waitFor(async (signal) => (await dataRow(E.harper, 'sentinel', signal)).present, 'the copy to reach E');
-		await waitFor(async (signal) => (await dataRow(E.harper, 'covered', signal)).stored, 'the delete on E');
-		const { originId, origin, ...onE } = await dataRow(E.harper, 'covered');
-		assert.ok(originId, "the delete keeps a remote origin on E, not E's own");
-		if (origin !== null) assert.equal(origin, A.harper.hostname, "the delete keeps A's origin, not the copy source's");
-		assert.deepEqual(
-			onE,
-			{ stored: true, present: false, version: deleted.version, fullWriteHead: true, history: 0 },
-			'E holds the delete at its version'
-		);
-		await redeliver(E.harper, 'covered', { id: 'covered', name: 'older write' }, 1000);
-		assert.equal((await dataRow(E.harper, 'covered')).present, false, 'an older write recreated the deleted row on E');
+		assert.equal(held.boundary?.version, deleted.covered, 'premise: X holds the delete only as the boundary');
+		E2 = await nodes.startFresh();
+		await nodes.join(E2, X);
+		await waitFor(async (signal) => (await dataRow(E2.harper, 'sentinel', signal)).present, 'the copy to reach E2');
+		await expectDeleteOn(E2, 'covered');
 	});
 });
 
