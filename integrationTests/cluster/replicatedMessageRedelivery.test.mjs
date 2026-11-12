@@ -20,7 +20,13 @@ import { basename, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import mqtt from 'mqtt';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, restartNode, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
+import {
+	restartHttpWorkers,
+	restartNode,
+	sendOperation,
+	stopAndTeardownNodes,
+	waitForCondition,
+} from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = resolve(
 	import.meta.dirname,
@@ -208,7 +214,7 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 	test("the receiving node's HTTP workers restart", () =>
 		deliversOnce(ctx, 'worker-restart', async (onB) => {
 			const since = Date.now();
-			await sendOperation(ctx.B, { operation: 'restart_service', service: 'http_workers' });
+			await restartHttpWorkers(ctx.B);
 			return nextNAfter(onB.subscriptions, since, 'the subscriber on B to resubscribe');
 		}));
 
