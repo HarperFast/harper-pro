@@ -10763,10 +10763,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																.includes(remoteNodeName)
 														)
 															continue;
+														// a record-less head over a delete this node took by copy; the delete is what is sent
+														const retainedDelete =
+															sendTombstonesAsDeletes &&
+															entry.value == null &&
+															!(entry.metadataFlags & (INVALIDATED | REPLICA | FULL_WRITE_HEAD))
+																? entry.copiedDeleteBoundary
+																: undefined;
 														// same origin normalization as recordNodeId below: undefined means we authored it
 														if (
 															withheldOriginNodeId !== undefined &&
-															(entry.nodeId ?? nodeId) === withheldOriginNodeId
+															(retainedDelete ? retainedDelete.nodeId || nodeId : (entry.nodeId ?? nodeId)) ===
+																withheldOriginNodeId
 														) {
 															withheldRecordCount++;
 															continue;
@@ -10785,34 +10793,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// origin on the follower. `entry.nodeId` is this node's local id for that
 														// origin (undefined/0 = us) — the same id space the wire uses.
 														const recordNodeId = entry.nodeId ?? nodeId;
-														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
+														const headTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
 														const isReplica = Boolean(entry.metadataFlags & REPLICA);
 														const isStub = Boolean(entry.metadataFlags & (INVALIDATED | REPLICA));
 														const stubAsInvalidation =
 															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
 														const legacyStubCopy = isStub && !stubAsInvalidation;
 														if (legacyStubCopy && table.residency) continue;
-														// a delete's tombstone, or a record-less head (a publish) over a delete this node took by copy
-														const retainedDelete =
-															entry.value == null && !isStub && !(entry.metadataFlags & FULL_WRITE_HEAD)
-																? entry.copiedDeleteBoundary
-																: undefined;
 														const tombstoneAsDelete =
 															entry.value == null &&
 															!isStub &&
 															Boolean(entry.metadataFlags & FULL_WRITE_HEAD || retainedDelete) &&
 															sendTombstonesAsDeletes;
-														const copyVersion =
-															tombstoneAsDelete && retainedDelete ? retainedDelete.version : entry.version;
-														const copyNodeId =
-															tombstoneAsDelete && retainedDelete ? retainedDelete.nodeId || nodeId : recordNodeId;
-														if (
-															tombstoneAsDelete &&
-															retainedDelete &&
-															withheldOriginNodeId !== undefined &&
-															copyNodeId === withheldOriginNodeId
-														)
-															continue;
+														// the delete keeps its own version, origin and frame clock: a head that crossed the copy anchor
+														// must not turn the delete into a live write
+														const copyVersion = retainedDelete ? retainedDelete.version : entry.version;
+														const copyNodeId = retainedDelete ? retainedDelete.nodeId || nodeId : recordNodeId;
+														const copyTxnLogKey = retainedDelete ? retainedDelete.version : headTxnLogKey;
 														const copyType = stubAsInvalidation ? 'invalidate' : tombstoneAsDelete ? 'delete' : 'put';
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;

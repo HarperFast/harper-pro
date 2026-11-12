@@ -129,6 +129,7 @@ describe('delete tombstones in a base copy', function () {
 		const end = socket.sent.findIndex((frame) => frame[0] === COPY_COMPLETE);
 		assert.ok(start >= 0 && end > start, 'must exercise the base-copy row walk');
 		const records = new Map();
+		records.sent = new Map();
 		for (const frame of socket.sent.slice(start + 1, end)) {
 			if (!Buffer.isBuffer(frame)) continue;
 			const decoder = new Decoder(frame.buffer, frame.byteOffset, frame.byteLength);
@@ -139,6 +140,8 @@ describe('delete tombstones in a base copy', function () {
 				decoder.position += length;
 				if (length === 9 && frame[offset] === 11) continue;
 				const entry = readAuditEntry(frame, offset, offset + length);
+				if (entry.tableId === Records.tableId)
+					records.sent.set(entry.recordId, (records.sent.get(entry.recordId) ?? 0) + 1);
 				if (entry.tableId === Records.tableId)
 					records.set(entry.recordId, { entry, bytes: Buffer.from(frame.subarray(offset, offset + length)) });
 			}
@@ -186,6 +189,7 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(covered.version, boundaryVersion, "at the delete's version, not the publish's");
 		assert.equal(covered.nodeId, copiedDeleted.nodeId, "from the delete's origin");
 		assert.equal(covered.getValue(Records.primaryStore), undefined);
+		assert.equal(records.sent.get('published-over-delete'), 1, 'one entry stands for the key');
 	});
 
 	for (const peer of ['a pre-key capability bag', 'unlearned capabilities']) {
