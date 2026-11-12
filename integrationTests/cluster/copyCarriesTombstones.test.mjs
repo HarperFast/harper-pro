@@ -285,9 +285,11 @@ suite('a delete under a later publish', { timeout: 900_000, skip: isLMDB && 'cop
 			`${id} on ${node.harper.hostname} holds the delete at its version`
 		);
 		const older = deleted[id] - 1000;
-		await redeliver(node.harper, 'control', id, { id: 'control', name: 'older write' }, older);
+		const control = `control-${id}-${node.harper.hostname}`;
+		assert.equal((await dataRow(node.harper, control)).stored, false, 'premise: the control key is absent');
+		await redeliver(node.harper, control, id, { id: control, name: 'older write' }, older);
 		assert.equal(
-			(await dataRow(node.harper, 'control')).present,
+			(await dataRow(node.harper, control)).present,
 			true,
 			'the redelivery applies where nothing is deleted'
 		);

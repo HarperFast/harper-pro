@@ -156,7 +156,6 @@ describe('delete tombstones in a base copy', function () {
 		return records;
 	}
 
-	// the nil put a receiver without tombstoneCopy gets
 	function nilPutEncoding(key, nodeId) {
 		const stored = [...Records.primaryStore.getRange({ versions: true, snapshot: false })].find(
 			(entry) => entry.key === key
