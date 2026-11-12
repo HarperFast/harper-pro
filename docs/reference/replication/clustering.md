@@ -114,12 +114,32 @@ Modifies an existing Harper instance in the cluster. Will attempt to add the nod
 
 ### Remove Node
 
-Removes a Harper node from the cluster and stops all replication to and from that node.
+Removes a Harper node from the cluster and stops all replication to and from that node. Run it on any member, naming the node to remove.
+
+A node accepts writes locally and sends them to its peers afterward, so a live node can hold writes no peer has received yet: writes accepted just before removal, while a peer link was down, or, for a sharded table, writes to records it does not own. `remove_node` does not delete the node's membership until those writes are on its peers:
+
+1. The node being removed stops accepting local writes. A write to it returns `503` ("This node is being removed from its cluster"). Transactions it already started commit. This fence is persisted, so the node stays fenced across a restart. Writes it receives from peers still apply. The `system` database is not fenced.
+2. `remove_node` waits until every peer that replicates a database with the node reports that it has committed all of the node's writes to that database. For a sharded database, a peer on another shard reports the records it owns.
+3. Then the node's membership is deleted, as before.
+
+The wait has a limit (`timeout`, five minutes by default). When it runs out, the removal fails with `504` and names each peer that has not confirmed. The node stays fenced and stays a member. Run `remove_node` again to resume the wait, or cancel the removal with `cancel: true`, which lets the node accept writes again.
+
+`remove_node` refuses a live removal without `force` when:
+
+- the node cannot be reached (it keeps retrying until `timeout`, since a restarting node is briefly unreachable),
+- the node runs a version that cannot fence its writes,
+- the node is the only owner of a shard in a database's [shard map](./residency.md#installed-maps), so its records exist nowhere else, or
+- a database is stored on LMDB, which keeps no origin floors to confirm delivery with.
+
+`force: true` removes the node without fencing or waiting. Writes that only that node held are lost. Use it for a node that is permanently down.
 
 **Parameters**:
 
 - `operation` _(required)_ — must be `remove_node`
 - `hostname` _(required)_ — hostname of the node to remove
+- `timeout` _(optional)_ — milliseconds to wait for the node's writes to reach its peers; default `300000`
+- `force` _(optional)_ — remove without fencing the node or waiting; writes only it holds may be lost
+- `cancel` _(optional)_ — stop a removal that timed out: the node accepts local writes again and stays a member. Refused once the removal has been finalized, just before the membership is deleted; then run `remove_node` again to complete it.
 
 **Request**:
 
@@ -134,9 +154,11 @@ Removes a Harper node from the cluster and stops all replication to and from tha
 
 ```json
 {
-	"message": "Successfully removed 'server-two' from cluster"
+	"message": "Successfully removed 'server-two' from cluster; its writes reached 2 peers before it was removed"
 }
 ```
+
+Two operations carry the removal between nodes, authorized for cluster nodes and super users: `remove_node_fence` runs on the node being removed (fence, finalize or cancel), and `get_received_origin_floors` runs on each peer and reports what it has received from the node. `remove_node` calls them; you do not need to.
 
 ---
 
