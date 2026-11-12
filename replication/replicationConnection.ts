@@ -10763,11 +10763,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																.includes(remoteNodeName)
 														)
 															continue;
-														// a record-less head over a delete keeps the delete's identity (`copiedDeleteBoundary`)
+														// the stronger delete identity a head retains (`copiedDeleteBoundary`): under a record-less head, or above a tombstone's own
 														const retainedDelete =
 															sendTombstonesAsDeletes &&
 															entry.value == null &&
-															!(entry.metadataFlags & (INVALIDATED | REPLICA | FULL_WRITE_HEAD))
+															!(entry.metadataFlags & (INVALIDATED | REPLICA)) &&
+															(!(entry.metadataFlags & FULL_WRITE_HEAD) ||
+																entry.copiedDeleteBoundary?.version > entry.version)
 																? entry.copiedDeleteBoundary
 																: undefined;
 														// same origin normalization as recordNodeId below: undefined means we authored it
