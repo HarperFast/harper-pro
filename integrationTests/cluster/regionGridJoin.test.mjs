@@ -48,32 +48,44 @@ const REQUESTED_COPY = /Requesting full copy of database data from (\S+)/g;
 
 const WRITE_INTERVAL_MS = 200;
 
-/** Each writer inserts a row of `phase` every WRITE_INTERVAL_MS until stopped; `stop` resolves how many each wrote. */
+/**
+ * Each writer inserts a row of `phase` every WRITE_INTERVAL_MS until stopped. `stop` resolves how many each wrote, or
+ * rejects with the first write that failed.
+ */
 function startRowWriters(writers, phase) {
 	let stopped = false;
+	let failure;
 	const loops = writers.map(async (writer) => {
 		let written = 0;
-		for (; !stopped; written++) {
-			await sendOperation(writer, {
-				operation: 'insert',
-				database: 'data',
-				table: TABLE,
-				records: [
-					{
-						id: `${phase}-${writer.hostname}-${written}`,
-						phase: `${phase}-${writer.hostname}`,
-						origin: writer.hostname,
-					},
-				],
-			});
-			await delay(WRITE_INTERVAL_MS);
+		try {
+			for (; !stopped; written++) {
+				await sendOperation(writer, {
+					operation: 'insert',
+					database: 'data',
+					table: TABLE,
+					records: [
+						{
+							id: `${phase}-${writer.hostname}-${written}`,
+							phase: `${phase}-${writer.hostname}`,
+							origin: writer.hostname,
+						},
+					],
+				});
+				await delay(WRITE_INTERVAL_MS);
+			}
+		} catch (error) {
+			// caught here, not at stop: the join can still be running when a write fails
+			failure ??= error;
+			stopped = true;
 		}
 		return written;
 	});
 	return {
 		async stop() {
 			stopped = true;
-			return Promise.all(loops);
+			const written = await Promise.all(loops);
+			if (failure) throw failure;
+			return written;
 		},
 	};
 }
