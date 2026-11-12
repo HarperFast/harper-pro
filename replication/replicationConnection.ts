@@ -3734,6 +3734,8 @@ export class PendingRouteState {
 	private settledClearVersion = new Map<number, number>();
 	private settledRevokeVersion = new Map<number, number>();
 	private settledCertifiedSinceClear = new Map<number, { clearVersion: number; start: number; generation?: string }>();
+	/** The newest settled version per origin that wrote `partialHistory`; a later read-back of an older one sees it. */
+	private settledPartialVersion = new Map<number, number>();
 	private takenEvents = new WeakSet<object>();
 	private unverifiedBatches: UnverifiedRouteStateBatch[] = [];
 	private onSettled?: (event: any) => void;
@@ -3922,6 +3924,11 @@ export class PendingRouteState {
 			{ clearVersion: number; start: number; generation?: string } | undefined
 		>();
 		for (const [originId, sent] of marks ?? []) {
+			if (
+				(sent.mark[2] !== undefined || sent.clearCertifiedFirst) &&
+				sent.version > (this.settledPartialVersion.get(originId) ?? 0)
+			)
+				this.settledPartialVersion.set(originId, sent.version);
 			prevMarks.set(originId, this.settledMarkVersion.get(originId));
 			prevCertifiedSinceClear.set(originId, this.settledCertifiedSinceClear.get(originId));
 			if (sent.version > (this.settledMarkVersion.get(originId) ?? 0)) {
@@ -4133,14 +4140,17 @@ export class PendingRouteState {
 				if (gen !== undefined && node?.originGeneration !== gen) {
 					continue;
 				}
-				// the row is read now: once a newer mark of this origin has settled it holds that one, which its own batch
-				// verifies, and comparing this one with it would re-queue a superseded mark
-				if ((this.settledMarkVersion.get(originId) ?? 0) > entry.version) continue;
 				if (!node) {
 					batchPersisted = false;
 					break;
 				}
-				if (partialHistory !== undefined && node.partialHistory !== partialHistory) {
+				// the row is read now: once a newer mark that wrote partialHistory has settled, the row holds that value,
+				// which its own batch verifies (a copy pass's start mark against the restore at its finish)
+				if (
+					partialHistory !== undefined &&
+					!((this.settledPartialVersion.get(originId) ?? 0) > entry.version) &&
+					node.partialHistory !== partialHistory
+				) {
 					batchPersisted = false;
 					break;
 				}

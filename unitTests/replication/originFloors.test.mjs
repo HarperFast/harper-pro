@@ -1125,6 +1125,25 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
 	});
 
+	it('PendingRouteState verifyPersisted still re-queues a safety field the newer settled mark did not write', async () => {
+		const routeState = new PendingRouteState(() => {});
+		const commit = async () => {
+			const event = { remoteNodeIds: [1] };
+			routeState.attachTo(event);
+			await event.onCommit();
+		};
+		routeState.hole(1, 'g1');
+		await commit();
+		routeState.certifiedFrom(1, 200, 'g1');
+		await commit();
+		// the hole's write did not land; the certification after it carried no hole
+		assert.strictEqual(
+			routeState.verifyPersisted(() => [{ id: 1, originGeneration: 'g1', certifiedFrom: 200 }]),
+			false
+		);
+		assert.strictEqual(routeState.hasPending(), true);
+	});
+
 	it('buildOriginCursorVector never uses floor-only resume for removed origins seeded from another row or unnamed node ids', () => {
 		const seqRows = new Map([
 			[
