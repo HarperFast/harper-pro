@@ -189,6 +189,35 @@ export async function restartNode(node, opts) {
 }
 
 /**
+ * Rolling-restart a node's HTTP workers and resolve once every worker runs what is in `components/` now.
+ *
+ * `restart_service` answers as soon as the restart starts. Until its job completes, the old workers keep
+ * serving the components they loaded at their own start, so a component copied in just before answers 404.
+ *
+ * @param {Object} node
+ * @param {Object} [opts]
+ * @param {number} [opts.timeoutMs]
+ */
+export async function restartHttpWorkers(node, { timeoutMs = 120_000 } = {}) {
+	const { job_id: id } = await sendOperation(node, { operation: 'restart_service', service: 'http_workers' });
+	if (!id) throw new Error(`restart_service on ${node.hostname} returned no job id`);
+	let job;
+	await waitForCondition(
+		async (signal) => {
+			// a worker being retired can drop the request
+			const [current] = await sendOperation(node, { operation: 'get_job', id }, { signal }).catch((error) => {
+				if (signal.aborted) throw error;
+				return [];
+			});
+			job = current ?? job;
+			return job?.status === 'COMPLETE' || job?.status === 'ERROR';
+		},
+		{ timeoutMs, description: () => `the HTTP-worker restart on ${node.hostname} (job ${JSON.stringify(job)})` }
+	);
+	equal(job.status, 'COMPLETE', `HTTP-worker restart on ${node.hostname}: ${JSON.stringify(job)}`);
+}
+
+/**
  * Env that keeps one node's replication off the pool whether the pool comes from `HARPER_CONFIG` or the
  * `threads.count`-derived default (`Math.floor(threads.count / 2)` for `threads.count >= 2`). For a node whose
  * fault injection is application code: pool workers load none, so an injector armed over HTTP never runs on the

@@ -4,7 +4,13 @@ import { cp, mkdtemp } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { readLog, sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
+import {
+	readLog,
+	restartHttpWorkers,
+	sendOperation,
+	stopAndTeardownNodes,
+	waitForCondition,
+} from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -107,7 +113,7 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 	async function deployOnLeaderFirst(fixture, database) {
 		const [leader, ...others] = backbone;
 		await cp(fixture, join(leader.dataRootDir, 'components', basename(fixture)), { recursive: true });
-		await sendOperation(leader, { operation: 'restart_service', service: 'http_workers' });
+		await restartHttpWorkers(leader);
 		await waitForCondition(
 			async (signal) =>
 				(await Promise.all(others.map((node) => mapShards(node, database, signal).catch(() => undefined)))).every(
@@ -115,10 +121,12 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 				),
 			{ timeoutMs: 180_000, description: `the ${database} map to reach every backbone node` }
 		);
-		for (const node of others) {
-			await cp(fixture, join(node.dataRootDir, 'components', basename(fixture)), { recursive: true });
-			await sendOperation(node, { operation: 'restart_service', service: 'http_workers' });
-		}
+		await Promise.all(
+			others.map(async (node) => {
+				await cp(fixture, join(node.dataRootDir, 'components', basename(fixture)), { recursive: true });
+				await restartHttpWorkers(node);
+			})
+		);
 	}
 
 	before(async () => {
