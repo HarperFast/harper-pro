@@ -17,7 +17,7 @@ import { getThisNodeName, hostnameToUrl, getThisNodeUrl } from '../core/server/n
 import * as hdbLogger from '../core/utility/logging/harper_logger.js';
 import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/hdbError.js';
 import { server } from '../core/server/Server.ts';
-import { drainNode, drainTimeoutMs, FENCE_OPERATION, removeNodeFence } from './nodeRemoval.ts';
+import { drainNode, drainTimeoutMs, FENCE_OPERATION, liftFenceAfterRemoval, removeNodeFence } from './nodeRemoval.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
 
 const validationSchema = Joi.object({
@@ -131,6 +131,8 @@ export async function setNode(req: any) {
 		csr,
 		cert_auth,
 		authorization: req.retain_authorization ? req.authorization : null,
+		// the target lifts a removal fence it still holds, as this node does below
+		joining: req.operation !== 'update_node',
 	};
 	if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) targetAddNodeObj.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
 
@@ -255,7 +257,10 @@ export async function setNode(req: any) {
 	let message: string;
 	if (req.operation === 'update_node') {
 		message = `Successfully updated '${url}'`;
-	} else message = `Successfully added '${url}' to cluster`;
+	} else {
+		await liftFenceAfterRemoval();
+		message = `Successfully added '${url}' to cluster`;
+	}
 	if (targetNodeResponseError) {
 		// Opt-in only, so add_node/set_node keep reporting success-with-warning for every other caller:
 		// the local peer row is written either way, but for a caller whose next step depends on the
@@ -335,6 +340,7 @@ export async function addNodeBack(req) {
 		await ensureNode(getThisNodeName(), thisNode);
 	}
 	await ensureNode(req.hostname, nodeRecord);
+	if (req.joining === true) await liftFenceAfterRemoval();
 	certs.nodeName = getThisNodeName();
 
 	certs.usingCA = repCa?.certificate; // in addition to the signed CA, we need to return the CA that is being used for the active certificate
@@ -453,6 +459,7 @@ export async function removeNodeBackFromTable(req, hdbNodes) {
 export async function removeNodeBack(req) {
 	hdbLogger.trace('removeNodeBack received request:', req);
 	await removeNodeBackFromTable(req, getHDBNodeTable());
+	await liftFenceAfterRemoval();
 }
 
 function reverseSubscription(subscription) {

@@ -40,6 +40,12 @@ async function members(node) {
 	return rows.map((row) => row.name).sort();
 }
 
+// a removed node is out of its shard, so sharding may refuse the write; the fence must not
+async function writeNotFenced(context, id) {
+	const response = await request(context.harper, `Drained/${id}`, { method: 'PUT', body: { id, body: id } });
+	assert.doesNotMatch(JSON.stringify(response.data ?? ''), /being removed from its cluster/, JSON.stringify(response));
+}
+
 async function writeRefused(context, id) {
 	const response = await request(context.harper, `Drained/${id}`, { method: 'PUT', body: { id, body: id } });
 	assert.equal(response.status, 503, JSON.stringify(response));
@@ -72,6 +78,8 @@ suite('remove_node drains a live node', { timeout: 1_200_000, skip: isLMDB && 'R
 			const result = await removal;
 			assert.equal(result.status, 200, JSON.stringify(result));
 			assert.match(JSON.stringify(result.body), /its writes reached \d+ peers before it was removed/);
+			// the removal notice lifts the fence: what the node writes from now on is its own
+			await writeNotFenced(drained, 'after-removal-0');
 		} finally {
 			await resumeLink(drained, owner);
 		}
@@ -118,6 +126,7 @@ suite('remove_node drains a live node', { timeout: 1_200_000, skip: isLMDB && 'R
 		await writeRefused(restarted, 'refused-after-restart-0');
 		const result = await removeNode(coOwner.harper, restarted, { timeout: 120_000 });
 		assert.equal(result.status, 200, JSON.stringify(result));
+		await writeNotFenced(restarted, 'after-restarted-removal-1');
 		await stopNodeProcess(restarted.harper);
 		await waitForLocal(owner.harper, ['before-timeout-0'], 'Drained', 10_000);
 		assert.ok((await localEntries(keeper.harper)).some((entry) => entry.id === 'while-owner-down-1'));

@@ -159,6 +159,37 @@ describe('drainNode', () => {
 		assert.equal(refused.calls.length, 1);
 	});
 
+	it('waits only for peers that receive the database from the node, and counts those that hold its writes', async () => {
+		const send = transport((node, operation) => {
+			if (operation.operation === FENCE_OPERATION)
+				return operation.finalize ? { ...fence(), state: 'removing' } : fence();
+			return { data: node.name === 'p2' ? { closedFloor: null, receives: false } : holds };
+		});
+		const result = await drainNode('leaving', { name: 'leaving' }, 5000, send, async (peer) => ({ name: peer }));
+		assert.deepEqual(result.databases.data.peers, ['p1']);
+	});
+
+	it('never calls a peer with less than a usable budget left, keeping the last complete round', async () => {
+		const send = transport(async (node, operation) => {
+			if (operation.operation === FENCE_OPERATION) return fence();
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			return { data: { ...holds, closedFloor: T - 1 } };
+		});
+		await assert.rejects(
+			drainNode('leaving', { name: 'leaving' }, 1500, send, async (peer) => ({ name: peer })),
+			(error) => {
+				assert.equal(error.statusCode, 504);
+				assert.match(error.message, /p1 has its floor at .* below the target/);
+				assert.match(error.message, /p2 has its floor at .* below the target/);
+				return true;
+			}
+		);
+		assert.ok(
+			send.calls.every(({ options }) => options.timeoutMs >= 250),
+			JSON.stringify(send.calls.map((c) => c.options))
+		);
+	});
+
 	it('re-fences after a refused finalize, for a database created during the drain', async () => {
 		let fences = 0;
 		const send = transport((node, operation) => {

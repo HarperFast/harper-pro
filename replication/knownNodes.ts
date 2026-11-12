@@ -778,7 +778,7 @@ const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array
 
 type AwaitingReplication = {
 	txnTime: number;
-	// the confirmation marker taken after this write committed (`takeConfirmationMarker`); 0 without one
+	// the database's confirmation marker taken after this write committed; 0 without one
 	marker: number;
 	onConfirm: (nodeName: string) => void;
 	settled: boolean;
@@ -790,7 +790,7 @@ type AwaitingReplication = {
  * taken, so it proves this write's delivery whatever order keys committed in. The key maximum in
  * `CONFIRMATION_STATUS_POSITION` cannot (harper-pro#1351).
  */
-export const CONFIRMATION_DEMAND_KEY = 'replication-confirmation-demand';
+const CONFIRMATION_DEMAND_KEY = 'replication-confirmation-demand';
 export const DEMAND_MARKER = 0;
 export const DEMAND_WAITERS = 1;
 export function confirmationDemand(auditStore: any, databaseName: string, callback?: () => void) {
@@ -802,7 +802,7 @@ export function confirmationDemand(auditStore: any, databaseName: string, callba
 	return { words: new BigInt64Array(buffer), buffer };
 }
 
-/** Whether `nodeName`'s shared status shows it holds the write `waiter` is waiting on. */
+/** Whether a peer's shared status shows it holds the write `waiter` is waiting on. */
 export function peerConfirms(status: Float64Array, waiter: { txnTime: number; marker: number }): boolean {
 	const support = status[PEER_CONFIRMATION_MARKERS_POSITION];
 	if (support === CONFIRMATION_MARKERS_SUPPORTED)
@@ -1065,14 +1065,14 @@ function assertConfirmationFeasible(databaseName: string, confirmationCount: num
 	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);
 }
 
-const demandByDatabase = new Map<string, ReturnType<typeof confirmationDemand>>();
+// keyed by store, not name: a database dropped and created again has a new store, which its senders read
+const demandByStore = new WeakMap<object, ReturnType<typeof confirmationDemand>>();
 function demandFor(databaseName: string): ReturnType<typeof confirmationDemand> | undefined {
-	let demand = demandByDatabase.get(databaseName);
-	if (demand) return demand;
 	for (const tableName in databases[databaseName] ?? {}) {
 		const auditStore = databases[databaseName][tableName].auditStore;
 		if (typeof auditStore?.getUserSharedBuffer !== 'function') continue;
-		demandByDatabase.set(databaseName, (demand = confirmationDemand(auditStore, databaseName)));
+		let demand = demandByStore.get(auditStore);
+		if (!demand) demandByStore.set(auditStore, (demand = confirmationDemand(auditStore, databaseName)));
 		return demand;
 	}
 }

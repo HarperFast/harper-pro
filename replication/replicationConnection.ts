@@ -591,6 +591,9 @@ const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWater
 // receiver moves past it, so a failure that recurs on every delivery cannot stall a peer's replication forever.
 const FAILED_FRAME_REPLAYS = env.get('replication_failedFrameReplays') ?? 5;
 const failedFrameAttempts = new Map<string, { position: number; attempts: number }>();
+// `<peer>/<database>` routes that skipped a frame: a later marker would cover the skipped write, so this process
+// acknowledges none on any later connection of that route
+const markersWithheldRoutes = new Set<string>();
 /** Attempts are counted per peer and database across reconnects; a later position's commit clears them. */
 export function holdFailedFrame(
 	attemptsByPeer: Map<string, { position: number; attempts: number }>,
@@ -3320,15 +3323,21 @@ export function resumeStartWithFloor(position: number, closedFloor: unknown): nu
 
 /**
  * Where a completed sharding projection resumes its peer's own log. The received position is a key maximum: an
- * entry reserved below it and committed after the link dropped would be filtered by the sender. The route's
- * certified floor (`directState`, from a peer that certifies) is what it has delivered, so it starts below that.
+ * entry reserved below it and committed after the link dropped would be filtered by the sender. From a peer that
+ * certifies floors, the route's certified floor (`directState`) is what it has delivered, so it starts below that,
+ * and before the first floor it starts again at the projection, the last proven prefix. A peer that does not
+ * certify keeps the position.
  */
-export function shardingRouteResumeStart(projectionStart: number, position: number, directState: any): number {
-	const delivered =
-		directState?.floorRevoked !== true && isValidFloor(directState?.closedFloor)
-			? cursorBelowFloor(directState.closedFloor)
-			: position;
-	return Math.max(projectionStart, delivered);
+export function shardingRouteResumeStart(
+	projectionStart: number,
+	position: number,
+	certifies: boolean,
+	directState: any
+): number {
+	if (!certifies) return Math.max(projectionStart, position);
+	return directState?.floorRevoked !== true && isValidFloor(directState?.closedFloor)
+		? Math.max(projectionStart, cursorBelowFloor(directState.closedFloor))
+		: projectionStart;
 }
 
 /** A level-2 certificate: `floor` alone from a level-1 peer; `generation` and `fullCoverage` from level 2; `revoked` for `0`. */
@@ -6357,7 +6366,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				error
 			);
 			recordAction(true, FAILED_FRAME_SKIP_METRIC, `${remoteNodeName}.${databaseName}`);
-			confirmationMarkersWithheld = true;
+			markersWithheldRoutes.add(`${remoteNodeName}/${databaseName}`);
 			return false;
 		}
 	}
@@ -6375,10 +6384,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// diagnosable) indistinguishable from a genuinely pre-#646 peer.
 	let peerCapabilitiesLearned = false;
 	// Sender: the highest marker sent on this socket, the bound on an acknowledgement it accepts. Receiver: a marker
-	// whose acknowledgement waits for blobs, and whether a frame was skipped (after which nothing is acknowledged).
+	// whose acknowledgement waits for blobs.
 	let lastConfirmationMarkerSent = 0;
 	let heldConfirmationMarkerAck = 0;
-	let confirmationMarkersWithheld = false;
 	let lastPostedPeerCapabilities: ResolvedPeerCapabilities | undefined;
 	let peerSupportsSubscriptionSetupAck = false;
 	let peerAcceptedBlobCodecs = new Set<string>();
@@ -7189,15 +7197,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	/** From an empty sequence update's onCommit, which runs after every frame received before the marker committed. */
 	function acknowledgeConfirmationMarker(marker: number) {
-		if (confirmationMarkersWithheld || wsClosed || connectionSuperseded()) return;
+		if (markersWithheldRoutes.has(`${remoteNodeName}/${databaseName}`) || wsClosed || connectionSuperseded()) return;
 		if (cursorBlockedByBlob()) {
 			if (marker > heldConfirmationMarkerAck) heldConfirmationMarkerAck = marker;
 			return;
 		}
-		heldConfirmationMarkerAck = 0;
 		try {
 			ws.send(encode([CONFIRMATION_MARKER_ACK, marker]));
+			heldConfirmationMarkerAck = 0;
 		} catch (error) {
+			if (marker > heldConfirmationMarkerAck) heldConfirmationMarkerAck = marker;
 			logger.debug?.(connectionId, 'could not acknowledge a confirmation marker', error);
 		}
 	}
@@ -8779,7 +8788,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					case CONFIRMATION_MARKER: {
 						if (!Number.isSafeInteger(data) || data <= 0 || projectionCopy) break;
-						if (!(await whenSubscriptionResolved())) return;
+						if (!(await whenSubscriptionResolved()) || wsClosed || connectionSuperseded()) return;
 						const marker = data;
 						const event = seqUpdateEndTxn(clampedPosition());
 						const priorOnCommit = event.onCommit;
@@ -13370,7 +13379,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						startTime = shardingRouteResumeStart(
 							Math.min(floor, complete.anchor),
 							Math.max(sequenceEntry?.seqId ?? 0, lastTxnTimes.get(nodeId) ?? 0),
-							certifiesOriginFloors() ? allNodes.find((state: any) => state.id === nodeId) : undefined
+							certifiesOriginFloors(),
+							allNodes.find((state: any) => state.id === nodeId)
 						);
 					} else {
 						startTime = 0;

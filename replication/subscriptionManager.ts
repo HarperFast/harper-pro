@@ -23,7 +23,7 @@ import {
 	updateExclusionOrigins,
 } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
-import { parentPort } from 'worker_threads';
+import { isMainThread, parentPort } from 'worker_threads';
 import {
 	subscribeToNodeUpdates,
 	getHDBNodeTable,
@@ -1011,6 +1011,25 @@ export function computeExclusionOrigins(databaseName: string): string[] {
 		origins.push(node.name);
 	}
 	return origins;
+}
+
+/**
+ * Whether this node subscribes to `databaseName` directly from `nodeName`; undefined off the main thread, where the
+ * configured routes that take precedence over the peer's row are not loaded.
+ */
+export function receivesDirectlyFrom(nodeName: string, databaseName: string): boolean | undefined {
+	const node = getHDBNodeTable().primaryStore.getSync(nodeName);
+	if (!node) return false;
+	if (!isMainThread) return undefined;
+	const matchingRoute = routes.find((route) => route.name === nodeName);
+	const routeReplicates =
+		typeof matchingRoute?.replicates === 'object'
+			? matchingRoute.replicates
+			: node.replicates && typeof node.replicates === 'object'
+				? node.replicates
+				: null;
+	const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
+	return shouldReplicateFromNode({ ...node, routeReplicates, configRouteReplicates } as any, databaseName);
 }
 
 function updateShardingFailover(database: string): void {

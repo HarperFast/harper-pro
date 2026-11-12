@@ -55,21 +55,29 @@ describe('resumeStartWithFloor', () => {
 
 describe('shardingRouteResumeStart (harper-pro#1351)', () => {
 	it('starts below the certified floor, not at a received key maximum above it', () => {
-		assert.strictEqual(shardingRouteResumeStart(T - 5000, T + 2000, { id: 1, closedFloor: T }), cursorBelowFloor(T));
+		assert.strictEqual(
+			shardingRouteResumeStart(T - 5000, T + 2000, true, { id: 1, closedFloor: T }),
+			cursorBelowFloor(T)
+		);
 	});
 
 	it('never starts below the completed projection', () => {
-		assert.strictEqual(shardingRouteResumeStart(T + 1000, T + 2000, { id: 1, closedFloor: T }), T + 1000);
+		assert.strictEqual(shardingRouteResumeStart(T + 1000, T + 2000, true, { id: 1, closedFloor: T }), T + 1000);
 	});
 
-	it('falls back to the received position without a usable floor', () => {
+	it('restarts at the projection before the route has a usable floor from a peer that certifies', () => {
 		for (const state of [
 			undefined,
 			{ id: 1 },
 			{ id: 1, closedFloor: NaN },
 			{ id: 1, closedFloor: T, floorRevoked: true },
 		])
-			assert.strictEqual(shardingRouteResumeStart(T - 5000, T + 2000, state), T + 2000, JSON.stringify(state));
+			assert.strictEqual(shardingRouteResumeStart(T - 5000, T + 2000, true, state), T - 5000, JSON.stringify(state));
+	});
+
+	it('keeps the received position from a peer that does not certify floors', () => {
+		assert.strictEqual(shardingRouteResumeStart(T - 5000, T + 2000, false, { id: 1, closedFloor: T }), T + 2000);
+		assert.strictEqual(shardingRouteResumeStart(T + 3000, T + 2000, false, undefined), T + 3000);
 	});
 });
 
