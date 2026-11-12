@@ -1,4 +1,4 @@
-import { equal } from 'node:assert';
+import { equal, ok } from 'node:assert';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { teardownHarper } from '@harperfast/integration-testing';
@@ -363,6 +363,43 @@ export async function waitForCondition(probe, opts = {}) {
 		}
 	}
 	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: lastError ?? signal.reason });
+}
+
+/**
+ * `restart_service` answers before it has replaced any worker, and a worker not yet replaced does not
+ * serve a component deployed for that restart. Resolves once the restart's job has finished.
+ */
+export async function waitForRestartJob(node, restart, { timeoutMs = 120_000, pollMs = 500 } = {}) {
+	ok(restart?.job_id, `restart_service returned no job id: ${JSON.stringify(restart)}`);
+	let pollError;
+	const job = await waitForCondition(
+		async (signal) => {
+			// the operations API can drop connections while its workers are being replaced
+			const [current] = await sendOperation(node, { operation: 'get_job', id: restart.job_id }, { signal }).catch(
+				(error) => {
+					pollError = error;
+					return [];
+				}
+			);
+			return current?.status === 'COMPLETE' || current?.status === 'ERROR' ? current : undefined;
+		},
+		{
+			timeoutMs,
+			pollMs,
+			description: () =>
+				`restart job ${restart.job_id} on ${node.hostname} to finish` +
+				(pollError ? ` (last poll error: ${pollError.message})` : ''),
+		}
+	);
+	equal(job.status, 'COMPLETE', JSON.stringify(job));
+}
+
+export async function restartHttpWorkers(node, options) {
+	await waitForRestartJob(
+		node,
+		await sendOperation(node, { operation: 'restart_service', service: 'http_workers' }),
+		options
+	);
 }
 
 /** A missing directory throws instead of reading as purged. */

@@ -25,7 +25,14 @@ import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { readNodePid, restartNode, sendOperation, waitForCondition, waitForNewPid } from './clusterShared.mjs';
+import {
+	readNodePid,
+	restartNode,
+	sendOperation,
+	waitForCondition,
+	waitForNewPid,
+	waitForRestartJob,
+} from './clusterShared.mjs';
 import {
 	CONVERGE_TIMEOUT_MS,
 	DB,
@@ -158,21 +165,6 @@ async function incrementAcrossHeldBarrier(node, id, holdFile, restart, timeout =
 	} finally {
 		await rm(holdFile, { force: true });
 	}
-}
-
-/** A `restart_service` keeps replacing workers after it answers; resolves once its job has finished. */
-async function waitForRestartJob(node, restart) {
-	assert.ok(restart?.job_id, `restart_service returned no job id: ${JSON.stringify(restart)}`);
-	const job = await waitForCondition(
-		async (signal) => {
-			const [current] = await sendOperation(node, { operation: 'get_job', id: restart.job_id }, { signal }).catch(
-				() => []
-			);
-			return current?.status === 'COMPLETE' || current?.status === 'ERROR' ? current : undefined;
-		},
-		{ timeoutMs: 120_000, pollMs: 500, description: 'the rolling worker restart to finish' }
-	);
-	assert.equal(job.status, 'COMPLETE', JSON.stringify(job));
 }
 
 /**

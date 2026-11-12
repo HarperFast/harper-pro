@@ -17,6 +17,7 @@ import {
 	readLog,
 	logMark,
 	readLogSince,
+	restartHttpWorkers,
 } from '../../integrationTests/cluster/clusterShared.mjs';
 
 async function startStub(handler) {
@@ -249,6 +250,80 @@ describe('cluster test helpers — ensureTableExists', () => {
 				(error) => error
 			);
 			expect(error?.message).to.contain("'primary_key' is required");
+		} finally {
+			await stub.close();
+		}
+	});
+});
+
+describe('cluster test helpers — restartHttpWorkers', () => {
+	const fast = { pollMs: 1, timeoutMs: 2000 };
+
+	async function restartStub(jobStatuses) {
+		const seen = [];
+		const stub = await startStub(async (request, response) => {
+			const { operation } = JSON.parse(await text(request));
+			seen.push(operation);
+			response.writeHead(200, { 'Content-Type': 'application/json' });
+			response.end(JSON.stringify(operation === 'restart_service' ? { job_id: 'job-1' } : [jobStatuses.shift()]));
+		});
+		return Object.assign(stub, { seen });
+	}
+
+	it('resolves only once the restart job reports COMPLETE', async () => {
+		const stub = await restartStub([{ status: 'CREATED' }, { status: 'IN_PROGRESS' }, { status: 'COMPLETE' }]);
+		try {
+			await restartHttpWorkers(stub.node, fast);
+			expect(stub.seen).to.deep.equal(['restart_service', 'get_job', 'get_job', 'get_job']);
+		} finally {
+			await stub.close();
+		}
+	});
+
+	it('rejects with the job when it ends in ERROR', async () => {
+		const stub = await restartStub([{ status: 'ERROR', message: 'worker failed to start' }]);
+		try {
+			const error = await restartHttpWorkers(stub.node, fast).then(
+				() => undefined,
+				(error) => error
+			);
+			expect(error?.message).to.contain('worker failed to start');
+		} finally {
+			await stub.close();
+		}
+	});
+
+	it('rejects a restart response with no job id', async () => {
+		const stub = await startStub((request, response) => {
+			response.writeHead(200, { 'Content-Type': 'application/json' });
+			response.end(JSON.stringify({ message: 'Restarting http_workers' }));
+		});
+		try {
+			const error = await restartHttpWorkers(stub.node, fast).then(
+				() => undefined,
+				(error) => error
+			);
+			expect(error?.message).to.contain('restart_service returned no job id');
+		} finally {
+			await stub.close();
+		}
+	});
+
+	it('times out naming the job, the node and the last failed poll', async () => {
+		const stub = await startStub(async (request, response) => {
+			const { operation } = JSON.parse(await text(request));
+			response.writeHead(operation === 'restart_service' ? 200 : 503, { 'Content-Type': 'application/json' });
+			response.end(JSON.stringify(operation === 'restart_service' ? { job_id: 'job-2' } : { error: 'restarting' }));
+		});
+		try {
+			stub.node.hostname = '127.0.0.9';
+			const error = await restartHttpWorkers(stub.node, { pollMs: 1, timeoutMs: 100 }).then(
+				() => undefined,
+				(error) => error
+			);
+			expect(error?.message).to.match(
+				/^Timed out after 100ms waiting for restart job job-2 on 127\.0\.0\.9 to finish \(last poll error: .*restarting/
+			);
 		} finally {
 			await stub.close();
 		}
