@@ -20,10 +20,13 @@ export class StoredRow extends Resource {
 			version: entry.version,
 			origin: originName(Table.auditStore, entry.nodeId),
 			fullWriteHead: Boolean(entry.metadataFlags & FULL_WRITE_HEAD),
-			boundary: entry.copiedDeleteBoundary && {
-				version: entry.copiedDeleteBoundary.version,
-				origin: originName(Table.auditStore, entry.copiedDeleteBoundary.nodeId),
-			},
+			originId: entry.nodeId ?? 0,
+			// a tombstone's own identity is its boundary; only one under a later write is separate state
+			boundary: !(entry.metadataFlags & FULL_WRITE_HEAD) &&
+				entry.copiedDeleteBoundary && {
+					version: entry.copiedDeleteBoundary.version,
+					origin: originName(Table.auditStore, entry.copiedDeleteBoundary.nodeId),
+				},
 			history: (await Table.getHistoryOfRecord(id)).length,
 		};
 	}
