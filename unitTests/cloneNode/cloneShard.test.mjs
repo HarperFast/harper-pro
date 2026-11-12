@@ -321,12 +321,35 @@ describe('cloneShard', () => {
 			});
 
 			it('refuses "replica" with no map: the default map gives every listed shard slots', () => {
-				refuses({ ...BACKBONE, leaderMaps: [], requested: 'replica', leaderStatus: status() }, /no shard map/);
+				refuses(
+					{ ...BACKBONE, leaderMaps: [], requested: 'replica', leaderStatus: status() },
+					/no shard map and no replication.spareShards/
+				);
 			});
 
 			it('refuses "replica" with no list, as "auto" does', () => {
 				refuses({ leaderShard: 0, requested: 'replica' }, /"replica" only fills shards listed/);
 				refuses({ requested: 'replica' }, /"replica" only fills shards listed/);
+			});
+
+			it('reads spares from replication.spareShards before any map is installed', () => {
+				const noMap = { ...BACKBONE, leaderMaps: [], leaderSpareShards: [1, 2, 3] };
+				assert.strictEqual(chosen({ ...noMap, requested: 'replica', leaderStatus: status(0, 0) }), 1);
+				assert.strictEqual(chosen({ ...noMap, requested: 'auto', leaderStatus: status(0, 0) }), 0);
+			});
+
+			it('lets the installed map decide once there is one', () => {
+				assert.strictEqual(
+					chosen({ ...BACKBONE, leaderSpareShards: [3], requested: 'replica', leaderStatus: status(0, 0) }),
+					1
+				);
+			});
+
+			it('refuses a malformed replication.spareShards from the leader', () => {
+				refuses(
+					{ ...BACKBONE, leaderMaps: [], leaderSpareShards: 'one', requested: 'replica', leaderStatus: status() },
+					/replication.spareShards is not a list/
+				);
 			});
 
 			it('"auto" refuses when every owning shard is offline, rather than picking a spare', () => {

@@ -239,7 +239,7 @@ export function recordResidencyConfiguration(peer: string, digest: unknown): voi
 		fingerprint !== digestFingerprint(residencyConfigurationDigest()) &&
 		Atomics.compareExchange(status, 1, 0n, 1n) === 0n
 	)
-		logger.warn?.(`Sharding blocked: replication.shards differs from peer ${peer}`);
+		logger.warn?.(`Sharding blocked: replication.shards differs from peer ${peer} (shard or spare list)`);
 }
 
 export function recordResidencyMapAgreement(database: string, peer: string, error?: unknown): void {
@@ -285,7 +285,7 @@ export function residencyTopologyErrors(database = '*', includeRecovery = true, 
 			recoveryErrors.push(`peer ${node.name} does not support sharding recovery admission`);
 		const observed = Atomics.load(peerDigest(store, node.name), 0);
 		if (observed !== 0n && observed !== local)
-			agreementErrors.push(`replication.shards differs from peer ${node.name}`);
+			agreementErrors.push(`replication.shards differs from peer ${node.name} (shard or spare list)`);
 		if (database !== '*') {
 			const flags = Atomics.load(agreement(node.name, database), 0);
 			if (flags & 1) agreementErrors.push(`shard map agreement with ${node.name} is blocked`);

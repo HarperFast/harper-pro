@@ -1235,6 +1235,7 @@ function resolveShard(
 		configuredUnproven: fileOnly && priorMarker !== undefined && !priorMarker.shardAware,
 		leaderShard: leaderConfigData.replication?.shard,
 		leaderShards: leaderConfigData.replication?.shards,
+		leaderSpareShards: leaderConfigData.replication?.spareShards,
 		leaderStatus,
 		leaderMaps,
 		thisNode: nodeHostname,

@@ -90,10 +90,10 @@ export function pickReplicaShard(
 	return shards.filter((shard) => !owning.has(shard)).sort((a, b) => live.get(b)! - live.get(a)! || a - b)[0];
 }
 
-function listedShards(value: unknown): number[] | undefined {
+function listedShards(value: unknown, setting = 'replication.shards'): number[] | undefined {
 	if (value == null) return undefined;
-	if (!Array.isArray(value)) throw new CloneShardRefusedError(`The leader's replication.shards is not a list`);
-	return value.map((shard) => shardNumber(shard, `The leader's replication.shards entry`));
+	if (!Array.isArray(value)) throw new CloneShardRefusedError(`The leader's ${setting} is not a list`);
+	return value.map((shard) => shardNumber(shard, `The leader's ${setting} entry`));
 }
 
 /**
@@ -109,6 +109,7 @@ export function chooseCloneShard({
 	leaderShards,
 	leaderStatus,
 	leaderMaps,
+	leaderSpareShards,
 	thisNode,
 }: {
 	requested: unknown;
@@ -120,6 +121,8 @@ export function chooseCloneShard({
 	leaderStatus?: any;
 	/** The leader's shard map rows, one per sharded database. */
 	leaderMaps?: readonly any[];
+	/** The leader's replication.spareShards: listed shards a default map gives no slots. */
+	leaderSpareShards?: unknown;
 	thisNode: string;
 }): { shard?: number; description: string } {
 	const request = parseShardOption(requested);
@@ -154,7 +157,10 @@ export function chooseCloneShard({
 			);
 		}
 		const members = leaderShardMembers(leaderShard, leaderStatus, thisNode);
-		const owning = slotOwningShards(leaderMaps);
+		const spares = leaderSpareShards == null ? undefined : listedShards(leaderSpareShards, 'replication.spareShards');
+		// With no map yet, the default map will give every listed shard but the spares slots.
+		const owning =
+			slotOwningShards(leaderMaps) ?? (spares?.length ? new Set(list.filter((id) => !spares.includes(id))) : undefined);
 		const owners = owning ? `; shards owning slots: [${[...owning].sort((a, b) => a - b).join(', ')}]` : '';
 		let picked: number | undefined;
 		if (request === 'auto') {
@@ -166,7 +172,7 @@ export function chooseCloneShard({
 		} else {
 			if (!owning)
 				throw new CloneShardRefusedError(
-					`"replica" needs a listed shard owning no slots, but the leader has no shard map, so the default map will give every listed shard slots${listing}`
+					`"replica" needs a listed shard owning no slots, but the leader has no shard map and no replication.spareShards, so the default map will give every listed shard slots${listing}`
 				);
 			picked = pickReplicaShard(list, members, owning);
 			if (picked === undefined)

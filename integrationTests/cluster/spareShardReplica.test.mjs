@@ -1,4 +1,5 @@
-// A backbone layout: every slot on shard 0, spare IDs listed. Replica nodes join a spare and own nothing.
+// A backbone layout: shard 0 holds every slot because the other listed IDs are spares, which a default map skips.
+// Replica nodes join a spare and own nothing.
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { cp, mkdtemp } from 'node:fs/promises';
@@ -10,6 +11,8 @@ import { readLog, sendOperation, stopAndTeardownNodes, waitForCondition } from '
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
 const FIXTURE = join(import.meta.dirname, 'fixture-clone-sharded');
+const SECOND_FIXTURE = join(import.meta.dirname, 'fixture-spare-second');
+const SPARES = [1, 2, 3];
 const SHARDS = [0, 1, 2, 3];
 const ROW_COUNT = 20;
 
@@ -29,13 +32,32 @@ async function rest(node, path, { method = 'GET', body, signal = AbortSignal.tim
 		...(body === undefined ? {} : { body: JSON.stringify(body) }),
 	});
 	const text = await response.text();
-	return { status: response.status, data: text ? JSON.parse(text) : undefined };
+	let data = text || undefined;
+	try {
+		data = text ? JSON.parse(text) : undefined;
+	} catch {}
+	return { status: response.status, data };
 }
 
 async function localRows(node, signal) {
 	const { status, data } = await rest(node, 'CloneLocalRows', { signal });
 	assert.equal(status, 200, JSON.stringify(data));
 	return data.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+async function mapShards(node, database, signal) {
+	const [map] = await sendOperation(
+		node,
+		{
+			operation: 'search_by_id',
+			database: 'system',
+			table: 'hdb_residency_slots',
+			ids: [database],
+			get_attributes: ['ranges'],
+		},
+		{ signal }
+	);
+	return map && [...new Set(map.ranges.map((range) => range.shard))].sort();
 }
 
 const clusterStatus = (node, signal) => sendOperation(node, { operation: 'cluster_status' }, { signal });
@@ -80,6 +102,25 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 		return node;
 	}
 
+	// The leader activates the default map and the others install it from replication: three first activations at
+	// once is a separate race, not what this suite is about.
+	async function deployOnLeaderFirst(fixture, database) {
+		const [leader, ...others] = backbone;
+		await cp(fixture, join(leader.dataRootDir, 'components', basename(fixture)), { recursive: true });
+		await sendOperation(leader, { operation: 'restart_service', service: 'http_workers' });
+		await waitForCondition(
+			async (signal) =>
+				(await Promise.all(others.map((node) => mapShards(node, database, signal).catch(() => undefined)))).every(
+					(shards) => shards !== undefined
+				),
+			{ timeoutMs: 180_000, description: `the ${database} map to reach every backbone node` }
+		);
+		for (const node of others) {
+			await cp(fixture, join(node.dataRootDir, 'components', basename(fixture)), { recursive: true });
+			await sendOperation(node, { operation: 'restart_service', service: 'http_workers' });
+		}
+	}
+
 	before(async () => {
 		for (let i = 0; i < 3; i++) {
 			const context = {
@@ -93,7 +134,7 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 			};
 			contexts.push(context);
 			await startHarper(context, {
-				config: nodeConfig(context.harper.hostname, { shard: 0, shards: SHARDS, databases: '*' }),
+				config: nodeConfig(context.harper.hostname, { shard: 0, shards: SHARDS, spareShards: SPARES, databases: '*' }),
 			});
 		}
 		backbone = nodes();
@@ -110,38 +151,7 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 				rejectUnauthorized: false,
 			});
 		}
-		await sendOperation(leader, { operation: 'create_database', database: 'data' });
-		const { digest } = await sendOperation(leader, {
-			operation: 'initialize_shard_map',
-			database: 'data',
-			slots: 10,
-			ranges: [{ start: 0, end: 10, shard: 0 }],
-		});
-		await waitForCondition(
-			async (signal) =>
-				(
-					await Promise.all(
-						others.map((node) =>
-							sendOperation(
-								node,
-								{
-									operation: 'search_by_id',
-									database: 'system',
-									table: 'hdb_residency_slots',
-									ids: ['data'],
-									get_attributes: ['digest'],
-								},
-								{ signal }
-							)
-						)
-					)
-				).every((answer) => answer[0]?.digest === digest),
-			{ description: 'the backbone map to reach every backbone node' }
-		);
-		for (const node of backbone) {
-			await cp(FIXTURE, join(node.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
-			await sendOperation(node, { operation: 'restart_service', service: 'http_workers' });
-		}
+		await deployOnLeaderFirst(FIXTURE, 'data');
 		await waitForCondition(
 			async (signal) =>
 				(await Promise.all(backbone.map((node) => clusterStatus(node, signal).catch(() => undefined)))).every(
@@ -154,14 +164,23 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 				),
 			{ timeoutMs: 180_000, description: 'the backbone to become ready' }
 		);
+		// every worker answers only once it has reloaded the application
 		for (let i = 0; i < ROW_COUNT; i++) {
 			const id = `row-${i}`;
-			const { status, data } = await rest(leader, `CloneRows/${id}`, {
-				method: 'PUT',
-				body: { id, body: `body-${i}` },
-			});
-			assert.ok(status >= 200 && status < 300, JSON.stringify(data));
+			await waitForCondition(
+				async (signal) => {
+					const { status } = await rest(leader, `CloneRows/${id}`, {
+						method: 'PUT',
+						body: { id, body: `body-${i}` },
+						signal,
+					});
+					return status >= 200 && status < 300;
+				},
+				{ description: `the leader to accept ${id}` }
+			);
 		}
+		for (const node of backbone)
+			assert.deepEqual(await mapShards(node, 'data'), [0], `${node.hostname}'s default map gives spares no slots`);
 		await waitForCondition(
 			async (signal) => {
 				const held = await Promise.all(backbone.map((node) => localRows(node, signal)));
@@ -189,7 +208,9 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 			status.sharding.data.shards.map(({ shard, slots }) => ({ shard, slots })),
 			[{ shard: 0, slots: 10 }]
 		);
-		assert.equal((await sendOperation(replica, { operation: 'get_configuration' })).replication.shard, 1);
+		const configuration = (await sendOperation(replica, { operation: 'get_configuration' })).replication;
+		assert.equal(configuration.shard, 1);
+		assert.deepEqual(configuration.spareShards, SPARES, 'the clone takes the spare list, or it would disagree');
 		assert.deepEqual(
 			(await localRows(replica)).filter((row) => row.body !== undefined),
 			[],
@@ -200,7 +221,17 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 	});
 
 	test('reads through the replica come from the owners, and its writes reach every owner', async () => {
-		for (const row of rows.slice(0, 5)) assert.deepEqual((await rest(replica, `CloneRows/${row.id}`)).data, row);
+		await waitForCondition(
+			async (signal) => {
+				for (const row of rows.slice(0, 5)) {
+					const { status, data } = await rest(replica, `CloneRows/${row.id}`, { signal });
+					if (status !== 200) return false;
+					assert.deepEqual(data, row);
+				}
+				return true;
+			},
+			{ description: "the replica to serve the owners' rows" }
+		);
 		const written = { id: 'from-replica', body: 'written on a replica' };
 		const { status, data } = await rest(replica, `CloneRows/${written.id}`, { method: 'PUT', body: written });
 		assert.ok(status >= 200 && status < 300, JSON.stringify(data));
@@ -212,7 +243,15 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 					)
 				).every((body) => body === written.body),
 			{ description: 'the replica write to reach every owner' }
-		);
+		).catch(async (error) => {
+			const views = await Promise.all(
+				nodes().map(async (node) => [node.hostname, await rest(node, `CloneRows/${written.id}`).catch(String)])
+			);
+			const status = await clusterStatus(replica).catch(String);
+			throw new Error(
+				`${error.message}; views: ${JSON.stringify(views)}; replica sharding: ${JSON.stringify(status?.sharding?.data)}; replica connections: ${JSON.stringify(status?.connections?.map((peer) => [peer.name, peer.database_sockets?.map((socket) => [socket.database, socket.connected, socket.lastReceivedVersion, socket.lastSentVersion ?? socket.sending])]))}`
+			);
+		});
 		assert.deepEqual((await rest(replica, `CloneRows/${written.id}`)).data, written);
 	});
 
@@ -224,5 +263,76 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 		await waitForCondition(async (signal) => (await localRows(backboneNode, signal)).length === ROW_COUNT + 1, {
 			description: 'the "auto" clone to hold every row as an owner',
 		});
+	});
+
+	test('a database deployed after setup puts no slots on spares, on any node', async () => {
+		await deployOnLeaderFirst(SECOND_FIXTURE, 'second');
+		await waitForCondition(
+			async (signal) =>
+				(await Promise.all(nodes().map((node) => mapShards(node, 'second', signal).catch(() => undefined)))).every(
+					(shards) => JSON.stringify(shards) === '[0]'
+				),
+			{ timeoutMs: 180_000, description: "every node to hold the second database's map, all on shard 0" }
+		);
+		await waitForCondition(
+			async (signal) =>
+				(await Promise.all(backbone.map((node) => clusterStatus(node, signal).catch(() => undefined)))).every(
+					(status) => status?.sharding?.second?.state === 'available'
+				),
+			{ timeoutMs: 180_000, description: 'the second database to become available on the backbone' }
+		);
+		const { status, data } = await rest(backbone[0], 'SecondRows/after-setup', {
+			method: 'PUT',
+			body: { id: 'after-setup', body: 'second database' },
+		});
+		assert.ok(status >= 200 && status < 300, JSON.stringify(data));
+		await waitForCondition(
+			async (signal) =>
+				(await rest(backbone[1], 'SecondRows/after-setup', { signal })).data?.body === 'second database',
+			{ description: 'another owner to hold the second database row' }
+		);
+	});
+
+	test('a node whose spare list differs is reported by its peers and holds sharded writes until repaired', async () => {
+		const [leader, , node] = backbone;
+		const differs = (status) =>
+			status?.sharding?.data?.errors?.some((error) =>
+				error.includes(`replication.shards differs from peer ${node.hostname} (shard or spare list)`)
+			);
+		await sendOperation(node, { operation: 'set_configuration', replication_spareShards: [1, 2] });
+		try {
+			await waitForCondition(async (signal) => differs(await clusterStatus(leader, signal)), {
+				timeoutMs: 60_000,
+				description: 'the leader to report the differing spare list',
+			});
+			await waitForCondition(
+				async (signal) =>
+					(
+						await rest(node, 'CloneRows/held', {
+							method: 'PUT',
+							body: { id: 'held', body: 'must not commit' },
+							signal,
+						})
+					).status === 503,
+				{ timeoutMs: 60_000, description: 'the node with the differing list to refuse sharded writes' }
+			);
+		} finally {
+			await sendOperation(node, { operation: 'set_configuration', replication_spareShards: SPARES });
+		}
+		await waitForCondition(async (signal) => !differs(await clusterStatus(leader, signal)), {
+			timeoutMs: 60_000,
+			description: 'the repaired list to clear the report',
+		});
+		await waitForCondition(
+			async (signal) => {
+				const { status } = await rest(node, 'CloneRows/repaired', {
+					method: 'PUT',
+					body: { id: 'repaired', body: 'after repair' },
+					signal,
+				});
+				return status >= 200 && status < 300;
+			},
+			{ timeoutMs: 60_000, description: 'sharded writes to resume after the repair' }
+		);
 	});
 });
