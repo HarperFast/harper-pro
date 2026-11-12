@@ -3715,7 +3715,7 @@ type SettledRouteStateVersions = {
 	clears: Map<number, number | undefined>;
 	revocations: Map<number, number | undefined>;
 	certifiedSinceClear: Map<number, { clearVersion: number; start: number; generation?: string } | undefined>;
-	partials: Map<number, { version: number; generation?: string } | undefined>;
+	partials: Map<string, number | undefined>;
 };
 type UnverifiedRouteStateBatch = {
 	event: any;
@@ -3727,6 +3727,7 @@ type UnverifiedRouteStateBatch = {
  * Keeps this connection's route marks and revocations until the carrying sequence update's `onCommit` runs
  * (restoring on `onFailure` or when post-commit verification finds the `[seq, peer]` row did not persist).
  */
+const partialKey = (originId: number, generation: string | undefined) => `${originId}:${generation ?? ''}`;
 export class PendingRouteState {
 	private marks: Map<number, PendingRouteMarkEntry> | undefined;
 	private revocations: Map<number, PendingRouteRevocationEntry> | undefined;
@@ -3735,8 +3736,8 @@ export class PendingRouteState {
 	private settledClearVersion = new Map<number, number>();
 	private settledRevokeVersion = new Map<number, number>();
 	private settledCertifiedSinceClear = new Map<number, { clearVersion: number; start: number; generation?: string }>();
-	/** Per origin, the newest settled mark that wrote `partialHistory`; a later read-back of an older one sees it. */
-	private settledPartial = new Map<number, { version: number; generation?: string }>();
+	/** Per origin and generation, the newest settled version that wrote `partialHistory`; the read-back of an older one sees it. */
+	private settledPartial = new Map<string, number>();
 	private takenEvents = new WeakSet<object>();
 	private unverifiedBatches: UnverifiedRouteStateBatch[] = [];
 	private onSettled?: (event: any) => void;
@@ -3924,13 +3925,13 @@ export class PendingRouteState {
 			number,
 			{ clearVersion: number; start: number; generation?: string } | undefined
 		>();
-		const prevPartials = new Map<number, { version: number; generation?: string } | undefined>();
+		const prevPartials = new Map<string, number | undefined>();
 		for (const [originId, sent] of marks ?? []) {
 			if (sent.mark[2] !== undefined || sent.clearCertifiedFirst) {
-				const partial = this.settledPartial.get(originId);
-				prevPartials.set(originId, partial);
-				if (!(partial?.version >= sent.version))
-					this.settledPartial.set(originId, { version: sent.version, generation: sent.mark[4] });
+				const key = partialKey(originId, sent.mark[4]);
+				const partial = this.settledPartial.get(key);
+				prevPartials.set(key, partial);
+				if (!(partial >= sent.version)) this.settledPartial.set(key, sent.version);
 			}
 			prevMarks.set(originId, this.settledMarkVersion.get(originId));
 			prevCertifiedSinceClear.set(originId, this.settledCertifiedSinceClear.get(originId));
@@ -4033,9 +4034,9 @@ export class PendingRouteState {
 				if (prev === undefined) this.settledCertifiedSinceClear.delete(originId);
 				else this.settledCertifiedSinceClear.set(originId, prev);
 			}
-			for (const [originId, prev] of settled.partials) {
-				if (prev === undefined) this.settledPartial.delete(originId);
-				else this.settledPartial.set(originId, prev);
+			for (const [key, prev] of settled.partials) {
+				if (prev === undefined) this.settledPartial.delete(key);
+				else this.settledPartial.set(key, prev);
 			}
 		}
 		// A re-queued entry takes a new version: keeping the one it was sent under, another batch's settle or rollback can
@@ -4154,10 +4155,9 @@ export class PendingRouteState {
 				}
 				// the row is read now: once a newer mark of the same generation that wrote partialHistory has settled, the
 				// row holds that value, which its own batch verifies (a copy pass's start mark against the restore at its finish)
-				const newerPartial = this.settledPartial.get(originId);
 				if (
 					partialHistory !== undefined &&
-					!(newerPartial && newerPartial.version > entry.version && newerPartial.generation === gen) &&
+					!(this.settledPartial.get(partialKey(originId, gen)) > entry.version) &&
 					node.partialHistory !== partialHistory
 				) {
 					batchPersisted = false;

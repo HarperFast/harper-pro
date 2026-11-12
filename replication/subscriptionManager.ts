@@ -1982,7 +1982,15 @@ export async function startOnMainThread(options) {
 			entry.originFallbackTimer = undefined;
 			const current = connectionReplicationMap.get(entry.url)?.get(database);
 			if (current !== entry || entry.connected !== false || entry.unsubscribed) return;
-			if (!openOriginFallback(entry, database)) scheduleOriginFallback(entry, database);
+			try {
+				if (!openOriginFallback(entry, database)) scheduleOriginFallback(entry, database);
+			} catch (error) {
+				logger.warn(
+					`Region topology: could not open a fallback link for ${entry.nodes[0]?.name} on ${database}`,
+					error
+				);
+				scheduleOriginFallback(entry, database);
+			}
 		}, TOPOLOGY_HOLD_MS);
 		entry.originFallbackTimer.unref?.();
 		return true;
