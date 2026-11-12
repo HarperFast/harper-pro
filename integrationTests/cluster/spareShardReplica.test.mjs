@@ -101,7 +101,9 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 		return node;
 	}
 
-	// three first activations of the same default map at once can wedge writes for minutes
+	// Workaround for a known wedge, not fixed here: three co-owners activating the same default map at once held
+	// sharded writes on the leader for over 120 s in 1 of 3 runs (harper-pro#1354). Activating on the leader first
+	// avoids it.
 	async function deployOnLeaderFirst(fixture, database) {
 		const [leader, ...others] = backbone;
 		await cp(fixture, join(leader.dataRootDir, 'components', basename(fixture)), { recursive: true });
