@@ -323,7 +323,7 @@ describe('cloneShard', () => {
 			it('refuses "replica" with no map: the default map gives every listed shard slots', () => {
 				refuses(
 					{ ...BACKBONE, leaderMaps: [], requested: 'replica', leaderStatus: status() },
-					/no shard map and no replication.spareShards/
+					/no shard map and lists no spare shards/
 				);
 			});
 
@@ -338,10 +338,22 @@ describe('cloneShard', () => {
 				assert.strictEqual(chosen({ ...noMap, requested: 'auto', leaderStatus: status(0, 0) }), 0);
 			});
 
-			it('lets the installed map decide once there is one', () => {
+			it('takes only a listed spare once a map exists: a non-spare owning nothing gets slots from the next default map', () => {
 				assert.strictEqual(
 					chosen({ ...BACKBONE, leaderSpareShards: [3], requested: 'replica', leaderStatus: status(0, 0) }),
-					1
+					3
+				);
+				assert.strictEqual(
+					chosen({ ...BACKBONE, leaderSpareShards: [], requested: 'replica', leaderStatus: status(0, 0) }),
+					1,
+					'an empty spare list is none, so the map alone decides'
+				);
+			});
+
+			it('refuses "replica" when every listed spare already owns slots', () => {
+				refuses(
+					{ ...BACKBONE, leaderSpareShards: [0], requested: 'replica', leaderStatus: status() },
+					/"replica" found no spare shard owning no slots.*replication.spareShards is \[0\]/
 				);
 			});
 

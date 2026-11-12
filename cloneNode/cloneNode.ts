@@ -1243,9 +1243,9 @@ function resolveShard(
 }
 
 /**
- * Read the leader's exact shard maps, one per database it reports as sharded. The shard choice reads which shards
- * own slots from them, and they are installed before this node declares anything. Reading "none" after a failed read
- * would let a declaration start a default map that conflicts with the leader's, so a failure stops the clone.
+ * The shard choice reads which shards own slots from these maps, and they are installed before this node declares
+ * anything: a declaration with no map would start a default one that conflicts with the leader's, and a plain table
+ * left by an earlier attempt could not activate at all. Reading "none" after a failed read would recreate that.
  */
 async function readLeaderShardMaps(leaderStatus: any): Promise<{ databases: string[]; maps: any[] }> {
 	const databases = Object.keys(leaderStatus?.sharding ?? {});
@@ -1260,10 +1260,6 @@ async function readLeaderShardMaps(leaderStatus: any): Promise<{ databases: stri
 	return { databases, maps: requireLeaderMaps(databases, answer) };
 }
 
-/**
- * A declaration with no map would start one of its own, which the leader's then conflicts with, and a plain table
- * left by an earlier attempt could not activate at all.
- */
 async function installLeaderShardMaps(maps: any[]): Promise<void> {
 	if (!maps.length) return;
 	const { installResidencyMap } = await import('../core/resources/residencyMaps.ts');

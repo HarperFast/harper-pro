@@ -1,5 +1,3 @@
-// A backbone layout: shard 0 holds every slot because the other listed IDs are spares, which a default map skips.
-// Replica nodes join a spare and own nothing.
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { cp, mkdtemp } from 'node:fs/promises';
@@ -62,8 +60,9 @@ async function mapShards(node, database, signal) {
 
 const clusterStatus = (node, signal) => sendOperation(node, { operation: 'cluster_status' }, { signal });
 
-const availability = async (node) =>
-	(await sendOperation(node, { operation: 'get_status', id: 'availability' }).catch(() => undefined))?.status;
+const availability = async (node, signal) =>
+	(await sendOperation(node, { operation: 'get_status', id: 'availability' }, { signal }).catch(() => undefined))
+		?.status;
 
 suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 	const contexts = [];
@@ -91,12 +90,12 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 			},
 		});
 		const node = context.harper;
-		await waitForCondition(async () => (await availability(node)) === 'Available', {
+		await waitForCondition(async (signal) => (await availability(node, signal)) === 'Available', {
 			timeoutMs: 180_000,
 			description: `${node.hostname} to become Available`,
 		});
 		await waitForCondition(
-			async () => (await sendOperation(node, { operation: 'get_configuration' })).cloned === true,
+			async (signal) => (await sendOperation(node, { operation: 'get_configuration' }, { signal })).cloned === true,
 			{ timeoutMs: 180_000, description: `${node.hostname} to finish its clone` }
 		);
 		return node;
@@ -164,7 +163,6 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 				),
 			{ timeoutMs: 180_000, description: 'the backbone to become ready' }
 		);
-		// every worker answers only once it has reloaded the application
 		for (let i = 0; i < ROW_COUNT; i++) {
 			const id = `row-${i}`;
 			await waitForCondition(
