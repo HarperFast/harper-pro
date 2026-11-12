@@ -9601,8 +9601,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							cursor,
 							subscriptionNodeId = auditRecord.nodeId,
 							encodeCopy?: () => Buffer,
-							// a copy row whose frame key is capped below the anchor is still selected at its head's log key
-							copySelectionKey?: number
+							// a delete a copy sends in place of the publish over it is also selected at the publish's key
+							copyHeadKey?: number
 						) => {
 							if (closed || wsClosed) return;
 							if (sourceReadiness.some(sourceNotReady)) throw new Error('Sharding source completeness was revoked');
@@ -9662,7 +9662,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const txnLogKey = STORAGE_IS_ROCKSDB
 								? (auditRecord.txnLogKey ?? cursor ?? auditRecord.version)
 								: auditRecord.version;
-							const subscriptionPosition = STORAGE_IS_ROCKSDB ? (copySelectionKey ?? txnLogKey) : cursor;
+							const subscriptionPosition = STORAGE_IS_ROCKSDB ? txnLogKey : cursor;
 							// Force a reload the first time this connection touches each table:
 							// `primaryStore.encoder` is a process-wide singleton, so its typedStructs
 							// may have been populated to a stale length by prior activity on this
@@ -9688,12 +9688,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const timeRange = subscribedNodeIds?.[subscriptionNodeId];
 							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
 							// in the subscribedNodeIds list, than it matches the subscription
-							const matchesSubscription = matchesSubscriptionPosition(
-								timeRange as any,
-								!!excludedNodes,
-								originFloorById?.[subscriptionNodeId],
-								subscriptionPosition
-							);
+							const matchesSubscription =
+								matchesSubscriptionPosition(
+									timeRange as any,
+									!!excludedNodes,
+									originFloorById?.[subscriptionNodeId],
+									subscriptionPosition
+								) ||
+								(copyHeadKey !== undefined &&
+									matchesSubscriptionPosition(
+										timeRange as any,
+										!!excludedNodes,
+										originFloorById?.[subscriptionNodeId],
+										copyHeadKey
+									));
 							if (!matchesSubscription) {
 								if (DEBUG_MODE)
 									logger.trace?.(
@@ -10518,16 +10526,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													);
 													copyResume = undefined;
 													reachedResumeTable = true;
-												} else if (
-													copyResume &&
-													!(
-														isValidFrameTxnLogKey(copyResume.copyStartTime) &&
-														isValidFrameTxnLogKey(cursorBelowFloor(copyResume.copyStartTime))
-													)
-												) {
+												} else if (copyResume && !isValidFrameTxnLogKey(copyResume.copyStartTime)) {
 													// The anchor is peer-supplied. A non-finite or non-positive value would reach the resume cursor
-													// and the tail's range start, and every reconnect would wedge on the same cursor; so would one
-													// with no valid key below it, which `belowCopyStart` needs.
+													// and the tail's range start, and every reconnect would wedge on the same cursor.
 													logger.warn?.(
 														'Copy-resume anchor is not a valid log key, restarting full copy',
 														copyResume.copyStartTime
@@ -10558,7 +10559,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// An empty log (anchorKey 0) still sends the wall clock, never a sentinel below every key: the
 												// follower persists it, and shouldForceBaseCopyForRetention reads such a cursor as purged history.
 												const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
-												const belowCopyStart = cursorBelowFloor(copyStartTime);
 												// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
 												const relayedAnchors =
 													!copyResume && canResumePastAnchor && excludedNodes
@@ -10841,9 +10841,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															sendTombstonesAsDeletes;
 														const copyVersion = retainedDelete ? retainedDelete.version : entry.version;
 														const copyNodeId = retainedDelete ? retainedDelete.nodeId || nodeId : recordNodeId;
-														const copyTxnLogKey = retainedDelete
-															? Math.min(headTxnLogKey, belowCopyStart)
-															: headTxnLogKey;
+														const copyTxnLogKey = retainedDelete ? retainedDelete.version : headTxnLogKey;
 														const copyType = stubAsInvalidation ? 'invalidate' : tombstoneAsDelete ? 'delete' : 'put';
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;
@@ -10907,7 +10905,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															copyTxnLogKey,
 															nodeId,
 															encodeCopy,
-															headTxnLogKey
+															retainedDelete ? headTxnLogKey : undefined
 														);
 														if (closed || wsClosed) return;
 														logger.debug?.(
