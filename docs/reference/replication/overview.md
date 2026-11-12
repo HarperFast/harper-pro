@@ -426,6 +426,42 @@ Users and roles **do** propagate by default. They live in the `system` database,
 
 Check each management operation's replication default before using it in a single-node procedure.
 
+## Cluster Record Locks
+
+On a replicated table, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. From v5.4.0, conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default. A table declared with `replicate: false` takes a node-local lock instead.
+
+Cluster record locks are off unless you turn them on. While they are off, a cluster `lock()` and a conditional write on a replicated table answer `503` with a message naming the fix. `{ scope: 'node' }` still takes a node-local lock, and `rest.preconditionLocks: false` makes conditional writes skip the lock.
+
+**On Harper Fabric**, Fabric turns cluster record locks on for a cluster and publishes its home map; you do not configure them.
+
+**On a self-hosted cluster**, turn them on in two steps:
+
+1. Set [`replication.recordLocks: true`](../configuration/options.md#replication) on every node and restart each one. Every node of a database must have the same setting.
+2. Apply a home map, the list of nodes that arbitrate a database's locks, once per replicated database. Run it on any node, naming every node that replicates the database:
+
+   ```json
+   {
+   	"operation": "record_lock_apply_homes",
+   	"database": "data",
+   	"homes": ["node-1", "node-2", "node-3"]
+   }
+   ```
+
+   `record_lock_propose_homes` with `{"database": "data"}` returns the list this node sees, which you can pass straight in. The call answers `outcome: "activated"` once every named node has the map. The other outcomes fail closed:
+
+   - `refused`: nothing was written, for example because a named node did not answer. Fix the cause and repeat the call.
+   - `incomplete`: a node did not finish staging or activating, so some nodes refuse locks. Repeat the same call.
+   - `staged`: every node stopped granting, but one could not prove it holds no locks. Wait `retryAfterMs`, then repeat the call with the `generation` it returned and `"drained": true`.
+
+Between the two steps, a cluster `lock()` and a conditional write wait up to 10 seconds within their timeout and then answer `503`, so apply the map right after the restarts.
+
+The home map changes only when an operator applies a new one, so apply one after membership changes:
+
+- **A node added later** answers every cluster `lock()` and conditional write with `503` until a map that includes it is applied. The other nodes keep locking.
+- **A removed node** stays in the map, and `remove_node` makes the other nodes stop trusting it, so every cluster `lock()` and conditional write on the database answers `503` until a map without it is applied. Apply a map without it before running `remove_node`, while the node is still reachable, with `quiesce` listing the old map's nodes and the new ones, so the departing node stops granting too. A node that is already unreachable can be left out only by naming it in `fenced`, which attests that it is stopped and needs a majority of the old map's nodes to answer; if the call is refused, its `reason` names the per-node steps that recover.
+
+Cluster record locks need the RocksDB storage engine. On LMDB `lock()` is not available, and conditional writes do not take a lock.
+
 ## Inspecting Cluster Configuration
 
 Query the `hdb_nodes` system table to inspect the current known nodes and their configuration:
