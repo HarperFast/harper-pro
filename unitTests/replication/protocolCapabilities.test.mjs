@@ -572,10 +572,7 @@ describe('Region topology capability', () => {
 		assert.equal(peerSupportsRegionGrid(resolvePeerCapabilities({})), false);
 		assert.equal(peerSupportsRegionGrid(resolvePeerCapabilities({ regionGrid: 1 })), false);
 		assert.equal(peerSupportsRegionGrid(resolvePeerCapabilities({ regionGrid: 1, originCursors: 1 })), true);
-		assert.equal(
-			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ regionGrid: 1 })),
-			false
-		);
+		assert.equal(samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ regionGrid: 1 })), false);
 		assert.equal(buildLocalCapabilities(1000, false, true).regionGrid, REGION_GRID_CAPABILITY);
 		assert.equal(buildLocalCapabilities(1000, false, false).regionGrid, 0);
 	});
