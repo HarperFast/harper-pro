@@ -3715,6 +3715,7 @@ type SettledRouteStateVersions = {
 	clears: Map<number, number | undefined>;
 	revocations: Map<number, number | undefined>;
 	certifiedSinceClear: Map<number, { clearVersion: number; start: number; generation?: string } | undefined>;
+	partials: Map<number, { version: number; generation?: string } | undefined>;
 };
 type UnverifiedRouteStateBatch = {
 	event: any;
@@ -3734,8 +3735,8 @@ export class PendingRouteState {
 	private settledClearVersion = new Map<number, number>();
 	private settledRevokeVersion = new Map<number, number>();
 	private settledCertifiedSinceClear = new Map<number, { clearVersion: number; start: number; generation?: string }>();
-	/** The newest settled version per origin that wrote `partialHistory`; a later read-back of an older one sees it. */
-	private settledPartialVersion = new Map<number, number>();
+	/** Per origin, the newest settled mark that wrote `partialHistory`; a later read-back of an older one sees it. */
+	private settledPartial = new Map<number, { version: number; generation?: string }>();
 	private takenEvents = new WeakSet<object>();
 	private unverifiedBatches: UnverifiedRouteStateBatch[] = [];
 	private onSettled?: (event: any) => void;
@@ -3923,12 +3924,14 @@ export class PendingRouteState {
 			number,
 			{ clearVersion: number; start: number; generation?: string } | undefined
 		>();
+		const prevPartials = new Map<number, { version: number; generation?: string } | undefined>();
 		for (const [originId, sent] of marks ?? []) {
-			if (
-				(sent.mark[2] !== undefined || sent.clearCertifiedFirst) &&
-				sent.version > (this.settledPartialVersion.get(originId) ?? 0)
-			)
-				this.settledPartialVersion.set(originId, sent.version);
+			if (sent.mark[2] !== undefined || sent.clearCertifiedFirst) {
+				const partial = this.settledPartial.get(originId);
+				prevPartials.set(originId, partial);
+				if (!(partial?.version >= sent.version))
+					this.settledPartial.set(originId, { version: sent.version, generation: sent.mark[4] });
+			}
 			prevMarks.set(originId, this.settledMarkVersion.get(originId));
 			prevCertifiedSinceClear.set(originId, this.settledCertifiedSinceClear.get(originId));
 			if (sent.version > (this.settledMarkVersion.get(originId) ?? 0)) {
@@ -4005,6 +4008,7 @@ export class PendingRouteState {
 			clears: prevClears,
 			revocations: prevRevocations,
 			certifiedSinceClear: prevCertifiedSinceClear,
+			partials: prevPartials,
 		};
 	}
 	private restore(
@@ -4028,6 +4032,10 @@ export class PendingRouteState {
 			for (const [originId, prev] of settled.certifiedSinceClear) {
 				if (prev === undefined) this.settledCertifiedSinceClear.delete(originId);
 				else this.settledCertifiedSinceClear.set(originId, prev);
+			}
+			for (const [originId, prev] of settled.partials) {
+				if (prev === undefined) this.settledPartial.delete(originId);
+				else this.settledPartial.set(originId, prev);
 			}
 		}
 		// A re-queued entry takes a new version: keeping the one it was sent under, another batch's settle or rollback can
@@ -4144,11 +4152,12 @@ export class PendingRouteState {
 					batchPersisted = false;
 					break;
 				}
-				// the row is read now: once a newer mark that wrote partialHistory has settled, the row holds that value,
-				// which its own batch verifies (a copy pass's start mark against the restore at its finish)
+				// the row is read now: once a newer mark of the same generation that wrote partialHistory has settled, the
+				// row holds that value, which its own batch verifies (a copy pass's start mark against the restore at its finish)
+				const newerPartial = this.settledPartial.get(originId);
 				if (
 					partialHistory !== undefined &&
-					!((this.settledPartialVersion.get(originId) ?? 0) > entry.version) &&
+					!(newerPartial && newerPartial.version > entry.version && newerPartial.generation === gen) &&
 					node.partialHistory !== partialHistory
 				) {
 					batchPersisted = false;

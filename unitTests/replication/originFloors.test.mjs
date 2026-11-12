@@ -1125,6 +1125,25 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
 	});
 
+	it("PendingRouteState verifyPersisted counts a newer partialHistory only within the older mark's generation", async () => {
+		const routeState = new PendingRouteState(() => {});
+		const commit = async () => {
+			const event = { remoteNodeIds: [1] };
+			routeState.attachTo(event);
+			await event.onCommit();
+		};
+		routeState.partialHistory(1, true, 'g1');
+		await commit();
+		// a mark for another generation, which core ignores while the row is still on g1
+		routeState.partialHistory(1, false, 'g2');
+		await commit();
+		assert.strictEqual(
+			routeState.verifyPersisted(() => [{ id: 1, originGeneration: 'g1', partialHistory: false }]),
+			false
+		);
+		assert.strictEqual(routeState.hasPendingPartialHistory(1), true);
+	});
+
 	it('PendingRouteState verifyPersisted still re-queues a safety field the newer settled mark did not write', async () => {
 		const routeState = new PendingRouteState(() => {});
 		const commit = async () => {
