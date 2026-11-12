@@ -10805,7 +10805,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															!isStub &&
 															Boolean(entry.metadataFlags & FULL_WRITE_HEAD || retainedDelete) &&
 															sendTombstonesAsDeletes;
-														// its own frame clock, so a head newer than the copy anchor cannot make it a live write
 														const copyVersion = retainedDelete ? retainedDelete.version : entry.version;
 														const copyNodeId = retainedDelete ? retainedDelete.nodeId || nodeId : recordNodeId;
 														const copyTxnLogKey = retainedDelete ? retainedDelete.version : headTxnLogKey;
