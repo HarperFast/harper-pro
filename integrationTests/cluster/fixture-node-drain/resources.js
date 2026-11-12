@@ -18,7 +18,8 @@ export class LocalEntries extends Resource {
 	static loadAsInstance = false;
 
 	get(target) {
-		const table = tables[target.get('table') ?? 'Drained'];
+		const database = target.get('database');
+		const table = (database ? databases[database] : tables)[target.get('table') ?? 'Drained'];
 		return Array.from(table.primaryStore.getRange({ start: true, versions: true }), (entry) => ({
 			id: entry.key,
 			body: entry.value?.body,

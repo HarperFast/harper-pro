@@ -6,3 +6,7 @@ type Plain @table @export {
 	id: ID @primaryKey
 	body: String
 }
+type Unsharded @table(database: "unsharded") @export {
+	id: ID @primaryKey
+	body: String
+}

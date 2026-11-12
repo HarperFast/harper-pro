@@ -1,0 +1,350 @@
+/**
+ * Draining a live node before `remove_node` deletes its membership (harper-pro#1348). The node being removed (Y)
+ * stops admitting local writes (core's durable write fence) and fixes a target key above every write it admitted;
+ * `remove_node`, on any node, waits until every peer that must hold Y's writes has durably recorded a certified
+ * origin-closed floor for Y at or above that target. A floor `F` means the peer committed every Y entry below `F`
+ * that its route carries, and a floor at or above the target was certified once every admitted write had settled.
+ * Design: replication/DESIGN.md "Removing a live node".
+ */
+import { randomUUID } from 'node:crypto';
+import { databases } from '../core/resources/databases.ts';
+import { isValidFloor, originFloorsDurable, setLocalWriteFence } from '../core/resources/originClosedFloor.ts';
+import {
+	getDatabaseGeneration,
+	persistLocalWriteFence,
+	readLocalWriteFence,
+	type LocalWriteFence,
+} from '../core/resources/auditStore.ts';
+import { exportIdMapping } from '../core/resources/nodeIdMapping.ts';
+import { readResidencyMap } from '../core/resources/residencyMaps.ts';
+import { getThisNodeName } from '../core/server/nodeName.ts';
+import { server } from '../core/server/Server.ts';
+import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
+import * as hdbLogger from '../core/utility/logging/harper_logger.js';
+import { getReplicationRecipients, shouldReplicateFromNode } from './knownNodes.ts';
+import { principalNodeName } from './recordLockRpc.ts';
+
+export const FENCE_OPERATION = 'remove_node_fence';
+export const RECEIPT_OPERATION = 'get_received_origin_floors';
+export const DEFAULT_DRAIN_TIMEOUT_MS = 300_000;
+const MAX_DRAIN_TIMEOUT_MS = 24 * 3_600_000;
+const CALL_TIMEOUT_MS = 30_000;
+const POLL_INTERVAL_MS = 1_000;
+// below this a call could not complete; the last round's findings are the answer
+const MIN_CALL_MS = 250;
+
+export interface DatabaseDrain {
+	target: number;
+	generation?: string;
+	sharded: boolean;
+	peers: string[];
+}
+
+export interface FenceState {
+	node: string;
+	epoch: string;
+	state: LocalWriteFence['state'];
+	databases: Record<string, DatabaseDrain>;
+}
+
+export interface ReceivedFloor {
+	closedFloor: number | null;
+	originGeneration?: string;
+	fullCoverage?: boolean;
+	partialHistory?: boolean;
+	hole?: boolean;
+	floorRevoked?: boolean;
+}
+
+function isSuperUser(request: any): boolean {
+	return request?.hdb_user?.role?.permission?.super_user === true;
+}
+
+function authorize(request: any, operation: string): void {
+	if (!isSuperUser(request) && !principalNodeName(request))
+		throw new ClientError(`${operation} is accepted from cluster nodes and super users only`, 403);
+}
+
+/** Every native root of each database other than `system`: a database can keep tables in more than one. */
+function databaseRoots(): Map<string, any[]> {
+	const roots = new Map<string, any[]>();
+	for (const name in databases) {
+		if (name === 'system') continue;
+		const auditStores = new Set<any>();
+		for (const tableName in databases[name]) {
+			const auditStore = databases[name][tableName]?.auditStore;
+			if (auditStore) auditStores.add(auditStore);
+		}
+		if (auditStores.size > 0) roots.set(name, [...auditStores]);
+	}
+	return roots;
+}
+
+function assertDrainable(database: string, auditStore: any): void {
+	const rootStore = auditStore.rootStore ?? auditStore;
+	if (typeof rootStore?.getUserSharedBuffer !== 'function' || !originFloorsDurable(rootStore))
+		throw new ClientError(
+			`Database ${database} has no durable origin-closed floor (RocksDB with WAL sync is required), so its writes cannot be drained before removal; use force: true to remove without draining`,
+			400
+		);
+}
+
+/**
+ * The peers that must hold this node's writes to `database`: the peers it replicates the database with. For a
+ * database with a shard map, a shard this node alone owns would lose its records, which no wait can prevent.
+ */
+export function requiredPeers(database: string, thisNode = getThisNodeName()): { peers: string[]; sharded: boolean } {
+	const recipients = new Set(getReplicationRecipients(database).map((node: any) => node.name));
+	const peers = (server.nodes ?? [])
+		.filter(
+			(node: any) =>
+				node?.name && node.name !== thisNode && recipients.has(node.name) && shouldReplicateFromNode(node, database)
+		)
+		.map((node: any) => node.name)
+		.sort();
+	const map = readResidencyMap(database);
+	if (map) {
+		for (const shard of new Set(map.ranges.map((range: any) => range.shard))) {
+			const members = (server.shards?.get(shard) ?? []).map((node: any) =>
+				typeof node === 'string' ? node : node.name
+			);
+			if (members.includes(thisNode) && !members.some((name: string) => name !== thisNode))
+				throw new ClientError(
+					`${thisNode} is the only owner of shard ${shard} of database ${database}; removing it would lose that shard's records. Add another owner first, or use force: true`,
+					409
+				);
+		}
+	}
+	return { peers, sharded: Boolean(map) };
+}
+
+/**
+ * Fence (the default), finalize or cancel this node's removal. Idempotent: a repeat call returns the persisted
+ * epoch and targets, and fences any database created since under the same epoch.
+ */
+export async function removeNodeFence(request: any): Promise<FenceState | { cancelled: true }> {
+	authorize(request, FENCE_OPERATION);
+	const thisNode = getThisNodeName();
+	if (request.node !== thisNode)
+		throw new ClientError(`${FENCE_OPERATION} names node '${request.node}', but this node is '${thisNode}'`, 400);
+	const roots = databaseRoots();
+	for (const [database, auditStores] of roots)
+		for (const auditStore of auditStores) assertDrainable(database, auditStore);
+	const fences = [...roots.values()].flat().map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
+	if (request.cancel) {
+		if (fences.some((fence) => fence.state === 'removing'))
+			throw new ClientError(`${thisNode}'s removal was finalized; complete it with remove_node`, 409);
+		for (const auditStores of roots.values())
+			for (const auditStore of auditStores) {
+				await persistLocalWriteFence(auditStore, undefined);
+				setLocalWriteFence(auditStore.rootStore ?? auditStore, false);
+			}
+		hdbLogger.notify(`Removal of ${thisNode} from its cluster was cancelled; local writes are accepted again`);
+		return { cancelled: true };
+	}
+	const epoch = fences.find((fence) => fence.epoch)?.epoch || randomUUID();
+	if (request.finalize !== undefined) {
+		const expected = new Set(request.databases ?? []);
+		const fenced = [...roots].every(([database, auditStores]) =>
+			auditStores.every(
+				(auditStore) => readLocalWriteFence(auditStore)?.epoch === request.finalize && expected.has(database)
+			)
+		);
+		if (request.finalize !== epoch || !fenced || expected.size !== roots.size)
+			throw new ClientError(`${thisNode}'s fence changed since its receipts were collected; retry the removal`, 409);
+	}
+	const state: LocalWriteFence['state'] =
+		request.finalize !== undefined || fences.some((fence) => fence.state === 'removing') ? 'removing' : 'fenced';
+	const result: FenceState = { node: thisNode, epoch, state, databases: {} };
+	for (const [database, auditStores] of roots) {
+		let target = 0;
+		for (const auditStore of auditStores) {
+			const rootStore = auditStore.rootStore ?? auditStore;
+			const existing = readLocalWriteFence(auditStore);
+			// the fence is set before the target is taken, so the target is above every write it admitted
+			const fenceTarget =
+				existing && isValidFloor(existing.target) ? existing.target : setLocalWriteFence(rootStore, true);
+			if (existing) setLocalWriteFence(rootStore, true);
+			if (existing?.epoch !== epoch || existing.state !== state || existing.target !== fenceTarget)
+				await persistLocalWriteFence(auditStore, { epoch, target: fenceTarget, state });
+			if (fenceTarget > target) target = fenceTarget;
+		}
+		const { peers, sharded } = requiredPeers(database, thisNode);
+		const generation = getDatabaseGeneration(auditStores[0])?.id;
+		result.databases[database] = { target, sharded, peers, ...(typeof generation === 'string' ? { generation } : {}) };
+	}
+	if (fences.length === 0)
+		hdbLogger.notify(`${thisNode} is being removed from its cluster: local writes are now refused`);
+	return result;
+}
+
+/**
+ * The certified floor this node has recorded for `origin` on its direct route from it, per database, after a WAL
+ * sync: the answer and the records below it survive power loss once it is sent.
+ */
+export async function getReceivedOriginFloors(request: any): Promise<Record<string, ReceivedFloor>> {
+	authorize(request, RECEIPT_OPERATION);
+	const { origin } = request;
+	if (typeof origin !== 'string' || !origin) throw new ClientError('origin is required', 400);
+	if (!Array.isArray(request.databases) || request.databases.some((name: unknown) => typeof name !== 'string'))
+		throw new ClientError('databases must be an array of database names', 400);
+	const answers: Record<string, ReceivedFloor> = {};
+	const synced = new Set<any>();
+	for (const database of request.databases) {
+		answers[database] = { closedFloor: null };
+		const tables = databases[database];
+		let auditStore: any;
+		let dbisDB: any;
+		for (const tableName in tables ?? {}) {
+			auditStore ??= tables[tableName]?.auditStore;
+			dbisDB ??= tables[tableName]?.dbisDB;
+		}
+		if (!auditStore || !dbisDB) continue;
+		const id = exportIdMapping(auditStore)?.[origin];
+		if (typeof id !== 'number') continue;
+		const entry = dbisDB.getSync([Symbol.for('seq'), id])?.nodes?.find((node: any) => node?.id === id);
+		if (!entry) continue;
+		answers[database] = {
+			closedFloor: isValidFloor(entry.closedFloor) ? entry.closedFloor : null,
+			originGeneration: typeof entry.originGeneration === 'string' ? entry.originGeneration : undefined,
+			fullCoverage: entry.fullCoverage === true,
+			partialHistory: entry.partialHistory === true,
+			hole: entry.hole === true,
+			floorRevoked: entry.floorRevoked === true,
+		};
+		const rootStore = auditStore.rootStore ?? auditStore;
+		if (!synced.has(rootStore)) {
+			synced.add(rootStore);
+			if (typeof rootStore.syncWal === 'function') await rootStore.syncWal();
+			else rootStore.flushSync?.({ allowWriteStall: true });
+		}
+	}
+	return answers;
+}
+
+/** Why a peer's answer does not yet prove it holds every write the drain covers, or undefined when it does. */
+export function receiptShortfall(answer: ReceivedFloor | undefined, drain: DatabaseDrain): string | undefined {
+	if (!answer || !isValidFloor(answer.closedFloor)) return 'has recorded no certified floor for it';
+	if (answer.floorRevoked) return 'had its floor for it revoked';
+	if (answer.partialHistory || answer.hole) return 'holds a partial history of it';
+	if (drain.generation !== undefined && answer.originGeneration !== drain.generation)
+		return 'holds a floor from another generation of the database';
+	// a route between shards never carries every table, and its floor covers the records that peer owns
+	if (!drain.sharded && !answer.fullCoverage) return 'receives it on a route that does not carry every table';
+	if (answer.closedFloor < drain.target)
+		return `has its floor at ${answer.closedFloor}, below the target ${drain.target}`;
+}
+
+export function drainTimeoutMs(timeout: unknown): number {
+	if (timeout === undefined) return DEFAULT_DRAIN_TIMEOUT_MS;
+	if (!Number.isInteger(timeout) || (timeout as number) < 1 || (timeout as number) > MAX_DRAIN_TIMEOUT_MS)
+		throw new ClientError(`timeout must be an integer number of milliseconds from 1 to ${MAX_DRAIN_TIMEOUT_MS}`, 400);
+	return timeout as number;
+}
+
+function unsupportedOperation(error: unknown): boolean {
+	const message = String((error as Error)?.message ?? error);
+	return new RegExp(
+		`Operation '?${FENCE_OPERATION}'? (?:is )?not found|unknown operation '?${FENCE_OPERATION}`,
+		'i'
+	).test(message);
+}
+
+/** A refusal (bad request, conflict, permission) rather than a node that could not be reached or did not answer. */
+function isRefusal(error: any): boolean {
+	return (error?.statusCode >= 400 && error.statusCode < 500) || /^ClientError\b/.test(String(error?.message ?? ''));
+}
+
+const errorText = (error: unknown) => String((error as Error)?.message ?? error);
+
+type SendOperation = (node: any, operation: any, options: { timeoutMs: number }) => Promise<any>;
+
+/**
+ * Fence `name` and wait for every required peer's receipt, then finalize so the fence can no longer be cancelled.
+ * Throws, leaving the node fenced and its membership in place, when the budget runs out.
+ */
+export async function drainNode(
+	name: string,
+	record: any,
+	timeoutMs: number,
+	sendOperation: SendOperation,
+	nodeRecord: (peer: string) => Promise<any>
+): Promise<FenceState> {
+	const deadline = performance.now() + timeoutMs;
+	const remaining = () => Math.max(0, deadline - performance.now());
+	const thisNode = getThisNodeName();
+	const local = name === thisNode;
+	const call = async (target: string, peerRecord: any, operation: any) => {
+		if (target === thisNode) {
+			const request = { ...operation, hdb_user: { name: thisNode, role: { permission: { super_user: true } } } };
+			return operation.operation === FENCE_OPERATION ? removeNodeFence(request) : getReceivedOriginFloors(request);
+		}
+		const response = await sendOperation(peerRecord, operation, { timeoutMs: Math.min(CALL_TIMEOUT_MS, remaining()) });
+		return response?.results ?? response;
+	};
+	const pause = () => new Promise((resolve) => setTimeout(resolve, Math.min(POLL_INTERVAL_MS, remaining())));
+	// what the last full round found, kept when a later call only runs out of budget
+	let shortfalls: string[] = [];
+	let unreachable: string | undefined;
+	while (remaining() > MIN_CALL_MS) {
+		let fence: FenceState;
+		try {
+			fence = await call(name, record, { operation: FENCE_OPERATION, node: name });
+		} catch (error) {
+			if (unsupportedOperation(error))
+				throw new ClientError(
+					`${name} runs a version that cannot drain its writes before removal; upgrade it, or use force: true to remove it without draining`,
+					400
+				);
+			if (local || isRefusal(error)) throw error;
+			// a live node that cannot be reached may still hold writes no peer has: keep trying until the budget ends
+			unreachable = `${name} could not be reached to fence it (${errorText(error)})`;
+			await pause();
+			continue;
+		}
+		unreachable = undefined;
+		const byPeer = new Map<string, string[]>();
+		for (const [database, drain] of Object.entries(fence.databases))
+			for (const peer of drain.peers) byPeer.set(peer, [...(byPeer.get(peer) ?? []), database]);
+		shortfalls = [];
+		for (const [peer, peerDatabases] of byPeer) {
+			let answers: Record<string, ReceivedFloor>;
+			try {
+				answers = await call(peer, peer === thisNode ? undefined : await nodeRecord(peer), {
+					operation: RECEIPT_OPERATION,
+					origin: name,
+					databases: peerDatabases,
+				});
+			} catch (error) {
+				shortfalls.push(`${peer} could not be asked for its receipt (${errorText(error)})`);
+				continue;
+			}
+			for (const database of peerDatabases) {
+				const shortfall = receiptShortfall(answers?.[database], fence.databases[database]);
+				if (shortfall) shortfalls.push(`${peer} ${shortfall} in database ${database}`);
+			}
+		}
+		if (shortfalls.length === 0) {
+			try {
+				return await call(name, record, {
+					operation: FENCE_OPERATION,
+					node: name,
+					finalize: fence.epoch,
+					databases: Object.keys(fence.databases),
+				});
+			} catch (error) {
+				// 409: a database appeared or the fence changed; the next round fences and checks it
+				if (local && (error as any)?.statusCode !== 409) throw error;
+				shortfalls = [`${name} did not finalize its removal (${errorText(error)})`];
+			}
+		}
+		await pause();
+	}
+	throw new ServerError(
+		`Timed out after ${timeoutMs}ms waiting for ${name}'s writes to reach its peers: ${[...shortfalls, ...(unreachable ? [unreachable] : [])].join('; ') || 'no answer'}. ${name} still refuses local writes and stays a member; run remove_node again to resume the wait, remove_node with cancel: true to stop removing it, or force: true to remove it without the wait (writes only it holds would be lost)`,
+		504
+	);
+}
+
+server.registerOperation?.({ name: FENCE_OPERATION, execute: removeNodeFence, httpMethod: 'POST' });
+server.registerOperation?.({ name: RECEIPT_OPERATION, execute: getReceivedOriginFloors, httpMethod: 'POST' });

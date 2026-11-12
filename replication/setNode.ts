@@ -17,6 +17,7 @@ import { getThisNodeName, hostnameToUrl, getThisNodeUrl } from '../core/server/n
 import * as hdbLogger from '../core/utility/logging/harper_logger.js';
 import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/hdbError.js';
 import { server } from '../core/server/Server.ts';
+import { drainNode, drainTimeoutMs, FENCE_OPERATION, removeNodeFence } from './nodeRemoval.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
 
 const validationSchema = Joi.object({
@@ -29,6 +30,9 @@ const validationSchema = Joi.object({
 	revoked_certificates: Joi.array(),
 	shard: Joi.number(),
 	isLeader: Joi.boolean(),
+	force: Joi.boolean(),
+	cancel: Joi.boolean(),
+	timeout: Joi.number().integer().min(1),
 });
 
 // Strict ISO 8601 with a required UTC/offset designator (Z or +/-HH:MM). `new Date(string)` also accepts
@@ -86,7 +90,11 @@ export async function setNode(req: any) {
 
 	if (req.operation === 'remove_node') {
 		if (!url && !hostname) throw new ClientError('url or hostname is required for remove_node operation');
-		return removeNodeFromTable(hostname, url, getHDBNodeTable(), sendOperationToNode);
+		return removeNodeFromTable(hostname, url, getHDBNodeTable(), sendOperationToNode, {
+			force: req.force,
+			cancel: req.cancel,
+			timeout: req.timeout,
+		});
 	}
 
 	if (!url) throw new ClientError('url required for this operation');
@@ -335,10 +343,28 @@ export async function addNodeBack(req) {
 	return certs;
 }
 
+export interface RemoveNodeOptions {
+	/** Remove without waiting for the node's writes to reach its peers. */
+	force?: boolean;
+	/** Stop removing the node: it accepts local writes again and stays a member. */
+	cancel?: boolean;
+	/** Milliseconds to wait for the drain before failing the removal with the node still fenced. */
+	timeout?: number;
+	drain?: typeof drainNode;
+}
+
 /**
- * The local removal stands even when the peer does not confirm its reciprocal; the result says so.
+ * A live node is drained first (`nodeRemoval.ts`): it stops accepting local writes, and its row is deleted only
+ * once every peer that must hold its writes has them. The local removal stands even when the peer does not
+ * confirm its reciprocal; the result says so.
  */
-export async function removeNodeFromTable(hostname: string, url: string, hdbNodes, sendOperation) {
+export async function removeNodeFromTable(
+	hostname: string,
+	url: string,
+	hdbNodes,
+	sendOperation,
+	{ force = false, cancel = false, timeout, drain = drainNode }: RemoveNodeOptions = {}
+) {
 	const found = await findExistingNodeRecord(hostname, url, hdbNodes);
 	// Only the exact name selects this node's own row: removing it takes this node out of replication
 	// with every peer, too broad an effect to reach through an address.
@@ -346,9 +372,25 @@ export async function removeNodeFromTable(hostname: string, url: string, hdbNode
 		throw new ClientError(hostname + ' does not exist');
 	}
 	const { name, record } = found;
+	if (force && cancel) throw new ClientError('force and cancel cannot be combined', 400);
+	if (cancel) {
+		await sendFenceCancel(name, record, sendOperation);
+		return `Cancelled the removal of '${name}': it accepts local writes again and remains a member`;
+	}
 	// An exact-key hit wins over other rows at the same url; refusing it would also refuse their exact
 	// names, leaving no way to remove either.
 	const othersAtUrl = (await rowsAtUrl(record.url, hdbNodes)).filter((node) => node.name !== name);
+	const timeoutMs = drainTimeoutMs(timeout);
+	let drained: string;
+	if (force)
+		drained = '; removed without waiting for its writes to reach its peers, so writes only it held may be lost';
+	else {
+		const fence = await drain(name, record, timeoutMs, sendOperation, (peer) => hdbNodes.get(peer));
+		const peers = new Set(Object.values(fence.databases).flatMap((database) => database.peers));
+		drained = peers.size
+			? `; its writes reached ${peers.size} peer${peers.size === 1 ? '' : 's'} before it was removed`
+			: '';
+	}
 
 	// Revoke locally before notifying the peer: the dynamic send-authorization watch acts on this
 	// delete, so the peer's access must not outlive a round trip to that (possibly offline or
@@ -376,7 +418,14 @@ export async function removeNodeFromTable(hostname: string, url: string, hdbNode
 	if (othersAtUrl.length > 0) {
 		message += `; still registered at ${record.url} and not removed: ${othersAtUrl.map((node) => `'${node.name}'`).join(', ')}`;
 	}
-	return message;
+	return message + drained;
+}
+
+async function sendFenceCancel(name: string, record: any, sendOperation) {
+	const operation = { operation: FENCE_OPERATION, node: name, cancel: true };
+	if (name === getThisNodeName())
+		await removeNodeFence({ ...operation, hdb_user: { name, role: { permission: { super_user: true } } } });
+	else await sendOperation(record, operation, { timeoutMs: REMOVE_NODE_BACK_TIMEOUT_MS });
 }
 
 async function rowsAtUrl(url: string, hdbNodes) {

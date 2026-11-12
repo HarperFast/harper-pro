@@ -119,18 +119,22 @@ export async function put(node, id, { table = 'Drained', body = id, headers } = 
 }
 
 /** A write from the main thread (operations API): it never queues behind a request held open on an HTTP worker. */
-export async function upsert(node, id, { table = 'Drained', replicatedConfirmation } = {}) {
+export async function upsert(node, id, { database = 'data', table = 'Drained', replicatedConfirmation } = {}) {
 	return sendOperation(node, {
 		operation: 'upsert',
-		database: 'data',
+		database,
 		table,
 		records: [{ id, body: id }],
 		...(replicatedConfirmation ? { replicatedConfirmation } : {}),
 	});
 }
 
+/** `table` is a table of `data`, or `database.table`. */
 export async function localEntries(node, table = 'Drained', signal) {
-	const response = await request(node, `LocalEntries/?table=${table}`, { signal });
+	const [database, tableName] = table.includes('.') ? table.split('.') : [undefined, table];
+	const response = await request(node, `LocalEntries/?table=${tableName}${database ? `&database=${database}` : ''}`, {
+		signal,
+	});
 	assert.equal(response.status, 200, JSON.stringify(response));
 	return response.data;
 }
