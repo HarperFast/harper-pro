@@ -50,7 +50,7 @@ async function until(predicate) {
 
 describe('delete tombstones in a base copy', function () {
 	this.timeout(30_000);
-	let Records, socket, boundaryVersion;
+	let Records, socket, boundaryVersion, nativeDeleteVersion;
 
 	before(async function () {
 		// FULL_WRITE_HEAD and copy-apply are RocksDB-only
@@ -83,6 +83,10 @@ describe('delete tombstones in a base copy', function () {
 		boundaryVersion = Date.now() - 2000;
 		await takeCopiedDelete('published-over-delete', boundaryVersion);
 		await Records.publish('published-over-delete', { message: 'no record' });
+		await Records.put('native-covered', { id: 'native-covered', name: 'gone' });
+		await Records.delete('native-covered');
+		nativeDeleteVersion = Records.primaryStore.getEntry('native-covered').version;
+		await Records.publish('native-covered', { message: 'no record' });
 		setReplicator(DATABASE, Records, {});
 		await until(() => databaseSubscriptions.get(DATABASE)?.auditStore);
 		const tombstone = Records.primaryStore.getEntry('deleted');
@@ -96,6 +100,9 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(covered.metadataFlags & FULL_WRITE_HEAD, 0, 'premise: a publish clears the flag');
 		assert.equal(covered.copiedDeleteBoundary?.version, boundaryVersion, 'premise: the delete outlives the publish');
 		assert.ok(covered.version > boundaryVersion);
+		const nativeCovered = Records.primaryStore.getEntry('native-covered');
+		assert.equal(nativeCovered.metadataFlags & FULL_WRITE_HEAD, 0);
+		assert.deepEqual(nativeCovered.copiedDeleteBoundary, { version: nativeDeleteVersion, nodeId: 0 });
 	});
 
 	afterEach(() => socket?.close());
@@ -149,7 +156,7 @@ describe('delete tombstones in a base copy', function () {
 		return records;
 	}
 
-	// what the copy sent for a null row before tombstoneCopy existed
+	// the nil put a receiver without tombstoneCopy gets
 	function nilPutEncoding(key, nodeId) {
 		const stored = [...Records.primaryStore.getRange({ versions: true, snapshot: false })].find(
 			(entry) => entry.key === key
@@ -190,6 +197,11 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(covered.nodeId, copiedDeleted.nodeId, "from the delete's origin");
 		assert.equal(covered.getValue(Records.primaryStore), undefined);
 		assert.equal(records.sent.get('published-over-delete'), 1, 'one entry stands for the key');
+		const native = records.get('native-covered')?.entry;
+		assert.equal(native?.type, 'delete', 'a delete this node made, under a later publish, is copied as that delete');
+		assert.equal(native.version, nativeDeleteVersion);
+		assert.equal(native.nodeId, records.get('live').entry.nodeId, 'from this node');
+		assert.equal(records.sent.get('native-covered'), 1);
 	});
 
 	for (const peer of ['a pre-key capability bag', 'unlearned capabilities']) {
@@ -207,6 +219,9 @@ describe('delete tombstones in a base copy', function () {
 			const covered = records.get('published-over-delete');
 			assert.equal(covered?.entry.type, 'put');
 			assert.deepEqual(covered.bytes, nilPutEncoding('published-over-delete', covered.entry.nodeId));
+			const native = records.get('native-covered');
+			assert.equal(native?.entry.type, 'put');
+			assert.deepEqual(native.bytes, nilPutEncoding('native-covered', native.entry.nodeId));
 		});
 	}
 
