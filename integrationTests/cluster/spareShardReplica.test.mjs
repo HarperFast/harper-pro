@@ -101,8 +101,7 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 		return node;
 	}
 
-	// The leader activates the default map and the others install it from replication: three first activations at
-	// once is a separate race, not what this suite is about.
+	// three first activations of the same default map at once can wedge writes for minutes
 	async function deployOnLeaderFirst(fixture, database) {
 		const [leader, ...others] = backbone;
 		await cp(fixture, join(leader.dataRootDir, 'components', basename(fixture)), { recursive: true });

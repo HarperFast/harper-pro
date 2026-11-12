@@ -93,23 +93,26 @@ describe('cloneShard', () => {
 		const live = (shard) => ({ shard, live: true });
 		const offline = (shard) => ({ shard, live: false });
 		const owning = new Set([0]);
+		const spares = new Set([1, 2, 3]);
 
 		it('takes the spare with the most live members, so replica nodes group', () => {
-			assert.strictEqual(pickReplicaShard([0, 1, 2, 3], [live(0), live(2), live(2), live(3)], owning), 2);
+			assert.strictEqual(pickReplicaShard([0, 1, 2, 3], [live(0), live(2), live(2), live(3)], owning, spares), 2);
 		});
 
 		it('takes the lowest spare on a tie, whatever the list order', () => {
-			assert.strictEqual(pickReplicaShard([3, 0, 2, 1], [live(0)], owning), 1);
-			assert.strictEqual(pickReplicaShard([0, 1, 2], [live(1), live(2)], owning), 1);
+			assert.strictEqual(pickReplicaShard([3, 0, 2, 1], [live(0)], owning, spares), 1);
+			assert.strictEqual(pickReplicaShard([0, 1, 2], [live(1), live(2)], owning, spares), 1);
 		});
 
 		it('counts only live members, and keeps a spare whose members are all offline', () => {
-			assert.strictEqual(pickReplicaShard([0, 1, 2], [live(1), offline(2), offline(2)], owning), 1);
-			assert.strictEqual(pickReplicaShard([0, 1], [offline(1)], owning), 1);
+			assert.strictEqual(pickReplicaShard([0, 1, 2], [live(1), offline(2), offline(2)], owning, spares), 1);
+			assert.strictEqual(pickReplicaShard([0, 1], [offline(1)], owning, spares), 1);
 		});
 
-		it('never picks a shard owning slots', () => {
-			assert.strictEqual(pickReplicaShard([0, 1], [live(1)], new Set([0, 1])), undefined);
+		it('never picks a shard owning slots, nor a listed shard outside the spares', () => {
+			assert.strictEqual(pickReplicaShard([0, 1], [live(1)], new Set([0, 1]), spares), undefined);
+			assert.strictEqual(pickReplicaShard([0, 1, 4], [live(4)], owning, new Set([1])), 1);
+			assert.strictEqual(pickReplicaShard([0, 4], [], owning, new Set([1])), undefined);
 		});
 	});
 
@@ -263,6 +266,7 @@ describe('cloneShard', () => {
 				leaderShard: 0,
 				leaderShards: [0, 1, 2, 3],
 				leaderMaps: [{ database: 'data', slots: 10, ranges: [{ start: 0, end: 10, shard: 0 }] }],
+				leaderSpareShards: [1, 2, 3],
 			};
 			const status = (...shards) => ({
 				connections: shards.map((shard, i) => ({
@@ -294,15 +298,16 @@ describe('cloneShard', () => {
 				assert.strictEqual(chosen({ ...BACKBONE, requested: 'replica', leaderStatus: status(0, 3, 3, 2) }), 3);
 			});
 
-			it('keeps this node\'s configured shard on "replica", as on "auto"', () => {
+			it('keeps this node\'s configured shard on "replica" when it is a spare owning no slots', () => {
 				assert.strictEqual(chosen({ ...BACKBONE, requested: 'replica', configured: 2, leaderStatus: status() }), 2);
 			});
 
-			it('refuses "replica" when every listed shard owns slots, naming the owners', () => {
+			it('refuses "replica" when every spare owns slots, naming the owners', () => {
 				refuses(
 					{
 						...BACKBONE,
 						leaderShards: [0, 1],
+						leaderSpareShards: [1],
 						leaderMaps: [
 							{
 								database: 'data',
@@ -316,15 +321,21 @@ describe('cloneShard', () => {
 						requested: 'replica',
 						leaderStatus: status(),
 					},
-					/"replica" found no listed shard owning no slots.*\[0, 1\].*shards owning slots: \[0, 1\]; list a spare/
+					/"replica" found no spare shard owning no slots.*shards owning slots: \[0, 1\].*replication.spareShards is \[1\]/
 				);
 			});
 
-			it('refuses "replica" with no map: the default map gives every listed shard slots', () => {
-				refuses(
-					{ ...BACKBONE, leaderMaps: [], requested: 'replica', leaderStatus: status() },
-					/no shard map and lists no spare shards/
-				);
+			it('refuses "replica" when the leader lists no spares, map or not: a listed shard gets slots from the next default map', () => {
+				for (const leaderSpareShards of [undefined, []]) {
+					refuses(
+						{ ...BACKBONE, leaderSpareShards, requested: 'replica', leaderStatus: status() },
+						/leader lists none/
+					);
+					refuses(
+						{ ...BACKBONE, leaderMaps: [], leaderSpareShards, requested: 'replica', leaderStatus: status() },
+						/leader lists none/
+					);
+				}
 			});
 
 			it('refuses "replica" with no list, as "auto" does', () => {
@@ -333,7 +344,7 @@ describe('cloneShard', () => {
 			});
 
 			it('reads spares from replication.spareShards before any map is installed', () => {
-				const noMap = { ...BACKBONE, leaderMaps: [], leaderSpareShards: [1, 2, 3] };
+				const noMap = { ...BACKBONE, leaderMaps: [] };
 				assert.strictEqual(chosen({ ...noMap, requested: 'replica', leaderStatus: status(0, 0) }), 1);
 				assert.strictEqual(chosen({ ...noMap, requested: 'auto', leaderStatus: status(0, 0) }), 0);
 			});
@@ -343,17 +354,28 @@ describe('cloneShard', () => {
 					chosen({ ...BACKBONE, leaderSpareShards: [3], requested: 'replica', leaderStatus: status(0, 0) }),
 					3
 				);
-				assert.strictEqual(
-					chosen({ ...BACKBONE, leaderSpareShards: [], requested: 'replica', leaderStatus: status(0, 0) }),
-					1,
-					'an empty spare list is none, so the map alone decides'
-				);
 			});
 
-			it('refuses "replica" on a node configured for a shard owning slots, rather than joining the backbone', () => {
+			it('refuses "replica" on a node configured for a shard that is not a spare owning no slots', () => {
 				refuses(
 					{ ...BACKBONE, requested: 'replica', configured: 0, leaderStatus: status() },
-					/asks for a replica shard but this node is configured for shard 0, which owns slots/
+					/configured for shard 0, which is not a spare owning no slots/
+				);
+				refuses(
+					{ ...BACKBONE, leaderSpareShards: [3], requested: 'replica', configured: 1, leaderStatus: status() },
+					/configured for shard 1, which is not a spare owning no slots/
+				);
+				refuses(
+					{
+						...BACKBONE,
+						leaderShards: [0, 1],
+						leaderSpareShards: [1],
+						leaderMaps: [],
+						requested: 'replica',
+						configured: 0,
+						leaderStatus: status(),
+					},
+					/configured for shard 0, which is not a spare owning no slots/
 				);
 			});
 

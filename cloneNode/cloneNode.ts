@@ -108,7 +108,7 @@ import {
  * --sync-timeout: Sync stall timeout in milliseconds — the clone fails only if no replication
  *   data arrives for this long, not on total elapsed time. Intended for minutes-scale values;
  *   arrival stamps have second precision (default: max(300000, 2 x replication.copyTimeout))
- * --shard: This node's shard, a number or "auto"; see CLONE_SHARD
+ * --shard: This node's shard, a number, "auto" or "replica"; see CLONE_SHARD
  * --skip-ssh-keys: Skip cloning SSH keys (default: false)
  * --skip-jwt-keys: Skip cloning JWT keys (default: false)
  * --force-clone: Force clone even if node exists (default: false)
