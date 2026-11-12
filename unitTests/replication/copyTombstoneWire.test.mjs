@@ -55,7 +55,7 @@ async function until(predicate) {
 
 describe('delete tombstones in a base copy', function () {
 	this.timeout(30_000);
-	let Records, socket, boundaryVersion, nativeDeleteVersion, strongerVersion, tieVersion, tieOrigins;
+	let Records, socket, boundaryVersion, nativeDeleteVersion, strongerVersion, tieVersion, tieOrigins, aheadVersion;
 
 	before(async function () {
 		// FULL_WRITE_HEAD and copy-apply are RocksDB-only
@@ -128,6 +128,25 @@ describe('delete tombstones in a base copy', function () {
 		await Records.delete('native-covered');
 		nativeDeleteVersion = Records.primaryStore.getEntry('native-covered').version;
 		await Records.publish('native-covered', { message: 'no record' });
+		// a delete from an origin whose clock runs ahead of this node's log, under a later local publish
+		aheadVersion = Date.now() + 60_000;
+		await takeCopiedDelete('ahead-under-publish', aheadVersion);
+		await Records.publish('ahead-under-publish', { message: 'no record' });
+		// a publish keyed past this node's own log, from such an origin, over an older delete
+		await takeCopiedDelete('under-later-publish', Date.now() - 3000);
+		const laterPublish = { source: {}, sourceApply: true, timestamp: Date.now() + 60_000 };
+		await transaction(laterPublish, async () => {
+			const row = await Records.getResource('under-later-publish', laterPublish, { ensureLoaded: false });
+			await row._writePublish(
+				'under-later-publish',
+				{ message: 'm' },
+				{
+					isNotification: true,
+					nodeId: getIdOfRemoteNode('copy-tombstone-origin', Records.auditStore),
+					version: laterPublish.timestamp,
+				}
+			);
+		});
 		setReplicator(DATABASE, Records, {});
 		await until(() => databaseSubscriptions.get(DATABASE)?.auditStore);
 		const tombstone = Records.primaryStore.getEntry('deleted');
@@ -187,8 +206,10 @@ describe('delete tombstones in a base copy', function () {
 		assert.ok(start >= 0 && end > start, 'must exercise the base-copy row walk');
 		const records = new Map();
 		records.sent = new Map();
+		records.anchor = socket.sent[start][1];
 		for (const frame of socket.sent.slice(start + 1, end)) {
 			if (!Buffer.isBuffer(frame)) continue;
+			const frameKey = frame.readDoubleBE(0);
 			const decoder = new Decoder(frame.buffer, frame.byteOffset, frame.byteLength);
 			decoder.position = 8;
 			while (decoder.position < frame.length) {
@@ -200,7 +221,11 @@ describe('delete tombstones in a base copy', function () {
 				if (entry.tableId === Records.tableId)
 					records.sent.set(entry.recordId, (records.sent.get(entry.recordId) ?? 0) + 1);
 				if (entry.tableId === Records.tableId)
-					records.set(entry.recordId, { entry, bytes: Buffer.from(frame.subarray(offset, offset + length)) });
+					records.set(entry.recordId, {
+						entry,
+						frameKey,
+						bytes: Buffer.from(frame.subarray(offset, offset + length)),
+					});
 			}
 		}
 		return records;
@@ -258,6 +283,30 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(native.version, nativeDeleteVersion);
 		assert.equal(native.nodeId, records.get('live').entry.nodeId, 'from this node');
 		assert.equal(records.sent.get('native-covered'), 1);
+	});
+
+	it("keys a delete it sends for a publish below the copy anchor, whatever the delete's own clock", async () => {
+		await connect(buildLocalCapabilities(90_000, false, true));
+		const records = await copiedRecords();
+		const ahead = records.get('ahead-under-publish');
+		assert.ok(aheadVersion > records.anchor, "premise: the delete's version is past the anchor");
+		assert.equal(ahead?.entry.type, 'delete');
+		assert.equal(ahead.entry.version, aheadVersion);
+		assert.ok(ahead.frameKey < records.anchor, 'a pre-anchor snapshot row, so the receiver copy-applies it');
+		const later = records.get('under-later-publish');
+		assert.equal(later?.entry.type, 'delete');
+		assert.ok(
+			Records.primaryStore.getEntry('under-later-publish').version > records.anchor,
+			'premise: the publish is past the anchor'
+		);
+		assert.ok(later.frameKey < records.anchor, 'clamped below the anchor, not keyed at the publish');
+		assert.equal(
+			records.get('published-over-delete').frameKey,
+			Records.primaryStore.getEntry('published-over-delete').localTime,
+			"below the anchor, the publish's own log key"
+		);
+		for (const key of ['stronger-boundary', 'tie-boundary', 'native-covered'])
+			assert.ok(records.get(key).frameKey < records.anchor, key);
 	});
 
 	for (const peer of ['a pre-key capability bag', 'unlearned capabilities']) {
