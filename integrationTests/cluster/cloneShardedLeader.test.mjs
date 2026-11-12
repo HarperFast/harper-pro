@@ -186,12 +186,10 @@ suite('Clone from a statically sharded leader', { timeout: 900_000 }, (ctx) => {
 				)[0]?.digest === digest,
 			{ description: 'the custom map to reach the co-owner' }
 		);
-		await Promise.all(
-			nodes().map(async (node) => {
-				await cp(FIXTURE, join(node.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
-				await restartHttpWorkers(node);
-			})
-		);
+		for (const node of nodes()) {
+			await cp(FIXTURE, join(node.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
+			await restartHttpWorkers(node);
+		}
 		await waitForCondition(
 			async (signal) =>
 				(await Promise.all(nodes().map((node) => clusterStatus(node, signal).catch(() => undefined)))).every(

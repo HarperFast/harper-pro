@@ -189,10 +189,11 @@ export async function restartNode(node, opts) {
 }
 
 /**
- * Rolling-restart a node's HTTP workers and resolve once every worker runs what is in `components/` now.
+ * Rolling-restart a node's HTTP workers and resolve once the restart job completes.
  *
  * `restart_service` answers as soon as the restart starts. Until its job completes, the old workers keep
  * serving the components they loaded at their own start, so a component copied in just before answers 404.
+ * A completed job still leaves an old worker serving where its replacement failed to start.
  *
  * @param {Object} node
  * @param {Object} [opts]

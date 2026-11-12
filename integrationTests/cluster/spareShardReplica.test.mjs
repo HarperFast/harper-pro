@@ -121,12 +121,10 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 				),
 			{ timeoutMs: 180_000, description: `the ${database} map to reach every backbone node` }
 		);
-		await Promise.all(
-			others.map(async (node) => {
-				await cp(fixture, join(node.dataRootDir, 'components', basename(fixture)), { recursive: true });
-				await restartHttpWorkers(node);
-			})
-		);
+		for (const node of others) {
+			await cp(fixture, join(node.dataRootDir, 'components', basename(fixture)), { recursive: true });
+			await restartHttpWorkers(node);
+		}
 	}
 
 	before(async () => {
