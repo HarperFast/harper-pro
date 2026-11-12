@@ -40,10 +40,10 @@ const storedRow = (node, database, table, id, signal) =>
 	request(node, 'StoredRow', { method: 'POST', body: JSON.stringify({ database, table, id }), signal });
 const dataRow = (node, id, signal) => storedRow(node, 'data', TABLE, id, signal);
 const nodeRow = (node, name, signal) => storedRow(node, 'system', 'hdb_nodes', name, signal);
-const redeliver = (node, id, record, behind) =>
+const redeliver = (node, id, likeId, record, version) =>
 	request(node, 'Redeliver', {
 		method: 'POST',
-		body: JSON.stringify({ database: 'data', table: TABLE, id, record, behind }),
+		body: JSON.stringify({ database: 'data', table: TABLE, id, likeId, record, version }),
 	});
 const writeTogether = (node, database, writes) =>
 	request(node, 'WriteTogether', { method: 'POST', body: JSON.stringify({ database, writes }) });
@@ -284,7 +284,14 @@ suite('a delete under a later publish', { timeout: 900_000, skip: isLMDB && 'cop
 			{ stored: true, present: false, version: deleted[id], fullWriteHead: true, history: 0 },
 			`${id} on ${node.harper.hostname} holds the delete at its version`
 		);
-		await redeliver(node.harper, id, { id, name: 'older write' }, 1000);
+		const older = deleted[id] - 1000;
+		await redeliver(node.harper, 'control', id, { id: 'control', name: 'older write' }, older);
+		assert.equal(
+			(await dataRow(node.harper, 'control')).present,
+			true,
+			'the redelivery applies where nothing is deleted'
+		);
+		await redeliver(node.harper, id, id, { id, name: 'older write' }, older);
 		assert.equal((await dataRow(node.harper, id)).present, false, `an older write recreated ${id}`);
 	};
 
