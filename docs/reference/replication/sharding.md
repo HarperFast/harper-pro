@@ -216,6 +216,33 @@ Setup exchanges include a digest of the list. Nodes with different lists refuse 
 
 To see which nodes own which shard once a map is installed, read `cluster_status.sharding.<database>.shards` and `nodesOwningNoSlots`; see [Sharding Status](./clustering.md#sharding-status).
 
+### Spare shard IDs
+
+<VersionBadge version="v5.4.0" />
+
+`replication.spareShards` lists shard IDs from `replication.shards` that a default map gives no slots:
+
+```yaml
+replication:
+  shard: 0
+  shards: [0, 1, 2, 3, 4, 5, 6, 7]
+  spareShards: [1, 2, 3, 4, 5, 6, 7] # every default map puts all slots on shard 0
+```
+
+Every database whose first `@sharded` table deploys after this is set maps its slots only to the listed shards that are not spares, here all of them to shard 0. Without the setting, the first database deployed after a cluster is set up spreads its slots across every listed ID, spares included, and an installed map is never recomputed. The list must be a subset of `replication.shards` and leave at least one shard out; an empty list means no spares. A node's own `replication.shard` may be a spare. A map installed with [`initialize_shard_map`](./residency.md#installed-maps) is used exactly as given, whatever the spare list says.
+
+Like `replication.shards`, the spare list is part of the configuration every node must share. Setup exchanges include a digest of both lists, so a node whose spare list differs refuses declarative writes on both sides, and peers report `replication.shards differs from peer <name> (shard or spare list)` in `cluster_status.sharding.<database>.errors`. A node that predates this setting agrees only with nodes that list no spares. Set it on every node before the first `@sharded` deployment, and plan for the write refusal during a rolling change. Upgrade every node to a version that supports the setting before setting it: an older node ignores it, so a first activation there could install a default map that gives spares slots.
+
+### Replica nodes in a spare shard
+
+<VersionBadge version="v5.4.0" />
+
+A cluster can hold its data in one shard (the backbone) and add read capacity without copying full records. List spare IDs up front with [`replication.spareShards`](#spare-shard-ids), as in the example above, so every database maps its slots to the backbone shard. Listing an ID moves no records.
+
+Clone a replica node with `--shard replica` (or `CLONE_SHARD=replica`) from any member. It joins a spare shard, owns no slots, copies only the projections that indexed tables need, and reads full records from the owners, keeping local replicas that invalidations keep current. Replica nodes join the same spare unless you pass a shard number. Joining a spare shard ID, not no shard, matters because a shard is node identity: slots can later be moved into that ID, which makes its members owners without a new node. Clones with `--shard auto` skip spares and join a shard that owns slots. A replica node appears in [`cluster_status.sharding.<database>.nodesOwningNoSlots`](./clustering.md#sharding-status).
+
+Writes on a replica node commit locally and reach the owners asynchronously, unless the request asks for [confirmation](#replication-control-via-rest-header), which counts only owners. Every write still reaches every owner, so this adds read capacity, not write capacity. [`remove_node`](./clustering.md#remove-node) does not wait for a node's writes to reach the owners, so do not remove a replica node that has taken writes the owners may not have yet.
+
 ### Other shard configuration
 
 Shards can also be assigned per route:

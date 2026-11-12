@@ -54,5 +54,8 @@ says nothing about the owned copy from a same-shard peer. `waitingOrigins` does 
 that is down. A marker that is not `shardAware`
 came from an older binary: setup replays, and a shard only in its config file is refused as possibly inherited.
 
-**Where.** `cloneShard.ts` (`chooseCloneShard`), `cloneNode.ts` (`cloneShardMaps`, `cloneSchemas`),
+**Choice.** `auto` and `replica` read slot ownership from the same map rows the clone installs, not from
+`cluster_status`, so the choice and the installed map cannot disagree and an older leader still answers.
+
+**Where.** `cloneShard.ts` (`chooseCloneShard`), `cloneNode.ts` (`readLeaderShardMaps`, `cloneSchemas`),
 `syncMonitor.ts` (`checkSyncStatus`). Test: `integrationTests/cluster/cloneShardedLeader.test.mjs`.
