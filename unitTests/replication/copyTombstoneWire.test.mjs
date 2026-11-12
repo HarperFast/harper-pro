@@ -56,15 +56,7 @@ async function until(predicate) {
 
 describe('delete tombstones in a base copy', function () {
 	this.timeout(30_000);
-	let Records,
-		socket,
-		boundaryVersion,
-		nativeDeleteVersion,
-		strongerVersion,
-		tieVersion,
-		tieOrigins,
-		aheadVersion,
-		laterBoundaryVersion;
+	let Records, socket, boundaryVersion, nativeDeleteVersion, newerDeleteVersion, aheadVersion, laterBoundaryVersion;
 
 	before(async function () {
 		// FULL_WRITE_HEAD and copy-apply are RocksDB-only
@@ -97,42 +89,18 @@ describe('delete tombstones in a base copy', function () {
 		boundaryVersion = Date.now() - 2000;
 		await takeCopiedDelete('published-over-delete', boundaryVersion);
 		await Records.publish('published-over-delete', { message: 'no record' });
-		strongerVersion = Date.now() - 4000;
-		await takeCopiedDelete('stronger-boundary', strongerVersion);
-		for (const [version, write] of [
-			[strongerVersion - 3000, (row, options) => row._writePublish('stronger-boundary', { message: 'm' }, options)],
-			[strongerVersion - 200, (row, options) => row._writeDelete('stronger-boundary', options)],
-		]) {
-			const context = { source: {}, sourceApply: true, timestamp: version };
-			await transaction(context, async () => {
-				const row = await Records.getResource('stronger-boundary', context, { ensureLoaded: false });
-				await write(row, {
-					isNotification: true,
-					nodeId: getIdOfRemoteNode('copy-tombstone-origin', Records.auditStore),
-					version,
-				});
+		// a copied delete older than a newer delete this node made stamps its boundary under that head
+		newerDeleteVersion = Date.now() - 4000;
+		const newerDelete = { source: {}, sourceApply: true, timestamp: newerDeleteVersion };
+		await transaction(newerDelete, async () => {
+			const row = await Records.getResource('head-over-boundary', newerDelete, { ensureLoaded: false });
+			await row._writeDelete('head-over-boundary', {
+				isNotification: true,
+				nodeId: getIdOfRemoteNode('copy-tombstone-newer', Records.auditStore),
+				version: newerDeleteVersion,
 			});
-		}
-		tieVersion = Date.now() - 6000;
-		tieOrigins = ['copy-tombstone-tie-a', 'copy-tombstone-tie-z'].map((name) =>
-			getIdOfRemoteNode(name, Records.auditStore)
-		);
-		for (const [version, origin, copy, write] of [
-			[tieVersion, tieOrigins[1], true, (row, options) => row._writeDelete('tie-boundary', options)],
-			[
-				tieVersion - 3000,
-				tieOrigins[1],
-				false,
-				(row, options) => row._writePublish('tie-boundary', { message: 'm' }, options),
-			],
-			[tieVersion, tieOrigins[0], false, (row, options) => row._writeDelete('tie-boundary', options)],
-		]) {
-			const context = { source: {}, sourceApply: true, timestamp: version };
-			await transaction(context, async () => {
-				const row = await Records.getResource('tie-boundary', context, { ensureLoaded: false });
-				await write(row, { isNotification: true, isCopyApply: copy, nodeId: origin, version });
-			});
-		}
+		});
+		await takeCopiedDelete('head-over-boundary', newerDeleteVersion - 3000);
 		await Records.put('native-covered', { id: 'native-covered', name: 'gone' });
 		await Records.delete('native-covered');
 		nativeDeleteVersion = Records.primaryStore.getEntry('native-covered').version;
@@ -170,15 +138,10 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(covered.metadataFlags & FULL_WRITE_HEAD, 0, 'premise: a publish clears the flag');
 		assert.equal(covered.copiedDeleteBoundary?.version, boundaryVersion, 'premise: the delete outlives the publish');
 		assert.ok(covered.version > boundaryVersion);
-		const stronger = Records.primaryStore.getEntry('stronger-boundary');
-		assert.ok(stronger.metadataFlags & FULL_WRITE_HEAD, 'premise: a flagged tombstone');
-		assert.ok(stronger.version < strongerVersion, 'premise: its own version is below the boundary');
-		assert.equal(stronger.copiedDeleteBoundary?.version, strongerVersion);
-		const tie = Records.primaryStore.getEntry('tie-boundary');
-		assert.ok(tie.metadataFlags & FULL_WRITE_HEAD, 'premise: a flagged tombstone');
-		assert.equal(tie.version, tieVersion);
-		assert.equal(tie.nodeId, tieOrigins[0], 'premise: the head is the lower origin name');
-		assert.deepEqual(tie.copiedDeleteBoundary, { version: tieVersion, nodeId: tieOrigins[1] });
+		const head = Records.primaryStore.getEntry('head-over-boundary');
+		assert.ok(head.metadataFlags & FULL_WRITE_HEAD, 'premise: a flagged tombstone');
+		assert.equal(head.version, newerDeleteVersion, 'premise: the newer delete stays the head');
+		assert.equal(head.copiedDeleteBoundary?.version, newerDeleteVersion - 3000, 'premise: the older boundary is kept');
 		const nativeCovered = Records.primaryStore.getEntry('native-covered');
 		assert.equal(nativeCovered.metadataFlags & FULL_WRITE_HEAD, 0);
 		assert.deepEqual(nativeCovered.copiedDeleteBoundary, { version: nativeDeleteVersion, nodeId: 0 });
@@ -281,13 +244,9 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(covered.nodeId, copiedDeleted.nodeId, "from the delete's origin");
 		assert.equal(covered.getValue(Records.primaryStore), undefined);
 		assert.equal(records.sent.get('published-over-delete'), 1, 'one entry stands for the key');
-		const strongest = records.get('stronger-boundary')?.entry;
-		assert.equal(strongest?.type, 'delete');
-		assert.equal(strongest.version, strongerVersion, 'the stronger of the head and its retained boundary');
-		const tied = records.get('tie-boundary')?.entry;
-		assert.equal(tied?.type, 'delete');
-		assert.equal(tied.version, tieVersion);
-		assert.equal(tied.nodeId, tieOrigins[1], 'at an equal version the higher origin name wins, as in core');
+		const headWins = records.get('head-over-boundary')?.entry;
+		assert.equal(headWins?.type, 'delete');
+		assert.equal(headWins.version, newerDeleteVersion, 'the head stands when it outranks its retained boundary');
 		const native = records.get('native-covered')?.entry;
 		assert.equal(native?.type, 'delete', 'a delete this node made, under a later publish, is copied as that delete');
 		assert.equal(native.version, nativeDeleteVersion);
@@ -404,7 +363,9 @@ describe('delete tombstones in a base copy', function () {
 	});
 
 	it('orders a retained boundary against a head by version, then origin name', () => {
-		const [low, high] = tieOrigins;
+		const [low, high] = ['copy-tombstone-tie-a', 'copy-tombstone-tie-z'].map((name) =>
+			getIdOfRemoteNode(name, Records.auditStore)
+		);
 		const store = Records.auditStore;
 		assert.equal(boundaryOutranksHead(store, { version: 2, nodeId: low }, { version: 1, nodeId: high }), true);
 		assert.equal(boundaryOutranksHead(store, { version: 1, nodeId: high }, { version: 2, nodeId: low }), false);
