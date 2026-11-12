@@ -851,14 +851,14 @@ export function earlierReservationSlots(dbisDB: DbisStore, peerId: number, pass:
  * in the same commit: `copied` for the pass that was running, which knows the versions it received, and the reserved
  * value for every earlier attempt.
  */
-export function settleAbandonedReservations(
+export async function settleAbandonedReservations(
 	dbisDB: DbisStore | undefined,
 	peerId: number,
 	rootStore: any,
 	pass: string,
 	copied: ReadonlyMap<number, number>
 ): Promise<boolean> {
-	if (!dbisDB?.put || !dbisDB.getRange) return Promise.resolve(false);
+	if (!dbisDB?.put || !dbisDB.getRange) return false;
 	const raise = new Map<number, number>();
 	const release: (string | number)[][] = [];
 	for (const { key, value } of dbisDB.getRange({
@@ -871,7 +871,7 @@ export function settleAbandonedReservations(
 			for (const [originId, bound] of copied) if (!(raise.get(originId)! >= bound)) raise.set(originId, bound);
 		} else mergeCopyBoundRecordInto(raise, value);
 	}
-	if (release.length === 0) return Promise.resolve(false);
+	if (release.length === 0) return false;
 	return writeCopyBoundRows(dbisDB, peerId, rootStore, { raise: validBounds(raise), release });
 }
 
@@ -7763,29 +7763,34 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	ws.once('close', releaseRelayLease);
 	ws.once('close', () => {
-		const abandoned = options.connection?.intentionallyUnsubscribed === true;
-		const unsettled = copyPassToken !== '' && settledPass !== copyPassToken;
-		const { dbisDB } = getDatabaseStores();
-		const rootStore = (auditStore ?? getDatabaseStores().auditStore)?.rootStore;
-		if (!dbisDB) return;
-		// peer 0 stands for a source this session never identified, which other sessions may share
-		if (abandoned && ownCopyPeerId() !== 0) {
-			settleAbandonedReservations(
-				dbisDB,
-				ownCopyPeerId(),
-				rootStore,
-				unsettled ? copyPassToken : '',
-				copiedVersionByOrigin
-			).catch((error) =>
-				logger.warn?.(connectionId, 'could not settle the copy reservations of an ended link for', databaseName, error)
+		// a store closing under the unsubscribe throws from here; the reservation then stays, which holds relaying
+		try {
+			const abandoned = options.connection?.intentionallyUnsubscribed === true;
+			const unsettled = copyPassToken !== '' && settledPass !== copyPassToken;
+			const { dbisDB, auditStore: databaseAuditStore } = getDatabaseStores();
+			const rootStore = (auditStore ?? databaseAuditStore)?.rootStore;
+			if (!dbisDB) return;
+			const peerId = ownCopyPeerId();
+			let release: Promise<unknown> | undefined;
+			// peer 0 stands for a source this session never identified, which other sessions may share
+			if (abandoned && peerId !== 0) {
+				release = settleAbandonedReservations(
+					dbisDB,
+					peerId,
+					rootStore,
+					unsettled ? copyPassToken : '',
+					copiedVersionByOrigin
+				);
+			} else if (unsettled && copiedVersionByOrigin.size === 0) {
+				// a pass that ends unsettled having applied no copied row covers nothing, so its reservation must not hold relaying
+				release = writeCopyBoundRows(dbisDB, peerId, rootStore, { release: [['reserved', copyPassToken]] });
+			}
+			release?.catch((error) =>
+				logger.warn?.(connectionId, 'could not release the copy reservations of an ended pass for', databaseName, error)
 			);
-			return;
+		} catch (error) {
+			logger.warn?.(connectionId, 'could not release the copy reservations of an ended pass for', databaseName, error);
 		}
-		// a pass that ends unsettled having applied no copied row covers nothing, so its reservation must not hold relaying
-		if (!unsettled || copiedVersionByOrigin.size > 0) return;
-		writeCopyBoundRows(dbisDB, ownCopyPeerId(), rootStore, { release: [['reserved', copyPassToken]] }).catch((error) =>
-			logger.warn?.(connectionId, 'could not release an empty copy reservation for', databaseName, error)
-		);
 	});
 	function loadPersistedCopyBounds(cursor?: DbisCursor): void {
 		if (!supportsCheckpointFloors()) return;
@@ -13477,11 +13482,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	/**
 	 * Where a temporary direct link to a managed origin starts that origin's own log: this node held the origin only
-	 * through a supplier, so its start is where that supplier's link would have resumed it, as for any switch. Null when
-	 * this link is not one; undefined when the supplier's link recorded neither a position nor a floor for the origin,
-	 * which leaves the start to a base copy.
+	 * through a supplier, so its start is where that supplier's link would have resumed it, as for any switch. The
+	 * origin's database generation recorded with it goes on the request, so an origin replaced since then copies rather
+	 * than replays from a start that names nothing in its replacement. Null when this link is not one; undefined when
+	 * the supplier's link recorded neither a position nor a floor for the origin, which leaves the start to a base copy.
 	 */
-	function borrowedDirectStart(name: string, id: number, store: any, dbisDB: any): number | undefined | null {
+	function borrowedDirectStart(
+		name: string,
+		id: number,
+		store: any,
+		dbisDB: any
+	): { start: number; generation?: string } | undefined | null {
 		const borrow: Record<string, string | null> | undefined = options.connection?.topologyBorrow;
 		if (!borrow || restrictedOrigins || !Object.hasOwn(borrow, name)) return null;
 		const nameToId = exportIdMapping(store);
@@ -13491,11 +13502,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				? nameToId[relieved]
 				: undefined;
 		const relievedRow = relievedId === undefined ? undefined : readDbisCursorSync(dbisDB, 'seq', relievedId);
-		return borrowedOriginCursor(
-			relievedId === id ? undefined : relievedOriginState(relievedRow, relievedId, id),
-			readQualifiedOriginFloors(store, dbisDB).floors.get(id),
-			ORIGIN_CURSOR_OVERLAP_MS
-		);
+		const state = relievedId === id ? undefined : relievedOriginState(relievedRow, relievedId, id);
+		const qualified = readQualifiedOriginFloors(store, dbisDB).floors.get(id);
+		const start = borrowedOriginCursor(state, qualified, ORIGIN_CURSOR_OVERLAP_MS);
+		if (start === undefined) return undefined;
+		const recorded = state?.originGeneration ?? state?.lastGeneration;
+		return { start, generation: qualified?.generation ?? (typeof recorded === 'string' ? recorded : undefined) };
 	}
 	/**
 	 * A managed origin excluded here is supplied by another link, so this route's record of it stops being continuous:
@@ -14026,10 +14038,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					connectedNode === node && nodeId !== undefined && auditStore
 						? borrowedDirectStart(node.name, nodeId, auditStore, dbisDB)
 						: null;
+				let takeover: { start: number; generation?: string } | undefined;
 				if (takeoverStart !== null) {
 					// never the any-route transaction time below: another route's can sit above writes this node lacks
-					if (!forceFullCopyOnWidening && floorOnlyStart === undefined && takeoverStart > startTime) {
-						startTime = takeoverStart;
+					if (!forceFullCopyOnWidening && floorOnlyStart === undefined && takeoverStart?.start > startTime) {
+						takeover = takeoverStart;
+						startTime = takeover.start;
 						logger.debug?.('Starting a takeover link from the borrowed cursor', connectedNode.name, startTime);
 					}
 				}
@@ -14194,7 +14208,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					shardingProjection,
 					refusesCopies: restrictedOrigins,
 					copyResume, // present only when resuming an interrupted bulk copy
-					...(floorOnlyStart !== undefined && startTime === floorOnlyStart && { floorGeneration: floorOnlyGeneration }),
+					...(floorOnlyStart !== undefined && startTime === floorOnlyStart
+						? { floorGeneration: floorOnlyGeneration }
+						: takeover?.generation !== undefined &&
+							startTime === takeover.start && { floorGeneration: takeover.generation }),
 				};
 			});
 		if (

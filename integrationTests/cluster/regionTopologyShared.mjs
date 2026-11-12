@@ -91,7 +91,6 @@ export async function killNode(node) {
 	);
 }
 
-/** Peers this node holds a connected `data` subscription to. */
 export async function dataLinks(node, signal) {
 	const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
 	return new Set(
@@ -160,7 +159,6 @@ export function insert(node, phase, origin, count) {
 	);
 }
 
-/** Ids of the rows a node holds in `phase`. */
 export async function phaseIds(node, phase, signal) {
 	const found = await sendOperation(
 		node,
@@ -257,7 +255,6 @@ export function regionLayout(hostnames, nodes, regionOf) {
 		byName,
 		carrier,
 		receivesDirect,
-		// east: [lane 0, lane 1, lane 2], and so on
 		named: (regionName, index) => byName(inRegion(regionName)[index]),
 		/** The peers a node subscribes to itself: its region, and the origins whose column it carries. */
 		expectedLinks: (node) =>

@@ -19,13 +19,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { stopAndTeardownNodes, readLogSince } from './clusterShared.mjs';
+import { sendOperation, stopAndTeardownNodes, readLogSince } from './clusterShared.mjs';
 import {
 	REGIONS,
 	startNode,
 	connectTo,
 	waitForLinks,
 	waitForCopiesSettled,
+	TABLE,
 	insert,
 	waitForPhase,
 	waitForSuppliers,
@@ -44,6 +45,38 @@ const OPTIONS = {
 };
 const FORCED_COPY = /Peer (\S+) requested replication of database data\b[^\n]*forcing a bounded base-copy resync/g;
 const REQUESTED_COPY = /Requesting full copy of database data from (\S+)/g;
+
+const WRITE_INTERVAL_MS = 200;
+
+/** Each writer inserts a row of `phase` every WRITE_INTERVAL_MS until stopped; `stop` resolves how many each wrote. */
+function startRowWriters(writers, phase) {
+	let stopped = false;
+	const loops = writers.map(async (writer) => {
+		let written = 0;
+		for (; !stopped; written++) {
+			await sendOperation(writer, {
+				operation: 'insert',
+				database: 'data',
+				table: TABLE,
+				records: [
+					{
+						id: `${phase}-${writer.hostname}-${written}`,
+						phase: `${phase}-${writer.hostname}`,
+						origin: writer.hostname,
+					},
+				],
+			});
+			await delay(WRITE_INTERVAL_MS);
+		}
+		return written;
+	});
+	return {
+		async stop() {
+			stopped = true;
+			return Promise.all(loops);
+		},
+	};
+}
 
 suite('Nodes joining a region grid', { timeout: 1_800_000 }, (ctx) => {
 	let workDir;
@@ -89,12 +122,11 @@ suite('Nodes joining a region grid', { timeout: 1_800_000 }, (ctx) => {
 	});
 
 	/** Starts `name` in `region` and returns it once the grid has settled on `layout`. */
-	async function joinGrid(name, region, layout, duringJoin) {
+	async function joinGrid(name, region, layout) {
 		const existing = nodes();
 		contexts.push(await startNode(ctx.name, name, region, workDir, OPTIONS));
 		const joiner = contexts.at(-1).harper;
 		await connectTo(existing[0], [joiner]);
-		await duringJoin?.();
 		await waitForLinks(nodes(), layout.expectedLinks, `grid links after ${name} joined`);
 		await waitForCopiesSettled(nodes(), `copies of ${name} joining`);
 		await waitForSuppliers(nodes(), layout.steadySuppliers(), `settled suppliers after ${name} joined`);
@@ -139,10 +171,17 @@ suite('Nodes joining a region grid', { timeout: 1_800_000 }, (ctx) => {
 		const { afterQuiet } = layouts;
 		const writers = [afterQuiet.named('east', 0), afterQuiet.named('west', 1), afterQuiet.named('eu', 2)];
 		const marks = await markAll(existing);
-		const joiner = await joinGrid(busyJoiner, REGIONS[1], layouts.afterBusy, async () => {
-			for (const writer of writers) await insert(writer, `during-join-${writer.hostname}`, writer.hostname, 20);
-		});
-		for (const writer of writers) await waitForPhase(nodes(), `during-join-${writer.hostname}`, 20);
+		// writing until the suppliers have settled, so writes are in flight when each moved link borrows its start
+		const writing = startRowWriters(writers, 'during-join');
+		let written;
+		let joiner;
+		try {
+			joiner = await joinGrid(busyJoiner, REGIONS[1], layouts.afterBusy);
+		} finally {
+			written = await writing.stop();
+		}
+		for (const [index, writer] of writers.entries())
+			await waitForPhase(nodes(), `during-join-${writer.hostname}`, written[index]);
 		for (const writer of [joiner, ...writers]) {
 			await insert(writer, `after-busy-join-${writer.hostname}`, writer.hostname, 20);
 			await waitForPhase(nodes(), `after-busy-join-${writer.hostname}`, 20);

@@ -144,7 +144,6 @@ export function gridLinks(topology: RegionTopology, a: string, b: string): boole
 	return a !== b && (receivesDirect(topology, a, b) || receivesDirect(topology, b, a));
 }
 
-/** Equal for two topologies that give every node the same links. */
 export function topologySignature(topology: RegionTopology): string {
 	if (!topology.active) return 'inactive';
 	return JSON.stringify([[...topology.regionOf].sort(), [...topology.columnOf].sort()]);
