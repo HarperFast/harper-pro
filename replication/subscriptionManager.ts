@@ -1947,6 +1947,8 @@ export async function startOnMainThread(options) {
 		);
 		// nothing was opened while the replication pool restarts; the caller's timer tries again
 		if (!connectToNextWorker(origin, database, mateNode)) return false;
+		// placement can pick a worker that owns no primary entry, which nothing else watches for its exit
+		ensureWorkerExitHandler(origin.worker);
 		retiredOriginFallbacks.delete(fallbackKey(getNodeURL(mateNode), origin.url, database));
 		entry.originFallback = {
 			name: mate,
@@ -1978,7 +1980,7 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		closeOriginFallback(entry, database);
-		openOriginFallback(entry, database, next);
+		if (!openOriginFallback(entry, database, next)) scheduleOriginFallback(entry, database);
 	}
 	function closeOriginFallback(entry: any, database: string): void {
 		clearTimeout(entry.originFallbackTimer);
