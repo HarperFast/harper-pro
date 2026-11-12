@@ -11,6 +11,7 @@ import {
 	logMark,
 	readLog,
 	readLogSince,
+	restartHttpWorkers,
 	sendOperation,
 	stopAndTeardownNodes,
 	waitForCondition,
@@ -187,7 +188,7 @@ suite('Clone from a statically sharded leader', { timeout: 900_000 }, (ctx) => {
 		);
 		for (const node of nodes()) {
 			await cp(FIXTURE, join(node.dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
-			await sendOperation(node, { operation: 'restart_service', service: 'http_workers' });
+			await restartHttpWorkers(node);
 		}
 		await waitForCondition(
 			async (signal) =>
