@@ -29,6 +29,7 @@ const RETENTION_S = 20;
 const FORCED_COPY = 'forcing a bounded base-copy resync';
 // the system database is not sharded, so it may take a copy (harper-pro#1308)
 const DATA_DATABASE = 'database data';
+const REPLAY_CONTINUES = 'so replay continues from';
 const RESUMED_UNDER_PURGE =
 	/Peer (\S+) requested replication of database data from (\S+), under transaction-log history purged through (\S+); it owns sharding slots this node cannot copy, so replay continues from/;
 const REFUSED = 'refused a copy this node cannot accept';
@@ -148,6 +149,7 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 			nodes[i] = { hostname, dataRootDir };
 			const component = join(dataRootDir, 'components', basename(FIXTURE));
 			await cp(FIXTURE, component, { recursive: true });
+			// a GraphQL table has no implicit __updatedtime__; `version` reads back a write's version
 			await writeFile(
 				join(component, 'schema.graphql'),
 				`type Rows @table @export @sharded(slots: 2) {
@@ -233,12 +235,10 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 				!(await socketTo(nodes[1], nodes[0], signal))?.stuckCopy,
 			{ timeoutMs: 90_000, description: 'neither node to report a stuck copy' }
 		);
-		const warnings = (await readLogSince(nodes[1], marks[1]))
-			.split('\n')
-			.filter((line) => RESUMED_UNDER_PURGE.test(line));
+		const warnings = await linesSince(nodes[1], marks[1], REPLAY_CONTINUES);
 		ok(
 			warnings.some((line) => {
-				const [, peer, from, purgedThrough] = line.match(RESUMED_UNDER_PURGE);
+				const [, peer, from, purgedThrough] = line.match(RESUMED_UNDER_PURGE) ?? [];
 				return peer === nodes[0].hostname && Date.parse(from) < missedAt && Date.parse(purgedThrough) >= missedAt;
 			}),
 			`node 1 resumed node 0 from before the missed write (${new Date(missedAt).toISOString()}), under history purged through it:\n${warnings.join('\n')}`
