@@ -845,34 +845,22 @@ export function earlierReservationSlots(dbisDB: DbisStore, peerId: number, pass:
 }
 
 /**
- * A link this node unsubscribed (its peer was removed, or the topology stopped linking to it) runs no later pass, so
- * nothing would settle what its passes reserved and relaying would stay held back for the whole reservation hold.
- * Their bounds become the peer's settled bound instead, where the start check enforces them, and the reservations go
- * in the same commit: `copied` for the pass that was running, which knows the versions it received, and the reserved
- * value for every earlier attempt.
+ * The token of a reservation a pass from `peerId` left unsettled, if one stands. Its rows sit here without log
+ * entries, and only a later pass from that peer settles it, so a link to the peer that resumed its log instead would
+ * leave the reservation holding relaying back for its whole hold.
  */
-export async function settleAbandonedReservations(
+export function unsettledCopyReservation(
 	dbisDB: DbisStore | undefined,
-	peerId: number,
-	rootStore: any,
-	pass: string,
-	copied: ReadonlyMap<number, number>
-): Promise<boolean> {
-	if (!dbisDB?.put || !dbisDB.getRange) return false;
-	const raise = new Map<number, number>();
-	const release: (string | number)[][] = [];
-	for (const { key, value } of dbisDB.getRange({
+	peerId: number | undefined
+): string | undefined {
+	if (peerId === undefined || typeof dbisDB?.getRange !== 'function') return undefined;
+	for (const { key } of dbisDB.getRange({
 		start: COPY_BOUND_KEY,
 		end: [COPY_BOUND_KEY, Buffer.from([0xff])],
-	}) as Iterable<{ key: any; value: unknown }>) {
-		if (key[1] !== peerId || key[2] !== 'reserved') continue;
-		release.push(key.slice(2));
-		if (key[3] === pass) {
-			for (const [originId, bound] of copied) if (!(raise.get(originId)! >= bound)) raise.set(originId, bound);
-		} else mergeCopyBoundRecordInto(raise, value);
+	}) as Iterable<{ key: any }>) {
+		if (key[1] === peerId && key[2] === 'reserved') return String(key[3]);
 	}
-	if (release.length === 0) return false;
-	return writeCopyBoundRows(dbisDB, peerId, rootStore, { raise: validBounds(raise), release });
+	return undefined;
 }
 
 const copyBoundsByEpoch = new WeakMap<object, { epoch: number; bounds: RelayCopyBounds }>();
@@ -7765,33 +7753,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	ws.once('close', releaseRelayLease);
 	ws.once('close', () => {
-		// a store closing under the unsubscribe throws from here; the reservation then stays, which holds relaying
+		// A pass that ends unsettled having applied no copied row covers nothing, so its reservation must not hold
+		// relaying. One that applied rows keeps its reservation for a later pass from this peer to settle: the link is
+		// kept until it does (subscriptionManager's `heldForCopy`), and a reconnect without a copy cursor copies again.
+		if (!copyPassToken || settledPass === copyPassToken || copiedVersionByOrigin.size > 0) return;
+		const pass = copyPassToken;
 		try {
-			const abandoned = options.connection?.intentionallyUnsubscribed === true;
-			const unsettled = copyPassToken !== '' && settledPass !== copyPassToken;
 			const { dbisDB, auditStore: databaseAuditStore } = getDatabaseStores();
-			const rootStore = (auditStore ?? databaseAuditStore)?.rootStore;
 			if (!dbisDB) return;
+			const rootStore = (auditStore ?? databaseAuditStore)?.rootStore;
 			const peerId = ownCopyPeerId();
-			let release: Promise<unknown> | undefined;
-			// peer 0 stands for a source this session never identified, which other sessions may share
-			if (abandoned && peerId !== 0) {
-				release = settleAbandonedReservations(
-					dbisDB,
-					peerId,
-					rootStore,
-					unsettled ? copyPassToken : '',
-					copiedVersionByOrigin
+			// A reservation write still in flight would land after a release written now and bring the reservation
+			// back with no pass left to settle it, so the release follows it. None starts after the socket closed.
+			Promise.resolve(copyBoundPersist)
+				.catch(() => {})
+				.then(() => writeCopyBoundRows(dbisDB, peerId, rootStore, { release: [['reserved', pass]] }))
+				.catch((error) =>
+					logger.warn?.(connectionId, 'could not release an empty copy reservation for', databaseName, error)
 				);
-			} else if (unsettled && copiedVersionByOrigin.size === 0) {
-				// a pass that ends unsettled having applied no copied row covers nothing, so its reservation must not hold relaying
-				release = writeCopyBoundRows(dbisDB, peerId, rootStore, { release: [['reserved', copyPassToken]] });
-			}
-			release?.catch((error) =>
-				logger.warn?.(connectionId, 'could not release the copy reservations of an ended pass for', databaseName, error)
-			);
 		} catch (error) {
-			logger.warn?.(connectionId, 'could not release the copy reservations of an ended pass for', databaseName, error);
+			// a store closing under the unsubscribe throws from here; the reservation then stays, which holds relaying
+			logger.warn?.(connectionId, 'could not release an empty copy reservation for', databaseName, error);
 		}
 	});
 	function loadPersistedCopyBounds(cursor?: DbisCursor): void {
@@ -12339,8 +12321,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (event.isCopyApply && event.table) copiedTablesThisPass.add(event.table);
 					if (event.isCopyApply && copyFrameSupportsCheckpoints && typeof event.nodeId === 'number') {
 						const version = auditRecord.version;
-						if (!(copiedVersionByOrigin.get(event.nodeId)! >= version))
-							copiedVersionByOrigin.set(event.nodeId, version);
 						if (!(maxCopiedVersionByOrigin.get(event.nodeId)! >= version)) {
 							const reserved = copyBoundReservation(version, copyModeStartTime);
 							maxCopiedVersionByOrigin.set(event.nodeId, reserved);
@@ -12359,6 +12339,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 							return;
 						}
+						// counted once it is handed on: a pass that closes with none keeps no reservation
+						if (!(copiedVersionByOrigin.get(event.nodeId)! >= version))
+							copiedVersionByOrigin.set(event.nodeId, version);
 					}
 					if (messageIsCopyFrame && event.table) lastCopyFrameKey = { table: event.table, id: event.id };
 					maybeFailApplyForTest(event);
@@ -14036,12 +14019,34 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (nodeId === undefined) {
 					logger.warn('Starting subscription request from node', node, 'but no node id found');
 				} else receivingDataFromNodeIds.push(nodeId);
+				// a failover socket (subscriptionManager's `connectToNextWorker`) carries `node`'s log from a peer relaying it
+				const relayedByPeer = connectedNode === node && remoteNodeName !== undefined && node.name !== remoteNodeName;
 				const takeoverStart =
-					connectedNode === node && nodeId !== undefined && auditStore
+					connectedNode === node && !relayedByPeer && nodeId !== undefined && auditStore
 						? borrowedDirectStart(node.name, nodeId, auditStore, dbisDB)
 						: null;
 				let takeover: { start: number; generation?: string } | undefined;
-				if (takeoverStart !== null) {
+				if (relayedByPeer) {
+					// The peer appends `node`'s entries as it received them, so its log can hold one below where this node's own
+					// link left off: start that position less the overlap, or at the floor `node` certified, never at another
+					// route's transaction time, which can sit above writes this node lacks.
+					if (
+						!forceFullCopyOnWidening &&
+						floorOnlyStart === undefined &&
+						nodeId !== undefined &&
+						auditStore &&
+						startTime > 1
+					) {
+						const qualified = readQualifiedOriginFloors(auditStore, dbisDB).floors.get(nodeId);
+						const own = borrowedOriginCursor(
+							allNodes.find((state) => state.id === nodeId),
+							qualified,
+							ORIGIN_CURSOR_OVERLAP_MS
+						);
+						startTime = Math.max(own ?? startTime - ORIGIN_CURSOR_OVERLAP_MS, startCutoff ?? 2, 2);
+						logger.debug?.("Starting a failover link below this node's own position", node.name, startTime);
+					}
+				} else if (takeoverStart !== null) {
 					// never the any-route transaction time below: another route's can sit above writes this node lacks
 					if (!forceFullCopyOnWidening && floorOnlyStart === undefined && takeoverStart?.start > startTime) {
 						takeover = takeoverStart;
@@ -14141,6 +14146,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							`Requesting full copy of database ${databaseName} from ${getNodeURL(node)}: its owned copy was not certified`
 						);
 					} else dbisDB.remove([OWNED_COPY_PENDING, nodeId]);
+				}
+				// A pass from this peer ended unsettled, its rows here without log entries, and with no cursor to resume it.
+				// Only a later pass from this peer settles its reservation, which holds relaying back until then; resuming
+				// the peer's log instead left it standing for the whole hold, and a joiner deferred every copy its peers
+				// asked of it, so its writes reached none of them.
+				if (
+					startTime !== 0 &&
+					!copyCursor &&
+					!restrictedOrigins &&
+					databaseName !== 'system' &&
+					connectedNode === node &&
+					node.name === remoteNodeName
+				) {
+					const unsettled = unsettledCopyReservation(dbisDB, nodeId);
+					if (unsettled !== undefined) {
+						startTime = 0;
+						logger.warn?.(
+							`Requesting full copy of database ${databaseName} from ${getNodeURL(node)}: a copy from it ended without settling (reservation ${unsettled})`
+						);
+					}
 				}
 				let copyResume;
 				if (copyCursor && !shardingProjection) {

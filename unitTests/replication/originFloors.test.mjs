@@ -14,7 +14,6 @@ import {
 	persistMergedCopyBounds,
 	readCommittedCopyBounds,
 	resolveOriginFloors,
-	settleAbandonedReservations,
 	settleCopyBounds,
 	restoreCompletedCopyPass,
 	resumeStartWithFloor,
@@ -827,27 +826,6 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(await settleCopyBounds(dbisDB, new Map([[2, T + 650]]), 1, rootStore, `${T + 7}:retry`), true);
 		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', `${T + 7}:retry`]), undefined);
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', T + 7]), { 2: T + 980 });
-		// a link unsubscribed for good settles what its passes reserved, since no later pass of its can: the running
-		// pass by the versions it received, an earlier attempt by its reserved value, and nothing of another peer
-		await persistMergedCopyBounds(
-			dbisDB,
-			new Map([
-				[2, T + 995],
-				[4, T + 995],
-			]),
-			3,
-			rootStore,
-			'running'
-		);
-		assert.strictEqual(
-			await settleAbandonedReservations(dbisDB, 3, rootStore, 'running', new Map([[4, T + 300]])),
-			true
-		);
-		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3]), { 1: T + 500, 4: T + 300 });
-		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3, 'reserved', 0]), undefined);
-		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3, 'reserved', 'running']), undefined);
-		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', T + 7]), { 2: T + 980 });
-		assert.strictEqual(await settleAbandonedReservations(dbisDB, 3, rootStore, '', new Map()), false);
 		store.delete(keyOf([Symbol.for('copyBound'), 1, 'reserved', T + 7]));
 		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 900]]), 1, rootStore);
 		const epochBeforeFailure = epochWord();

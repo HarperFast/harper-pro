@@ -12,7 +12,7 @@ import { collectRecordLockStatus } from './recordLockTransport.ts';
 import { replicationWorkers } from './replicationWorkers.ts';
 import { isWorkerPoolActive } from '../core/server/threads/workerPools.ts';
 import { setSessionHolderReader } from './recordLockRpc.ts';
-import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
+import { lastTimeInAuditStore, exportIdMapping } from '../core/resources/nodeIdMapping.ts';
 import {
 	subscribeToNode,
 	urlToNodeName,
@@ -69,6 +69,7 @@ import {
 	formatFireClassification,
 	type ConnectionTruth,
 	type FireMechanism,
+	unsettledCopyReservation,
 } from './replicationConnection.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { createBackoff, type Backoff } from './backoff.ts';
@@ -488,6 +489,24 @@ function getAuditStoreForDatabase(databaseName: string): any {
 		if (auditStore) return auditStore;
 	}
 }
+
+/**
+ * Whether a base copy from `peerName` into `databaseName` ended without settling. Its rows are here without log
+ * entries, and its reservation holds relaying back until a later pass from that peer settles it, so the link that pass
+ * runs on is kept until then. `system` takes no such hold.
+ */
+export function copyUnsettledFrom(databaseName: string, peerName: string): boolean {
+	if (databaseName === 'system') return false;
+	try {
+		const auditStore = getAuditStoreForDatabase(databaseName);
+		const peerId = auditStore ? exportIdMapping(auditStore)[peerName] : undefined;
+		return typeof peerId === 'number' && unsettledCopyReservation(auditStore.rootStore?.dbisDb, peerId) !== undefined;
+	} catch (error) {
+		logger.warn('Could not read the copy reservations of', databaseName, 'from', peerName, error);
+		return false;
+	}
+}
+const COPY_HOLD_RECHECK_MS = 2_000;
 
 // Contained: this only decorates a subscription, so a database torn down mid-lookup must not abandon setup.
 function resolveSharedStatus(databaseName: string, nodeName: string | undefined): Float64Array | undefined {
@@ -1538,6 +1557,29 @@ export async function startOnMainThread(options) {
 	}
 	setResidencyVerdictListener(scheduleTopologyReview);
 	onDirectTakeoverChange = scheduleTopologyReview;
+	// Links the grid drops are re-driven after COPY_HOLD_RECHECK_MS while a copy over them is unsettled
+	// (`copyUnsettledFrom`), and once after they are dropped, for a reservation committed after that read.
+	const copyHoldRechecks = new Map<string, ReturnType<typeof setTimeout>>();
+	const heldForCopy = new Set<string>();
+	function recheckCopyHold(name: string, database: string, held: boolean) {
+		const key = `${name}\0${database}`;
+		if (held && !heldForCopy.has(key)) {
+			heldForCopy.add(key);
+			logger.info(`Region topology: ${database} keeps its link to ${name} until the copy from it settles`);
+		} else if (!held) heldForCopy.delete(key);
+		if (copyHoldRechecks.has(key)) return;
+		const timer = setTimeout(() => {
+			copyHoldRechecks.delete(key);
+			try {
+				const row = readNodeRowSync(getHDBNodeTable().primaryStore, name);
+				if (row) onNodeUpdate(row, name);
+			} catch (error) {
+				logger.error('Error rechecking the link kept for a copy from', name, database, error);
+			}
+		}, COPY_HOLD_RECHECK_MS);
+		timer.unref?.();
+		copyHoldRechecks.set(key, timer);
+	}
 	/**
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
@@ -1740,6 +1782,18 @@ export async function startOnMainThread(options) {
 			const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
 			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node, routeReplicates, configRouteReplicates }];
 			let shouldSubscribe = wantsDirectSubscription(nodes[0] as any, databaseName);
+			// The grid can drop a link whose copy has not settled. A pass on that link is the only one that settles the
+			// reservation the copy left, which holds relaying back until then (a joiner deferred every copy its peers asked
+			// of it, so its own writes reached none of them), so the link is kept, or restored, until one does.
+			if (
+				!shouldSubscribe &&
+				regionTopologyFor(databaseName) &&
+				shouldReplicateFromNode(nodes[0] as any, databaseName) &&
+				copyUnsettledFrom(databaseName, node.name)
+			) {
+				shouldSubscribe = true;
+				recheckCopyHold(node.name, databaseName, true);
+			}
 			if (shouldSubscribe || existingEntry?.nodes?.[0]?.isLeader) {
 				const { hasExplicitLeader, leaderName, nodeName } = getLeaderContext();
 				nodes[0].isLeader = deriveEffectiveLeader({
@@ -1833,6 +1887,13 @@ export async function startOnMainThread(options) {
 					logger.warn(`Setting up subscription with leader ${leaderName} for node ${nodeName} in ${subscribeDelay}ms`);
 				}
 			} else {
+				// a reservation the closing session commits after the read above is caught by one more pass
+				if (
+					regionTopologyFor(databaseName) &&
+					shouldReplicateFromNode(nodes[0] as any, databaseName) &&
+					((existingEntry && !existingEntry.unsubscribed) || heldForCopy.has(`${node.name}\0${databaseName}`))
+				)
+					recheckCopyHold(node.name, databaseName, false);
 				logger.info('Node no longer should be used, unsubscribing from node', {
 					replicates: node.replicates,
 					databaseName,
@@ -1982,6 +2043,20 @@ export async function startOnMainThread(options) {
 		closeOriginFallback(entry, database);
 		if (!openOriginFallback(entry, database, next)) scheduleOriginFallback(entry, database);
 	}
+	/** The origin's own link is back: its fallback closes once no copy over it is left unsettled (`copyUnsettledFrom`). */
+	function endOriginFallback(entry: any, database: string): void {
+		const fallback = entry.originFallback;
+		if (fallback && copyUnsettledFrom(database, fallback.name)) {
+			clearTimeout(fallback.recheck);
+			fallback.recheck = setTimeout(() => {
+				fallback.recheck = undefined;
+				if (entry.originFallback === fallback && entry.connected === true) endOriginFallback(entry, database);
+			}, COPY_HOLD_RECHECK_MS);
+			fallback.recheck.unref?.();
+			return;
+		}
+		closeOriginFallback(entry, database);
+	}
 	function closeOriginFallback(entry: any, database: string): void {
 		clearTimeout(entry.originFallbackTimer);
 		entry.originFallbackTimer = undefined;
@@ -2124,7 +2199,7 @@ export async function startOnMainThread(options) {
 		if (!wasConnected) mainWorkerEntry.liveSince = Date.now();
 		// only the origin's own socket ends its fallback, not another origin's failover socket over the same URL
 		if (!connection.subscriptionUrl || connection.subscriptionUrl === connection.url)
-			closeOriginFallback(mainWorkerEntry, connection.database);
+			endOriginFallback(mainWorkerEntry, connection.database);
 		if (connectReportAdvancesGeneration(mainWorkerEntry, connection))
 			advanceConnectGeneration(mainWorkerEntry, Date.now(), RECEIVE_STALL_THRESHOLD_MS);
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);

@@ -8,6 +8,7 @@ import {
 	relayedHeldFrom,
 	relayedStartBelowCopyBound,
 	relayedCursorsForCopy,
+	unsettledCopyReservation,
 	copyBoundRoseForLogs,
 	withheldRecordAction,
 	earlierReservationSlots,
@@ -119,6 +120,20 @@ describe('relayedStartBelowCopyBound', () => {
 	it('compares a log with no cursor from the merged start', () => {
 		assert.strictEqual(relayedStartBelowCopyBound(['other'], T, undefined, settled({ other: T + 1 }))?.start, T);
 		assert.strictEqual(relayedStartBelowCopyBound(['other'], T + 1, undefined, settled({ other: T + 1 })), undefined);
+	});
+});
+
+describe('unsettledCopyReservation', () => {
+	it("names a reservation a pass from the peer left, ignoring settled rows, holes and other peers' reservations", () => {
+		const store = rowsStore([
+			[[COPY_BOUND, 4], { 2: T }],
+			[[COPY_BOUND, 4, 'hole', 'p0', 1, T], { 2: T }],
+			[[COPY_BOUND, 5, 'reserved', 'p5'], { 2: T }],
+		]);
+		assert.strictEqual(unsettledCopyReservation(store, 4), undefined);
+		assert.strictEqual(unsettledCopyReservation(store, 5), 'p5');
+		assert.strictEqual(unsettledCopyReservation(store, undefined), undefined);
+		assert.strictEqual(unsettledCopyReservation(undefined, 5), undefined);
 	});
 });
 
