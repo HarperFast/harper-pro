@@ -197,7 +197,8 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 				['k-patch', dataRow],
 				[D.harper.hostname, nodeRow],
 			]) {
-				const row = await read(C.harper, id);
+				const { originId, ...row } = await read(C.harper, id);
+				assert.ok(originId, `${id} on C keeps a remote origin`);
 				assert.deepEqual(
 					row,
 					{
@@ -296,17 +297,13 @@ suite('a delete under a later publish', { timeout: 600_000, skip: isLMDB && 'cop
 		await nodes.join(E, X);
 		await waitFor(async (signal) => (await dataRow(E.harper, 'sentinel', signal)).present, 'the copy to reach E');
 		await waitFor(async (signal) => (await dataRow(E.harper, 'covered', signal)).stored, 'the delete on E');
+		// E never connected to A, so it has no name for the delete's origin; the id must still be a remote one
+		const { originId, origin, ...onE } = await dataRow(E.harper, 'covered');
+		assert.ok(originId, "the delete keeps a remote origin on E, not E's own");
 		assert.deepEqual(
-			await dataRow(E.harper, 'covered'),
-			{
-				stored: true,
-				present: false,
-				version: deleted.version,
-				origin: A.harper.hostname,
-				fullWriteHead: true,
-				history: 0,
-			},
-			'E holds the delete at its version and origin'
+			onE,
+			{ stored: true, present: false, version: deleted.version, fullWriteHead: true, history: 0 },
+			'E holds the delete at its version'
 		);
 		await redeliver(E.harper, 'covered', { id: 'covered', name: 'older write' }, 1000);
 		assert.equal((await dataRow(E.harper, 'covered')).present, false, 'an older write recreated the deleted row on E');
