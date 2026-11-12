@@ -145,6 +145,11 @@ export function chooseCloneShard({
 		shard = request;
 		description = `shard ${shard} from ${SHARD_OPTION}`;
 	} else if (local !== undefined) {
+		if (request === 'replica' && slotOwningShards(leaderMaps)?.has(local))
+			throw new CloneShardRefusedError(
+				`${SHARD_OPTION} asks for a replica shard but this node is configured for shard ${local}, which owns slots; ` +
+					'remove replication.shard, or clone onto a fresh root'
+			);
 		shard = local;
 		description = `shard ${shard} from this node's configuration`;
 	} else if (request === 'auto' || request === 'replica') {

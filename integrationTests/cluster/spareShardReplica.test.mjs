@@ -245,7 +245,7 @@ suite('Replica nodes in a spare shard', { timeout: 900_000 }, (ctx) => {
 			const views = await Promise.all(
 				nodes().map(async (node) => [node.hostname, await rest(node, `CloneRows/${written.id}`).catch(String)])
 			);
-			const status = await clusterStatus(replica).catch(String);
+			const status = await clusterStatus(replica, AbortSignal.timeout(10_000)).catch(String);
 			throw new Error(
 				`${error.message}; views: ${JSON.stringify(views)}; replica sharding: ${JSON.stringify(status?.sharding?.data)}; replica connections: ${JSON.stringify(status?.connections?.map((peer) => [peer.name, peer.database_sockets?.map((socket) => [socket.database, socket.connected, socket.lastReceivedVersion, socket.lastSentVersion ?? socket.sending])]))}`
 			);

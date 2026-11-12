@@ -76,8 +76,9 @@ import {
  * - HDB_LEADER_TOKEN: JWT authentication token for the leader node
  *
  * Optional:
- * - CLONE_SHARD: This node's shard, a number or "auto". Required when the leader is sharded, since a clone never
- *   inherits the leader's shard; "auto" picks the listed shard with the fewest live members
+ * - CLONE_SHARD: This node's shard: a number, "auto" or "replica". Required when the leader is sharded, since a clone
+ *   never inherits the leader's shard; "auto" picks the shard owning slots with the fewest live members, and "replica"
+ *   a spare shard owning no slots
  * - CLONE_SSH_KEYS: Clone SSH keys from leader (default: true)
  * - CLONE_JWT_KEYS: Clone JWT keys from leader (default: true)
  * - ALLOW_SELF_SIGNED: Allow self-signed certificates to be used for authentication (default: false)

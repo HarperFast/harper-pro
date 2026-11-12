@@ -350,6 +350,13 @@ describe('cloneShard', () => {
 				);
 			});
 
+			it('refuses "replica" on a node configured for a shard owning slots, rather than joining the backbone', () => {
+				refuses(
+					{ ...BACKBONE, requested: 'replica', configured: 0, leaderStatus: status() },
+					/asks for a replica shard but this node is configured for shard 0, which owns slots/
+				);
+			});
+
 			it('refuses "replica" when every listed spare already owns slots', () => {
 				refuses(
 					{ ...BACKBONE, leaderSpareShards: [0], requested: 'replica', leaderStatus: status() },
