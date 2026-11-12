@@ -6,6 +6,7 @@ import {
 	orderFailoverCandidates,
 	originFallbackMates,
 	receivesDirect,
+	relievedSuppliers,
 	settleSupplier,
 	supplierCandidates,
 	topologySignature,
@@ -414,6 +415,34 @@ describe('regionTopology', () => {
 			const held = settle(['carrier'], { supplier: 'gone' }, 1000);
 			assert.equal(held.supplier, 'gone');
 			assert.deepEqual(settle(['carrier'], held, 1000 + HOLD_MS), { supplier: 'carrier' });
+		});
+	});
+
+	describe('relievedSuppliers', () => {
+		it('puts the supplier being relieved first, before those it relieved', () => {
+			assert.deepEqual(relievedSuppliers(undefined), []);
+			assert.deepEqual(relievedSuppliers({ supplier: 'east1' }), ['east1']);
+			assert.deepEqual(relievedSuppliers({ supplier: 'east1', relieved: ['east2'] }), ['east1', 'east2']);
+		});
+
+		it('keeps every earlier supplier, so one relieved before it recorded anything hides none', () => {
+			// the quiet join: east2 carried the origin, the joiner east1 took it while its link was copying, then the
+			// node took the origin by a direct link
+			const joinerAssigned = { supplier: 'east1', relieved: relievedSuppliers({ supplier: 'east2' }) };
+			assert.deepEqual(relievedSuppliers(joinerAssigned), ['east1', 'east2']);
+		});
+
+		it('names each supplier once, most recent first, and counts a direct link as one', () => {
+			assert.deepEqual(relievedSuppliers({ supplier: 'east2', relieved: ['east1', 'east2', 'origin'] }), [
+				'east2',
+				'east1',
+				'origin',
+			]);
+			assert.deepEqual(relievedSuppliers({ supplier: 'origin', relieved: ['east1'] }), ['origin', 'east1']);
+		});
+
+		it('keeps the list unchanged through a time with no supplier', () => {
+			assert.deepEqual(relievedSuppliers({ relieved: ['east1', 'east2'] }), ['east1', 'east2']);
 		});
 	});
 

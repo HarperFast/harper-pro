@@ -47,6 +47,7 @@ import {
 	orderFailoverCandidates,
 	originFallbackMates,
 	receivesDirect,
+	relievedSuppliers,
 	settleSupplier,
 	supplierCandidates,
 	topologySignature,
@@ -1098,11 +1099,11 @@ function updateShardingFailover(database: string): void {
 const TOPOLOGY_HOLD_MS = 3_000;
 const TOPOLOGY_STABLE_MS = 10_000;
 const TOPOLOGY_SWITCH_GRACE_MS = 30_000;
-type TopologyAssignment = SupplierAssignment & { relieved?: string | null };
+type TopologyAssignment = SupplierAssignment & { relieved?: string[] };
 const topologyAssignments = new Map<string, Map<string, TopologyAssignment>>();
-// Per database, the origins this node now subscribes to itself that it last took through a supplier, with that
-// supplier: the origin's own link has no record of what the supplier delivered, so it borrows its start from it.
-const directBorrows = new Map<string, Map<string, string | null>>();
+// Per database, the origins this node now subscribes to itself that it last took through a supplier, with the suppliers
+// it took them through: the origin's own link has no record of what they delivered, so it borrows its start from them.
+const directBorrows = new Map<string, Map<string, string[]>>();
 let topologyRecheckTimer: ReturnType<typeof setTimeout> | undefined;
 let topologyRecheckAt = Infinity;
 let onDirectTakeoverChange: (() => void) | undefined;
@@ -1161,17 +1162,18 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 	const topology = regionTopologyFor(database);
 	let borrows = directBorrows.get(database);
 	const becameDirect = (origin: string, assignment: TopologyAssignment) => {
-		const last = assignment.supplier === origin ? undefined : (assignment.supplier ?? assignment.relieved);
-		if (!last) return;
+		if (assignment.supplier === origin) return;
+		const routes = relievedSuppliers(assignment);
+		if (!routes.length) return;
 		if (!borrows) directBorrows.set(database, (borrows = new Map()));
-		borrows.set(origin, last);
+		borrows.set(origin, routes);
 	};
 	const borrowLinks = (byUrl: Record<string, TopologyLink>) => {
-		for (const [origin, last] of borrows ?? []) {
+		for (const [origin, routes] of borrows ?? []) {
 			const node = nodeMap.get(origin);
 			if (!node) continue;
 			const link = (byUrl[getNodeURL(node)] ??= {});
-			(link.borrow ??= {})[origin] = last;
+			(link.borrow ??= {})[origin] = routes;
 		}
 		return byUrl;
 	};
@@ -1208,8 +1210,8 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 		);
 		if (next.supplier === previous?.supplier) next.relieved = previous?.relieved;
 		else {
-			// a move through having no supplier still borrows from the last real one
-			next.relieved = previous?.supplier ?? previous?.relieved ?? null;
+			// a move through having no supplier still borrows from the last real ones
+			next.relieved = relievedSuppliers(previous);
 			if (next.supplier === origin || previous?.supplier === origin) directChanged = true;
 			// only a move off another supplier reconnects the new link (the origin was excluded there); a first
 			// assignment finds the origin already admitted, and a direct link is a new subscription
@@ -1245,15 +1247,15 @@ export function computeTopologyLinks(database: string, now = Date.now()): Topolo
 		const url = getNodeURL(node);
 		if (!connectionReplicationMap.get(url)?.has(database)) continue;
 		const excluded: string[] = [];
-		const borrow: Record<string, string | null> = {};
+		const borrow: Record<string, string[]> = {};
 		for (const origin of managed) {
 			const { supplier, relieved } = assignments.get(origin)!;
 			if (supplier === undefined) {
-				// with no supplier the origin is admitted on every link, each resuming from where the last supplier left it
-				if (relieved) borrow[origin] = relieved;
+				// with no supplier the origin is admitted on every link, each resuming from where the last suppliers left it
+				if (relieved?.length) borrow[origin] = relieved;
 				continue;
 			}
-			if (supplier === name) borrow[origin] = relieved ?? null;
+			if (supplier === name) borrow[origin] = relieved ?? [];
 			else excluded.push(origin);
 		}
 		byUrl[url] = { excluded, borrow };
@@ -2043,20 +2045,6 @@ export async function startOnMainThread(options) {
 		closeOriginFallback(entry, database);
 		if (!openOriginFallback(entry, database, next)) scheduleOriginFallback(entry, database);
 	}
-	/** The origin's own link is back: its fallback closes once no copy over it is left unsettled (`copyUnsettledFrom`). */
-	function endOriginFallback(entry: any, database: string): void {
-		const fallback = entry.originFallback;
-		if (fallback && copyUnsettledFrom(database, fallback.name)) {
-			clearTimeout(fallback.recheck);
-			fallback.recheck = setTimeout(() => {
-				fallback.recheck = undefined;
-				if (entry.originFallback === fallback && entry.connected === true) endOriginFallback(entry, database);
-			}, COPY_HOLD_RECHECK_MS);
-			fallback.recheck.unref?.();
-			return;
-		}
-		closeOriginFallback(entry, database);
-	}
 	function closeOriginFallback(entry: any, database: string): void {
 		clearTimeout(entry.originFallbackTimer);
 		entry.originFallbackTimer = undefined;
@@ -2199,7 +2187,7 @@ export async function startOnMainThread(options) {
 		if (!wasConnected) mainWorkerEntry.liveSince = Date.now();
 		// only the origin's own socket ends its fallback, not another origin's failover socket over the same URL
 		if (!connection.subscriptionUrl || connection.subscriptionUrl === connection.url)
-			endOriginFallback(mainWorkerEntry, connection.database);
+			closeOriginFallback(mainWorkerEntry, connection.database);
 		if (connectReportAdvancesGeneration(mainWorkerEntry, connection))
 			advanceConnectGeneration(mainWorkerEntry, Date.now(), RECEIVE_STALL_THRESHOLD_MS);
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);

@@ -1,5 +1,9 @@
 import assert from 'node:assert';
-import { borrowedOriginCursor, cursorBelowFloor } from '#src/replication/replicationConnection';
+import {
+	borrowedOriginCursor,
+	borrowFromRelievedRoutes,
+	cursorBelowFloor,
+} from '#src/replication/replicationConnection';
 
 describe('borrowedOriginCursor (harper-pro#1291 supplier switch)', () => {
 	it("takes the relieved supplier's position when no floor is certified", () => {
@@ -72,5 +76,56 @@ describe('borrowedOriginCursor (harper-pro#1291 supplier switch)', () => {
 
 	it('has no cursor with neither source', () => {
 		assert.strictEqual(borrowedOriginCursor(undefined, undefined), undefined);
+	});
+});
+
+describe('borrowFromRelievedRoutes', () => {
+	it('passes over a route that recorded nothing for the origin (the quiet-join trace)', () => {
+		// .81's row after only copying; .82's row from carrying the origin
+		const joiner = { id: 3, partialHistory: false };
+		const carrier = { id: 3, closedFloor: 7000, originLogKey: 9000 };
+		const { cursor, state } = borrowFromRelievedRoutes([joiner, undefined, carrier], undefined);
+		assert.strictEqual(cursor, 9000);
+		assert.strictEqual(state, carrier);
+	});
+
+	it('takes the highest position among the routes, not the most recent one', () => {
+		// a supplier reused after another carried the origin further keeps its older, lower position
+		const reused = { originLogKey: 200 };
+		const further = { originLogKey: 1000 };
+		assert.strictEqual(borrowFromRelievedRoutes([reused, further], undefined).cursor, 1000);
+		assert.strictEqual(borrowFromRelievedRoutes([reused, further], undefined, 100).cursor, 900);
+	});
+
+	it('passes over flagged routes, and takes a floor-only route', () => {
+		const flagged = { originLogKey: 12000, hole: true };
+		const floorOnly = { closedFloor: 5000 };
+		assert.strictEqual(borrowFromRelievedRoutes([flagged, floorOnly], undefined).cursor, cursorBelowFloor(5000));
+	});
+
+	it("counts only the most recent positioned route's generation", () => {
+		const current = { originLogKey: 300, originGeneration: 'g1' };
+		const replaced = { originLogKey: 5000, originGeneration: 'g0' };
+		const { cursor, state } = borrowFromRelievedRoutes([current, replaced], undefined);
+		assert.strictEqual(cursor, 300);
+		assert.strictEqual(state, current);
+	});
+
+	it('combines the chosen route with the qualified floor as borrowedOriginCursor does', () => {
+		const qualified = { floor: 9000, generation: 'g1' };
+		assert.strictEqual(
+			borrowFromRelievedRoutes([{ originLogKey: 5000, originGeneration: 'g1' }], qualified).cursor,
+			cursorBelowFloor(9000)
+		);
+		assert.strictEqual(
+			borrowFromRelievedRoutes([{ originLogKey: 12000, originGeneration: 'g1' }], qualified).cursor,
+			12000
+		);
+	});
+
+	it('falls back to the qualified floor alone, or to nothing', () => {
+		const qualified = { floor: 9000, generation: 'g1' };
+		assert.deepEqual(borrowFromRelievedRoutes([{ id: 3 }, undefined], qualified), { cursor: cursorBelowFloor(9000) });
+		assert.deepEqual(borrowFromRelievedRoutes([], undefined), { cursor: undefined });
 	});
 });

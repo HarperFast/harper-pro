@@ -225,6 +225,18 @@ export interface SupplierState {
 	qualifiedSince(name: string): number;
 }
 
+/**
+ * The links an origin was taken through, most recent first, once `assignment`'s supplier is relieved: that supplier
+ * leads, then those it relieved, each named once. A borrow reads them all, so a supplier relieved before its route
+ * recorded anything (its link only copied, or the origin wrote nothing through it) does not hide one that did.
+ * Bounded by the region's members and the origin itself.
+ */
+export function relievedSuppliers(assignment: { supplier?: string; relieved?: string[] } | undefined): string[] {
+	const relieved = assignment?.relieved ?? [];
+	const supplier = assignment?.supplier;
+	return supplier === undefined ? relieved : [supplier, ...relieved.filter((name) => name !== supplier)];
+}
+
 export interface SupplierAssignment {
 	/** The origin's own name when this node links to the origin itself; undefined while no supplier is settled. */
 	supplier?: string;

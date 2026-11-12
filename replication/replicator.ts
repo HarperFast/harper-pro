@@ -878,7 +878,8 @@ export function releaseSharedStatusOnUnsubscribe(connection) {
 export interface TopologyLink {
 	/** Undefined on a link of a database the topology no longer manages, which carries only a borrow. */
 	excluded?: string[];
-	borrow?: Record<string, string | null>;
+	/** Per origin, the links it was taken through, most recent first. */
+	borrow?: Record<string, string[]>;
 }
 
 /**

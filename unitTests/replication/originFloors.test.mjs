@@ -1049,6 +1049,37 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(routeState.hasPending(), false);
 	});
 
+	it('PendingRouteState re-sends what verification re-queues from more than one batch, so it settles', async () => {
+		// two batches whose row write did not persist come back together: restored as they were sent, the later batch's
+		// rollback left each origin settled at the version it was re-queued under, so every commit filtered it out and
+		// it stayed pending for good (a copy pass waiting on the route never settled, holding relaying back)
+		const routeState = new PendingRouteState(() => {});
+		const commit = async () => {
+			const event = { remoteNodeIds: [1] };
+			routeState.attachTo(event);
+			await event.onCommit();
+			return event;
+		};
+		for (let batch = 0; batch < 2; batch++) {
+			routeState.partialHistory(1, true, 'g1');
+			routeState.hole(2, 'g2');
+			await commit();
+		}
+		assert.strictEqual(routeState.hasPending(), false);
+		const unpersisted = [
+			{ id: 1, originGeneration: 'g1' },
+			{ id: 2, originGeneration: 'g2' },
+		];
+		assert.strictEqual(
+			routeState.verifyPersisted(() => unpersisted),
+			false
+		);
+		assert.strictEqual(routeState.size, 2);
+		const retry = await commit();
+		assert.deepStrictEqual((retry.originRouteStates ?? []).map(([originId]) => originId).sort(), [1, 2]);
+		assert.strictEqual(routeState.size, 0, 'the re-queued marks settle once re-sent');
+	});
+
 	it('buildOriginCursorVector never uses floor-only resume for removed origins seeded from another row or unnamed node ids', () => {
 		const seqRows = new Map([
 			[
