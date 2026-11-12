@@ -4042,12 +4042,13 @@ export class PendingRouteState {
 			if (current.clearCertifiedFirst) current.clearVersion = current.version;
 		}
 		for (const [originId, sent] of revocations ?? []) {
-			if (!this.revocations?.has(originId)) {
+			const current = this.revocations?.get(originId);
+			if (current) current.version = ++this.nextVersion;
+			else
 				(this.revocations ??= new Map()).set(originId, {
 					revocation: [...sent.revocation] as [number, string?],
 					version: ++this.nextVersion,
 				});
-			}
 		}
 	}
 	private recordUnverifiedBatch(
@@ -4111,6 +4112,9 @@ export class PendingRouteState {
 				if (gen !== undefined && node?.originGeneration !== gen) {
 					continue;
 				}
+				// the row is read now: once a newer mark of this origin has settled it holds that one, which its own batch
+				// verifies, and comparing this one with it would re-queue a superseded mark
+				if ((this.settledMarkVersion.get(originId) ?? 0) > entry.version) continue;
 				if (!node) {
 					batchPersisted = false;
 					break;

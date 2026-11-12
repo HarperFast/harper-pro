@@ -1063,21 +1063,66 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		for (let batch = 0; batch < 2; batch++) {
 			routeState.partialHistory(1, true, 'g1');
 			routeState.hole(2, 'g2');
+			routeState.revoke(3, 'g3');
+			// a certification clear: partial history marked, then restored
+			routeState.partialHistory(4, true, 'g4');
+			routeState.partialHistory(4, false, 'g4');
 			await commit();
 		}
 		assert.strictEqual(routeState.hasPending(), false);
 		const unpersisted = [
 			{ id: 1, originGeneration: 'g1' },
 			{ id: 2, originGeneration: 'g2' },
+			{ id: 3, originGeneration: 'g3' },
+			{ id: 4, originGeneration: 'g4', partialHistory: false, certifiedFrom: 100 },
 		];
 		assert.strictEqual(
 			routeState.verifyPersisted(() => unpersisted),
 			false
 		);
-		assert.strictEqual(routeState.size, 2);
+		assert.strictEqual(routeState.size, 4);
 		const retry = await commit();
-		assert.deepStrictEqual((retry.originRouteStates ?? []).map(([originId]) => originId).sort(), [1, 2]);
+		assert.deepStrictEqual(retry.originRouteStates, [
+			[1, undefined, true, undefined, 'g1'],
+			[2, undefined, undefined, true, 'g2'],
+			[4, undefined, true, undefined, 'g4'],
+			[4, undefined, false, undefined, 'g4'],
+		]);
+		assert.deepStrictEqual(retry.originFloorRevocations, [[3, 'g3']]);
 		assert.strictEqual(routeState.size, 0, 'the re-queued marks settle once re-sent');
+		const persisted = [
+			{ id: 1, originGeneration: 'g1', partialHistory: true },
+			{ id: 2, originGeneration: 'g2', hole: true },
+			{ id: 3, originGeneration: 'g3', floorRevoked: true },
+			{ id: 4, originGeneration: 'g4', partialHistory: false },
+		];
+		assert.strictEqual(
+			routeState.verifyPersisted(() => persisted, retry),
+			true
+		);
+		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
+	});
+
+	it('PendingRouteState verifyPersisted does not re-queue a mark a newer settled one superseded', async () => {
+		// a copy pass marks an origin partial at its start and restores it at its finish: once the restore settles, the
+		// row holds partialHistory: false, which is no reason to send the start's mark again
+		const routeState = new PendingRouteState(() => {});
+		const commit = async () => {
+			const event = { remoteNodeIds: [1] };
+			routeState.attachTo(event);
+			await event.onCommit();
+			return event;
+		};
+		routeState.partialHistory(1, true, 'g1');
+		await commit();
+		routeState.partialHistory(1, false, 'g1');
+		await commit();
+		assert.strictEqual(
+			routeState.verifyPersisted(() => [{ id: 1, originGeneration: 'g1', partialHistory: false }]),
+			true
+		);
+		assert.strictEqual(routeState.hasPending(), false);
+		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
 	});
 
 	it('buildOriginCursorVector never uses floor-only resume for removed origins seeded from another row or unnamed node ids', () => {
