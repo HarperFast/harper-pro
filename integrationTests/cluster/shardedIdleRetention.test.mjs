@@ -208,7 +208,10 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		await stop(1, { graceMs: 30_000 });
 		await start(1);
 		await waitForLogPurged(nodes[1], 'local');
-		ok(await holds(nodes[1], missedId, 'while-0-down'), 'node 1 kept the row whose log entry it purged');
+		ok(
+			await holds(nodes[1], missedId, 'while-0-down', AbortSignal.timeout(30_000)),
+			'node 1 kept the row whose log entry it purged'
+		);
 		const marks = await Promise.all(nodes.map(logMark));
 		await start(0);
 		await ready();
@@ -297,7 +300,10 @@ suite('sharded database idle past retention', { timeout: 900_000 }, (ctx) => {
 		);
 		ok(accepted);
 		await ownerHolds(1, OWNED_BY[1][0], 'after-refusal');
-		ok(await holds(nodes[1], OWNED_BY[1][1], 'while-0-down'), 'the refused write changed nothing on node 1');
+		ok(
+			await holds(nodes[1], OWNED_BY[1][1], 'while-0-down', AbortSignal.timeout(30_000)),
+			'the refused write changed nothing on node 1'
+		);
 	});
 
 	test('a copy-resume cursor left from before the route was restricted asks node 1 for no copy (harper-pro#1315)', async () => {
