@@ -1102,6 +1102,28 @@ export function isValidFrameTxnLogKey(value: unknown): boolean {
 export function isValidRecordVersion(value: unknown): boolean {
 	return isValidReplicationClock(value);
 }
+/** Whether a retained delete boundary outranks a head's own identity, in core's order: version, then origin name. */
+export function boundaryOutranksHead(
+	auditStore: any,
+	boundary: { version: number; nodeId?: number },
+	head: { version: number; nodeId?: number }
+): boolean {
+	if (boundary.version !== head.version) return boundary.version > head.version;
+	const boundaryId = boundary.nodeId ?? 0;
+	const headId = head.nodeId ?? 0;
+	if (boundaryId === headId) return false;
+	const nodeNameToId = exportIdMapping(auditStore);
+	let boundaryName: string | undefined;
+	let headName: string | undefined;
+	for (const name in nodeNameToId) {
+		if (nodeNameToId[name] === boundaryId) boundaryName = name;
+		if (nodeNameToId[name] === headId) headName = name;
+	}
+	if (boundaryName !== undefined && headName !== undefined) return boundaryName > headName;
+	if (boundaryName !== undefined) return true;
+	if (headName !== undefined) return false;
+	return boundaryId > headId;
+}
 export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number, recordNodeId = entry.nodeId): number {
 	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs?.length) {
 		let readError: unknown;
@@ -10769,7 +10791,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															entry.value == null &&
 															!(entry.metadataFlags & (INVALIDATED | REPLICA)) &&
 															(!(entry.metadataFlags & FULL_WRITE_HEAD) ||
-																entry.copiedDeleteBoundary?.version > entry.version)
+																(entry.copiedDeleteBoundary &&
+																	boundaryOutranksHead(auditStore, entry.copiedDeleteBoundary, entry)))
 																? entry.copiedDeleteBoundary
 																: undefined;
 														// same origin normalization as recordNodeId below: undefined means we authored it
