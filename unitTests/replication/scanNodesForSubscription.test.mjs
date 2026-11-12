@@ -325,6 +325,14 @@ describe('runNodeUpdateWatcher idempotency (harper-pro#460 reload double-registr
 	});
 });
 
+async function waitFor(condition, description, timeoutMs = 10_000) {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${description}`);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
 describe('runNodeUpdateWatcher delivers private_urls patches (harper-pro#1292)', function () {
 	this.timeout(30_000);
 	const name = 'patched-private-peer';
@@ -338,16 +346,23 @@ describe('runNodeUpdateWatcher delivers private_urls patches (harper-pro#1292)',
 	it('hands listeners the stored row with its new private_urls', async () => {
 		const calls = [];
 		await getHDBNodeTable().put(name, { name, url: `wss://${name}:9933`, replicates: true });
-		runNodeUpdateWatcher((node, id) => calls.push({ node, id }), { key: WATCHER });
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		let subscribed = false;
+		runNodeUpdateWatcher((node, id) => calls.push({ node, id }), {
+			key: WATCHER,
+			subscribe: async () => {
+				const events = await getHDBNodeTable().subscribe({});
+				subscribed = true;
+				return events;
+			},
+		});
+		await waitFor(() => subscribed, 'the hdb_nodes subscription to open');
 		calls.length = 0;
 		const privateUrls = [{ url: 'wss://10.0.0.9:9933', network: 'net1' }];
 		await ensureNode(name, { private_urls: privateUrls });
-		const deadline = Date.now() + 10_000;
-		while (!calls.some((call) => call.id === name && call.node?.private_urls)) {
-			if (Date.now() > deadline) throw new Error('the patch never reached the listener with its private_urls');
-			await new Promise((resolve) => setTimeout(resolve, 10));
-		}
+		await waitFor(
+			() => calls.some((call) => call.id === name && call.node?.private_urls),
+			'the patch to reach the listener with its private_urls'
+		);
 		const delivered = calls.findLast((call) => call.id === name).node;
 		expect(delivered.private_urls).to.deep.equal(privateUrls);
 		expect(delivered.url).to.equal(`wss://${name}:9933`);
