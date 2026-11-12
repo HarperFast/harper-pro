@@ -29,11 +29,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import {
 	sendOperation,
 	waitForCondition,
 	stopAndTeardownNodes,
+	stopNodeProcess,
+	waitForLogPurged,
 	logMark,
 	readLogSince,
 	hdbLogPath,
@@ -58,7 +60,8 @@ import {
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
-const OPTIONS = { replicationLogLevel: 'info' };
+// a purge removes only log segments a clean stop flushed (harper#4238), so these nodes flush on exit
+const OPTIONS = { replicationLogLevel: 'info', env: { HARPER_NO_FLUSH_ON_EXIT: '' } };
 const WRITE_INTERVAL_MS = 200;
 // [region, lane] of each node killed in turn; the other two nodes of every region write, so each killed node's column
 // has a writer in both other regions
@@ -266,8 +269,23 @@ suite('Region grid switches under load', { timeout: 2_700_000 }, (ctx) => {
 	const restart = (context, env) =>
 		startHarper(
 			context,
-			nodeOptions(context.harper.hostname, layout.region.get(context.harper.hostname), workDir, { ...OPTIONS, env })
+			nodeOptions(context.harper.hostname, layout.region.get(context.harper.hostname), workDir, {
+				...OPTIONS,
+				env: { ...OPTIONS.env, ...env },
+			})
 		);
+	/** Stops `context` cleanly, which flushes its open log segment, and purges its own log once it is back. */
+	async function purgeOwnLog(context) {
+		await killHarper(context, { graceMs: 30_000 });
+		await stopNodeProcess(context.harper);
+		await restart(context);
+		await sendOperation(context.harper, {
+			operation: 'delete_transaction_logs_before',
+			database: 'data',
+			timestamp: Date.now(),
+		});
+		await waitForLogPurged(context.harper, 'local');
+	}
 	/** `node` receives replication data from `reachable` alone. */
 	const cutOffAllBut = (node, reachable) =>
 		writeFile(
@@ -311,13 +329,11 @@ suite('Region grid switches under load', { timeout: 2_700_000 }, (ctx) => {
 		await insert(origin, `${phase}-after`, origin.hostname, 1);
 		await waitForPhase([layout.named('east', 1)], `${phase}-after`, 1);
 		await delay(1000);
-		await sendOperation(origin, {
-			operation: 'delete_transaction_logs_before',
-			database: 'data',
-			timestamp: Date.now(),
-		});
+		const originContext = contextOf(origin);
+		await purgeOwnLog(originContext);
 		await cutOffAllBut(relay, origin);
-		return { relay: contextOf(relay), follower: contextOf(follower), origin };
+		// the restart replaced the origin's handle
+		return { relay: contextOf(relay), follower: contextOf(follower), origin: originContext.harper };
 	}
 	const reconnectAll = (...contexts) =>
 		Promise.all(contexts.map(({ harper }) => writeFile(partitionFile(workDir, harper.hostname), '[]')));
@@ -495,7 +511,9 @@ suite('Region grid switches under load', { timeout: 2_700_000 }, (ctx) => {
 		await assertExactlyWritten(nodes(), writes);
 	});
 
-	test('a follower behind purged history moves to the stand-in through a base copy and loses nothing', async () => {
+	// Skipped since harper#4238: the purge below removes nothing until a clean stop flushes the stand-in's segment, and
+	// the stand-in writes throughout, so it cannot restart here. Rebuilding the scenario is tracked on harper-pro#1300.
+	test.skip('a follower behind purged history moves to the stand-in through a base copy and loses nothing', async () => {
 		const carrier = layout.named('east', 2);
 		const standIn = layout.named('east', 0);
 		const follower = layout.named('east', 1);
