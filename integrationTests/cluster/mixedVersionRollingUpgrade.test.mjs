@@ -58,7 +58,13 @@ function nodeOptions(hostname, harperBinPath, env) {
 		config: {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: false, console: true },
-			replication: { securePort: hostname + ':9933' },
+			replication: {
+				securePort: hostname + ':9933',
+				// Every node, on every release, carries private-address config (its own listener, so routing is
+				// unchanged): an older release must start with these keys and replicate rows carrying private_urls.
+				network: 'mixed-version',
+				privateUrls: [{ url: `wss://${hostname}:9933`, network: 'mixed-version' }],
+			},
 		},
 		env,
 		harperBinPath,

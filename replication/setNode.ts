@@ -17,6 +17,7 @@ import { getThisNodeName, hostnameToUrl, getThisNodeUrl } from '../core/server/n
 import * as hdbLogger from '../core/utility/logging/harper_logger.js';
 import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/hdbError.js';
 import { server } from '../core/server/Server.ts';
+import { ownPrivateUrls, receivedPrivateUrls } from './privatePaths.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
 
 const validationSchema = Joi.object({
@@ -49,6 +50,12 @@ function selfReplicatesForNodeWrite(): any {
 	const existingSelf = getHDBNodeTable().primaryStore.getSync(getThisNodeName());
 	if (existingSelf && typeof existingSelf.replicates === 'object') return existingSelf.replicates;
 	return computeSelfReplicates(getConfiguredRoutes());
+}
+
+// ensureNode patches, so a removed advertisement is cleared explicitly
+function ownRowPrivateUrls(privateUrls: unknown): unknown {
+	if (privateUrls) return privateUrls;
+	return getHDBNodeTable().primaryStore.getSync(getThisNodeName())?.private_urls ? null : undefined;
 }
 
 /**
@@ -127,6 +134,9 @@ export async function setNode(req: any) {
 		authorization: req.retain_authorization ? req.authorization : null,
 	};
 	if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) targetAddNodeObj.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+	const privateUrls = ownPrivateUrls();
+	// sent even when empty, so a peer clears an advertisement this node no longer has
+	targetAddNodeObj.private_urls = privateUrls ?? null;
 
 	if (req.subscriptions) {
 		targetAddNodeObj.subscriptions = req.subscriptions.map(reverseSubscription);
@@ -211,6 +221,11 @@ export async function setNode(req: any) {
 	if (req.revoked_certificates) nodeRecord.revoked_certificates = req.revoked_certificates;
 	if (targetNodeResponse?.shard !== undefined) nodeRecord.shard = targetNodeResponse.shard;
 	else if (req.shard !== undefined) nodeRecord.shard = req.shard;
+	const peerPrivateUrls = receivedPrivateUrls(
+		targetNodeResponse,
+		getHDBNodeTable().primaryStore.getSync(targetNodeResponse?.nodeName ?? nodeRecord.name ?? urlToNodeName(url))
+	);
+	if (peerPrivateUrls !== undefined) nodeRecord.private_urls = peerPrivateUrls;
 	// isLeader is LOCAL-ONLY: it means "this peer is my leader; request a full-table copy from it".
 	// It must NOT be forwarded to the peer via targetAddNodeObj — doing so would cause the peer
 	// to treat this node as its leader and attempt to full-copy in the wrong direction.
@@ -236,6 +251,8 @@ export async function setNode(req: any) {
 			subscriptions: null,
 		};
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+		const ownPrivate = ownRowPrivateUrls(privateUrls);
+		if (ownPrivate !== undefined) thisNode.private_urls = ownPrivate;
 
 		if (req.retain_authorization) thisNode.authorization = req.authorization;
 		if (req.start_time) thisNode.start_time = req.start_time;
@@ -304,6 +321,11 @@ export async function addNodeBack(req) {
 	if (req.start_time) nodeRecord.start_time = req.start_time;
 	if (req.authorization) nodeRecord.authorization = req.authorization;
 	if (req.shard !== undefined) nodeRecord.shard = req.shard;
+	const peerPrivateUrls = receivedPrivateUrls(req, getHDBNodeTable().primaryStore.getSync(req.hostname));
+	if (peerPrivateUrls !== undefined) nodeRecord.private_urls = peerPrivateUrls;
+
+	const privateUrls = ownPrivateUrls();
+	certs.private_urls = privateUrls ?? null;
 
 	const rep = await getReplicationCert();
 	if (!rep && (req.csr || req.url?.startsWith('wss:'))) {
@@ -323,6 +345,8 @@ export async function addNodeBack(req) {
 			thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
 			certs.shard = thisNode.shard;
 		}
+		const ownPrivate = ownRowPrivateUrls(privateUrls);
+		if (ownPrivate !== undefined) thisNode.private_urls = ownPrivate;
 
 		if (req.start_time) thisNode.start_time = req.start_time;
 		if (req.authorization) thisNode.authorization = req.authorization;
