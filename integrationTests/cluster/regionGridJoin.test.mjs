@@ -166,7 +166,7 @@ suite('Nodes joining a region grid', { timeout: 1_800_000 }, (ctx) => {
 		for (const writer of writers) await insert(writer, `before-join-${writer.hostname}`, writer.hostname, 20);
 		for (const writer of writers) await waitForPhase(existing, `before-join-${writer.hostname}`, 20);
 		// no operation reports a certified floor
-		await delay(3 * FLOOR_INTERVAL_MS);
+		await delay(10 * FLOOR_INTERVAL_MS);
 		const marks = await markAll(existing);
 
 		const joiner = await joinGrid(quietJoiner, REGIONS[0], layouts.afterQuiet);

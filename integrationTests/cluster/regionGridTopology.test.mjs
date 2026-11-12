@@ -139,7 +139,7 @@ suite('Region grid topology', { timeout: 1_500_000 }, (ctx) => {
 		await waitForPhase(nodes(), 'before-kill', 20);
 		// otherOrigin has written nothing, so east holds no position for it: the stand-in can start its link only from
 		// the floor the carrier certified, which no operation reports
-		await delay(3 * FLOOR_INTERVAL_MS);
+		await delay(10 * FLOOR_INTERVAL_MS);
 		const marksAtKill = await markAll([standIn, follower, writer, otherOrigin]);
 		await stopNodeProcess(carrier);
 		await insert(writer, 'after-kill', writer.hostname, 20);
