@@ -17,6 +17,12 @@ function originName(auditStore, nodeId) {
 	}
 }
 
+// a tombstone carries its own identity as its boundary; only a different one is separate state
+function separateBoundary(entry) {
+	const boundary = entry.copiedDeleteBoundary;
+	return boundary && !(boundary.version === entry.version && boundary.nodeId === (entry.nodeId ?? 0));
+}
+
 export class StoredRow extends Resource {
 	static loadAsInstance = false;
 
@@ -31,14 +37,12 @@ export class StoredRow extends Resource {
 			origin: originName(Table.auditStore, entry.nodeId),
 			fullWriteHead: Boolean(entry.metadataFlags & FULL_WRITE_HEAD),
 			originId: entry.nodeId ?? 0,
-			// a tombstone's own identity is its boundary; only one under a later write is separate state
-			boundary:
-				!(entry.metadataFlags & FULL_WRITE_HEAD) && entry.copiedDeleteBoundary
-					? {
-							version: entry.copiedDeleteBoundary.version,
-							origin: originName(Table.auditStore, entry.copiedDeleteBoundary.nodeId),
-						}
-					: undefined,
+			boundary: separateBoundary(entry)
+				? {
+						version: entry.copiedDeleteBoundary.version,
+						origin: originName(Table.auditStore, entry.copiedDeleteBoundary.nodeId),
+					}
+				: undefined,
 			history: (await Table.getHistoryOfRecord(id)).length,
 		};
 	}
@@ -66,7 +70,6 @@ export class WriteTogether extends Resource {
 	}
 }
 
-// A write at `version` from the origin of row `likeId`, as replication applies one.
 export class Redeliver extends Resource {
 	static loadAsInstance = false;
 
