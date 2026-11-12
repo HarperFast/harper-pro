@@ -8,7 +8,12 @@
  */
 import { randomUUID } from 'node:crypto';
 import { databases } from '../core/resources/databases.ts';
-import { isValidFloor, originFloorsDurable, setLocalWriteFence } from '../core/resources/originClosedFloor.ts';
+import {
+	isValidFloor,
+	localWritesFenced,
+	originFloorsDurable,
+	setLocalWriteFence,
+} from '../core/resources/originClosedFloor.ts';
 import {
 	getDatabaseGeneration,
 	persistLocalWriteFence,
@@ -153,7 +158,7 @@ export async function removeNodeFence(request: any): Promise<FenceState | { canc
 		if (request.finalize !== epoch || !fenced || expected.size !== roots.size)
 			throw new ClientError(`${thisNode}'s fence changed since its receipts were collected; retry the removal`, 409);
 	}
-	const state: LocalWriteFence['state'] =
+	const state: FenceState['state'] =
 		request.finalize !== undefined || fences.some((fence) => fence.state === 'removing') ? 'removing' : 'fenced';
 	const result: FenceState = { node: thisNode, epoch, state, databases: {} };
 	for (const [database, auditStores] of roots) {
@@ -164,7 +169,7 @@ export async function removeNodeFence(request: any): Promise<FenceState | { canc
 			// the fence is set before the target is taken, so the target is above every write it admitted
 			const fenceTarget =
 				existing && isValidFloor(existing.target) ? existing.target : setLocalWriteFence(rootStore, true);
-			if (existing) setLocalWriteFence(rootStore, true);
+			if (existing && !localWritesFenced(rootStore)) setLocalWriteFence(rootStore, true);
 			if (existing?.epoch !== epoch || existing.state !== state || existing.target !== fenceTarget)
 				await persistLocalWriteFence(auditStore, { epoch, target: fenceTarget, state });
 			if (fenceTarget > target) target = fenceTarget;
