@@ -3304,6 +3304,19 @@ export function resumeStartWithFloor(position: number, closedFloor: unknown): nu
 	return isValidFloor(closedFloor) ? Math.max(position, cursorBelowFloor(closedFloor)) : position;
 }
 
+/**
+ * Where a completed sharding projection resumes its peer's own log. The received position is a key maximum: an
+ * entry reserved below it and committed after the link dropped would be filtered by the sender. The route's
+ * certified floor (`directState`, from a peer that certifies) is what it has delivered, so it starts below that.
+ */
+export function shardingRouteResumeStart(projectionStart: number, position: number, directState: any): number {
+	const delivered =
+		directState?.floorRevoked !== true && isValidFloor(directState?.closedFloor)
+			? cursorBelowFloor(directState.closedFloor)
+			: position;
+	return Math.max(projectionStart, delivered);
+}
+
 /** A level-2 certificate: `floor` alone from a level-1 peer; `generation` and `fullCoverage` from level 2; `revoked` for `0`. */
 export interface OriginCertificate {
 	floor?: number;
@@ -13253,10 +13266,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						{ agreement: string; anchor: number } | undefined;
 					const floor = shardingInitialFloor(databaseName, node.name);
 					if (complete?.agreement === admittedLayout && floor !== undefined) {
-						startTime = Math.max(
-							sequenceEntry?.seqId ?? 0,
+						startTime = shardingRouteResumeStart(
 							Math.min(floor, complete.anchor),
-							lastTxnTimes.get(nodeId) ?? 0
+							Math.max(sequenceEntry?.seqId ?? 0, lastTxnTimes.get(nodeId) ?? 0),
+							certifiesOriginFloors() ? allNodes.find((state: any) => state.id === nodeId) : undefined
 						);
 					} else {
 						startTime = 0;

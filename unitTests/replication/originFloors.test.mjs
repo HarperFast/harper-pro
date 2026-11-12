@@ -17,6 +17,7 @@ import {
 	settleCopyBounds,
 	restoreCompletedCopyPass,
 	resumeStartWithFloor,
+	shardingRouteResumeStart,
 } from '#src/replication/replicationConnection';
 
 const T = 1_790_000_000_000;
@@ -49,6 +50,26 @@ describe('resumeStartWithFloor', () => {
 		for (const floor of [undefined, null, 0, -1, NaN, Infinity, 8.64e15, '1']) {
 			assert.strictEqual(resumeStartWithFloor(T, floor), T, String(floor));
 		}
+	});
+});
+
+describe('shardingRouteResumeStart (harper-pro#1351)', () => {
+	it('starts below the certified floor, not at a received key maximum above it', () => {
+		assert.strictEqual(shardingRouteResumeStart(T - 5000, T + 2000, { id: 1, closedFloor: T }), cursorBelowFloor(T));
+	});
+
+	it('never starts below the completed projection', () => {
+		assert.strictEqual(shardingRouteResumeStart(T + 1000, T + 2000, { id: 1, closedFloor: T }), T + 1000);
+	});
+
+	it('falls back to the received position without a usable floor', () => {
+		for (const state of [
+			undefined,
+			{ id: 1 },
+			{ id: 1, closedFloor: NaN },
+			{ id: 1, closedFloor: T, floorRevoked: true },
+		])
+			assert.strictEqual(shardingRouteResumeStart(T - 5000, T + 2000, state), T + 2000, JSON.stringify(state));
 	});
 });
 
