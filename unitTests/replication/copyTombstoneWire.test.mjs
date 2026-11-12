@@ -50,7 +50,7 @@ async function until(predicate) {
 
 describe('delete tombstones in a base copy', function () {
 	this.timeout(30_000);
-	let Records, socket, boundaryVersion, nativeDeleteVersion;
+	let Records, socket, boundaryVersion, nativeDeleteVersion, strongerVersion;
 
 	before(async function () {
 		// FULL_WRITE_HEAD and copy-apply are RocksDB-only
@@ -83,6 +83,22 @@ describe('delete tombstones in a base copy', function () {
 		boundaryVersion = Date.now() - 2000;
 		await takeCopiedDelete('published-over-delete', boundaryVersion);
 		await Records.publish('published-over-delete', { message: 'no record' });
+		strongerVersion = Date.now() - 4000;
+		await takeCopiedDelete('stronger-boundary', strongerVersion);
+		for (const [version, write] of [
+			[strongerVersion - 3000, (row, options) => row._writePublish('stronger-boundary', { message: 'm' }, options)],
+			[strongerVersion - 200, (row, options) => row._writeDelete('stronger-boundary', options)],
+		]) {
+			const context = { source: {}, sourceApply: true, timestamp: version };
+			await transaction(context, async () => {
+				const row = await Records.getResource('stronger-boundary', context, { ensureLoaded: false });
+				await write(row, {
+					isNotification: true,
+					nodeId: getIdOfRemoteNode('copy-tombstone-origin', Records.auditStore),
+					version,
+				});
+			});
+		}
 		await Records.put('native-covered', { id: 'native-covered', name: 'gone' });
 		await Records.delete('native-covered');
 		nativeDeleteVersion = Records.primaryStore.getEntry('native-covered').version;
@@ -100,6 +116,10 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(covered.metadataFlags & FULL_WRITE_HEAD, 0, 'premise: a publish clears the flag');
 		assert.equal(covered.copiedDeleteBoundary?.version, boundaryVersion, 'premise: the delete outlives the publish');
 		assert.ok(covered.version > boundaryVersion);
+		const stronger = Records.primaryStore.getEntry('stronger-boundary');
+		assert.ok(stronger.metadataFlags & FULL_WRITE_HEAD, 'premise: a flagged tombstone');
+		assert.ok(stronger.version < strongerVersion, 'premise: its own version is below the boundary');
+		assert.equal(stronger.copiedDeleteBoundary?.version, strongerVersion);
 		const nativeCovered = Records.primaryStore.getEntry('native-covered');
 		assert.equal(nativeCovered.metadataFlags & FULL_WRITE_HEAD, 0);
 		assert.deepEqual(nativeCovered.copiedDeleteBoundary, { version: nativeDeleteVersion, nodeId: 0 });
@@ -196,6 +216,9 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(covered.nodeId, copiedDeleted.nodeId, "from the delete's origin");
 		assert.equal(covered.getValue(Records.primaryStore), undefined);
 		assert.equal(records.sent.get('published-over-delete'), 1, 'one entry stands for the key');
+		const strongest = records.get('stronger-boundary')?.entry;
+		assert.equal(strongest?.type, 'delete');
+		assert.equal(strongest.version, strongerVersion, 'the stronger of the head and its retained boundary');
 		const native = records.get('native-covered')?.entry;
 		assert.equal(native?.type, 'delete', 'a delete this node made, under a later publish, is copied as that delete');
 		assert.equal(native.version, nativeDeleteVersion);
