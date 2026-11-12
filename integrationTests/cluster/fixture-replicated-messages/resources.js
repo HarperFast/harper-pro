@@ -1,4 +1,3 @@
-/** This node's route row for `peer`: whether its resume from that peer is floor-only (checkpoint-grade). */
 export class RouteState extends Resource {
 	static loadAsInstance = false;
 	post(target, data) {
@@ -17,12 +16,14 @@ export class RouteState extends Resource {
 	}
 }
 
-/** How many times this node logged each message `peer` published to `topic`. */
 export class LoggedMessages extends Resource {
 	static loadAsInstance = false;
 	post(target, data) {
 		const Message = databases.data.Message;
 		const counts = {};
+		Message.auditStore.loadLogs();
+		// getRange would create a log it does not find
+		if (!Message.auditStore.logByName.has(data.peer)) return counts;
 		for (const entry of Message.auditStore.getRange({ start: 1, log: data.peer })) {
 			if (entry.type !== 'message' || entry.tableId !== Message.tableId || entry.recordId !== data.topic) continue;
 			counts[entry.version] = (counts[entry.version] ?? 0) + 1;
