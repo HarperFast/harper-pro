@@ -12,6 +12,8 @@ import {
 	RESIDENCY_NOT_RESIDENT_CAPABILITY,
 	RESIDENCY_SLOTS_CAPABILITY,
 	SHARDING_RECOVERY_CAPABILITY,
+	CONFIRMATION_MARKERS_CAPABILITY,
+	peerSupportsConfirmationMarkers,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
@@ -49,6 +51,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				residencyNotResident: 0,
 				residencySlots: 0,
 				shardingRecovery: 0,
+				confirmationMarkers: 0,
 			}
 		);
 	});
@@ -68,6 +71,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 	it('drops keys this build does not know instead of carrying them', () => {
 		const resolved = resolvePeerCapabilities({ subscriptionSetupAck: 1, futureThing: 3, somethingElse: 'x' });
 		assert.deepStrictEqual(Object.keys(resolved).sort(), [
+			'confirmationMarkers',
 			'originCursors',
 			'originFloors',
 			'protocolVersion',
@@ -257,6 +261,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
+				confirmationMarkers: CONFIRMATION_MARKERS_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -302,6 +307,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
+				confirmationMarkers: CONFIRMATION_MARKERS_CAPABILITY,
 			}
 		);
 	});
@@ -558,5 +564,18 @@ describe('Sharding recovery capability', () => {
 		);
 		assert.equal(buildLocalCapabilities(1000, false, true).shardingRecovery, SHARDING_RECOVERY_CAPABILITY);
 		assert.equal(buildLocalCapabilities(1000, false, false).shardingRecovery, 0);
+	});
+});
+
+describe('Confirmation markers capability (harper-pro#1351)', () => {
+	it('is advertised by every build, and an absent or zero level is unsupported', () => {
+		assert.equal(buildLocalCapabilities(1000, false, false).confirmationMarkers, CONFIRMATION_MARKERS_CAPABILITY);
+		assert.equal(peerSupportsConfirmationMarkers(resolvePeerCapabilities({})), false);
+		assert.equal(peerSupportsConfirmationMarkers(resolvePeerCapabilities({ confirmationMarkers: 0 })), false);
+		assert.equal(peerSupportsConfirmationMarkers(resolvePeerCapabilities({ confirmationMarkers: 1 })), true);
+		assert.equal(
+			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ confirmationMarkers: 1 })),
+			false
+		);
 	});
 });

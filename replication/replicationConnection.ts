@@ -147,6 +147,11 @@ import {
 	FIRE_COUNTER_BASE_POSITION,
 	PEER_CERTIFIES_FLOORS_POSITION,
 	LAST_SEND_LOG_BREAK_RECONNECT_TIME_POSITION,
+	ACKED_CONFIRMATION_MARKER_POSITION,
+	PEER_CONFIRMATION_MARKERS_POSITION,
+	CONFIRMATION_MARKERS_SUPPORTED,
+	CONFIRMATION_MARKERS_UNKNOWN,
+	CONFIRMATION_MARKERS_UNSUPPORTED,
 } from './sharedStatusSlots.ts';
 import {
 	recordPeerLockCapability,
@@ -176,6 +181,7 @@ import {
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
+	peerSupportsConfirmationMarkers,
 	peerSupportsOriginCursors,
 	peerSupportsOriginFloors,
 	peerCertifiesCheckpointFloors,
@@ -227,6 +233,9 @@ import {
 	isGenuineNodeDeletion,
 	probeNodeRow,
 	SEND_AUTH_UNCHANGED,
+	confirmationDemand,
+	DEMAND_MARKER,
+	DEMAND_WAITERS,
 } from './knownNodes.ts';
 import * as process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -312,6 +321,11 @@ const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; 
 // (e.g. sendSubscriptionRequestUpdate). Sent at initial handshake alongside NODE_NAME, and standalone
 // whenever this node's own active home-map digest for the database changes (on activate).
 const RECORD_LOCK_HOMES_DIGEST = 150;
+// Sender → receiver after a send pass that began once `[1]` was taken (knownNodes.ts `confirmationDemand`); the
+// receiver answers CONFIRMATION_MARKER_ACK once every frame sent before it has committed. Only to a peer
+// advertising `confirmationMarkers`.
+const CONFIRMATION_MARKER = 151;
+const CONFIRMATION_MARKER_ACK = 152;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -6343,6 +6357,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				error
 			);
 			recordAction(true, FAILED_FRAME_SKIP_METRIC, `${remoteNodeName}.${databaseName}`);
+			confirmationMarkersWithheld = true;
 			return false;
 		}
 	}
@@ -6359,6 +6374,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// one would make a peer that wedges before its handshake (the #642 failure this registry exists to make
 	// diagnosable) indistinguishable from a genuinely pre-#646 peer.
 	let peerCapabilitiesLearned = false;
+	// Sender: the highest marker sent on this socket, the bound on an acknowledgement it accepts. Receiver: a marker
+	// whose acknowledgement waits for blobs, and whether a frame was skipped (after which nothing is acknowledged).
+	let lastConfirmationMarkerSent = 0;
+	let heldConfirmationMarkerAck = 0;
+	let confirmationMarkersWithheld = false;
 	let lastPostedPeerCapabilities: ResolvedPeerCapabilities | undefined;
 	let peerSupportsSubscriptionSetupAck = false;
 	let peerAcceptedBlobCodecs = new Set<string>();
@@ -7165,6 +7185,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function advanceDurableWatermark() {
 		lastDurableSequenceId = committedSequence;
 		creditDurableProgress();
+		if (heldConfirmationMarkerAck) acknowledgeConfirmationMarker(heldConfirmationMarkerAck);
+	}
+	/** From an empty sequence update's onCommit, which runs after every frame received before the marker committed. */
+	function acknowledgeConfirmationMarker(marker: number) {
+		if (confirmationMarkersWithheld || wsClosed || connectionSuperseded()) return;
+		if (cursorBlockedByBlob()) {
+			if (marker > heldConfirmationMarkerAck) heldConfirmationMarkerAck = marker;
+			return;
+		}
+		heldConfirmationMarkerAck = 0;
+		try {
+			ws.send(encode([CONFIRMATION_MARKER_ACK, marker]));
+		} catch (error) {
+			logger.debug?.(connectionId, 'could not acknowledge a confirmation marker', error);
+		}
 	}
 	function queueCommitConfirmation(sequence: number) {
 		if (projectionCopy || !sequence || connectionSuperseded()) return;
@@ -8505,6 +8540,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								referenceSnapshots.set(data, snapshot);
 						}
 						break;
+					case CONFIRMATION_MARKER_ACK: {
+						// a marker this socket sent; any socket's acknowledgement stays a proof, so the slot only rises
+						if (!Number.isSafeInteger(data) || data <= 0 || data > lastConfirmationMarkerSent) break;
+						const status = getSharedStatus();
+						if (!(status[ACKED_CONFIRMATION_MARKER_POSITION] >= data)) {
+							status[ACKED_CONFIRMATION_MARKER_POSITION] = data;
+							(status.buffer as any).notify();
+						}
+						break;
+					}
 					case COMMITTED_UPDATE:
 						// we need to record the sequence number that the remote node has received
 						getSharedStatus()[CONFIRMATION_STATUS_POSITION] = data;
@@ -8732,6 +8777,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (inCopyMode) copyFinalizeWatchdog?.reset();
 						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
 						break;
+					case CONFIRMATION_MARKER: {
+						if (!Number.isSafeInteger(data) || data <= 0 || projectionCopy) break;
+						if (!(await whenSubscriptionResolved())) return;
+						const marker = data;
+						const event = seqUpdateEndTxn(clampedPosition());
+						const priorOnCommit = event.onCommit;
+						event.onCommit = function () {
+							const result = priorOnCommit?.call(this);
+							if (result?.then) return result.then(() => acknowledgeConfirmationMarker(marker));
+							acknowledgeConfirmationMarker(marker);
+							return result;
+						};
+						tableSubscriptionToReplicator.send(event);
+						break;
+					}
 					case SEQUENCE_ID_UPDATE:
 						refreshShardingAdmission();
 						if (!admitsIncomingOrigins(message[2])) return;
@@ -10023,6 +10083,29 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								lastFloorCaptureAt = 0;
 								let floorTimer: ReturnType<typeof setTimeout> | undefined;
 								let capturedFloors: Map<string, OriginCertificate> | undefined;
+								// A peer that acknowledges markers proves a replicatedConfirmation waiter's delivery by one.
+								const confirmationStatus = getSharedStatus();
+								const sendsOwnLog = excludedNodes
+									? !excludedNodes.includes(getThisNodeName())
+									: nodeSubscriptions.some(({ name }) => name === getThisNodeName());
+								const markersSupported =
+									sendsOwnLog && peerCapabilitiesLearned && peerSupportsConfirmationMarkers(peerCapabilities);
+								const demand = markersSupported
+									? confirmationDemand(auditStore, databaseName, () => wakeSender?.())
+									: undefined;
+								lastConfirmationMarkerSent = 0;
+								if (sendsOwnLog && confirmationStatus) {
+									confirmationStatus[PEER_CONFIRMATION_MARKERS_POSITION] = !peerCapabilitiesLearned
+										? CONFIRMATION_MARKERS_UNKNOWN
+										: markersSupported
+											? CONFIRMATION_MARKERS_SUPPORTED
+											: CONFIRMATION_MARKERS_UNSUPPORTED;
+									(confirmationStatus.buffer as any).notify();
+								}
+								const uncoveredMarker = () =>
+									demand && Atomics.load(demand.words, DEMAND_WAITERS) > 0n
+										? Number(Atomics.load(demand.words, DEMAND_MARKER))
+										: 0;
 								const connectionCertifiedFloors = new Map<string, number>();
 								const connectionCertifiedGenerations = new Map<string, string | undefined>();
 								certifiedFloors = connectionCertifiedFloors;
@@ -10740,6 +10823,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// drains must wake this iteration; subscribing afterward can miss that commit.
 										const nextTransaction = whenNextTransaction(auditStore);
 										capturedFloors = undefined;
+										// taken before the scan: every waiter holding a marker at or below it committed before the scan began
+										const passMarker = uncoveredMarker();
 										if (certifiesOriginFloors() && Date.now() - lastFloorCaptureAt >= originFloorIntervalMs) {
 											lastFloorCaptureAt = Date.now();
 											capturedFloors = captureOriginFloors();
@@ -10910,6 +10995,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											} else if (floorEmissionLatchedRange !== liveRange) certifyOriginFloors(capturedFloors);
 											capturedFloors = undefined;
 										}
+										let markersProven = false;
+										if (demand) {
+											const liveRange: any = auditLogIterable;
+											// a scan that may have skipped an entry proves nothing about what it sent
+											markersProven =
+												!(boundaryLogName && liveRange?.exactStartFailures?.size > 0) &&
+												!(liveRange?.failedLogs?.size > 0) &&
+												!(liveRange?.corruptFrameStop?.breaks > 0);
+											if (markersProven && passMarker > lastConfirmationMarkerSent && !closed && !wsClosed) {
+												ws.send(encode([CONFIRMATION_MARKER, passMarker]));
+												lastConfirmationMarkerSent = passMarker;
+											}
+										}
 										getSharedStatus()[SENDING_TIME_POSITION] = 0;
 										if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
 										// a timed wake can land after the socket was marked closed, before the close event
@@ -10919,6 +11017,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										if (whenNextTransaction(auditStore) !== nextTransaction) continue;
 										// The recovery timer fired during this pass, when no waker was parked to receive it.
 										if (sendLogRecoveryPending && sendLogRecoveryTimer === undefined) continue;
+										// a waiter registered during the pass (its wake found no parked waker) needs a pass that begins after it
+										if (markersProven && uncoveredMarker() > lastConfirmationMarkerSent) continue;
 										// an `includeNodes` update re-admits a log whose entries are already committed
 										let wake: () => void;
 										// one timer per loop; an exit that skips the clear leaks nothing but one unreferenced timer
@@ -10950,6 +11050,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								} finally {
 									clearTimeout(floorTimer);
 									clearTimeout(sendLogRecoveryTimer);
+									demand?.buffer.cancel();
 								}
 							})
 							.catch((error) => {

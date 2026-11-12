@@ -12,7 +12,14 @@ import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
-import { CONFIRMATION_STATUS_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
+import {
+	ACKED_CONFIRMATION_MARKER_POSITION,
+	CONFIRMATION_MARKERS_SUPPORTED,
+	CONFIRMATION_MARKERS_UNSUPPORTED,
+	CONFIRMATION_STATUS_POSITION,
+	PEER_CONFIRMATION_MARKERS_POSITION,
+	REPLICATION_SHARED_STATUS_SLOTS,
+} from './sharedStatusSlots.ts';
 import { createBackoff } from './backoff.ts';
 
 type MaybePromise<T> = T | Promise<T>;
@@ -771,9 +778,38 @@ const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array
 
 type AwaitingReplication = {
 	txnTime: number;
+	// the confirmation marker taken after this write committed (`takeConfirmationMarker`); 0 without one
+	marker: number;
 	onConfirm: (nodeName: string) => void;
 	settled: boolean;
 };
+
+/**
+ * Per database: `[latest marker, waiters]`. A marker taken after a write commits is acknowledged by a capable peer
+ * only once that peer has committed every frame its sender sent before a pass that began after the marker was
+ * taken, so it proves this write's delivery whatever order keys committed in. The key maximum in
+ * `CONFIRMATION_STATUS_POSITION` cannot (harper-pro#1351).
+ */
+export const CONFIRMATION_DEMAND_KEY = 'replication-confirmation-demand';
+export const DEMAND_MARKER = 0;
+export const DEMAND_WAITERS = 1;
+export function confirmationDemand(auditStore: any, databaseName: string, callback?: () => void) {
+	const buffer = auditStore.getUserSharedBuffer(
+		[CONFIRMATION_DEMAND_KEY, databaseName],
+		new ArrayBuffer(16),
+		callback && { callback }
+	);
+	return { words: new BigInt64Array(buffer), buffer };
+}
+
+/** Whether `nodeName`'s shared status shows it holds the write `waiter` is waiting on. */
+export function peerConfirms(status: Float64Array, waiter: { txnTime: number; marker: number }): boolean {
+	const support = status[PEER_CONFIRMATION_MARKERS_POSITION];
+	if (support === CONFIRMATION_MARKERS_SUPPORTED)
+		return waiter.marker > 0 && status[ACKED_CONFIRMATION_MARKER_POSITION] >= waiter.marker;
+	// a peer that cannot acknowledge markers keeps the key rule; one not yet known counts once it is
+	return support === CONFIRMATION_MARKERS_UNSUPPORTED && status[CONFIRMATION_STATUS_POSITION] >= waiter.txnTime;
+}
 // A Set, not an array: both settle paths (confirmed, and timed out — see createConfirmationWaiter)
 // remove their own entry the instant they settle, via `.delete(entry)`. That's an O(1) operation on a
 // Set regardless of how many other waiters are pending, unlike an array (indexOf+splice is O(n), and
@@ -804,12 +840,13 @@ export let commitsAwaitingReplication: Map<string, Set<AwaitingReplication>>;
 export function countAlreadyConfirmedPeers(
 	confirmationsByNode: Map<string, Map<string, Float64Array>>,
 	databaseName: string,
-	txnTime: number
+	txnTime: number,
+	marker = 0
 ): Set<string> {
 	const confirmedPeers = new Set<string>();
 	for (const [nodeName, confirmationsForNode] of confirmationsByNode) {
 		const replicatedTime = confirmationsForNode.get(databaseName);
-		if (replicatedTime && replicatedTime[CONFIRMATION_STATUS_POSITION] >= txnTime) confirmedPeers.add(nodeName);
+		if (replicatedTime && peerConfirms(replicatedTime, { txnTime, marker })) confirmedPeers.add(nodeName);
 	}
 	return confirmedPeers;
 }
@@ -865,14 +902,9 @@ function replicationConfirmationTimeout(automatic = false): number {
 export function notifyConfirmedWaiters(
 	awaiting: Set<AwaitingReplication>,
 	nodeName: string,
-	lastTime: number,
-	updatedTime: number
+	status: Float64Array
 ): void {
-	for (const waiter of awaiting) {
-		if (waiter.txnTime > lastTime && waiter.txnTime <= updatedTime) {
-			waiter.onConfirm(nodeName);
-		}
-	}
+	for (const waiter of awaiting) if (peerConfirms(status, waiter)) waiter.onConfirm(nodeName);
 }
 
 /**
@@ -891,7 +923,9 @@ export function createConfirmationWaiter(
 	confirmationCount: number,
 	timeoutMs: number = replicationConfirmationTimeout(),
 	alreadyConfirmedPeers: Set<string> = new Set(),
-	residentPeerLists?: string[][]
+	residentPeerLists?: string[][],
+	marker = 0,
+	onSettled?: () => void
 ): Promise<void> {
 	const residentGroups = residentPeerLists?.length ? residentPeerLists : undefined;
 	const isConfirmed = (confirmed: Set<string>) => {
@@ -903,7 +937,10 @@ export function createConfirmationWaiter(
 	// stays in one place. Computing alreadyConfirmedPeers and adding `entry` to `awaiting` both happen
 	// synchronously in the caller's turn — with nothing awaited between them — so no peer ack can land
 	// in the gap; this is what closes the race, not just an optimization.
-	if (isConfirmed(alreadyConfirmedPeers)) return Promise.resolve();
+	if (isConfirmed(alreadyConfirmedPeers)) {
+		onSettled?.();
+		return Promise.resolve();
+	}
 	return new Promise((resolve, reject) => {
 		// Confirmations are tracked by peer identity, not a bare counter: the same peer's status
 		// update can otherwise be credited twice — once via the `alreadyConfirmedPeers` seed and
@@ -914,6 +951,7 @@ export function createConfirmationWaiter(
 		const confirmed = new Set(alreadyConfirmedPeers);
 		const entry: AwaitingReplication = {
 			txnTime,
+			marker,
 			settled: false,
 			onConfirm: (nodeName) => {
 				if (entry.settled) return; // a peer that acks after we've already timed out is a no-op, not a double-resolve
@@ -923,6 +961,7 @@ export function createConfirmationWaiter(
 					entry.settled = true;
 					clearTimeout(timer);
 					awaiting.delete(entry);
+					onSettled?.();
 					resolve();
 				}
 			},
@@ -933,6 +972,7 @@ export function createConfirmationWaiter(
 			// O(1) regardless of how many other waiters are pending or expiring in this same tick — an
 			// outage that times out many waiters at once costs O(n) total here, not O(n²).
 			awaiting.delete(entry);
+			onSettled?.();
 			const received = residentGroups
 				? residentGroups.map((residents) => countMembers(confirmed, residents)).join(', ') +
 					` from the residents of each written record's residency (${residentGroups.map((residents) => residents.join(', ')).join('; ')})`
@@ -1025,6 +1065,18 @@ function assertConfirmationFeasible(databaseName: string, confirmationCount: num
 	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);
 }
 
+const demandByDatabase = new Map<string, ReturnType<typeof confirmationDemand>>();
+function demandFor(databaseName: string): ReturnType<typeof confirmationDemand> | undefined {
+	let demand = demandByDatabase.get(databaseName);
+	if (demand) return demand;
+	for (const tableName in databases[databaseName] ?? {}) {
+		const auditStore = databases[databaseName][tableName].auditStore;
+		if (typeof auditStore?.getUserSharedBuffer !== 'function') continue;
+		demandByDatabase.set(databaseName, (demand = confirmationDemand(auditStore, databaseName)));
+		return demand;
+	}
+}
+
 replicationConfirmation(
 	(databaseName, txnTime, confirmationCount, residentPeerLists?: string[][], automatic = false): Promise<void> => {
 		if (!commitsAwaitingReplication) {
@@ -1036,14 +1088,28 @@ replicationConfirmation(
 			awaiting = new Set();
 			commitsAwaitingReplication.set(databaseName, awaiting);
 		}
+		const demand = demandFor(databaseName);
+		let marker = 0;
+		let onSettled: (() => void) | undefined;
+		if (demand) {
+			marker = Number(Atomics.add(demand.words, DEMAND_MARKER, 1n)) + 1;
+			Atomics.add(demand.words, DEMAND_WAITERS, 1n);
+			onSettled = () => {
+				Atomics.sub(demand.words, DEMAND_WAITERS, 1n);
+			};
+			// wakes every sender of this database, so a pass that begins after the marker sends it
+			demand.buffer.notify();
+		}
 		return createConfirmationWaiter(
 			awaiting,
 			databaseName,
 			txnTime,
 			confirmationCount,
 			replicationConfirmationTimeout(automatic),
-			countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime),
-			residentPeerLists
+			countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime, marker),
+			residentPeerLists,
+			marker,
+			onSettled
 		);
 	},
 	assertConfirmationFeasible
@@ -1096,23 +1162,15 @@ function startSubscriptionToReplications() {
 				if (auditStore) break;
 			}
 			if (auditStore) {
-				const replicatedTime: Float64Array & { lastTime?: number } = getReplicationSharedStatus(
+				const replicatedTime: Float64Array = getReplicationSharedStatus(
 					auditStore,
 					databaseName,
 					nodeNameAtUpdate,
 					() => {
-						const updatedTime = replicatedTime[CONFIRMATION_STATUS_POSITION];
-						const lastTime = replicatedTime.lastTime;
-						notifyConfirmedWaiters(
-							commitsAwaitingReplication.get(databaseName) || new Set(),
-							nodeNameAtUpdate,
-							lastTime,
-							updatedTime
-						);
-						replicatedTime.lastTime = updatedTime;
+						const awaiting = commitsAwaitingReplication.get(databaseName);
+						if (awaiting) notifyConfirmedWaiters(awaiting, nodeNameAtUpdate, replicatedTime);
 					}
 				);
-				replicatedTime.lastTime = 0;
 				confirmationsForNode.set(databaseName, replicatedTime);
 			}
 		});

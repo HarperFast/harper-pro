@@ -23,11 +23,11 @@ import {
 
 suite('late older-keyed writes from a non-owner', { timeout: 900_000, skip: isLMDB && 'RocksDB floors' }, (ctx) => {
 	let contexts;
-	let owner, replica;
+	let owner, coOwner, replica;
 
 	before(async () => {
 		contexts = await startShardedCluster(ctx, [0, 0, 1, 1]);
-		[owner, , replica] = contexts;
+		[owner, coOwner, replica] = contexts;
 	});
 
 	after(() => stopAndTeardownNodes(contexts.map((context) => context.harper)));
@@ -62,7 +62,9 @@ suite('late older-keyed writes from a non-owner', { timeout: 900_000, skip: isLM
 		await upsert(replica.harper, 'confirm-newer0', { replicatedConfirmation: 1 });
 		await waitForLocal(owner.harper, ['confirm-newer0']);
 
+		// both owners are residents of the record: either one's acknowledgement would confirm it
 		await pauseLink(replica, owner);
+		await pauseLink(replica, coOwner);
 		let settled = false;
 		const confirmation = held.inFlight.then((result) => ((settled = true), result));
 		try {
@@ -75,6 +77,7 @@ suite('late older-keyed writes from a non-owner', { timeout: 900_000, skip: isLM
 			);
 		} finally {
 			await resumeLink(replica, owner);
+			await resumeLink(replica, coOwner);
 		}
 		const result = await confirmation;
 		assert.ok(result.status < 300, JSON.stringify(result));

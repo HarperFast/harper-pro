@@ -67,6 +67,13 @@ export const SHARDING_RECOVERY_CAPABILITY = 2;
 
 export const RESIDENCY_NOT_RESIDENT_CAPABILITY = 1;
 
+/**
+ * Level at which a receiver acknowledges `CONFIRMATION_MARKER` with `CONFIRMATION_MARKER_ACK` once every frame sent
+ * before the marker has committed: a sender counts a `replicatedConfirmation` waiter delivered by that, not by the
+ * key maximum `COMMITTED_UPDATE` carries (harper-pro#1351).
+ */
+export const CONFIRMATION_MARKERS_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	safeCopyAudit: number;
@@ -81,6 +88,7 @@ export interface ResolvedPeerCapabilities {
 	residencyNotResident: number;
 	residencySlots: number;
 	shardingRecovery: number;
+	confirmationMarkers: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -134,6 +142,7 @@ export function resolvePeerCapabilities(
 		residencyNotResident: resolveLevel(bag?.residencyNotResident, RESIDENCY_NOT_RESIDENT_CAPABILITY, 0),
 		residencySlots: resolveLevel(bag?.residencySlots, RESIDENCY_SLOTS_CAPABILITY, 0),
 		shardingRecovery: resolveLevel(bag?.shardingRecovery, SHARDING_RECOVERY_CAPABILITY, 0),
+		confirmationMarkers: resolveLevel(bag?.confirmationMarkers, CONFIRMATION_MARKERS_CAPABILITY, 0),
 	});
 }
 
@@ -155,6 +164,10 @@ export function peerSupportsResidencySlots(resolved: ResolvedPeerCapabilities): 
 
 export function peerSupportsShardingRecovery(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.shardingRecovery >= SHARDING_RECOVERY_CAPABILITY;
+}
+
+export function peerSupportsConfirmationMarkers(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.confirmationMarkers >= CONFIRMATION_MARKERS_CAPABILITY;
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
@@ -216,6 +229,7 @@ export function buildLocalCapabilities(
 		residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 		residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 		shardingRecovery: perOriginLogs ? SHARDING_RECOVERY_CAPABILITY : 0,
+		confirmationMarkers: CONFIRMATION_MARKERS_CAPABILITY,
 	});
 }
 
@@ -234,7 +248,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.residencyStubCopy === b.residencyStubCopy &&
 		a.residencyNotResident === b.residencyNotResident &&
 		a.residencySlots === b.residencySlots &&
-		a.shardingRecovery === b.shardingRecovery
+		a.shardingRecovery === b.shardingRecovery &&
+		a.confirmationMarkers === b.confirmationMarkers
 	);
 }
 
