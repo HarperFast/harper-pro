@@ -10516,9 +10516,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													);
 													copyResume = undefined;
 													reachedResumeTable = true;
-												} else if (copyResume && !isValidFrameTxnLogKey(copyResume.copyStartTime)) {
+												} else if (
+													copyResume &&
+													!(
+														isValidFrameTxnLogKey(copyResume.copyStartTime) &&
+														isValidFrameTxnLogKey(cursorBelowFloor(copyResume.copyStartTime))
+													)
+												) {
 													// The anchor is peer-supplied. A non-finite or non-positive value would reach the resume cursor
-													// and the tail's range start, and every reconnect would wedge on the same cursor.
+													// and the tail's range start, and every reconnect would wedge on the same cursor; so would one
+													// with no valid key below it, which `belowCopyStart` needs.
 													logger.warn?.(
 														'Copy-resume anchor is not a valid log key, restarting full copy',
 														copyResume.copyStartTime
@@ -10549,6 +10556,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// An empty log (anchorKey 0) still sends the wall clock, never a sentinel below every key: the
 												// follower persists it, and shouldForceBaseCopyForRetention reads such a cursor as purged history.
 												const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
+												// the frame key of a delete sent in place of a publish over it: a snapshot row, so below the anchor
+												const belowCopyStart = cursorBelowFloor(copyStartTime);
 												// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
 												const relayedAnchors =
 													!copyResume && canResumePastAnchor && excludedNodes
@@ -10831,7 +10840,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															sendTombstonesAsDeletes;
 														const copyVersion = retainedDelete ? retainedDelete.version : entry.version;
 														const copyNodeId = retainedDelete ? retainedDelete.nodeId || nodeId : recordNodeId;
-														const copyTxnLogKey = retainedDelete ? retainedDelete.version : headTxnLogKey;
+														const copyTxnLogKey = retainedDelete
+															? Math.min(headTxnLogKey, belowCopyStart)
+															: headTxnLogKey;
 														const copyType = stubAsInvalidation ? 'invalidate' : tombstoneAsDelete ? 'delete' : 'put';
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;
