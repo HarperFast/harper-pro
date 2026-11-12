@@ -54,6 +54,7 @@ import {
 	reusableCloneAttemptId,
 } from './cloneAttempt.ts';
 import { createBackoff } from '../replication/backoff.ts';
+import { CONFIG_TO_EXCLUDE_FROM_CLONE } from './configExclusions.ts';
 import {
 	isExplicitDatabaseSubscription,
 	isReplicatedDatabase as isReplicatedDatabaseUnder,
@@ -124,35 +125,6 @@ const VERSION_PROBE_MAX_DELAY_MS = 4000;
 const MIN_MAX_CLONE_DURATION_MS = 3600000;
 const DEFAULT_REPLICATION_PORT = '9933';
 const CLONE_ATTEMPT_ENV = 'HARPER_CLONE_ATTEMPT';
-
-const CONFIG_TO_EXCLUDE_FROM_CLONE = {
-	clustering_nodename: true,
-	clustering_leafserver_streams_path: true,
-	clustering_tls_certificate: true,
-	clustering_tls_privatekey: true,
-	clustering_tls_certificateauthority: true,
-	logging_file: true,
-	logging_root: true,
-	logging_rotation_path: true,
-	operationsapi_network_domainsocket: true,
-	operationsapi_tls_certificate: true,
-	operationsapi_tls_privatekey: true,
-	operationsapi_tls_certificateauthority: true,
-	rootpath: true,
-	storage_path: true,
-	storage_audit_path: true,
-	databases: true,
-	mqtt_network_mtls_certificateauthority: true,
-	componentsroot: true,
-	tls_certificate: true,
-	tls_privatekey: true,
-	tls_certificateauthority: true,
-	replication_hostname: true,
-	replication_url: true,
-	replication_shard: true,
-	cloned: true,
-	node_hostname: true,
-};
 
 type ParsedValues = {
 	'leader-url'?: string;

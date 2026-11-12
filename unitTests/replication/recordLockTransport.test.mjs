@@ -43,6 +43,7 @@ import {
 	recordPeerLockCapability,
 	releaseRecordLockOwner,
 	cachedActiveGeneration,
+	homeMapConfirmedAbsent,
 	controlEntryRelayDropCount,
 	forgetRecordLockHomesCache,
 	handleRelayedControlEntry,
@@ -228,7 +229,17 @@ describe('createRecordLockTransport().homeMap', () => {
 			}
 		}
 		const cached = 'active' in options ? options.active : { generation: 1, homes: ['self', 'peer-a'] };
-		return { transport: createRecordLockTransport('data', deps, () => cached), auditStore, sent };
+		const confirmedAbsent = 'confirmedAbsent' in options ? options.confirmedAbsent : cached === undefined;
+		return {
+			transport: createRecordLockTransport(
+				'data',
+				deps,
+				() => cached,
+				() => confirmedAbsent
+			),
+			auditStore,
+			sent,
+		};
 	}
 
 	it('carries the request id and epoch on a delegation request, and the epoch on a recall (§4.5)', async () => {
@@ -292,6 +303,19 @@ describe('createRecordLockTransport().homeMap', () => {
 	it('is undefined with no cached active generation', () => {
 		const { transport } = transportFor({ active: undefined, agreements: { 'peer-a': true } });
 		assert.strictEqual(transport.homeMap('data'), undefined);
+	});
+
+	it('names record_lock_apply_homes only when a read confirmed no applied map', () => {
+		const none = transportFor({ active: undefined });
+		assert.match(none.transport.homeMapUnavailableReason('data'), /record_lock_apply_homes/);
+		assert.strictEqual(none.transport.disabled, undefined, 'an enabled transport is not the disabled stand-in');
+		const unread = transportFor({ active: undefined, confirmedAbsent: false });
+		assert.strictEqual(unread.transport.homeMapUnavailableReason('data'), undefined);
+		const disagreeing = transportFor({ agreements: { 'peer-a': false } });
+		assert.strictEqual(disagreeing.transport.homeMap('data'), undefined);
+		assert.strictEqual(disagreeing.transport.homeMapUnavailableReason('data'), undefined);
+		const incarnating = transportFor({ homeIncarnation: 0, agreements: { 'peer-a': true } });
+		assert.strictEqual(incarnating.transport.homeMapUnavailableReason('data'), undefined);
 	});
 
 	it('is undefined until the home incarnation is known', () => {
@@ -784,6 +808,7 @@ describe('createDisabledRecordLockTransport', () => {
 		// independently found by the delegation cost bench (harper-pro#824's follow-up).
 		const transport = createDisabledRecordLockTransport();
 		assert.strictEqual(transport.ownsCoordination(), true);
+		assert.strictEqual(transport.disabled, true, 'core runs conditional REST writes unlocked on this stand-in');
 		// The cost bench matches this prefix.
 		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /^cluster record locks are not enabled on this node/);
 		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /replication\.recordLocks: true/);
@@ -808,6 +833,7 @@ describe('createDisabledRecordLockTransport', () => {
 		);
 		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /replication\.recordLocks/);
 		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /scope: 'node'/);
+		assert.doesNotMatch(RECORD_LOCKS_DISABLED_MESSAGE, /preconditionLocks/);
 	});
 });
 
@@ -1313,6 +1339,24 @@ describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
 		await settle(200);
 		assert.strictEqual(reads, 3, 'no retry after a success');
 		forgetRecordLockHomesCache('refresh-retry');
+	});
+
+	it('confirms an absent map only from a successful read that found none', async () => {
+		let outcome = 'empty';
+		setRecordLockHomesRowReader(async () => {
+			if (outcome === 'fail') throw new Error('storage hiccup');
+			return outcome === 'empty' ? undefined : generation(1);
+		});
+		assert.strictEqual(homeMapConfirmedAbsent('refresh-absent'), false, 'not read yet');
+		await refreshRecordLockHomesCache('refresh-absent');
+		assert.strictEqual(homeMapConfirmedAbsent('refresh-absent'), true);
+		outcome = 'fail';
+		await refreshRecordLockHomesCache('refresh-absent', true);
+		assert.strictEqual(homeMapConfirmedAbsent('refresh-absent'), false, 'an unreadable row proves nothing');
+		outcome = 'map';
+		await refreshRecordLockHomesCache('refresh-absent', true);
+		assert.strictEqual(homeMapConfirmedAbsent('refresh-absent'), false);
+		forgetRecordLockHomesCache('refresh-absent');
 	});
 
 	it('a read that resolves after a newer refresh began installs nothing', async () => {

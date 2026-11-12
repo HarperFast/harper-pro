@@ -55,6 +55,30 @@ Harper automatically replicates node information to other nodes in the cluster u
 
 As of v5.2, this full-mesh, bidirectional auto-connect behavior applies to nodes with no directional routes. A node configured with [directional routes](#controlling-replication-flow) advertises a constrained registry record instead, so a node that discovers it — and has no directional route of its own for it — does not open a replication subscription to it. Containment is a property of the _discovered_ node's advertised record, not of the discovering node's configuration: configuring directional routes on one node does not stop that node from subscribing to a discovered peer that still advertises the legacy full-mesh record. See [Controlling Replication Flow](#controlling-replication-flow).
 
+### Private Network Addresses
+
+<VersionBadge version="v5.5.0" />
+
+Some providers bill traffic between public addresses even inside one region, while traffic over a private network (a VLAN or VPC) is free or cheaper. Nodes that share a private network can replicate over it:
+
+```yaml
+replication:
+  url: wss://server-one.example.com:9933
+  privateUrls:
+    - url: wss://10.0.0.5:9933
+      network: vpc-1/us-east1
+```
+
+Each node publishes its `privateUrls` on its own `hdb_nodes` record, so peers learn them the same way they learn `url` (by [gossip discovery](#gossip-discovery), or from the node that ran `add_node`). A node dials a peer's private URL when the URL's `network` tag is one of its own: a network in its own `privateUrls`, or the `replication.network` setting. If several of the peer's private URLs match, it uses the first in the peer's list. Otherwise it dials the peer's `url`. The tags are compared as plain strings; Harper does not check that two nodes are really on the same network.
+
+- **Only `wss://`.** A private URL must use TLS. Peers identify a TLS connection by its certificate, which does not depend on the address dialed.
+- **Certificates do not change.** A node dialing a private address presents the same TLS server name (SNI) and checks the peer's certificate against the same name as when it dials `url`. Do not add private IP addresses to certificates.
+- **Fallback.** If a private address does not connect, or the peer there does not identify as the expected node within 30 seconds, the node replicates over `url` instead. It checks the private address again on a backoff of up to five minutes, which starts over while the peer itself is down. When it answers, one connection moves back first; once that peer identifies itself, the others follow, each reconnecting once. The public port must stay reachable.
+- **Changes.** A node publishes a change to its own `privateUrls` when it restarts. Its peers then reconnect to it at the new address.
+- **Status.** [`cluster_status`](./clustering.md#cluster-status) reports which address each connection uses in its `path` field.
+
+Forwarded operations, such as a replicated `deploy_component`, always use `url`.
+
 ### Data Selection
 
 By default, Harper replicates all data in all databases. You can narrow replication to specific databases:
@@ -466,9 +490,9 @@ Check each management operation's replication default before using it in a singl
 
 ## Cluster Record Locks
 
-On a replicated table, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. From v5.4.0, conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default. A table declared with `replicate: false` takes a node-local lock instead.
+On a replicated table, `lock()` without `{ scope: 'node' }` takes a cluster-wide lock: while one node holds it, no other node's `lock()` on that record succeeds. From v5.4.0, with cluster record locks on, conditional REST writes (a `PUT`, `PATCH` or `DELETE` with `If-Match`, `If-None-Match` or `If-Unmodified-Since`) take the same lock while `rest.preconditionLocks` is on, its default. A table declared with `replicate: false` takes a node-local lock instead.
 
-Cluster record locks are off unless you turn them on. While they are off, a cluster `lock()` and a conditional write on a replicated table answer `503` with a message naming the fix. `{ scope: 'node' }` still takes a node-local lock, and `rest.preconditionLocks: false` makes conditional writes skip the lock.
+Cluster record locks are off unless you turn them on. While they are off, a cluster `lock()` on a replicated table answers `503` with a message naming the fix, and `{ scope: 'node' }` still takes a node-local lock. Conditional writes do not take a lock: they check their precondition against this node's copy of the record, as in v5.3, so a matching `If-Match` succeeds and a stale one answers `412`. Two requests that saw the same ETag can then both succeed, on one node or on two. With cluster record locks on, conditional writes are checked one at a time per record, which is stronger but still has [limits](../rest/headers.md#conditional-writes); unconditional writes are never excluded, and a conditional write on a node that has them off is not serialized against writes on nodes that have them on, so set the key on every node before relying on them.
 
 **On Harper Fabric**, Fabric turns cluster record locks on for a cluster and publishes its home map; you do not configure them.
 

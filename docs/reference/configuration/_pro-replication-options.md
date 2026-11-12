@@ -15,6 +15,8 @@ replication:
 - `url` — WebSocket URL peers use to connect to this instance
 - `databases` — Databases to replicate; _Default_: `"*"` (all). Each entry supports `name`, `replicateTo`, and `sharded`
 - `routes` — Peer nodes; URL strings or `{hostname, port, startTime, revokedCertificates}` objects
+- `privateUrls` <VersionBadge version="v5.5.0" /> — Addresses where peers on a private network can reach this instance, as `{url, network}` objects. `url` must be a `wss://` URL with no credentials; `network` is a tag you choose for the network (for example a VPC id and region). A peer that dials from the same network uses this URL instead of `url`. See [Private Network Addresses](../replication/overview.md#private-network-addresses)
+- `network` <VersionBadge version="v5.5.0" /> — The network this instance dials peers from, in addition to the networks in its own `privateUrls`. Needed only for an instance that is not itself reachable on that network
 - `port` — Replication port
 - `securePort` — Secure replication port; _Default_: `9933` (changed from `9925` in v4.5.0)
 - `threads` — Worker threads dedicated to replication, which then own the replication port and every subscription and load no application code; requires `port` or `securePort`; see [Dedicated Replication Threads](../replication/overview.md#dedicated-replication-threads); _Default_: `0` (replication runs on the HTTP worker threads) (Added in: v5.4.0)
