@@ -7062,6 +7062,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		const origin = getNodeNameForId(auditStore, originId, true);
 		const pass = copyPassToken;
+		const premarked: number[] = [];
 		try {
 			const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? databaseAuditStore;
@@ -7072,7 +7073,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					: [0, ...Object.values(exportIdMapping(store)).filter((id): id is number => typeof id === 'number')];
 			// in memory before any await, so an update committing meanwhile takes no floor for it (dropHoledFloors)
 			if (!projectionCopy)
-				for (const lostId of lost) if (!holedOrigins.has(lostId)) holedOrigins.set(lostId, undefined);
+				for (const lostId of lost)
+					if (!holedOrigins.has(lostId)) {
+						holedOrigins.set(lostId, undefined);
+						premarked.push(lostId);
+					}
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
 			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
 			passHoles++;
@@ -7122,6 +7127,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// The connection can close during the write; the caller must not keep applying frames then.
 			return !wsClosed;
 		} catch (error) {
+			// the frame is held and replayed, so the hole this call assumed is not one
+			for (const lostId of premarked) holedOrigins.delete(lostId);
 			logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error);
 			wsClosed = true;
 			close(1011, 'could not record a replication hole; reconnecting');
@@ -12180,7 +12187,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (frameOrigin !== undefined) noteOriginProgress(frameOrigin, frameTxnLogKey);
 					if (frameMoreOrigins) for (const originId of frameMoreOrigins) noteOriginProgress(originId, frameTxnLogKey);
 					endTxnEvent.originCursors = takeDurableOriginCursors();
-					if (!projectionCopy) pendingOriginFloors.takeForCommit(endTxnEvent, cursorBlockedByBlob());
+					if (!projectionCopy) {
+						dropHoledFloors();
+						pendingOriginFloors.takeForCommit(endTxnEvent, cursorBlockedByBlob());
+					}
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
 					// (frameTxnLogKey < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
 					// core persists [seq] = copyStartTime. Otherwise a small copy that finished before the cadence
