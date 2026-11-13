@@ -52,7 +52,6 @@ import {
 	REPLICATION_SHARED_STATUS_SLOTS,
 } from '#src/replication/sharedStatusSlots';
 
-/** A peer without confirmation markers whose committed key maximum is `confirmed`. */
 function keyStatus(confirmed) {
 	const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 	status[PEER_CONFIRMATION_MARKERS_POSITION] = CONFIRMATION_MARKERS_UNSUPPORTED;
@@ -60,7 +59,6 @@ function keyStatus(confirmed) {
 	return status;
 }
 
-/** A peer that acknowledges confirmation markers, with its key maximum and highest acknowledged marker. */
 function markerStatus(confirmed, acked) {
 	const status = keyStatus(confirmed);
 	status[PEER_CONFIRMATION_MARKERS_POSITION] = CONFIRMATION_MARKERS_SUPPORTED;

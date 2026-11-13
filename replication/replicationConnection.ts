@@ -10096,8 +10096,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								const sendsOwnLog = excludedNodes
 									? !excludedNodes.includes(getThisNodeName())
 									: nodeSubscriptions.some(({ name }) => name === getThisNodeName());
+								// LMDB keeps the key rule: its shared buffers have no listener removal
 								const markersSupported =
-									sendsOwnLog && peerCapabilitiesLearned && peerSupportsConfirmationMarkers(peerCapabilities);
+									STORAGE_IS_ROCKSDB &&
+									sendsOwnLog &&
+									peerCapabilitiesLearned &&
+									peerSupportsConfirmationMarkers(peerCapabilities);
 								const demand = markersSupported
 									? confirmationDemand(auditStore, databaseName, () => wakeSender?.())
 									: undefined;

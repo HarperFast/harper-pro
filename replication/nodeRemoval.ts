@@ -144,12 +144,14 @@ export async function removeNodeFence(
 }
 
 const FENCE_LOCK_KEY = [Symbol.for('remove-node-fence')];
+const syncedFences = new WeakMap<object, string>();
 
 async function withFenceLock<T>(work: () => Promise<T>, deadline = performance.now() + CALL_TIMEOUT_MS): Promise<T> {
 	const store = getHDBNodeTable().primaryStore;
-	while (!store.tryLock(FENCE_LOCK_KEY)) {
+	for (;;) {
 		if (performance.now() > deadline)
 			throw new ServerError(`Timed out waiting for another ${FENCE_OPERATION} on this node to finish`, 503);
+		if (store.tryLock(FENCE_LOCK_KEY)) break;
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	try {
@@ -161,15 +163,8 @@ async function withFenceLock<T>(work: () => Promise<T>, deadline = performance.n
 
 async function changeFence(request: any, thisNode: string): Promise<FenceState | { cancelled: true }> {
 	const roots = databaseRoots();
-	for (const [database, auditStores] of roots) {
-		// replication sends and certifies floors for one root per database; another root's writes have no receipt
-		if (auditStores.length > 1)
-			throw new ClientError(
-				`Database ${database} keeps its tables in more than one storage root, so its writes cannot be drained before removal; use force: true to remove without draining`,
-				400
-			);
+	for (const [database, auditStores] of roots)
 		for (const auditStore of auditStores) assertDrainable(database, auditStore);
-	}
 	const fences = [...roots.values()].flat().map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
 	const wasRemoving = fences.some((fence) => fence.state === 'removing');
 	if (request.cancel) {
@@ -183,6 +178,13 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 		hdbLogger.notify(`Removal of ${thisNode} from its cluster was cancelled; local writes are accepted again`);
 		return { cancelled: true };
 	}
+	for (const [database, auditStores] of roots)
+		// replication sends and certifies floors for one root per database; another root's writes have no receipt
+		if (auditStores.length > 1)
+			throw new ClientError(
+				`Database ${database} keeps its tables in more than one storage root, so its writes cannot be drained before removal; use force: true to remove without draining`,
+				400
+			);
 	const epoch = fences.find((fence) => fence.epoch)?.epoch || randomUUID();
 	if (request.finalize !== undefined) {
 		const expected = new Set(request.databases ?? []);
@@ -209,13 +211,13 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 				existing && isValidFloor(existing.target) ? existing.target : setLocalWriteFence(rootStore, true);
 			if (existing && !localWritesFenced(rootStore)) setLocalWriteFence(rootStore, true);
 			// finalize always persists: a retry after a failed WAL sync must not report an unsynced state
-			if (
-				request.finalize !== undefined ||
-				existing?.epoch !== epoch ||
-				existing.state !== state ||
-				existing.target !== fenceTarget
-			)
+			const record = `${epoch}:${fenceTarget}:${state}`;
+			// a record read back is reported only once this process has synced it: a persist whose WAL sync failed
+			// left it committed but not durable
+			if (request.finalize !== undefined || syncedFences.get(auditStore) !== record) {
 				await persistLocalWriteFence(auditStore, { epoch, target: fenceTarget, state });
+				syncedFences.set(auditStore, record);
+			}
 			targets.set(auditStore, fenceTarget);
 			if (fenceTarget > target) target = fenceTarget;
 		}
@@ -229,8 +231,10 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 		const created = [...databaseRoots().values()].flat().some((auditStore) => !known.has(auditStore));
 		if (created) {
 			if (!wasRemoving)
-				for (const [auditStore, target] of targets)
+				for (const [auditStore, target] of targets) {
 					await persistLocalWriteFence(auditStore, { epoch, target, state: 'fenced' });
+					syncedFences.set(auditStore, `${epoch}:${target}:fenced`);
+				}
 			throw new ClientError(`A database was created on ${thisNode} while its removal was finalized; retry`, 409);
 		}
 	}
@@ -242,6 +246,7 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 async function clearFences(roots: Map<string, any[]>): Promise<void> {
 	for (const auditStores of roots.values())
 		for (const auditStore of auditStores) {
+			syncedFences.delete(auditStore);
 			await persistLocalWriteFence(auditStore, undefined);
 			setLocalWriteFence(auditStore.rootStore ?? auditStore, false);
 		}
@@ -397,7 +402,8 @@ export async function drainNode(
 		try {
 			fence = await call(name, record, { operation: FENCE_OPERATION, node: name });
 		} catch (error) {
-			if (error instanceof OutOfBudget) break;
+			// a local fence change that could not get the lock before the deadline
+			if (error instanceof OutOfBudget || (local && remaining() <= MIN_CALL_MS)) break;
 			if (unsupportedOperation(error))
 				throw new ClientError(
 					`${name} runs a version that cannot drain its writes before removal; upgrade it, or use force: true to remove it without draining`,
