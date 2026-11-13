@@ -200,7 +200,6 @@ describe('peers this node is sending a database to', () => {
 		const nodes = server.nodes;
 		server.nodes = [{ name: 'node-b' }, { name: 'node-c' }];
 		try {
-			// node-e is connected but not a recipient of this database
 			assert.strictEqual(lockConfirmersReachable(database, 1, new Set(), [['node-e', 'node-c']]), false);
 			assert.strictEqual(lockConfirmersReachable(database, 1, new Set(), [['node-b', 'node-c']]), true);
 			assert.strictEqual(lockConfirmersReachable(database, 2, new Set(), [['node-b', 'node-c']]), false);

@@ -1119,8 +1119,9 @@ function assertConfirmationFeasible(
 	let of = recipients.length;
 	if (connected >= confirmationCount && residentPeerLists)
 		for (const residents of residentPeerLists) {
-			connected = countSendingTo(databaseName, recipientResidents(residents, recipients));
-			of = residents.length;
+			const reachable = recipientResidents(residents, recipients);
+			connected = countSendingTo(databaseName, reachable);
+			of = reachable.length;
 			if (connected < confirmationCount) break;
 		}
 	if (connected < confirmationCount)
