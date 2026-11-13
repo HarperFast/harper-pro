@@ -390,7 +390,6 @@ export async function drainNode(
 		return response?.results ?? response;
 	};
 	const pause = () => new Promise((resolve) => setTimeout(resolve, Math.min(POLL_INTERVAL_MS, remaining())));
-	// what the last complete poll of every peer found, kept when a later poll only runs out of budget
 	let shortfalls: string[] = [];
 	let unreachable: string | undefined;
 	while (remaining() > MIN_CALL_MS) {
@@ -444,7 +443,6 @@ export async function drainNode(
 				else (holders[database] ??= []).push(peer);
 			}
 		}
-		// a poll cut short by the budget did not ask every peer
 		if (budgetSpent) {
 			if (shortfalls.length === 0) shortfalls = round;
 			break;

@@ -1097,7 +1097,6 @@ replicationConfirmation(
 			onSettled = () => {
 				Atomics.sub(demand.words, DEMAND_WAITERS, 1n);
 			};
-			// wakes every sender of this database, so a pass that begins after the marker sends it
 			demand.buffer.notify();
 		}
 		return createConfirmationWaiter(
