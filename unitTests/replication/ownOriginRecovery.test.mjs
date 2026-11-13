@@ -3,7 +3,7 @@
  * proves own lineage, which subscription a sender treats as a recovery range, and the coalesced flush.
  */
 import assert from 'node:assert';
-import { flushAfterNow, lineageFromReports, recoveryStart } from '#src/replication/ownOriginRecovery';
+import { flushAfterNow, lineageFromReports, nextEpoch, recoveryStart } from '#src/replication/ownOriginRecovery';
 import { findOwnOriginRecoveryRange, ORIGIN_CURSOR_OVERLAP_MS } from '#src/replication/replicationConnection';
 import {
 	buildLocalCapabilities,
@@ -29,6 +29,18 @@ describe('recoveryStart', () => {
 		const earlier = { after: NOW - 3_600_000, lastKey: 0, before: NOW - 1_000, requiredPeers: [] };
 		assert.strictEqual(recoveryStart(NOW, undefined, earlier), earlier.after);
 		assert.strictEqual(recoveryStart(NOW, undefined, { ...earlier, finished: true }), NOW - ORIGIN_CURSOR_OVERLAP_MS);
+	});
+});
+
+describe('nextEpoch', () => {
+	it('judges an unfinished window against what the log held when it opened, so a restart cannot clear a purge gap', () => {
+		const earlier = { after: NOW - 60_000, lastKey: NOW, before: NOW + 1_000, requiredPeers: [] };
+		const next = nextEpoch(NOW + 5_000, undefined, earlier, NOW + 10_000, ['b']);
+		assert.deepStrictEqual(next, { after: earlier.after, lastKey: NOW, before: NOW + 10_000, requiredPeers: ['b'] });
+		assert.strictEqual(
+			nextEpoch(NOW + 5_000, undefined, { ...earlier, finished: true }, NOW + 10_000, []).lastKey,
+			NOW + 5_000
+		);
 	});
 });
 
@@ -79,18 +91,24 @@ describe('lineageFromReports', () => {
 			'intact'
 		);
 	});
-	it('a finished epoch is intact without reading reports', () => {
-		let finished = 0;
-		const result = lineageFromReports(
-			{ ...epoch, finished: true },
-			['d'],
-			'self',
-			() => assert.fail('read a report'),
-			member,
-			() => finished++
+	it('a finished epoch still waits on a lock home that is not a cursor peer', () => {
+		const reports = { b: clean, c: clean };
+		assert.strictEqual(
+			lineageFromReports({ ...epoch, finished: true }, ['d'], 'self', (p) => reports[p], member).state,
+			'pending'
 		);
-		assert.deepStrictEqual(result, { state: 'intact' });
-		assert.strictEqual(finished, 1);
+	});
+	it('names each peer it found clean, so the caller can stop reading it', () => {
+		const seen = [];
+		lineageFromReports(
+			epoch,
+			[],
+			'self',
+			() => clean,
+			member,
+			(peer) => seen.push(peer)
+		);
+		assert.deepStrictEqual(seen, ['b', 'c']);
 	});
 });
 

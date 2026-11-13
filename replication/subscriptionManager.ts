@@ -1166,6 +1166,7 @@ export async function startOnMainThread(options) {
 		return replicationPool[nextWorkerIndex++];
 	}
 	const databases = getDatabases();
+	const epochSyncs: Promise<void>[] = [];
 	// find all the databases last recorded audit entry so that we can inquire from the first node for self catch-up
 	// of any records that may have been missed
 	for (const dbName of Object.getOwnPropertyNames(databases)) {
@@ -1174,17 +1175,19 @@ export async function startOnMainThread(options) {
 			const table = database[tableName];
 			if (table.auditStore) {
 				selfCatchupOfDatabase.set(dbName, lastTimeInAuditStore(table.auditStore) as number);
-				if (dbName !== 'system') {
-					try {
-						openOwnOriginRecoveryEpoch(dbName, table.auditStore, table.dbisDB);
-					} catch (error) {
-						logger.warn?.(`Own-origin recovery: could not open the recovery epoch of ${dbName}`, error);
-					}
+				try {
+					const synced = openOwnOriginRecoveryEpoch(dbName, table.auditStore, table.dbisDB);
+					if (synced) epochSyncs.push(synced);
+				} catch (error) {
+					logger.error?.(`Own-origin recovery: could not open the recovery epoch of ${dbName}`, error);
 				}
 				break;
 			}
 		}
 	}
+	for (const result of await Promise.allSettled(epochSyncs))
+		if (result.status === 'rejected')
+			logger.error?.('Own-origin recovery: could not sync a recovery epoch to disk', result.reason);
 	// we need to wait for the threads to start before we can start adding nodes
 	// but don't await this because this start function has to finish before the threads can start
 	whenThreadsStarted.then(async () => {

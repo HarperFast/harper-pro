@@ -767,4 +767,34 @@ describe('createFreshnessBarrier: own lineage after a restart (harper-pro#1364)'
 		await wait;
 		assert.strictEqual(asked.length, 0);
 	});
+	it('rechecks own-origin poison once recovery is confirmed, since a returned write can fail to apply', async () => {
+		let poisoned = false;
+		let lineage = pending;
+		const h = harness({ isPoisoned: (origin) => origin === 'self' && poisoned, ownLineage: () => lineage });
+		const wait = h.barrier.establish('t', [['self', 5]], 5_000);
+		poisoned = true;
+		lineage = { state: 'intact' };
+		h.advance(OWN_LINEAGE_POLL_MS);
+		assert.match((await rejection(wait)).message, /own origin has a recorded replication hole/);
+	});
+	it('a close during the wait answers 503 even if recovery is confirmed meanwhile', async () => {
+		const { h, set } = lineageHarness(pending);
+		const wait = h.barrier.establish('t', [['self', 5]], 5_000);
+		h.barrier.close();
+		set({ state: 'intact' });
+		h.advance(OWN_LINEAGE_POLL_MS);
+		assert.match((await rejection(wait)).message, /closed/);
+	});
+	it('counts own-lineage waits against the cap and in outstanding', async () => {
+		const { h } = lineageHarness(pending);
+		const waits = [];
+		for (let i = 0; i < MAX_OUTSTANDING_BARRIERS; i++)
+			waits.push(h.barrier.establish('t', [['self', 5]], 5_000).catch(() => {}));
+		assert.strictEqual(h.barrier.stats().outstanding, MAX_OUTSTANDING_BARRIERS);
+		assert.match((await rejection(h.barrier.establish('t', [['self', 5]], 5_000))).message, /too many/);
+		h.barrier.close();
+		h.advance(OWN_LINEAGE_POLL_MS);
+		await Promise.all(waits);
+		assert.strictEqual(h.barrier.stats().outstanding, 0);
+	});
 });

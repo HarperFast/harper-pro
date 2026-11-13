@@ -133,6 +133,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	let retried = 0;
 	let sweep: unknown;
 	let closed = false;
+	let ownWaits = 0;
 
 	// A check that throws is answered as poisoned: a settlement callback must end in a 503, never escape.
 	const poisonedPair = (origin: string, table: string): boolean => {
@@ -356,17 +357,38 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		return lineage.state === 'intact';
 	};
 
+	const refuseOwnPoison = (table: string) => {
+		if (poisonedPair(deps.thisNodeName(), table))
+			reject(
+				'poisoned',
+				`${database}.${table} from this node's own origin has a recorded replication hole here; record locks cannot prove its own lineage until this node is recloned`
+			);
+	};
+
 	/** Waits out peers returning this node's own writes lost in a restart, until the lock's deadline. */
-	const awaitOwnLineage = async (position: number | null, homes: readonly string[], deadlineMono: number) => {
-		while (!checkOwnLineage(position, homes)) {
-			if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
-			if (deps.monotonicNow() >= deadlineMono)
-				reject(
-					'own-lineage-gap',
-					`this node is still recovering its own writes on ${database} from its peers after a restart`
-				);
-			await new Promise<void>((resolve) => setTimer(resolve, OWN_LINEAGE_POLL_MS));
+	const awaitOwnLineage = async (
+		table: string,
+		position: number | null,
+		homes: readonly string[],
+		deadlineMono: number
+	) => {
+		ownWaits++;
+		try {
+			for (;;) {
+				if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
+				if (checkOwnLineage(position, homes)) break;
+				if (deps.monotonicNow() >= deadlineMono)
+					reject(
+						'own-lineage-gap',
+						`this node is still recovering its own writes on ${database} from its peers after a restart`
+					);
+				await new Promise<void>((resolve) => setTimer(resolve, OWN_LINEAGE_POLL_MS));
+			}
+		} finally {
+			ownWaits--;
 		}
+		// a returned write that failed to apply records its hole before its peer's report can land
+		refuseOwnPoison(table);
 	};
 
 	const checkRequest = (origin: string, table: string) => {
@@ -387,7 +409,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			const deadlineMono = deps.monotonicNow() + Math.min(Math.max(deadlineMs, 0), MAX_LOCK_LEASE_MS);
 			const self = deps.thisNodeName();
 			const origins: string[] = [];
-			// undefined: no own dependency to prove
 			let ownPosition: number | null | undefined;
 			if (dependencies === null) {
 				for (const member of homeMap.homes) if (member !== self) origins.push(member);
@@ -409,19 +430,16 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			// Every refusal before the first wait starts: a wait started for an earlier origin would be
 			// left asking on its own, holding a slot, with nothing to settle its rejection.
 			for (const origin of origins) checkOrigin(origin, table, homeMap);
+			let ownIntact = true;
 			if (ownPosition !== undefined) {
-				if (poisonedPair(self, table))
-					reject(
-						'poisoned',
-						`${database}.${table} from this node's own origin has a recorded replication hole here; record locks cannot prove its own lineage until this node is recloned`
-					);
-				checkOwnLineage(ownPosition, homeMap.homes);
+				refuseOwnPoison(table);
+				ownIntact = checkOwnLineage(ownPosition, homeMap.homes);
 			}
-			if (waits.size + origins.length > MAX_OUTSTANDING_BARRIERS)
+			if (waits.size + ownWaits + origins.length + (ownIntact ? 0 : 1) > MAX_OUTSTANDING_BARRIERS)
 				reject('capacity', `too many record lock barriers are outstanding for ${database}`);
 			const [positions] = await Promise.all([
 				Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono))),
-				ownPosition === undefined ? undefined : awaitOwnLineage(ownPosition, homeMap.homes, deadlineMono),
+				ownIntact ? undefined : awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono),
 			]);
 			if (dependencies === null) return origins.map((origin, index) => [origin, positions[index]] as const);
 		},
@@ -455,7 +473,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			return true;
 		},
 		stats() {
-			return { outstanding: waits.size, applied, timeouts, retried, rejected: { ...rejected } };
+			return { outstanding: waits.size + ownWaits, applied, timeouts, retried, rejected: { ...rejected } };
 		},
 		close() {
 			closed = true;
