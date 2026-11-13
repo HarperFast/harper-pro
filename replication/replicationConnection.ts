@@ -13045,7 +13045,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return localBlob;
 	}
 	let lastSentExcludedNodes: string[] = [];
-	// The recovery epoch this connection's last subscription asked its own writes back for, until answered.
 	let ownOriginRecoveryRequested: number | undefined;
 	let ownOriginRetries = 0;
 	function currentOriginCursorVector(

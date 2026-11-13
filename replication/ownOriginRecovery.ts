@@ -26,6 +26,7 @@ import { findLastCommittedLogKey, ORIGIN_CURSOR_OVERLAP_MS } from './replication
 const EPOCH = Symbol.for('ownOriginRecovery');
 // Databases whose epoch could not be opened, set on the main thread before workers start, which copy the env.
 const FAILED_ENV = 'HARPER_OWN_ORIGIN_RECOVERY_FAILED';
+const failedDatabases = new Set((process.env[FAILED_ENV] ?? '').split('\n').filter(Boolean));
 const REPORT = Symbol.for('ownOriginRecovered');
 const MIN_START = 1;
 
@@ -77,7 +78,6 @@ export function recoveryStart(
 	return after;
 }
 
-/** The epoch this start opens, from what the log holds now and an earlier epoch's row. */
 export function nextEpoch(
 	lastKey: number | undefined,
 	purgeBound: number | undefined,
@@ -91,7 +91,7 @@ export function nextEpoch(
 	return { after: recoveryStart(lastKey, purgeBound, previous), lastKey: held, before, requiredPeers };
 }
 
-/** Names of the peers with a replication cursor in this database, i.e. that have sent it here. */
+/** Peers that have sent this database here. */
 function peersWithCursors(dbisDB: any, auditStore: any): string[] {
 	const names = new Set<string>();
 	for (const { key } of dbisDB.getRange({
@@ -108,14 +108,8 @@ function peersWithCursors(dbisDB: any, auditStore: any): string[] {
 
 /** Own lineage on `database` stays unprovable in this process and the workers it starts. */
 export function markOwnOriginRecoveryFailed(database: string): void {
-	const failed = new Set((process.env[FAILED_ENV] ?? '').split('\n').filter(Boolean));
-	failed.add(database);
-	process.env[FAILED_ENV] = [...failed].join('\n');
-	cachedEpochs.delete(database);
-}
-
-function recoveryFailed(database: string): boolean {
-	return (process.env[FAILED_ENV] ?? '').split('\n').includes(database);
+	failedDatabases.add(database);
+	process.env[FAILED_ENV] = [...failedDatabases].join('\n');
 }
 
 /**
@@ -160,7 +154,6 @@ function readReport(dbisDB: any, peer: string): OwnOriginReport | undefined {
 	return dbisDB?.getSync([REPORT, peer]);
 }
 
-/** The range a subscription to `peer` asks for, until that peer has reported for this epoch. */
 export function recoveryRangeFor(dbisDB: any, peer: string): { startTime: number; endTime: number } | undefined {
 	const epoch = readEpoch(dbisDB);
 	if (!epoch || readReport(dbisDB, peer)?.epoch === epoch.before) return undefined;
@@ -231,7 +224,7 @@ export function ownLineage(
 	self: string,
 	memberCheck: (name: string) => boolean = isMember
 ): OwnLineage {
-	if (recoveryFailed(database))
+	if (failedDatabases.has(database))
 		return { state: 'unprovable', detail: 'its recovery epoch could not be recorded at startup' };
 	let cached = cachedEpochs.get(database);
 	if (!cached) {

@@ -374,7 +374,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	) => {
 		ownWaits++;
 		try {
-			// establish checked once already
 			do {
 				if (deps.monotonicNow() >= deadlineMono)
 					reject(

@@ -191,7 +191,7 @@ describe('flushAfterNow', () => {
 });
 
 describe('markOwnOriginRecoveryFailed', () => {
-	it('makes own lineage unprovable for that database only, through the env workers inherit', () => {
+	it('makes own lineage unprovable for that database only, and records it in the env workers inherit', () => {
 		const saved = process.env.HARPER_OWN_ORIGIN_RECOVERY_FAILED;
 		try {
 			markOwnOriginRecoveryFailed('own-origin-failed-db');
