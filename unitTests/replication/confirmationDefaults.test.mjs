@@ -1,6 +1,7 @@
 import assert from 'node:assert';
 import { createRequire } from 'node:module';
 import { table } from '#src/core/resources/databases';
+import { server } from '#src/core/server/Server';
 import {
 	createConfirmationWaiter,
 	lockConfirmersReachable,
@@ -9,7 +10,10 @@ import {
 	sweepWatchedWaiters,
 } from '#src/replication/knownNodes';
 import { countSendingTo, registerResidencySender } from '#src/replication/residencyTopology';
-import { confirmationDefaultsConfigured } from '#src/core/resources/DatabaseTransaction';
+import {
+	confirmationDefaultsConfigured,
+	writeConfirmationDefaultConfigured,
+} from '#src/core/resources/DatabaseTransaction';
 
 const { setupTestDBPath } = createRequire(import.meta.url)('../testUtils.js');
 
@@ -39,6 +43,9 @@ describe('replication confirmation defaults', () => {
 	it('registers the values a clone installs, read through the given source', () => {
 		const installed = { replication_confirmation: 2, replication_recordLockConfirmation: '1' };
 		registerConfirmationDefaults((key) => installed[key], false);
+		assert.strictEqual(writeConfirmationDefaultConfigured(), true);
+		registerConfirmationDefaults((key) => (key === 'replication_recordLockConfirmation' ? '1' : undefined), false);
+		assert.strictEqual(writeConfirmationDefaultConfigured(), false);
 		assert.strictEqual(confirmationDefaultsConfigured(), true);
 		assert.throws(() => registerConfirmationDefaults(() => -1, false), /Invalid replication\.confirmation/);
 		registerConfirmationDefaults(() => undefined, false);
@@ -59,7 +66,9 @@ describe('replication confirmation defaults', () => {
 				(key) => (key === 'replication_recordLockConfirmation' ? lockCount : undefined),
 				recordLocksEnabled
 			);
-			assert.strictEqual(confirmationDefaultsConfigured(), configured, `${lockCount} with locks ${recordLocksEnabled}`);
+			const label = `${lockCount} with locks ${recordLocksEnabled}`;
+			assert.strictEqual(confirmationDefaultsConfigured(), configured, label);
+			assert.strictEqual(writeConfirmationDefaultConfigured(), false, label);
 		}
 	});
 });
@@ -185,15 +194,22 @@ describe('peers this node is sending a database to', () => {
 		assert.strictEqual(countSendingTo('no-such-database', ['node-b']), 0);
 	});
 
-	it('reaches a resident count from confirmed peers plus connected ones', () => {
+	it('reaches a resident count from confirmed peers plus connected recipients', () => {
 		const b = registerResidencySender(store, database, 'node-b');
+		const e = registerResidencySender(store, database, 'node-e');
+		const nodes = server.nodes;
+		server.nodes = [{ name: 'node-b' }, { name: 'node-c' }];
 		try {
+			// node-e is connected but not a recipient of this database
+			assert.strictEqual(lockConfirmersReachable(database, 1, new Set(), [['node-e', 'node-c']]), false);
 			assert.strictEqual(lockConfirmersReachable(database, 1, new Set(), [['node-b', 'node-c']]), true);
 			assert.strictEqual(lockConfirmersReachable(database, 2, new Set(), [['node-b', 'node-c']]), false);
 			assert.strictEqual(lockConfirmersReachable(database, 2, new Set(['node-c']), [['node-b', 'node-c']]), true);
 			assert.strictEqual(lockConfirmersReachable(database, 1, new Set(), [['node-b'], ['node-c']]), false);
 		} finally {
+			server.nodes = nodes;
 			b.close();
+			e.close();
 		}
 	});
 });

@@ -967,12 +967,9 @@ function watchWaiter(waiter: WatchedWaiter): void {
 		peersGoneSweep.unref?.();
 	}
 }
+// the sweep stops itself once it finds no waiter, so a commit that confirms at once does not churn a timer
 function unwatchWaiter(waiter: WatchedWaiter): void {
 	watchedWaiters.delete(waiter);
-	if (!watchedWaiters.size && peersGoneSweep) {
-		clearInterval(peersGoneSweep);
-		peersGoneSweep = undefined;
-	}
 }
 // recipients read once per sweep, not once per pending waiter
 let sweepRecipients: Map<string, { name: string }[]> | undefined;
@@ -984,6 +981,11 @@ function recipientsDuringSweep(databaseName: string): { name: string }[] {
 }
 /** One pass of the shared sweep; exported so tests can drive it with their own clock. */
 export function sweepWatchedWaiters(now = performance.now()): void {
+	if (!watchedWaiters.size) {
+		if (peersGoneSweep) clearInterval(peersGoneSweep);
+		peersGoneSweep = undefined;
+		return;
+	}
 	sweepRecipients = new Map();
 	try {
 		for (const waiter of watchedWaiters) {
@@ -1010,12 +1012,15 @@ export function lockConfirmersReachable(
 	confirmed: ReadonlySet<string>,
 	residentPeerLists?: string[][]
 ): boolean {
+	const recipients = recipientsDuringSweep(databaseName);
 	if (!residentPeerLists?.length)
-		return (
-			confirmed.size + countSendingTo(databaseName, recipientsDuringSweep(databaseName), confirmed) >= confirmationCount
-		);
+		return confirmed.size + countSendingTo(databaseName, recipients, confirmed) >= confirmationCount;
 	for (const residents of residentPeerLists)
-		if (countMembers(confirmed, residents) + countSendingTo(databaseName, residents, confirmed) < confirmationCount)
+		if (
+			countMembers(confirmed, residents) +
+				countSendingTo(databaseName, recipientResidents(residents, recipients), confirmed) <
+			confirmationCount
+		)
 			return false;
 	return true;
 }
@@ -1059,6 +1064,12 @@ function isRecipient(recipients: { name: string }[], name: string): boolean {
 	return false;
 }
 
+function recipientResidents(residents: string[], recipients: { name: string }[]): string[] {
+	for (const name of residents)
+		if (!isRecipient(recipients, name)) return residents.filter((resident) => isRecipient(recipients, resident));
+	return residents;
+}
+
 /**
  * Refuse a count some written record's residents can never meet through this node's recipients — a
  * resident that is no longer a cluster member, or one this node does not send `databaseName` to.
@@ -1089,7 +1100,7 @@ const LOCK_OPT_OUT =
  * replicates `databaseName` to, or than a written record's residents among them. A lock-governed count is
  * also refused while too few of them are connected, rather than left to wait for peers that are gone.
  */
-export function assertConfirmationFeasible(
+function assertConfirmationFeasible(
 	databaseName: string,
 	confirmationCount: number,
 	residentPeerLists?: string[][],
@@ -1108,7 +1119,7 @@ export function assertConfirmationFeasible(
 	let of = recipients.length;
 	if (connected >= confirmationCount && residentPeerLists)
 		for (const residents of residentPeerLists) {
-			connected = countSendingTo(databaseName, residents);
+			connected = countSendingTo(databaseName, recipientResidents(residents, recipients));
 			of = residents.length;
 			if (connected < confirmationCount) break;
 		}
