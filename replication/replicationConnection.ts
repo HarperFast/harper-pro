@@ -197,10 +197,13 @@ import {
 	peerSupportsRecordLocks,
 	peerSupportsResidencyNotResident,
 	peerSupportsResidencyStubCopy,
+	peerSupportsTombstoneCopy,
 	peerSupportsTableLifecycle,
+	receiverDeclaresTombstoneCopy,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
+	TOMBSTONE_COPY_CAPABILITY,
 	type ResolvedPeerCapabilities,
 } from './protocolCapabilities.ts';
 import {
@@ -1098,6 +1101,28 @@ export function isValidFrameTxnLogKey(value: unknown): boolean {
 }
 export function isValidRecordVersion(value: unknown): boolean {
 	return isValidReplicationClock(value);
+}
+/** Whether a retained delete boundary outranks a head's own identity, in core's order: version, then origin name. */
+export function boundaryOutranksHead(
+	auditStore: any,
+	boundary: { version: number; nodeId?: number },
+	head: { version: number; nodeId?: number }
+): boolean {
+	if (boundary.version !== head.version) return boundary.version > head.version;
+	const boundaryId = boundary.nodeId ?? 0;
+	const headId = head.nodeId ?? 0;
+	if (boundaryId === headId) return false;
+	const nodeNameToId = exportIdMapping(auditStore);
+	let boundaryName: string | undefined;
+	let headName: string | undefined;
+	for (const name in nodeNameToId) {
+		if (nodeNameToId[name] === boundaryId) boundaryName = name;
+		if (nodeNameToId[name] === headId) headName = name;
+	}
+	if (boundaryName !== undefined && headName !== undefined) return boundaryName > headName;
+	if (boundaryName !== undefined) return true;
+	if (headName !== undefined) return false;
+	return boundaryId > headId;
 }
 export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number, recordNodeId = entry.nodeId): number {
 	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs?.length) {
@@ -9344,6 +9369,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							!!receiverLayout && shardingSourceCertificate(databaseName) !== receiverLayout;
 						// a peer too old to declare it: a wrong guess of copy is a held, reported refusal, a wrong replay loses rows
 						const refusesCopies = receiverRefusesCopies(data, getThisNodeName(), restrictedSendingOrigins);
+						const sendTombstonesAsDeletes = peerCapabilitiesLearned
+							? peerSupportsTombstoneCopy(peerCapabilities)
+							: receiverDeclaresTombstoneCopy(data);
 						const sendingProjection = data.some((node) => node.shardingProjection === true);
 						if (sendingProjection && !receiverLayout)
 							throw new Error('Sharding projection requires authenticated owned slots');
@@ -9572,7 +9600,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							auditRecord,
 							cursor,
 							subscriptionNodeId = auditRecord.nodeId,
-							encodeCopy?: () => Buffer
+							encodeCopy?: () => Buffer,
+							// a delete a copy sends in place of the publish over it is also selected at the publish's key
+							copyHeadKey?: number
 						) => {
 							if (closed || wsClosed) return;
 							if (sourceReadiness.some(sourceNotReady)) throw new Error('Sharding source completeness was revoked');
@@ -9658,12 +9688,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const timeRange = subscribedNodeIds?.[subscriptionNodeId];
 							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
 							// in the subscribedNodeIds list, than it matches the subscription
-							const matchesSubscription = matchesSubscriptionPosition(
-								timeRange as any,
-								!!excludedNodes,
-								originFloorById?.[subscriptionNodeId],
-								subscriptionPosition
-							);
+							const matchesSubscription =
+								matchesSubscriptionPosition(
+									timeRange as any,
+									!!excludedNodes,
+									originFloorById?.[subscriptionNodeId],
+									subscriptionPosition
+								) ||
+								(copyHeadKey !== undefined &&
+									matchesSubscriptionPosition(
+										timeRange as any,
+										!!excludedNodes,
+										originFloorById?.[subscriptionNodeId],
+										copyHeadKey
+									));
 							if (!matchesSubscription) {
 								if (DEBUG_MODE)
 									logger.trace?.(
@@ -10757,10 +10795,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																.includes(remoteNodeName)
 														)
 															continue;
+														const retainedDelete =
+															sendTombstonesAsDeletes &&
+															entry.value == null &&
+															!(entry.metadataFlags & (INVALIDATED | REPLICA)) &&
+															(!(entry.metadataFlags & FULL_WRITE_HEAD) ||
+																(entry.copiedDeleteBoundary &&
+																	boundaryOutranksHead(auditStore, entry.copiedDeleteBoundary, entry)))
+																? entry.copiedDeleteBoundary
+																: undefined;
 														// same origin normalization as recordNodeId below: undefined means we authored it
 														if (
 															withheldOriginNodeId !== undefined &&
-															(entry.nodeId ?? nodeId) === withheldOriginNodeId
+															(retainedDelete ? retainedDelete.nodeId || nodeId : (entry.nodeId ?? nodeId)) ===
+																withheldOriginNodeId
 														) {
 															withheldRecordCount++;
 															continue;
@@ -10779,14 +10827,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// origin on the follower. `entry.nodeId` is this node's local id for that
 														// origin (undefined/0 = us) — the same id space the wire uses.
 														const recordNodeId = entry.nodeId ?? nodeId;
-														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
+														const headTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
 														const isReplica = Boolean(entry.metadataFlags & REPLICA);
 														const isStub = Boolean(entry.metadataFlags & (INVALIDATED | REPLICA));
 														const stubAsInvalidation =
 															isStub && peerCapabilitiesLearned && peerSupportsResidencyStubCopy(peerCapabilities);
 														const legacyStubCopy = isStub && !stubAsInvalidation;
 														if (legacyStubCopy && table.residency) continue;
-														const copyType = stubAsInvalidation ? 'invalidate' : 'put';
+														const tombstoneAsDelete =
+															entry.value == null &&
+															!isStub &&
+															Boolean(entry.metadataFlags & FULL_WRITE_HEAD || retainedDelete) &&
+															sendTombstonesAsDeletes;
+														const copyVersion = retainedDelete ? retainedDelete.version : entry.version;
+														const copyNodeId = retainedDelete ? retainedDelete.nodeId || nodeId : recordNodeId;
+														const copyTxnLogKey = retainedDelete ? retainedDelete.version : headTxnLogKey;
+														const copyType = stubAsInvalidation ? 'invalidate' : tombstoneAsDelete ? 'delete' : 'put';
 														// a replica's body and lifetime are this node's alone; the peer gets what a stub holder sends
 														let copyValue = entry.value;
 														if (isReplica) {
@@ -10806,15 +10862,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															(entry.residencyId && !legacyStubCopy ? HAS_CURRENT_RESIDENCY_ID : 0);
 														const encodeCopyRecord = () =>
 															createAuditEntry({
-																version: entry.version,
+																version: copyVersion,
 																tableId: table.tableId,
 																recordId: entry.key,
 																previousVersion: null,
-																nodeId: recordNodeId,
+																nodeId: copyNodeId,
 																type: copyType,
-																encodedRecord: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
-																	sendBlobs(blob, entry.key)
-																),
+																encodedRecord: tombstoneAsDelete
+																	? undefined
+																	: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
+																			sendBlobs(blob, entry.key)
+																		),
 																extendedType: copyExtendedType,
 																residencyId: entry.residencyId,
 																residencySlot: entry.residencySlot,
@@ -10837,16 +10895,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																	return copyValue;
 																},
 																encoded,
-																version: entry.version,
+																version: copyVersion,
 																residencyId: entry.residencyId,
 																residencySlot: entry.residencySlot,
-																nodeId: recordNodeId,
+																nodeId: copyNodeId,
 																extendedType: copyExtendedType,
 																expiresAt: isReplica ? undefined : entry.expiresAt,
 															},
 															copyTxnLogKey,
 															nodeId,
-															encodeCopy
+															encodeCopy,
+															retainedDelete ? headTxnLogKey : undefined
 														);
 														if (closed || wsClosed) return;
 														logger.debug?.(
@@ -13547,6 +13606,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					endTime: node.endTime,
 					shardingProjection,
 					refusesCopies: restrictedOrigins,
+					...(!TEST_OMIT_CAPABILITIES && STORAGE_IS_ROCKSDB && { tombstoneCopy: TOMBSTONE_COPY_CAPABILITY }),
 					copyResume, // present only when resuming an interrupted bulk copy
 					...(floorOnlyStart !== undefined && startTime === floorOnlyStart && { floorGeneration: floorOnlyGeneration }),
 				};

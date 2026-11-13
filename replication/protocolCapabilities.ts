@@ -62,6 +62,12 @@ export const TABLE_LIFECYCLE_CAPABILITY = 1;
  * an older receiver would turn its full row into a stub, so it gets the stub as a `put` it skips.
  */
 export const RESIDENCY_STUB_COPY_CAPABILITY = 1;
+/**
+ * Level at which a peer stores a base copy's `delete` entry as a tombstone at the delete's version and origin
+ * (core `_writeDelete` with `isCopyApply`). Only then does the copy send a delete tombstone as `delete`; an
+ * older receiver gets it as the nil-body `put` it always skipped, and so still keeps no tombstone.
+ */
+export const TOMBSTONE_COPY_CAPABILITY = 1;
 export const RESIDENCY_SLOTS_CAPABILITY = 1;
 export const SHARDING_RECOVERY_CAPABILITY = 2;
 
@@ -78,6 +84,7 @@ export interface ResolvedPeerCapabilities {
 	originFloors: number;
 	tableLifecycle: number;
 	residencyStubCopy: number;
+	tombstoneCopy: number;
 	residencyNotResident: number;
 	residencySlots: number;
 	shardingRecovery: number;
@@ -131,6 +138,7 @@ export function resolvePeerCapabilities(
 		originFloors: resolveLevel(bag?.originFloors, localOriginFloors, 0),
 		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
 		residencyStubCopy: resolveLevel(bag?.residencyStubCopy, RESIDENCY_STUB_COPY_CAPABILITY, 0),
+		tombstoneCopy: resolveLevel(bag?.tombstoneCopy, TOMBSTONE_COPY_CAPABILITY, 0),
 		residencyNotResident: resolveLevel(bag?.residencyNotResident, RESIDENCY_NOT_RESIDENT_CAPABILITY, 0),
 		residencySlots: resolveLevel(bag?.residencySlots, RESIDENCY_SLOTS_CAPABILITY, 0),
 		shardingRecovery: resolveLevel(bag?.shardingRecovery, SHARDING_RECOVERY_CAPABILITY, 0),
@@ -143,6 +151,19 @@ export function peerSupportsTableLifecycle(resolved: ResolvedPeerCapabilities): 
 
 export function peerSupportsResidencyStubCopy(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.residencyStubCopy >= RESIDENCY_STUB_COPY_CAPABILITY;
+}
+
+export function peerSupportsTombstoneCopy(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.tombstoneCopy >= TOMBSTONE_COPY_CAPABILITY;
+}
+
+/** Read only while the receiver's bag is not learned; a learned bag decides. */
+export function receiverDeclaresTombstoneCopy(entries: unknown): boolean {
+	if (!Array.isArray(entries)) return false;
+	return entries.some((entry) => {
+		const level = entry?.tombstoneCopy;
+		return typeof level === 'number' && Number.isFinite(level) && level >= TOMBSTONE_COPY_CAPABILITY;
+	});
 }
 
 export function peerSupportsResidencyNotResident(resolved: ResolvedPeerCapabilities): boolean {
@@ -213,6 +234,8 @@ export function buildLocalCapabilities(
 		originFloors: perOriginLogs ? (durableFloors ? ORIGIN_FLOORS_CAPABILITY : 1) : 0,
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 		residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
+		// LMDB applies a copied delete as an ordinary replicated delete, not as a copy-applied tombstone
+		tombstoneCopy: perOriginLogs ? TOMBSTONE_COPY_CAPABILITY : 0,
 		residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 		residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 		shardingRecovery: perOriginLogs ? SHARDING_RECOVERY_CAPABILITY : 0,
@@ -232,6 +255,7 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.originFloors === b.originFloors &&
 		a.tableLifecycle === b.tableLifecycle &&
 		a.residencyStubCopy === b.residencyStubCopy &&
+		a.tombstoneCopy === b.tombstoneCopy &&
 		a.residencyNotResident === b.residencyNotResident &&
 		a.residencySlots === b.residencySlots &&
 		a.shardingRecovery === b.shardingRecovery
