@@ -112,6 +112,20 @@ suite('remove_node drains a live node', { timeout: 1_200_000, skip: isLMDB && 'R
 			assert.match(JSON.stringify(result.body), /still refuses local writes and stays a member/);
 			assert.ok((await members(coOwner.harper)).includes(restarted.hostname));
 			await writeRefused(restarted, 'refused-while-pending-0');
+			// a database created after the fence opens fenced too: no receipt would cover a write to it
+			await sendOperation(restarted.harper, {
+				operation: 'create_table',
+				database: 'created_while_fenced',
+				table: 'Late',
+				primary_key: 'id',
+			});
+			const late = await postOperation(restarted.harper, {
+				operation: 'upsert',
+				database: 'created_while_fenced',
+				table: 'Late',
+				records: [{ id: 'late-0' }],
+			});
+			assert.match(JSON.stringify(late.body), /being removed from its cluster/, JSON.stringify(late));
 		} finally {
 			await startHarper(owner, nodeOptions(owner));
 		}

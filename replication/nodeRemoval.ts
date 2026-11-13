@@ -7,12 +7,16 @@
  * Design: replication/DESIGN.md "Removing a live node".
  */
 import { randomUUID } from 'node:crypto';
+import { closeSync, existsSync, fsyncSync, openSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { databases } from '../core/resources/databases.ts';
 import {
 	isValidFloor,
 	localWritesFenced,
 	originFloorsDurable,
+	restoreLocalWriteFence,
 	setLocalWriteFence,
+	setNewRootWriteFence,
 } from '../core/resources/originClosedFloor.ts';
 import {
 	getDatabaseGeneration,
@@ -25,6 +29,8 @@ import { readResidencyMap } from '../core/resources/residencyMaps.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { server } from '../core/server/Server.ts';
 import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
+import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import * as env from '../core/utility/environment/environmentManager.js';
 import * as hdbLogger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, getReplicationRecipients } from './knownNodes.ts';
 import { receivesDirectlyFrom } from './subscriptionManager.ts';
@@ -65,6 +71,58 @@ export interface ReceivedFloor {
 	partialHistory?: boolean;
 	hole?: boolean;
 	floorRevoked?: boolean;
+}
+
+/**
+ * Present from before this node fences its roots until before it clears them: while it exists, every root opened on
+ * any thread starts fenced, so a database created after the removal's last scan admits no write its receipts miss.
+ */
+function removalMarkerPath(): string | undefined {
+	const rootPath = env.get(CONFIG_PARAMS.ROOTPATH);
+	return rootPath ? join(rootPath, 'removal-fence.json') : undefined;
+}
+export function removalMarked(): boolean {
+	const path = removalMarkerPath();
+	return path !== undefined && existsSync(path);
+}
+setNewRootWriteFence((rootStore: any) => rootStore?.databaseName !== 'system' && removalMarked());
+// a root this thread opened before registering (at startup) holds no record if it was created mid-removal
+if (removalMarked())
+	for (const auditStore of [...databaseRoots().values()].flat()) {
+		const rootStore = auditStore.rootStore ?? auditStore;
+		if (originFloorsDurable(rootStore)) restoreLocalWriteFence(rootStore, () => true);
+	}
+
+function syncDirectory(path: string): void {
+	const fd = openSync(dirname(path), 'r');
+	try {
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+export function markRemoval(epoch: string): void {
+	const path = removalMarkerPath();
+	if (!path) throw new ServerError('This node has no root path to record its removal in', 500);
+	if (existsSync(path)) return;
+	const temporary = `${path}.${process.pid}.tmp`;
+	const fd = openSync(temporary, 'w');
+	try {
+		writeSync(fd, JSON.stringify({ epoch }));
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	renameSync(temporary, path);
+	syncDirectory(path);
+}
+
+export function unmarkRemoval(): void {
+	const path = removalMarkerPath();
+	if (!path || !existsSync(path)) return;
+	rmSync(path, { force: true });
+	syncDirectory(path);
 }
 
 function isSuperUser(request: any): boolean {
@@ -202,6 +260,7 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 				400
 			);
 	const epoch = fences.find((fence) => fence.epoch)?.epoch || randomUUID();
+	const required = new Map([...roots.keys()].map((database) => [database, requiredPeers(database, thisNode)]));
 	if (request.finalize !== undefined) {
 		const expected = new Set(request.databases ?? []);
 		// the receipts vouch for one target and generation per database; a database dropped and created again since
@@ -220,10 +279,16 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 		);
 		if (request.finalize !== epoch || !fenced || expected.size !== roots.size)
 			throw new ClientError(`${thisNode}'s fence changed since its receipts were collected; retry the removal`, 409);
+		for (const [database, now] of required)
+			if (!receiptsBindRequired(receipted[database], now))
+				throw new ClientError(
+					`The peers that must hold ${thisNode}'s writes to database ${database} changed since its receipts were collected; retry the removal`,
+					409
+				);
 	}
+	markRemoval(epoch);
 	const state: FenceState['state'] = request.finalize !== undefined || wasRemoving ? 'removing' : 'fenced';
 	const result: FenceState = { node: thisNode, epoch, state, databases: {} };
-	const required = new Map([...roots.keys()].map((database) => [database, requiredPeers(database, thisNode)]));
 	const targets = new Map<any, number>();
 	for (const [database, auditStores] of roots) {
 		let target = 0;
@@ -276,6 +341,8 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 const canBeFenced = (auditStore: any): boolean => originFloorsDurable(auditStore.rootStore ?? auditStore);
 
 async function clearFences(roots: Map<string, any[]>): Promise<void> {
+	// first, so a root opened while these are cleared does not start fenced with nothing left to lift it
+	unmarkRemoval();
 	for (const auditStores of roots.values())
 		for (const auditStore of auditStores) {
 			if (
@@ -301,7 +368,11 @@ export async function liftFenceAfterRemoval(removed: boolean): Promise<void> {
 		const stores = [...roots.values()].flat().filter(canBeFenced);
 		const fences = stores.map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
 		// a clear whose WAL sync failed leaves the word set with no record
-		if (fences.length === 0 && !stores.some((auditStore) => localWritesFenced(auditStore.rootStore ?? auditStore)))
+		if (
+			fences.length === 0 &&
+			!stores.some((auditStore) => localWritesFenced(auditStore.rootStore ?? auditStore)) &&
+			!removalMarked()
+		)
 			return;
 		if (!removed && fences.some((fence) => fence.state === 'removing')) return;
 		await clearFences(roots);
@@ -359,6 +430,19 @@ export async function getReceivedOriginFloors(request: any): Promise<Record<stri
 		else rootStore.flushSync?.({ allowWriteStall: true });
 	}
 	return answers;
+}
+
+/**
+ * Whether a finalize's receipts were collected from every peer that must now hold the node's writes to a database,
+ * under the shard ownership they were judged by: a peer that became required after the last poll was never asked.
+ */
+export function receiptsBindRequired(
+	receipt: { peers?: unknown; shardOwners?: unknown } | undefined,
+	required: { peers: string[]; shardOwners?: string[][] }
+): boolean {
+	const asked = receipt?.peers;
+	if (!Array.isArray(asked) || required.peers.some((peer) => !asked.includes(peer))) return false;
+	return JSON.stringify(required.shardOwners ?? null) === JSON.stringify(receipt.shardOwners ?? null);
 }
 
 export function receiptShortfall(answer: ReceivedFloor | undefined, drain: DatabaseDrain): string | undefined {
@@ -525,7 +609,12 @@ export async function drainNode(
 					receipts: Object.fromEntries(
 						Object.entries(fence.databases).map(([database, drain]) => [
 							database,
-							{ target: drain.target, generation: drain.generation },
+							{
+								target: drain.target,
+								generation: drain.generation,
+								peers: drain.peers,
+								...(drain.shardOwners ? { shardOwners: drain.shardOwners } : {}),
+							},
 						])
 					),
 				});

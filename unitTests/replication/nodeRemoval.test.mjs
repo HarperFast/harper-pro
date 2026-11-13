@@ -6,7 +6,18 @@ import {
 	drainNode,
 	drainTimeoutMs,
 	receiptShortfall,
+	receiptsBindRequired,
+	markRemoval,
+	removalMarked,
+	unmarkRemoval,
 } from '#src/replication/nodeRemoval';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { table } from '#src/core/resources/databases';
+import { localWritesFenced, setLocalWriteFence } from '#src/core/resources/originClosedFloor';
+import { CONFIG_PARAMS } from '#src/core/utility/hdbTerms';
+import * as env from '#src/core/utility/environment/environmentManager';
 
 const T = 1_790_000_000_000;
 const drain = { target: T, generation: 'gen-1', sharded: false, peers: ['p1'] };
@@ -35,6 +46,35 @@ describe('receiptShortfall (harper-pro#1348)', () => {
 
 	it('accepts a route between shards, which never carries every table, for a sharded database', () => {
 		assert.equal(receiptShortfall({ ...holds, fullCoverage: false }, { ...drain, sharded: true }), undefined);
+	});
+});
+
+describe('receiptsBindRequired (harper-pro#1348)', () => {
+	it('accepts receipts from every peer still required, under the same shard ownership', () => {
+		assert.equal(receiptsBindRequired({ peers: ['p1', 'p2'] }, { peers: ['p1', 'p2'] }), true);
+		assert.equal(receiptsBindRequired({ peers: ['p1', 'p2'] }, { peers: ['p2'] }), true);
+		const owners = [['p1'], ['p2']];
+		assert.equal(
+			receiptsBindRequired({ peers: ['p1', 'p2'], shardOwners: owners }, { peers: ['p1', 'p2'], shardOwners: owners }),
+			true
+		);
+	});
+
+	it('refuses when a peer became required after the receipts were collected', () => {
+		assert.equal(receiptsBindRequired({ peers: ['p1'] }, { peers: ['p1', 'p3'] }), false);
+	});
+
+	it('refuses when shard ownership changed, or the receipts name no peers', () => {
+		assert.equal(
+			receiptsBindRequired(
+				{ peers: ['p1', 'p2'], shardOwners: [['p1'], ['p2']] },
+				{ peers: ['p1', 'p2'], shardOwners: [['p2']] }
+			),
+			false
+		);
+		assert.equal(receiptsBindRequired({ peers: ['p1', 'p2'] }, { peers: ['p1', 'p2'], shardOwners: [['p1']] }), false);
+		assert.equal(receiptsBindRequired({ target: T }, { peers: [] }), false);
+		assert.equal(receiptsBindRequired(undefined, { peers: [] }), false);
 	});
 });
 
@@ -81,7 +121,7 @@ describe('drainNode', () => {
 			node: 'leaving',
 			finalize: 'e1',
 			databases: ['data'],
-			receipts: { data: { target: T, generation: 'gen-1' } },
+			receipts: { data: { target: T, generation: 'gen-1', peers: ['p1', 'p2'] } },
 		});
 		assert.ok(send.calls.every(({ options }) => options.timeoutMs > 0 && options.timeoutMs <= 30_000));
 	});
@@ -272,5 +312,31 @@ describe('drainNode', () => {
 		const result = await drainNode('leaving', {}, 10_000, send, async (peer) => ({ name: peer }));
 		assert.equal(result.state, 'removing');
 		assert.equal(fences, 2);
+	});
+});
+
+describe('a database created while a removal is marked (harper-pro#1348)', () => {
+	let rootPath;
+	before(() => {
+		rootPath = env.get(CONFIG_PARAMS.ROOTPATH);
+		env.setProperty(CONFIG_PARAMS.ROOTPATH, mkdtempSync(join(tmpdir(), 'removal-mark-')));
+	});
+	after(() => {
+		unmarkRemoval();
+		env.setProperty(CONFIG_PARAMS.ROOTPATH, rootPath);
+	});
+
+	const open = (database) =>
+		table({ table: 'Created', database, attributes: [{ name: 'id', isPrimaryKey: true }] }).primaryStore.rootStore;
+
+	it('opens fenced while the mark exists, and unfenced once it is cleared', () => {
+		markRemoval('epoch-1');
+		assert.equal(removalMarked(), true);
+		const fenced = open('created_during_removal');
+		assert.equal(localWritesFenced(fenced), true);
+		setLocalWriteFence(fenced, false);
+		unmarkRemoval();
+		assert.equal(removalMarked(), false);
+		assert.equal(localWritesFenced(open('created_after_removal')), false);
 	});
 });
