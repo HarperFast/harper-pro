@@ -242,7 +242,7 @@ if (!stressEnabled()) {
 			ok(newPIDs.length <= 1, `expected ≤1 new worker after kill, saw ${newPIDs.length}: ${newPIDs.join(',')}`);
 			ok(goneePIDs.length <= 1, `expected ≤1 worker to have died, saw ${goneePIDs.length}: ${goneePIDs.join(',')}`);
 
-			// (4) B reconnected every database after the kill.
+			// (4) No subscription is left without a worker after the kill.
 			await waitForAllConnected(B, { timeoutMs: 30_000, databases: DATABASES });
 
 			// (5) Crisp invariant: NO ERR_WORKER_OUT_OF_MEMORY or uncaughtException
