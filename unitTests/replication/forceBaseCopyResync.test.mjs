@@ -225,16 +225,17 @@ describe('retainedLogCoversStart', () => {
 	const LOGS = ['local'];
 	const atTracking = () => TRACKED_FROM;
 	const covers = (overrides = {}) => {
-		const { start, oldest, trackedFrom, logs, boundOf, singleLog } = {
+		const { start, oldest, cutoff, trackedFrom, logs, boundOf, singleLog } = {
 			start: 6000,
 			oldest: 1000,
+			cutoff: 2000,
 			trackedFrom: TRACKED_FROM,
 			logs: LOGS,
 			boundOf: atTracking,
 			singleLog: true,
 			...overrides,
 		};
-		return retainedLogCoversStart(start, oldest, trackedFrom, logs, boundOf, singleLog);
+		return retainedLogCoversStart(start, oldest, cutoff, trackedFrom, logs, boundOf, singleLog);
 	};
 
 	it('covers a start below tracking when the retained log reaches back to it and no prune passed tracking', () => {
@@ -256,6 +257,11 @@ describe('retainedLogCoversStart', () => {
 		expect(
 			covers({ logs: ['local', 'other'], boundOf: (name) => (name === 'local' ? TRACKED_FROM : undefined) })
 		).to.equal(false);
+	});
+
+	it('does not cover a start retention cleanup is due to remove', () => {
+		expect(covers({ cutoff: 6001 })).to.equal(false);
+		expect(covers({ cutoff: 6000 })).to.equal(true);
 	});
 
 	it('only covers a start that predates tracking', () => {

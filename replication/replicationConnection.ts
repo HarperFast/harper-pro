@@ -799,19 +799,21 @@ export function predatesPurgeTracking(
  * Whether a single-log store still holds everything after `start` although `start` predates where it began
  * tracking prunes: no tracked prune reached past `trackedFrom`, so the bound is only the resync epoch a store
  * without a floor record is stamped with, and retention removes from the oldest key up, so a log whose oldest
- * retained key is at or below `start` lost nothing after it. A legacy `deleteHistory` that removed one table's
+ * retained key is at or below `start` lost nothing after it. A `start` below the retention cutoff is refused: it is
+ * still in the log only because cleanup has not reached it yet. A legacy `deleteHistory` that removed one table's
  * entries above the oldest retained key is not visible here.
  */
 export function retainedLogCoversStart(
 	start: number,
 	oldestRetainedTime: number | undefined,
+	retentionCutoff: number,
 	trackedFrom: number | undefined,
 	logNames: string[],
 	boundOf: (logName: string) => number | undefined,
 	singleLog: boolean
 ): boolean {
 	if (!singleLog || !(start > 0) || trackedFrom === undefined || !(start < trackedFrom)) return false;
-	if (oldestRetainedTime === undefined || oldestRetainedTime > start) return false;
+	if (oldestRetainedTime === undefined || oldestRetainedTime > start || start < retentionCutoff) return false;
 	for (const log of logNames) {
 		const bound = boundOf(log);
 		if (bound === undefined || bound > trackedFrom) return false;
@@ -10388,19 +10390,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												));
 											if (currentSequenceId > 0) {
 												const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
-												let oldestRetainedTime: number | undefined;
 												// Mirror the replay scope below (single log, or all non-excluded logs) and take the
 												// first (oldest) entry; getRange yields ascending by audit-log key. Use the same key
 												// basis as the replay loop (`txnLogKey`) and retention cleanup.
-												for (const entry of auditStore.getRange({
-													start: 1,
-													log: excludedNodes ? undefined : oldestLogName,
-													excludeLogs: excludedNodes,
-													snapshot: false,
-												})) {
-													oldestRetainedTime = entry.txnLogKey;
-													break;
-												}
+												const readOldestRetainedTime = (): number | undefined => {
+													for (const entry of auditStore.getRange({
+														start: 1,
+														log: excludedNodes ? undefined : oldestLogName,
+														excludeLogs: excludedNodes,
+														snapshot: false,
+													}))
+														return entry.txnLogKey;
+												};
+												const oldestRetainedTime = readOldestRetainedTime();
 												const scopedLogs = purgeBoundLogNames(
 													auditStore,
 													excludedNodes ? undefined : oldestLogName,
@@ -10438,21 +10440,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																getAuditFloor(auditStore)
 															));
 												const forceCopy = forceRetentionCopyForTest(databaseName);
-												let retainedForLegacyCopy = false;
-												if (
-													retentionGap &&
-													!otherGeneration &&
-													!forceCopy &&
+												const coversRetained = (oldest: number | undefined) =>
 													retainedLogCoversStart(
 														currentSequenceId,
-														oldestRetainedTime,
+														oldest,
+														Date.now() - auditRetention,
 														trackedFrom,
 														purgeScope,
 														(name) => purgeBounds?.get(name),
 														auditStore.reusableIterable !== true
-													)
-												) {
-													retainedForLegacyCopy = await probeLegacyCopy();
+													);
+												let retainedForLegacyCopy = false;
+												if (retentionGap && !otherGeneration && !forceCopy && coversRetained(oldestRetainedTime)) {
+													// retention can prune while the probe waits, so the log is read again after it
+													retainedForLegacyCopy = (await probeLegacyCopy()) && coversRetained(readOldestRetainedTime());
 													if (closed || wsClosed) return;
 												}
 												const decision = retentionResumeDecision(
