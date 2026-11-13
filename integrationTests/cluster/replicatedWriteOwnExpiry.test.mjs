@@ -1,7 +1,7 @@
 /**
- * harper-pro#1399 (HarperFast/harper#4390): a replicated write takes only its own expiry. The receiver applies an
- * origin transaction under its first event, so a `Plain` row written after an `Exp` row (table expiration) in one
- * transaction must not take `Exp`'s expiry: the replica would hide it once that passes, while the origin keeps it.
+ * The receiver applies an origin transaction under its first event, so a `Plain` row written after an `Exp` row
+ * (table expiration) in one transaction must not take `Exp`'s expiry: the replica would hide it once that passes,
+ * while the origin keeps it.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal } from 'node:assert';
@@ -32,13 +32,14 @@ function get(node, path, signal) {
 	});
 }
 
+// 1 or 0 rows with this id; -1 for a failed read or a per-record error entry, so neither passes as either.
 function readable(node, table, id, signal) {
 	return sendOperation(
 		node,
 		{ operation: 'search_by_id', database: DATABASE, table, ids: [id], get_attributes: ['id'] },
 		{ signal }
 	).then(
-		(rows) => rows.filter((row) => row?.id === id).length,
+		(rows) => (rows.every((row) => row?.id === id) ? rows.length : -1),
 		() => -1
 	);
 }
@@ -94,10 +95,12 @@ suite('a replicated write takes only its own expiry (harper-pro#1399)', { timeou
 		equal((await get(ctx.A, '/ExpiringThenPlain/after')).status, 200);
 		equal((await get(ctx.A, '/PlainThenExpiring/before')).status, 200);
 		await waitForCondition(
-			async (signal) =>
-				(await readable(ctx.B, 'Plain', 'after', signal)) === 1 &&
-				(await readable(ctx.B, 'Plain', 'before', signal)) === 1,
-			{ timeoutMs: 30_000, description: 'both Plain rows to reach B' }
+			async (signal) => {
+				for (const table of ['Exp', 'Plain'])
+					for (const id of ['after', 'before']) if ((await readable(ctx.B, table, id, signal)) !== 1) return false;
+				return true;
+			},
+			{ timeoutMs: 30_000, description: 'the Exp and Plain rows to reach B' }
 		);
 		await waitForCondition(
 			async (signal) =>
@@ -107,5 +110,6 @@ suite('a replicated write takes only its own expiry (harper-pro#1399)', { timeou
 		equal(await readable(ctx.B, 'Plain', 'after'), 1, 'B keeps the Plain row written after Exp');
 		equal(await readable(ctx.B, 'Plain', 'before'), 1, 'B keeps the Plain row written before Exp');
 		equal(await readable(ctx.A, 'Plain', 'after'), 1, 'A keeps the Plain row written after Exp');
+		equal(await readable(ctx.A, 'Plain', 'before'), 1, 'A keeps the Plain row written before Exp');
 	});
 });
