@@ -33,13 +33,13 @@ import {
 	call,
 	clusterStatusOf,
 	connectMesh,
+	keyHomedOn,
+	lockStats,
 	counter,
 	increments,
-	putCounter,
 	restartStoppedNode,
 	startNode,
 	stopNode,
-	waitForCounter,
 	waitForMesh,
 	waitForRing,
 } from './recordLockShared.mjs';
@@ -54,31 +54,6 @@ const AVAILABLE_BOUND_MS = 120_000;
  * barrier can be last; the promise holds only for a lock whose timeout and lease outlast that.
  */
 const ROLLING_RESTART_LOCK_MS = 120_000;
-
-async function lockStats(node, signal) {
-	return (await clusterStatusOf(node, signal)).recordLocks?.[DB];
-}
-
-/**
- * A fresh key homed on `target`, found by probing from `from` so the hash is never re-implemented here.
- * `from` is left holding a (released) delegation for it, which is what the restart tests need.
- */
-async function keyHomedOn(nodes, target, from, prefix) {
-	for (let i = 0; i < 64; i++) {
-		const id = `${prefix}-${Date.now()}-${i}`;
-		await putCounter(from, id, 0);
-		await waitForCounter(nodes, id, 0);
-		const before = await Promise.all(nodes.map((node) => lockStats(node).then((stats) => stats?.granted ?? 0)));
-		const held = await call(from, 'LockHold/', { id, lease: 5_000, timeout: 10_000 });
-		if (held.status === 503) continue;
-		assert.equal(held.status, 200, JSON.stringify(held.body));
-		await call(from, 'LockRelease/', { token: held.body.token });
-		const after = await Promise.all(nodes.map((node) => lockStats(node).then((stats) => stats?.granted ?? 0)));
-		const home = nodes.findIndex((_, index) => after[index] > before[index]);
-		if (home >= 0 && nodes[home] === target) return id;
-	}
-	throw new Error(`no key homed on ${target.hostname} found in 64 probes`);
-}
 
 function waitForIncarnationAbove(node, previous, description) {
 	return waitForCondition(
