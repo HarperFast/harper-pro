@@ -95,10 +95,7 @@ export class LockRelease extends Resource {
 
 const gates = new Map();
 
-/**
- * POST { id, n, lease? }: take the cluster lock inside the request transaction, wait until GateControl
- * opens this id's gate, then write `n` and commit. The test changes the cluster while the lock is held.
- */
+/** POST { id, n, lease? }: lock, wait for GateControl to open this id's gate, then write `n`. */
 export class GatedLockedWrite extends Resource {
 	async post(data) {
 		const record = await tables.Counter.lock(data.id, lockOptions(data));

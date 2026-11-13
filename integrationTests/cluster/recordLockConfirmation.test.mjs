@@ -1,12 +1,5 @@
-/**
- * `replication.recordLockConfirmation` and `replication.confirmation` end to end (harper-pro#1363).
- *
- * Node A sets `recordLockConfirmation: 1`: a commit holding a cluster lock waits for B's acknowledgement,
- * and with B stopped fails with `replicationUnconfirmed` once `confirmationTimeout` passes, the lock
- * already released. Node B sets `confirmation: 2`, more than the one peer it replicates to, so an
- * unlocked write there is refused before it lands unless it sets its own count. B still joins the cluster
- * and applies A's writes, because the default skips the system database and replication apply.
- */
+// B's `confirmation: 2` is more than the one peer it replicates to. It still joins the cluster and applies
+// A's writes, because the default skips the system database and replication apply.
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -81,7 +74,10 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 
 	test('with the peer stopped, a locked commit fails as unconfirmed after confirmationTimeout and releases the lock', async () => {
 		const id = 'locked-unconfirmed';
-		const writing = call(a, 'GatedLockedWrite/', { id, n: 5, lease: 60_000, timeout: 10_000 });
+		let settled = false;
+		const writing = call(a, 'GatedLockedWrite/', { id, n: 5, lease: 60_000, timeout: 10_000 }).finally(() => {
+			settled = true;
+		});
 		await waitForCondition(async () => ((await call(a, 'GateControl/', { id })).body?.waiting ? true : undefined), {
 			timeoutMs: 30_000,
 			description: 'the gated write to hold its cluster lock',
@@ -89,6 +85,14 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 		await stopNodeProcess(b);
 		const opened = performance.now();
 		assert.equal((await call(a, 'GateControl/', { id, open: true })).body.waiting, true);
+		await waitForCondition(async () => ((await counter(a, id))?.n === 5 ? true : undefined), {
+			timeoutMs: CONFIRMATION_TIMEOUT_MS,
+			description: 'the locked write to commit locally',
+		});
+		// the key goes back at local commit, before the confirmation wait ends
+		assert.equal((await call(a, 'LockOnce/', { id, scope: 'node', timeout: 2_000 })).status, 200);
+		assert.equal((await call(a, 'LockOnce/', { id, timeout: 2_000 })).status, 200);
+		assert.equal(settled, false, 'the locked write was still waiting for confirmation');
 		const result = await writing;
 		const elapsed = performance.now() - opened;
 
@@ -97,12 +101,8 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 		assert.equal(result.body.retryable, false, JSON.stringify(result.body));
 		assert.ok(elapsed >= CONFIRMATION_TIMEOUT_MS - 500, `answered after ${elapsed}ms`);
 		assert.equal((await counter(a, id))?.n, 5, 'the write committed locally');
-
-		// the native key went back at local commit, and this node's delegation still serves the key
-		assert.equal((await call(a, 'LockOnce/', { id, scope: 'node', timeout: 2_000 })).status, 200);
 		assert.equal((await call(a, 'LockOnce/', { id, timeout: 2_000 })).status, 200);
 
-		// an unlocked write on A waits for nothing: the count is scoped to commits holding a cluster lock
 		const started = performance.now();
 		await putCounter(a, 'unlocked-while-peer-down', 1);
 		assert.ok(performance.now() - started < CONFIRMATION_TIMEOUT_MS, 'an unlocked write did not wait');
