@@ -5662,6 +5662,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (!sub) return;
 				tableSubscriptionToReplicator = sub;
 				if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
+				bindReceivingNodeIds();
 			})
 			// This handler is detached — nothing awaits it — so a rejection here would surface as a
 			// process-level unhandled rejection rather than a connection error (the DESIGN item-12 /
@@ -8714,6 +8715,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							tableDecoders[tableId] = { name: tableName, refused: true, decoder };
 							break;
 						}
+						// a database that had no tables when the schema frame came has its first store now
+						if (!auditStore) auditStore = table?.auditStore;
+						bindReceivingNodeIds();
 						// A pool worker never ran the application, so it cannot maintain an index whose resolver the
 						// application assigns; applying here would leave the index silently wrong. Latch inbound off
 						// and drop a decoder from an earlier structure message, so queued frames cannot apply either.
@@ -10230,6 +10234,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!resolvedDatabaseSubscription || closed || wsClosed || connectionSuperseded()) return;
 								tableSubscriptionToReplicator = resolvedDatabaseSubscription;
 								auditStore = tableSubscriptionToReplicator.auditStore;
+								bindReceivingNodeIds();
 								residencySender = subscriptionResidencySender = registerResidencySender(
 									auditStore,
 									databaseName,

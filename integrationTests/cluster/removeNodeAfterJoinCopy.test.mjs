@@ -27,21 +27,27 @@ const nodeConfig = (hostname) => ({
 	},
 });
 
-const ids = (node) =>
-	sendOperation(node, {
-		operation: 'search_by_value',
-		database: 'data',
-		table: TABLE,
-		search_attribute: 'id',
-		search_value: '*',
-		get_attributes: ['id'],
-	}).then(
+const ids = (node, signal) =>
+	sendOperation(
+		node,
+		{
+			operation: 'search_by_value',
+			database: 'data',
+			table: TABLE,
+			search_attribute: 'id',
+			search_value: '*',
+			get_attributes: ['id'],
+		},
+		{ signal }
+	).then(
 		(rows) => rows.map((row) => row.id),
 		() => []
 	);
 
 const holds = (node, id) =>
-	waitForCondition(async () => (await ids(node)).includes(id), { description: `${node.hostname} to hold ${id}` });
+	waitForCondition(async (signal) => (await ids(node, signal)).includes(id), {
+		description: `${node.hostname} to hold ${id}`,
+	});
 
 suite(
 	'a node that joined by copying a database it lacked',
@@ -81,12 +87,12 @@ suite(
 		// before any restart: a reconnect binds the ids from the database that now exists
 		test('records the leader certified floor on the connection that copied the database', async () => {
 			await waitForCondition(
-				async () => {
-					const receipt = await sendOperation(joiner, {
-						operation: 'get_received_origin_floors',
-						origin: leader.hostname,
-						databases: ['data'],
-					});
+				async (signal) => {
+					const receipt = await sendOperation(
+						joiner,
+						{ operation: 'get_received_origin_floors', origin: leader.hostname, databases: ['data'] },
+						{ signal }
+					);
 					return typeof receipt?.data?.closedFloor === 'number';
 				},
 				{ timeoutMs: 30_000, description: `${joiner.hostname} to record a certified floor for ${leader.hostname}` }
