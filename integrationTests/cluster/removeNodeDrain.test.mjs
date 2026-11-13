@@ -61,7 +61,7 @@ suite('remove_node drains a live node', { timeout: 1_200_000, skip: isLMDB && 'R
 		[owner, coOwner, keeper, drained, restarted, forced] = contexts;
 	});
 
-	after(() => stopAndTeardownNodes(contexts.map((context) => context.harper)));
+	after(() => contexts && stopAndTeardownNodes(contexts.map((context) => context.harper)));
 
 	test('a node with writes still held on its link to an owner is removed only once the owner has them', async () => {
 		await pauseLink(drained, owner);

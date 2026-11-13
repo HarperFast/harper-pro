@@ -30,7 +30,7 @@ suite('late older-keyed writes from a non-owner', { timeout: 900_000, skip: isLM
 		[owner, coOwner, replica] = contexts;
 	});
 
-	after(() => stopAndTeardownNodes(contexts.map((context) => context.harper)));
+	after(() => contexts && stopAndTeardownNodes(contexts.map((context) => context.harper)));
 
 	test('an owner that reconnects receives a write committed after a newer-keyed one it already holds', async () => {
 		await put(replica.harper, 'warm-a0');

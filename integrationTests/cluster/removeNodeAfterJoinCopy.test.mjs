@@ -82,7 +82,7 @@ suite(
 			await holds(joiner, 'before-join');
 		});
 
-		after(() => stopAndTeardownNodes([leader, joiner]));
+		after(() => stopAndTeardownNodes([leader, joiner].filter(Boolean)));
 
 		// before any restart: a reconnect sends a new request, which resolves the ids itself now that the database exists
 		test('records the leader certified floor on the connection that copied the database', async () => {
