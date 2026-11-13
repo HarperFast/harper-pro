@@ -748,7 +748,6 @@ const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array
 
 type AwaitingReplication = {
 	txnTime: number;
-	// the database's confirmation marker taken after this write committed; 0 without one
 	marker: number;
 	onConfirm: (nodeName: string) => void;
 	settled: boolean;

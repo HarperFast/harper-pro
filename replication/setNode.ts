@@ -140,7 +140,6 @@ export async function setNode(req: any) {
 		csr,
 		cert_auth,
 		authorization: req.retain_authorization ? req.authorization : null,
-		// the target lifts a removal fence it still holds, as this node does below
 		joining: req.operation !== 'update_node',
 	};
 	if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) targetAddNodeObj.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);

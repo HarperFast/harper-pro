@@ -28,7 +28,6 @@ export class LocalEntries extends Resource {
 	}
 }
 
-// The [seq] rows this node keeps per route: each origin's certified floor and generation as received.
 export class SeqRows extends Resource {
 	static loadAsInstance = false;
 

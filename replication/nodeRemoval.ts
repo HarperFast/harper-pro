@@ -218,7 +218,6 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 	}
 	const state: FenceState['state'] = request.finalize !== undefined || wasRemoving ? 'removing' : 'fenced';
 	const result: FenceState = { node: thisNode, epoch, state, databases: {} };
-	// refusals (a shard only this node owns) come before any fence is set
 	const required = new Map([...roots.keys()].map((database) => [database, requiredPeers(database, thisNode)]));
 	const targets = new Map<any, number>();
 	for (const [database, auditStores] of roots) {
