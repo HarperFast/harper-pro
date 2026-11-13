@@ -91,7 +91,6 @@ export function nextEpoch(
 	return { after: recoveryStart(lastKey, purgeBound, previous), lastKey: held, before, requiredPeers };
 }
 
-/** Peers that have sent this database here. */
 function peersWithCursors(dbisDB: any, auditStore: any): string[] {
 	const names = new Set<string>();
 	for (const { key } of dbisDB.getRange({
@@ -106,7 +105,6 @@ function peersWithCursors(dbisDB: any, auditStore: any): string[] {
 	return [...names];
 }
 
-/** Own lineage on `database` stays unprovable in this process and the workers it starts. */
 export function markOwnOriginRecoveryFailed(database: string): void {
 	failedDatabases.add(database);
 	process.env[FAILED_ENV] = [...failedDatabases].join('\n');
@@ -120,8 +118,9 @@ export function markOwnOriginRecoveryFailed(database: string): void {
  */
 export function openOwnOriginRecoveryEpoch(database: string, auditStore: any, dbisDB: any): Promise<void> | undefined {
 	const rootStore = auditStore?.rootStore;
-	if (auditStore?.reusableIterable !== true || !dbisDB || typeof rootStore?.getMonotonicTimestamp !== 'function')
-		return undefined;
+	if (auditStore?.reusableIterable !== true) return undefined;
+	if (!dbisDB || typeof rootStore?.getMonotonicTimestamp !== 'function' || typeof rootStore.syncWal !== 'function')
+		throw new Error(`${database} has per-origin logs but no store to record a recovery epoch in`);
 	const before = rootStore.getMonotonicTimestamp();
 	const requiredPeers = peersWithCursors(dbisDB, auditStore);
 	let epoch: OwnOriginEpoch;
@@ -142,7 +141,7 @@ export function openOwnOriginRecoveryEpoch(database: string, auditStore: any, db
 	logger.info?.(
 		`Own-origin recovery for ${database}: asking peers for this node's writes after ${new Date(epoch.after).toISOString()}`
 	);
-	return rootStore.syncWal?.();
+	return rootStore.syncWal();
 }
 
 function readEpoch(dbisDB: any): OwnOriginEpoch | undefined {
@@ -174,7 +173,7 @@ function purgedPastLog(report: OwnOriginReport, epoch: OwnOriginEpoch): boolean 
 }
 
 function cleanReport(report: OwnOriginReport | undefined, epoch: OwnOriginEpoch): boolean {
-	return report?.epoch === epoch.before && !report.failed && !purgedPastLog(report, epoch);
+	return report?.epoch === epoch.before && !purgedPastLog(report, epoch);
 }
 
 /**
@@ -207,8 +206,8 @@ async function recordReport(database: string, peer: string, report: OwnOriginRep
 	logger.info?.(`Own-origin recovery for ${database}: every peer returned this node's writes`);
 }
 
-/** Per database: the epoch row (fixed once workers run) and the peers known to have reported cleanly for it. */
-const cachedEpochs = new Map<string, { epoch: OwnOriginEpoch | undefined; clean: Set<string> }>();
+// the epoch row is fixed once workers run, and a clean report is never replaced within its epoch
+const cachedEpochs = new Map<string, { epoch: OwnOriginEpoch; clean: Set<string> }>();
 
 /**
  * Whether this node's own history is proven at `position` (null: anywhere, for a grant whose lineage the
@@ -228,11 +227,14 @@ export function ownLineage(
 		return { state: 'unprovable', detail: 'its recovery epoch could not be recorded at startup' };
 	let cached = cachedEpochs.get(database);
 	if (!cached) {
-		cached = { epoch: readEpoch(dbisFor(database)), clean: new Set() };
+		const epoch = readEpoch(dbisFor(database));
+		// a database created since this start has no epoch and nothing to have lost
+		if (!epoch) return { state: 'intact' };
+		cached = { epoch, clean: new Set() };
 		cachedEpochs.set(database, cached);
 	}
 	const { epoch, clean } = cached;
-	if (!epoch || (position !== null && position >= epoch.before)) return { state: 'intact' };
+	if (position !== null && position >= epoch.before) return { state: 'intact' };
 	return lineageFromReports(
 		epoch,
 		homes,
@@ -262,10 +264,7 @@ export function lineageFromReports(
 		if (!memberCheck(peer)) continue;
 		if (report?.epoch !== epoch.before)
 			return { state: 'pending', detail: `${peer} has not returned this node's writes since it restarted` };
-		return {
-			state: 'unprovable',
-			detail: `${peer} ${report.failed ? 'could not read' : 'had purged'} this node's writes in the recovery window`,
-		};
+		return { state: 'unprovable', detail: `${peer} had purged this node's writes in the recovery window` };
 	}
 	return { state: 'intact' };
 }

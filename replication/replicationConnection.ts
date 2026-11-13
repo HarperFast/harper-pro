@@ -8949,8 +8949,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								return onFrameFailure(error, position);
 							},
 							onCommit() {
-								if (!connectionSuperseded())
-									settleOwnOriginReport(reportDatabase, peer, report, rootStore, askOwnOriginAgain);
+								// a returned row is recovered only once its blobs are saved
+								Promise.allSettled(outstandingBlobsToFinish.slice()).then(() => {
+									if (connectionSuperseded()) return;
+									if (hasBlobGap) askOwnOriginAgain();
+									else settleOwnOriginReport(reportDatabase, peer, report, rootStore, askOwnOriginAgain);
+								});
 							},
 						};
 						if (tableSubscriptionToReplicator.send(barrierEvent) === false) askOwnOriginAgain();
@@ -9414,8 +9418,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							? data.filter((node) => node.name === getThisNodeName())
 							: data;
 						const excludedNodes: string[] | undefined = restrictedSendingOrigins ? undefined : message[2]; // use the third argument for exclusion list
-						// The receiver's own writes it asks back after a restart: served from that origin's log alone,
-						// never folded into the replay start, retention decision or log choice (harper-pro#1364).
 						const ownOriginRange = excludedNodes
 							? findOwnOriginRecoveryRange(
 									nodeSubscriptions,

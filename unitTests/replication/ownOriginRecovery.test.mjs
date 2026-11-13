@@ -75,9 +75,7 @@ describe('lineageFromReports', () => {
 		const peersOnly = { b: clean, c: clean };
 		assert.strictEqual(lineageFromReports(epoch, ['d'], 'self', (p) => peersOnly[p], member).state, 'pending');
 	});
-	it('is unprovable when a peer could not read the log or purged past everything this node still held', () => {
-		const failed = { b: clean, c: { epoch: epoch.before, failed: true } };
-		assert.strictEqual(lineageFromReports(epoch, [], 'self', (p) => failed[p], member).state, 'unprovable');
+	it('is unprovable when a peer purged past everything this node still held', () => {
 		const purged = { b: clean, c: { epoch: epoch.before, purgedThrough: NOW + 1 } };
 		assert.strictEqual(lineageFromReports(epoch, [], 'self', (p) => purged[p], member).state, 'unprovable');
 	});

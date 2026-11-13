@@ -436,11 +436,11 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			}
 			if (waits.size + ownWaits + origins.length + (ownIntact ? 0 : 1) > MAX_OUTSTANDING_BARRIERS)
 				reject('capacity', `too many record lock barriers are outstanding for ${database}`);
-			const [positions] = await Promise.all([
-				Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono))),
-				ownIntact ? undefined : awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono),
-			]);
-			if (!ownIntact && closed) throw unavailable(`record lock freshness for ${database} is closed`);
+			const barriers = Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono)));
+			const positions = ownIntact
+				? await barriers
+				: (await Promise.all([barriers, awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono)]))[0];
+			if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
 			if (dependencies === null) return origins.map((origin, index) => [origin, positions[index]] as const);
 		},
 		noteBarrierApplied(origin, position, nonce) {
