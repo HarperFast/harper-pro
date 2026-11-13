@@ -6446,6 +6446,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// An update queued before a hole was marked takes its floors at commit: a holed origin's floor must not commit
 	// ahead of the durable hole mark and satisfy a removal receipt for the write this node skipped.
 	function dropHoledFloors() {
+		if (holedOrigins.size === 0) return;
 		for (const id of holedOrigins.keys()) pendingOriginFloors.drop(id);
 	}
 	function seqUpdateEndTxn(seqId: number, originFloors?: ReceivedOriginFloor[], releasePending = false): any {
@@ -13042,14 +13043,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// A source that still holds the bytes (a transient failure escalated past its budget) leaves a
 						// write this node lacks, so no floor of this route may vouch for it. A blob the source reports
 						// gone is gone there too: a receipt for that origin loses nothing more.
-						if (escalation)
-							await recordReplicationHole(
+						if (
+							escalation &&
+							!(await recordReplicationHole(
 								originId,
 								tableName ?? ANY_TABLE,
 								'blob its source could not send',
 								undefined,
 								false
-							);
+							))
+						) {
+							// the hole was not recorded and the connection is closing: hold, so the reconnect re-streams it
+							hasBlobGap = true;
+							copyBlobGapped = true;
+							return;
+						}
 						logger.error?.(
 							escalation
 								? `Blob ${blobId} for record ${id} stayed transiently unavailable at source ${remoteNodeName} (${errorToString(err)}) — ` +
