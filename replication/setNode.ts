@@ -258,7 +258,7 @@ export async function setNode(req: any) {
 	if (req.operation === 'update_node') {
 		message = `Successfully updated '${url}'`;
 	} else {
-		await liftFenceAfterRemoval();
+		await liftFenceAfterRemoval(false);
 		message = `Successfully added '${url}' to cluster`;
 	}
 	if (targetNodeResponseError) {
@@ -340,7 +340,7 @@ export async function addNodeBack(req) {
 		await ensureNode(getThisNodeName(), thisNode);
 	}
 	await ensureNode(req.hostname, nodeRecord);
-	if (req.joining === true) await liftFenceAfterRemoval();
+	if (req.joining === true) await liftFenceAfterRemoval(false);
 	certs.nodeName = getThisNodeName();
 
 	certs.usingCA = repCa?.certificate; // in addition to the signed CA, we need to return the CA that is being used for the active certificate
@@ -456,7 +456,7 @@ export async function removeNodeBackFromTable(req, hdbNodes) {
 export async function removeNodeBack(req) {
 	hdbLogger.trace('removeNodeBack received request:', req);
 	await removeNodeBackFromTable(req, getHDBNodeTable());
-	await liftFenceAfterRemoval();
+	await liftFenceAfterRemoval(true);
 }
 
 function reverseSubscription(subscription) {

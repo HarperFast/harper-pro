@@ -139,7 +139,7 @@ The wait has a limit (`timeout`, five minutes by default). When it runs out, the
 - `hostname` _(required)_ — hostname of the node to remove
 - `timeout` _(optional)_ — milliseconds to wait for the node's writes to reach its peers; default `300000`
 - `force` _(optional)_ — remove without fencing the node or waiting; writes only it holds may be lost
-- `cancel` _(optional)_ — stop a removal that timed out: the node accepts local writes again and stays a member. Refused once the removal has been finalized, just before the membership is deleted; then run `remove_node` again to complete it.
+- `cancel` _(optional)_ — stop a removal that timed out: the node accepts local writes again and stays a member. Refused once the removal has been finalized, just before the membership is deleted; then run `remove_node` again to complete it. If a removal completed but the removed node never received its notice (it was unreachable), it keeps refusing local writes: run `remove_node_fence` on that node with `node` set to its own name, `cancel: true` and `force: true`.
 
 **Request**:
 

@@ -162,9 +162,14 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 	for (const [database, auditStores] of roots)
 		for (const auditStore of auditStores) assertDrainable(database, auditStore);
 	const fences = [...roots.values()].flat().map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
+	const wasRemoving = fences.some((fence) => fence.state === 'removing');
 	if (request.cancel) {
-		if (fences.some((fence) => fence.state === 'removing'))
-			throw new ClientError(`${thisNode}'s removal was finalized; complete it with remove_node`, 409);
+		// `force` is the operator's word that the removal finished but its notice never arrived
+		if (wasRemoving && request.force !== true)
+			throw new ClientError(
+				`${thisNode}'s removal was finalized; complete it with remove_node, or, if it was already removed, run ${FENCE_OPERATION} with cancel and force on it`,
+				409
+			);
 		await clearFences(roots);
 		hdbLogger.notify(`Removal of ${thisNode} from its cluster was cancelled; local writes are accepted again`);
 		return { cancelled: true };
@@ -180,9 +185,11 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 		if (request.finalize !== epoch || !fenced || expected.size !== roots.size)
 			throw new ClientError(`${thisNode}'s fence changed since its receipts were collected; retry the removal`, 409);
 	}
-	const state: FenceState['state'] =
-		request.finalize !== undefined || fences.some((fence) => fence.state === 'removing') ? 'removing' : 'fenced';
+	const state: FenceState['state'] = request.finalize !== undefined || wasRemoving ? 'removing' : 'fenced';
 	const result: FenceState = { node: thisNode, epoch, state, databases: {} };
+	// refusals (a shard only this node owns) come before any fence is set
+	const required = new Map([...roots.keys()].map((database) => [database, requiredPeers(database, thisNode)]));
+	const targets = new Map<any, number>();
 	for (const [database, auditStores] of roots) {
 		let target = 0;
 		for (const auditStore of auditStores) {
@@ -192,20 +199,32 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 			const fenceTarget =
 				existing && isValidFloor(existing.target) ? existing.target : setLocalWriteFence(rootStore, true);
 			if (existing && !localWritesFenced(rootStore)) setLocalWriteFence(rootStore, true);
-			if (existing?.epoch !== epoch || existing.state !== state || existing.target !== fenceTarget)
+			// finalize always persists: a retry after a failed WAL sync must not report an unsynced state
+			if (
+				request.finalize !== undefined ||
+				existing?.epoch !== epoch ||
+				existing.state !== state ||
+				existing.target !== fenceTarget
+			)
 				await persistLocalWriteFence(auditStore, { epoch, target: fenceTarget, state });
+			targets.set(auditStore, fenceTarget);
 			if (fenceTarget > target) target = fenceTarget;
 		}
-		const { peers, sharded } = requiredPeers(database, thisNode);
+		const { peers, sharded } = required.get(database)!;
 		const generation = getDatabaseGeneration(auditStores[0])?.id;
 		result.databases[database] = { target, sharded, peers, ...(typeof generation === 'string' ? { generation } : {}) };
 	}
 	// a database created while finalize ran is neither fenced nor receipted; the next round covers it
 	if (request.finalize !== undefined) {
 		const known = new Set([...roots.values()].flat());
-		for (const auditStores of databaseRoots().values())
-			if (auditStores.some((auditStore) => !known.has(auditStore)))
-				throw new ClientError(`A database was created on ${thisNode} while its removal was finalized; retry`, 409);
+		const created = [...databaseRoots().values()].flat().some((auditStore) => !known.has(auditStore));
+		if (created) {
+			// back to cancellable, as before this finalize
+			if (!wasRemoving)
+				for (const [auditStore, target] of targets)
+					await persistLocalWriteFence(auditStore, { epoch, target, state: 'fenced' });
+			throw new ClientError(`A database was created on ${thisNode} while its removal was finalized; retry`, 409);
+		}
 	}
 	if (fences.length === 0)
 		hdbLogger.notify(`${thisNode} is being removed from its cluster: local writes are now refused`);
@@ -221,15 +240,20 @@ async function clearFences(roots: Map<string, any[]>): Promise<void> {
 }
 
 /**
- * Lift this node's fence, in any state, once a peer has removed it (`remove_node_back`) or it joins a cluster again
- * (`add_node`): what it writes from then on is its own, or replicates to its new peers. Without this a node removed
- * after a finalize, or with `force` after a timeout, refuses local writes for good.
+ * Lift this node's fence once a peer has removed it (`remove_node_back`, any state), or when it joins a cluster
+ * (`add_node`, `add_node_back`), unless a removal was finalized: then only its removal notice, or a forced cancel,
+ * lifts it, since its receipts were taken under the fence. Without this a node removed after a finalize, or with
+ * `force` after a timeout, refuses local writes for good.
  */
-export async function liftFenceAfterRemoval(): Promise<void> {
+export async function liftFenceAfterRemoval(removed: boolean): Promise<void> {
 	await withFenceLock(async () => {
 		const roots = databaseRoots();
-		const fenced = [...roots.values()].flat().some((auditStore) => readLocalWriteFence(auditStore));
-		if (!fenced) return;
+		const stores = [...roots.values()].flat();
+		const fences = stores.map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
+		// a clear whose WAL sync failed leaves the word set with no record
+		if (fences.length === 0 && !stores.some((auditStore) => localWritesFenced(auditStore.rootStore ?? auditStore)))
+			return;
+		if (!removed && fences.some((fence) => fence.state === 'removing')) return;
 		await clearFences(roots);
 		hdbLogger.notify(`${getThisNodeName()} left its cluster; local writes are accepted again`);
 	});
@@ -246,7 +270,7 @@ export async function getReceivedOriginFloors(request: any): Promise<Record<stri
 	if (!Array.isArray(request.databases) || request.databases.some((name: unknown) => typeof name !== 'string'))
 		throw new ClientError('databases must be an array of database names', 400);
 	const answers: Record<string, ReceivedFloor> = {};
-	const synced = new Set<any>();
+	const roots = new Set<any>();
 	for (const database of new Set<string>(request.databases)) {
 		answers[database] = { closedFloor: null };
 		if (receivesDirectlyFrom(origin, database) === false) {
@@ -276,12 +300,13 @@ export async function getReceivedOriginFloors(request: any): Promise<Record<stri
 		// a database can keep tables in more than one root; the receipt vouches for the records in each
 		for (const tableName in tables) {
 			const tableAudit = tables[tableName]?.auditStore;
-			const rootStore = tableAudit?.rootStore ?? tableAudit;
-			if (!rootStore || synced.has(rootStore)) continue;
-			synced.add(rootStore);
-			if (typeof rootStore.syncWal === 'function') await rootStore.syncWal();
-			else rootStore.flushSync?.({ allowWriteStall: true });
+			if (tableAudit) roots.add(tableAudit.rootStore ?? tableAudit);
 		}
+	}
+	// every floor is read before any sync, so each answer is covered by one
+	for (const rootStore of roots) {
+		if (typeof rootStore.syncWal === 'function') await rootStore.syncWal();
+		else rootStore.flushSync?.({ allowWriteStall: true });
 	}
 	return answers;
 }
@@ -344,7 +369,13 @@ export async function drainNode(
 		if (remaining() <= MIN_CALL_MS) throw new OutOfBudget();
 		if (target === thisNode) {
 			const request = { ...operation, hdb_user: { name: thisNode, role: { permission: { super_user: true } } } };
-			return operation.operation === FENCE_OPERATION ? removeNodeFence(request) : getReceivedOriginFloors(request);
+			const local =
+				operation.operation === FENCE_OPERATION ? removeNodeFence(request) : getReceivedOriginFloors(request);
+			let timer: ReturnType<typeof setTimeout>;
+			const deadlinePassed = new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new OutOfBudget()), remaining());
+			});
+			return Promise.race([local, deadlinePassed]).finally(() => clearTimeout(timer));
 		}
 		const response = await sendOperation(peerRecord, operation, { timeoutMs: Math.min(CALL_TIMEOUT_MS, remaining()) });
 		return response?.results ?? response;
@@ -376,6 +407,7 @@ export async function drainNode(
 			for (const peer of drain.peers) byPeer.set(peer, [...(byPeer.get(peer) ?? []), database]);
 		const round: string[] = [];
 		const holders: Record<string, string[]> = {};
+		const notSubscribed: Record<string, number> = {};
 		let budgetSpent = false;
 		for (const [peer, peerDatabases] of byPeer) {
 			let answers: Record<string, ReceivedFloor>;
@@ -394,7 +426,10 @@ export async function drainNode(
 				continue;
 			}
 			for (const database of peerDatabases) {
-				if (answers?.[database]?.receives === false) continue;
+				if (answers?.[database]?.receives === false) {
+					notSubscribed[database] = (notSubscribed[database] ?? 0) + 1;
+					continue;
+				}
 				const shortfall = receiptShortfall(answers?.[database], fence.databases[database]);
 				if (shortfall) round.push(`${peer} ${shortfall} in database ${database}`);
 				else (holders[database] ??= []).push(peer);
@@ -405,6 +440,13 @@ export async function drainNode(
 			if (shortfalls.length === 0) shortfalls = round;
 			break;
 		}
+		// every peer it sends a replicated database to said it does not subscribe: its writes there exist only on it
+		for (const [database, drain] of Object.entries(fence.databases))
+			if (drain.peers.length > 0 && notSubscribed[database] === drain.peers.length)
+				throw new ClientError(
+					`No peer of ${name} receives database ${database} from it, so its writes there exist only on ${name}; use force: true to remove it anyway`,
+					409
+				);
 		shortfalls = round;
 		if (shortfalls.length === 0) {
 			try {

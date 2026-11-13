@@ -35,7 +35,9 @@ import {
 	clearReplicationSharedStatus,
 	type Route,
 	getNodeURL,
+	selfNodeReplicates,
 } from './knownNodes.ts';
+import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 import {
 	RECEIVING_STATUS_POSITION,
 	RECEIVING_STATUS_RECEIVING,
@@ -1014,13 +1016,26 @@ export function computeExclusionOrigins(databaseName: string): string[] {
 }
 
 /**
- * Whether this node subscribes to `databaseName` directly from `nodeName`; undefined off the main thread, where the
- * configured routes that take precedence over the peer's row are not loaded.
+ * Whether this node subscribes to `databaseName` directly from `nodeName`. Off the main thread the configured routes,
+ * which take precedence over the peer's row, are not loaded, so it answers false only for what routes cannot change
+ * (no row for the peer, a database this node does not replicate with it) and undefined otherwise.
  */
 export function receivesDirectlyFrom(nodeName: string, databaseName: string): boolean | undefined {
 	const node = getHDBNodeTable().primaryStore.getSync(nodeName);
 	if (!node) return false;
-	if (!isMainThread) return undefined;
+	if (!isMainThread) {
+		if (isExplicitDatabaseSubscription(node.subscriptions, databaseName)) return undefined;
+		const replicatesWith =
+			(Boolean(getDatabases()[databaseName]) || Boolean(node.isLeader)) &&
+			isReplicatedDatabase(
+				env.get(CONFIG_PARAMS.REPLICATION_DATABASES),
+				databaseName,
+				() => node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD),
+				false
+			) &&
+			selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
+		return replicatesWith ? undefined : false;
+	}
 	const matchingRoute = routes.find((route) => route.name === nodeName);
 	const routeReplicates =
 		typeof matchingRoute?.replicates === 'object'

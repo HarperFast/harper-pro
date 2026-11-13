@@ -169,6 +169,22 @@ describe('drainNode', () => {
 		assert.deepEqual(result.databases.data.peers, ['p1']);
 	});
 
+	it('refuses when no peer the node sends a database to subscribes to it', async () => {
+		const send = transport((node, operation) => {
+			if (operation.operation === FENCE_OPERATION) return fence();
+			return { data: { closedFloor: null, receives: false } };
+		});
+		await assert.rejects(
+			drainNode('leaving', { name: 'leaving' }, 5000, send, async (peer) => ({ name: peer })),
+			(error) => {
+				assert.equal(error.statusCode, 409);
+				assert.match(error.message, /No peer of leaving receives database data/);
+				return true;
+			}
+		);
+		assert.ok(!send.calls.some(({ operation }) => operation.finalize));
+	});
+
 	it('never calls a peer with less than a usable budget left, keeping the last complete round', async () => {
 		const send = transport(async (node, operation) => {
 			if (operation.operation === FENCE_OPERATION) return fence();

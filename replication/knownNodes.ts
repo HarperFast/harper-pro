@@ -803,7 +803,7 @@ export function confirmationDemand(auditStore: any, databaseName: string, callba
 }
 
 /** Whether a peer's shared status shows it holds the write `waiter` is waiting on. */
-export function peerConfirms(status: Float64Array, waiter: { txnTime: number; marker: number }): boolean {
+function peerConfirms(status: Float64Array, waiter: { txnTime: number; marker: number }): boolean {
 	const support = status[PEER_CONFIRMATION_MARKERS_POSITION];
 	if (support === CONFIRMATION_MARKERS_SUPPORTED)
 		return waiter.marker > 0 && status[ACKED_CONFIRMATION_MARKER_POSITION] >= waiter.marker;

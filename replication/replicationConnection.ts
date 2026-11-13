@@ -10122,6 +10122,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								const lastKnownGenerations = new Map<string, string>();
 								const revokedSent = new Set<string>();
 								let floorEmissionLatchedRange: unknown;
+								let markersLatchedRange: unknown;
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
 								const originCertifies = (name: string): number => {
@@ -11006,11 +11007,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										let markersProven = false;
 										if (demand) {
 											const liveRange: any = auditLogIterable;
-											// a scan that may have skipped an entry proves nothing about what it sent
-											markersProven =
-												!(boundaryLogName && liveRange?.exactStartFailures?.size > 0) &&
-												!(liveRange?.failedLogs?.size > 0) &&
-												!(liveRange?.corruptFrameStop?.breaks > 0);
+											// a scan that may have skipped an entry proves nothing about what this range sends after it
+											if (
+												(boundaryLogName && liveRange?.exactStartFailures?.size > 0) ||
+												liveRange?.failedLogs?.size > 0 ||
+												liveRange?.corruptFrameStop?.breaks > 0
+											)
+												markersLatchedRange = liveRange;
+											markersProven = markersLatchedRange !== liveRange;
 											if (markersProven && passMarker > lastConfirmationMarkerSent && !closed && !wsClosed) {
 												ws.send(encode([CONFIRMATION_MARKER, passMarker]));
 												lastConfirmationMarkerSent = passMarker;
