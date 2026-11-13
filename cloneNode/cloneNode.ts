@@ -54,6 +54,7 @@ import {
 	reusableCloneAttemptId,
 } from './cloneAttempt.ts';
 import { createBackoff } from '../replication/backoff.ts';
+import { CONFIG_TO_EXCLUDE_FROM_CLONE } from './configExclusions.ts';
 import {
 	isExplicitDatabaseSubscription,
 	isReplicatedDatabase as isReplicatedDatabaseUnder,
@@ -76,8 +77,9 @@ import {
  * - HDB_LEADER_TOKEN: JWT authentication token for the leader node
  *
  * Optional:
- * - CLONE_SHARD: This node's shard, a number or "auto". Required when the leader is sharded, since a clone never
- *   inherits the leader's shard; "auto" picks the listed shard with the fewest live members
+ * - CLONE_SHARD: This node's shard: a number, "auto" or "replica". Required when the leader is sharded, since a clone
+ *   never inherits the leader's shard; "auto" picks the shard owning slots with the fewest live members, and "replica"
+ *   a spare shard owning no slots
  * - CLONE_SSH_KEYS: Clone SSH keys from leader (default: true)
  * - CLONE_JWT_KEYS: Clone JWT keys from leader (default: true)
  * - ALLOW_SELF_SIGNED: Allow self-signed certificates to be used for authentication (default: false)
@@ -107,7 +109,7 @@ import {
  * --sync-timeout: Sync stall timeout in milliseconds — the clone fails only if no replication
  *   data arrives for this long, not on total elapsed time. Intended for minutes-scale values;
  *   arrival stamps have second precision (default: max(300000, 2 x replication.copyTimeout))
- * --shard: This node's shard, a number or "auto"; see CLONE_SHARD
+ * --shard: This node's shard, a number, "auto" or "replica"; see CLONE_SHARD
  * --skip-ssh-keys: Skip cloning SSH keys (default: false)
  * --skip-jwt-keys: Skip cloning JWT keys (default: false)
  * --force-clone: Force clone even if node exists (default: false)
@@ -123,35 +125,6 @@ const VERSION_PROBE_MAX_DELAY_MS = 4000;
 const MIN_MAX_CLONE_DURATION_MS = 3600000;
 const DEFAULT_REPLICATION_PORT = '9933';
 const CLONE_ATTEMPT_ENV = 'HARPER_CLONE_ATTEMPT';
-
-const CONFIG_TO_EXCLUDE_FROM_CLONE = {
-	clustering_nodename: true,
-	clustering_leafserver_streams_path: true,
-	clustering_tls_certificate: true,
-	clustering_tls_privatekey: true,
-	clustering_tls_certificateauthority: true,
-	logging_file: true,
-	logging_root: true,
-	logging_rotation_path: true,
-	operationsapi_network_domainsocket: true,
-	operationsapi_tls_certificate: true,
-	operationsapi_tls_privatekey: true,
-	operationsapi_tls_certificateauthority: true,
-	rootpath: true,
-	storage_path: true,
-	storage_audit_path: true,
-	databases: true,
-	mqtt_network_mtls_certificateauthority: true,
-	componentsroot: true,
-	tls_certificate: true,
-	tls_privatekey: true,
-	tls_certificateauthority: true,
-	replication_hostname: true,
-	replication_url: true,
-	replication_shard: true,
-	cloned: true,
-	node_hostname: true,
-};
 
 type ParsedValues = {
 	'leader-url'?: string;
@@ -487,12 +460,13 @@ async function establishReplicationSetup(syncStartedAt: number, priorMarker?: Sy
 		throw new Error('Leader config data check failed: rootPath is missing from leader config response');
 	}
 	const leaderStatus = await leaderClusterStatus();
-	const { shard, description } = resolveShard(leaderConfigData, leaderStatus, priorMarker);
+	const { databases: shardedDatabases, maps } = await readLeaderShardMaps(leaderStatus);
+	const { shard, description } = resolveShard(leaderConfigData, leaderStatus, maps, priorMarker);
 	log(`Clone shard: ${description}`);
 
 	// Before the config or any application reaches disk. If this fails and the node restarts with them already
 	// there, boot activates the @sharded component with a default map that conflicts with a custom one.
-	const shardedDatabases = await cloneShardMaps(leaderStatus);
+	await installLeaderShardMaps(maps);
 	shardRecord = { shardAware: true, shard, shardedDatabases };
 	writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
 
@@ -1220,7 +1194,12 @@ function localShardConfiguration(): { effective: unknown; fileOnly: boolean } {
 	};
 }
 
-function resolveShard(leaderConfigData: Record<string, any>, leaderStatus: any, priorMarker?: SyncStartedMarker) {
+function resolveShard(
+	leaderConfigData: Record<string, any>,
+	leaderStatus: any,
+	leaderMaps: any[],
+	priorMarker?: SyncStartedMarker
+) {
 	const { effective, fileOnly } = localShardConfiguration();
 	return chooseCloneShard({
 		requested: requestedShard,
@@ -1229,33 +1208,38 @@ function resolveShard(leaderConfigData: Record<string, any>, leaderStatus: any, 
 		configuredUnproven: fileOnly && priorMarker !== undefined && !priorMarker.shardAware,
 		leaderShard: leaderConfigData.replication?.shard,
 		leaderShards: leaderConfigData.replication?.shards,
+		leaderSpareShards: leaderConfigData.replication?.spareShards,
 		leaderStatus,
+		leaderMaps,
 		thisNode: nodeHostname,
 	});
 }
 
 /**
- * Install the leader's exact shard maps before this node declares anything: a declaration with no map would start
- * one of its own, which the leader's then conflicts with, and a plain table left by an earlier attempt could not
- * activate at all. Returns every database the leader reports as sharded. Reading "none" after a failed read would
- * recreate that, so a failure stops the clone.
+ * The shard choice reads which shards own slots from these maps, and they are installed before this node declares
+ * anything: a declaration with no map would start a default one that conflicts with the leader's, and a plain table
+ * left by an earlier attempt could not activate at all. Reading "none" after a failed read would recreate that.
  */
-async function cloneShardMaps(leaderStatus: any): Promise<string[]> {
+async function readLeaderShardMaps(leaderStatus: any): Promise<{ databases: string[]; maps: any[] }> {
 	const databases = Object.keys(leaderStatus?.sharding ?? {});
-	if (!databases.length) return databases;
-	const maps = await leaderRequest({
+	if (!databases.length) return { databases, maps: [] };
+	const answer = await leaderRequest({
 		operation: OPERATIONS_ENUM.SEARCH_BY_ID,
 		database: SYSTEM_SCHEMA_NAME,
 		table: SYSTEM_TABLE_NAMES.RESIDENCY_SLOTS_TABLE_NAME,
 		ids: databases,
 		get_attributes: ['*'],
 	});
+	return { databases, maps: requireLeaderMaps(databases, answer) };
+}
+
+async function installLeaderShardMaps(maps: any[]): Promise<void> {
+	if (!maps.length) return;
 	const { installResidencyMap } = await import('../core/resources/residencyMaps.ts');
-	for (const map of requireLeaderMaps(databases, maps)) {
+	for (const map of maps) {
 		await installResidencyMap(map);
 		log(`Installed the leader's shard map for '${map.database}' (version ${map.version}, ${map.digest})`);
 	}
-	return databases;
 }
 
 function cloneConfig(leaderConfigData: Record<string, any>, shard: number | undefined): void {

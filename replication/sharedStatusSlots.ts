@@ -60,6 +60,8 @@ export const STUCK_COPY_REASON_POSITION = allocate();
 export const STUCK_COPY_COUNT_POSITION = allocate();
 export const STUCK_COPY_SINCE_POSITION = allocate();
 export const STUCK_COPY_RETRY_AT_POSITION = allocate();
+// The address the current outbound subscription socket dialed (privatePaths.ts PATH_*); 0 before any handshake.
+export const CONNECTION_PATH_POSITION = allocate();
 // Written only by the connection sending this node's own log to the peer. The peer's `confirmationMarkers` support:
 // 0 unknown (no sending socket yet), 1 unsupported, 2 supported; and the highest marker it has acknowledged.
 export const PEER_CONFIRMATION_MARKERS_POSITION = allocate();
@@ -82,3 +84,8 @@ export function assertAllocationFits(allocated: number, capacity: number): void 
 assertAllocationFits(ALLOCATED_SLOTS, REPLICATION_SHARED_STATUS_SLOTS);
 
 export const CONNECTION_STATE_CONNECTED = 2;
+
+export const PATH_PUBLIC = 1;
+export const PATH_PRIVATE = 2;
+// The peer advertises a private URL on this node's network, but it is down on the dialing thread.
+export const PATH_PUBLIC_FALLBACK = 3;

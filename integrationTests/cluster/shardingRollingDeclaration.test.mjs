@@ -4,7 +4,14 @@ import { cp, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, postOperation, waitForCondition, stopAndTeardownNodes, readLog } from './clusterShared.mjs';
+import {
+	sendOperation,
+	postOperation,
+	waitForCondition,
+	stopAndTeardownNodes,
+	readLog,
+	restartHttpWorkers,
+} from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '../../dist/bin/harper.js');
 const fixture = join(import.meta.dirname, 'fixture-sharding-rolling');
@@ -142,7 +149,7 @@ suite('Rolling local sharding declaration', { timeout: 360_000 }, (ctx) => {
 					'type RollingRows @table @export @sharded(slots: 2, slotFrom: "Number(id)")'
 				)
 			);
-			await sendOperation(node, { operation: 'restart_service', service: 'http_workers' });
+			await restartHttpWorkers(node);
 			const workers = new Set();
 			await waitForCondition(
 				async (signal) => {

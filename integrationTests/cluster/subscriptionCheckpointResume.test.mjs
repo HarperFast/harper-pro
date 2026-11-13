@@ -109,6 +109,9 @@ const waitForRecord = (node, id) =>
 		description: `${id} to reach ${node.hostname}`,
 	});
 
+const checkpointGrade = (state) =>
+	state?.closedFloor > 0 && typeof state.originGeneration === 'string' && state.fullCoverage === true;
+
 function waitForState(node, peer, origin, predicate, what) {
 	let last;
 	return waitForCondition(async () => predicate((last = await stateFor(node, peer, origin))), {
@@ -221,8 +224,6 @@ suite(SUITE, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		const { A, B, C, E } = ctx;
 		const closedFloorsOnB = await postToFixture(B, 'ClosedFloors', { peer: A.hostname });
 		equal(closedFloorsOnB.syncWalInstalled, true, 'standinSyncWal is installed on the database rootStore');
-		const checkpointGrade = (state) =>
-			state?.closedFloor > 0 && typeof state.originGeneration === 'string' && state.fullCoverage === true;
 		await waitForState(B, A, A, checkpointGrade, 'a checkpoint-grade certificate from A');
 		await waitForState(C, B, B, checkpointGrade, "B's own certificate");
 		await waitForState(B, C, C, checkpointGrade, "C's own certificate on B");
@@ -488,6 +489,9 @@ suite(SUITE, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 	});
 	test('a peer that stops certifying at level 2 is revoked on its direct receiver and one hop beyond', async () => {
 		const { A, B, C } = ctx;
+		// an earlier test can leave C holding A's floor without a generation, and a revocation only clears such a row
+		await waitForState(B, A, A, checkpointGrade, 'a checkpoint-grade certificate from A before the downgrade');
+		await waitForState(C, B, A, checkpointGrade, "A's certificate relayed through B before the downgrade");
 		A.testEnv = { HARPER_TEST_FORCE_ORIGIN_FLOORS_LEVEL_1: '1' };
 		await restartNode(A);
 		await waitForState(B, A, A, (state) => state?.floorRevoked === true, "A revoked on B after A's downgrade");

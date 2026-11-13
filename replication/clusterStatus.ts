@@ -21,6 +21,8 @@ import {
 	readFireCounters,
 } from './replicationConnection.ts';
 import { readStuckCopy } from './copyStall.ts';
+import { PATH_NAMES } from './privatePaths.ts';
+import { CONNECTION_PATH_POSITION } from './sharedStatusSlots.ts';
 import '../core/server/serverHelpers/serverUtilities.ts';
 
 // Keyed by request id: the main thread's answer takes a bounded fan-out, so two cluster_status calls on
@@ -75,7 +77,10 @@ export async function clusterStatus() {
 				socket.connected = truth.connected;
 				// Capabilities belong to the live socket. Nothing clears the stored value on disconnect —
 				// that would be a second racing message to fence — so a down link omits it here instead.
-				if (!truth.connected) socket.peerCapabilities = undefined;
+				if (!truth.connected) {
+					socket.peerCapabilities = undefined;
+					socket.path = undefined;
+				}
 				// Surface the last proof-of-life (handshake/pong/receive stamp) so an operator — and the
 				// watchdog-demotion soak (#431) — can see how fresh the truth behind `connected` is, and
 				// distinguish "connected, actively alive" from "connected, liveness nearing the stale window".
@@ -129,6 +134,7 @@ export function applySharedStatus(socket, replicationSharedStatus: Float64Array)
 	// in the recovery paths reads it. Omitted entirely for a link where nothing has ever fired.
 	socket.recoveryFires = readFireCounters(replicationSharedStatus);
 	socket.stuckCopy = readStuckCopy(replicationSharedStatus);
+	socket.path = PATH_NAMES[replicationSharedStatus[CONNECTION_PATH_POSITION]];
 }
 
 function asDate(date) {

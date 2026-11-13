@@ -6,7 +6,7 @@ import {
 	getReplicationCertAuth,
 	loadForge,
 } from '../security/certificate.ts';
-import { validateBySchema } from '../core/validation/validationWrapper.js';
+import { validateBySchema, validateAndConvertBySchema } from '../core/validation/validationWrapper.js';
 import Joi from 'joi';
 import { get } from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -18,6 +18,7 @@ import * as hdbLogger from '../core/utility/logging/harper_logger.js';
 import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/hdbError.js';
 import { server } from '../core/server/Server.ts';
 import { drainNode, drainTimeoutMs, FENCE_OPERATION, liftFenceAfterRemoval, removeNodeFence } from './nodeRemoval.ts';
+import { ownPrivateUrls, receivedPrivateUrls } from './privatePaths.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
 
 const validationSchema = Joi.object({
@@ -28,7 +29,7 @@ const validationSchema = Joi.object({
 	receivesFrom: Joi.array(),
 	subscriptions: Joi.array(),
 	revoked_certificates: Joi.array(),
-	shard: Joi.number(),
+	shard: Joi.number().integer().min(0).max(65535),
 	isLeader: Joi.boolean(),
 	force: Joi.boolean(),
 	cancel: Joi.boolean(),
@@ -55,6 +56,12 @@ function selfReplicatesForNodeWrite(): any {
 	return computeSelfReplicates(getConfiguredRoutes());
 }
 
+// ensureNode patches, so a removed advertisement is cleared explicitly
+function ownRowPrivateUrls(privateUrls: unknown): unknown {
+	if (privateUrls) return privateUrls;
+	return getHDBNodeTable().primaryStore.getSync(getThisNodeName())?.private_urls ? null : undefined;
+}
+
 /**
  * Can add, update or remove a node from replication
  * @param req
@@ -65,10 +72,11 @@ export async function setNode(req: any) {
 	let { url, hostname } = req;
 	if (!url) url = hostnameToUrl(hostname);
 	else if (!hostname) hostname = req.hostname = urlToNodeName(url);
-	const validation = validateBySchema(req, validationSchema);
+	const { error: validation, value: validated } = validateAndConvertBySchema(req, validationSchema);
 	if (validation) {
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
 	}
+	if (req.shard !== undefined) req.shard = validated.shard;
 
 	// Normalize and validate the optional data cutoff at the boundary, and persist a number so readers see
 	// one shape. Only a strict ISO 8601 UTC string or an epoch-ms number is accepted; anything else (a typo
@@ -97,9 +105,10 @@ export async function setNode(req: any) {
 		});
 	}
 
-	if (!url) throw new ClientError('url required for this operation');
-
 	const thisUrl = getThisNodeUrl();
+	if (hostname === getThisNodeName() || (url && url === thisUrl))
+		assertOwnShard(req.operation ?? 'set_node', req.shard);
+	if (!url) throw new ClientError('url required for this operation');
 	if (thisUrl == null) throw new ClientError('replication url is missing from harperdb-config.yaml');
 
 	let rep;
@@ -135,6 +144,9 @@ export async function setNode(req: any) {
 		joining: req.operation !== 'update_node',
 	};
 	if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) targetAddNodeObj.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+	const privateUrls = ownPrivateUrls();
+	// sent even when empty, so a peer clears an advertisement this node no longer has
+	targetAddNodeObj.private_urls = privateUrls ?? null;
 
 	if (req.subscriptions) {
 		targetAddNodeObj.subscriptions = req.subscriptions.map(reverseSubscription);
@@ -219,6 +231,11 @@ export async function setNode(req: any) {
 	if (req.revoked_certificates) nodeRecord.revoked_certificates = req.revoked_certificates;
 	if (targetNodeResponse?.shard !== undefined) nodeRecord.shard = targetNodeResponse.shard;
 	else if (req.shard !== undefined) nodeRecord.shard = req.shard;
+	const peerPrivateUrls = receivedPrivateUrls(
+		targetNodeResponse,
+		getHDBNodeTable().primaryStore.getSync(targetNodeResponse?.nodeName ?? nodeRecord.name ?? urlToNodeName(url))
+	);
+	if (peerPrivateUrls !== undefined) nodeRecord.private_urls = peerPrivateUrls;
 	// isLeader is LOCAL-ONLY: it means "this peer is my leader; request a full-table copy from it".
 	// It must NOT be forwarded to the peer via targetAddNodeObj — doing so would cause the peer
 	// to treat this node as its leader and attempt to full-copy in the wrong direction.
@@ -244,6 +261,8 @@ export async function setNode(req: any) {
 			subscriptions: null,
 		};
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+		const ownPrivate = ownRowPrivateUrls(privateUrls);
+		if (ownPrivate !== undefined) thisNode.private_urls = ownPrivate;
 
 		if (req.retain_authorization) thisNode.authorization = req.authorization;
 		if (req.start_time) thisNode.start_time = req.start_time;
@@ -315,6 +334,11 @@ export async function addNodeBack(req) {
 	if (req.start_time) nodeRecord.start_time = req.start_time;
 	if (req.authorization) nodeRecord.authorization = req.authorization;
 	if (req.shard !== undefined) nodeRecord.shard = req.shard;
+	const peerPrivateUrls = receivedPrivateUrls(req, getHDBNodeTable().primaryStore.getSync(req.hostname));
+	if (peerPrivateUrls !== undefined) nodeRecord.private_urls = peerPrivateUrls;
+
+	const privateUrls = ownPrivateUrls();
+	certs.private_urls = privateUrls ?? null;
 
 	const rep = await getReplicationCert();
 	if (!rep && (req.csr || req.url?.startsWith('wss:'))) {
@@ -334,6 +358,8 @@ export async function addNodeBack(req) {
 			thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
 			certs.shard = thisNode.shard;
 		}
+		const ownPrivate = ownRowPrivateUrls(privateUrls);
+		if (ownPrivate !== undefined) thisNode.private_urls = ownPrivate;
 
 		if (req.start_time) thisNode.start_time = req.start_time;
 		if (req.authorization) thisNode.authorization = req.authorization;
@@ -484,6 +510,16 @@ export async function findExistingNodeRecord(hostname: string, url: string, hdbN
 	return undefined;
 }
 
+/** This node's own row follows replication.shard, which ensureThisNode writes back at every start. */
+function assertOwnShard(operation: string, shard: unknown) {
+	const configuredShard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+	if (shard !== undefined && shard !== configuredShard) {
+		throw new ClientError(
+			`${operation} cannot set this node's shard to ${shard}: it follows replication.shard (${configuredShard ?? 'not set'}); change replication.shard and restart instead`
+		);
+	}
+}
+
 const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization', 'start_time', 'force_signing'];
 
 /**
@@ -491,7 +527,7 @@ const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization'
  * peer contact. Anything else needs setNode(), which resets omitted topology to full mesh and
  * derives a default url from this node's own port -- both carried forward from the existing row.
  */
-async function updateNode(req: any) {
+export async function updateNode(req: any) {
 	const hostname = req.hostname || req.node_name || req.name || (req.url ? urlToNodeName(req.url) : undefined);
 	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
 	if (req.replicates !== undefined) {
@@ -504,10 +540,22 @@ async function updateNode(req: any) {
 			`update_node does not support top-level 'subscribe'/'publish' without 'subscriptions'; supply a subscriptions array, or use set_node`
 		);
 	}
+	if (req.shard !== undefined) {
+		const { error, value } = validateAndConvertBySchema({ shard: req.shard }, validationSchema);
+		if (error) throw new ClientError(error.message);
+		req.shard = value.shard;
+	}
 	const requestHasTopology = Boolean(req.subscriptions || req.sendsTo || req.receivesFrom);
+	// Classified before req.url is filled from the stored row below, which would make every request look
+	// like a url change.
+	const metadataOnly =
+		!requestHasTopology &&
+		(req.revoked_certificates !== undefined || req.shard !== undefined) &&
+		!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined);
 
 	if (hostname) {
 		const found = await findExistingNodeRecord(hostname, url);
+		if ((found?.name ?? hostname) === getThisNodeName()) assertOwnShard('update_node', req.shard);
 		if (found) {
 			// Normalize to the row's own identity regardless of which path runs below, so an alias or a
 			// custom port/scheme a caller used to reach the peer is never mistaken for a change to apply.
@@ -515,7 +563,7 @@ async function updateNode(req: any) {
 			req.url ??= found.record.url;
 
 			if (!requestHasTopology) {
-				if (!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined)) {
+				if (metadataOnly) {
 					const validation = validateBySchema(req, validationSchema);
 					if (validation) {
 						throw handleHDBError(

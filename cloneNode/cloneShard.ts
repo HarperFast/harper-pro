@@ -10,14 +10,29 @@ function shardNumber(value: unknown, source: string): number {
 	const shard = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
 	if (!Number.isInteger(shard) || (shard as number) < 0 || (shard as number) > 65535)
 		throw new CloneShardRefusedError(
-			`${source} must be an integer from 0 through 65535 or "auto", received ${JSON.stringify(value)}`
+			`${source} must be an integer from 0 through 65535, "auto" or "replica", received ${JSON.stringify(value)}`
 		);
 	return shard as number;
 }
 
-export function parseShardOption(raw: unknown): number | 'auto' | undefined {
+export function parseShardOption(raw: unknown): number | 'auto' | 'replica' | undefined {
 	if (raw === undefined || raw === '') return undefined;
-	return raw === 'auto' ? 'auto' : shardNumber(raw, SHARD_OPTION);
+	return raw === 'auto' || raw === 'replica' ? raw : shardNumber(raw, SHARD_OPTION);
+}
+
+export function slotOwningShards(maps: readonly any[] | undefined): Set<number> | undefined {
+	if (!maps?.length) return undefined;
+	const owning = new Set<number>();
+	for (const map of maps) {
+		if (!Array.isArray(map?.ranges))
+			throw new Error(`The leader's shard map for '${map?.database}' has no slot ranges`);
+		for (const range of map.ranges) {
+			if (!Number.isInteger(range?.shard))
+				throw new Error(`The leader's shard map for '${map.database}' has a range with no shard`);
+			if (range.end > range.start) owning.add(range.shard);
+		}
+	}
+	return owning;
 }
 
 export type ShardMember = { shard: unknown; live: boolean };
@@ -32,12 +47,7 @@ export function leaderShardMembers(leaderShard: unknown, leaderStatus: any, this
 	return members;
 }
 
-/**
- * The listed shard with the fewest live members, lowest number on a tie. A shard whose registered members are all
- * offline is passed over: it has no source for this node's owned slots, so choosing it would stall the clone. A
- * shard with no members at all has nothing to copy.
- */
-export function pickAutoShard(shards: readonly number[], members: readonly ShardMember[]): number | undefined {
+function memberCounts(shards: readonly number[], members: readonly ShardMember[]) {
 	const registered = new Map(shards.map((shard) => [shard, 0]));
 	const live = new Map(shards.map((shard) => [shard, 0]));
 	for (const { shard, live: isLive } of members) {
@@ -45,15 +55,45 @@ export function pickAutoShard(shards: readonly number[], members: readonly Shard
 		registered.set(shard as number, registered.get(shard as number)! + 1);
 		if (isLive) live.set(shard as number, live.get(shard as number)! + 1);
 	}
+	return { registered, live };
+}
+
+/**
+ * A backbone node placed in a shard owning nothing would hold nothing. A shard whose registered members are all offline
+ * is passed over: it has no source for this node's owned slots, so choosing it would stall the clone.
+ */
+export function pickAutoShard(
+	shards: readonly number[],
+	members: readonly ShardMember[],
+	owning?: ReadonlySet<number>
+): number | undefined {
+	const { registered, live } = memberCounts(shards, members);
 	return shards
-		.filter((shard) => !registered.get(shard) || live.get(shard))
+		.filter((shard) => (!owning || owning.has(shard)) && (!registered.get(shard) || live.get(shard)))
 		.sort((a, b) => live.get(a)! - live.get(b)! || a - b)[0];
 }
 
-function listedShards(value: unknown): number[] | undefined {
+/**
+ * Most live members first, so replica nodes group into one spare unless told otherwise. Only a listed spare qualifies:
+ * a non-spare owning nothing today gets slots from the next default map. A node owning no slots bootstraps from any
+ * peer, so liveness does not filter.
+ */
+export function pickReplicaShard(
+	shards: readonly number[],
+	members: readonly ShardMember[],
+	owning: ReadonlySet<number>,
+	spares: ReadonlySet<number>
+): number | undefined {
+	const { live } = memberCounts(shards, members);
+	return shards
+		.filter((shard) => spares.has(shard) && !owning.has(shard))
+		.sort((a, b) => live.get(b)! - live.get(a)! || a - b)[0];
+}
+
+function listedShards(value: unknown, setting = 'replication.shards'): number[] | undefined {
 	if (value == null) return undefined;
-	if (!Array.isArray(value)) throw new CloneShardRefusedError(`The leader's replication.shards is not a list`);
-	return value.map((shard) => shardNumber(shard, `The leader's replication.shards entry`));
+	if (!Array.isArray(value)) throw new CloneShardRefusedError(`The leader's ${setting} is not a list`);
+	return value.map((shard) => shardNumber(shard, `The leader's ${setting} entry`));
 }
 
 /**
@@ -68,6 +108,8 @@ export function chooseCloneShard({
 	leaderShard,
 	leaderShards,
 	leaderStatus,
+	leaderMaps,
+	leaderSpareShards,
 	thisNode,
 }: {
 	requested: unknown;
@@ -77,6 +119,8 @@ export function chooseCloneShard({
 	leaderShard?: unknown;
 	leaderShards?: unknown;
 	leaderStatus?: any;
+	leaderMaps?: readonly any[];
+	leaderSpareShards?: unknown;
 	thisNode: string;
 }): { shard?: number; description: string } {
 	const request = parseShardOption(requested);
@@ -85,6 +129,13 @@ export function chooseCloneShard({
 	const listing = list ? ` (the leader's replication.shards is [${list.join(', ')}])` : '';
 	let shard: number;
 	let description: string;
+
+	const spareList = leaderSpareShards == null ? undefined : listedShards(leaderSpareShards, 'replication.spareShards');
+	const spares = spareList?.length ? new Set(spareList) : undefined;
+	const owning =
+		slotOwningShards(leaderMaps) ?? (spares && list ? new Set(list.filter((id) => !spares.has(id))) : undefined);
+	const owners = owning ? `; shards owning slots: [${[...owning].sort((a, b) => a - b).join(', ')}]` : '';
+	const spareListing = spares ? `; replication.spareShards is [${spareList.join(', ')}]` : '';
 
 	if (local !== undefined && configuredUnproven && local !== request)
 		throw new CloneShardRefusedError(
@@ -100,30 +151,48 @@ export function chooseCloneShard({
 		shard = request;
 		description = `shard ${shard} from ${SHARD_OPTION}`;
 	} else if (local !== undefined) {
+		if (request === 'replica' && !(spares?.has(local) && !owning?.has(local)))
+			throw new CloneShardRefusedError(
+				`${SHARD_OPTION} asks for a replica shard but this node is configured for shard ${local}, which is not a spare owning no slots${owners}${spareListing}; ` +
+					'remove replication.shard, or clone onto a fresh root'
+			);
 		shard = local;
 		description = `shard ${shard} from this node's configuration`;
-	} else if (request === 'auto') {
+	} else if (request === 'auto' || request === 'replica') {
 		if (!list) {
-			if (leaderShard == null && !Object.keys(leaderStatus?.sharding ?? {}).length)
+			if (request === 'auto' && leaderShard == null && !Object.keys(leaderStatus?.sharding ?? {}).length)
 				return { description: 'no shard: the leader is not sharded, so "auto" has nothing to fill' };
 			throw new CloneShardRefusedError(
-				`"auto" only fills shards listed in replication.shards, and the leader lists none; pass a shard number with ${SHARD_OPTION}`
+				`"${request}" only fills shards listed in replication.shards, and the leader lists none; pass a shard number with ${SHARD_OPTION}`
 			);
 		}
 		const members = leaderShardMembers(leaderShard, leaderStatus, thisNode);
-		const picked = pickAutoShard(list, members);
-		if (picked === undefined)
-			throw new CloneShardRefusedError(
-				`"auto" found no listed shard with a live member to copy from${listing}; pass a shard number with ${SHARD_OPTION}`
-			);
+		let picked: number | undefined;
+		if (request === 'auto') {
+			picked = pickAutoShard(list, members, owning);
+			if (picked === undefined)
+				throw new CloneShardRefusedError(
+					`"auto" found no listed shard with a live member to copy from${listing}${owners}; pass a shard number with ${SHARD_OPTION}`
+				);
+		} else {
+			if (!spares)
+				throw new CloneShardRefusedError(
+					`"replica" joins a shard in replication.spareShards, and the leader lists none${listing}; a listed shard outside that list gets slots from the next default map`
+				);
+			picked = pickReplicaShard(list, members, owning, spares);
+			if (picked === undefined)
+				throw new CloneShardRefusedError(
+					`"replica" found no spare shard owning no slots${listing}${owners}${spareListing}; list another spare shard ID first`
+				);
+		}
 		shard = picked;
 		const liveCount = (candidate: number) =>
 			members.filter((member) => member.shard === candidate && member.live).length;
-		description = `shard ${shard} from "auto"; live members: ${list.map((candidate) => `${candidate}=${liveCount(candidate)}`).join(', ')}`;
+		description = `shard ${shard} from "${request}"; live members: ${list.map((candidate) => `${candidate}=${liveCount(candidate)}`).join(', ')}${owners}`;
 	} else if (leaderShard != null || list) {
 		throw new CloneShardRefusedError(
 			`The leader is sharded and a clone does not inherit its shard: choose this node's shard with ${SHARD_OPTION}, ` +
-				`as a number or "auto"${listing}`
+				`as a number, "auto" or "replica"${listing}`
 		);
 	} else {
 		// A leader with neither holds no slots, and a clone of it may do the same: the documented fast clone.

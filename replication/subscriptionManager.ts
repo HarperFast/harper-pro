@@ -38,6 +38,7 @@ import {
 	selfNodeReplicates,
 } from './knownNodes.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
+import { ownPrivateUrls, samePrivateUrls } from './privatePaths.ts';
 import {
 	RECEIVING_STATUS_POSITION,
 	RECEIVING_STATUS_RECEIVING,
@@ -1249,18 +1250,18 @@ export async function startOnMainThread(options) {
 				// `mainThreadInitialized`, harper-pro#460), and replication routes are process config, so a
 				// route change takes effect on the next restart — where this rewrite fires.
 				const selfReplicates = computeSelfReplicates(iterateRoutes(options));
+				const privateUrls = ownPrivateUrls();
 				if (
 					existing === undefined ||
 					existing.url !== url ||
 					existing.shard !== options.shard ||
-					!replicatesEqual(existing.replicates, selfReplicates)
+					!replicatesEqual(existing.replicates, selfReplicates) ||
+					!samePrivateUrls(existing?.private_urls, privateUrls)
 				) {
-					return ensureNode(thisName, {
-						name: thisName,
-						url,
-						shard: options.shard,
-						replicates: selfReplicates,
-					});
+					const record: any = { name: thisName, url, shard: options.shard, replicates: selfReplicates };
+					// ensureNode patches, so an advertisement removed from config has to be cleared explicitly
+					if (privateUrls || existing?.private_urls) record.private_urls = privateUrls ?? null;
+					return ensureNode(thisName, record);
 				}
 			}
 		}

@@ -131,6 +131,18 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 		assert.equal(typeof entry?.error, 'string', `expected an error frame, got ${JSON.stringify(entry)}`);
 	});
 
+	it('rejects a record request on a closed session instead of sending it into the closed socket', async () => {
+		const closed = new FakeSocket();
+		const session = replicateOverWS(closed, {}, { replicates: true });
+		closed.close(1000);
+		const sentBefore = closed.sent.length;
+		await assert.rejects(
+			session.getRecord({ id: 'k', table: { tableId: 1, tableName: 'SomeTable' } }),
+			/closed before the record request was sent/
+		);
+		assert.equal(closed.sent.length, sentBefore, 'nothing was sent after the close');
+	});
+
 	it('refuses cleanly, not with an internal fault, when the connection resolved no database', async () => {
 		const orphan = new FakeSocket();
 		replicateOverWS(orphan, {}, { replicates: true });
