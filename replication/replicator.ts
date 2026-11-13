@@ -17,6 +17,7 @@ import { ensureShardingConfiguration } from '../core/config/shardingConfiguratio
 import {
 	databases,
 	databaseResidencyBlockReason,
+	databaseStorageEngines,
 	assertDatabaseResidencyAvailable,
 	databaseEventsEmitter,
 	getDatabases,
@@ -38,6 +39,7 @@ import {
 	deriveConnectionTruth,
 } from './replicationConnection.ts';
 import {
+	admitRecordLocks,
 	ensureRecordLockTransport,
 	releaseRecordLockTransport,
 	setConnectionDownSinceReader,
@@ -119,6 +121,7 @@ export async function startOnMainThread(options) {
 	if (env.get(CONFIG_PARAMS.REPLICATION_SHARDS) !== undefined || residencyDeclarationDatabases().length)
 		await configuration;
 	await migrateSSHConfigOnce();
+	admitRecordLocks(() => replicatedLmdbDatabases(options));
 	await startSubscriptionsOnMainThread(options);
 	startShardingBootstrap();
 }
@@ -433,6 +436,7 @@ export let enabledDatabases;
 function assignReplicationSource(options) {
 	if (replicationDisabled) return;
 	getDatabases();
+	admitRecordLocks(() => replicatedLmdbDatabases(options));
 	enabledDatabases = options.databases;
 	// we need to set up the replicator as a source for each database that is replicated
 	forEachReplicatedDatabase(options, (database, databaseName) => {
@@ -932,6 +936,16 @@ registerShutdownDrain({
 });
 export function urlToNodeName(nodeUrl) {
 	if (nodeUrl) return new URL(nodeUrl).hostname; // this the part of the URL that is the node name, as we want it to match common name in the certificate
+}
+
+/** The replicated databases this thread has open on LMDB, by the same selection replication uses. */
+export function replicatedLmdbDatabases(options): string[] {
+	getDatabases();
+	const names: string[] = [];
+	iterateReplicatedDatabases(options, (database, databaseName) => {
+		if (database && databaseStorageEngines(databaseName).has('lmdb')) names.push(databaseName);
+	});
+	return names.sort();
 }
 
 /**

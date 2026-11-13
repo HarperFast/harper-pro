@@ -56,7 +56,7 @@ import {
 	type LockHomeMap,
 	type LockRound,
 } from '../core/resources/recordLockCoordinator.ts';
-import { getDatabases, table } from '../core/resources/databases.ts';
+import { databaseStorageEngines, getDatabases, table } from '../core/resources/databases.ts';
 import { transaction } from '../core/resources/transaction.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -68,7 +68,12 @@ import {
 } from './sharedStatusSlots.ts';
 import { isReplicationWorker } from './replicationWorkers.ts';
 import { ClientError, LockUnavailableError } from '../core/utility/errors/hdbError.ts';
-import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import {
+	admitClusterRecordLocks,
+	CLUSTER_RECORD_LOCKS_ENABLED,
+	RECORD_LOCKS_LMDB_REFUSAL,
+	RECORD_LOCKS_REFUSAL,
+} from './recordLockConfig.ts';
 import { tableReplicates as declarationReplicates } from './replicatedDatabases.ts';
 import { createBackoff, type Backoff } from './backoff.ts';
 import {
@@ -462,12 +467,14 @@ export const RECORD_LOCKS_DISABLED_MESSAGE =
  * a received request or entry finds no map, so this node never grants. `disabled` lets a conditional
  * REST write skip the lock; the setting is read once at module load, so it holds for the process.
  */
-export function createDisabledRecordLockTransport(): ClusterLockTransport {
-	const disabled = () => Promise.reject(new ClientError(RECORD_LOCKS_DISABLED_MESSAGE, 503));
+export function createDisabledRecordLockTransport(
+	message = RECORD_LOCKS_REFUSAL ?? RECORD_LOCKS_DISABLED_MESSAGE
+): ClusterLockTransport {
+	const disabled = () => Promise.reject(new ClientError(message, 503));
 	return {
 		disabled: true,
 		homeMap(): LockHomeMap | undefined {
-			throw new ClientError(RECORD_LOCKS_DISABLED_MESSAGE, 503);
+			throw new ClientError(message, 503);
 		},
 		ownsCoordination(): boolean {
 			return true;
@@ -1113,6 +1120,17 @@ export function ensureRecordLockTransport(database: string, buildTransport?: () 
 						() => homeMapConfirmedAbsent(database)
 					)
 			: undefined);
+	if (!buildTransport && builder && databaseStorageEngines(database).has('lmdb')) {
+		// Admitted at startup, but this database became replicated since; peers already have this
+		// node's capability level, so it stays refused here until a restart refuses the whole node.
+		logger.error?.(
+			`Cluster record locks stay disabled for ${database}: it is opened on LMDB and became replicated after startup; restart to have the node refuse record locks`
+		);
+		const transport = createDisabledRecordLockTransport(RECORD_LOCKS_LMDB_REFUSAL);
+		transports.set(database, transport);
+		registerClusterLockTransport(database, transport);
+		return;
+	}
 	if (builder) transportBuilders.set(database, builder);
 	const transport = builder ? builder() : createDisabledRecordLockTransport();
 	transports.set(database, transport);
@@ -1788,8 +1806,26 @@ function tableReplicates(database: string, table: string): boolean {
 	return definition !== undefined && declarationReplicates(definition);
 }
 
+/**
+ * Called at each replication startup hook once the catalog has loaded, before any transport is
+ * registered. The main thread's startup work is scheduled here rather than at import: with
+ * `threads.count: 0`, `whenThreadsStarted` resolves before components start.
+ */
+export function admitRecordLocks(listLmdbDatabases: () => readonly string[]): void {
+	if (!admitClusterRecordLocks(listLmdbDatabases) || parentPort) return;
+	whenThreadsStarted.then(() => {
+		ensureStartupHomeIncarnation();
+		// Operator-visible at the point the switch takes effect, not only in repo design docs. The
+		// switch alone grants nothing: the home map is stated by an operator, never derived here
+		// (RECORD_LOCK_HOMES_DESIGN.md §4.1), so without this line the first cluster lock() answers
+		// 503 with no indication that a step of the runbook is simply missing.
+		logger.warn?.(
+			`replication.recordLocks is enabled: every cluster-scoped lock() for a database answers 503 until an operator applies a home map for it (record_lock_apply_homes), and every peer advertises record lock capability level ${RECORD_LOCKS_CAPABILITY} — a peer at any other level is not a participant and withholds the map on both sides.`
+		);
+	});
+}
+
 if (!parentPort) {
-	if (CLUSTER_RECORD_LOCKS_ENABLED) whenThreadsStarted.then(() => ensureStartupHomeIncarnation());
 	onMessageByType('record-lock-incarnation-request', (_message, worker) => {
 		if (worker && homeIncarnation > 0) confer(worker, 'record-lock-incarnation', homeIncarnation, isFirstIncarnation());
 	});
@@ -1851,14 +1887,4 @@ if (!parentPort) {
 	onMessageByType('record-lock-homes-changed-ack', (message) => {
 		pendingHomesChangedAcks.get(message.requestId)?.(message.ok === true);
 	});
-	if (CLUSTER_RECORD_LOCKS_ENABLED)
-		whenThreadsStarted.then(() => {
-			// Operator-visible at the point the switch takes effect, not only in repo design docs. The
-			// switch alone grants nothing: the home map is stated by an operator, never derived here
-			// (RECORD_LOCK_HOMES_DESIGN.md §4.1), so without this line the first cluster lock() answers
-			// 503 with no indication that a step of the runbook is simply missing.
-			logger.warn?.(
-				`replication.recordLocks is enabled: every cluster-scoped lock() for a database answers 503 until an operator applies a home map for it (record_lock_apply_homes), and every peer advertises record lock capability level ${RECORD_LOCKS_CAPABILITY} — a peer at any other level is not a participant and withholds the map on both sides.`
-			);
-		});
 }

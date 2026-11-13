@@ -1,5 +1,7 @@
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { copyFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
 	DB,
 	call,
@@ -8,11 +10,12 @@ import {
 	counter,
 	operation,
 	putCounter,
+	restartStoppedNode,
 	startNode,
 	stopNode,
 	waitForCounter,
 } from './recordLockShared.mjs';
-import { waitForCondition } from './clusterShared.mjs';
+import { logMark, readLogSince, sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 
 const FIX = /replication\.recordLocks: true.*record_lock_apply_homes/;
 
@@ -177,5 +180,113 @@ suite('cluster record locks on LMDB with the key unset', { timeout: 300_000 }, (
 		const stale = await conditionalPut(3);
 		assert.equal(stale.status, 412, stale.body);
 		assert.equal((await counter(context.harper, id))?.n, 2);
+	});
+});
+
+// A node upgraded in place from v4 keeps its `.mdb` databases on LMDB whatever storage.engine says.
+suite('cluster record locks on a node with a replicated database opened on LMDB', { timeout: 600_000 }, (ctx) => {
+	const LEGACY = 'legacy';
+	let lmdbSource;
+	let node;
+	let peer;
+
+	const engines = async (target) => {
+		const all = await sendOperation(target, { operation: 'describe_all', skip_record_count: true });
+		return { data: all[DB]?.Counter?.engine, legacy: all[LEGACY]?.Old?.engine };
+	};
+	/** Waits for `observer` to have learned, on a connected `data` socket, a `recordLocks` level from `target` that `accept`s. */
+	const waitForObservedLevel = (observer, target, accept, description) => {
+		let last;
+		return waitForCondition(
+			async (signal) => {
+				const status = await clusterStatusOf(observer, signal).catch(() => undefined);
+				const connection = status?.connections.find((entry) => entry.name === target.nodeName);
+				const socket = connection?.database_sockets.find((entry) => entry.database === DB && entry.connected);
+				if (!socket?.peerCapabilities) return undefined;
+				last = socket.peerCapabilities.recordLocks ?? 0;
+				return accept(last) ? { level: last } : undefined;
+			},
+			{
+				timeoutMs: 90_000,
+				description: () => `${observer.hostname} to see ${description} from ${target.hostname}; last ${last}`,
+			}
+		);
+	};
+
+	before(async () => {
+		lmdbSource = await startNode(ctx.name, { HARPER_STORAGE_ENGINE: 'lmdb' }, 1, undefined, null);
+		await sendOperation(lmdbSource.harper, {
+			operation: 'create_table',
+			database: LEGACY,
+			table: 'Old',
+			primary_key: 'id',
+		});
+		await sendOperation(lmdbSource.harper, {
+			operation: 'insert',
+			database: LEGACY,
+			table: 'Old',
+			records: [{ id: 'v4' }],
+		});
+		await stopNodeProcess(lmdbSource.harper);
+
+		node = await startNode(ctx.name, {}, 2, undefined, true, [LEGACY]);
+		peer = await startNode(ctx.name, {}, 1, undefined, true, [LEGACY]);
+		await connectMesh([node.harper, peer.harper]);
+		for (const context of [node, peer]) context.harper.nodeName = (await clusterStatusOf(context.harper)).node_name;
+	});
+
+	after(async () => {
+		for (const context of [peer, node, lmdbSource]) if (context) await stopNode(context);
+	});
+
+	test('a RocksDB-only node enables record locks as before', async () => {
+		assert.deepEqual(await engines(node.harper), { data: 'rocksdb', legacy: undefined });
+		const result = await waitForCondition(
+			async (signal) => {
+				const attempt = await call(node.harper, 'LockOnce/', { id: 'rocks-only', timeout: 2_000 }, signal);
+				return /record_lock_apply_homes/.test(JSON.stringify(attempt.body)) ? attempt : undefined;
+			},
+			{ timeoutMs: 60_000, description: 'a lock() answer naming record_lock_apply_homes' }
+		);
+		assert.equal(result.status, 503);
+		assert.doesNotMatch(JSON.stringify(result.body), /not enabled on this node|opened on LMDB/);
+		await waitForObservedLevel(peer.harper, node.harper, (level) => level > 0, 'a record-lock capability level');
+	});
+
+	test('with an LMDB database replicated, it starts with record locks off and says why', async () => {
+		const mark = await logMark(node.harper);
+		await stopNodeProcess(node.harper);
+		await copyFile(
+			join(lmdbSource.harper.dataRootDir, 'database', `${LEGACY}.mdb`),
+			join(node.harper.dataRootDir, 'database', `${LEGACY}.mdb`)
+		);
+		await restartStoppedNode(node, {}, 2);
+		node.harper.nodeName = (await clusterStatusOf(node.harper)).node_name;
+
+		assert.deepEqual(await engines(node.harper), { data: 'rocksdb', legacy: 'lmdb' });
+		const describedTable = await sendOperation(node.harper, {
+			operation: 'describe_table',
+			database: LEGACY,
+			table: 'Old',
+		});
+		assert.equal(describedTable.engine, 'lmdb');
+
+		const log = await readLogSince(node.harper, mark);
+		assert.match(log, /cluster record locks stay disabled because these are opened on LMDB: legacy\b/);
+		assert.equal(log.match(/these are opened on LMDB/g).length, 1, 'logged once, by the main thread');
+
+		// both http workers: each answers with the LMDB reason, never the enabled no-home-map 503
+		for (let attempt = 0; attempt < 6; attempt++) {
+			const result = await call(node.harper, 'LockOnce/', { id: 'mixed-' + attempt, timeout: 2_000 });
+			assert.equal(result.status, 503, JSON.stringify(result.body));
+			assert.match(JSON.stringify(result.body), /opened on LMDB/);
+			assert.doesNotMatch(JSON.stringify(result.body), /legacy/);
+		}
+		const status = await clusterStatusOf(node.harper);
+		assert.equal(status.recordLocks?.[DB], undefined, JSON.stringify(status.recordLocks));
+		await waitForObservedLevel(peer.harper, node.harper, (level) => level === 0, 'record-lock level 0');
+
+		await putCounter(node.harper, 'mixed-plain', 3);
+		await waitForCounter([node.harper, peer.harper], 'mixed-plain', 3);
 	});
 });
