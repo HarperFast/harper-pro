@@ -140,7 +140,6 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		baseline.tableFiles = await tableFiles(nodeA);
 		baseline.flushes = await flushesStarted(nodeA);
 
-		// The writes power loss takes from A.
 		await upsertConfirmed(nodeA, { id: 'ins', n: 1 });
 		await upsertConfirmed(nodeA, { id: 'ins', n: 2 });
 		await upsertConfirmed(nodeA, { id: 'upd', n: 2 });
@@ -207,8 +206,6 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			{ ins: 2, upd: 2, [lockKey]: 1 },
 			'B still holds every write it confirmed'
 		);
-		await putCounter(nodeB, 'sentinel-from-b', 1);
-		await waitForCounter([nodeA], 'sentinel-from-b', 1);
 		simulated = true;
 	});
 
@@ -229,6 +226,9 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 	test('A recovers its own writes from B', { todo: ISSUE }, async (t) => {
 		if (!nodeA) return t.skip('RocksDB only');
 		assert.ok(simulated, 'runs only after the power-loss simulation test passed');
+		// B -> A delivers B's own writes, so the stream A's lost writes would need is live.
+		await putCounter(nodeB, 'sentinel-from-b', 1);
+		await waitForCounter([nodeA], 'sentinel-from-b', 1);
 		let onA;
 		await waitForCondition(
 			async () => {
