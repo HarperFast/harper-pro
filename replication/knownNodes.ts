@@ -15,7 +15,7 @@ import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicat
 import { CONFIRMATION_STATUS_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
 import { createBackoff } from './backoff.ts';
 import { countSendingTo } from './residencyTopology.ts';
-import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { RECORD_LOCKS_CONFIGURED } from './recordLockConfig.ts';
 import { PING_TIMEOUT } from './replicationConnection.ts';
 
 type MaybePromise<T> = T | Promise<T>;
@@ -1126,7 +1126,7 @@ function assertConfirmationFeasible(
 		}
 	if (connected < confirmationCount)
 		throw new ServerError(
-			`Cannot commit a write made under a cluster record lock: it needs confirmation from ${confirmationCount} peer(s) for database "${databaseName}", and this node is sending it to ${connected} of ${of} right now. Nothing was committed; retry once a peer reconnects. ${LOCK_OPT_OUT}`,
+			`Cannot commit a write made under a cluster record lock: it needs confirmation from ${confirmationCount} peer(s) for database "${databaseName}", and this node is sending it to ${connected} of ${of} right now. This database's writes were not committed, though another database's in the same transaction may have been; retry once a peer reconnects. ${LOCK_OPT_OUT}`,
 			503
 		);
 }
@@ -1146,11 +1146,13 @@ export function parseConfirmationDefault(name: string, raw: unknown): number {
 /**
  * Read once per thread at load, so a change takes a restart. A clone calls it again with the configuration it
  * installed, since its main thread loaded this module before the leader's configuration was written. An unset
- * `replication.recordLockConfirmation` is 1 while cluster record locks are on.
+ * `replication.recordLockConfirmation` is 1 while `replication.recordLocks` is on, decided from the configuration
+ * rather than admission, which runs later: on a node admission refuses, no lock is cluster-granted, so the
+ * minimum never applies.
  */
 export function registerConfirmationDefaults(
 	read: (key: string) => unknown = (key) => env.get(key),
-	recordLocksEnabled: boolean = CLUSTER_RECORD_LOCKS_ENABLED
+	recordLocksEnabled: boolean = RECORD_LOCKS_CONFIGURED
 ): void {
 	const recordLocks = read(CONFIG_PARAMS.REPLICATION_RECORDLOCKCONFIRMATION);
 	setReplicationConfirmationDefaults({

@@ -36,17 +36,19 @@ if (configured && typeof configured !== 'boolean')
 // (harper-pro#790); the deprecated LMDB engine keys replicated writes by its own local clock, so no
 // barrier would ever match there. Refuse the switch outright rather than advertise a level every
 // handoff then times out on.
-let engineSupported = true;
-if (configured === true) {
-	const engine = process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_PARAMS.STORAGE_ENGINE);
-	if (engine === 'lmdb') {
-		engineSupported = false;
-		logger.error?.(
-			'replication.recordLocks requires the RocksDB storage engine; cluster record locks stay disabled on this LMDB node'
-		);
-	}
+const engineIsLMDB = () => (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_PARAMS.STORAGE_ENGINE)) === 'lmdb';
+if (configured === true && engineIsLMDB())
+	logger.error?.(
+		'replication.recordLocks requires the RocksDB storage engine; cluster record locks stay disabled on this LMDB node'
+	);
+/**
+ * Whether a `replication.recordLocks` value turns record locks on for this engine: only a real boolean `true`, and
+ * not on LMDB. A clone applies it to the configuration it installed, which this module loaded before.
+ */
+export function recordLocksConfiguredFrom(value: unknown): boolean {
+	return value === true && !engineIsLMDB();
 }
-export const RECORD_LOCKS_CONFIGURED: boolean = configured === true && engineSupported;
+export const RECORD_LOCKS_CONFIGURED: boolean = recordLocksConfiguredFrom(configured);
 /**
  * False until `admitClusterRecordLocks` runs at a replication startup hook, after the catalog has
  * loaded: `storage.engine` only picks the engine of a database created from now on, so an `.mdb`
