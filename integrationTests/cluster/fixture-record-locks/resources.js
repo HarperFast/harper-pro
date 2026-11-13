@@ -93,6 +93,31 @@ export class LockRelease extends Resource {
 	}
 }
 
+const gates = new Map();
+
+/** POST { id, n, lease? }: lock, wait for GateControl to open this id's gate, then write `n`. */
+export class GatedLockedWrite extends Resource {
+	async post(data) {
+		const record = await tables.Counter.lock(data.id, lockOptions(data));
+		await new Promise((resolve) => gates.set(data.id, resolve));
+		record.set('n', data.n);
+		await record.save();
+		return { n: data.n };
+	}
+}
+
+/** POST { id, open? }: whether GatedLockedWrite holds this id's lock; `open: true` lets it write. */
+export class GateControl extends Resource {
+	async post(data) {
+		const open = gates.get(data.id);
+		if (open && data.open) {
+			gates.delete(data.id);
+			open();
+		}
+		return { waiting: Boolean(open) };
+	}
+}
+
 /** The lock release entries in this node's Counter transaction log: type and local origin id (0 = self). */
 export class LockControlEntries extends Resource {
 	async get() {

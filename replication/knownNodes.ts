@@ -5,7 +5,7 @@
 import { table } from '../core/resources/databases.ts';
 import { forEachReplicatedDatabase } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
-import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
+import { replicationConfirmation, setReplicationConfirmationDefaults } from '../core/resources/DatabaseTransaction.ts';
 import { isMainThread } from 'worker_threads';
 import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
 import * as env from '../core/utility/environment/environmentManager.js';
@@ -21,6 +21,9 @@ import {
 	REPLICATION_SHARED_STATUS_SLOTS,
 } from './sharedStatusSlots.ts';
 import { createBackoff } from './backoff.ts';
+import { countSendingTo } from './residencyTopology.ts';
+import { RECORD_LOCKS_CONFIGURED } from './recordLockConfig.ts';
+import { PING_TIMEOUT } from './replicationConnection.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -892,6 +895,7 @@ export function createConfirmationWaiter(
 	timeoutMs: number = replicationConfirmationTimeout(),
 	alreadyConfirmedPeers: Set<string> = new Set(),
 	residentPeerLists?: string[][],
+	peersGone?: PeersGoneWatch,
 	marker = 0,
 	onSettled?: () => void
 ): Promise<void> {
@@ -917,6 +921,22 @@ export function createConfirmationWaiter(
 		// (harper-pro#633 review). A peer already in `confirmed` returns early, so it contributes at
 		// most once regardless of how many times it's reported confirmed.
 		const confirmed = new Set(alreadyConfirmedPeers);
+		const received = () =>
+			residentGroups
+				? residentGroups.map((residents) => countMembers(confirmed, residents)).join(', ') +
+					` from the residents of each written record's residency (${residentGroups.map((residents) => residents.join(', ')).join('; ')})`
+				: confirmed.size;
+		// a lock-governed wait says plainly what the caller has, since the lock is already released
+		const committedLocally = peersGone ? 'The write committed on this node but was not confirmed: ' : '';
+		const settle = () => {
+			entry.settled = true;
+			clearTimeout(timer);
+			// O(1) regardless of how many other waiters are pending or expiring in this same tick — an
+			// outage that times out many waiters at once costs O(n) total here, not O(n²).
+			awaiting.delete(entry);
+			if (watched) unwatchWaiter(watched);
+			onSettled?.();
+		};
 		const entry: AwaitingReplication = {
 			txnTime,
 			marker,
@@ -926,39 +946,124 @@ export function createConfirmationWaiter(
 				if (confirmed.has(nodeName)) return;
 				confirmed.add(nodeName);
 				if (isConfirmed(confirmed)) {
-					entry.settled = true;
-					clearTimeout(timer);
-					awaiting.delete(entry);
-					onSettled?.();
+					settle();
 					resolve();
 				}
 			},
 		};
 		const timer = setTimeout(() => {
 			if (entry.settled) return;
-			entry.settled = true;
-			// O(1) regardless of how many other waiters are pending or expiring in this same tick — an
-			// outage that times out many waiters at once costs O(n) total here, not O(n²).
-			awaiting.delete(entry);
-			onSettled?.();
-			const received = residentGroups
-				? residentGroups.map((residents) => countMembers(confirmed, residents)).join(', ') +
-					` from the residents of each written record's residency (${residentGroups.map((residents) => residents.join(', ')).join('; ')})`
-				: confirmed.size;
+			settle();
 			reject(
 				new ServerError(
-					`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${received})`,
+					`${committedLocally}Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${received()})`,
 					504
 				)
 			);
 		}, timeoutMs);
 		timer.unref?.();
+		const watched: WatchedWaiter | undefined = peersGone && {
+			reachable: () => peersGone.reachable(confirmed),
+			graceMs: peersGone.graceMs,
+			unreachableSince: -1,
+			fail: (goneMs) => {
+				if (entry.settled) return;
+				settle();
+				reject(
+					new ServerError(
+						`${committedLocally}the peers that could confirm it for database "${databaseName}" have not been receiving replication from this node for ${Math.round(goneMs)}ms (needed ${confirmationCount}, received ${received()})`,
+						504
+					)
+				);
+			},
+		};
 		awaiting.add(entry);
+		if (watched) watchWaiter(watched);
 	});
 }
 
+/**
+ * Ends a wait early once the peers that could still confirm it are gone. `reachable` is asked with the
+ * peers that confirmed so far; it must stay false for `graceMs` before the wait fails, so a link that
+ * drops and reconnects inside that window does not fail a commit that would have confirmed.
+ */
+export type PeersGoneWatch = { reachable: (confirmed: ReadonlySet<string>) => boolean; graceMs: number };
+type WatchedWaiter = {
+	reachable: () => boolean;
+	graceMs: number;
+	unreachableSince: number;
+	fail: (goneMs: number) => void;
+};
+const watchedWaiters = new Set<WatchedWaiter>();
+const PEERS_GONE_SWEEP_MS = 1000;
+let peersGoneSweep: ReturnType<typeof setInterval> | undefined;
+function watchWaiter(waiter: WatchedWaiter): void {
+	watchedWaiters.add(waiter);
+	if (!peersGoneSweep) {
+		peersGoneSweep = setInterval(sweepWatchedWaiters, PEERS_GONE_SWEEP_MS);
+		peersGoneSweep.unref?.();
+	}
+}
+// the sweep stops itself once it finds no waiter, so a commit that confirms at once does not churn a timer
+function unwatchWaiter(waiter: WatchedWaiter): void {
+	watchedWaiters.delete(waiter);
+}
+// recipients read once per sweep, not once per pending waiter
+let sweepRecipients: Map<string, { name: string }[]> | undefined;
+function recipientsDuringSweep(databaseName: string): { name: string }[] {
+	if (!sweepRecipients) return getReplicationRecipients(databaseName);
+	let recipients = sweepRecipients.get(databaseName);
+	if (!recipients) sweepRecipients.set(databaseName, (recipients = getReplicationRecipients(databaseName)));
+	return recipients;
+}
+/** One pass of the shared sweep; exported so tests can drive it with their own clock. */
+export function sweepWatchedWaiters(now = performance.now()): void {
+	if (!watchedWaiters.size) {
+		if (peersGoneSweep) clearInterval(peersGoneSweep);
+		peersGoneSweep = undefined;
+		return;
+	}
+	sweepRecipients = new Map();
+	try {
+		for (const waiter of watchedWaiters) {
+			let reachable: boolean;
+			try {
+				reachable = waiter.reachable();
+			} catch (error) {
+				logger.debug?.('Could not check the peers a lock-governed confirmation waits on', error);
+				reachable = true;
+			}
+			if (reachable) waiter.unreachableSince = -1;
+			else if (waiter.unreachableSince < 0) waiter.unreachableSince = now;
+			else if (now - waiter.unreachableSince >= waiter.graceMs) waiter.fail(now - waiter.unreachableSince);
+		}
+	} finally {
+		sweepRecipients = undefined;
+	}
+}
+
+/** Whether the peers this node is sending `databaseName` to right now could still confirm the wait. */
+export function lockConfirmersReachable(
+	databaseName: string,
+	confirmationCount: number,
+	confirmed: ReadonlySet<string>,
+	residentPeerLists?: string[][]
+): boolean {
+	const recipients = recipientsDuringSweep(databaseName);
+	if (!residentPeerLists?.length)
+		return confirmed.size + countSendingTo(databaseName, recipients, confirmed) >= confirmationCount;
+	for (const residents of residentPeerLists)
+		if (
+			countMembers(confirmed, residents) +
+				countSendingTo(databaseName, recipientResidents(residents, recipients), confirmed) <
+			confirmationCount
+		)
+			return false;
+	return true;
+}
+
 // residents are distinct (core deduplicates them)
-function countMembers(confirmed: Set<string>, residents: string[]): number {
+function countMembers(confirmed: ReadonlySet<string>, residents: string[]): number {
 	let count = 0;
 	for (const nodeName of residents) if (confirmed.has(nodeName)) count++;
 	return count;
@@ -996,6 +1101,12 @@ function isRecipient(recipients: { name: string }[], name: string): boolean {
 	return false;
 }
 
+function recipientResidents(residents: string[], recipients: { name: string }[]): string[] {
+	for (const name of residents)
+		if (!isRecipient(recipients, name)) return residents.filter((resident) => isRecipient(recipients, resident));
+	return residents;
+}
+
 /**
  * Refuse a count some written record's residents can never meet through this node's recipients — a
  * resident that is no longer a cluster member, or one this node does not send `databaseName` to.
@@ -1018,19 +1129,43 @@ export function assertResidentsReachable(
 	}
 }
 
+const LOCK_OPT_OUT =
+	'A commit holding a cluster record lock waits for replication.recordLockConfirmation peer(s); set it to 0 to commit locked writes without peer confirmation.';
+
 /**
  * Refuse, before the write is committed, a confirmation this node could never collect: more peers than it
- * replicates `databaseName` to, or than a written record's residents among them.
+ * replicates `databaseName` to, or than a written record's residents among them. A lock-governed count is
+ * also refused while too few of them are connected, rather than left to wait for peers that are gone.
  */
-function assertConfirmationFeasible(databaseName: string, confirmationCount: number, residentPeerLists?: string[][]) {
+function assertConfirmationFeasible(
+	databaseName: string,
+	confirmationCount: number,
+	residentPeerLists?: string[][],
+	lockGoverned = false
+) {
 	const recipients = getReplicationRecipients(databaseName);
 	if (confirmationCount > recipients.length) {
 		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
 		throw new ClientError(
-			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
+			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})${lockGoverned ? '. ' + LOCK_OPT_OUT : ''}`
 		);
 	}
 	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);
+	if (!lockGoverned) return;
+	let connected = countSendingTo(databaseName, recipients);
+	let of = recipients.length;
+	if (connected >= confirmationCount && residentPeerLists)
+		for (const residents of residentPeerLists) {
+			const reachable = recipientResidents(residents, recipients);
+			connected = countSendingTo(databaseName, reachable);
+			of = reachable.length;
+			if (connected < confirmationCount) break;
+		}
+	if (connected < confirmationCount)
+		throw new ServerError(
+			`Cannot commit a write made under a cluster record lock: it needs confirmation from ${confirmationCount} peer(s) for database "${databaseName}", and this node is sending it to ${connected} of ${of} right now. This database's writes were not committed, though another database's in the same transaction may have been; retry once a peer reconnects. ${LOCK_OPT_OUT}`,
+			503
+		);
 }
 
 // keyed by store, not name: a database dropped and created again has a new store, which its senders read
@@ -1047,8 +1182,51 @@ function demandFor(databaseName: string): ReturnType<typeof confirmationDemand> 
 	}
 }
 
+/**
+ * Parse `replication.confirmation` or `replication.recordLockConfirmation`; absent means 0. Core's config
+ * validator refuses any other value at startup, and one that still reaches here throws rather than
+ * silently turning off the confirmation an operator configured.
+ */
+export function parseConfirmationDefault(name: string, raw: unknown): number {
+	if (raw == null || raw === '') return 0;
+	const value = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+	if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
+	throw new Error(`Invalid ${name} ${JSON.stringify(raw)}: expected a non-negative integer`);
+}
+
+/**
+ * Read once per thread at load, so a change takes a restart. A clone calls it again with the configuration it
+ * installed, since its main thread loaded this module before the leader's configuration was written. An unset
+ * `replication.recordLockConfirmation` is 1 while `replication.recordLocks` is on, decided from the configuration
+ * rather than admission, which runs later: on a node admission refuses, no lock is cluster-granted, so the
+ * minimum never applies.
+ */
+export function registerConfirmationDefaults(
+	read: (key: string) => unknown = (key) => env.get(key),
+	recordLocksEnabled: boolean = RECORD_LOCKS_CONFIGURED
+): void {
+	const recordLocks = read(CONFIG_PARAMS.REPLICATION_RECORDLOCKCONFIRMATION);
+	setReplicationConfirmationDefaults({
+		writes: parseConfirmationDefault('replication.confirmation', read(CONFIG_PARAMS.REPLICATION_CONFIRMATION)),
+		recordLocks:
+			recordLocks == null || recordLocks === ''
+				? recordLocksEnabled
+					? 1
+					: 0
+				: parseConfirmationDefault('replication.recordLockConfirmation', recordLocks),
+	});
+}
+registerConfirmationDefaults();
+
 replicationConfirmation(
-	(databaseName, txnTime, confirmationCount, residentPeerLists?: string[][], automatic = false): Promise<void> => {
+	(
+		databaseName,
+		txnTime,
+		confirmationCount,
+		residentPeerLists?: string[][],
+		automatic = false,
+		lockGoverned = false
+	): Promise<void> => {
 		if (!commitsAwaitingReplication) {
 			commitsAwaitingReplication = new Map();
 			startSubscriptionToReplications();
@@ -1077,6 +1255,13 @@ replicationConfirmation(
 			replicationConfirmationTimeout(automatic),
 			countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime, marker),
 			residentPeerLists,
+			lockGoverned
+				? {
+						reachable: (confirmed) =>
+							lockConfirmersReachable(databaseName, confirmationCount, confirmed, residentPeerLists),
+						graceMs: PING_TIMEOUT,
+					}
+				: undefined,
 			marker,
 			onSettled
 		);

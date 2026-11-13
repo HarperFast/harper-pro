@@ -470,7 +470,15 @@ async function establishReplicationSetup(syncStartedAt: number, priorMarker?: Sy
 	shardRecord = { shardAware: true, shard, shardedDatabases };
 	writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
 
-	cloneConfig(leaderConfigData, shard);
+	const clonedConfig = cloneConfig(leaderConfigData, shard);
+	const { registerConfirmationDefaults } = await import('../replication/knownNodes.ts');
+	const { recordLocksConfiguredFrom } = await import('../replication/recordLockConfig.ts');
+	// an environment overlay was already in this thread's settings at startup; the leader's value was not
+	const readCloned = (key: string) => envMgr.get(key) ?? clonedConfig[key] ?? clonedConfig[key.toLowerCase()];
+	registerConfirmationDefaults(
+		readCloned,
+		recordLocksConfiguredFrom(readCloned(CONFIG_PARAMS.REPLICATION_RECORDLOCKS))
+	);
 
 	// Refine the leader replication URL using the leader's own config. This is the only way to
 	// pick the right scheme (ws:// vs wss://) when bootstrapping against a leader whose
@@ -1242,7 +1250,7 @@ async function installLeaderShardMaps(maps: any[]): Promise<void> {
 	}
 }
 
-function cloneConfig(leaderConfigData: Record<string, any>, shard: number | undefined): void {
+function cloneConfig(leaderConfigData: Record<string, any>, shard: number | undefined): Record<string, any> {
 	log('Cloning config from leader');
 
 	// Build base configuration with node-specific settings
@@ -1291,6 +1299,7 @@ function cloneConfig(leaderConfigData: Record<string, any>, shard: number | unde
 
 	// Write final configuration to file
 	createConfigFile(configData, true);
+	return configData;
 }
 
 /**

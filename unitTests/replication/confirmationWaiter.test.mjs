@@ -215,7 +215,7 @@ describe('createConfirmationWaiter', () => {
 	it('a peer with confirmation markers confirms only once it acknowledges the waiter marker, whatever its key maximum (harper-pro#1351)', async () => {
 		const awaiting = new Set();
 		// the write committed with key 100 after a write keyed 150 was delivered: the key maximum already passes it
-		const waiting = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), undefined, 7);
+		const waiting = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), undefined, undefined, 7);
 		notifyConfirmedWaiters(awaiting, 'peer1', markerStatus(150, 6));
 		expect(awaiting.size).to.equal(1);
 		notifyConfirmedWaiters(awaiting, 'peer1', markerStatus(150, 7));
@@ -225,7 +225,7 @@ describe('createConfirmationWaiter', () => {
 
 	it('a peer whose marker support is not known yet confirms nothing', async () => {
 		const awaiting = new Set();
-		const waiting = createConfirmationWaiter(awaiting, 'data', 100, 1, 20, new Set(), undefined, 3);
+		const waiting = createConfirmationWaiter(awaiting, 'data', 100, 1, 20, new Set(), undefined, undefined, 3);
 		const unknown = keyStatus(500);
 		unknown[PEER_CONFIRMATION_MARKERS_POSITION] = 0;
 		unknown[ACKED_CONFIRMATION_MARKER_POSITION] = 9;
@@ -249,16 +249,37 @@ describe('createConfirmationWaiter', () => {
 			5000,
 			new Set(),
 			undefined,
+			undefined,
 			1,
 			() => settled++
 		);
 		notifyConfirmedWaiters(awaiting, 'peer1', markerStatus(0, 1));
 		notifyConfirmedWaiters(awaiting, 'peer1', markerStatus(0, 1));
 		await confirmed;
-		await createConfirmationWaiter(awaiting, 'data', 100, 1, 10, new Set(), undefined, 2, () => settled++).catch(
-			() => {}
+		await createConfirmationWaiter(
+			awaiting,
+			'data',
+			100,
+			1,
+			10,
+			new Set(),
+			undefined,
+			undefined,
+			2,
+			() => settled++
+		).catch(() => {});
+		await createConfirmationWaiter(
+			awaiting,
+			'data',
+			100,
+			1,
+			10,
+			new Set(['peer1']),
+			undefined,
+			undefined,
+			3,
+			() => settled++
 		);
-		await createConfirmationWaiter(awaiting, 'data', 100, 1, 10, new Set(['peer1']), undefined, 3, () => settled++);
 		expect(settled).to.equal(3);
 	});
 
