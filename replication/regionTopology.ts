@@ -229,12 +229,15 @@ export interface SupplierState {
  * The links an origin was taken through, most recent first, once `assignment`'s supplier is relieved: that supplier
  * leads, then those it relieved, each named once. A borrow reads them all, so a supplier relieved before its route
  * recorded anything (its link only copied, or the origin wrote nothing through it) does not hide one that did.
- * Bounded by the region's members and the origin itself.
+ * Departed members stay named, so the list is capped: dropping the oldest can only lower a borrowed start, or leave
+ * none, which takes a base copy.
  */
+export const RELIEVED_SUPPLIER_LIMIT = 8;
 export function relievedSuppliers(assignment: { supplier?: string; relieved?: string[] } | undefined): string[] {
 	const relieved = assignment?.relieved ?? [];
 	const supplier = assignment?.supplier;
-	return supplier === undefined ? relieved : [supplier, ...relieved.filter((name) => name !== supplier)];
+	const routes = supplier === undefined ? relieved : [supplier, ...relieved.filter((name) => name !== supplier)];
+	return routes.length > RELIEVED_SUPPLIER_LIMIT ? routes.slice(0, RELIEVED_SUPPLIER_LIMIT) : routes;
 }
 
 export interface SupplierAssignment {

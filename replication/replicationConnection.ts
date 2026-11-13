@@ -3715,7 +3715,8 @@ type SettledRouteStateVersions = {
 	clears: Map<number, number | undefined>;
 	revocations: Map<number, number | undefined>;
 	certifiedSinceClear: Map<number, { clearVersion: number; start: number; generation?: string } | undefined>;
-	partials: Map<string, number | undefined>;
+	/** what each raised partial watermark was, and the version this batch raised it to */
+	partials: Map<string, [previous: number | undefined, raised: number]>;
 };
 type UnverifiedRouteStateBatch = {
 	event: any;
@@ -3925,13 +3926,15 @@ export class PendingRouteState {
 			number,
 			{ clearVersion: number; start: number; generation?: string } | undefined
 		>();
-		const prevPartials = new Map<string, number | undefined>();
+		const prevPartials = new Map<string, [number | undefined, number]>();
 		for (const [originId, sent] of marks ?? []) {
 			if (sent.mark[2] !== undefined || sent.clearCertifiedFirst) {
 				const key = partialKey(originId, sent.mark[4]);
 				const partial = this.settledPartial.get(key);
-				prevPartials.set(key, partial);
-				if (!(partial >= sent.version)) this.settledPartial.set(key, sent.version);
+				if (!(partial >= sent.version)) {
+					prevPartials.set(key, [partial, sent.version]);
+					this.settledPartial.set(key, sent.version);
+				}
 			}
 			prevMarks.set(originId, this.settledMarkVersion.get(originId));
 			prevCertifiedSinceClear.set(originId, this.settledCertifiedSinceClear.get(originId));
@@ -4034,7 +4037,9 @@ export class PendingRouteState {
 				if (prev === undefined) this.settledCertifiedSinceClear.delete(originId);
 				else this.settledCertifiedSinceClear.set(originId, prev);
 			}
-			for (const [key, prev] of settled.partials) {
+			// a batch that settled later raised it again, and the row holds what that batch wrote
+			for (const [key, [prev, raised]] of settled.partials) {
+				if (this.settledPartial.get(key) !== raised) continue;
 				if (prev === undefined) this.settledPartial.delete(key);
 				else this.settledPartial.set(key, prev);
 			}
@@ -4042,7 +4047,13 @@ export class PendingRouteState {
 		// A re-queued entry takes a new version: keeping the one it was sent under, another batch's settle or rollback can
 		// leave its origin settled at or above it, and a commit then filters it out every time without removing it, so the
 		// route never reads as durable and a copy pass over it never settles.
-		for (const [originId, sent] of marks ?? []) {
+		for (const [originId, original] of marks ?? []) {
+			// a newer partialHistory of this origin and generation has settled since: re-sending this one would undo it
+			const superseded =
+				original.mark[2] !== undefined &&
+				this.settledPartial.get(partialKey(originId, original.mark[4])) > original.version;
+			const sent = superseded ? { ...original, mark: [...original.mark] as OriginRouteState } : original;
+			if (superseded) sent.mark[2] = undefined;
 			let current = this.marks?.get(originId);
 			if (!current) {
 				(this.marks ??= new Map()).set(
@@ -4059,7 +4070,7 @@ export class PendingRouteState {
 				if (sent.mark[2] === true || sent.clearCertifiedFirst) {
 					current.clearCertifiedFirst = true;
 					if (!current.clearVersion) current.clearVersion = sent.clearVersion || sent.version;
-					if (current.mark[2] === undefined) {
+					if (current.mark[2] === undefined && !superseded) {
 						if (sent.mark[2] === true) {
 							current.mark[2] = true;
 							current.mark[1] = undefined;

@@ -6,6 +6,7 @@ import {
 	orderFailoverCandidates,
 	originFallbackMates,
 	receivesDirect,
+	RELIEVED_SUPPLIER_LIMIT,
 	relievedSuppliers,
 	settleSupplier,
 	supplierCandidates,
@@ -443,6 +444,15 @@ describe('regionTopology', () => {
 
 		it('keeps the list unchanged through a time with no supplier', () => {
 			assert.deepEqual(relievedSuppliers({ relieved: ['east1', 'east2'] }), ['east1', 'east2']);
+		});
+
+		it('keeps only the most recent suppliers once departed members would grow it', () => {
+			let assignment;
+			for (let i = 0; i < RELIEVED_SUPPLIER_LIMIT + 5; i++)
+				assignment = { supplier: `member${i}`, relieved: relievedSuppliers(assignment) };
+			const routes = relievedSuppliers(assignment);
+			assert.strictEqual(routes.length, RELIEVED_SUPPLIER_LIMIT);
+			assert.strictEqual(routes[0], `member${RELIEVED_SUPPLIER_LIMIT + 4}`);
 		});
 	});
 

@@ -504,8 +504,9 @@ export function copyUnsettledFrom(databaseName: string, peerName: string): boole
 		const peerId = auditStore ? exportIdMapping(auditStore)[peerName] : undefined;
 		return typeof peerId === 'number' && unsettledCopyReservation(auditStore.rootStore?.dbisDb, peerId) !== undefined;
 	} catch (error) {
+		// held: dropping the link could strand a reservation, and the hold rechecks it
 		logger.warn('Could not read the copy reservations of', databaseName, 'from', peerName, error);
-		return false;
+		return true;
 	}
 }
 const COPY_HOLD_RECHECK_MS = 2_000;
@@ -1577,6 +1578,7 @@ export async function startOnMainThread(options) {
 				if (row) onNodeUpdate(row, name);
 			} catch (error) {
 				logger.error('Error rechecking the link kept for a copy from', name, database, error);
+				recheckCopyHold(name, database, heldForCopy.has(key));
 			}
 		}, COPY_HOLD_RECHECK_MS);
 		timer.unref?.();

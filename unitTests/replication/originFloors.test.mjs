@@ -1125,6 +1125,26 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
 	});
 
+	it('PendingRouteState does not restore a partialHistory a newer settled one superseded', async () => {
+		// a copy pass's start mark fails after its finish's restore settled: the row holds partialHistory: false, and no
+		// later pass would clear a true sent again
+		const routeState = new PendingRouteState(() => {});
+		const commit = async () => {
+			const event = { remoteNodeIds: [1] };
+			routeState.attachTo(event);
+			await event.onCommit();
+			return event;
+		};
+		routeState.partialHistory(1, true, 'g1');
+		const start = await commit();
+		routeState.partialHistory(1, false, 'g1');
+		await commit();
+		start.onFailure(new Error('the start mark did not land'), 0, true);
+		assert.strictEqual(routeState.hasPendingPartialHistory(1), false);
+		// the certification clear it carried is still sent
+		assert.strictEqual(routeState.hasPending(), true);
+	});
+
 	it("PendingRouteState verifyPersisted counts a newer partialHistory only within the older mark's generation", async () => {
 		const routeState = new PendingRouteState(() => {});
 		const commit = async () => {
