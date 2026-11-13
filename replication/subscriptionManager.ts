@@ -1977,29 +1977,41 @@ export async function startOnMainThread(options) {
 	 */
 	function scheduleOriginFallback(entry: any, database: string): boolean {
 		if (entry.originFallback || entry.originFallbackTimer) return true;
-		if (originFallbackCandidates(entry, database).length === 0) return false;
-		armOriginFallback(entry, database, () => {
-			if (!openOriginFallback(entry, database)) scheduleOriginFallback(entry, database);
-		});
+		try {
+			if (originFallbackCandidates(entry, database).length === 0) return false;
+		} catch (error) {
+			retryOriginFallback(entry, database, error);
+			return true;
+		}
+		armOriginFallback(entry, database);
 		return true;
 	}
-	/** Runs `attempt` after the hold; one that throws (it reads hdb_nodes) is logged and tried again after another. */
-	function armOriginFallback(entry: any, database: string, attempt: () => void): void {
+	/**
+	 * After the hold: moves a fallback that is down to the next region-mate, or opens one. A step that throws (each reads
+	 * hdb_nodes) is retried after another hold, since a connection reports its first failed dial only once and no later
+	 * report would try again.
+	 */
+	function armOriginFallback(entry: any, database: string): void {
 		entry.originFallbackTimer = setTimeout(() => {
 			entry.originFallbackTimer = undefined;
 			const current = connectionReplicationMap.get(entry.url)?.get(database);
 			if (current !== entry || entry.connected !== false || entry.unsubscribed) return;
-			try {
-				attempt();
-			} catch (error) {
-				logger.warn(
-					`Region topology: could not open a fallback link for ${entry.nodes[0]?.name} on ${database}`,
-					error
-				);
-				if (!entry.originFallbackTimer) armOriginFallback(entry, database, attempt);
-			}
+			if (entry.originFallback) rotateOriginFallback(entry, database);
+			else
+				try {
+					if (!openOriginFallback(entry, database)) scheduleOriginFallback(entry, database);
+				} catch (error) {
+					retryOriginFallback(entry, database, error);
+				}
 		}, TOPOLOGY_HOLD_MS);
 		entry.originFallbackTimer.unref?.();
+	}
+	function retryOriginFallback(entry: any, database: string, error: unknown): void {
+		logger.warn(
+			`Region topology: could not open or move the fallback link for ${entry.nodes[0]?.name} on ${database}`,
+			error
+		);
+		if (!entry.originFallbackTimer) armOriginFallback(entry, database);
 	}
 	/**
 	 * Under the grid a node that receives an origin from another region links to nothing else of that origin's region.
@@ -2044,32 +2056,24 @@ export async function startOnMainThread(options) {
 	function rotateOriginFallback(entry: any, database: string): void {
 		const fallback = entry.originFallback;
 		if (!fallback || fallback.connected || entry.connected !== false) return;
-		const mates = originFallbackCandidates(entry, database);
-		const next = mates[(mates.indexOf(fallback.name) + 1) % mates.length];
-		if (next === undefined || next === fallback.name) return;
-		const wait = fallback.openedAt + TOPOLOGY_STABLE_MS - Date.now();
-		if (wait > 0) {
-			fallback.recheck ??= setTimeout(() => {
-				fallback.recheck = undefined;
-				if (entry.originFallback !== fallback) return;
-				try {
-					rotateOriginFallback(entry, database);
-				} catch (error) {
-					logger.warn(
-						`Region topology: could not move the fallback link for ${entry.nodes[0]?.name} on ${database}`,
-						error
-					);
-					if (!entry.originFallback && !entry.originFallbackTimer)
-						armOriginFallback(entry, database, () => {
-							if (!openOriginFallback(entry, database)) scheduleOriginFallback(entry, database);
-						});
-				}
-			}, wait);
-			fallback.recheck.unref?.();
-			return;
+		try {
+			const mates = originFallbackCandidates(entry, database);
+			const next = mates[(mates.indexOf(fallback.name) + 1) % mates.length];
+			if (next === undefined || next === fallback.name) return;
+			const wait = fallback.openedAt + TOPOLOGY_STABLE_MS - Date.now();
+			if (wait > 0) {
+				fallback.recheck ??= setTimeout(() => {
+					fallback.recheck = undefined;
+					if (entry.originFallback === fallback) rotateOriginFallback(entry, database);
+				}, wait);
+				fallback.recheck.unref?.();
+				return;
+			}
+			closeOriginFallback(entry, database);
+			if (!openOriginFallback(entry, database, next)) scheduleOriginFallback(entry, database);
+		} catch (error) {
+			retryOriginFallback(entry, database, error);
 		}
-		closeOriginFallback(entry, database);
-		if (!openOriginFallback(entry, database, next)) scheduleOriginFallback(entry, database);
 	}
 	function closeOriginFallback(entry: any, database: string): void {
 		clearTimeout(entry.originFallbackTimer);
