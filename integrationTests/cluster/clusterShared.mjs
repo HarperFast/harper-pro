@@ -403,6 +403,37 @@ export async function waitForCondition(probe, opts = {}) {
 	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: lastError ?? signal.reason });
 }
 
+/**
+ * Resolves once `node` gets `peerName`'s answer to a replicated operation, the path `drop_table`, deploys and other
+ * replicated operations take. A replication connection is not that proof: `add_node` returns before the certificates
+ * it exchanged reach either node's TLS contexts, and until they do the peer can serve a certificate the origin's
+ * operation client does not yet trust. `list_releases` is read-only, so polling it changes nothing.
+ * @param {Object} node - the origin
+ * @param {string} peerName - the peer's node name (its hostname in these suites)
+ * @param {Object} [opts]
+ * @param {number} [opts.timeoutMs=30000]
+ * @param {number} [opts.pollMs=250]
+ */
+export function waitForOperationPath(node, peerName, { timeoutMs = 30000, pollMs = 250 } = {}) {
+	let lastAnswer;
+	return waitForCondition(
+		async (signal) => {
+			const { body } = await postOperation(node, { operation: 'list_releases', replicated: true }, { signal }).catch(
+				(error) => ({ body: { error: error.message } })
+			);
+			lastAnswer = body;
+			const peer = body?.nodes?.find((entry) => entry.node === peerName);
+			return Boolean(peer && !peer.error && Array.isArray(peer.components));
+		},
+		{
+			timeoutMs,
+			pollMs,
+			description: () =>
+				`${node.hostname} to get ${peerName}'s answer to a replicated operation; last: ${JSON.stringify(lastAnswer)}`,
+		}
+	);
+}
+
 /** A missing directory throws instead of reading as purged. */
 export async function logSegments(node, logName, database = 'data') {
 	const { readdir } = await import('node:fs/promises');

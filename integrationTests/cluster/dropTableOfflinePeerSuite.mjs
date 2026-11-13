@@ -19,7 +19,7 @@ import {
 	getNextAvailableLoopbackAddress,
 	targz,
 } from '@harperfast/integration-testing';
-import { sendOperation, waitForCondition } from './clusterShared.mjs';
+import { sendOperation, waitForCondition, waitForOperationPath } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -256,6 +256,9 @@ export function dropTableOfflinePeerSuite({ replicationThreads, scenarios } = {}
 				authorization: ctx.nodeB.admin,
 			});
 			await waitForBothConnected(ctx, 'at setup');
+			// scenario 1 asserts B acknowledged a replicated drop, which takes more than a connected socket
+			await waitForOperationPath(ctx.nodeA, ctx.nodeB.hostname);
+			await waitForOperationPath(ctx.nodeB, ctx.nodeA.hostname);
 		});
 
 		after(async () => {
