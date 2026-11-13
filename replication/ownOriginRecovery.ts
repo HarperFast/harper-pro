@@ -1,10 +1,11 @@
 /**
  * Own-origin recovery after a lost transaction-log tail (harper-pro#1364). Table writes run WAL-off, so
  * between memtable flushes a node's `local` log is the only on-disk record of its own commits, and a power
- * loss can drop a tail its peers already confirmed. Each start opens an epoch: the window `(after, before)`
- * where an own write can be missing here yet held by a peer. Every capable peer is asked for its entries
- * of this node's origin in that window over the ordinary subscription, and reports once it has sent them;
- * record-lock freshness refuses own lineage in the window until every peer that may hold it has reported.
+ * loss can drop a tail its peers already confirmed. A start that may follow such a loss (bootIdentity.ts)
+ * opens an epoch: the window `(after, before)` where an own write can be missing here yet held by a peer.
+ * Every capable peer is asked for its entries of this node's origin in that window over the ordinary
+ * subscription, and reports once it has sent them; record-lock freshness refuses own lineage in the window
+ * until every peer that may hold it has reported.
  * Design: replication/DESIGN.md, non-obvious behavior 39.
  *
  * State lives in the database's `dbis` store so every thread reads the same facts: the epoch row, written
@@ -40,6 +41,22 @@ export interface OwnOriginEpoch {
 	/** Peers that had replicated this database with this node when the epoch opened. */
 	requiredPeers: string[];
 	finished?: boolean;
+	/** The OS boot this epoch opened on, when known: a later start on the same boot continues it. */
+	bootId?: string;
+}
+
+export interface StartContinuity {
+	bootId?: string;
+	/** A transaction-log sync failure was recorded since the previous start. */
+	syncFailure: boolean;
+}
+
+/** The previous epoch still covers this start when the OS kept its page cache, so no own write was lost since. */
+export function continuesEpoch(
+	previous: OwnOriginEpoch | undefined,
+	continuity: StartContinuity
+): previous is OwnOriginEpoch {
+	return !continuity.syncFailure && continuity.bootId !== undefined && previous?.bootId === continuity.bootId;
 }
 
 export interface OwnOriginReport {
@@ -113,14 +130,28 @@ export function markOwnOriginRecoveryFailed(database: string): void {
 /**
  * Open this start's epoch for one database, before any worker writes to it: the row is written
  * synchronously so the first subscription a worker builds sees it, and the caller awaits the WAL sync
- * this returns before workers start. A failure to read the log opens the widest window rather than none;
- * a failure to write or sync the row is the caller's to mark (`markOwnOriginRecoveryFailed`).
+ * this returns before workers start. On the previous epoch's boot with no sync failure since, that epoch
+ * stays in force instead: every own write minted since it opened survived, and older ones still wait for
+ * the peers that have not reported for it. A failure to read the log opens the widest window rather than
+ * none; a failure to write or sync the row is the caller's to mark (`markOwnOriginRecoveryFailed`).
  */
-export function openOwnOriginRecoveryEpoch(database: string, auditStore: any, dbisDB: any): Promise<void> | undefined {
+export function openOwnOriginRecoveryEpoch(
+	database: string,
+	auditStore: any,
+	dbisDB: any,
+	continuity: StartContinuity
+): Promise<void> | undefined {
 	const rootStore = auditStore?.rootStore;
 	if (auditStore?.reusableIterable !== true) return undefined;
 	if (!dbisDB || typeof rootStore?.getMonotonicTimestamp !== 'function' || typeof rootStore.syncWal !== 'function')
 		throw new Error(`${database} has per-origin logs but no store to record a recovery epoch in`);
+	const previous = readEpoch(dbisDB);
+	if (continuesEpoch(previous, continuity)) {
+		logger.info?.(
+			`Own-origin recovery for ${database}: the OS has not restarted since ${new Date(previous.before).toISOString()}, so this node's own log is intact`
+		);
+		return undefined;
+	}
 	const before = rootStore.getMonotonicTimestamp();
 	const requiredPeers = peersWithCursors(dbisDB, auditStore);
 	let epoch: OwnOriginEpoch;
@@ -128,7 +159,7 @@ export function openOwnOriginRecoveryEpoch(database: string, auditStore: any, db
 		epoch = nextEpoch(
 			findLastCommittedLogKey(auditStore, 'local') || undefined,
 			getLogPurgeBounds(auditStore, 'local')?.get('local'),
-			readEpoch(dbisDB),
+			previous,
 			before,
 			requiredPeers
 		);
@@ -136,6 +167,7 @@ export function openOwnOriginRecoveryEpoch(database: string, auditStore: any, db
 		logger.warn?.(`Own-origin recovery: could not read ${database}'s log; asking peers for all of it`, error);
 		epoch = { after: MIN_START, lastKey: 0, before, requiredPeers };
 	}
+	if (continuity.bootId !== undefined) epoch.bootId = continuity.bootId;
 	dbisDB.putSync(EPOCH, epoch);
 	cachedEpochs.delete(database);
 	logger.info?.(

@@ -14,6 +14,7 @@ import { isWorkerPoolActive } from '../core/server/threads/workerPools.ts';
 import { setSessionHolderReader } from './recordLockRpc.ts';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import { markOwnOriginRecoveryFailed, openOwnOriginRecoveryEpoch } from './ownOriginRecovery.ts';
+import { clearSyncFailureMarker, readBootId, readSyncFailureMarker, watchLogSyncFailures } from './bootIdentity.ts';
 import {
 	subscribeToNode,
 	urlToNodeName,
@@ -1167,6 +1168,11 @@ export async function startOnMainThread(options) {
 	}
 	const databases = getDatabases();
 	const epochSyncs: Array<{ database: string; synced: Promise<void> }> = [];
+	const rootPath = env.getHdbBasePath();
+	watchLogSyncFailures(rootPath);
+	const syncFailure = rootPath ? readSyncFailureMarker(rootPath) : { present: true };
+	const continuity = { bootId: readBootId(), syncFailure: syncFailure.present };
+	let epochFailed = false;
 	// find all the databases last recorded audit entry so that we can inquire from the first node for self catch-up
 	// of any records that may have been missed
 	for (const dbName of Object.getOwnPropertyNames(databases)) {
@@ -1176,9 +1182,10 @@ export async function startOnMainThread(options) {
 			if (table.auditStore) {
 				selfCatchupOfDatabase.set(dbName, lastTimeInAuditStore(table.auditStore) as number);
 				try {
-					const synced = openOwnOriginRecoveryEpoch(dbName, table.auditStore, table.dbisDB);
+					const synced = openOwnOriginRecoveryEpoch(dbName, table.auditStore, table.dbisDB, continuity);
 					if (synced) epochSyncs.push({ database: dbName, synced });
 				} catch (error) {
+					epochFailed = true;
 					markOwnOriginRecoveryFailed(dbName);
 					logger.error?.(
 						`Own-origin recovery: could not open the recovery epoch of ${dbName}; cluster locks refuse this node's own lineage there until a restart opens one`,
@@ -1193,12 +1200,15 @@ export async function startOnMainThread(options) {
 	syncResults.forEach((result, index) => {
 		if (result.status === 'fulfilled') return;
 		const { database } = epochSyncs[index];
+		epochFailed = true;
 		markOwnOriginRecoveryFailed(database);
 		logger.error?.(
 			`Own-origin recovery: could not sync the recovery epoch of ${database}; cluster locks refuse this node's own lineage there until a restart opens one`,
 			result.reason
 		);
 	});
+	// every epoch this marker called for is now durable, so a later start on this boot may continue them
+	if (syncFailure.token !== undefined && !epochFailed) clearSyncFailureMarker(rootPath, syncFailure.token);
 	// we need to wait for the threads to start before we can start adding nodes
 	// but don't await this because this start function has to finish before the threads can start
 	whenThreadsStarted.then(async () => {

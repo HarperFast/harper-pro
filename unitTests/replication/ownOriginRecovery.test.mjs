@@ -4,11 +4,14 @@
  */
 import assert from 'node:assert';
 import {
+	continuesEpoch,
 	flushAfterNow,
 	lineageFromReports,
 	markOwnOriginRecoveryFailed,
 	nextEpoch,
+	openOwnOriginRecoveryEpoch,
 	ownLineage,
+	recoveryRangeFor,
 	recoveryStart,
 } from '#src/replication/ownOriginRecovery';
 import { findOwnOriginRecoveryRange, ORIGIN_CURSOR_OVERLAP_MS } from '#src/replication/replicationConnection';
@@ -201,4 +204,95 @@ describe('markOwnOriginRecoveryFailed', () => {
 			else process.env.HARPER_OWN_ORIGIN_RECOVERY_FAILED = saved;
 		}
 	});
+});
+
+describe('continuesEpoch', () => {
+	const previous = { after: 1, lastKey: 0, before: NOW, requiredPeers: [], bootId: 'boot-a' };
+	it('continues on the boot the previous epoch opened on, with no sync failure since', () => {
+		assert.strictEqual(continuesEpoch(previous, { bootId: 'boot-a', syncFailure: false }), true);
+		assert.strictEqual(
+			continuesEpoch({ ...previous, finished: false }, { bootId: 'boot-a', syncFailure: false }),
+			true
+		);
+	});
+	it('opens a new epoch after a changed or unknown boot, a sync failure, or with no boot recorded', () => {
+		assert.strictEqual(continuesEpoch(previous, { bootId: 'boot-b', syncFailure: false }), false);
+		assert.strictEqual(continuesEpoch(previous, { bootId: undefined, syncFailure: false }), false);
+		assert.strictEqual(continuesEpoch(previous, { bootId: 'boot-a', syncFailure: true }), false);
+		assert.strictEqual(
+			continuesEpoch({ ...previous, bootId: undefined }, { bootId: 'boot-a', syncFailure: false }),
+			false
+		);
+		assert.strictEqual(continuesEpoch(undefined, { bootId: 'boot-a', syncFailure: false }), false);
+	});
+});
+
+describe('openOwnOriginRecoveryEpoch', () => {
+	const EPOCH = Symbol.for('ownOriginRecovery');
+	function stores(previous) {
+		const rows = new Map();
+		if (previous) rows.set(EPOCH, previous);
+		let syncs = 0;
+		const dbisDB = {
+			rows,
+			getSync: (key) => rows.get(key),
+			putSync: (key, value) => rows.set(key, value),
+			getRange: () => [],
+		};
+		const auditStore = {
+			reusableIterable: true,
+			getRange: () => [],
+			getBinary: () => undefined,
+			rootStore: {
+				getMonotonicTimestamp: () => NOW + 1000,
+				syncWal: async () => {
+					syncs++;
+				},
+			},
+		};
+		return { dbisDB, auditStore, syncs: () => syncs };
+	}
+	const settled = { after: 5, lastKey: 10, before: NOW, requiredPeers: ['peer'], bootId: 'boot-a', finished: true };
+
+	it('leaves the previous epoch in force on the same boot: nothing written and nothing synced', () => {
+		const { dbisDB, auditStore, syncs } = stores(settled);
+		const result = openOwnOriginRecoveryEpoch('continued-db', auditStore, dbisDB, {
+			bootId: 'boot-a',
+			syncFailure: false,
+		});
+		assert.strictEqual(result, undefined);
+		assert.strictEqual(syncs(), 0);
+		assert.deepStrictEqual(dbisDB.rows.get(EPOCH), settled);
+	});
+
+	it('keeps an unfinished epoch on the same boot, so peers that never reported are still asked for its window', () => {
+		const unfinished = { ...settled, finished: undefined };
+		const { dbisDB, auditStore } = stores(unfinished);
+		openOwnOriginRecoveryEpoch('unfinished-db', auditStore, dbisDB, { bootId: 'boot-a', syncFailure: false });
+		assert.deepStrictEqual(recoveryRangeFor(dbisDB, 'peer'), { startTime: 5, endTime: NOW });
+	});
+
+	for (const [label, continuity, previous] of [
+		['a changed boot', { bootId: 'boot-b', syncFailure: false }, settled],
+		['an unknown boot', { bootId: undefined, syncFailure: false }, settled],
+		['a recorded sync failure', { bootId: 'boot-a', syncFailure: true }, settled],
+		[
+			'a previous epoch with no boot recorded',
+			{ bootId: 'boot-a', syncFailure: false },
+			{ ...settled, bootId: undefined },
+		],
+		['no previous epoch', { bootId: 'boot-a', syncFailure: false }, undefined],
+	]) {
+		it(`opens a new epoch, recording the boot, after ${label}`, async () => {
+			const { dbisDB, auditStore, syncs } = stores(previous);
+			const result = openOwnOriginRecoveryEpoch('opened-db', auditStore, dbisDB, continuity);
+			await result;
+			assert.strictEqual(syncs(), 1);
+			const epoch = dbisDB.rows.get(EPOCH);
+			assert.strictEqual(epoch.before, NOW + 1000);
+			assert.strictEqual(epoch.bootId, continuity.bootId);
+			assert.strictEqual(epoch.finished, undefined);
+			assert.deepStrictEqual(recoveryRangeFor(dbisDB, 'peer'), { startTime: epoch.after, endTime: NOW + 1000 });
+		});
+	}
 });

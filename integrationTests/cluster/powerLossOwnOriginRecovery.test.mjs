@@ -16,6 +16,10 @@
  * The tests run in the order the node meets them: a lock right after the reconnect, then convergence
  * within a bounded wait. A restarts with its recovery reports held (`HARPER_TEST_HOLD_OWN_ORIGIN_REPORT_DIR`),
  * so the lock first meets a recovery that is not yet confirmed and must refuse, whatever the rows read.
+ *
+ * Recovery runs only when the OS may have dropped page-cache data, so each start names its boot through
+ * `HARPER_TEST_BOOT_ID`: the power loss restarts A on a new boot, and the last tests restart A's process on
+ * the same boot, once plainly and once after a recorded transaction-log sync failure.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -42,6 +46,9 @@ import {
 } from './recordLockShared.mjs';
 
 const SETTLE_MS = 30_000;
+const FIRST_BOOT = { HARPER_TEST_BOOT_ID: 'power-loss-boot-1' };
+const SECOND_BOOT = { HARPER_TEST_BOOT_ID: 'power-loss-boot-2' };
+const SYNC_FAILURE_MARKER = 'own-origin-recovery-log-sync-failed';
 
 const dataDbDir = (node) => join(node.dataRootDir, 'database', DB);
 const ownLogDir = (node) => join(dataDbDir(node), 'transaction_logs', 'local');
@@ -106,11 +113,13 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 	let nodeB;
 	let lockKey;
 	let simulated = false;
+	let recovered = false;
+	const extraHoldDirs = [];
 	const baseline = {};
 
 	before(async () => {
 		if ((process.env.HARPER_STORAGE_ENGINE ?? 'rocksdb') !== 'rocksdb') return;
-		const started = await Promise.allSettled([startNode(ctx.name), startNode(ctx.name)]);
+		const started = await Promise.allSettled([startNode(ctx.name, FIRST_BOOT), startNode(ctx.name, FIRST_BOOT)]);
 		for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
 		const failed = started.find((result) => result.status === 'rejected');
 		if (failed) throw failed.reason;
@@ -155,9 +164,23 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 
 	after(async () => {
 		for (const c of contexts) await stopNode(c);
-		if (snapshotDir) await rm(snapshotDir, { recursive: true, force: true });
-		if (reportHoldDir) await rm(reportHoldDir, { recursive: true, force: true });
+		for (const dir of [snapshotDir, reportHoldDir, ...extraHoldDirs])
+			if (dir) await rm(dir, { recursive: true, force: true });
 	});
+
+	/** Kill A's process with its page cache intact (the OS stays up) and start it again with reports held. */
+	async function crashAndRestartA(env) {
+		const holdDir = await mkdtemp(join(tmpdir(), 'harper-power-loss-report-hold-'));
+		extraHoldDirs.push(holdDir);
+		const pid = await readNodePid(nodeA);
+		process.kill(pid, 'SIGKILL');
+		await waitForProcessGone(pid);
+		if (env.beforeStart) await env.beforeStart();
+		await restartStoppedNode(contexts[0], { ...env.boot, HARPER_TEST_HOLD_OWN_ORIGIN_REPORT_DIR: holdDir });
+		nodeA = contexts[0].harper;
+		await waitForMesh([nodeA, nodeB]);
+		return holdDir;
+	}
 
 	test('simulated power loss leaves A without its last writes while B keeps them', async (t) => {
 		if (!nodeA) return t.skip('RocksDB only: LMDB syncs its commits');
@@ -194,7 +217,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		await rm(ownLogDir(nodeA), { recursive: true, force: true });
 		await cp(join(snapshotDir, 'local'), ownLogDir(nodeA), { recursive: true });
 
-		await restartStoppedNode(contexts[0], { HARPER_TEST_HOLD_OWN_ORIGIN_REPORT_DIR: reportHoldDir });
+		await restartStoppedNode(contexts[0], { ...SECOND_BOOT, HARPER_TEST_HOLD_OWN_ORIGIN_REPORT_DIR: reportHoldDir });
 		nodeA = contexts[0].harper;
 		assert.deepEqual(
 			await readCounters(nodeA, ['ins', 'upd', lockKey]),
@@ -202,7 +225,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			'A came back with the pre-baseline state only'
 		);
 
-		await restartStoppedNode(contexts[1]);
+		await restartStoppedNode(contexts[1], FIRST_BOOT);
 		nodeB = contexts[1].harper;
 		await waitForMesh([nodeA, nodeB]);
 		assert.deepEqual(
@@ -259,5 +282,46 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 				description: () => `A to hold B's confirmed ins=2, upd=2; A reads ${JSON.stringify(onA)}`,
 			}
 		);
+		recovered = true;
+	});
+
+	test('a process restart on the same boot keeps the recovery done and admits own lineage at once', async (t) => {
+		if (!nodeA) return t.skip('RocksDB only');
+		assert.ok(recovered, 'runs only after A recovered');
+		const holdDir = await crashAndRestartA({ boot: SECOND_BOOT });
+		// lockKey's last grant was A's n=2, minted on this boot: a new epoch would hold it behind the parked report
+		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 10_000 });
+		assert.equal(increment.status, 200, `the lock on A waited for a recovery: ${JSON.stringify(increment.body)}`);
+		assert.equal(increment.body.n, 3);
+		// a sentinel from B proves the subscription exchange that would carry a recovery range has run
+		await putCounter(nodeB, 'sentinel-after-crash', 1);
+		await waitForCounter([nodeA], 'sentinel-after-crash', 1);
+		await waitForCounter([nodeB], lockKey, 3);
+		assert.equal(existsSync(join(holdDir, 'held')), false, 'A asked a peer for its own writes after a process restart');
+	});
+
+	test('a recorded transaction-log sync failure makes the next start on the same boot recover', async (t) => {
+		if (!nodeA) return t.skip('RocksDB only');
+		assert.ok(recovered, 'runs only after A recovered');
+		const marker = join(nodeA.dataRootDir, SYNC_FAILURE_MARKER);
+		const holdDir = await crashAndRestartA({
+			boot: SECOND_BOOT,
+			beforeStart: () => writeFile(marker, 'injected-sync-failure'),
+		});
+		await waitForCondition(() => existsSync(join(holdDir, 'held')), {
+			timeoutMs: 60_000,
+			description: `B to return A's writes after the recorded sync failure (A's report parked in ${holdDir})`,
+		});
+		assert.equal(existsSync(marker), false, 'the marker is cleared once the recovery epoch is durable');
+		const refused = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
+		assert.equal(
+			refused.status,
+			503,
+			`a lock admitted before A's recovery was confirmed: ${JSON.stringify(refused.body)}`
+		);
+		await writeFile(join(holdDir, 'release'), '');
+		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
+		assert.equal(increment.status, 200, `the lock on A was refused: ${JSON.stringify(increment.body)}`);
+		assert.equal(increment.body.n, 4);
 	});
 });
