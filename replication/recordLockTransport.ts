@@ -107,6 +107,7 @@ import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } fr
 import { createRestartRecall, type RestartRecallStatus } from './recordLockRestart.ts';
 import { recallDelegationsFromHome, retireDelegateEpoch } from '../core/resources/recordLockCoordinator.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
+import { ownLineage } from './ownOriginRecovery.ts';
 import { ANY_TABLE, everRecloned, forgetPoisonState, isPoisoned, poison, poisonedPairs } from './recordLockPoison.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
 import {
@@ -1018,6 +1019,7 @@ const productionDeps: RecordLockTransportDeps = {
 			tableReplicates: (table) => tableReplicates(database, table),
 			isPoisoned: (origin, table) => isPoisoned(database, origin, table),
 			everRecloned: () => everRecloned(database),
+			ownLineage: (position, homes) => ownLineage(database, position, homes, getThisNodeName()),
 			async requestBarrier(origin, table, nonce, timeoutMs) {
 				const reply = await sendRecordLockOperation(
 					origin,
@@ -1799,7 +1801,24 @@ setRecordLockOwnershipReaders({
 		return auditStore ? readPeerLockLevel(getReplicationSharedStatus(auditStore, database, node)) : 0;
 	},
 	tableReplicates: (database, table) => tableReplicates(database, table),
+	ownLineageIntact: (database, table) => {
+		try {
+			const self = getThisNodeName();
+			if (isPoisoned(database, self, table)) return false;
+			let homes: readonly string[] = NO_HOMES;
+			try {
+				homes = transports.get(database)?.homeMap(database)?.homes ?? NO_HOMES;
+			} catch {}
+			return ownLineage(database, null, homes, self).state === 'intact';
+		} catch (error) {
+			logger.warn?.(`Could not check this node's own lineage on ${database}; refusing the barrier`, error);
+			return false;
+		}
+	},
 });
+
+// one identity, so ownLineage's per-home-list proof cache holds while no home map is known
+const NO_HOMES: readonly string[] = Object.freeze([]);
 
 function tableReplicates(database: string, table: string): boolean {
 	const definition = getDatabases()[database]?.[table];

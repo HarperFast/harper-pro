@@ -178,6 +178,32 @@ export async function clusterStatusOf(node, signal) {
 	return sendOperation(node, { operation: 'cluster_status' }, { signal });
 }
 
+export async function lockStats(node, signal) {
+	return (await clusterStatusOf(node, signal)).recordLocks?.[DB];
+}
+
+/**
+ * A fresh key homed on `target`: the node whose `granted` count rises when `from` locks it, so the ring
+ * hash is never re-implemented in a test. A probe refused with 503 (the key's home is quarantined) is
+ * skipped. `from` is left holding a released delegation for the key.
+ */
+export async function keyHomedOn(nodes, target, from, prefix) {
+	for (let i = 0; i < 64; i++) {
+		const id = `${prefix}-${Date.now()}-${i}`;
+		await putCounter(from, id, 0);
+		await waitForCounter(nodes, id, 0);
+		const before = await Promise.all(nodes.map((node) => lockStats(node).then((stats) => stats?.granted ?? 0)));
+		const held = await call(from, 'LockHold/', { id, lease: 5_000, timeout: 10_000 });
+		if (held.status === 503) continue;
+		assert.equal(held.status, 200, JSON.stringify(held.body));
+		await call(from, 'LockRelease/', { token: held.body.token });
+		const after = await Promise.all(nodes.map((node) => lockStats(node).then((stats) => stats?.granted ?? 0)));
+		const home = nodes.findIndex((_, index) => after[index] > before[index]);
+		if (home >= 0 && nodes[home] === target) return id;
+	}
+	throw new Error(`no key homed on ${target.hostname} found in 64 probes`);
+}
+
 /** Every node sees every other node's `data` socket connected and has learned its capabilities. */
 export function waitForMesh(nodes) {
 	return waitForCondition(

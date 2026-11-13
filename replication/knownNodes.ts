@@ -1059,6 +1059,25 @@ export function getReplicationRecipients(databaseName: string) {
 	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
 }
 
+/**
+ * Names of the members this node sends `databaseName` to, read from hdb_nodes directly (it runs before
+ * `server.nodes` is published): this node's directional self-record, then the database and shard rule the
+ * subscription path applies.
+ */
+export function ownWriteRecipientNames(databaseName: string): string[] {
+	const store = getHDBNodeTable().primaryStore;
+	const self = getThisNodeName();
+	const nodes: any[] = [];
+	scanNodesForSubscription(store, (node) => {
+		if (node?.name && node.name !== self) nodes.push(node);
+	});
+	const databaseReplications = env.get(CONFIG_PARAMS.REPLICATION_DATABASES);
+	const shard = env.get(CONFIG_PARAMS.REPLICATION_SHARD);
+	return filterReplicationRecipients(nodes, selfNodeReplicates(store, self), databaseName)
+		.filter((node) => isReplicatedDatabase(databaseReplications, databaseName, () => node.shard === shard, false))
+		.map((node) => node.name);
+}
+
 function isRecipient(recipients: { name: string }[], name: string): boolean {
 	for (const node of recipients) if (node.name === name) return true;
 	return false;

@@ -20,6 +20,7 @@ import {
 } from '../core/resources/recordLockCoordinator.ts';
 import { MAX_LOCK_LEASE_MS } from '../core/resources/recordLock.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
+import type { OwnLineage } from './ownOriginRecovery.ts';
 
 /** Bounds what abandoned callers can pin per database; beyond it a new wait rejects rather than queues. */
 export const MAX_OUTSTANDING_BARRIERS = 10_000;
@@ -31,6 +32,8 @@ export const BARRIER_SWEEP_MS = 250;
  */
 export const BARRIER_RETRY_MIN_MS = 250;
 export const BARRIER_RETRY_MAX_MS = 2_000;
+/** Recheck cadence while own lineage waits on peers returning this node's lost writes (`ownOriginRecovery.ts`). */
+export const OWN_LINEAGE_POLL_MS = 100;
 const NONCE_BOUND = Number.MAX_SAFE_INTEGER;
 /** The replication clock domain (`isValidFrameTxnLogKey` in replicationConnection.ts): finite, positive, a date. */
 const MAX_DATE_TIMESTAMP = 8.64e15;
@@ -46,6 +49,11 @@ export interface FreshnessDeps {
 	tableReplicates(table: string): boolean;
 	isPoisoned(origin: string, table: string): boolean;
 	everRecloned(): boolean;
+	/**
+	 * Whether this node's own history is proven at `position` (null: anywhere), given the homes that may
+	 * hold it. Absent means the local log is always authoritative.
+	 */
+	ownLineage?(position: number | null, homes: readonly string[]): OwnLineage;
 	/**
 	 * Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position.
 	 * `timeoutMs` is the attempt's bound, never more than what is left of the lock's own deadline: the
@@ -125,6 +133,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	let retried = 0;
 	let sweep: unknown;
 	let closed = false;
+	let ownWaits = 0;
 
 	// A check that throws is answered as poisoned: a settlement callback must end in a 503, never escape.
 	const poisonedPair = (origin: string, table: string): boolean => {
@@ -333,6 +342,54 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			);
 	};
 
+	const checkOwnLineage = (position: number | null, homes: readonly string[]): boolean => {
+		let lineage: OwnLineage;
+		try {
+			lineage = deps.ownLineage?.(position, homes) ?? { state: 'intact' };
+		} catch (error) {
+			lineage = { state: 'unprovable', detail: `its recovery state could not be read (${(error as Error).message})` };
+		}
+		if (lineage.state === 'unprovable')
+			reject(
+				'own-lineage-unprovable',
+				`this node's own record lock lineage on ${database} cannot be proven: ${lineage.detail}`
+			);
+		return lineage.state === 'intact';
+	};
+
+	const refuseOwnPoison = (table: string) => {
+		if (poisonedPair(deps.thisNodeName(), table))
+			reject(
+				'poisoned',
+				`${database}.${table} from this node's own origin has a recorded replication hole here; record locks cannot prove its own lineage until this node is recloned`
+			);
+	};
+
+	/** Waits out peers returning this node's own writes lost in a restart, until the lock's deadline. */
+	const awaitOwnLineage = async (
+		table: string,
+		position: number | null,
+		homes: readonly string[],
+		deadlineMono: number
+	) => {
+		ownWaits++;
+		try {
+			do {
+				if (deps.monotonicNow() >= deadlineMono)
+					reject(
+						'own-lineage-gap',
+						`this node is still recovering its own writes on ${database} from its peers after a restart`
+					);
+				await new Promise<void>((resolve) => setTimer(resolve, OWN_LINEAGE_POLL_MS));
+				if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
+			} while (!checkOwnLineage(position, homes));
+		} finally {
+			ownWaits--;
+		}
+		// a returned write that failed to apply records its hole before its peer's report can land
+		refuseOwnPoison(table);
+	};
+
 	const checkRequest = (origin: string, table: string) => {
 		const homeMap = deps.homeMap();
 		if (!homeMap) reject('no-home-map', `no agreed record lock home map for ${database}`);
@@ -351,8 +408,10 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			const deadlineMono = deps.monotonicNow() + Math.min(Math.max(deadlineMs, 0), MAX_LOCK_LEASE_MS);
 			const self = deps.thisNodeName();
 			const origins: string[] = [];
+			let ownPosition: number | null | undefined;
 			if (dependencies === null) {
 				for (const member of homeMap.homes) if (member !== self) origins.push(member);
+				ownPosition = null;
 			} else {
 				for (const [origin, position] of dependencies) {
 					if (!isValidLogPosition(position))
@@ -364,14 +423,24 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 							'recloned',
 							`${database} on this node was recloned, so its own earlier record lock lineage cannot be proven`
 						);
+					else ownPosition = ownPosition == null ? position : Math.min(ownPosition, position);
 				}
 			}
 			// Every refusal before the first wait starts: a wait started for an earlier origin would be
 			// left asking on its own, holding a slot, with nothing to settle its rejection.
 			for (const origin of origins) checkOrigin(origin, table, homeMap);
-			if (waits.size + origins.length > MAX_OUTSTANDING_BARRIERS)
+			let ownIntact = true;
+			if (ownPosition !== undefined) {
+				refuseOwnPoison(table);
+				ownIntact = checkOwnLineage(ownPosition, homeMap.homes);
+			}
+			if (waits.size + ownWaits + origins.length + (ownIntact ? 0 : 1) > MAX_OUTSTANDING_BARRIERS)
 				reject('capacity', `too many record lock barriers are outstanding for ${database}`);
-			const positions = await Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono)));
+			const barriers = Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono)));
+			const positions = ownIntact
+				? await barriers
+				: (await Promise.all([barriers, awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono)]))[0];
+			if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
 			if (dependencies === null) return origins.map((origin, index) => [origin, positions[index]] as const);
 		},
 		noteBarrierApplied(origin, position, nonce) {
@@ -404,7 +473,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			return true;
 		},
 		stats() {
-			return { outstanding: waits.size, applied, timeouts, retried, rejected: { ...rejected } };
+			return { outstanding: waits.size + ownWaits, applied, timeouts, retried, rejected: { ...rejected } };
 		},
 		close() {
 			closed = true;

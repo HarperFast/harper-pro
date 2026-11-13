@@ -62,6 +62,10 @@ const writeStderrSync = (output) => {
 	}
 };
 stream.on('test:fail', (event) => {
+	// node:test semantics, as in @harperfast/integration-testing's runner: a failing `todo` or `skip` test
+	// doesn't fail the run. The marker can be an empty reason string.
+	const { todo, skip } = event ?? {};
+	if (todo || todo === '' || skip || skip === '') return;
 	process.exitCode = 1;
 	if (event?.details?.error) {
 		if (failures.length < MAX_CAPTURED_FAILURES) {
