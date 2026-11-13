@@ -488,6 +488,10 @@ The home map changes only when an operator applies a new one, so apply one after
 
 Cluster record locks need the RocksDB storage engine. On LMDB `lock()` is not available, and conditional writes do not take a lock.
 
+<VersionBadge version="v5.4.1" />
+
+What counts is the engine each database is opened on, not `storage.engine`. That setting only picks the engine for databases created from then on, so a node upgraded in place from v4 keeps its existing `.mdb` databases on LMDB. If any database the node replicates is opened on LMDB, including `system`, which `replication.databases: '*'` (the default) replicates, the node starts with cluster record locks off even with `recordLocks: true`. It logs an error naming those databases, peers see it as not taking part, and a cluster `lock()` answers `503` saying that replicated databases are on LMDB. Migrate them with `storage.migrateOnStart` and restart. `describe_all` and `describe_table` report each table's `engine` (`rocksdb` or `lmdb`), so a tool can check a node before turning locks on.
+
 ## Inspecting Cluster Configuration
 
 Query the `hdb_nodes` system table to inspect the current known nodes and their configuration:
