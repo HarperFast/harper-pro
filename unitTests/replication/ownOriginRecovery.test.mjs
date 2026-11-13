@@ -3,6 +3,9 @@
  * proves own lineage, which subscription a sender treats as a recovery range, and the coalesced flush.
  */
 import assert from 'node:assert';
+import { createRequire } from 'node:module';
+import { setTimeout as delay } from 'node:timers/promises';
+import { table } from '#src/core/resources/databases';
 import {
 	continuesEpoch,
 	flushAfterNow,
@@ -10,11 +13,16 @@ import {
 	markOwnOriginRecoveryFailed,
 	nextEpoch,
 	openOwnOriginRecoveryEpoch,
+	UNPROVEN_RECHECK_MS,
 	ownLineage,
 	recoveryRangeFor,
 	recoveryStart,
 } from '#src/replication/ownOriginRecovery';
-import { findOwnOriginRecoveryRange, ORIGIN_CURSOR_OVERLAP_MS } from '#src/replication/replicationConnection';
+import {
+	findOwnOriginRecoveryRange,
+	ORIGIN_CURSOR_OVERLAP_MS,
+	returnedByOwnOriginRecovery,
+} from '#src/replication/replicationConnection';
 import {
 	buildLocalCapabilities,
 	peerSupportsOwnOriginRecovery,
@@ -22,6 +30,7 @@ import {
 } from '#src/replication/protocolCapabilities';
 
 const NOW = 1_800_000_000_000;
+const { setupTestDBPath } = createRequire(import.meta.url)('../testUtils.js');
 
 describe('recoveryStart', () => {
 	it('starts the commit-order overlap below the last key, since an entry can append after a higher key', () => {
@@ -95,8 +104,14 @@ describe('lineageFromReports', () => {
 		const purged = { b: clean, c: { epoch: epoch.before, purgedThrough: NOW + 1 } };
 		assert.strictEqual(lineageFromReports(epoch, [], 'self', (p) => purged[p], member).state, 'unprovable');
 	});
-	it('accepts a purge that stopped at or below what this node held', () => {
-		const purged = { b: clean, c: { epoch: epoch.before, purgedThrough: NOW } };
+	it('is unprovable when a peer purged into the window below the last surviving key', () => {
+		// the log appends in commit order: a write keyed 175 can append after the one keyed 200 and be lost
+		const window = { after: 140, lastKey: 200, before: 300, requiredPeers: ['b'] };
+		const report = { epoch: 300, purgedThrough: 180 };
+		assert.strictEqual(lineageFromReports(window, [], 'self', () => report, member).state, 'unprovable');
+	});
+	it("accepts a purge that stopped at or below the window's start", () => {
+		const purged = { b: clean, c: { epoch: epoch.before, purgedThrough: epoch.after } };
 		assert.strictEqual(lineageFromReports(epoch, [], 'self', (p) => purged[p], member).state, 'intact');
 	});
 	it('skips removed members and this node itself', () => {
@@ -167,6 +182,17 @@ describe('findOwnOriginRecoveryRange', () => {
 	});
 });
 
+describe('returnedByOwnOriginRecovery', () => {
+	it("leaves out a sharded table's residency records and keeps every other record", () => {
+		const sharded = { residency: { slots: 2 } };
+		for (const type of ['put', 'patch', 'delete', 'invalidate', 'relocate'])
+			assert.strictEqual(returnedByOwnOriginRecovery(sharded, type), false, type);
+		assert.strictEqual(returnedByOwnOriginRecovery(sharded, 'lockBarrier'), true);
+		assert.strictEqual(returnedByOwnOriginRecovery({}, 'put'), true, 'an ordinary table in the same database');
+		assert.strictEqual(returnedByOwnOriginRecovery(undefined, 'put'), true);
+	});
+});
+
 describe('ownOriginRecovery capability', () => {
 	it('is advertised only with per-origin logs and resolved from the peer bag', () => {
 		assert.strictEqual(buildLocalCapabilities(1000, false, true).ownOriginRecovery, 1);
@@ -210,7 +236,10 @@ describe('markOwnOriginRecoveryFailed', () => {
 		try {
 			markOwnOriginRecoveryFailed('own-origin-failed-db');
 			assert.strictEqual(ownLineage('own-origin-failed-db', null, [], 'self').state, 'unprovable');
-			assert.match(process.env.HARPER_OWN_ORIGIN_RECOVERY_FAILED, /own-origin-failed-db/);
+			assert.match(
+				process.env.HARPER_OWN_ORIGIN_RECOVERY_FAILED,
+				new RegExp(`^${process.pid}\n.*own-origin-failed-db`, 's')
+			);
 			assert.strictEqual(ownLineage('own-origin-other-db', null, [], 'self').state, 'intact');
 		} finally {
 			if (saved === undefined) delete process.env.HARPER_OWN_ORIGIN_RECOVERY_FAILED;
@@ -295,7 +324,7 @@ describe('openOwnOriginRecoveryEpoch', () => {
 
 	it('does not continue an epoch a peer reported purging past, so a new epoch judges purges against the log now', () => {
 		const { dbisDB, auditStore, syncs } = stores(settled, {
-			reports: [{ peer: 'peer', epoch: NOW, purgedThrough: 1 }],
+			reports: [{ peer: 'peer', epoch: NOW, purgedThrough: 6 }],
 		});
 		const result = openOwnOriginRecoveryEpoch(
 			'tainted-db',
@@ -363,4 +392,71 @@ describe('openOwnOriginRecoveryEpoch', () => {
 			assert.deepStrictEqual(recoveryRangeFor(dbisDB, 'peer'), { startTime: epoch.after, endTime: NOW + 1000 });
 		});
 	}
+});
+
+describe('ownLineage caching', () => {
+	const EPOCH = Symbol.for('ownOriginRecovery');
+	const REPORT = Symbol.for('ownOriginRecovered');
+	const epoch = { after: NOW - 60_000, lastKey: NOW, before: NOW + 10_000, requiredPeers: ['b', 'c'] };
+	before(() => setupTestDBPath());
+	async function epochStore(database) {
+		const Table = table({ database, table: 'Rows', attributes: [{ name: 'id', isPrimaryKey: true }] });
+		const dbisDB = Table.dbisDB;
+		dbisDB.putSync(EPOCH, epoch);
+		return dbisDB;
+	}
+	const report = (dbisDB, peer, value = { epoch: epoch.before }) => dbisDB.put([REPORT, peer], value);
+
+	it('keeps a proof for the home list it was made for, and evaluates a new home list afresh', async () => {
+		const dbisDB = await epochStore('own-lineage-proven');
+		await report(dbisDB, 'b');
+		await report(dbisDB, 'c');
+		const homes = ['self', 'b'];
+		assert.strictEqual(ownLineage('own-lineage-proven', NOW, homes, 'self', undefined, () => true).state, 'intact');
+		assert.strictEqual(ownLineage('own-lineage-proven', null, homes, 'self', undefined, () => true).state, 'intact');
+		assert.strictEqual(
+			ownLineage('own-lineage-proven', NOW, ['self', 'b', 'd'], 'self', undefined, () => true).state,
+			'pending',
+			'a home added since needs its own report'
+		);
+	});
+	it('keeps a proof that skipped a removed member only while that member stays removed', async () => {
+		const dbisDB = await epochStore('own-lineage-skipped');
+		await report(dbisDB, 'b');
+		const checked = [];
+		let cRemoved = true;
+		const memberCheck = (peer) => {
+			checked.push(peer);
+			return peer !== 'c' || !cRemoved;
+		};
+		const homes = ['self'];
+		assert.strictEqual(ownLineage('own-lineage-skipped', NOW, homes, 'self', undefined, memberCheck).state, 'intact');
+		checked.length = 0;
+		for (let i = 0; i < 10; i++) ownLineage('own-lineage-skipped', null, homes, 'self', undefined, memberCheck);
+		assert.deepStrictEqual(new Set(checked), new Set(['c']), 'a repeat check probes only the skipped member');
+		assert.strictEqual(checked.length, 10);
+		cRemoved = false;
+		assert.strictEqual(
+			ownLineage('own-lineage-skipped', null, homes, 'self', undefined, memberCheck).state,
+			'pending',
+			'a re-added member must report before own lineage is proven again'
+		);
+	});
+	it('serves a pending result until the recheck interval passes, then sees the report that landed', async () => {
+		const dbisDB = await epochStore('own-lineage-pending');
+		await report(dbisDB, 'b');
+		const homes = ['self'];
+		assert.strictEqual(ownLineage('own-lineage-pending', NOW, homes, 'self', undefined, () => true).state, 'pending');
+		await report(dbisDB, 'c');
+		assert.strictEqual(ownLineage('own-lineage-pending', NOW, homes, 'self', undefined, () => true).state, 'pending');
+		await delay(UNPROVEN_RECHECK_MS + 10);
+		assert.strictEqual(ownLineage('own-lineage-pending', NOW, homes, 'self', undefined, () => true).state, 'intact');
+	});
+	it('admits a position minted since the epoch opened without any report', async () => {
+		await epochStore('own-lineage-new-position');
+		assert.strictEqual(
+			ownLineage('own-lineage-new-position', epoch.before, ['self'], 'self', undefined, () => true).state,
+			'intact'
+		);
+	});
 });

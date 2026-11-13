@@ -488,6 +488,10 @@ The home map changes only when an operator applies a new one, so apply one after
 
 <VersionBadge version="v5.5.0" /> **After the operating system restarts** (an OS crash, power loss or reboot), a node may have lost its most recent commits even though peers confirmed them, so it asks each peer for the writes it originated and applies the ones it is missing. Until every peer that replicates the database with it, and every node in the home map, has answered, a lock on that node that depends on its writes from before the restart (including the first lock on a key whose home node also restarted) waits within its timeout and then answers `503`. A peer that is stopped, or that runs a version without this recovery, therefore keeps such locks at `503` until it is back or upgraded.
 
+A node asks a peer for its writes over its own subscription to that peer, so every node it sends the database to must also send the database back to it. On a one-way route the receiving node is never asked and such locks stay at `503`; make the route two-way.
+
+Writes to a sharded table (one with a residency policy) are not recovered this way: a node takes its own rows of a sharded table back only from a complete copy, so a lost log tail on a sharded table is not restored from peers, and locks on such a table do not wait for recovery.
+
 A restart of Harper alone (a deploy, a crash or an out-of-memory kill with the OS still running) loses nothing, so it skips this. The node tells the two apart by the OS boot identity on Linux and macOS; on other platforms every start recovers, and so does the first start after upgrading to this version. A failed transaction-log sync also makes the next start recover.
 
 Cluster record locks need the RocksDB storage engine. On LMDB `lock()` is not available, and conditional writes do not take a lock.

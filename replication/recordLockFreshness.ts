@@ -24,7 +24,7 @@ import type { OwnLineage } from './ownOriginRecovery.ts';
 
 /** Bounds what abandoned callers can pin per database; beyond it a new wait rejects rather than queues. */
 export const MAX_OUTSTANDING_BARRIERS = 10_000;
-/** Deadline sweep cadence while anything is outstanding. Waits settle on the applied entry, not on this. */
+/** Waits settle on the applied entry, not on this sweep. */
 export const BARRIER_SWEEP_MS = 250;
 /**
  * A barrier whose request failed is asked again on core's restart backoff (record-locks.md §4.5 (2)):
@@ -32,7 +32,7 @@ export const BARRIER_SWEEP_MS = 250;
  */
 export const BARRIER_RETRY_MIN_MS = 250;
 export const BARRIER_RETRY_MAX_MS = 2_000;
-/** Recheck cadence while own lineage waits on peers returning this node's lost writes (`ownOriginRecovery.ts`). */
+/** One poll per database serves every caller waiting on peers returning this node's lost writes. */
 export const OWN_LINEAGE_POLL_MS = 100;
 const NONCE_BOUND = Number.MAX_SAFE_INTEGER;
 /** The replication clock domain (`isValidFrameTxnLogKey` in replicationConnection.ts): finite, positive, a date. */
@@ -53,7 +53,7 @@ export interface FreshnessDeps {
 	 * Whether this node's own history is proven at `position` (null: anywhere), given the homes that may
 	 * hold it. Absent means the local log is always authoritative.
 	 */
-	ownLineage?(position: number | null, homes: readonly string[]): OwnLineage;
+	ownLineage?(position: number | null, homes: readonly string[], table: string): OwnLineage;
 	/**
 	 * Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position.
 	 * `timeoutMs` is the attempt's bound, never more than what is left of the lock's own deadline: the
@@ -80,6 +80,19 @@ export interface FreshnessStats {
 interface Waiter {
 	deadlineMono: number;
 	settle(error?: Error): void;
+}
+
+interface OwnWaiter {
+	table: string;
+	position: number | null;
+	homes: readonly string[];
+	deadlineMono: number;
+	settle(error?: Error): void;
+}
+
+interface Cancellable<T> {
+	promise: Promise<T>;
+	cancel(): void;
 }
 
 interface Outstanding {
@@ -133,7 +146,8 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	let retried = 0;
 	let sweep: unknown;
 	let closed = false;
-	let ownWaits = 0;
+	const ownWaiters = new Set<OwnWaiter>();
+	let ownPoll: unknown;
 
 	// A check that throws is answered as poisoned: a settlement callback must end in a 503, never escape.
 	const poisonedPair = (origin: string, table: string): boolean => {
@@ -298,7 +312,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	};
 
 	/** Resolves to the barrier's position once the origin's entry has committed on this node. */
-	const awaitBarrier = (origin: string, table: string, deadlineMono: number): Promise<number> => {
+	const awaitBarrier = (origin: string, table: string, deadlineMono: number): Cancellable<number> => {
 		const entry: Outstanding = {
 			nonce: nonce(),
 			origin,
@@ -313,9 +327,10 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		// Registered before the request leaves, so the applied entry cannot arrive unmatched.
 		waits.add(entry);
 		attempts.set(entry.nonce, entry);
-		const wait = new Promise<number>((resolve, rejectWait) => {
+		let waiter: Waiter;
+		const promise = new Promise<number>((resolve, rejectWait) => {
 			let settled = false;
-			entry.waiters.push({
+			waiter = {
 				deadlineMono,
 				settle(error) {
 					if (settled) return;
@@ -323,11 +338,20 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 					if (error) rejectWait(error);
 					else resolve(entry.position as number);
 				},
-			});
+			};
+			entry.waiters.push(waiter);
 		});
 		armSweep();
 		send(entry);
-		return wait;
+		return {
+			promise,
+			cancel() {
+				const index = entry.waiters.indexOf(waiter);
+				if (index < 0) return;
+				entry.waiters.splice(index, 1);
+				if (entry.waiters.length === 0) settleEntry(entry);
+			},
+		};
 	};
 
 	const checkOrigin = (origin: string, table: string, homeMap: LockHomeMap) => {
@@ -342,10 +366,10 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			);
 	};
 
-	const checkOwnLineage = (position: number | null, homes: readonly string[]): boolean => {
+	const checkOwnLineage = (position: number | null, homes: readonly string[], table: string): boolean => {
 		let lineage: OwnLineage;
 		try {
-			lineage = deps.ownLineage?.(position, homes) ?? { state: 'intact' };
+			lineage = deps.ownLineage?.(position, homes, table) ?? { state: 'intact' };
 		} catch (error) {
 			lineage = { state: 'unprovable', detail: `its recovery state could not be read (${(error as Error).message})` };
 		}
@@ -365,29 +389,79 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			);
 	};
 
-	/** Waits out peers returning this node's own writes lost in a restart, until the lock's deadline. */
-	const awaitOwnLineage = async (
-		table: string,
-		position: number | null,
-		homes: readonly string[],
-		deadlineMono: number
-	) => {
-		ownWaits++;
-		try {
-			do {
-				if (deps.monotonicNow() >= deadlineMono)
+	const settleOwn = (waiter: OwnWaiter, error?: Error) => {
+		ownWaiters.delete(waiter);
+		waiter.settle(error);
+	};
+
+	const pollOwnLineage = () => {
+		ownPoll = undefined;
+		const now = deps.monotonicNow();
+		// callers on the same table, position and homes share one evaluation per poll
+		const evaluated = new Map<readonly string[], Map<string, Error | boolean>>();
+		for (const waiter of Array.from(ownWaiters)) {
+			if (now >= waiter.deadlineMono) {
+				try {
 					reject(
 						'own-lineage-gap',
 						`this node is still recovering its own writes on ${database} from its peers after a restart`
 					);
-				await new Promise<void>((resolve) => setTimer(resolve, OWN_LINEAGE_POLL_MS));
-				if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
-			} while (!checkOwnLineage(position, homes));
-		} finally {
-			ownWaits--;
+				} catch (error) {
+					settleOwn(waiter, error as Error);
+				}
+				continue;
+			}
+			let byKey = evaluated.get(waiter.homes);
+			if (!byKey) evaluated.set(waiter.homes, (byKey = new Map()));
+			const key = `${waiter.position}\0${waiter.table}`;
+			let outcome = byKey.get(key);
+			if (outcome === undefined) {
+				try {
+					outcome = checkOwnLineage(waiter.position, waiter.homes, waiter.table);
+					// a returned write that failed to apply records its hole before its peer's report can land
+					if (outcome) refuseOwnPoison(waiter.table);
+				} catch (error) {
+					outcome = error as Error;
+				}
+				byKey.set(key, outcome);
+			}
+			if (outcome instanceof Error) settleOwn(waiter, outcome);
+			else if (outcome) settleOwn(waiter);
 		}
-		// a returned write that failed to apply records its hole before its peer's report can land
-		refuseOwnPoison(table);
+		if (ownWaiters.size > 0 && !closed) ownPoll = setTimer(pollOwnLineage, OWN_LINEAGE_POLL_MS);
+	};
+
+	/** Waits out peers returning this node's own writes lost in a restart, until the lock's deadline. */
+	const awaitOwnLineage = (
+		table: string,
+		position: number | null,
+		homes: readonly string[],
+		deadlineMono: number
+	): Cancellable<void> => {
+		let waiter: OwnWaiter;
+		const promise = new Promise<void>((resolve, rejectWait) => {
+			let settled = false;
+			waiter = {
+				table,
+				position,
+				homes,
+				deadlineMono,
+				settle(error) {
+					if (settled) return;
+					settled = true;
+					if (error) rejectWait(error);
+					else resolve();
+				},
+			};
+		});
+		ownWaiters.add(waiter);
+		if (ownPoll === undefined) ownPoll = setTimer(pollOwnLineage, OWN_LINEAGE_POLL_MS);
+		return {
+			promise,
+			cancel() {
+				ownWaiters.delete(waiter);
+			},
+		};
 	};
 
 	const checkRequest = (origin: string, table: string) => {
@@ -432,14 +506,21 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			let ownIntact = true;
 			if (ownPosition !== undefined) {
 				refuseOwnPoison(table);
-				ownIntact = checkOwnLineage(ownPosition, homeMap.homes);
+				ownIntact = checkOwnLineage(ownPosition, homeMap.homes, table);
 			}
-			if (waits.size + ownWaits + origins.length + (ownIntact ? 0 : 1) > MAX_OUTSTANDING_BARRIERS)
+			if (waits.size + ownWaiters.size + origins.length + (ownIntact ? 0 : 1) > MAX_OUTSTANDING_BARRIERS)
 				reject('capacity', `too many record lock barriers are outstanding for ${database}`);
-			const barriers = Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono)));
-			const positions = ownIntact
-				? await barriers
-				: (await Promise.all([barriers, awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono)]))[0];
+			const barrierWaits = origins.map((origin) => awaitBarrier(origin, table, deadlineMono));
+			const ownWait = ownIntact ? undefined : awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono);
+			let positions: number[];
+			try {
+				[positions] = await Promise.all([Promise.all(barrierWaits.map((wait) => wait.promise)), ownWait?.promise]);
+			} catch (error) {
+				// the first refusal decides; the rest would only hold slots until the deadline
+				for (const wait of barrierWaits) wait.cancel();
+				ownWait?.cancel();
+				throw error;
+			}
 			if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
 			if (dependencies === null) return origins.map((origin, index) => [origin, positions[index]] as const);
 		},
@@ -473,7 +554,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			return true;
 		},
 		stats() {
-			return { outstanding: waits.size + ownWaits, applied, timeouts, retried, rejected: { ...rejected } };
+			return { outstanding: waits.size + ownWaiters.size, applied, timeouts, retried, rejected: { ...rejected } };
 		},
 		close() {
 			closed = true;
@@ -481,6 +562,12 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				clearTimer(sweep);
 				sweep = undefined;
 			}
+			if (ownPoll !== undefined) {
+				clearTimer(ownPoll);
+				ownPoll = undefined;
+			}
+			for (const waiter of Array.from(ownWaiters))
+				settleOwn(waiter, unavailable(`record lock freshness for ${database} was closed while recovering own writes`));
 			for (const entry of Array.from(waits))
 				settleEntry(
 					entry,
