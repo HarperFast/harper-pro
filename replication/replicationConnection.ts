@@ -5691,6 +5691,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			options.connection?.nodeSubscriptions?.[0]?.name);
 	const awaitingResponse = new Map();
 	let receivingDataFromNodeIds = [];
+	/** the subscribed nodes in request order; their ids wait for an audit store when the database did not exist yet */
+	let requestedNodeNames: string[] = [];
+	/**
+	 * Binds the ids of a request sent before this database existed here, once its schema frame has created it. Until
+	 * then core has no `[seq, id]` row to write this connection's cursor and certified floors to.
+	 */
+	function bindReceivingNodeIds(): void {
+		if (!auditStore || receivingDataFromNodeIds.length === requestedNodeNames.length) return;
+		const ids: number[] = [];
+		for (const name of requestedNodeNames) {
+			auditStore.ensureLogExists?.(name);
+			const nodeId = getIdOfRemoteNode(name, auditStore);
+			if (nodeId !== undefined) ids.push(nodeId);
+		}
+		receivingDataFromNodeIds = ids;
+	}
 	/**
 	 * The `[seq, id]` row core writes for this connection's sequence updates (`remoteNodeIds[0]`): the first subscribed
 	 * node, which on a failover subscription is not the socket peer. Route state is read and marked there only.
@@ -8567,6 +8583,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!tables) tables = getDatabases()?.[newDatabaseName];
 							}
 						}
+						if (schemaDatabaseName === databaseName) bindReceivingNodeIds();
 						if (pendingMarkers.length > 0 && databases[schemaDatabaseName]) {
 							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
 							if (!connectionSuperseded()) releaseHeldMarkers(schemaDatabaseName, pendingMarkers);
@@ -13227,6 +13244,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
 		receivingDataFromNodeIds = [];
+		requestedNodeNames = [];
 		lastSentBareFloorCursors.clear();
 		requestIsCopy = false;
 		copyWasResumed = false;
@@ -13539,9 +13557,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
-				if (nodeId === undefined) {
-					logger.warn('Starting subscription request from node', node, 'but no node id found');
-				} else receivingDataFromNodeIds.push(nodeId);
+				requestedNodeNames.push(node.name);
+				if (nodeId !== undefined) receivingDataFromNodeIds.push(nodeId);
+				else if (auditStore) logger.warn('Starting subscription request from node', node, 'but no node id found');
 				// if another node had previously acted as a proxy, it may not have the same sequence ids, but we can use the last
 				// originating txn time, and sequence ids should always be higher than their originating txn time, and starting from them should overlap
 				// a floor-only start is the proven one; a recorded transaction time above it would let the sender filter
