@@ -45,6 +45,8 @@ function createSender() {
 		currentSequenceId: 1000,
 		sentSequenceId: 0,
 		skippedMessageSequenceUpdateTimer: null,
+		restartAfterCopy: undefined,
+		relayWithheld: undefined,
 		updateBackPressureRatio() {},
 	};
 	const senders = runInNewContext(

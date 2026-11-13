@@ -831,6 +831,7 @@ export function subscribeToNode(request: any) {
 		// The session reads it when building SUBSCRIPTION_REQUEST's excluded list; only overwrite when the
 		// request carries one, so a re-subscribe from a path without the set keeps the last known value.
 		if (request.exclusionOrigins) connection.exclusionOrigins = request.exclusionOrigins;
+		if (request.topology !== undefined) applyTopologyLink(connection, request.topology);
 		connection.subscribe(
 			request.nodes.filter((node) => {
 				return shouldReplicateFromNode(node, request.database);
@@ -902,12 +903,56 @@ export function releaseSharedStatusOnUnsubscribe(connection) {
 // Apply a recomputed exclusion-origin set (an update-exclusion-origins message from the main thread's
 // subscriptionManager broadcast) to every live subscription connection for the database. Each session
 // diffs against the list it last sent, so a set that changes nothing sends nothing.
-export function updateExclusionOrigins({ database, origins }: { database: string; origins: string[] }) {
+export interface TopologyLink {
+	/** Undefined on a link of a database the topology no longer manages, which carries only a borrow. */
+	excluded?: string[];
+	/** Per origin, the links it was taken through, most recent first. */
+	borrow?: Record<string, string[]>;
+}
+
+/**
+ * Region-topology exclusions for one database (harper-pro#1343): each primary link's by its URL; `managed` for a
+ * failover link. Not `active` once the database is back on the full mesh, when it only carries the borrows of links
+ * that became direct.
+ */
+export interface TopologyLinks {
+	byUrl: Record<string, TopologyLink>;
+	managed: string[];
+	active: boolean;
+}
+
+function applyTopologyLink(connection: any, link: TopologyLink | null) {
+	connection.topologyExcluded = link?.excluded;
+	connection.topologyBorrow = link?.borrow;
+}
+
+export function updateExclusionOrigins({
+	database,
+	origins,
+	topology,
+}: {
+	database: string;
+	origins: string[];
+	topology?: TopologyLinks | null;
+}) {
 	for (const dbConnections of connections.values()) {
 		const connection = dbConnections.get(database);
 		if (!connection) continue;
-		connection.exclusionOrigins = origins;
-		connection.emit('exclusion-origins-updated', origins);
+		// One connection failing must not stop its siblings: it rebuilds from the state just assigned instead.
+		try {
+			connection.exclusionOrigins = origins;
+			const proxied = connection.subscriptionUrl !== undefined && connection.subscriptionUrl !== connection.url;
+			const unmanaged = topology?.active ? { excluded: proxied ? topology.managed : [] } : null;
+			applyTopologyLink(connection, proxied ? unmanaged : (topology?.byUrl[connection.url] ?? unmanaged));
+			connection.emit('exclusion-origins-updated', origins);
+		} catch (error) {
+			logger.error('Error applying exclusion origins for', database, connection.url, error);
+			try {
+				connection.forceReconnect();
+			} catch (reconnectError) {
+				logger.error('Error reconnecting after an exclusion update failed', connection.url, reconnectError);
+			}
+		}
 	}
 }
 

@@ -2,7 +2,7 @@
  * This module is responsible for managing the list of known nodes in the network. This also tracks replication confirmation
  * when we want to ensure that a transaction has been replicated to multiple nodes before we confirm it.
  */
-import { table } from '../core/resources/databases.ts';
+import { table, databaseEventsEmitter } from '../core/resources/databases.ts';
 import { forEachReplicatedDatabase } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
@@ -14,6 +14,13 @@ import { logger } from '../core/utility/logging/logger.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 import { CONFIRMATION_STATUS_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
 import { createBackoff } from './backoff.ts';
+import {
+	deriveRegionTopology,
+	receivesDirect,
+	topologySignature,
+	validRegion,
+	type RegionTopology,
+} from './regionTopology.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -950,7 +957,136 @@ export function filterReplicationRecipients(nodes: any[], selfReplicates: any, d
  */
 export function getReplicationRecipients(databaseName: string) {
 	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
-	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
+	const recipients = filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
+	const topology = regionTopologyFor(databaseName);
+	return topology ? topologyRecipients(topology, recipients) : recipients;
+}
+
+const STORAGE_IS_ROCKSDB = (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_PARAMS.STORAGE_ENGINE)) !== 'lmdb';
+let warnedRegionOnLmdb = false;
+
+/**
+ * This node's region as it publishes it. A node on LMDB publishes none: supplier switches resume from per-origin
+ * cursors, which only RocksDB keeps, and one unlabeled member keeps the whole cluster on full mesh.
+ */
+export function selfTopologyLabels(): { region: string | null } {
+	let region = validRegion(env.get(CONFIG_PARAMS.REPLICATION_REGION)) ?? null;
+	if (region !== null && !STORAGE_IS_ROCKSDB) {
+		if (!warnedRegionOnLmdb) {
+			warnedRegionOnLmdb = true;
+			logger.warn?.('replication.region is not published on LMDB; region topology needs RocksDB');
+		}
+		region = null;
+	}
+	return { region };
+}
+
+const TOPOLOGY_CACHE_MS = 5_000;
+let topologyCache:
+	| {
+			nodes: unknown;
+			count: number;
+			at: number;
+			topology: RegionTopology;
+			recipients: WeakMap<object, any[]>;
+			residency: Map<string, boolean>;
+	  }
+	| undefined;
+
+/**
+ * Members come from the `hdb_nodes` table itself: `server.nodes` is built incrementally from change events (a full
+ * rescan appends to it while calling the listener, which reads this), so it can lag a row the table already holds.
+ * The cache is keyed on `server.nodes`, which every event replaces, and lives at most `TOPOLOGY_CACHE_MS`, so the
+ * inactive path costs a compare and a clock read.
+ */
+export function currentRegionTopology(): RegionTopology {
+	const nodes = server.nodes;
+	const now = Date.now();
+	if (
+		topologyCache?.nodes === nodes &&
+		topologyCache.count === nodes.length &&
+		now - topologyCache.at < TOPOLOGY_CACHE_MS
+	)
+		return topologyCache.topology;
+	const selfName = getThisNodeName();
+	const { region } = selfTopologyLabels();
+	const self: any = {
+		name: selfName,
+		region,
+		shard: env.get(CONFIG_PARAMS.REPLICATION_SHARD),
+		replicates: region !== null && selfNodeReplicates(getHDBNodeTable().primaryStore, selfName),
+	};
+	const members: any[] = [self];
+	// an unlabeled node decides the gate alone: the table cannot turn it on
+	if (region !== null) {
+		for (const row of getHDBNodeTable().search([])) {
+			if (!row?.name) continue;
+			// the shard its row publishes is the one every other node ranks it by
+			if (row.name === selfName) self.shard = row.shard ?? self.shard;
+			else members.push(row);
+		}
+	}
+	const topology = deriveRegionTopology(members);
+	const previous = topologyCache?.topology;
+	if (region !== null && (previous?.active !== topology.active || previous?.inactiveReason !== topology.inactiveReason))
+		logger.info?.(topology.active ? 'Region topology active' : `Region topology off: ${topology.inactiveReason}`);
+	if (
+		previous &&
+		previous.inactiveReason === topology.inactiveReason &&
+		topologySignature(previous) === topologySignature(topology)
+	) {
+		topologyCache = { ...topologyCache!, nodes, count: nodes.length, at: now };
+		return previous;
+	}
+	topologyCache = { nodes, count: nodes.length, at: now, topology, recipients: new WeakMap(), residency: new Map() };
+	return topology;
+}
+
+let onResidencyVerdictsCleared: (() => void) | undefined;
+export function setResidencyVerdictListener(listener: (() => void) | undefined) {
+	onResidencyVerdictsCleared = listener;
+}
+// a table gaining or losing residency changes the verdict, which the topology cache would otherwise keep for 5 s
+const clearResidencyVerdicts = () => {
+	topologyCache?.residency.clear();
+	onResidencyVerdictsCleared?.();
+};
+databaseEventsEmitter.on('updateTable', clearResidencyVerdicts);
+databaseEventsEmitter.on('dropTable', clearResidencyVerdicts);
+databaseEventsEmitter.on('dropDatabase', clearResidencyVerdicts);
+
+/** Relays forward residency partials as they hold them, so a database with residency keeps full mesh. */
+function databaseUsesResidency(databaseName: string): boolean {
+	const database = databases[databaseName];
+	for (const tableName in database) if (database[tableName]?.residency) return true;
+	const configured = env.get(CONFIG_PARAMS.REPLICATION_DATABASES);
+	return (
+		Array.isArray(configured) &&
+		configured.some((entry) => entry?.name === databaseName && (entry.sharded || entry.replicateTo !== undefined))
+	);
+}
+
+/** The topology governing `databaseName` here, or undefined when it replicates as a full mesh. */
+export function regionTopologyFor(databaseName: string): RegionTopology | undefined {
+	const topology = currentRegionTopology();
+	if (!topology.active) return undefined;
+	// cached with the topology: every confirmed write asks, and the walk covers every table
+	const residency = topologyCache!.residency;
+	let usesResidency = residency.get(databaseName);
+	if (usesResidency === undefined) residency.set(databaseName, (usesResidency = databaseUsesResidency(databaseName)));
+	return usesResidency ? undefined : topology;
+}
+
+/** Peers that subscribe to this node itself: only they acknowledge its writes. */
+function topologyRecipients(topology: RegionTopology, nodes: any[]): any[] {
+	const cache = topologyCache?.topology === topology ? topologyCache.recipients : undefined;
+	let recipients = cache?.get(nodes);
+	if (!recipients) {
+		const selfName = getThisNodeName();
+		recipients = nodes.filter((node) => receivesDirect(topology, node.name, selfName));
+		cache?.set(nodes, recipients);
+	}
+	return recipients;
 }
 
 function isRecipient(recipients: { name: string }[], name: string): boolean {
@@ -989,7 +1125,10 @@ function assertConfirmationFeasible(databaseName: string, confirmationCount: num
 	if (confirmationCount > recipients.length) {
 		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
 		throw new ClientError(
-			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
+			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})` +
+				(regionTopologyFor(databaseName)
+					? '; under region topology only the nodes that subscribe to this node confirm its writes'
+					: '')
 		);
 	}
 	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);
@@ -1114,6 +1253,8 @@ export type Route = {
 				receives?: boolean;
 				receivesFrom?: (RouteEntry | string)[];
 		  };
+	/** The route states its own replication; otherwise it is a seed, and region topology decides the link. */
+	explicitReplication?: boolean;
 };
 export type Node = {
 	name: string;
@@ -1279,6 +1420,12 @@ export function* iterateRoutes(options: { routes: (Route | any)[] }) {
 		}
 		yield {
 			replicates,
+			explicitReplication:
+				typeof route === 'object' &&
+				(route.replicates !== undefined ||
+					route.sendsTo !== undefined ||
+					route.receivesFrom !== undefined ||
+					route.subscriptions !== undefined),
 			name: host,
 			url,
 			port: route.port,

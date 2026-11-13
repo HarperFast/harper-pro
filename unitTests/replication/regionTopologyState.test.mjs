@@ -1,0 +1,118 @@
+import assert from 'node:assert';
+import * as env from '#src/core/utility/environment/environmentManager';
+import { server } from '#src/core/server/Server';
+import { getThisNodeName } from '#src/core/server/nodeName';
+import {
+	currentRegionTopology,
+	getHDBNodeTable,
+	getReplicationRecipients,
+	regionTopologyFor,
+	selfTopologyLabels,
+} from '#src/replication/knownNodes';
+
+const peers = [
+	{ name: 'state-a2', region: 'east', replicates: true },
+	{ name: 'state-a3', region: 'east', replicates: true },
+	{ name: 'state-b1', region: 'west', replicates: true },
+	{ name: 'state-b2', region: 'west', replicates: true },
+	{ name: 'state-b3', region: 'west', replicates: true },
+];
+
+describe('region topology state (harper-pro#1343)', function () {
+	this.timeout(10_000);
+	let rows = [];
+	let stubbed;
+	let prior;
+	// Rows written to the real table would fire node events whose cluster state outlives them and stalls later
+	// suites' copies (residencyControls), so the table's two reads are stubbed instead.
+	before(() => {
+		const table = getHDBNodeTable();
+		stubbed = { table, search: table.search, getSync: table.primaryStore.getSync };
+		table.search = () => rows;
+		table.primaryStore.getSync = function (key, ...rest) {
+			if (key === getThisNodeName()) return { name: key, replicates: true };
+			return rows.find((row) => row.name === key) ?? stubbed.getSync.call(this, key, ...rest);
+		};
+	});
+	after(() => {
+		if (!stubbed) return;
+		stubbed.table.search = stubbed.search;
+		stubbed.table.primaryStore.getSync = stubbed.getSync;
+	});
+	const putRows = async (added) => {
+		rows.push(...added);
+	};
+	beforeEach(() => {
+		rows = [];
+		prior = { nodes: server.nodes, region: env.get('replication_region') };
+		env.setProperty('replication_region', 'east');
+	});
+	afterEach(() => {
+		rows = [];
+		if (!prior) return;
+		server.nodes = prior.nodes;
+		env.setProperty('replication_region', prior.region);
+		prior = undefined;
+	});
+
+	it('publishes the configured region', () => {
+		assert.deepEqual(selfTopologyLabels(), { region: 'east' });
+		env.setProperty('replication_region', '  ');
+		assert.deepEqual(selfTopologyLabels(), { region: null });
+	});
+
+	it('reads members from hdb_nodes, and recomputes when server.nodes grows in place as a full rescan grows it', async () => {
+		await putRows([peers[0]]);
+		server.nodes = [peers[0]];
+		assert.equal(currentRegionTopology().active, false);
+		await putRows(peers.slice(1));
+		server.nodes.push(...peers.slice(1));
+		const topology = currentRegionTopology();
+		assert.equal(topology.active, true);
+		assert.deepEqual(topology.membersByRegion.get('west'), ['state-b1', 'state-b2', 'state-b3']);
+	});
+
+	it('counts as acknowledging recipients only the peers that subscribe to this node itself', async () => {
+		// this node sorts before its two region-mates, so it is in east's first column, which state-b1 carries in west
+		assert.ok(getThisNodeName() < 'state-a2', `the test node ${getThisNodeName()} must sort before state-a2`);
+		await putRows(peers);
+		server.nodes = [...peers];
+		assert.deepEqual(
+			getReplicationRecipients('data').map((node) => node.name),
+			['state-a2', 'state-a3', 'state-b1']
+		);
+	});
+
+	it('ranks this node by the shard its own row publishes', async () => {
+		await putRows(peers);
+		server.nodes = [...peers];
+		const selfName = getThisNodeName();
+		assert.equal(currentRegionTopology().columnOf.get(selfName), 0);
+		// a shard of its own puts this node in a column no region-mate shares
+		await putRows([{ name: selfName, region: 'east', replicates: true, shard: 7 }]);
+		server.nodes = [...peers];
+		assert.equal(currentRegionTopology().columnOf.get(selfName), 3);
+	});
+
+	it('keeps the topology and its caches when a rebuild finds the same links, and replaces them when links change', async () => {
+		await putRows(peers);
+		server.nodes = [...peers];
+		const first = currentRegionTopology();
+		// a node event replaces server.nodes without changing membership
+		server.nodes = [...peers];
+		assert.strictEqual(currentRegionTopology(), first);
+		const joined = { name: 'state-a0', region: 'east', replicates: true };
+		await putRows([joined]);
+		server.nodes = [...peers, joined];
+		const changed = currentRegionTopology();
+		assert.notStrictEqual(changed, first);
+		assert.deepEqual(changed.membersByRegion.get('east'), [getThisNodeName(), 'state-a0', 'state-a2', 'state-a3']);
+	});
+
+	it('keeps the full mesh while a member has no region', async () => {
+		await putRows([...peers, { name: 'state-old', replicates: true }]);
+		server.nodes = [...peers, { name: 'state-old', replicates: true }];
+		assert.equal(regionTopologyFor('data'), undefined);
+		assert.equal(getReplicationRecipients('data').length, peers.length + 1);
+	});
+});

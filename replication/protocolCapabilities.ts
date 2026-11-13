@@ -67,6 +67,13 @@ export const SHARDING_RECOVERY_CAPABILITY = 2;
 
 export const RESIDENCY_NOT_RESIDENT_CAPABILITY = 1;
 
+/**
+ * Region grid (harper-pro#1343): the peer admits a re-included origin through its initial subscription pass, with the
+ * copy-bound gate and relay copy lease, so it may be chosen as the one supplier of origins it relays. A build that
+ * predates it relays as before but is never a named supplier. Advertised only with per-origin logs (RocksDB).
+ */
+export const REGION_GRID_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	safeCopyAudit: number;
@@ -81,6 +88,7 @@ export interface ResolvedPeerCapabilities {
 	residencyNotResident: number;
 	residencySlots: number;
 	shardingRecovery: number;
+	regionGrid: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -134,6 +142,7 @@ export function resolvePeerCapabilities(
 		residencyNotResident: resolveLevel(bag?.residencyNotResident, RESIDENCY_NOT_RESIDENT_CAPABILITY, 0),
 		residencySlots: resolveLevel(bag?.residencySlots, RESIDENCY_SLOTS_CAPABILITY, 0),
 		shardingRecovery: resolveLevel(bag?.shardingRecovery, SHARDING_RECOVERY_CAPABILITY, 0),
+		regionGrid: resolveLevel(bag?.regionGrid, REGION_GRID_CAPABILITY, 0),
 	});
 }
 
@@ -160,6 +169,10 @@ export function peerSupportsShardingRecovery(resolved: ResolvedPeerCapabilities)
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
 export function peerSupportsRecordLocks(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.recordLocks === RECORD_LOCKS_CAPABILITY;
+}
+
+export function peerSupportsRegionGrid(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.regionGrid >= REGION_GRID_CAPABILITY && resolved.originCursors >= ORIGIN_CURSORS_CAPABILITY;
 }
 
 export function peerSupportsOriginCursors(resolved: ResolvedPeerCapabilities): boolean {
@@ -216,6 +229,7 @@ export function buildLocalCapabilities(
 		residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 		residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 		shardingRecovery: perOriginLogs ? SHARDING_RECOVERY_CAPABILITY : 0,
+		regionGrid: perOriginLogs ? REGION_GRID_CAPABILITY : 0,
 	});
 }
 
@@ -234,7 +248,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.residencyStubCopy === b.residencyStubCopy &&
 		a.residencyNotResident === b.residencyNotResident &&
 		a.residencySlots === b.residencySlots &&
-		a.shardingRecovery === b.shardingRecovery
+		a.shardingRecovery === b.shardingRecovery &&
+		a.regionGrid === b.regionGrid
 	);
 }
 

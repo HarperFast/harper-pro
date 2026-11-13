@@ -202,17 +202,20 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 			records: [{ id: '1', name: 'test2' }],
 			replicatedConfirmation: 1,
 		});
-		// we don't really have anyway of know when the message transitively replicated to the next node, so just wait
-		await delay(200);
+		// nothing reports when the update reaches a node transitively, and a relay holds relayed writes back while it
+		// applies a base copy, so poll each node
 		for (let i = 0; i < NODE_COUNT; i++) {
-			let response = await sendOperation(ctx.nodes[i], {
-				operation: 'search_by_id',
-				table: 'test',
-				get_attributes: ['id', 'name'],
-				ids: ['1'],
-			});
-			equal(response.length, 1);
-			equal(response[0].name, 'test2');
+			await waitForCondition(
+				async (signal) => {
+					const response = await sendOperation(
+						ctx.nodes[i],
+						{ operation: 'search_by_id', table: 'test', get_attributes: ['id', 'name'], ids: ['1'] },
+						{ signal }
+					);
+					return response.length === 1 && response[0].name === 'test2';
+				},
+				{ timeoutMs: 30_000, description: `the update from node 2 to reach node ${i + 1}` }
+			);
 		}
 	});
 	test('replicate delete from node 3', async () => {
@@ -229,15 +232,17 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 			ids: ['1'],
 		});
 		equal(response.length, 0);
-		// we don't really have anyway of know when the message transitively replicated to the next node, so just wait
-		await delay(200);
-		response = await sendOperation(ctx.nodes[1], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 0);
+		await waitForCondition(
+			async (signal) =>
+				(
+					await sendOperation(
+						ctx.nodes[1],
+						{ operation: 'search_by_id', table: 'test', get_attributes: ['id', 'name'], ids: ['1'] },
+						{ signal }
+					)
+				).length === 0,
+			{ timeoutMs: 30_000, description: 'the delete from node 3 to reach node 2' }
+		);
 	});
 	test('take down the central node, do writes and verify catchup afterwards', async () => {
 		await killHarper({ harper: ctx.nodes[0] });

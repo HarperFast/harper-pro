@@ -1049,6 +1049,172 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(routeState.hasPending(), false);
 	});
 
+	it('PendingRouteState re-sends what verification re-queues from more than one batch, so it settles', async () => {
+		// two batches whose row write did not persist come back together: restored as they were sent, the later batch's
+		// rollback left each origin settled at the version it was re-queued under, so every commit filtered it out and
+		// it stayed pending for good (a copy pass waiting on the route never settled, holding relaying back)
+		const routeState = new PendingRouteState(() => {});
+		const commit = async () => {
+			const event = { remoteNodeIds: [1] };
+			routeState.attachTo(event);
+			await event.onCommit();
+			return event;
+		};
+		for (let batch = 0; batch < 2; batch++) {
+			routeState.partialHistory(1, true, 'g1');
+			routeState.hole(2, 'g2');
+			routeState.revoke(3, 'g3');
+			// a certification clear: partial history marked, then restored
+			routeState.partialHistory(4, true, 'g4');
+			routeState.partialHistory(4, false, 'g4');
+			await commit();
+		}
+		assert.strictEqual(routeState.hasPending(), false);
+		const unpersisted = [
+			{ id: 1, originGeneration: 'g1' },
+			{ id: 2, originGeneration: 'g2' },
+			{ id: 3, originGeneration: 'g3' },
+			{ id: 4, originGeneration: 'g4', partialHistory: false, certifiedFrom: 100 },
+		];
+		assert.strictEqual(
+			routeState.verifyPersisted(() => unpersisted),
+			false
+		);
+		assert.strictEqual(routeState.size, 4);
+		const retry = await commit();
+		// each origin's states in the order sent; origins in any order
+		const byOrigin = (states) => [...states].sort((a, b) => a[0] - b[0]);
+		assert.deepStrictEqual(byOrigin(retry.originRouteStates), [
+			[1, undefined, true, undefined, 'g1'],
+			[2, undefined, undefined, true, 'g2'],
+			[4, undefined, true, undefined, 'g4'],
+			[4, undefined, false, undefined, 'g4'],
+		]);
+		assert.deepStrictEqual(retry.originFloorRevocations, [[3, 'g3']]);
+		assert.strictEqual(routeState.size, 0, 'the re-queued marks settle once re-sent');
+		const persisted = [
+			{ id: 1, originGeneration: 'g1', partialHistory: true },
+			{ id: 2, originGeneration: 'g2', hole: true },
+			{ id: 3, originGeneration: 'g3', floorRevoked: true },
+			{ id: 4, originGeneration: 'g4', partialHistory: false },
+		];
+		assert.strictEqual(
+			routeState.verifyPersisted(() => persisted, retry),
+			true
+		);
+		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
+	});
+
+	it('PendingRouteState verifyPersisted does not re-queue a mark a newer settled one superseded', async () => {
+		// a copy pass marks an origin partial at its start and restores it at its finish: once the restore settles, the
+		// row holds partialHistory: false, which is no reason to send the start's mark again
+		const routeState = new PendingRouteState(() => {});
+		const commit = async () => {
+			const event = { remoteNodeIds: [1] };
+			routeState.attachTo(event);
+			await event.onCommit();
+			return event;
+		};
+		routeState.partialHistory(1, true, 'g1');
+		await commit();
+		routeState.partialHistory(1, false, 'g1');
+		await commit();
+		assert.strictEqual(
+			routeState.verifyPersisted(() => [{ id: 1, originGeneration: 'g1', partialHistory: false }]),
+			true
+		);
+		assert.strictEqual(routeState.hasPending(), false);
+		assert.strictEqual(routeState.hasUnverifiedBatches(), false);
+	});
+
+	describe('PendingRouteState restoring a partialHistory a newer settled one superseded', () => {
+		const setup = () => {
+			const routeState = new PendingRouteState(() => {});
+			const commit = async () => {
+				const event = { remoteNodeIds: [1] };
+				routeState.attachTo(event);
+				await event.onCommit();
+				return event;
+			};
+			return { routeState, commit };
+		};
+		const partialFlags = (event) =>
+			(event.originRouteStates ?? []).filter((state) => state[0] === 1).map((state) => state[2]);
+
+		it("re-sends a copy pass's start clear after its finish settled, ending false as the row does", async () => {
+			const { routeState, commit } = setup();
+			routeState.partialHistory(1, true, 'g1');
+			const start = await commit();
+			routeState.partialHistory(1, false, 'g1');
+			await commit();
+			start.onFailure(new Error('the start mark did not land'), 0, true);
+			assert.strictEqual(routeState.hasPendingPartialHistory(1), false);
+			const retry = await commit();
+			assert.deepEqual(partialFlags(retry), [true, false]);
+		});
+
+		it('sends nothing over a newer pass still copying, which sent its own clear', async () => {
+			const { routeState, commit } = setup();
+			routeState.partialHistory(1, true, 'g1');
+			const first = await commit();
+			routeState.partialHistory(1, true, 'g1');
+			await commit();
+			first.onFailure(new Error('the first start mark did not land'), 0, true);
+			assert.strictEqual(routeState.hasPending(), false);
+		});
+
+		it('keeps a hole the superseded mark carried, without its partialHistory or clear', async () => {
+			const { routeState, commit } = setup();
+			routeState.partialHistory(1, true, 'g1');
+			routeState.hole(1, 'g1');
+			const first = await commit();
+			routeState.partialHistory(1, true, 'g1');
+			await commit();
+			first.onFailure(new Error('the first batch did not land'), 0, true);
+			const retry = await commit();
+			assert.deepEqual(partialFlags(retry), [undefined]);
+			assert.strictEqual(retry.originRouteStates.find((state) => state[0] === 1)[3], true);
+		});
+	});
+
+	it("PendingRouteState verifyPersisted counts a newer partialHistory only within the older mark's generation", async () => {
+		const routeState = new PendingRouteState(() => {});
+		const commit = async () => {
+			const event = { remoteNodeIds: [1] };
+			routeState.attachTo(event);
+			await event.onCommit();
+		};
+		routeState.partialHistory(1, true, 'g1');
+		await commit();
+		// a mark for another generation, which core ignores while the row is still on g1
+		routeState.partialHistory(1, false, 'g2');
+		await commit();
+		assert.strictEqual(
+			routeState.verifyPersisted(() => [{ id: 1, originGeneration: 'g1', partialHistory: false }]),
+			false
+		);
+		assert.strictEqual(routeState.hasPendingPartialHistory(1), true);
+	});
+
+	it('PendingRouteState verifyPersisted still re-queues a safety field the newer settled mark did not write', async () => {
+		const routeState = new PendingRouteState(() => {});
+		const commit = async () => {
+			const event = { remoteNodeIds: [1] };
+			routeState.attachTo(event);
+			await event.onCommit();
+		};
+		routeState.hole(1, 'g1');
+		await commit();
+		routeState.certifiedFrom(1, 200, 'g1');
+		await commit();
+		// the hole's write did not land; the certification after it carried no hole
+		assert.strictEqual(
+			routeState.verifyPersisted(() => [{ id: 1, originGeneration: 'g1', certifiedFrom: 200 }]),
+			false
+		);
+		assert.strictEqual(routeState.hasPending(), true);
+	});
+
 	it('buildOriginCursorVector never uses floor-only resume for removed origins seeded from another row or unnamed node ids', () => {
 		const seqRows = new Map([
 			[

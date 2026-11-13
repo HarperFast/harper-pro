@@ -11,7 +11,8 @@ import Joi from 'joi';
 import { get } from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { ensureNode, computeSelfReplicates, getConfiguredRoutes } from './subscriptionManager.ts';
-import { getHDBNodeTable } from './knownNodes.ts';
+import { getHDBNodeTable, selfTopologyLabels } from './knownNodes.ts';
+import { validRegion } from './regionTopology.ts';
 import { sendOperationToNode, urlToNodeName } from './replicator.ts';
 import { getThisNodeName, hostnameToUrl, getThisNodeUrl } from '../core/server/nodeName.ts';
 import * as hdbLogger from '../core/utility/logging/harper_logger.js';
@@ -38,6 +39,12 @@ const validationSchema = Joi.object({
 const ISO_8601_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 
 const REMOVE_NODE_BACK_TIMEOUT_MS = 30_000;
+
+/** A peer's region as it sent it, validated; a peer that sent none (an older build) is left unlabeled. */
+function peerTopologyLabels(source: any): { region?: string | null } {
+	if (!source || !('region' in source)) return {};
+	return { region: validRegion(source.region) ?? null };
+}
 
 /**
  * Resolve the `replicates` value to write for THIS node's own hdb_nodes row from add_node/set_node.
@@ -134,6 +141,7 @@ export async function setNode(req: any) {
 		authorization: req.retain_authorization ? req.authorization : null,
 	};
 	if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) targetAddNodeObj.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+	Object.assign(targetAddNodeObj, selfTopologyLabels());
 	const privateUrls = ownPrivateUrls();
 	// sent even when empty, so a peer clears an advertisement this node no longer has
 	targetAddNodeObj.private_urls = privateUrls ?? null;
@@ -221,6 +229,7 @@ export async function setNode(req: any) {
 	if (req.revoked_certificates) nodeRecord.revoked_certificates = req.revoked_certificates;
 	if (targetNodeResponse?.shard !== undefined) nodeRecord.shard = targetNodeResponse.shard;
 	else if (req.shard !== undefined) nodeRecord.shard = req.shard;
+	if (targetNodeResponse) Object.assign(nodeRecord, peerTopologyLabels(targetNodeResponse));
 	const peerPrivateUrls = receivedPrivateUrls(
 		targetNodeResponse,
 		getHDBNodeTable().primaryStore.getSync(targetNodeResponse?.nodeName ?? nodeRecord.name ?? urlToNodeName(url))
@@ -251,6 +260,7 @@ export async function setNode(req: any) {
 			subscriptions: null,
 		};
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
+		Object.assign(thisNode, selfTopologyLabels());
 		const ownPrivate = ownRowPrivateUrls(privateUrls);
 		if (ownPrivate !== undefined) thisNode.private_urls = ownPrivate;
 
@@ -321,6 +331,7 @@ export async function addNodeBack(req) {
 	if (req.start_time) nodeRecord.start_time = req.start_time;
 	if (req.authorization) nodeRecord.authorization = req.authorization;
 	if (req.shard !== undefined) nodeRecord.shard = req.shard;
+	Object.assign(nodeRecord, peerTopologyLabels(req));
 	const peerPrivateUrls = receivedPrivateUrls(req, getHDBNodeTable().primaryStore.getSync(req.hostname));
 	if (peerPrivateUrls !== undefined) nodeRecord.private_urls = peerPrivateUrls;
 
@@ -345,6 +356,8 @@ export async function addNodeBack(req) {
 			thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
 			certs.shard = thisNode.shard;
 		}
+		Object.assign(thisNode, selfTopologyLabels());
+		Object.assign(certs, selfTopologyLabels());
 		const ownPrivate = ownRowPrivateUrls(privateUrls);
 		if (ownPrivate !== undefined) thisNode.private_urls = ownPrivate;
 
