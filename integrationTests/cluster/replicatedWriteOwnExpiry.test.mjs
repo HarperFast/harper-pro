@@ -38,7 +38,7 @@ function readable(node, table, id, signal) {
 		{ operation: 'search_by_id', database: DATABASE, table, ids: [id], get_attributes: ['id'] },
 		{ signal }
 	).then(
-		(rows) => rows.length,
+		(rows) => rows.filter((row) => row?.id === id).length,
 		() => -1
 	);
 }
