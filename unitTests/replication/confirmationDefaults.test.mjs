@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import { parseConfirmationDefault, registerConfirmationDefaults } from '#src/replication/knownNodes';
+import { confirmationDefaultsConfigured } from '#src/core/resources/DatabaseTransaction';
 
 describe('replication confirmation defaults', () => {
 	it('reads an absent key as 0', () => {
@@ -25,7 +26,9 @@ describe('replication confirmation defaults', () => {
 	it('registers the values a clone installs, read through the given source', () => {
 		const installed = { replication_confirmation: 2, replication_recordLockConfirmation: '1' };
 		registerConfirmationDefaults((key) => installed[key]);
+		assert.strictEqual(confirmationDefaultsConfigured(), true);
 		assert.throws(() => registerConfirmationDefaults(() => -1), /Invalid replication\.confirmation/);
 		registerConfirmationDefaults(() => undefined);
+		assert.strictEqual(confirmationDefaultsConfigured(), false);
 	});
 });
