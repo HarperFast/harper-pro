@@ -215,6 +215,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		assert.ok(simulated, 'runs only after the power-loss simulation test passed');
 		// lockKey is homed on B, whose last grant was to A for the write A lost.
 		const onABefore = (await counter(nodeA, lockKey))?.n;
+		t.diagnostic(`A read ${lockKey}=${onABefore} before the lock`);
 		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
 		const onB = await counter(nodeB, lockKey).catch(() => undefined);
 		assert.equal(increment.status, 200, `the lock on A was refused: ${JSON.stringify(increment.body)}`);
