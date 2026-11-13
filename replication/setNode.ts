@@ -470,19 +470,27 @@ async function rowsAtUrl(url: string, hdbNodes) {
  * Is called by other node when remove_node is requested and
  * system tables are not replicating
  */
-export async function removeNodeBackFromTable(req, hdbNodes) {
+export async function removeNodeBackFromTable(req, hdbNodes, liftFence = liftFenceAfterRemoval) {
 	const callerName = req.hdb_user?.name;
 	if (!callerName || (req.name !== callerName && req.name !== getThisNodeName())) {
 		throw new ClientError(`remove_node_back may only remove the authenticated peer or this node, not '${req.name}'`);
 	}
 	//  delete the record
 	await hdbNodes.delete(req.name);
+	// A finalized fence belongs to this node's own removal: deleting one peer's row while others remain is not that
+	// removal, and another coordinator may be about to delete this node on the strength of receipts taken under it.
+	await liftFence(req.name === getThisNodeName() || !(await holdsPeerRow(hdbNodes)));
+}
+
+async function holdsPeerRow(hdbNodes): Promise<boolean> {
+	const thisNode = getThisNodeName();
+	for await (const node of hdbNodes.search({})) if (node?.name && node.name !== thisNode) return true;
+	return false;
 }
 
 export async function removeNodeBack(req) {
 	hdbLogger.trace('removeNodeBack received request:', req);
 	await removeNodeBackFromTable(req, getHDBNodeTable());
-	await liftFenceAfterRemoval(true);
 }
 
 function reverseSubscription(subscription) {
