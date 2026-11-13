@@ -6435,6 +6435,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
 	// audited/durable), mid-copy updates below copyStartTime, and projections that publish no cursor — is a plain end_txn with no flush gate. (harper-pro#480)
+	// An update queued before a hole was marked takes its floors at commit: a holed origin's floor must not commit
+	// ahead of the durable hole mark and satisfy a removal receipt for the write this node skipped.
+	function dropHoledFloors() {
+		for (const id of holedOrigins.keys()) pendingOriginFloors.drop(id);
+	}
 	function seqUpdateEndTxn(seqId: number, originFloors?: ReceivedOriginFloor[], releasePending = false): any {
 		if (projectionCopy)
 			return {
@@ -6472,6 +6477,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					if (hasFloors) {
 						pendingOriginFloors.note(originFloors);
+						dropHoledFloors();
 						pendingOriginFloors.takeForCommit(event, cursorBlockedByBlob());
 					}
 					if (releasePending) queueCommitConfirmation(seqId);
@@ -6504,6 +6510,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			originCursors,
 			onCommit() {
 				pendingOriginFloors.note(originFloors);
+				dropHoledFloors();
 				pendingOriginFloors.takeForCommit(event, cursorBlockedByBlob());
 				if (releasePending) queueCommitConfirmation(seqId);
 			},
@@ -7056,9 +7063,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const origin = getNodeNameForId(auditStore, originId, true);
 		const pass = copyPassToken;
 		try {
-			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
-			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
-			passHoles++;
 			const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? databaseAuditStore;
 			// an origin this node cannot name could be any it knows
@@ -7066,6 +7070,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				originId !== undefined
 					? [originId]
 					: [0, ...Object.values(exportIdMapping(store)).filter((id): id is number => typeof id === 'number')];
+			// in memory before any await, so an update committing meanwhile takes no floor for it (dropHoledFloors)
+			if (!projectionCopy)
+				for (const lostId of lost) if (!holedOrigins.has(lostId)) holedOrigins.set(lostId, undefined);
+			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
+			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
+			passHoles++;
 			if (projectionCopy) {
 				// a projection's end_txn names no route, so its hole is a copy bound no route start passes, durable
 				// before the frame moves on and so before the projection can complete; at any level, so a later engine
