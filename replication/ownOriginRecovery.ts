@@ -462,18 +462,17 @@ export function vouchesForEarlierLog(
 ): boolean {
 	if (recorded?.bootId !== undefined && continuity.bootId !== undefined && recorded.bootId !== continuity.bootId)
 		return true;
-	if (continuity.syncFailure || recorded?.vouched === false) return false;
+	if (continuity.syncFailure) return false;
 	const flushed = stats?.lastFlushedPosition;
 	const next = stats?.nextLogPosition;
 	if (!isLogPosition(flushed) || !isLogPosition(next)) return false;
-	// no flushed position yet reads as sequence 0; segments start at 1
-	return flushed.sequence === next.sequence || (flushed.sequence === 0 && next.sequence <= 1);
+	// segments start at 1: a log still in its first has no closed segment
+	if (next.sequence <= 1) return true;
+	return recorded?.vouched !== false && flushed.sequence === next.sequence;
 }
 
-/**
- * Before any row exists, the previous epoch's boot is the last start known. A refusal this start could not record
- * is retried by the sampler: until it lands, an older row could let the next start on this boot vouch.
- */
+// Before any row exists, the previous epoch's boot is the last start known. A verdict that could not be recorded is
+// retried by the sampler: until it lands, the older row speaks for this start.
 function recordLogVouch(
 	database: string,
 	dbisDB: any,
@@ -497,7 +496,7 @@ function recordLogVouch(
 	vouchedDatabases.set(database, vouched);
 	const row: LogVouch = { vouched };
 	if (continuity.bootId !== undefined) row.bootId = continuity.bootId;
-	if (!writeLogVouch(database, dbisDB, row) && !vouched) unrecordedRefusals.set(database, row);
+	if (!writeLogVouch(database, dbisDB, row)) unrecordedVouches.set(database, row);
 }
 
 function writeLogVouch(database: string, dbisDB: any, row: LogVouch): boolean {
@@ -528,7 +527,7 @@ function readDurableFloor(dbisDB: any): number | undefined {
 }
 
 const vouchedDatabases = new Map<string, boolean>();
-const unrecordedRefusals = new Map<string, LogVouch>();
+const unrecordedVouches = new Map<string, LogVouch>();
 const floorStates = new WeakMap<object, DurableFloorState>();
 let samplerTimer: ReturnType<typeof setInterval> | undefined;
 let samplerErrorLoggedAt = -Infinity;
@@ -546,9 +545,9 @@ export function startDurableFloorSampler(): void {
 }
 
 export function sampleDurableFloors(): void {
-	for (const [database, row] of unrecordedRefusals) {
+	for (const [database, row] of unrecordedVouches) {
 		const dbisDB = dbisFor(database);
-		if (dbisDB && writeLogVouch(database, dbisDB, row)) unrecordedRefusals.delete(database);
+		if (dbisDB && writeLogVouch(database, dbisDB, row)) unrecordedVouches.delete(database);
 	}
 	for (const [database, vouched] of vouchedDatabases) {
 		if (!vouched) continue;

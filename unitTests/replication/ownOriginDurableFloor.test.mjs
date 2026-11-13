@@ -191,6 +191,11 @@ describe('vouchesForEarlierLog', () => {
 			false
 		);
 	});
+	it('vouches for a log still in its first segment whatever an earlier start recorded', () => {
+		const first = { nextLogPosition: position(1, 400), lastFlushedPosition: position(1, 100) };
+		assert.strictEqual(vouchesForEarlierLog({ bootId: 'boot-a', vouched: false }, sameBoot, first), true);
+		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, { bootId: 'boot-a', syncFailure: true }, first), false);
+	});
 	it('vouches for a log with no flushed position yet only while it has just its first segment', () => {
 		const fresh = { nextLogPosition: position(1, 400), lastFlushedPosition: position(0, 0) };
 		assert.strictEqual(vouchesForEarlierLog(undefined, sameBoot, fresh), true);
