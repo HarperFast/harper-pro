@@ -319,17 +319,30 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 			...(typeof generation === 'string' ? { generation } : {}),
 		};
 	}
-	// a database created while finalize ran is neither fenced nor receipted; the next poll covers it
+	// finalize persisted across awaits: a database created, or a peer that became required, meanwhile has no
+	// receipt, so the state goes back to fenced and the next poll covers it
 	if (request.finalize !== undefined) {
 		const known = new Set([...roots.values()].flat());
 		const created = [...databaseRoots().values()].flat().some((auditStore) => !known.has(auditStore));
-		if (created) {
+		const rebound = [...roots.keys()].some((database) => {
+			try {
+				return !receiptsBindRequired(request.receipts?.[database], requiredPeers(database, thisNode));
+			} catch {
+				return true; // a refusal now (an owner gone): the next poll reports it
+			}
+		});
+		if (created || rebound) {
 			if (!wasRemoving)
 				for (const [auditStore, target] of targets) {
 					await persistLocalWriteFence(auditStore, { epoch, target, state: 'fenced' });
 					syncedFences.set(auditStore, `${epoch}:${target}:fenced`);
 				}
-			throw new ClientError(`A database was created on ${thisNode} while its removal was finalized; retry`, 409);
+			throw new ClientError(
+				created
+					? `A database was created on ${thisNode} while its removal was finalized; retry`
+					: `The peers that must hold ${thisNode}'s writes changed while its removal was finalized; retry`,
+				409
+			);
 		}
 	}
 	if (fences.length === 0)
