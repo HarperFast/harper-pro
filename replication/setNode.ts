@@ -350,11 +350,8 @@ export async function addNodeBack(req) {
 }
 
 export interface RemoveNodeOptions {
-	/** Remove without waiting for the node's writes to reach its peers. */
 	force?: boolean;
-	/** Stop removing the node: it accepts local writes again and stays a member. */
 	cancel?: boolean;
-	/** Milliseconds to wait for the drain before failing the removal with the node still fenced. */
 	timeout?: number;
 	drain?: typeof drainNode;
 }

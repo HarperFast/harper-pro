@@ -10092,7 +10092,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								lastFloorCaptureAt = 0;
 								let floorTimer: ReturnType<typeof setTimeout> | undefined;
 								let capturedFloors: Map<string, OriginCertificate> | undefined;
-								// A peer that acknowledges markers proves a replicatedConfirmation waiter's delivery by one.
 								const confirmationStatus = getSharedStatus();
 								const sendsOwnLog = excludedNodes
 									? !excludedNodes.includes(getThisNodeName())

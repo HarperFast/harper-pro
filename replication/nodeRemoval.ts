@@ -200,6 +200,13 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 		const generation = getDatabaseGeneration(auditStores[0])?.id;
 		result.databases[database] = { target, sharded, peers, ...(typeof generation === 'string' ? { generation } : {}) };
 	}
+	// a database created while finalize ran is neither fenced nor receipted; the next round covers it
+	if (request.finalize !== undefined) {
+		const known = new Set([...roots.values()].flat());
+		for (const auditStores of databaseRoots().values())
+			if (auditStores.some((auditStore) => !known.has(auditStore)))
+				throw new ClientError(`A database was created on ${thisNode} while its removal was finalized; retry`, 409);
+	}
 	if (fences.length === 0)
 		hdbLogger.notify(`${thisNode} is being removed from its cluster: local writes are now refused`);
 	return result;
