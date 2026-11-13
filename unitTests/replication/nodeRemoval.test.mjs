@@ -211,6 +211,13 @@ describe('drainNode', () => {
 		);
 	});
 
+	it('removes a node with no database but system without a finalize', async () => {
+		const send = transport(() => ({ node: 'leaving', epoch: 'e1', state: 'fenced', databases: {} }));
+		const result = await drainNode('leaving', {}, 5000, send, async () => ({}));
+		assert.equal(result.state, 'removing');
+		assert.equal(send.calls.length, 1);
+	});
+
 	it('re-fences after a refused finalize, for a database created during the drain', async () => {
 		let fences = 0;
 		const send = transport((node, operation) => {

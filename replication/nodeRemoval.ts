@@ -378,18 +378,20 @@ export async function drainNode(
 	const remaining = () => Math.max(0, deadline - performance.now());
 	const thisNode = getThisNodeName();
 	const local = name === thisNode;
+	const withinBudget = <T>(work: Promise<T>): Promise<T> => {
+		let timer: ReturnType<typeof setTimeout>;
+		const deadlinePassed = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => reject(new OutOfBudget()), remaining());
+		});
+		return Promise.race([work, deadlinePassed]).finally(() => clearTimeout(timer));
+	};
 	const call = async (target: string, peerRecord: any, operation: any) => {
 		if (remaining() <= MIN_CALL_MS) throw new OutOfBudget();
 		if (target === thisNode) {
 			const request = { ...operation, hdb_user: { name: thisNode, role: { permission: { super_user: true } } } };
 			// a fence change that won the lock runs to completion: abandoning it could persist a state after the 504
 			if (operation.operation === FENCE_OPERATION) return removeNodeFence(request, deadline);
-			const local = getReceivedOriginFloors(request);
-			let timer: ReturnType<typeof setTimeout>;
-			const deadlinePassed = new Promise<never>((_, reject) => {
-				timer = setTimeout(() => reject(new OutOfBudget()), remaining());
-			});
-			return Promise.race([local, deadlinePassed]).finally(() => clearTimeout(timer));
+			return withinBudget(getReceivedOriginFloors(request));
 		}
 		const response = await sendOperation(peerRecord, operation, { timeoutMs: Math.min(CALL_TIMEOUT_MS, remaining()) });
 		return response?.results ?? response;
@@ -402,7 +404,6 @@ export async function drainNode(
 		try {
 			fence = await call(name, record, { operation: FENCE_OPERATION, node: name });
 		} catch (error) {
-			// a local fence change that could not get the lock before the drain deadline
 			if (error instanceof OutOfBudget || (error instanceof FenceLockTimeout && remaining() <= MIN_CALL_MS)) break;
 			if (unsupportedOperation(error))
 				throw new ClientError(
@@ -416,6 +417,8 @@ export async function drainNode(
 			continue;
 		}
 		unreachable = undefined;
+		// only `system`: nothing to fence or drain, and no record would keep a finalize's epoch
+		if (Object.keys(fence.databases).length === 0) return { ...fence, state: 'removing' };
 		const byPeer = new Map<string, string[]>();
 		for (const [database, drain] of Object.entries(fence.databases))
 			for (const peer of drain.peers) byPeer.set(peer, [...(byPeer.get(peer) ?? []), database]);
@@ -430,7 +433,7 @@ export async function drainNode(
 			}
 			let answers: Record<string, ReceivedFloor>;
 			try {
-				answers = await call(peer, peer === thisNode ? undefined : await nodeRecord(peer), {
+				answers = await call(peer, peer === thisNode ? undefined : await withinBudget(nodeRecord(peer)), {
 					operation: RECEIPT_OPERATION,
 					origin: name,
 					databases: peerDatabases,
