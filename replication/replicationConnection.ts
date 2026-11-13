@@ -3355,8 +3355,12 @@ export function raiseStatusSlot(status: Float64Array, position: number, value: n
 	}
 }
 
+/**
+ * A valid floor is the proven start. A received position above it is a key maximum: an entry reserved below that
+ * position and committed after the link dropped would be filtered by the sender while later floors certify past it.
+ */
 export function resumeStartWithFloor(position: number, closedFloor: unknown): number {
-	return isValidFloor(closedFloor) ? Math.max(position, cursorBelowFloor(closedFloor)) : position;
+	return isValidFloor(closedFloor) ? cursorBelowFloor(closedFloor) : position;
 }
 
 /**
@@ -4389,9 +4393,7 @@ export function buildOriginCursorVector(
 				return start;
 			}
 		}
-		return position === undefined
-			? cursorBelowFloor(node.closedFloor)
-			: resumeStartWithFloor(position, node.closedFloor);
+		return cursorBelowFloor(node.closedFloor);
 	};
 	const cursors = new Map<string, number>();
 	const peerNodes = seqRows.get(peerId)?.nodes;
@@ -13349,6 +13351,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
 				let floorOnlyStart: number | undefined;
 				let floorOnlyGeneration: string | undefined;
+				let floorBoundedStart = false;
 				if (copyCursor) requestIsCopy = true;
 				const allNodes: any[] = (sequenceEntry?.nodes ?? [])
 					.filter((state: any) => state && typeof state.id === 'number')
@@ -13503,10 +13506,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							floorOnlyStart = startTime;
 							floorOnlyGeneration = ownState.originGeneration;
 						} else {
-							startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
+							startTime = ownFloorStart;
+							floorBoundedStart = true;
 						}
 					} else if (nodeId === undefined || !pendingRouteState.hasPendingRevocation(nodeId)) {
 						startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
+						floorBoundedStart = isValidFloor(ownState?.closedFloor);
 					}
 				}
 				if (copyCursor) {
@@ -13568,7 +13573,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// originating txn time, and sequence ids should always be higher than their originating txn time, and starting from them should overlap
 				// a floor-only start is the proven one; a recorded transaction time above it would let the sender filter
 				// what committed between them, the gap the floor exists to close
-				if (!forceFullCopyOnWidening && floorOnlyStart === undefined && lastTxnTimes.get(nodeId) > startTime) {
+				if (
+					!forceFullCopyOnWidening &&
+					floorOnlyStart === undefined &&
+					!floorBoundedStart &&
+					lastTxnTimes.get(nodeId) > startTime
+				) {
 					startTime = lastTxnTimes.get(nodeId);
 					logger.debug?.('Updating start time from more recent txn recorded', connectedNode.name, startTime);
 				}

@@ -20,6 +20,7 @@ export function nodeOptions(context) {
 			HARPER_TEST_REPLICATION_PAUSE_DIR: context.pauseDir,
 			// floors reach peers within a second, so a test does not wait out the 30 s production interval
 			HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS: '500',
+			...context.env,
 		},
 		config: {
 			threads: { count: 1, preload: [PAUSE_INJECTOR] },
@@ -37,7 +38,8 @@ export function nodeOptions(context) {
 	};
 }
 
-export async function startShardedCluster(ctx, shards) {
+/** `schema` replaces the fixture's schema.graphql; `database` is the one whose sockets `meshed` waits for. */
+export async function startShardedCluster(ctx, shards, { env, schema, database } = {}) {
 	const contexts = [];
 	for (const shard of shards) {
 		const hostname = await getNextAvailableLoopbackAddress();
@@ -45,9 +47,10 @@ export async function startShardedCluster(ctx, shards) {
 			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-')
 		);
 		const pauseDir = await mkdtemp(join(tmpdir(), 'node-drain-pause-'));
-		const context = { name: ctx.name, shard, hostname, pauseDir, harper: { hostname, dataRootDir } };
+		const context = { name: ctx.name, shard, hostname, pauseDir, env, harper: { hostname, dataRootDir } };
 		contexts.push(context);
 		await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
+		if (schema) await writeFile(join(dataRootDir, 'components', basename(FIXTURE), 'schema.graphql'), schema);
 		await startHarper(context, nodeOptions(context));
 	}
 	const [seed, ...peers] = contexts.map((context) => context.harper);
@@ -62,11 +65,12 @@ export async function startShardedCluster(ctx, shards) {
 			authorization: 'Bearer ' + token,
 			rejectUnauthorized: false,
 		});
-	await meshed(contexts);
+	await meshed(contexts, undefined, database);
 	return contexts;
 }
 
-export function meshed(contexts, description = 'every data socket connected') {
+/** For `data`, also waits for its sharding state to be available. */
+export function meshed(contexts, description = 'every data socket connected', database = 'data') {
 	const expected = contexts.length - 1;
 	return waitForCondition(
 		async (signal) => {
@@ -77,9 +81,9 @@ export function meshed(contexts, description = 'every data socket connected') {
 			);
 			return statuses.every(
 				(status) =>
-					status?.sharding?.data?.state === 'available' &&
+					(database !== 'data' || status?.sharding?.data?.state === 'available') &&
 					status.connections.filter((connection) =>
-						connection.database_sockets.some((socket) => socket.database === 'data' && socket.connected)
+						connection.database_sockets.some((socket) => socket.database === database && socket.connected)
 					).length >= expected
 			);
 		},
@@ -154,11 +158,11 @@ export function waitForLocal(node, ids, table = 'Drained', timeoutMs = 60_000) {
  * with its `release()`. Until released, send nothing else to that node's HTTP workers: it can queue behind the
  * open transaction (use the operations API, which runs on the main thread).
  */
-export async function holdWrite(context, id, { table = 'Drained', headers } = {}) {
+export async function holdWrite(context, id, { database, table = 'Drained', headers } = {}) {
 	const gate = join(context.pauseDir, `held-${id}`);
 	const inFlight = request(context.harper, 'HeldWrite', {
 		method: 'POST',
-		body: { table, id, body: id, gate },
+		body: { database, table, id, body: id, gate },
 		headers,
 		signal: AbortSignal.timeout(600_000),
 	});
@@ -180,8 +184,8 @@ export async function resumeLink(fromContext, toContext) {
 }
 
 /** The floor `node` has recorded for `origin` on its direct route from it, or null. */
-export async function directFloor(node, origin, signal) {
-	const response = await request(node, 'SeqRows', { signal });
+export async function directFloor(node, origin, signal, database) {
+	const response = await request(node, database ? `SeqRows/?database=${database}` : 'SeqRows', { signal });
 	assert.equal(response.status, 200, JSON.stringify(response));
 	const row = response.data.find((entry) => entry.route === origin);
 	return row?.nodes.find((entry) => entry.origin === origin)?.closedFloor ?? null;
