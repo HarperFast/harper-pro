@@ -207,7 +207,7 @@ async function recordReport(database: string, peer: string, report: OwnOriginRep
 }
 
 // the epoch row is fixed once workers run, and a clean report is never replaced within its epoch
-const cachedEpochs = new Map<string, { epoch: OwnOriginEpoch; clean: Set<string> }>();
+const cachedEpochs = new Map<string, { epoch: OwnOriginEpoch; clean: Set<string>; provenFor?: readonly string[] }>();
 
 /**
  * Whether this node's own history is proven at `position` (null: anywhere, for a grant whose lineage the
@@ -234,8 +234,8 @@ export function ownLineage(
 		cachedEpochs.set(database, cached);
 	}
 	const { epoch, clean } = cached;
-	if (position !== null && position >= epoch.before) return { state: 'intact' };
-	return lineageFromReports(
+	if ((position !== null && position >= epoch.before) || cached.provenFor === homes) return { state: 'intact' };
+	const lineage = lineageFromReports(
 		epoch,
 		homes,
 		self,
@@ -243,6 +243,9 @@ export function ownLineage(
 		memberCheck,
 		(peer) => clean.add(peer)
 	);
+	// a home map's array is replaced, never mutated, when it changes
+	if (lineage.state === 'intact') cached.provenFor = homes;
+	return lineage;
 }
 
 export function lineageFromReports(

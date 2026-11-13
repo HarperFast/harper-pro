@@ -1801,6 +1801,13 @@ setRecordLockOwnershipReaders({
 		return auditStore ? readPeerLockLevel(getReplicationSharedStatus(auditStore, database, node)) : 0;
 	},
 	tableReplicates: (database, table) => tableReplicates(database, table),
+	ownLineageIntact: (database) => {
+		let homes: readonly string[] = [];
+		try {
+			homes = transports.get(database)?.homeMap(database)?.homes ?? [];
+		} catch {}
+		return ownLineage(database, null, homes, getThisNodeName()).state === 'intact';
+	},
 });
 
 function tableReplicates(database: string, table: string): boolean {

@@ -154,6 +154,8 @@ interface OwnershipReaders {
 	/** The peer's exact advertised `recordLocks` level, 0 while unknown. */
 	peerLevel?(database: string, node: string): number;
 	tableReplicates?(database: string, table: string): boolean;
+	/** Whether this node's own history on the database is proven (`ownOriginRecovery.ts`), so a barrier it writes follows it. */
+	ownLineageIntact?(database: string): boolean;
 }
 let ownership: OwnershipReaders = {
 	ownsDatabase: () => false,
@@ -667,6 +669,12 @@ async function executeBarrier(request: any): Promise<{ position: number }> {
 		throw new ClientError('a barrier nonce must be a non-negative integer', 400);
 	if (!admitBarrierRequest(caller, request.database))
 		throw new ClientError(`too many record lock barrier requests from ${caller} for ${request.database}`, 429);
+	// a barrier written before this node's lost writes come back would sit ahead of them in its log
+	if (ownership.ownLineageIntact && !ownership.ownLineageIntact(request.database))
+		throw new ClientError(
+			`this node is still recovering its own writes on ${request.database} from its peers after a restart`,
+			503
+		);
 	const position = await writeLockBarrier(request.database, request.table, request.nonce);
 	if (claimHeldBarrierAnswer()) await new Promise(() => {});
 	return { position };
