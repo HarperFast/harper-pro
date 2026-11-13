@@ -404,32 +404,36 @@ export async function waitForCondition(probe, opts = {}) {
 }
 
 /**
- * Resolves once `node` gets `peerName`'s answer to a replicated operation, the path `drop_table`, deploys and other
- * replicated operations take. A replication connection is not that proof: `add_node` returns before the certificates
- * it exchanged reach either node's TLS contexts, and until they do the peer can serve a certificate the origin's
- * operation client does not yet trust. `list_releases` is read-only, so polling it changes nothing.
- * @param {Object} node - the origin
- * @param {string} peerName - the peer's node name (its hostname in these suites)
- * @param {Object} [opts]
- * @param {number} [opts.timeoutMs=30000]
- * @param {number} [opts.pollMs=250]
+ * Resolves once `node` has had `peerName`'s answer to a replicated operation (the path `drop_table` and deploys take)
+ * on every poll for `stableMs`. A connected replication socket does not prove that path: `add_node` returns before
+ * the certificates it exchanged reach the TLS contexts, which every thread on both nodes rebuilds on its own 1.5s
+ * debounce, so one answer proves only the threads that served it. `list_releases` is read-only.
  */
-export function waitForOperationPath(node, peerName, { timeoutMs = 30000, pollMs = 250 } = {}) {
+export function waitForOperationPath(node, peerName, { timeoutMs = 30000, pollMs = 250, stableMs = 2000 } = {}) {
 	let lastAnswer;
+	let answeringSince;
 	return waitForCondition(
 		async (signal) => {
 			const { body } = await postOperation(node, { operation: 'list_releases', replicated: true }, { signal }).catch(
-				(error) => ({ body: { error: error.message } })
+				(error) => {
+					if (signal.aborted) throw error;
+					return { body: { error: error.message } };
+				}
 			);
 			lastAnswer = body;
 			const peer = body?.nodes?.find((entry) => entry.node === peerName);
-			return Boolean(peer && !peer.error && Array.isArray(peer.components));
+			if (!peer || peer.error || !Array.isArray(peer.components)) {
+				answeringSince = undefined;
+				return false;
+			}
+			answeringSince ??= Date.now();
+			return Date.now() - answeringSince >= stableMs;
 		},
 		{
 			timeoutMs,
 			pollMs,
 			description: () =>
-				`${node.hostname} to get ${peerName}'s answer to a replicated operation; last: ${JSON.stringify(lastAnswer)}`,
+				`${node.hostname} to get ${peerName}'s answer to a replicated operation for ${stableMs}ms; last: ${JSON.stringify(lastAnswer)}`,
 		}
 	);
 }

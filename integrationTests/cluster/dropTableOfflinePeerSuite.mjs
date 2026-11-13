@@ -256,7 +256,6 @@ export function dropTableOfflinePeerSuite({ replicationThreads, scenarios } = {}
 				authorization: ctx.nodeB.admin,
 			});
 			await waitForBothConnected(ctx, 'at setup');
-			// scenario 1 asserts B acknowledged a replicated drop, which takes more than a connected socket
 			await waitForOperationPath(ctx.nodeA, ctx.nodeB.hostname);
 			await waitForOperationPath(ctx.nodeB, ctx.nodeA.hostname);
 		});
