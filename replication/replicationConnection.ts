@@ -795,14 +795,7 @@ export function predatesPurgeTracking(
 	return (subscriptions.find(({ name }) => name === thisNodeName)?.startTime ?? mergedStart) < trackedFrom;
 }
 
-/**
- * Whether a single-log store still holds everything after `start` although `start` predates where it began
- * tracking prunes: no tracked prune reached past `trackedFrom`, so the bound is only the resync epoch a store
- * without a floor record is stamped with, and retention removes from the oldest key up, so a log whose oldest
- * retained key is at or below `start` lost nothing after it. A `start` below the retention cutoff is refused: it is
- * still in the log only because cleanup has not reached it yet. A legacy `deleteHistory` that removed one table's
- * entries above the oldest retained key is not visible here.
- */
+/** Whether a single-log store's retained log still holds everything after a start that predates prune tracking. */
 export function retainedLogCoversStart(
 	start: number,
 	oldestRetainedTime: number | undefined,
@@ -823,9 +816,7 @@ export function retainedLogCoversStart(
 
 /**
  * A receiver that owns sharding slots this node cannot copy (`restricted`) refuses every base copy, so a start this
- * node cannot vouch for replays what is retained there instead (harper-pro#1278). A receiver that can only take a
- * verified legacy copy (`retainedForLegacyCopy`, set only when the retained log covers its start) replays from that
- * start: the verification cannot pass for a table without a numeric update timestamp.
+ * node cannot vouch for replays what is retained there instead (harper-pro#1278).
  */
 export function retentionResumeDecision(
 	forceForTest: boolean,
@@ -10384,7 +10375,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													sendOperation,
 													(error) =>
 														logger.warn?.(
-															`Version probe for peer ${remoteNodeName} failed; using baseline verification`,
+															`Version probe for peer ${remoteNodeName} failed; treating it as a legacy peer`,
 															error
 														)
 												));
@@ -10440,21 +10431,37 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																getAuditFloor(auditStore)
 															));
 												const forceCopy = forceRetentionCopyForTest(databaseName);
-												const coversRetained = (oldest: number | undefined) =>
+												const coversRetained = (
+													oldest: number | undefined,
+													bounds: Map<string, number> | undefined,
+													tracked: number | undefined
+												) =>
 													retainedLogCoversStart(
 														currentSequenceId,
 														oldest,
 														Date.now() - auditRetention,
-														trackedFrom,
+														tracked,
 														purgeScope,
-														(name) => purgeBounds?.get(name),
+														(name) => bounds?.get(name),
 														auditStore.reusableIterable !== true
 													);
 												let retainedForLegacyCopy = false;
-												if (retentionGap && !otherGeneration && !forceCopy && coversRetained(oldestRetainedTime)) {
-													// retention can prune while the probe waits, so the log is read again after it
-													retainedForLegacyCopy = (await probeLegacyCopy()) && coversRetained(readOldestRetainedTime());
+												if (
+													retentionGap &&
+													!otherGeneration &&
+													!forceCopy &&
+													coversRetained(oldestRetainedTime, purgeBounds, trackedFrom)
+												) {
+													const legacyPeer = await probeLegacyCopy();
 													if (closed || wsClosed) return;
+													const boundsAfterProbe = getLogPurgeBounds(auditStore, purgeScope);
+													retainedForLegacyCopy =
+														legacyPeer &&
+														coversRetained(
+															readOldestRetainedTime(),
+															boundsAfterProbe,
+															boundsAfterProbe && getLogPurgeTrackedFrom(auditStore)
+														);
 												}
 												const decision = retentionResumeDecision(
 													forceCopy,

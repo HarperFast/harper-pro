@@ -419,6 +419,8 @@ From v5.3.6, a peer records how far each prune of its transaction logs reached. 
 
 <VersionBadge version="v5.4.0" /> A peer never forces a base copy on a node that owns [sharding](./residency.md) slots the peer is not a complete co-owner of, because that node would refuse it. The peer replays what its transaction logs still hold from the node's position instead, and logs a warning once per database, node and reason, ending `so replay continues from <position>, and writes from this node it has not received may be missing there.` Whatever the peer purged before that node received it stays missing there, including rows of tables in that database that are not sharded.
 
+<VersionBadge version="v5.4.1" /> A peer upgraded in place from v4 on LMDB starts recording its prunes when it first runs v5.3.6 or later, so a v4 node's position from before that upgrade looks purged. A v4 node cannot take a verified copy of a table without a numeric update timestamp, including the system tables. So when the peer's retained transaction log still reaches back to that position, and the position is newer than `logging.auditRetention`, the peer replays from it instead of forcing a copy. It logs a warning once per database and node, ending `the retained log reaches back to that start and the peer cannot take an unverified copy, so replay continues from there.` A v4 node whose position falls outside retention, for example on a database with no writes after the upgrade, still gets the copy.
+
 A copy that keeps failing is reported as [`stuckCopy`](./clustering.md#stuck-copies) in `cluster_status`, and its reconnects are held back instead of retried indefinitely.
 
 ### Rows From Unnamed Origins
