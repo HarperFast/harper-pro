@@ -102,21 +102,11 @@ if (!stressEnabled()) {
 			});
 			ctx.nodes = [nodeA.harper, nodeB.harper];
 
-			// Mesh: B adds A.
-			const tokenResp = await sendOperation(ctx.nodes[0], {
-				operation: 'create_authentication_tokens',
-				authorization: ctx.nodes[0].admin,
-			});
-			await sendOperation(ctx.nodes[1], {
-				operation: 'add_node',
-				rejectUnauthorized: false,
-				hostname: ctx.nodes[0].hostname,
-				authorization: 'Bearer ' + tokenResp.operation_token,
-			});
-
 			// Create several databases so multiple subscriptions form on B (each
 			// db is a separate WS in replicationConnection). This makes the
 			// stagger observable — with one db there's nothing to space out.
+			// Created on both nodes before meshing: once meshed, A's definition can replicate to B
+			// ahead of B's own create_table, which then fails with "already exists".
 			for (let i = 0; i < DB_COUNT; i++) {
 				for (const n of ctx.nodes) {
 					await sendOperation(n, {
@@ -131,7 +121,22 @@ if (!stressEnabled()) {
 					});
 				}
 			}
-			await waitForAllConnected(ctx.nodes[1], { timeoutMs: 60_000 });
+
+			// Mesh: B adds A.
+			const tokenResp = await sendOperation(ctx.nodes[0], {
+				operation: 'create_authentication_tokens',
+				authorization: ctx.nodes[0].admin,
+			});
+			await sendOperation(ctx.nodes[1], {
+				operation: 'add_node',
+				rejectUnauthorized: false,
+				hostname: ctx.nodes[0].hostname,
+				authorization: 'Bearer ' + tokenResp.operation_token,
+			});
+			await waitForAllConnected(ctx.nodes[1], {
+				timeoutMs: 60_000,
+				databases: Array.from({ length: DB_COUNT }, (_, i) => `stress_db${i}`),
+			});
 		});
 
 		after(async () => {
