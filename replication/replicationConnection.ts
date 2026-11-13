@@ -5692,14 +5692,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			options.connection?.nodeSubscriptions?.[0]?.name);
 	const awaitingResponse = new Map();
 	let receivingDataFromNodeIds = [];
-	/** the subscribed nodes in request order; their ids wait for an audit store when the database did not exist yet */
 	let requestedNodeNames: string[] = [];
 	/**
-	 * Binds the ids of a request sent before this database existed here, once its schema frame has created it. Until
-	 * then core has no `[seq, id]` row to write this connection's cursor and certified floors to.
+	 * A request sent before this database existed here resolved no ids, and without them core writes no `[seq, id]` row:
+	 * no resume cursor and no certified floors for this connection.
 	 */
 	function bindReceivingNodeIds(): void {
 		if (!auditStore || receivingDataFromNodeIds.length === requestedNodeNames.length) return;
+		if (wsClosed || connectionSuperseded()) return;
 		const ids: number[] = [];
 		for (const name of requestedNodeNames) {
 			auditStore.ensureLogExists?.(name);
@@ -8715,8 +8715,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							tableDecoders[tableId] = { name: tableName, refused: true, decoder };
 							break;
 						}
-						// a database that had no tables when the schema frame came has its first store now
-						if (!auditStore) auditStore = table?.auditStore;
+						if (!auditStore) auditStore = getDatabaseStores().auditStore;
 						bindReceivingNodeIds();
 						// A pool worker never ran the application, so it cannot maintain an index whose resolver the
 						// application assigns; applying here would leave the index silently wrong. Latch inbound off
