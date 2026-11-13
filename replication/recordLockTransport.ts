@@ -1802,13 +1802,16 @@ setRecordLockOwnershipReaders({
 	},
 	tableReplicates: (database, table) => tableReplicates(database, table),
 	ownLineageIntact: (database) => {
-		let homes: readonly string[] = [];
+		let homes: readonly string[] = NO_HOMES;
 		try {
-			homes = transports.get(database)?.homeMap(database)?.homes ?? [];
+			homes = transports.get(database)?.homeMap(database)?.homes ?? NO_HOMES;
 		} catch {}
 		return ownLineage(database, null, homes, getThisNodeName()).state === 'intact';
 	},
 });
+
+// one identity, so ownLineage's per-home-list proof cache holds while no home map is known
+const NO_HOMES: readonly string[] = Object.freeze([]);
 
 function tableReplicates(database: string, table: string): boolean {
 	const definition = getDatabases()[database]?.[table];

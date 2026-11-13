@@ -6,7 +6,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { RocksDatabase } from '@harperfast/rocksdb-js';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -77,34 +77,21 @@ export function clearSyncFailureMarker(rootPath: string, token: string): void {
 	}
 }
 
-function writeDurably(directory: string, name: string, content: string): void {
-	const temporary = join(directory, `${name}.${process.pid}.${randomUUID()}.tmp`);
-	const fd = openSync(temporary, 'wx');
-	try {
-		writeSync(fd, content);
-		fsyncSync(fd);
-	} finally {
-		closeSync(fd);
-	}
-	try {
-		renameSync(temporary, join(directory, name));
-	} catch (error) {
-		try {
-			unlinkSync(temporary);
-		} catch {}
-		throw error;
-	}
-	const directoryFd = openSync(directory, 'r');
-	try {
-		fsyncSync(directoryFd);
-	} finally {
-		closeSync(directoryFd);
-	}
-}
-
+/**
+ * Written in place, and kept even if its fsync fails: it only has to outlive a restart on this boot (a new boot
+ * recovers anyway), which the page cache gives it, and a torn write still reads as present.
+ */
 export function recordSyncFailure(rootPath: string): void {
 	try {
-		writeDurably(rootPath, SYNC_FAILURE_MARKER, randomUUID());
+		const fd = openSync(join(rootPath, SYNC_FAILURE_MARKER), 'w');
+		try {
+			writeSync(fd, randomUUID());
+			try {
+				fsyncSync(fd);
+			} catch {}
+		} finally {
+			closeSync(fd);
+		}
 	} catch (error) {
 		logger.error?.(
 			'Could not record a transaction-log sync failure; a restart on this boot will not recover own-origin writes from peers',
@@ -124,6 +111,10 @@ let watching = false;
 /** rocksdb-js reports each store's sync failure once, and only to a listener registered when it happens. */
 export function watchLogSyncFailures(rootPath: string): void {
 	if (watching || !rootPath) return;
-	watching = true;
-	RocksDatabase.on('log.warn', (message: unknown) => onRocksWarning(rootPath, message));
+	try {
+		RocksDatabase.on('log.warn', (message: unknown) => onRocksWarning(rootPath, message));
+		watching = true;
+	} catch (error) {
+		logger.error?.('Could not watch for transaction-log sync failures', error);
+	}
 }

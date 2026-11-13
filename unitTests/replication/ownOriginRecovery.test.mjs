@@ -207,23 +207,21 @@ describe('markOwnOriginRecoveryFailed', () => {
 });
 
 describe('continuesEpoch', () => {
-	const previous = { after: 1, lastKey: 0, before: NOW, requiredPeers: [], bootId: 'boot-a' };
+	const previous = { after: 1, lastKey: 50, before: NOW, requiredPeers: [], bootId: 'boot-a' };
+	const sameBoot = { bootId: 'boot-a', syncFailure: false };
 	it('continues on the boot the previous epoch opened on, with no sync failure since', () => {
-		assert.strictEqual(continuesEpoch(previous, { bootId: 'boot-a', syncFailure: false }), true);
-		assert.strictEqual(
-			continuesEpoch({ ...previous, finished: false }, { bootId: 'boot-a', syncFailure: false }),
-			true
-		);
+		assert.strictEqual(continuesEpoch(previous, sameBoot, 50), true);
+		assert.strictEqual(continuesEpoch({ ...previous, finished: false }, sameBoot, 80), true);
 	});
 	it('opens a new epoch after a changed or unknown boot, a sync failure, or with no boot recorded', () => {
-		assert.strictEqual(continuesEpoch(previous, { bootId: 'boot-b', syncFailure: false }), false);
-		assert.strictEqual(continuesEpoch(previous, { bootId: undefined, syncFailure: false }), false);
-		assert.strictEqual(continuesEpoch(previous, { bootId: 'boot-a', syncFailure: true }), false);
-		assert.strictEqual(
-			continuesEpoch({ ...previous, bootId: undefined }, { bootId: 'boot-a', syncFailure: false }),
-			false
-		);
-		assert.strictEqual(continuesEpoch(undefined, { bootId: 'boot-a', syncFailure: false }), false);
+		assert.strictEqual(continuesEpoch(previous, { bootId: 'boot-b', syncFailure: false }, 50), false);
+		assert.strictEqual(continuesEpoch(previous, { bootId: undefined, syncFailure: false }, 50), false);
+		assert.strictEqual(continuesEpoch(previous, { bootId: 'boot-a', syncFailure: true }, 50), false);
+		assert.strictEqual(continuesEpoch({ ...previous, bootId: undefined }, sameBoot, 50), false);
+		assert.strictEqual(continuesEpoch(undefined, sameBoot, 50), false);
+	});
+	it('opens a new epoch when the log holds less than it did when the previous epoch opened', () => {
+		assert.strictEqual(continuesEpoch(previous, sameBoot, 49), false);
 	});
 });
 
@@ -252,7 +250,8 @@ describe('openOwnOriginRecoveryEpoch', () => {
 		};
 		return { dbisDB, auditStore, syncs: () => syncs };
 	}
-	const settled = { after: 5, lastKey: 10, before: NOW, requiredPeers: ['peer'], bootId: 'boot-a', finished: true };
+	// the fake log is empty, so an epoch it can continue recorded nothing held
+	const settled = { after: 5, lastKey: 0, before: NOW, requiredPeers: ['peer'], bootId: 'boot-a', finished: true };
 
 	it('leaves the previous epoch in force on the same boot: nothing written and nothing synced', () => {
 		const { dbisDB, auditStore, syncs } = stores(settled);
@@ -282,6 +281,11 @@ describe('openOwnOriginRecoveryEpoch', () => {
 			{ ...settled, bootId: undefined },
 		],
 		['no previous epoch', { bootId: 'boot-a', syncFailure: false }, undefined],
+		[
+			'a log holding less than when the epoch opened',
+			{ bootId: 'boot-a', syncFailure: false },
+			{ ...settled, lastKey: 10 },
+		],
 	]) {
 		it(`opens a new epoch, recording the boot, after ${label}`, async () => {
 			const { dbisDB, auditStore, syncs } = stores(previous);

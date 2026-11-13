@@ -51,12 +51,21 @@ export interface StartContinuity {
 	syncFailure: boolean;
 }
 
-/** The previous epoch still covers this start when the OS kept its page cache, so no own write was lost since. */
+/**
+ * The previous epoch still covers this start when the OS kept its page cache, so no own write was lost since;
+ * a log holding less than it did when that epoch opened says otherwise, whatever the boot.
+ */
 export function continuesEpoch(
 	previous: OwnOriginEpoch | undefined,
-	continuity: StartContinuity
+	continuity: StartContinuity,
+	held: number
 ): previous is OwnOriginEpoch {
-	return !continuity.syncFailure && continuity.bootId !== undefined && previous?.bootId === continuity.bootId;
+	return (
+		!continuity.syncFailure &&
+		continuity.bootId !== undefined &&
+		previous?.bootId === continuity.bootId &&
+		held >= previous.lastKey
+	);
 }
 
 export interface OwnOriginReport {
@@ -146,7 +155,17 @@ export function openOwnOriginRecoveryEpoch(
 	if (!dbisDB || typeof rootStore?.getMonotonicTimestamp !== 'function' || typeof rootStore.syncWal !== 'function')
 		throw new Error(`${database} has per-origin logs but no store to record a recovery epoch in`);
 	const previous = readEpoch(dbisDB);
-	if (continuesEpoch(previous, continuity)) {
+	let lastKey: number | undefined;
+	let purgeBound: number | undefined;
+	let logRead = true;
+	try {
+		lastKey = findLastCommittedLogKey(auditStore, 'local') || undefined;
+		purgeBound = getLogPurgeBounds(auditStore, 'local')?.get('local');
+	} catch (error) {
+		logRead = false;
+		logger.warn?.(`Own-origin recovery: could not read ${database}'s log; asking peers for all of it`, error);
+	}
+	if (logRead && continuesEpoch(previous, continuity, Math.max(lastKey ?? 0, purgeBound ?? 0))) {
 		logger.info?.(
 			`Own-origin recovery for ${database}: the OS has not restarted since ${new Date(previous.before).toISOString()}, so this node's own log is intact`
 		);
@@ -154,19 +173,9 @@ export function openOwnOriginRecoveryEpoch(
 	}
 	const before = rootStore.getMonotonicTimestamp();
 	const requiredPeers = peersWithCursors(dbisDB, auditStore);
-	let epoch: OwnOriginEpoch;
-	try {
-		epoch = nextEpoch(
-			findLastCommittedLogKey(auditStore, 'local') || undefined,
-			getLogPurgeBounds(auditStore, 'local')?.get('local'),
-			previous,
-			before,
-			requiredPeers
-		);
-	} catch (error) {
-		logger.warn?.(`Own-origin recovery: could not read ${database}'s log; asking peers for all of it`, error);
-		epoch = { after: MIN_START, lastKey: 0, before, requiredPeers };
-	}
+	const epoch: OwnOriginEpoch = logRead
+		? nextEpoch(lastKey, purgeBound, previous, before, requiredPeers)
+		: { after: MIN_START, lastKey: 0, before, requiredPeers };
 	if (continuity.bootId !== undefined) epoch.bootId = continuity.bootId;
 	dbisDB.putSync(EPOCH, epoch);
 	cachedEpochs.delete(database);
@@ -239,7 +248,10 @@ async function recordReport(database: string, peer: string, report: OwnOriginRep
 }
 
 // the epoch row is fixed once workers run, and a clean report is never replaced within its epoch
-const cachedEpochs = new Map<string, { epoch: OwnOriginEpoch; clean: Set<string>; provenFor?: readonly string[] }>();
+const cachedEpochs = new Map<
+	string,
+	{ epoch: OwnOriginEpoch; clean: Set<string>; provenFor?: readonly string[] } | null
+>();
 
 /**
  * Whether this node's own history is proven at `position` (null: anywhere, for a grant whose lineage the
@@ -258,10 +270,15 @@ export function ownLineage(
 	if (failedDatabases.has(database))
 		return { state: 'unprovable', detail: 'its recovery epoch could not be recorded at startup' };
 	let cached = cachedEpochs.get(database);
+	if (cached === null) return { state: 'intact' };
 	if (!cached) {
-		const epoch = readEpoch(dbisFor(database));
-		// a database created since this start has no epoch and nothing to have lost
-		if (!epoch) return { state: 'intact' };
+		const dbisDB = dbisFor(database);
+		const epoch = readEpoch(dbisDB);
+		if (!epoch) {
+			// a database created since this start has no epoch and nothing to have lost; epochs open only at startup
+			if (dbisDB) cachedEpochs.set(database, null);
+			return { state: 'intact' };
+		}
 		cached = { epoch, clean: new Set() };
 		cachedEpochs.set(database, cached);
 	}
