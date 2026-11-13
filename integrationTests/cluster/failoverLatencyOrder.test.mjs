@@ -3,8 +3,8 @@
  * (harper-pro#1291).
  *
  * Four nodes, names sorted n1 < n2 < n3 < n4. On n2, `regionNetworkInjector.mjs` delays pings to and messages from n4
- * by 40 ms and n1 by 2 ms, so n2 measures n1 as nearest. First n1's links to n3 and n4 are cut, so n1 fails n3 over to
- * n2 (its only live peer). Then n2's link to n3 is cut: n2 must follow the shared ring order after n3 and fail n3 over
+ * by 40 ms and n1 by 2 ms, so n2 measures n1 as nearest. First n1's links to n4 and then n3 are cut, so n1 fails n3 over
+ * to n2 (its only live peer). Then n2's link to n3 is cut: n2 must follow the shared ring order after n3 and fail n3 over
  * to n4 rather than back to the nearer n1, and a write at n3 must reach both n2 and n1.
  */
 import { suite, test, before, after } from 'node:test';
@@ -12,12 +12,18 @@ import assert from 'node:assert';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, waitForCondition, stopAndTeardownNodes, logMark, readLogSince } from './clusterShared.mjs';
+import { waitForCopiesSettled } from './regionTopologyShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
 const INJECTOR = join(import.meta.dirname, 'regionNetworkInjector.mjs');
+// A failover socket excludes its peer, so it carries no base copy: it is refused while this node's copy from the cut
+// node is unfinished, or while its start sits below the peer's own base copy, which a certified floor lifts it above.
+// Every origin certifies one at this interval (30 s by default).
+const FLOOR_INTERVAL_MS = 1000;
 
 suite('Failover ring order avoids a latency cycle', { timeout: 600_000 }, (ctx) => {
 	let workDir;
@@ -48,6 +54,7 @@ suite('Failover ring order avoids a latency cycle', { timeout: 600_000 }, (ctx) 
 					},
 					env: {
 						HARPER_NO_FLUSH_ON_EXIT: true,
+						HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS: String(FLOOR_INTERVAL_MS),
 						HARPER_TEST_PARTITION_FILE: join(workDir, `partition-${hostname}`),
 						...(hostname === n2 && {
 							HARPER_TEST_PEER_LATENCY_MS: JSON.stringify({ [n1]: 2, [n4]: 40 }),
@@ -118,10 +125,20 @@ suite('Failover ring order avoids a latency cycle', { timeout: 600_000 }, (ctx) 
 				description: 'n1 and n2 hold live links to every peer and n2 has measured n4 above 30 ms',
 			}
 		);
+		await waitForCopiesSettled(nodes(), 'formation copies');
+		// no operation reports a certified floor
+		await delay(10 * FLOOR_INTERVAL_MS);
+		// n4 first: cut together, n1 can fail n3 over to n4 before it sees n4 down, and then n4 over to n2
+		const mark0 = await logMark(n1);
+		await writeFile(join(workDir, `partition-${n1.hostname}`), JSON.stringify([n4.hostname]));
+		await writeFile(join(workDir, `partition-${n4.hostname}`), JSON.stringify([n1.hostname]));
+		await waitForCondition(
+			async () => (await readLogSince(n1, mark0)).includes(`Failing over data from ${n4.hostname} to ${n2.hostname}`),
+			{ timeoutMs: 60_000, description: 'n1 fails n4 over to n2 once n4 is cut' }
+		);
 		const mark1 = await logMark(n1);
 		await writeFile(join(workDir, `partition-${n1.hostname}`), JSON.stringify([n3.hostname, n4.hostname]));
 		await writeFile(join(workDir, `partition-${n3.hostname}`), JSON.stringify([n1.hostname]));
-		await writeFile(join(workDir, `partition-${n4.hostname}`), JSON.stringify([n1.hostname]));
 		await waitForCondition(
 			async () => (await readLogSince(n1, mark1)).includes(`Failing over data from ${n3.hostname} to ${n2.hostname}`),
 			{ timeoutMs: 60_000, description: 'n1 fails n3 over to n2 once n3 and n4 are cut' }
