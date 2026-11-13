@@ -148,6 +148,16 @@ describe('advanceDurableFloor', () => {
 		assert.strictEqual(state.bound, 500);
 		assert.strictEqual(advanceDurableFloor(state, 600, stats), 600);
 	});
+	it('raises a pending sample when the floor rises over an unchanged log, and skips one already covered', () => {
+		const state = freshState();
+		const pending = { nextLogPosition: position(1, 50), lastFlushedPosition: position(1, 10) };
+		advanceDurableFloor(state, 100, pending);
+		advanceDurableFloor(state, 150, pending);
+		assert.deepStrictEqual(state.samples, [{ floor: 150, position: position(1, 50) }]);
+		const flushed = { nextLogPosition: position(1, 50), lastFlushedPosition: position(1, 50) };
+		assert.strictEqual(advanceDurableFloor(state, 160, flushed), 160);
+		assert.strictEqual(advanceDurableFloor(state, 170, flushed), undefined, 'an idle, flushed log is not rewritten');
+	});
 	it('ignores unreadable positions', () => {
 		const state = freshState();
 		assert.strictEqual(advanceDurableFloor(state, 100, undefined), undefined);
@@ -195,6 +205,12 @@ describe('vouchesForEarlierLog', () => {
 		const first = { nextLogPosition: position(1, 400), lastFlushedPosition: position(1, 100) };
 		assert.strictEqual(vouchesForEarlierLog({ bootId: 'boot-a', vouched: false }, sameBoot, first), true);
 		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, { bootId: 'boot-a', syncFailure: true }, first), false);
+	});
+	it('stays unvouched after a sync failure recorded earlier on this boot, even in the first segment', () => {
+		const first = { nextLogPosition: position(1, 400), lastFlushedPosition: position(1, 100) };
+		const failedOnA = { bootId: 'boot-a', vouched: false, syncFailure: true };
+		assert.strictEqual(vouchesForEarlierLog(failedOnA, sameBoot, first), false);
+		assert.strictEqual(vouchesForEarlierLog(failedOnA, { bootId: 'boot-b', syncFailure: false }, first), true);
 	});
 	it('vouches for a log with no flushed position yet only while it has just its first segment', () => {
 		const fresh = { nextLogPosition: position(1, 400), lastFlushedPosition: position(0, 0) };
@@ -259,6 +275,21 @@ describe('openOwnOriginRecoveryEpoch records its log vouch', () => {
 		);
 		assert.deepStrictEqual(rows.get(LOG_VOUCH), { bootId: 'boot-a', vouched: false });
 	});
+	it('carries a sync failure forward on the same boot after the marker is cleared', async () => {
+		const rows = new Map([[LOG_VOUCH, { bootId: 'boot-a', vouched: false, syncFailure: true }]]);
+		const { dbisDB, auditStore } = stores(rows, {
+			nextLogPosition: position(1, 10),
+			lastFlushedPosition: position(1, 10),
+		});
+		await openOwnOriginRecoveryEpoch(
+			'sync-failure-row-db',
+			auditStore,
+			dbisDB,
+			{ bootId: 'boot-a', syncFailure: false },
+			() => []
+		);
+		assert.deepStrictEqual(rows.get(LOG_VOUCH), { bootId: 'boot-a', vouched: false, syncFailure: true });
+	});
 });
 
 describe('a durable floor on a real rocksdb-js log', () => {
@@ -291,18 +322,19 @@ describe('a durable floor on a real rocksdb-js log', () => {
 		assert.strictEqual(
 			advanceDurableFloor(state, NOW + 4, log.getStats()),
 			undefined,
-			'nothing appended since NOW + 3 was sampled, and nothing flushed'
+			'nothing flushed since NOW + 3 was sampled'
 		);
 		await db.flush();
 		assert.strictEqual(
 			advanceDurableFloor(state, NOW + 5, log.getStats()),
-			NOW + 3,
-			'a floor over an unchanged log is not sampled'
+			NOW + 5,
+			'a pending sample over an unchanged log takes the higher floor'
 		);
 		await append('d');
 		assert.strictEqual(advanceDurableFloor(state, NOW + 6, log.getStats()), undefined);
+		assert.strictEqual(advanceDurableFloor(state, NOW + 6.5, log.getStats()), undefined);
 		await db.flush();
-		assert.strictEqual(advanceDurableFloor(state, NOW + 7, log.getStats()), NOW + 6);
+		assert.strictEqual(advanceDurableFloor(state, NOW + 7, log.getStats()), NOW + 7);
 	});
 });
 

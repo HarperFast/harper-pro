@@ -423,13 +423,17 @@ export function advanceDurableFloor(state: DurableFloorState, floor: number, sta
 	const flushed = stats?.lastFlushedPosition;
 	if (!isLogPosition(next) || !isLogPosition(flushed)) return;
 	let samples = state.samples;
-	// over an unchanged log a newer floor proves nothing that matters: the window never starts above the overlap
-	const appended = !state.sampledAt || compareLogPositions(next, state.sampledAt) !== 0;
-	if (appended && isValidFloor(floor) && floor > state.bound && floor > (samples.at(-1)?.floor ?? 0)) {
-		// thinned rather than shifted: the oldest samples are the first a flush covers
-		if (samples.length >= MAX_FLOOR_SAMPLES) samples = state.samples = samples.filter((_, index) => index % 2 === 0);
-		samples.push({ floor, position: next });
-		state.sampledAt = next;
+	if (isValidFloor(floor) && floor > state.bound && floor > (samples.at(-1)?.floor ?? 0)) {
+		const last = samples.at(-1);
+		// a higher floor over an unchanged log raises its pending sample; once covered, it would only rewrite the row
+		if (state.sampledAt && compareLogPositions(next, state.sampledAt) === 0) {
+			if (last && compareLogPositions(last.position, next) === 0) last.floor = floor;
+		} else {
+			// thinned rather than shifted: the oldest samples are the first a flush covers
+			if (samples.length >= MAX_FLOOR_SAMPLES) samples = state.samples = samples.filter((_, index) => index % 2 === 0);
+			samples.push({ floor, position: next });
+			state.sampledAt = next;
+		}
 	}
 	let covered = 0;
 	while (covered < samples.length && compareLogPositions(samples[covered].position, flushed) <= 0) covered++;
@@ -444,6 +448,8 @@ export function advanceDurableFloor(state: DurableFloorState, floor: number, sta
 export interface LogVouch {
 	bootId?: string;
 	vouched: boolean;
+	/** A sync failure was recorded on this boot: a page that failed writeback can be marked clean and never written. */
+	syncFailure?: boolean;
 }
 
 /**
@@ -452,8 +458,7 @@ export interface LogVouch {
  * reopens stay unsynced while `lastFlushedPosition` passes them. After a reboot whatever survived is on disk. On
  * the same boot, a start that could not vouch taints every later start until a reboot; otherwise a log whose
  * flushed position is already in the segment it appends to (or that has only its first segment) has no such bytes
- * elsewhere. A sync failure since the last start on this boot vouches for nothing: a page that failed writeback
- * can be marked clean.
+ * elsewhere. A sync failure on this boot vouches for nothing, whatever the segment.
  */
 export function vouchesForEarlierLog(
 	recorded: LogVouch | undefined,
@@ -462,7 +467,7 @@ export function vouchesForEarlierLog(
 ): boolean {
 	if (recorded?.bootId !== undefined && continuity.bootId !== undefined && recorded.bootId !== continuity.bootId)
 		return true;
-	if (continuity.syncFailure) return false;
+	if (continuity.syncFailure || recorded?.syncFailure) return false;
 	const flushed = stats?.lastFlushedPosition;
 	const next = stats?.nextLogPosition;
 	if (!isLogPosition(flushed) || !isLogPosition(next)) return false;
@@ -481,6 +486,7 @@ function recordLogVouch(
 	stats: LogStats | undefined
 ): void {
 	let vouched = false;
+	let syncFailure = continuity.syncFailure;
 	try {
 		const row = dbisDB.getSync(LOG_VOUCH);
 		const recorded: LogVouch | undefined =
@@ -490,12 +496,16 @@ function recordLogVouch(
 					? { bootId: previous.bootId, vouched: true }
 					: undefined;
 		vouched = vouchesForEarlierLog(recorded, continuity, stats);
+		const rebooted =
+			recorded?.bootId !== undefined && continuity.bootId !== undefined && recorded.bootId !== continuity.bootId;
+		if (!rebooted && recorded?.syncFailure) syncFailure = true;
 	} catch (error) {
 		logger.warn?.(`Own-origin recovery: could not read ${database}'s log vouch`, error);
 	}
 	vouchedDatabases.set(database, vouched);
 	const row: LogVouch = { vouched };
 	if (continuity.bootId !== undefined) row.bootId = continuity.bootId;
+	if (syncFailure) row.syncFailure = true;
 	if (!writeLogVouch(database, dbisDB, row)) unrecordedVouches.set(database, row);
 }
 
