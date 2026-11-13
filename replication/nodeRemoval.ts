@@ -131,20 +131,22 @@ function requiredPeers(database: string, thisNode: string): { peers: string[]; s
  * Fence (the default), finalize or cancel this node's removal. Idempotent: a repeat call returns the persisted
  * epoch and targets, and fences any database created since under the same epoch.
  */
-export async function removeNodeFence(request: any): Promise<FenceState | { cancelled: true }> {
+export async function removeNodeFence(
+	request: any,
+	lockDeadline = performance.now() + CALL_TIMEOUT_MS
+): Promise<FenceState | { cancelled: true }> {
 	authorize(request, FENCE_OPERATION);
 	const thisNode = getThisNodeName();
 	if (request.node !== thisNode)
 		throw new ClientError(`${FENCE_OPERATION} names node '${request.node}', but this node is '${thisNode}'`, 400);
 	// a cancel and a finalize each decide from the persisted state, so they must not interleave
-	return withFenceLock(() => changeFence(request, thisNode));
+	return withFenceLock(() => changeFence(request, thisNode), lockDeadline);
 }
 
 const FENCE_LOCK_KEY = [Symbol.for('remove-node-fence')];
 
-async function withFenceLock<T>(work: () => Promise<T>): Promise<T> {
+async function withFenceLock<T>(work: () => Promise<T>, deadline = performance.now() + CALL_TIMEOUT_MS): Promise<T> {
 	const store = getHDBNodeTable().primaryStore;
-	const deadline = performance.now() + CALL_TIMEOUT_MS;
 	while (!store.tryLock(FENCE_LOCK_KEY)) {
 		if (performance.now() > deadline)
 			throw new ServerError(`Timed out waiting for another ${FENCE_OPERATION} on this node to finish`, 503);
@@ -159,8 +161,15 @@ async function withFenceLock<T>(work: () => Promise<T>): Promise<T> {
 
 async function changeFence(request: any, thisNode: string): Promise<FenceState | { cancelled: true }> {
 	const roots = databaseRoots();
-	for (const [database, auditStores] of roots)
+	for (const [database, auditStores] of roots) {
+		// replication sends and certifies floors for one root per database; another root's writes have no receipt
+		if (auditStores.length > 1)
+			throw new ClientError(
+				`Database ${database} keeps its tables in more than one storage root, so its writes cannot be drained before removal; use force: true to remove without draining`,
+				400
+			);
 		for (const auditStore of auditStores) assertDrainable(database, auditStore);
+	}
 	const fences = [...roots.values()].flat().map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
 	const wasRemoving = fences.some((fence) => fence.state === 'removing');
 	if (request.cancel) {
@@ -368,8 +377,9 @@ export async function drainNode(
 		if (remaining() <= MIN_CALL_MS) throw new OutOfBudget();
 		if (target === thisNode) {
 			const request = { ...operation, hdb_user: { name: thisNode, role: { permission: { super_user: true } } } };
-			const local =
-				operation.operation === FENCE_OPERATION ? removeNodeFence(request) : getReceivedOriginFloors(request);
+			// a fence change that won the lock runs to completion: abandoning it could persist a state after the 504
+			if (operation.operation === FENCE_OPERATION) return removeNodeFence(request, deadline);
+			const local = getReceivedOriginFloors(request);
 			let timer: ReturnType<typeof setTimeout>;
 			const deadlinePassed = new Promise<never>((_, reject) => {
 				timer = setTimeout(() => reject(new OutOfBudget()), remaining());
@@ -440,12 +450,21 @@ export async function drainNode(
 			break;
 		}
 		// every peer it sends a replicated database to said it does not subscribe: its writes there exist only on it
-		for (const [database, drain] of Object.entries(fence.databases))
-			if (drain.peers.length > 0 && notSubscribed[database] === drain.peers.length)
-				throw new ClientError(
-					`No peer of ${name} receives database ${database} from it, so its writes there exist only on ${name}; use force: true to remove it anyway`,
-					409
+		const unreceived = Object.entries(fence.databases).find(
+			([database, drain]) => drain.peers.length > 0 && notSubscribed[database] === drain.peers.length
+		)?.[0];
+		if (unreceived) {
+			let lifted = '';
+			if (fence.state !== 'removing')
+				lifted = await call(name, record, { operation: FENCE_OPERATION, node: name, cancel: true }).then(
+					() => `; ${name} accepts local writes again`,
+					(error) => `; ${name} is still fenced (${errorText(error)}): remove_node with cancel: true lifts it`
 				);
+			throw new ClientError(
+				`No peer of ${name} receives database ${unreceived} from it, so its writes there exist only on ${name}; use force: true to remove it anyway${lifted}`,
+				409
+			);
+		}
 		shortfalls = round;
 		if (shortfalls.length === 0) {
 			try {

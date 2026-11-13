@@ -128,8 +128,10 @@ The wait has a limit (`timeout`, five minutes by default). When it runs out, the
 
 - the node cannot be reached (it keeps retrying until `timeout`, since a restarting node is briefly unreachable),
 - the node runs a version that cannot fence its writes,
-- the node is the only owner of a shard in a database's [shard map](./residency.md#installed-maps), so its records exist nowhere else, or
-- a database is stored on LMDB, which keeps no origin floors to confirm delivery with.
+- the node is the only owner of a shard in a database's [shard map](./residency.md#installed-maps), so its records exist nowhere else,
+- a database is stored on LMDB, which keeps no origin floors to confirm delivery with,
+- a database keeps its tables in more than one storage root (per-table `path`), or
+- no peer the node sends a database to subscribes to it, so its writes there exist only on that node (the node accepts local writes again when this is refused).
 
 `force: true` removes the node without fencing or waiting. Writes that only that node held are lost. Use it for a node that is permanently down.
 

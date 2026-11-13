@@ -179,10 +179,15 @@ describe('drainNode', () => {
 			(error) => {
 				assert.equal(error.statusCode, 409);
 				assert.match(error.message, /No peer of leaving receives database data/);
+				assert.match(error.message, /leaving accepts local writes again/);
 				return true;
 			}
 		);
 		assert.ok(!send.calls.some(({ operation }) => operation.finalize));
+		assert.ok(
+			send.calls.some(({ operation }) => operation.cancel === true),
+			'the refused drain lifts its fence'
+		);
 	});
 
 	it('never calls a peer with less than a usable budget left, keeping the last complete round', async () => {
