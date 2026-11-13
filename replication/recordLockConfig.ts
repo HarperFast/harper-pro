@@ -1,3 +1,4 @@
+import { isMainThread } from 'node:worker_threads';
 import { getConfigObj } from '../core/config/configUtils.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -45,4 +46,45 @@ if (configured === true) {
 		);
 	}
 }
-export const CLUSTER_RECORD_LOCKS_ENABLED: boolean = configured === true && engineSupported;
+export const RECORD_LOCKS_CONFIGURED: boolean = configured === true && engineSupported;
+/**
+ * False until `admitClusterRecordLocks` runs at a replication startup hook, after the catalog has
+ * loaded: `storage.engine` only picks the engine of a database created from now on, so an `.mdb`
+ * database kept by an in-place upgrade from v4 still opens on LMDB.
+ */
+export let CLUSTER_RECORD_LOCKS_ENABLED = false;
+export let RECORD_LOCKS_REFUSAL: string | undefined;
+let admitted = false;
+
+export const RECORD_LOCKS_LMDB_REFUSAL =
+	"cluster record locks are off on this node: replication.recordLocks is true, but some replicated databases on this node are opened on LMDB, which record locks do not support (the node log names them); migrate them to RocksDB (storage.migrateOnStart) and restart, or lock with { scope: 'node' } for a node-local lock";
+
+export function recordLockAdmission(
+	configuredOn: boolean,
+	lmdbDatabases: readonly string[]
+): { enabled: boolean; refusal?: string } {
+	if (!configuredOn) return { enabled: false };
+	return lmdbDatabases.length > 0 ? { enabled: false, refusal: RECORD_LOCKS_LMDB_REFUSAL } : { enabled: true };
+}
+
+/**
+ * Decides `CLUSTER_RECORD_LOCKS_ENABLED` once per thread, from the replicated databases this thread
+ * opened on LMDB. Every thread opens the same roots after `storage.migrateOnStart`, so they agree. A
+ * root created later uses the configured engine, which `RECORD_LOCKS_CONFIGURED` requires to be
+ * RocksDB; an LMDB database that only becomes replicated later is refused on its own by
+ * `ensureRecordLockTransport`. Lists them only when config allows, so the default path walks no catalog.
+ * Returns whether this call admitted them.
+ */
+export function admitClusterRecordLocks(listLmdbDatabases: () => readonly string[]): boolean {
+	if (admitted || !RECORD_LOCKS_CONFIGURED) return false;
+	const lmdbDatabases = listLmdbDatabases();
+	admitted = true;
+	const { enabled, refusal } = recordLockAdmission(RECORD_LOCKS_CONFIGURED, lmdbDatabases);
+	RECORD_LOCKS_REFUSAL = refusal;
+	if (refusal && isMainThread)
+		logger.error?.(
+			`replication.recordLocks requires every replicated database to be on RocksDB; cluster record locks stay disabled because these are opened on LMDB: ${lmdbDatabases.join(', ')}. A node upgraded in place from v4 keeps its existing .mdb databases on LMDB whatever storage.engine says; migrate them with storage.migrateOnStart and restart`
+		);
+	CLUSTER_RECORD_LOCKS_ENABLED = enabled;
+	return enabled;
+}
