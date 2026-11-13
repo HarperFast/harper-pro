@@ -492,21 +492,23 @@ Cluster record locks need the RocksDB storage engine. On LMDB `lock()` is not av
 
 <VersionBadge version="v5.5.0" />
 
-A locked commit does not wait for replication. If the holder's node loses power before the write reaches a peer, the write can be lost. Once that node restarts, the next holder of the key can be admitted without it. To make locked commits wait for peers, set [`replication.recordLockConfirmation`](../configuration/options.md#replication):
+With cluster record locks on, a commit made under a cluster lock waits for one peer to confirm it. RocksDB commits do not wait for the local disk, so without that wait a holder whose node loses power before the write reaches a peer could lose the write, and once that node restarts the next holder could be admitted without it. [`replication.recordLockConfirmation`](../configuration/options.md#replication) sets the count:
 
 ```yaml
 replication:
   recordLocks: true
-  recordLockConfirmation: 1
-  confirmationTimeout: 30000
+  recordLockConfirmation: 1 # the default while recordLocks is true; 0 commits locked writes without waiting
 ```
 
-- **When it applies:** a commit waits when its transaction holds a cluster lock on a table in the database it writes, or writes through a held lock (`hold: true`). A lock in one database doesn't make writes to another database wait. A node-scoped lock never does.
+- **When it applies:** a commit waits when its transaction holds a cluster lock on a table in the database it writes, or writes through a held lock (`hold: true`). A lock in one database doesn't make writes to another database wait. A node-scoped lock never does, and neither do writes made without a lock.
 - **How many:** at least this many peers, or the write's own count if that is larger (including the [`replication.confirmation`](./sharding.md#default-confirmation-count) default). An explicit `0` doesn't lower it.
-- **Rules:** peers are counted, refused and timed out as for an [explicit count](./sharding.md#replication-control-via-rest-header), using `confirmationTimeout`.
-- **The lock is not held longer:** it is released when the commit lands on this node, before the wait, as without the setting.
+- **No peer connected:** when this node is not sending the database to enough connected peers, the commit is refused with `503` before anything is written, and the lock is released. Retry once a peer reconnects. A node that replicates the database to fewer peers than the count, a single-node cluster included, refuses it with `400`; set `recordLockConfirmation: 0` there.
+- **A peer drops during the wait:** the wait ends once the peers that could confirm it have not been heard from for `pingTimeout`, or at `confirmationTimeout` at the latest. The `504` says the write committed on this node but was not confirmed.
+- **An explicit count that meets the minimum** (`X-Replicate-To: *;confirm=<k>` or `replicatedConfirmation`) keeps its own rules: it is [refused or timed out](./sharding.md#replication-control-via-rest-header) as without locks, and waits up to `confirmationTimeout` while its peers are down.
+- **The lock is not held longer:** it is released when the commit lands on this node, before the wait.
 - **When confirmation fails,** the error carries `replicationUnconfirmed: true` and `retryable: false` ([details](./sharding.md#confirmation-failure-after-a-local-commit)). The write is committed on this node. A transaction's lock is already released, so the next holder can have it and may already see the write. A `hold: true` lock stays held until `unlock()` or its lease either way.
-- **Limits:** confirmation means the peers acknowledged replication past the write. It is not a quorum, and it doesn't change how the next holder is admitted.
+- **Limits:** confirmation means a peer acknowledged replication past the write. It is not a quorum: in a cluster of three or more, the next holder can be admitted through a peer that did not confirm. A power loss between the local commit and the acknowledgment can still lose the write, and the caller then sees no success.
+- **Cost:** each locked commit waits one replication round trip.
 - The value is read at startup, so restart a node after changing it.
 
 ## Inspecting Cluster Configuration
