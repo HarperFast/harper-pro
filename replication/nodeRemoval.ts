@@ -324,7 +324,6 @@ export async function getReceivedOriginFloors(request: any): Promise<Record<stri
 	return answers;
 }
 
-/** Why a peer's answer does not yet prove it holds every write the drain covers, or undefined when it does. */
 export function receiptShortfall(answer: ReceivedFloor | undefined, drain: DatabaseDrain): string | undefined {
 	if (!answer || !isValidFloor(answer.closedFloor)) return 'has recorded no certified floor for it';
 	if (answer.floorRevoked) return 'had its floor for it revoked';
@@ -352,7 +351,6 @@ function unsupportedOperation(error: unknown): boolean {
 	).test(message);
 }
 
-/** A refusal (bad request, conflict, permission) rather than a node that could not be reached or did not answer. */
 function isRefusal(error: any): boolean {
 	return (error?.statusCode >= 400 && error.statusCode < 500) || /^ClientError\b/.test(String(error?.message ?? ''));
 }

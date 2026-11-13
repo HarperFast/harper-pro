@@ -211,6 +211,16 @@ describe('drainNode', () => {
 		);
 	});
 
+	it('times out on time when looking up a peer stalls', async () => {
+		const send = transport(() => fence());
+		const started = performance.now();
+		await assert.rejects(
+			drainNode('leaving', { name: 'leaving' }, 1000, send, () => new Promise(() => {})),
+			(error) => error.statusCode === 504
+		);
+		assert.ok(performance.now() - started < 3000, `took ${performance.now() - started}ms`);
+	});
+
 	it('removes a node with no database but system without a finalize', async () => {
 		const send = transport(() => ({ node: 'leaving', epoch: 'e1', state: 'fenced', databases: {} }));
 		const result = await drainNode('leaving', {}, 5000, send, async () => ({}));
