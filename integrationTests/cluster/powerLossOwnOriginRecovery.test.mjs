@@ -138,6 +138,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		await cp(ownLogDir(nodeA), join(snapshotDir, 'local'), { recursive: true });
 		baseline.logFiles = await fileSizes(join(snapshotDir, 'local'));
 		baseline.tableFiles = await tableFiles(nodeA);
+		assert.ok((await readdir(dataDbDir(nodeA))).includes('LOG'), 'the flush check reads RocksDB info LOG');
 		baseline.flushes = await flushesStarted(nodeA);
 
 		await upsertConfirmed(nodeA, { id: 'ins', n: 1 });
@@ -213,13 +214,14 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		if (!nodeA) return t.skip('RocksDB only');
 		assert.ok(simulated, 'runs only after the power-loss simulation test passed');
 		// lockKey is homed on B, whose last grant was to A for the write A lost.
+		const onABefore = (await counter(nodeA, lockKey))?.n;
 		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
 		const onB = await counter(nodeB, lockKey).catch(() => undefined);
 		assert.equal(increment.status, 200, `the lock on A was refused: ${JSON.stringify(increment.body)}`);
 		assert.equal(
 			increment.body.n,
 			2,
-			`the lock on A answered n=${increment.body.n}: admitted without A's lost increment (expected 2); B now reads ${onB?.n}`
+			`the lock on A answered n=${increment.body.n}: admitted without A's lost increment (expected 2); A read ${onABefore} before the lock, B now reads ${onB?.n}`
 		);
 	});
 
