@@ -1007,14 +1007,20 @@ export function parseConfirmationDefault(name: string, raw: unknown): number {
 	throw new Error(`Invalid ${name} ${JSON.stringify(raw)}: expected a non-negative integer`);
 }
 
-// read once per thread at load, so a change takes a restart
-setReplicationConfirmationDefaults({
-	writes: parseConfirmationDefault('replication.confirmation', env.get(CONFIG_PARAMS.REPLICATION_CONFIRMATION)),
-	recordLocks: parseConfirmationDefault(
-		'replication.recordLockConfirmation',
-		env.get(CONFIG_PARAMS.REPLICATION_RECORDLOCKCONFIRMATION)
-	),
-});
+/**
+ * Read once per thread at load, so a change takes a restart. A clone calls it again with the configuration it
+ * installed, since its main thread loaded this module before the leader's configuration was written.
+ */
+export function registerConfirmationDefaults(read: (key: string) => unknown = (key) => env.get(key)): void {
+	setReplicationConfirmationDefaults({
+		writes: parseConfirmationDefault('replication.confirmation', read(CONFIG_PARAMS.REPLICATION_CONFIRMATION)),
+		recordLocks: parseConfirmationDefault(
+			'replication.recordLockConfirmation',
+			read(CONFIG_PARAMS.REPLICATION_RECORDLOCKCONFIRMATION)
+		),
+	});
+}
+registerConfirmationDefaults();
 
 replicationConfirmation(
 	(databaseName, txnTime, confirmationCount, residentPeerLists?: string[][], automatic = false): Promise<void> => {

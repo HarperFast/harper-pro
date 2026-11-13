@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { parseConfirmationDefault } from '#src/replication/knownNodes';
+import { parseConfirmationDefault, registerConfirmationDefaults } from '#src/replication/knownNodes';
 
 describe('replication confirmation defaults', () => {
 	it('reads an absent key as 0', () => {
@@ -20,5 +20,12 @@ describe('replication confirmation defaults', () => {
 				() => parseConfirmationDefault('replication.recordLockConfirmation', raw),
 				/Invalid replication\.recordLockConfirmation .*: expected a non-negative integer/
 			);
+	});
+
+	it('registers the values a clone installs, read through the given source', () => {
+		const installed = { replication_confirmation: 2, replication_recordLockConfirmation: '1' };
+		registerConfirmationDefaults((key) => installed[key]);
+		assert.throws(() => registerConfirmationDefaults(() => -1), /Invalid replication\.confirmation/);
+		registerConfirmationDefaults(() => undefined);
 	});
 });

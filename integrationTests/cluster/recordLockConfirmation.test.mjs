@@ -92,8 +92,7 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 			timeoutMs: CONFIRMATION_TIMEOUT_MS,
 			description: 'the locked write to commit locally',
 		});
-		// The native key goes back at local commit, before the confirmation wait ends. A cluster-scoped lock()
-		// here can depend on B, which is stopped (it answered 504 in CI).
+		// the native key goes back at local commit; a cluster-scoped lock() here would also depend on stopped B
 		assert.equal((await call(a, 'LockOnce/', { id, scope: 'node', timeout: 2_000 })).status, 200);
 		assert.equal(settled, false, 'the locked write was still waiting for confirmation');
 		const result = await writing;
