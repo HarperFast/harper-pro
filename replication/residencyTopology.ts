@@ -162,6 +162,25 @@ function databaseAuditStore(database: string): any {
 	for (const name in tables) if (tables[name].auditStore) return tables[name].auditStore;
 }
 
+/**
+ * How many of `peers` this node is sending `database` to right now: an active sender whose last receipt
+ * is within pingTimeout. Peers in `except` are not counted.
+ */
+export function countSendingTo(
+	database: string,
+	peers: readonly (string | { name: string })[],
+	except?: ReadonlySet<string>
+): number {
+	const store = databaseAuditStore(database);
+	if (!store) return 0;
+	let count = 0;
+	for (const peer of peers) {
+		const name = typeof peer === 'string' ? peer : peer.name;
+		if (!except?.has(name) && residencySenderConnected(store, database, name)) count++;
+	}
+	return count;
+}
+
 function residencySenderConnected(store: any, database: string, peer: string): boolean {
 	const active = Atomics.load(senderState(store, database, peer).status, 1);
 	return active !== 0n && (Date.now() - Number(active & 0xffffffffn)) >>> 0 < PING_TIMEOUT;

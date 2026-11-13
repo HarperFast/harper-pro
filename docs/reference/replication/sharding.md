@@ -69,9 +69,9 @@ X-Replicate-To: 2;confirm=1
 `confirm=N` (and the operation-body and programmatic `replicatedConfirmation: N` below) waits for N peers to acknowledge the commit, not N specific peers. Acknowledgements are counted by peer identity, so one peer never counts twice. Which peers count depends on the storage engine:
 
 - **RocksDB:** a peer counts only for records it is resident for; with no residency (every node holds every record), any N peers count. When the written records have different residents, each set of other residents must reach N on its own. A count larger than this node's replication recipients, or than a written record's reachable residents, is refused before the write lands; see [Confirmation Failure After a Local Commit](#confirmation-failure-after-a-local-commit) for failures after it does.
-- **LMDB:** any N peers that replicate the database count, including peers outside the record's residency that hold only an invalidation entry. A count that can't be met waits out the confirmation timeout instead of being refused.
+- **LMDB:** any N peers that replicate the database count, including peers outside the record's residency that hold only an invalidation entry. A count larger than this node's replication recipients is refused before the write lands.
 
-A count of `0` or less does not wait.
+A count of `0` or less does not wait. <VersionBadge type="changed" version="v5.5.0" /> Neither does a write to a table declared `replicate: false`, which no peer receives; earlier releases waited out the timeout and then reported it unconfirmed.
 
 Specify exact destination nodes by hostname:
 
@@ -149,6 +149,25 @@ Values your code sets on a context apply for every caller, including users witho
 
 On `@sharded` tables, `replicateTo` does not change placement; the database map determines owners. Explicit `replicatedConfirmation` counts acknowledgments from other owners for each affected owner set in the first written database. A local temporary replica cannot satisfy it. See [ownership, reads, and writes](./residency.md#ownership-reads-and-writes).
 
+### Default Confirmation Count
+
+<VersionBadge version="v5.5.0" />
+
+To make writes wait for peer confirmation without changing every write path, set [`replication.confirmation`](../configuration/options.md#replication). Each write that sets no count of its own then waits for that many peers:
+
+```yaml
+replication:
+  confirmation: 1
+  confirmationTimeout: 30000
+```
+
+- **Precedence:** a write's own count (`confirm`, the operation's `replicatedConfirmation`, or `transaction({ replicatedConfirmation })`) is used instead, including `0`, which waits for nothing. Sending a count over REST or the operations API still needs `super_user`, so other callers can't opt out.
+- **Same rules as an explicit count:** peers are counted the same way, including per owner set on `@sharded` tables. The same `confirmationTimeout` applies, and so does the same [failure after a local commit](#confirmation-failure-after-a-local-commit). A count this node can't meet is refused with `400` before the write lands. That includes every write to a database this node replicates to fewer peers than the count, for example on the first node of a new cluster before its peers are added.
+- **Every database:** the default applies to each database a transaction writes. An explicit positive count still covers only the first database, and the default covers the rest. An explicit `0` opts out every database.
+- **Not applied** to the `system` database (users, roles, cluster membership), to writes this node applies from its peers, to crash recovery, to cache fills from a table's source, or to writes that don't replicate (`replicate: false` tables, tables without an audit log).
+- Background writes, such as a component's scheduled jobs, wait like request writes.
+- The value is read at startup, so restart a node after changing it.
+
 ### Confirmation outcomes
 
 <VersionBadge type="changed" version="v5.4.0" />
@@ -181,7 +200,7 @@ The flag covers writes issued to the reported commit, not later application step
 
 Pre-commit refusals, including a confirmation count that cannot be met, do not carry this flag. Its absence does not establish that nothing was written: independent database commits can fail partially. A rejected commit ends its transaction scope; start a fresh transaction for subsequent writes.
 
-Confirmation currently applies to the first database a transaction writes to. This outcome flag covers the linked local commits; it does not enable confirmation for later databases.
+An explicit count applies to the first database a transaction writes to, and [`replication.confirmation`](#default-confirmation-count) to every database. This outcome flag covers the linked local commits; it does not enable confirmation for later databases.
 
 ## Static Sharding
 
