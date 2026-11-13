@@ -1,6 +1,6 @@
 /**
- * Reproduction for harper-pro#1364: a RocksDB node that loses the unsynced tail of its own transaction
- * log (power loss) after those writes replicated does not get them back from its peers.
+ * harper-pro#1364: a RocksDB node that loses the unsynced tail of its own transaction log (power loss)
+ * after those writes replicated gets them back from its peers, and record locks on it wait for that.
  *
  * Fault model. Table writes skip RocksDB's WAL (`openRocksDatabase`, `disableWAL ??= true`), so between
  * memtable flushes the transaction log is the only on-disk record of a commit, and it is appended to the
@@ -13,13 +13,14 @@
  * truncation to a state power loss can leave, not proof that this run's bytes were unsynced. Every other
  * file keeps what was written (the state most favorable to recovery).
  *
- * The expected behavior fails on main, so those two tests are `todo`. They run in the order a fixed
- * node would meet them: a lock right after the reconnect (before any catch-up could hide a stale admit),
- * then convergence within a bounded wait.
+ * The tests run in the order the node meets them: a lock right after the reconnect, then convergence
+ * within a bounded wait. A restarts with its recovery reports held (`HARPER_TEST_HOLD_OWN_ORIGIN_REPORT_DIR`),
+ * so the lock first meets a recovery that is not yet confirmed and must refuse, whatever the rows read.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { cp, mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { cp, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -40,7 +41,6 @@ import {
 	waitForRing,
 } from './recordLockShared.mjs';
 
-const ISSUE = 'harper-pro#1364: a restarted origin does not recover its own lost writes from peers';
 const SETTLE_MS = 30_000;
 
 const dataDbDir = (node) => join(node.dataRootDir, 'database', DB);
@@ -101,6 +101,7 @@ async function readCounters(node, ids) {
 suite('power loss on the origin: own replicated writes come back from peers', { timeout: 900_000 }, (ctx) => {
 	const contexts = [];
 	let snapshotDir;
+	let reportHoldDir;
 	let nodeA;
 	let nodeB;
 	let lockKey;
@@ -135,6 +136,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			{ timeoutMs: 60_000, description: `A's own transaction log to stop growing` }
 		);
 		snapshotDir = await mkdtemp(join(tmpdir(), 'harper-power-loss-snapshot-'));
+		reportHoldDir = await mkdtemp(join(tmpdir(), 'harper-power-loss-report-hold-'));
 		await cp(ownLogDir(nodeA), join(snapshotDir, 'local'), { recursive: true });
 		baseline.logFiles = await fileSizes(join(snapshotDir, 'local'));
 		baseline.tableFiles = await tableFiles(nodeA);
@@ -154,6 +156,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 	after(async () => {
 		for (const c of contexts) await stopNode(c);
 		if (snapshotDir) await rm(snapshotDir, { recursive: true, force: true });
+		if (reportHoldDir) await rm(reportHoldDir, { recursive: true, force: true });
 	});
 
 	test('simulated power loss leaves A without its last writes while B keeps them', async (t) => {
@@ -191,7 +194,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		await rm(ownLogDir(nodeA), { recursive: true, force: true });
 		await cp(join(snapshotDir, 'local'), ownLogDir(nodeA), { recursive: true });
 
-		await restartStoppedNode(contexts[0]);
+		await restartStoppedNode(contexts[0], { HARPER_TEST_HOLD_OWN_ORIGIN_REPORT_DIR: reportHoldDir });
 		nodeA = contexts[0].harper;
 		assert.deepEqual(
 			await readCounters(nodeA, ['ins', 'upd', lockKey]),
@@ -210,10 +213,22 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		simulated = true;
 	});
 
-	test('a lock taken on A after the restart sees the lost write', { todo: ISSUE }, async (t) => {
+	test('a lock taken on A after the restart waits for its recovery and sees the lost write', async (t) => {
 		if (!nodeA) return t.skip('RocksDB only');
 		assert.ok(simulated, 'runs only after the power-loss simulation test passed');
+		await waitForCondition(() => existsSync(join(reportHoldDir, 'held')), {
+			timeoutMs: 60_000,
+			description: `B to return A's writes (A's report parked in ${reportHoldDir})`,
+		});
 		// lockKey is homed on B, whose last grant was to A for the write A lost.
+		const refused = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
+		assert.equal(
+			refused.status,
+			503,
+			`a lock admitted before A's recovery was confirmed: ${JSON.stringify(refused.body)}`
+		);
+		assert.match(JSON.stringify(refused.body), /successor freshness/);
+		await writeFile(join(reportHoldDir, 'release'), '');
 		const onABefore = (await counter(nodeA, lockKey))?.n;
 		t.diagnostic(`A read ${lockKey}=${onABefore} before the lock`);
 		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
@@ -226,7 +241,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		);
 	});
 
-	test('A recovers its own writes from B', { todo: ISSUE }, async (t) => {
+	test('A recovers its own writes from B', async (t) => {
 		if (!nodeA) return t.skip('RocksDB only');
 		assert.ok(simulated, 'runs only after the power-loss simulation test passed');
 		// B -> A delivers B's own writes, so the stream A's lost writes would need is live.

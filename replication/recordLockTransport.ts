@@ -107,6 +107,7 @@ import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } fr
 import { createRestartRecall, type RestartRecallStatus } from './recordLockRestart.ts';
 import { recallDelegationsFromHome, retireDelegateEpoch } from '../core/resources/recordLockCoordinator.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
+import { ownLineage } from './ownOriginRecovery.ts';
 import { ANY_TABLE, everRecloned, forgetPoisonState, isPoisoned, poison, poisonedPairs } from './recordLockPoison.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
 import {
@@ -1018,6 +1019,7 @@ const productionDeps: RecordLockTransportDeps = {
 			tableReplicates: (table) => tableReplicates(database, table),
 			isPoisoned: (origin, table) => isPoisoned(database, origin, table),
 			everRecloned: () => everRecloned(database),
+			ownLineage: (position, homes) => ownLineage(database, position, homes, getThisNodeName()),
 			async requestBarrier(origin, table, nonce, timeoutMs) {
 				const reply = await sendRecordLockOperation(
 					origin,

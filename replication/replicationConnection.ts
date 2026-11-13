@@ -171,6 +171,7 @@ import {
 	recordLockBarrierApplied,
 } from './recordLockTransport.ts';
 import { ANY_TABLE, markReclonedIfLockHistory, poison as poisonRecordLockPair } from './recordLockPoison.ts';
+import { recoveryRangeFor, settleOwnOriginReport } from './ownOriginRecovery.ts';
 import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { requiresLegacyCopyVerification, verifyLegacyCopyBaseline } from './legacyCopy.ts';
@@ -192,6 +193,7 @@ import {
 	createUnknownCommandState,
 	noteUnknownCommand,
 	peerSupportsOriginCursors,
+	peerSupportsOwnOriginRecovery,
 	peerSupportsOriginFloors,
 	peerCertifiesCheckpointFloors,
 	peerSupportsRecordLocks,
@@ -333,6 +335,8 @@ const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; 
 // (e.g. sendSubscriptionRequestUpdate). Sent at initial handshake alongside NODE_NAME, and standalone
 // whenever this node's own active home-map digest for the database changes (on activate).
 const RECORD_LOCK_HOMES_DIGEST = 150;
+// sender -> receiver: the receiver's own-origin recovery range has been sent in full (harper-pro#1364)
+const OWN_ORIGIN_SENT = 151;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -4390,6 +4394,32 @@ export function resolveOriginFloors(
 		if (floor > 0) floors.set(name, floor);
 	}
 	return floors;
+}
+
+export interface OwnOriginRecoveryRange {
+	name: string;
+	startTime: number;
+	endTime: number;
+}
+
+/**
+ * The node subscription naming the receiver itself with a bounded range: its own writes, asked back after a
+ * restart (`ownOriginRecovery.ts`). Only from a receiver that advertised the capability; an older one's
+ * failover self catch-up has the same shape and keeps its old handling.
+ */
+export function findOwnOriginRecoveryRange(
+	nodeSubscriptions: any[],
+	receiver: string | undefined,
+	supported: boolean
+): OwnOriginRecoveryRange | undefined {
+	if (!supported || !receiver) return undefined;
+	return nodeSubscriptions.find(
+		(node) =>
+			node?.name === receiver &&
+			isValidFrameTxnLogKey(node.startTime) &&
+			isValidFrameTxnLogKey(node.endTime) &&
+			node.startTime < node.endTime
+	);
 }
 
 /**
@@ -8893,6 +8923,36 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 						break;
 					}
+					case OWN_ORIGIN_SENT: {
+						const epoch = ownOriginRecoveryRequested;
+						// only the answer to this connection's own request counts, once
+						if (epoch === undefined || data?.epoch !== epoch || !databaseName) break;
+						ownOriginRecoveryRequested = undefined;
+						if (!(await whenSubscriptionResolved())) break;
+						const report = {
+							epoch,
+							...(isValidFrameTxnLogKey(data.purgedThrough) && { purgedThrough: data.purgedThrough }),
+							...(data.failed === true && { failed: true }),
+						};
+						const peer = remoteNodeName;
+						const reportDatabase = databaseName;
+						const rootStore = (auditStore ?? getDatabaseStores().auditStore)?.rootStore;
+						// Queued behind every entry received before it; its commit callback runs once they committed.
+						const barrierEvent: any = {
+							type: 'end_txn',
+							remoteNodeIds: [],
+							txnStream,
+							onCommit() {
+								settleOwnOriginReport(reportDatabase, peer, report, rootStore);
+							},
+						};
+						if (tableSubscriptionToReplicator.send(barrierEvent) === false)
+							logger.warn?.(
+								connectionId,
+								`Own-origin recovery: could not queue ${peer}'s report for ${reportDatabase}; it is asked again on the next subscription`
+							);
+						break;
+					}
 					case COPY_COMPLETE:
 						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
 						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
@@ -9351,6 +9411,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							? data.filter((node) => node.name === getThisNodeName())
 							: data;
 						const excludedNodes: string[] | undefined = restrictedSendingOrigins ? undefined : message[2]; // use the third argument for exclusion list
+						// The receiver's own writes it asks back after a restart: served from that origin's log alone,
+						// never folded into the replay start, retention decision or log choice (harper-pro#1364).
+						const ownOriginRange = excludedNodes
+							? findOwnOriginRecoveryRange(
+									nodeSubscriptions,
+									remoteNodeName,
+									peerCapabilitiesLearned && peerSupportsOwnOriginRecovery(peerCapabilities)
+								)
+							: undefined;
+						let ownOriginRangeSettled = false;
 						const subscriptionSetupRequestId = message[3];
 						let requestedOriginCursors: Record<string, number> | undefined =
 							peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities)
@@ -9378,6 +9448,30 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let originFloorById: number[] | undefined;
 						let liveStartByLog: Map<string, number> | undefined;
 						const frame = new FrameWriter();
+						// Set when the live range was built with the recovery range's own start; a copy's pre-positioned
+						// range anchors that log at its last key instead, so its pass proves nothing about the range.
+						let ownOriginRangeInRange = false;
+						const settleOwnOriginRange = (recovery: OwnOriginRecoveryRange, range: any) => {
+							if (!ownOriginRangeInRange) return;
+							const purgeBound = getLogPurgeBounds(auditStore, recovery.name)?.get(recovery.name);
+							const failed = range?.failedLogs?.size > 0 || range?.corruptFrameStop?.breaks > 0;
+							ws.send(
+								encode([
+									OWN_ORIGIN_SENT,
+									{
+										epoch: recovery.endTime,
+										...(purgeBound > recovery.startTime && { purgedThrough: purgeBound }),
+										...(failed && { failed: true }),
+									},
+								])
+							);
+							logger.debug?.(connectionId, 'returned own-origin writes to', remoteNodeName, databaseName, { failed });
+							// served once: stop reading that log for this subscription
+							if (!excludedNodes.includes(recovery.name)) excludedNodes.push(recovery.name);
+							if (subscribedNodeIds) subscribedNodeIds[getIdOfRemoteNode(recovery.name, auditStore)] = false;
+							auditLogIterable?.removeLog?.(recovery.name);
+							liveStartByLog?.delete(recovery.name);
+						};
 						let skippedMessageSequenceUpdateTimer: ReturnType<typeof setTimeout> | undefined;
 						let copying = false;
 						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
@@ -9995,6 +10089,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 
 							if (closed || wsClosed || restrictedSendingOrigins || excludedNodes === undefined) return;
 
+							// an exclusion cut the recovery range's scan short, so its pass can no longer vouch for it
+							if (ownOriginRange && nodesToExclude.includes(ownOriginRange.name)) ownOriginRangeSettled = true;
 							// Add new excluded nodes (remove their logs from the iterator)
 							for (const nodeName of nodesToExclude) {
 								if (!excludedNodes.includes(nodeName)) {
@@ -10073,7 +10169,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let copyResume:
 							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
-							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
+							if (subscription !== ownOriginRange && subscription.startTime < currentSequenceId)
+								currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
 							// last cursor if several subscriptions carry one — the single-cursor assumption is load-bearing
 							// for the copy loop below (the order-version guard, skip-loop, and copyStartTime anchor all key
@@ -10134,11 +10231,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 								}
 								let subscribedNodeName: string;
-								for (const { name, startTime, endTime } of nodeSubscriptions) {
+								for (const subscription of nodeSubscriptions) {
+									const { name, startTime, endTime } = subscription;
 									const localId = getIdOfRemoteNode(name, auditStore);
 									logger.debug?.('subscription to', name, 'using local id', localId, 'starting', startTime);
 									subscribedNodeIds[localId] = { startTime, endTime };
-									subscribedNodeName = name;
+									if (subscription !== ownOriginRange) subscribedNodeName = name;
 								}
 								// Only a multi-log range reads unlisted origins, and only per-origin logs carry their keys.
 								if (excludedNodes && auditStore.reusableIterable === true) {
@@ -10349,6 +10447,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												floorFromAnotherGeneration(auditStore, ownSubscription.floorGeneration);
 											if (currentSequenceId > 0) {
 												const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+												// the recovery range's log is accounted for in its own report, not by a copy
+												const retentionExcluded =
+													ownOriginRange && excludedNodes ? [...excludedNodes, ownOriginRange.name] : excludedNodes;
 												let oldestRetainedTime: number | undefined;
 												// Mirror the replay scope below (single log, or all non-excluded logs) and take the
 												// first (oldest) entry; getRange yields ascending by audit-log key. Use the same key
@@ -10356,7 +10457,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												for (const entry of auditStore.getRange({
 													start: 1,
 													log: excludedNodes ? undefined : oldestLogName,
-													excludeLogs: excludedNodes,
+													excludeLogs: retentionExcluded,
 													snapshot: false,
 												})) {
 													oldestRetainedTime = entry.txnLogKey;
@@ -10365,7 +10466,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const scopedLogs = purgeBoundLogNames(
 													auditStore,
 													excludedNodes ? undefined : oldestLogName,
-													excludedNodes
+													retentionExcluded
 												);
 												// LMDB has one bound for every name, and an empty scope would drop a prune's bound on every log
 												const purgeScope = scopedLogs?.length ? scopedLogs : [oldestLogName];
@@ -10936,6 +11037,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												[logName, currentSequenceId || 1],
 												...[...(originFloors ?? [])].filter(([name]) => !relabeled?.has(name)),
 											]);
+											if (ownOriginRange && !ownOriginRangeSettled) {
+												liveStartByLog.set(ownOriginRange.name, ownOriginRange.startTime);
+												ownOriginRangeInRange = true;
+											}
 											auditLogIterable = auditStore.getRange({
 												start: currentSequenceId || 1,
 												exclusiveStart: true,
@@ -11009,6 +11114,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												},
 												currentSequenceId
 											);
+										}
+										if (ownOriginRange && !ownOriginRangeSettled && ownOriginRangeInRange) {
+											ownOriginRangeSettled = true;
+											settleOwnOriginRange(ownOriginRange, range);
 										}
 										// Core latches a log's iterator done at a corrupt frame, and a reusable range is kept for the
 										// session, so that log sends nothing more on this connection. Recover by reconnecting: the
@@ -12927,6 +13036,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return localBlob;
 	}
 	let lastSentExcludedNodes: string[] = [];
+	// The recovery epoch this connection's last subscription asked its own writes back for, until answered.
+	let ownOriginRecoveryRequested: number | undefined;
 	function currentOriginCursorVector(
 		recordOptimistic = false,
 		allowedOptimisticNames?: Set<string>
@@ -13565,6 +13676,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				generation: directFloorOnlyGeneration,
 			});
 		}
+		ownOriginRecoveryRequested = undefined;
+		if (
+			nodeSubscriptions?.length &&
+			!restrictedOrigins &&
+			peerCapabilitiesLearned &&
+			peerSupportsOwnOriginRecovery(peerCapabilities)
+		) {
+			const recovery = recoveryRangeFor(dbisDB, remoteNodeName);
+			if (recovery) {
+				const connected = nodeSubscriptions[0];
+				nodeSubscriptions.push({
+					name: getThisNodeName(),
+					replicateByDefault: connected.replicateByDefault,
+					tables: connected.tables,
+					startTime: recovery.startTime,
+					endTime: recovery.endTime,
+				});
+				ownOriginRecoveryRequested = recovery.endTime;
+			}
+		}
 		let excluded: string[];
 		// Build the excluded-origins list for this subscription: our own log, plus the origins the main
 		// thread determined we receive directly with full coverage (subscriptionManager's
@@ -13606,8 +13737,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					pendingSubscriptionSetupRequestId = requestId;
 					subscriptionSetupWatchdog?.arm();
 				}
-				// Track the excluded list we just sent
+				// Track the excluded list we just sent. While the peer returns our own writes, our origin counts as
+				// already excluded, so an exclusion update does not cut that range short.
 				lastSentExcludedNodes = excluded ? [...excluded] : [];
+				if (ownOriginRecoveryRequested !== undefined) lastSentExcludedNodes.push(getThisNodeName());
 			} else {
 				pendingSubscriptionSetupRequestId = undefined;
 				subscriptionSetupWatchdog?.stop();

@@ -13,6 +13,7 @@ import { replicationWorkers } from './replicationWorkers.ts';
 import { isWorkerPoolActive } from '../core/server/threads/workerPools.ts';
 import { setSessionHolderReader } from './recordLockRpc.ts';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
+import { openOwnOriginRecoveryEpoch } from './ownOriginRecovery.ts';
 import {
 	subscribeToNode,
 	urlToNodeName,
@@ -1173,6 +1174,13 @@ export async function startOnMainThread(options) {
 			const table = database[tableName];
 			if (table.auditStore) {
 				selfCatchupOfDatabase.set(dbName, lastTimeInAuditStore(table.auditStore) as number);
+				if (dbName !== 'system') {
+					try {
+						openOwnOriginRecoveryEpoch(dbName, table.auditStore, table.dbisDB);
+					} catch (error) {
+						logger.warn?.(`Own-origin recovery: could not open the recovery epoch of ${dbName}`, error);
+					}
+				}
 				break;
 			}
 		}
