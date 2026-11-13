@@ -293,8 +293,8 @@ async function writeReport(database: string, peer: string, report: OwnOriginRepo
 	if (!dbisDB) throw new Error(`no dbis store for ${database}`);
 	const epoch = readEpoch(dbisDB);
 	if (!epoch || epoch.before !== report.epoch) return;
-	// a later pass that met a purge must not replace a clean report already recorded for this epoch
-	if (cleanReport(readReport(dbisDB, peer), epoch)) return;
+	// a purge only advances, so the first report of an epoch stands: a later one cannot be cleaner
+	if (readReport(dbisDB, peer)?.epoch === epoch.before) return;
 	await dbisDB.put([REPORT, peer], report);
 	if (purgedIntoWindow(report, epoch))
 		logger.warn?.(
@@ -346,7 +346,6 @@ export function ownLineage(
 ): OwnLineage {
 	if (failedDatabases.has(database))
 		return { state: 'unprovable', detail: 'its recovery epoch could not be recorded at startup' };
-	if (table !== undefined && getDatabases()[database]?.[table]?.residency) return { state: 'intact' };
 	let cached = cachedEpochs.get(database);
 	if (cached === null) return { state: 'intact' };
 	if (!cached) {
@@ -362,6 +361,7 @@ export function ownLineage(
 	}
 	const { epoch, clean } = cached;
 	if ((position !== null && position >= epoch.before) || cached.provenFor === homes) return { state: 'intact' };
+	if (table !== undefined && getDatabases()[database]?.[table]?.residency) return { state: 'intact' };
 	const skipping = cached.provenSkipping;
 	if (skipping?.homes === homes) {
 		if (!skipping.skipped.some(memberCheck)) return { state: 'intact' };

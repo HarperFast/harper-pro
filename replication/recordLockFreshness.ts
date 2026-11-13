@@ -397,9 +397,9 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	const pollOwnLineage = () => {
 		ownPoll = undefined;
 		const now = deps.monotonicNow();
-		// callers on the same table, position and homes share one evaluation per poll
+		// every waiting position is below the epoch's start, where own lineage does not depend on it
 		const evaluated = new Map<readonly string[], Map<string, Error | boolean>>();
-		for (const waiter of Array.from(ownWaiters)) {
+		for (const waiter of ownWaiters) {
 			if (now >= waiter.deadlineMono) {
 				try {
 					reject(
@@ -413,7 +413,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			}
 			let byKey = evaluated.get(waiter.homes);
 			if (!byKey) evaluated.set(waiter.homes, (byKey = new Map()));
-			const key = `${waiter.position}\0${waiter.table}`;
+			const key = waiter.table;
 			let outcome = byKey.get(key);
 			if (outcome === undefined) {
 				try {

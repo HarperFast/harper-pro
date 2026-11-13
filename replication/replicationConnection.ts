@@ -8938,7 +8938,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					case OWN_ORIGIN_SENT: {
 						const epoch = ownOriginRecoveryRequested;
 						if (epoch === undefined || data?.epoch !== epoch || !databaseName) break;
-						if (data.request !== undefined && data.request !== ownOriginRecoveryRequestId) break;
+						if (ownOriginRecoveryRequestId !== undefined && data.request !== ownOriginRecoveryRequestId) break;
 						ownOriginRecoveryRequested = undefined;
 						const pass = ownOriginPass;
 						if (!(await whenSubscriptionResolved()) || wsClosed || connectionSuperseded()) break;
@@ -11141,6 +11141,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												: [];
 											for (const auditRecord of recoveryRange) {
 												if (closed || wsClosed) return;
+												if (ownOriginRangeCut) break;
 												const recordTable = tableSubscriptionToReplicator.tableById?.[auditRecord.tableId];
 												if (
 													!returnedByOwnOriginRecovery(
@@ -13810,10 +13811,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				lastSentExcludedNodes = excluded ? [...excluded] : [];
 				if (requestedOwnOrigin !== undefined) {
 					lastSentExcludedNodes.push(getThisNodeName());
-					// a request whose report has not arrived may still be answered, and its skips count against it
+					// without request ids an earlier request's report can still match, so its skips carry over
 					ownOriginPass = {
-						frameSkipped: ownOriginRecoveryRequested !== undefined && ownOriginPass.frameSkipped,
+						frameSkipped:
+							requestId === undefined && ownOriginRecoveryRequested !== undefined && ownOriginPass.frameSkipped,
 					};
+					clearTimeout(ownOriginRetryTimer);
+					ownOriginRetryTimer = undefined;
 				}
 				ownOriginRecoveryRequested = requestedOwnOrigin;
 				ownOriginRecoveryRequestId = requestId;
