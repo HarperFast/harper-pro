@@ -37,8 +37,16 @@ import {
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
+// A fallback link starts the origin at the floor the receiver certified for it, or 60 s below the receiver's position
+// when that is higher. Without a floor the start of a cluster this young sits below a region-mate's formation copy,
+// which a link carrying no base copy is refused at. Every origin certifies one at this interval (30 s by default).
+const FLOOR_INTERVAL_MS = 1000;
 // the main thread reports the fallback link at info
-const OPTIONS = { logLevel: 'info', replicationLogLevel: 'info' };
+const OPTIONS = {
+	logLevel: 'info',
+	replicationLogLevel: 'info',
+	env: { HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS: String(FLOOR_INTERVAL_MS) },
+};
 // longer than the test takes to kill the origin; a ping delayed this long does not yet mark the link down
 const HELD_MS = 30_000;
 const escape = (hostname) => hostname.replaceAll('.', '\\.');
@@ -83,6 +91,8 @@ suite('An origin lost for good whose last writes reached only an unpicked region
 		const lacking = [picked, ...remote];
 		await insert(origin, 'before-loss', origin.hostname, 5);
 		await waitForPhase(nodes(), 'before-loss', 5);
+		// no operation reports a certified floor
+		await delay(10 * FLOOR_INTERVAL_MS);
 
 		for (const node of [picked, ...receivers])
 			await writeFile(latencyFile(workDir, node.hostname), JSON.stringify({ [origin.hostname]: HELD_MS }));
@@ -110,6 +120,14 @@ suite('An origin lost for good whose last writes reached only an unpicked region
 		await waitForPhase(lacking, 'after-loss', 10);
 		// the fallback link has replayed the picked region-mate's log of the origin by now
 		await delay(10_000);
+		// a refused fallback moves to the next region-mate, which here is the holder
+		const rotated = new RegExp(`takes ${escape(origin.hostname)} from ${escape(holder.hostname)} while its link`);
+		for (const receiver of receivers)
+			assert.doesNotMatch(
+				await readLogSince(receiver, marks.get(receiver.hostname)),
+				rotated,
+				`${receiver.hostname} moved its fallback to the holder`
+			);
 		assert.equal((await phaseIds(holder, 'last-writes')).size, 20);
 		for (const node of lacking)
 			assert.equal(

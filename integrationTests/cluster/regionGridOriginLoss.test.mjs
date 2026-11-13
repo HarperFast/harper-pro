@@ -34,8 +34,16 @@ import {
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
+// A fallback link starts the origin at the floor the receiver certified for it, or 60 s below the receiver's position
+// when that is higher. Without a floor the start of a cluster this young sits below a region-mate's formation copy,
+// which a link carrying no base copy is refused at. Every origin certifies one at this interval (30 s by default).
+const FLOOR_INTERVAL_MS = 1000;
 // the main thread reports the fallback link at info
-const OPTIONS = { logLevel: 'info', replicationLogLevel: 'info' };
+const OPTIONS = {
+	logLevel: 'info',
+	replicationLogLevel: 'info',
+	env: { HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS: String(FLOOR_INTERVAL_MS) },
+};
 // longer than the test takes to kill the origin; a ping delayed this long does not yet mark the link down
 const HELD_MS = 30_000;
 
@@ -77,6 +85,8 @@ suite('An origin lost for good under the region grid', { timeout: 900_000 }, (ct
 		// every node holds a position for the origin, so nothing below depends on a first-time copy
 		await insert(origin, 'before-loss', origin.hostname, 5);
 		await waitForPhase(nodes(), 'before-loss', 5);
+		// no operation reports a certified floor
+		await delay(10 * FLOOR_INTERVAL_MS);
 
 		for (const receiver of receivers)
 			await writeFile(latencyFile(workDir, receiver.hostname), JSON.stringify({ [origin.hostname]: HELD_MS }));
