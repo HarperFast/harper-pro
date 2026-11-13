@@ -273,9 +273,15 @@ async function recordReport(database: string, peer: string, report: OwnOriginRep
 }
 
 // the epoch row is fixed once workers run, and a clean report is never replaced within its epoch
+const UNPROVEN_RECHECK_MS = 100;
 const cachedEpochs = new Map<
 	string,
-	{ epoch: OwnOriginEpoch; clean: Set<string>; provenFor?: readonly string[] } | null
+	{
+		epoch: OwnOriginEpoch;
+		clean: Set<string>;
+		provenFor?: readonly string[];
+		unproven?: { homes: readonly string[]; lineage: OwnLineage; until: number };
+	} | null
 >();
 
 /**
@@ -309,6 +315,9 @@ export function ownLineage(
 	}
 	const { epoch, clean } = cached;
 	if ((position !== null && position >= epoch.before) || cached.provenFor === homes) return { state: 'intact' };
+	const now = performance.now();
+	const unproven = cached.unproven;
+	if (unproven && unproven.homes === homes && unproven.until > now) return unproven.lineage;
 	let skippedNonMember = false;
 	const lineage = lineageFromReports(
 		epoch,
@@ -324,6 +333,8 @@ export function ownLineage(
 	);
 	// a home map's array is replaced, never mutated, when it changes; a peer removed now may be re-added
 	if (lineage.state === 'intact' && !skippedNonMember) cached.provenFor = homes;
+	// waiters poll this; one evaluation per interval serves them all, and a report lands at most that much later
+	else if (lineage.state !== 'intact') cached.unproven = { homes, lineage, until: now + UNPROVEN_RECHECK_MS };
 	return lineage;
 }
 
