@@ -1,0 +1,7 @@
+type Exp @table(expiration: 5) @export {
+	id: ID @primaryKey
+}
+
+type Plain @table @export {
+	id: ID @primaryKey
+}
