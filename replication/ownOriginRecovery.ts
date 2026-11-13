@@ -32,6 +32,7 @@ const FAILED_ENV = 'HARPER_OWN_ORIGIN_RECOVERY_FAILED';
 const failedDatabases = new Set((process.env[FAILED_ENV] ?? '').split('\n').filter(Boolean));
 const REPORT = Symbol.for('ownOriginRecovered');
 const DURABLE_FLOOR = Symbol.for('ownOriginDurableFloor');
+const LOG_VOUCH = Symbol.for('ownOriginLogVouch');
 const MIN_START = 1;
 
 export interface OwnOriginEpoch {
@@ -174,8 +175,7 @@ export function openOwnOriginRecoveryEpoch(
 		throw new Error(`${database} has per-origin logs but no store to record a recovery epoch in`);
 	const previous = readEpoch(dbisDB);
 	// decided once per process, before workers append: a reload's view of the log includes this process's writes
-	if (!vouchedDatabases.has(database))
-		vouchedDatabases.set(database, vouchesForEarlierLog(previous?.bootId, continuity, logStats(auditStore)));
+	if (!vouchedDatabases.has(database)) recordLogVouch(database, dbisDB, previous, continuity, logStats(auditStore));
 	let lastKey: number | undefined;
 	let purgeBound: number | undefined;
 	let logRead = true;
@@ -406,6 +406,7 @@ export interface DurableFloorState {
 	bound: number;
 	persisted: number;
 	persisting?: boolean;
+	sampledAt?: LogPosition;
 }
 
 const MAX_FLOOR_SAMPLES = 64;
@@ -422,10 +423,14 @@ export function advanceDurableFloor(state: DurableFloorState, floor: number, sta
 	const flushed = stats?.lastFlushedPosition;
 	if (!isLogPosition(next) || !isLogPosition(flushed)) return;
 	let samples = state.samples;
-	if (isValidFloor(floor) && floor > state.bound && floor > (samples.at(-1)?.floor ?? 0)) {
+	// a floor sampled over an unchanged log covers no key the last sample did not, and the window never starts
+	// above the overlap below the log's last key
+	const appended = !state.sampledAt || compareLogPositions(next, state.sampledAt) !== 0;
+	if (appended && isValidFloor(floor) && floor > state.bound && floor > (samples.at(-1)?.floor ?? 0)) {
 		// thinned rather than shifted: the oldest samples are the first a flush covers
-		if (samples.length >= MAX_FLOOR_SAMPLES) samples = state.samples = samples.filter((_, index) => index % 2 === 1);
+		if (samples.length >= MAX_FLOOR_SAMPLES) samples = state.samples = samples.filter((_, index) => index % 2 === 0);
 		samples.push({ floor, position: next });
+		state.sampledAt = next;
 	}
 	let covered = 0;
 	while (covered < samples.length && compareLogPositions(samples[covered].position, flushed) <= 0) covered++;
@@ -437,24 +442,68 @@ export function advanceDurableFloor(state: DurableFloorState, floor: number, sta
 	return proven;
 }
 
+export interface LogVouch {
+	bootId?: string;
+	vouched: boolean;
+}
+
 /**
- * Whether this process can advance a durable floor over the log an earlier process left. rocksdb-js syncs only the
- * segments it holds open, so bytes an earlier process on this boot left unsynced in a segment this process never
- * reopens stay unsynced while `lastFlushedPosition` passes them. A log whose flushed position is already in the
- * segment it appends to has no such bytes elsewhere; after a reboot whatever survived is on disk. A recorded sync
- * failure vouches for nothing: a page that failed writeback can be marked clean.
+ * Whether this process can advance a durable floor over the log earlier processes left. rocksdb-js syncs only the
+ * segments it holds open, so bytes an earlier process on this boot left unsynced in a segment no later process
+ * reopens stay unsynced while `lastFlushedPosition` passes them. After a reboot whatever survived is on disk. On
+ * the same boot, a start that could not vouch taints every later start until a reboot; otherwise a log whose
+ * flushed position is already in the segment it appends to has no such bytes elsewhere. A recorded sync failure
+ * vouches for nothing: a page that failed writeback can be marked clean.
  */
 export function vouchesForEarlierLog(
-	previousBootId: string | undefined,
+	recorded: LogVouch | undefined,
 	continuity: StartContinuity,
 	stats: LogStats | undefined
 ): boolean {
 	if (continuity.syncFailure) return false;
-	if (previousBootId !== undefined && continuity.bootId !== undefined && previousBootId !== continuity.bootId)
+	if (recorded?.bootId !== undefined && continuity.bootId !== undefined && recorded.bootId !== continuity.bootId)
 		return true;
+	if (recorded?.vouched === false) return false;
 	const flushed = stats?.lastFlushedPosition;
 	const next = stats?.nextLogPosition;
 	return isLogPosition(flushed) && isLogPosition(next) && flushed.sequence === next.sequence;
+}
+
+/**
+ * Decides and records this start's vouch. The row is written on every start, so the next start on this boot reads
+ * this one's verdict; before any row exists, the previous epoch's boot is the last start known.
+ */
+function recordLogVouch(
+	database: string,
+	dbisDB: any,
+	previous: OwnOriginEpoch | undefined,
+	continuity: StartContinuity,
+	stats: LogStats | undefined
+): void {
+	let recorded: LogVouch | undefined;
+	try {
+		const row = dbisDB.getSync(LOG_VOUCH);
+		recorded =
+			typeof row?.vouched === 'boolean'
+				? row
+				: previous?.bootId
+					? { bootId: previous.bootId, vouched: true }
+					: undefined;
+	} catch (error) {
+		logger.warn?.(`Own-origin recovery: could not read ${database}'s log vouch`, error);
+		vouchedDatabases.set(database, false);
+		return;
+	}
+	const vouched = vouchesForEarlierLog(recorded, continuity, stats);
+	vouchedDatabases.set(database, vouched);
+	try {
+		const row: LogVouch = { vouched };
+		if (continuity.bootId !== undefined) row.bootId = continuity.bootId;
+		dbisDB.putSync(LOG_VOUCH, row);
+	} catch (error) {
+		logger.warn?.(`Own-origin recovery: could not record ${database}'s log vouch`, error);
+		vouchedDatabases.set(database, false);
+	}
 }
 
 function logStats(auditStore: any): LogStats | undefined {
@@ -479,7 +528,6 @@ const floorStates = new WeakMap<object, DurableFloorState>();
 let samplerTimer: ReturnType<typeof setInterval> | undefined;
 let samplerErrorLoggedAt = -Infinity;
 
-/** Starts sampling durable floors on this thread, once per process. */
 export function startDurableFloorSampler(): void {
 	if (samplerTimer || isReadOnlyMode()) return;
 	samplerTimer = setInterval(sampleDurableFloors, ORIGIN_FLOOR_TICK_MS);
@@ -527,7 +575,8 @@ function sampleDurableFloor(database: string): void {
 	const floor = state.bound;
 	const persisting = state;
 	persisting.persisting = true;
-	Promise.resolve(dbisDB.put(DURABLE_FLOOR, floor))
+	Promise.resolve()
+		.then(() => dbisDB.put(DURABLE_FLOOR, floor))
 		.then(() => {
 			if (floor > persisting.persisted) persisting.persisted = floor;
 		})

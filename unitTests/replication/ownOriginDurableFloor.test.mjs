@@ -1,8 +1,3 @@
-/**
- * The durable floor own-origin recovery starts from (harper-pro#1380): a sampled origin-closed floor becomes
- * durable only once rocksdb-js's flushed log position covers the log position sampled with it, a process
- * advances it only over a log it can vouch for, and the recovery window starts just below it.
- */
 import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -29,6 +24,7 @@ const { setupTestDBPath } = require('../testUtils.js');
 const NOW = 1_800_000_000_000;
 const DURABLE_FLOOR = Symbol.for('ownOriginDurableFloor');
 const EPOCH = Symbol.for('ownOriginRecovery');
+const LOG_VOUCH = Symbol.for('ownOriginLogVouch');
 const position = (sequence, offset) => ({ sequence, offset });
 const freshState = (bound = 0) => ({ samples: [], bound, persisted: bound });
 
@@ -176,25 +172,67 @@ describe('advanceDurableFloor', () => {
 
 describe('vouchesForEarlierLog', () => {
 	const sameBoot = { bootId: 'boot-a', syncFailure: false };
+	const vouchedOnA = { bootId: 'boot-a', vouched: true };
+	const oneSegment = { nextLogPosition: position(3, 900), lastFlushedPosition: position(3, 100) };
+	const twoSegments = { nextLogPosition: position(4, 900), lastFlushedPosition: position(3, 100) };
 	it('vouches when the flushed position is in the segment the log appends to', () => {
-		const stats = { nextLogPosition: position(3, 900), lastFlushedPosition: position(3, 100) };
-		assert.strictEqual(vouchesForEarlierLog('boot-a', sameBoot, stats), true);
-		assert.strictEqual(vouchesForEarlierLog(undefined, sameBoot, stats), true);
+		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, sameBoot, oneSegment), true);
+		assert.strictEqual(vouchesForEarlierLog(undefined, sameBoot, oneSegment), true);
 	});
 	it('does not vouch for an earlier segment an earlier process on this boot may have left unsynced', () => {
-		const stats = { nextLogPosition: position(4, 900), lastFlushedPosition: position(3, 100) };
-		assert.strictEqual(vouchesForEarlierLog('boot-a', sameBoot, stats), false);
-		assert.strictEqual(vouchesForEarlierLog(undefined, sameBoot, stats), false);
-		assert.strictEqual(vouchesForEarlierLog('boot-a', { bootId: undefined, syncFailure: false }, stats), false);
+		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, sameBoot, twoSegments), false);
+		assert.strictEqual(vouchesForEarlierLog(undefined, sameBoot, twoSegments), false);
+		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, { bootId: undefined, syncFailure: false }, twoSegments), false);
+	});
+	it('stays unvouched on a boot where a start could not vouch, even once the flushed position catches up', () => {
+		assert.strictEqual(vouchesForEarlierLog({ bootId: 'boot-a', vouched: false }, sameBoot, oneSegment), false);
+		assert.strictEqual(
+			vouchesForEarlierLog({ vouched: false }, { bootId: undefined, syncFailure: false }, oneSegment),
+			false
+		);
 	});
 	it('vouches after a reboot, since whatever survived it is on disk', () => {
-		const stats = { nextLogPosition: position(4, 900), lastFlushedPosition: position(3, 100) };
-		assert.strictEqual(vouchesForEarlierLog('boot-a', { bootId: 'boot-b', syncFailure: false }, stats), true);
+		const rebooted = { bootId: 'boot-b', syncFailure: false };
+		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, rebooted, twoSegments), true);
+		assert.strictEqual(vouchesForEarlierLog({ bootId: 'boot-a', vouched: false }, rebooted, twoSegments), true);
 	});
 	it('never vouches after a recorded sync failure, or without positions', () => {
-		const stats = { nextLogPosition: position(3, 900), lastFlushedPosition: position(3, 100) };
-		assert.strictEqual(vouchesForEarlierLog('boot-a', { bootId: 'boot-b', syncFailure: true }, stats), false);
-		assert.strictEqual(vouchesForEarlierLog('boot-a', sameBoot, undefined), false);
+		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, { bootId: 'boot-b', syncFailure: true }, oneSegment), false);
+		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, sameBoot, undefined), false);
+	});
+});
+
+describe('openOwnOriginRecoveryEpoch records its log vouch', () => {
+	function stores(rows, stats) {
+		const dbisDB = {
+			rows,
+			getSync: (key) => rows.get(key),
+			putSync: (key, value) => rows.set(key, value),
+			getRange: () => [],
+		};
+		const auditStore = {
+			reusableIterable: true,
+			getRange: () => [],
+			getBinary: () => undefined,
+			log: { getStats: () => stats },
+			rootStore: { getMonotonicTimestamp: () => NOW + 1000, syncWal: async () => {} },
+		};
+		return { dbisDB, auditStore };
+	}
+	it('for the next start on this boot, including a verdict of no', async () => {
+		const rows = new Map();
+		const { dbisDB, auditStore } = stores(rows, {
+			nextLogPosition: position(4, 10),
+			lastFlushedPosition: position(3, 10),
+		});
+		await openOwnOriginRecoveryEpoch(
+			'vouch-row-db',
+			auditStore,
+			dbisDB,
+			{ bootId: 'boot-a', syncFailure: false },
+			() => []
+		);
+		assert.deepStrictEqual(rows.get(LOG_VOUCH), { bootId: 'boot-a', vouched: false });
 	});
 });
 
@@ -225,9 +263,21 @@ describe('a durable floor on a real rocksdb-js log', () => {
 		await db.flush();
 		await append('c');
 		assert.strictEqual(advanceDurableFloor(state, NOW + 3, log.getStats()), NOW + 2);
-		assert.strictEqual(advanceDurableFloor(state, NOW + 4, log.getStats()), undefined, 'nothing flushed since');
+		assert.strictEqual(
+			advanceDurableFloor(state, NOW + 4, log.getStats()),
+			undefined,
+			'nothing appended since NOW + 3 was sampled, and nothing flushed'
+		);
 		await db.flush();
-		assert.strictEqual(advanceDurableFloor(state, NOW + 5, log.getStats()), NOW + 5);
+		assert.strictEqual(
+			advanceDurableFloor(state, NOW + 5, log.getStats()),
+			NOW + 3,
+			'a floor over an unchanged log is not sampled'
+		);
+		await append('d');
+		assert.strictEqual(advanceDurableFloor(state, NOW + 6, log.getStats()), undefined);
+		await db.flush();
+		assert.strictEqual(advanceDurableFloor(state, NOW + 7, log.getStats()), NOW + 6);
 	});
 });
 
@@ -271,5 +321,33 @@ describe('sampleDurableFloors on a database', () => {
 		while (!(dbisDB.getSync(DURABLE_FLOOR) >= floor) && Date.now() < deadline)
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		assert.ok(dbisDB.getSync(DURABLE_FLOOR) >= floor);
+
+		const recorded = dbisDB.getSync(DURABLE_FLOOR);
+		await Durable.put({ id: 3, name: 'after' });
+		let later;
+		for (let attempt = 0; attempt < 100 && !(later > recorded); attempt++) {
+			later = certifyOriginFloor(rootStore);
+			if (!(later > recorded)) await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		persistOriginClosedFloor(auditStore, later);
+		await Durable.put({ id: 4, name: 'later' });
+		sampleDurableFloors();
+		await rootStore.flush();
+		const put = dbisDB.put;
+		dbisDB.put = () => {
+			throw new Error('ENOSPC');
+		};
+		try {
+			sampleDurableFloors();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		} finally {
+			dbisDB.put = put;
+		}
+		assert.strictEqual(dbisDB.getSync(DURABLE_FLOOR), recorded, 'the failed put recorded nothing');
+		sampleDurableFloors();
+		const retryDeadline = Date.now() + 5000;
+		while (!(dbisDB.getSync(DURABLE_FLOOR) >= later) && Date.now() < retryDeadline)
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(dbisDB.getSync(DURABLE_FLOOR) >= later, 'a synchronous put failure is retried on the next tick');
 	});
 });
