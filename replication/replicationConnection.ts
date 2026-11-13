@@ -3736,8 +3736,7 @@ export class PendingRouteState {
 	private settledClearVersion = new Map<number, number>();
 	private settledRevokeVersion = new Map<number, number>();
 	private settledCertifiedSinceClear = new Map<number, { clearVersion: number; start: number; generation?: string }>();
-	/** Per origin and generation, the newest settled version that wrote `partialHistory`; the read-back of an older one sees it. */
-	/** per origin and generation, the newest settled batch that wrote partialHistory, and the value it left */
+	/** Per origin and generation, the newest settled batch that wrote `partialHistory` and the value it left: the read-back and the restore of an older one defer to it. */
 	private settledPartial = new Map<string, { version: number; partial: boolean }>();
 	private takenEvents = new WeakSet<object>();
 	private unverifiedBatches: UnverifiedRouteStateBatch[] = [];
