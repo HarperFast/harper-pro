@@ -17,11 +17,11 @@
  * within a bounded wait. A restarts with its recovery reports held (`HARPER_TEST_HOLD_OWN_ORIGIN_REPORT_DIR`),
  * so the lock first meets a recovery that is not yet confirmed and must refuse, whatever the rows read.
  *
- * A third node, C, is down for the lost writes, so after the power loss only B holds them. A lock on C then
- * needs a barrier from A, and a barrier A wrote before its writes returned would follow a log without them:
- * C would admit from the value it holds. With every home reachable, C's refusal can come only from A's
- * barrier guard (`executeBarrier` in recordLockRpc.ts), and C's first lock after recovery must count A's
- * lost increment.
+ * A third node, C, is down for the lost writes, so after the power loss only B holds them. A lock on C needs
+ * a barrier from A, which A refuses until every peer has reported (`executeBarrier` in recordLockRpc.ts): a
+ * barrier written before then could follow a log still missing writes. With every home reachable, C's
+ * refusal can come only from that guard, so the test fails with it removed. The held report parks after the
+ * returned rows apply, and A forwards them to C, so C's state is not asserted while the report is held.
  *
  * Recovery runs only when the OS may have dropped page-cache data, so each start names its boot through
  * `HARPER_TEST_BOOT_ID`: the power loss restarts A on a new boot, and the last tests restart A's process on
@@ -249,11 +249,6 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			{ ins: 2, upd: 2, [lockKey]: 1 },
 			'B still holds every write it confirmed'
 		);
-		assert.deepEqual(
-			await readCounters(nodeC, ['ins', 'upd', lockKey]),
-			{ ins: undefined, upd: 1, [lockKey]: 0 },
-			'C was down for the writes A lost'
-		);
 		simulated = true;
 	});
 
@@ -272,10 +267,11 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			`a lock admitted before A's recovery was confirmed: ${JSON.stringify(refused.body)}`
 		);
 		assert.match(JSON.stringify(refused.body), /successor freshness/);
-		// B's and C's locks need A's lineage through a barrier A writes, which A refuses until its writes are back
+		// C's lock (B, the key's home, is up) and B's own need A's lineage through a barrier A writes, which A
+		// refuses until its writes are back
 		for (const [name, node] of [
-			['B', nodeB],
 			['C', nodeC],
+			['B', nodeB],
 		]) {
 			const refusedThere = await call(node, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
 			assert.equal(
@@ -285,7 +281,6 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			);
 			assert.match(JSON.stringify(refusedThere.body), BARRIER_REFUSAL, `${name}'s refusal came from A's barrier guard`);
 		}
-		assert.equal((await counter(nodeC, lockKey))?.n, 0, 'C still lacks the increment A lost');
 		await writeFile(join(reportHoldDir, 'release'), '');
 		const onABefore = (await counter(nodeA, lockKey))?.n;
 		t.diagnostic(`A read ${lockKey}=${onABefore} before the lock`);
