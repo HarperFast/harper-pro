@@ -164,7 +164,7 @@ replication:
 - **Precedence:** a write's own count (`confirm`, the operation's `replicatedConfirmation`, or `transaction({ replicatedConfirmation })`) is used instead, including `0`, which waits for nothing. Sending a count over REST or the operations API still needs `super_user`, so other callers can't opt out.
 - **Same rules as an explicit count:** peers are counted the same way, including per owner set on `@sharded` tables. The same `confirmationTimeout` applies, and so does the same [failure after a local commit](#confirmation-failure-after-a-local-commit). On RocksDB, a count this node can't meet is refused with `400` before the write lands. That includes every write to a database this node replicates to fewer peers than the count, for example on the first node of a new cluster before its peers are added. On LMDB the write waits out the timeout instead.
 - **Every database:** the default applies to each database a transaction writes. An explicit positive count still covers only the first database, and the default covers the rest. An explicit `0` opts out every database.
-- **Not applied** to the `system` database (users, roles, cluster membership), to writes this node applies from its peers, to crash recovery, or to writes that don't replicate (`replicate: false` tables, tables without an audit log).
+- **Not applied** to the `system` database (users, roles, cluster membership), to writes this node applies from its peers, to crash recovery, to cache fills from a table's source, or to writes that don't replicate (`replicate: false` tables, tables without an audit log).
 - Background writes, such as a component's scheduled jobs, wait like request writes.
 - The value is read at startup, so restart a node after changing it.
 
