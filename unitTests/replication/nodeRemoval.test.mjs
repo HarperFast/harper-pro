@@ -242,6 +242,16 @@ describe('drainNode', () => {
 		assert.ok(performance.now() - started < 3000, `took ${performance.now() - started}ms`);
 	});
 
+	it('finalizes without receipts a database the node sends to no peer', async () => {
+		const send = transport((node, operation) => {
+			const state = operation.finalize ? 'removing' : 'fenced';
+			return { ...fence(), state, databases: { data: { target: T, generation: 'gen-1', sharded: false, peers: [] } } };
+		});
+		const result = await drainNode('leaving', {}, 5000, send, async () => ({}));
+		assert.equal(result.state, 'removing');
+		assert.ok(!send.calls.some(({ operation }) => operation.operation === RECEIPT_OPERATION));
+	});
+
 	it('removes a node with no database but system without a finalize', async () => {
 		const send = transport(() => ({ node: 'leaving', epoch: 'e1', state: 'fenced', databases: {} }));
 		const result = await drainNode('leaving', {}, 5000, send, async () => ({}));
