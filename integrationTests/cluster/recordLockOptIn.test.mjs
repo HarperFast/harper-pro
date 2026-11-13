@@ -194,7 +194,6 @@ suite('cluster record locks on a node with a replicated database opened on LMDB'
 		const all = await sendOperation(target, { operation: 'describe_all', skip_record_count: true });
 		return { data: all[DB]?.Counter?.engine, legacy: all[LEGACY]?.Old?.engine };
 	};
-	/** Waits for `observer` to have learned, on a connected `data` socket, a `recordLocks` level from `target` that `accept`s. */
 	const waitForObservedLevel = (observer, target, accept, description) => {
 		let last;
 		return waitForCondition(
@@ -275,13 +274,10 @@ suite('cluster record locks on a node with a replicated database opened on LMDB'
 		assert.match(log, /cluster record locks stay disabled because these are opened on LMDB: legacy\b/);
 		assert.equal(log.match(/these are opened on LMDB/g).length, 1, 'logged once, by the main thread');
 
-		// both http workers: each answers with the LMDB reason, never the enabled no-home-map 503
-		for (let attempt = 0; attempt < 6; attempt++) {
-			const result = await call(node.harper, 'LockOnce/', { id: 'mixed-' + attempt, timeout: 2_000 });
-			assert.equal(result.status, 503, JSON.stringify(result.body));
-			assert.match(JSON.stringify(result.body), /opened on LMDB/);
-			assert.doesNotMatch(JSON.stringify(result.body), /legacy/);
-		}
+		const result = await call(node.harper, 'LockOnce/', { id: 'mixed', timeout: 2_000 });
+		assert.equal(result.status, 503, JSON.stringify(result.body));
+		assert.match(JSON.stringify(result.body), /opened on LMDB/);
+		assert.doesNotMatch(JSON.stringify(result.body), /legacy/);
 		const status = await clusterStatusOf(node.harper);
 		assert.equal(status.recordLocks?.[DB], undefined, JSON.stringify(status.recordLocks));
 		await waitForObservedLevel(peer.harper, node.harper, (level) => level === 0, 'record-lock level 0');

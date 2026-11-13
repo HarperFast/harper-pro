@@ -46,7 +46,6 @@ if (configured === true) {
 		);
 	}
 }
-/** What config alone allows; `admitClusterRecordLocks` still has to see the opened databases. */
 export const RECORD_LOCKS_CONFIGURED: boolean = configured === true && engineSupported;
 /**
  * False until `admitClusterRecordLocks` runs at a replication startup hook, after the catalog has
@@ -54,14 +53,12 @@ export const RECORD_LOCKS_CONFIGURED: boolean = configured === true && engineSup
  * database kept by an in-place upgrade from v4 still opens on LMDB.
  */
 export let CLUSTER_RECORD_LOCKS_ENABLED = false;
-/** Why `RECORD_LOCKS_CONFIGURED` was refused at admission, for the disabled transport's 503. */
 export let RECORD_LOCKS_REFUSAL: string | undefined;
 let admitted = false;
 
 export const RECORD_LOCKS_LMDB_REFUSAL =
 	"cluster record locks are off on this node: replication.recordLocks is true, but some replicated databases on this node are opened on LMDB, which record locks do not support (the node log names them); migrate them to RocksDB (storage.migrateOnStart) and restart, or lock with { scope: 'node' } for a node-local lock";
 
-/** Whether a node configured for record locks may run them, given its replicated databases on LMDB. */
 export function recordLockAdmission(
 	configuredOn: boolean,
 	lmdbDatabases: readonly string[]
@@ -80,8 +77,8 @@ export function recordLockAdmission(
  */
 export function admitClusterRecordLocks(listLmdbDatabases: () => readonly string[]): boolean {
 	if (admitted || !RECORD_LOCKS_CONFIGURED) return false;
-	admitted = true;
 	const lmdbDatabases = listLmdbDatabases();
+	admitted = true;
 	const { enabled, refusal } = recordLockAdmission(RECORD_LOCKS_CONFIGURED, lmdbDatabases);
 	RECORD_LOCKS_REFUSAL = refusal;
 	if (refusal && isMainThread)

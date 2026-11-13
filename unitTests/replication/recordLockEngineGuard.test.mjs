@@ -1,8 +1,3 @@
-/**
- * The record-lock guard judges the engine of each replicated database from the roots this thread
- * opened, not from `storage.engine`: a node upgraded in place from v4 keeps its `.mdb` databases on
- * LMDB whatever the config says, and record locks cannot run there.
- */
 import assert from 'node:assert';
 import { join } from 'node:path';
 import { readMetaDb, table } from '#src/core/resources/databases';
@@ -89,5 +84,17 @@ describe('record-lock guard on a node with RocksDB and LMDB databases', () => {
 			() => createDisabledRecordLockTransport().homeMap('guard_rocks'),
 			(error) => error.message === RECORD_LOCKS_DISABLED_MESSAGE
 		);
+	});
+
+	it('counts an LMDB database outside replication.databases once one of its tables replicates', () => {
+		readMetaDb(join(process.env.STORAGE_PATH, 'guard_tablerep.mdb'), null, 'guard_tablerep');
+		assert.ok(!lmdbIn({ databases: ['guard_rocks'] }).includes('guard_tablerep'));
+		table({
+			database: 'guard_tablerep',
+			table: 'Replicated',
+			replicate: true,
+			attributes: [{ name: 'id', type: 'ID', isPrimaryKey: true }],
+		});
+		assert.ok(lmdbIn({ databases: ['guard_rocks'] }).includes('guard_tablerep'));
 	});
 });

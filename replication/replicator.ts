@@ -938,7 +938,6 @@ export function urlToNodeName(nodeUrl) {
 	if (nodeUrl) return new URL(nodeUrl).hostname; // this the part of the URL that is the node name, as we want it to match common name in the certificate
 }
 
-/** The replicated databases this thread has open on LMDB, by the same selection replication uses. */
 export function replicatedLmdbDatabases(options): string[] {
 	getDatabases();
 	const names: string[] = [];

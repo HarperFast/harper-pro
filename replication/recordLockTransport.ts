@@ -462,10 +462,10 @@ export const RECORD_LOCKS_DISABLED_MESSAGE =
 	"cluster record locks are not enabled on this node: set replication.recordLocks: true on every node, restart, and apply a home map with record_lock_apply_homes; or lock with { scope: 'node' } for a node-local lock";
 
 /**
- * Registered while `replication.recordLocks` is off: `ownsCoordination` is true so core reaches
- * `homeMap()`, which refuses — a 503 naming the switch instead of the off-owner retry advice — and
+ * Registered while cluster record locks are off: `ownsCoordination` is true so core reaches
+ * `homeMap()`, which refuses — a 503 naming the reason instead of the off-owner retry advice — and
  * a received request or entry finds no map, so this node never grants. `disabled` lets a conditional
- * REST write skip the lock; the setting is read once at module load, so it holds for the process.
+ * REST write skip the lock; admission decides once per thread at startup, so it holds for the process.
  */
 export function createDisabledRecordLockTransport(
 	message = RECORD_LOCKS_REFUSAL ?? RECORD_LOCKS_DISABLED_MESSAGE
@@ -1127,14 +1127,14 @@ export function ensureRecordLockTransport(database: string, buildTransport?: () 
 			`Cluster record locks stay disabled for ${database}: it is opened on LMDB and became replicated after startup; restart to have the node refuse record locks`
 		);
 		const transport = createDisabledRecordLockTransport(RECORD_LOCKS_LMDB_REFUSAL);
-		transports.set(database, transport);
 		registerClusterLockTransport(database, transport);
+		transports.set(database, transport);
 		return;
 	}
 	if (builder) transportBuilders.set(database, builder);
 	const transport = builder ? builder() : createDisabledRecordLockTransport();
-	transports.set(database, transport);
 	registerClusterLockTransport(database, transport);
+	transports.set(database, transport);
 	if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
 	listenForApplyFailures(database);
 	refreshCache(database);
