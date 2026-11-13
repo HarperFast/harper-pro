@@ -5,7 +5,7 @@
 import { table } from '../core/resources/databases.ts';
 import { forEachReplicatedDatabase } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
-import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
+import { replicationConfirmation, setReplicationConfirmationDefaults } from '../core/resources/DatabaseTransaction.ts';
 import { isMainThread } from 'worker_threads';
 import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
 import * as env from '../core/utility/environment/environmentManager.js';
@@ -994,6 +994,27 @@ function assertConfirmationFeasible(databaseName: string, confirmationCount: num
 	}
 	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);
 }
+
+/**
+ * Parse `replication.confirmation` or `replication.recordLockConfirmation`; absent means 0. Core's config
+ * validator refuses any other value at startup, and one that still reaches here throws rather than
+ * silently turning off the confirmation an operator configured.
+ */
+export function parseConfirmationDefault(name: string, raw: unknown): number {
+	if (raw == null || raw === '') return 0;
+	const value = typeof raw === 'string' && /^\s*\d+\s*$/.test(raw) ? Number(raw) : raw;
+	if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
+	throw new Error(`Invalid ${name} ${JSON.stringify(raw)}: expected a non-negative integer`);
+}
+
+// read once per thread at load, so a change takes a restart
+setReplicationConfirmationDefaults({
+	writes: parseConfirmationDefault('replication.confirmation', env.get(CONFIG_PARAMS.REPLICATION_CONFIRMATION)),
+	recordLocks: parseConfirmationDefault(
+		'replication.recordLockConfirmation',
+		env.get(CONFIG_PARAMS.REPLICATION_RECORDLOCKCONFIRMATION)
+	),
+});
 
 replicationConfirmation(
 	(databaseName, txnTime, confirmationCount, residentPeerLists?: string[][], automatic = false): Promise<void> => {

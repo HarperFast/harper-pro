@@ -1,0 +1,23 @@
+import assert from 'node:assert';
+import { parseConfirmationDefault } from '#src/replication/knownNodes';
+
+describe('replication confirmation defaults', () => {
+	it('reads an absent key as 0', () => {
+		for (const raw of [undefined, null, ''])
+			assert.strictEqual(parseConfirmationDefault('replication.confirmation', raw), 0);
+	});
+
+	it('accepts non-negative integers, as numbers or integer strings', () => {
+		assert.strictEqual(parseConfirmationDefault('replication.confirmation', 0), 0);
+		assert.strictEqual(parseConfirmationDefault('replication.confirmation', 2), 2);
+		assert.strictEqual(parseConfirmationDefault('replication.recordLockConfirmation', ' 1 '), 1);
+	});
+
+	it('throws on any other value rather than turning confirmation off', () => {
+		for (const raw of [-1, 1.5, Number.NaN, 'one', '-1', true, {}, Number.MAX_SAFE_INTEGER + 1])
+			assert.throws(
+				() => parseConfirmationDefault('replication.recordLockConfirmation', raw),
+				/Invalid replication\.recordLockConfirmation .*: expected a non-negative integer/
+			);
+	});
+});

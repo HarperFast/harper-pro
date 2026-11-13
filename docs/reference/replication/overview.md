@@ -486,6 +486,27 @@ The home map changes only when an operator applies a new one, so apply one after
 
 Cluster record locks need the RocksDB storage engine. On LMDB `lock()` is not available, and conditional writes do not take a lock.
 
+### Confirming Locked Writes
+
+<VersionBadge version="v5.5.0" />
+
+A locked commit does not wait for replication. If the holder's node loses power before the write reaches a peer, the write can be lost. Once that node restarts, the next holder of the key can be admitted without it. To make locked commits wait for peers, set [`replication.recordLockConfirmation`](../configuration/options.md#replication):
+
+```yaml
+replication:
+  recordLocks: true
+  recordLockConfirmation: 1
+  confirmationTimeout: 30000
+```
+
+- **When it applies:** a commit waits when its transaction holds a cluster lock on a table in the database it writes, or writes through a held lock (`hold: true`). A lock in one database doesn't make writes to another database wait. A node-scoped lock never does.
+- **How many:** at least this many peers, or the write's own count if that is larger (including the [`replication.confirmation`](./sharding.md#default-confirmation-count) default). An explicit `0` doesn't lower it.
+- **Rules:** peers are counted, refused and timed out as for an [explicit count](./sharding.md#replication-control-via-rest-header), using `confirmationTimeout`.
+- **The lock is not held longer:** it is released when the commit lands on this node, before the wait, as without the setting.
+- **When confirmation fails,** the error carries `replicationUnconfirmed: true` and `retryable: false` ([details](./sharding.md#confirmation-failure-after-a-local-commit)). The write is committed on this node. A transaction's lock is already released, so the next holder can have it and may already see the write. A `hold: true` lock stays held until `unlock()` or its lease either way.
+- **Limits:** confirmation means the peers acknowledged replication past the write. It is not a quorum, and it doesn't change how the next holder is admitted.
+- The value is read at startup, so restart a node after changing it.
+
 ## Inspecting Cluster Configuration
 
 Query the `hdb_nodes` system table to inspect the current known nodes and their configuration:
