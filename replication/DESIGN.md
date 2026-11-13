@@ -631,7 +631,7 @@ Regressions: `unitTests/replication/replicateFalseSendPaths.test.mjs` (frames), 
     - **Record locks.** Freshness reads the epoch through `ownLineage` (see `RECORD_LOCK_FRESHNESS_DESIGN.md`).
 
     Known limits:
-    - A peer without the capability never reports, so own lineage stays unproven until every member is upgraded. The same holds where sharding restricts the origins a link carries, which drops the range.
+    - A peer without the capability never reports, so own lineage stays unproven until every member is upgraded. The same holds on a database with sharded tables: the subscriber asks no range there on any link, since the frame decoder refuses this node's own sharded records outside a snapshot copy and would close the link on every reconnect.
     - The window's start is the overlap, not a proven bound: a key reserved over 60 s before its lost append is not asked for, and a peer's purge at or below the log's last key counts as clean.
     - A peer's report covers only the tables its route sends here.
     - Unlocked writes are not held back.

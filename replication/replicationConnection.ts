@@ -13958,9 +13958,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			});
 		}
 		ownOriginRecoveryRequested = undefined;
+		// A sharded database's returned own writes arrive outside a snapshot copy, which the frame decoder refuses
+		// ("Sharded self-origin recovery requires a valid snapshot"), so asking there would close the link on every
+		// reconnect. That also covers a restricted link, whose admitted layout drops our origin anyway.
 		if (
 			nodeSubscriptions?.length &&
-			!restrictedOrigins &&
+			!(admittedLayout || residencyMapInstalled()) &&
 			peerCapabilitiesLearned &&
 			peerSupportsOwnOriginRecovery(peerCapabilities)
 		) {
