@@ -105,7 +105,7 @@ Transactions are replicated atomically, which may span multiple tables. You can 
 
 <VersionBadge version="v5.4.0" />
 
-When replication runs on the same worker threads that serve application requests, catching up a peer that was offline (streaming its backlog, a full copy, back-pressure handling) competes with your application for those threads. `replication.threads` starts that many additional worker threads that run replication only. It defaults to half of `threads.count`, rounded down, so a node with two or more HTTP worker threads gets them without configuration; set it explicitly to choose the count:
+When replication runs on the same worker threads that serve application requests, catching up a peer that was offline (streaming its backlog, a full copy, back-pressure handling) competes with your application for those threads. `replication.threads` starts that many additional worker threads that run replication only. It defaults to half of `threads.count`, rounded down, so a node with two or more HTTP worker threads and a dedicated replication port gets them without configuration; set it explicitly to choose the count:
 
 ```yaml
 replication:
@@ -117,6 +117,7 @@ With dedicated replication threads:
 
 - Only the replication threads listen on the replication port, and they own every subscription to other nodes, so both sending and receiving replication data happen off the application threads.
 - The replication threads load no application code. Anything your application installs on a table at runtime is not present there, so applications that rely on it should keep `replication.threads: 0`:
+  - `setResidency`: replicated writes that carry no residency list are placed by the default residency instead of by your callback.
   - `setResidencyById`: nodes outside a record's residency receive an invalidated, partial copy of it that holds the record's indexed attribute values.
   - `setComputedAttribute` on an `@indexed` computed attribute: a replication thread cannot maintain that index, so it refuses to receive the database that contains the table. It logs the table and attributes and keeps retrying, and nothing else in that database replicates to this node until `replication.threads` is set back to `0`. Computed attributes defined with `@computed(from: "...")` are not affected.
 - Reads that fetch a missing record from another node still run on the thread serving the request.
