@@ -13049,7 +13049,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	let lastSentExcludedNodes: string[] = [];
 	let ownOriginRecoveryRequested: number | undefined;
-	// a frame given up on since recovery was last asked for may be a returned own write this node never applied
+	// a frame given up on may be a returned own write this node never applied; a re-asked pass re-sends it, so
+	// no report on this connection counts as clean after one
 	let ownOriginFrameSkipped = false;
 	let ownOriginRetries = 0;
 	function currentOriginCursorVector(
@@ -13721,7 +13722,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					ownOriginRecovery: true,
 				});
 				ownOriginRecoveryRequested = recovery.endTime;
-				ownOriginFrameSkipped = false;
 			}
 		}
 		let excluded: string[];

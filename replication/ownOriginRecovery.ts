@@ -112,8 +112,12 @@ export function nextEpoch(
 	requiredPeers: string[]
 ): OwnOriginEpoch {
 	let held = Math.max(lastKey ?? 0, purgeBound ?? 0);
-	// an unfinished window is judged against what the log held when it opened, not what it holds since
-	if (previous && !previous.finished) held = Math.min(held, previous.lastKey);
+	// an unfinished window is judged against what the log held when it opened, not what it holds since, and
+	// still waits on every holder it named
+	if (previous && !previous.finished) {
+		held = Math.min(held, previous.lastKey);
+		requiredPeers = [...new Set([...previous.requiredPeers, ...requiredPeers])];
+	}
 	return { after: recoveryStart(lastKey, purgeBound, previous), lastKey: held, before, requiredPeers };
 }
 

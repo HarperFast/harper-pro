@@ -118,8 +118,9 @@ record of that origin and table this node dropped or failed to apply. Those are 
     peer's report of a purge past the log's last key, or an epoch that could not be recorded, rejects
     at once (`own-lineage-unprovable`); a failed read is asked again, not recorded. An own-origin
     poison row rejects before and again after the wait. Until its own lineage is intact, the node also
-    refuses to write a `lockBarrier` for a peer (503, which the requester rides through): a barrier
-    written then would sit ahead of the returned writes in its log and prove nothing about them.
+    refuses to write a `lockBarrier` for a peer, as it does for a table holding own-origin poison (503,
+    which the requester rides through): a barrier written then would sit ahead of the returned writes in
+    its log, or past a skipped one, and prove nothing about them.
   - otherwise the origin must be in `homeMap().homes` at the exact capability level, the table must
     replicate (`replicate !== false`), and `(database, origin, table)` must not be poisoned — any
     failure rejects at once with a 503 naming which. Then request a barrier from the origin

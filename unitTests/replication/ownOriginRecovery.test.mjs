@@ -54,6 +54,19 @@ describe('nextEpoch', () => {
 	});
 });
 
+describe('nextEpoch required peers', () => {
+	it('an unfinished epoch keeps waiting on every holder it named, even one no longer found', () => {
+		const previous = { after: 1, lastKey: 5, before: NOW - 1000, requiredPeers: ['route-removed'] };
+		assert.deepStrictEqual(nextEpoch(9, undefined, previous, NOW, ['current']).requiredPeers, [
+			'route-removed',
+			'current',
+		]);
+		assert.deepStrictEqual(nextEpoch(9, undefined, { ...previous, finished: true }, NOW, ['current']).requiredPeers, [
+			'current',
+		]);
+	});
+});
+
 describe('lineageFromReports', () => {
 	const epoch = { after: NOW - 60_000, lastKey: NOW, before: NOW + 10_000, requiredPeers: ['b', 'c'] };
 	const member = () => true;
