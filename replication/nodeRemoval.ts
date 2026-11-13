@@ -128,7 +128,7 @@ function requiredPeers(
 			);
 		const others = members.filter((name: string) => name !== thisNode && peers.includes(name));
 		if (others.length > 0) shardOwners.push(others);
-		else if (members.some((name: string) => name !== thisNode))
+		else if (peers.length > 0 && members.some((name: string) => name !== thisNode))
 			throw new ClientError(
 				`${thisNode} sends database ${database} to no owner of shard ${shard}, so its writes to that shard's records exist only on it. Use force: true to remove it anyway`,
 				409
@@ -174,8 +174,6 @@ async function withFenceLock<T>(work: () => Promise<T>, deadline = performance.n
 
 async function changeFence(request: any, thisNode: string): Promise<FenceState | { cancelled: true }> {
 	const roots = databaseRoots();
-	for (const [database, auditStores] of roots)
-		for (const auditStore of auditStores) assertDrainable(database, auditStore);
 	const fences = [...roots.values()].flat().map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
 	const wasRemoving = fences.some((fence) => fence.state === 'removing');
 	if (request.cancel) {
@@ -189,6 +187,8 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 		hdbLogger.notify(`Removal of ${thisNode} from its cluster was cancelled; local writes are accepted again`);
 		return { cancelled: true };
 	}
+	for (const [database, auditStores] of roots)
+		for (const auditStore of auditStores) assertDrainable(database, auditStore);
 	for (const [database, auditStores] of roots)
 		// replication sends and certifies floors for one root per database; another root's writes have no receipt
 		if (auditStores.length > 1)
@@ -270,6 +270,8 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 async function clearFences(roots: Map<string, any[]>): Promise<void> {
 	for (const auditStores of roots.values())
 		for (const auditStore of auditStores) {
+			// a root that was never fenced (one opened on LMDB, say) has nothing to clear
+			if (!readLocalWriteFence(auditStore) && !localWritesFenced(auditStore.rootStore ?? auditStore)) continue;
 			syncedFences.delete(auditStore);
 			await persistLocalWriteFence(auditStore, undefined);
 			setLocalWriteFence(auditStore.rootStore ?? auditStore, false);

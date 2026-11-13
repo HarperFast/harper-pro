@@ -1024,9 +1024,10 @@ export function computeExclusionOrigins(databaseName: string): string[] {
 export function receivesDirectlyFrom(nodeName: string, databaseName: string): boolean | undefined {
 	const node = getHDBNodeTable().primaryStore.getSync(nodeName);
 	if (!node) return false;
+	// a database not created here yet may still arrive, so its absence is not an answer
+	if (!getDatabases()[databaseName]) return undefined;
 	if (!isMainThread) {
 		if (isExplicitDatabaseSubscription(node.subscriptions, databaseName)) return undefined;
-		// a database not created here yet may still arrive, so its absence is not an answer
 		const replicatesWith =
 			isReplicatedDatabase(
 				env.get(CONFIG_PARAMS.REPLICATION_DATABASES),
