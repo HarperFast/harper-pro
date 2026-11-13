@@ -175,7 +175,11 @@ async function withFenceLock<T>(work: () => Promise<T>, deadline = performance.n
 
 async function changeFence(request: any, thisNode: string): Promise<FenceState | { cancelled: true }> {
 	const roots = databaseRoots();
-	const fences = [...roots.values()].flat().map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
+	const fences = [...roots.values()]
+		.flat()
+		.filter(canBeFenced)
+		.map(readLocalWriteFence)
+		.filter(Boolean) as LocalWriteFence[];
 	const wasRemoving = fences.some((fence) => fence.state === 'removing');
 	if (request.cancel) {
 		// `force` is the operator's word that the removal finished but its notice never arrived
@@ -268,11 +272,17 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 	return result;
 }
 
+// only a durable-floor (RocksDB) root can hold a fence; reading one on an LMDB root would build a registry it lacks
+const canBeFenced = (auditStore: any): boolean => originFloorsDurable(auditStore.rootStore ?? auditStore);
+
 async function clearFences(roots: Map<string, any[]>): Promise<void> {
 	for (const auditStores of roots.values())
 		for (const auditStore of auditStores) {
-			// a root that was never fenced (one opened on LMDB, say) has nothing to clear
-			if (!readLocalWriteFence(auditStore) && !localWritesFenced(auditStore.rootStore ?? auditStore)) continue;
+			if (
+				!canBeFenced(auditStore) ||
+				(!readLocalWriteFence(auditStore) && !localWritesFenced(auditStore.rootStore ?? auditStore))
+			)
+				continue;
 			syncedFences.delete(auditStore);
 			await persistLocalWriteFence(auditStore, undefined);
 			setLocalWriteFence(auditStore.rootStore ?? auditStore, false);
@@ -288,7 +298,7 @@ async function clearFences(roots: Map<string, any[]>): Promise<void> {
 export async function liftFenceAfterRemoval(removed: boolean): Promise<void> {
 	await withFenceLock(async () => {
 		const roots = databaseRoots();
-		const stores = [...roots.values()].flat();
+		const stores = [...roots.values()].flat().filter(canBeFenced);
 		const fences = stores.map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
 		// a clear whose WAL sync failed leaves the word set with no record
 		if (fences.length === 0 && !stores.some((auditStore) => localWritesFenced(auditStore.rootStore ?? auditStore)))
