@@ -71,7 +71,7 @@ X-Replicate-To: 2;confirm=1
 - **RocksDB:** a peer counts only for records it is resident for; with no residency (every node holds every record), any N peers count. When the written records have different residents, each set of other residents must reach N on its own. A count larger than this node's replication recipients, or than a written record's reachable residents, is refused before the write lands; see [Confirmation Failure After a Local Commit](#confirmation-failure-after-a-local-commit) for failures after it does.
 - **LMDB:** any N peers that replicate the database count, including peers outside the record's residency that hold only an invalidation entry. A count that can't be met waits out the confirmation timeout instead of being refused.
 
-A peer counts only once it has committed every write the sending node sent it before your write was visible, not merely a write with a later timestamp: transactions commit out of timestamp order, so a later-timestamped write can arrive before yours. Peers running a version before 5.4 cannot report this, and count by timestamp as before; so does every peer when the writing node stores the database on LMDB.
+A peer counts only once it has committed every write the sending node sent it before your write was visible, not merely a write with a later timestamp: transactions commit out of timestamp order, so a later-timestamped write can arrive before yours. Peers running a version before 5.5 cannot report this, and count by timestamp as before; so does every peer when the writing node stores the database on LMDB.
 
 A count of `0` or less does not wait.
 

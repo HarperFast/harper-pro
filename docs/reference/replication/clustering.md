@@ -118,6 +118,8 @@ A request for an existing `hostname` record that carries `revoked_certificates` 
 
 Removes a Harper node from the cluster and stops all replication to and from that node. Run it on any member, naming the node to remove.
 
+<VersionBadge type="changed" version="v5.5.0" />
+
 A node accepts writes locally and sends them to its peers afterward, so a live node can hold writes no peer has received yet: writes accepted just before removal, while a peer link was down, or, for a sharded table, writes to records it does not own. `remove_node` does not delete the node's membership until those writes are on its peers:
 
 1. The node being removed stops accepting local writes. A write to it returns `503` ("This node is being removed from its cluster"). Transactions it already started commit. This fence is persisted, so the node stays fenced across a restart. Writes it receives from peers still apply. The `system` database is not fenced.
@@ -141,9 +143,9 @@ The wait has a limit (`timeout`, five minutes by default). When it runs out, the
 
 - `operation` _(required)_ — must be `remove_node`
 - `hostname` _(required)_ — hostname of the node to remove
-- `timeout` _(optional)_ — milliseconds to wait for the node's writes to reach its peers; default `300000`
-- `force` _(optional)_ — remove without fencing the node or waiting; writes only it holds may be lost
-- `cancel` _(optional)_ — stop a removal that timed out: the node accepts local writes again and stays a member. Refused once the removal has been finalized, just before the membership is deleted; then run `remove_node` again to complete it. If a removal completed but the removed node never received its notice (it was unreachable), it keeps refusing local writes: run `remove_node_fence` on that node with `node` set to its own name, `cancel: true` and `force: true`.
+- `timeout` _(optional)_ <VersionBadge version="v5.5.0" /> — milliseconds to wait for the node's writes to reach its peers; default `300000`
+- `force` _(optional)_ <VersionBadge version="v5.5.0" /> — remove without fencing the node or waiting; writes only it holds may be lost
+- `cancel` _(optional)_ <VersionBadge version="v5.5.0" /> — stop a removal that timed out: the node accepts local writes again and stays a member. Refused once the removal has been finalized, just before the membership is deleted; then run `remove_node` again to complete it. If a removal completed but the removed node never received its notice (it was unreachable), it keeps refusing local writes: run `remove_node_fence` on that node with `node` set to its own name, `cancel: true` and `force: true`.
 
 **Request**:
 
