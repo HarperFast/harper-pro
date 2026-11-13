@@ -78,14 +78,17 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 		const writing = call(a, 'GatedLockedWrite/', { id, n: 5, lease: 60_000, timeout: 10_000 }).finally(() => {
 			settled = true;
 		});
-		await waitForCondition(async () => ((await call(a, 'GateControl/', { id })).body?.waiting ? true : undefined), {
-			timeoutMs: 30_000,
-			description: 'the gated write to hold its cluster lock',
-		});
+		await waitForCondition(
+			async (signal) => ((await call(a, 'GateControl/', { id }, signal)).body?.waiting ? true : undefined),
+			{
+				timeoutMs: 30_000,
+				description: 'the gated write to hold its cluster lock',
+			}
+		);
 		await stopNodeProcess(b);
 		const opened = performance.now();
 		assert.equal((await call(a, 'GateControl/', { id, open: true })).body.waiting, true);
-		await waitForCondition(async () => ((await counter(a, id))?.n === 5 ? true : undefined), {
+		await waitForCondition(async (signal) => ((await counter(a, id, signal))?.n === 5 ? true : undefined), {
 			timeoutMs: CONFIRMATION_TIMEOUT_MS,
 			description: 'the locked write to commit locally',
 		});
