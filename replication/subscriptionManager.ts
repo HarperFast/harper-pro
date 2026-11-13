@@ -1026,15 +1026,14 @@ export function receivesDirectlyFrom(nodeName: string, databaseName: string): bo
 	if (!node) return false;
 	if (!isMainThread) {
 		if (isExplicitDatabaseSubscription(node.subscriptions, databaseName)) return undefined;
+		// a database not created here yet may still arrive, so its absence is not an answer
 		const replicatesWith =
-			(Boolean(getDatabases()[databaseName]) || Boolean(node.isLeader)) &&
 			isReplicatedDatabase(
 				env.get(CONFIG_PARAMS.REPLICATION_DATABASES),
 				databaseName,
 				() => node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD),
 				false
-			) &&
-			selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
+			) && selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
 		return replicatesWith ? undefined : false;
 	}
 	const matchingRoute = routes.find((route) => route.name === nodeName);

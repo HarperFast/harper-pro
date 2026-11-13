@@ -3342,8 +3342,10 @@ export function cursorBelowFloor(floor: number): number {
  * Raise a non-negative status slot to `value` unless it already holds as much. Sockets on different workers write the
  * same slot; a non-negative double's bits order like the number, so a compare-and-swap on them never lowers it.
  */
+const statusBits = new WeakMap<Float64Array, BigInt64Array>();
 export function raiseStatusSlot(status: Float64Array, position: number, value: number): boolean {
-	const bits = new BigInt64Array(status.buffer, status.byteOffset, status.length);
+	let bits = statusBits.get(status);
+	if (!bits) statusBits.set(status, (bits = new BigInt64Array(status.buffer, status.byteOffset, status.length)));
 	FLOOR_SCRATCH[0] = value;
 	const next = FLOOR_BITS[0];
 	for (;;) {

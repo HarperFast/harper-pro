@@ -128,6 +128,11 @@ function requiredPeers(
 			);
 		const others = members.filter((name: string) => name !== thisNode && peers.includes(name));
 		if (others.length > 0) shardOwners.push(others);
+		else if (members.some((name: string) => name !== thisNode))
+			throw new ClientError(
+				`${thisNode} sends database ${database} to no owner of shard ${shard}, so its writes to that shard's records exist only on it. Use force: true to remove it anyway`,
+				409
+			);
 	}
 	return { peers, sharded: true, shardOwners };
 }
