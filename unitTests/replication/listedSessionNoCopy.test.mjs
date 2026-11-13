@@ -129,6 +129,11 @@ describe('copyBoundScope', () => {
 		assert.deepEqual(copyBoundScope(undefined, ['origin'], 'self'), { log: 'origin' });
 	});
 
+	it('takes the last listed log, which such a request replays', () => {
+		assert.deepEqual(copyBoundScope(undefined, ['self', 'origin'], 'self'), { log: 'origin' });
+		assert.strictEqual(copyBoundScope(undefined, ['origin', 'self'], 'self'), undefined);
+	});
+
 	it("covers nothing when such a request replays only this node's own log", () => {
 		// a sharded session is restricted to it
 		assert.strictEqual(copyBoundScope(undefined, ['self'], 'self'), undefined);

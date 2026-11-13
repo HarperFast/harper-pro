@@ -918,8 +918,8 @@ export function withheldRecordAction(
 
 /**
  * The logs a session's copy-bound checks cover: every relayed log of an aggregate range (one with exclusions), or the
- * one log a request without an exclusion vector replays, when it is another node's (an older receiver's failover).
- * Undefined when the session replays only this node's own log.
+ * one log a request without an exclusion vector replays, its last listed node's, when that is another node's (an older
+ * receiver's failover). Undefined when the session replays only this node's own log.
  */
 export function copyBoundScope(
 	excludedNodes: string[] | undefined,
@@ -927,19 +927,21 @@ export function copyBoundScope(
 	thisNodeName: string
 ): { aggregate: true } | { log: string } | undefined {
 	if (excludedNodes) return { aggregate: true };
-	return listed.length === 1 && listed[0] !== thisNodeName ? { log: listed[0] } : undefined;
+	const replayed = listed[listed.length - 1];
+	return replayed !== undefined && replayed !== thisNodeName ? { log: replayed } : undefined;
 }
 
+export type CopyVeto = { walkStart: number | undefined };
 /**
- * Clears a copy source's veto only while it still names the walk the caller acted for: a later walk's veto, set while
- * an older write was in flight, must survive that write's completion.
+ * Clears a copy source's veto only while it is still the one the caller captured: a later walk's veto, set while an
+ * older write was in flight, must survive that write's completion, even when both walks share a copy start.
  */
 export function clearCopyVeto(
-	vetoed: Map<number, number | undefined> | undefined,
+	vetoed: Map<number, CopyVeto> | undefined,
 	sourceId: number,
-	walkStart: number | undefined
+	captured: CopyVeto | undefined
 ): void {
-	if (vetoed?.has(sourceId) && vetoed.get(sourceId) === walkStart) vetoed.delete(sourceId);
+	if (captured !== undefined && vetoed?.get(sourceId) === captured) vetoed.delete(sourceId);
 }
 
 /** Whether a persisted cursor is a newer pass's than the vetoed walk, which ends the veto. */
@@ -5290,7 +5292,7 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	topologyExcluded?: string[];
 	topologyBorrow?: Record<string, string[]>;
 	/** Copy sources that vetoed completing a copy, each with the vetoed walk's copy start. */
-	vetoedCopySources?: Map<number, number | undefined>;
+	vetoedCopySources?: Map<number, CopyVeto>;
 	/** Whether the last subscription request on this route carried every table. */
 	routeFullCoverage?: boolean;
 	latency = 0;
@@ -6134,7 +6136,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (sourceId === undefined) return;
 		// keyed by the received copy start, not a visible cursor's, which can be an older walk's; set before the read
 		const vetoed = (options.connection.vetoedCopySources ??= new Map());
-		vetoed.set(sourceId, copyModeStartTime);
+		vetoed.set(sourceId, { walkStart: copyModeStartTime });
 		try {
 			const cursor = readDbisCursorSync(dbisDB, 'copyCursor', sourceId);
 			if (cursor && !cursor.restartFullCopy) markCopyCursorRestart(sourceId, { ...cursor, restartFullCopy: true });
@@ -6143,10 +6145,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	function markCopyCursorRestart(sourceId: number, cursor: object): void {
-		const walkStart = options.connection?.vetoedCopySources?.get(sourceId);
+		const veto = options.connection?.vetoedCopySources?.get(sourceId);
 		try {
 			Promise.resolve(getDatabaseStores().dbisDB.put([Symbol.for('copyCursor'), sourceId], cursor)).then(
-				() => clearCopyVeto(options.connection?.vetoedCopySources, sourceId, walkStart),
+				() => clearCopyVeto(options.connection?.vetoedCopySources, sourceId, veto),
 				(error: unknown) =>
 					logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error)
 			);
@@ -7691,7 +7693,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const credit = () => {
 			// a newer pass's cursor has replaced the vetoed walk's; an older pass's late write, or one issued before a
 			// later veto, has not
-			if (cursorEndsCopyVeto(vetoAtWrite, cursor?.copyStartTime))
+			if (vetoAtWrite && cursorEndsCopyVeto(vetoAtWrite.walkStart, cursor?.copyStartTime))
 				clearCopyVeto(options.connection?.vetoedCopySources, nodeId, vetoAtWrite);
 			noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
 		};
@@ -7704,9 +7706,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	async function removeFinishedCopyCursor(nodeId: number) {
 		const dbisDB = getDatabaseStores().dbisDB;
 		if (!dbisDB?.remove) return;
-		const walkStart = options.connection?.vetoedCopySources?.get(nodeId);
+		const veto = options.connection?.vetoedCopySources?.get(nodeId);
 		await dbisDB.remove([Symbol.for('copyCursor'), nodeId]);
-		clearCopyVeto(options.connection?.vetoedCopySources, nodeId, walkStart);
+		clearCopyVeto(options.connection?.vetoedCopySources, nodeId, veto);
 		noteCopyStall((tracker) => tracker.noteDurableProgress());
 	}
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
