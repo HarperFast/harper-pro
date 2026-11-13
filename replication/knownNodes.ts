@@ -1070,7 +1070,9 @@ const demandByStore = new WeakMap<object, ReturnType<typeof confirmationDemand>>
 function demandFor(databaseName: string): ReturnType<typeof confirmationDemand> | undefined {
 	for (const tableName in databases[databaseName] ?? {}) {
 		const auditStore = databases[databaseName][tableName].auditStore;
-		if (typeof auditStore?.getUserSharedBuffer !== 'function') continue;
+		if (!auditStore) continue;
+		// an LMDB writer's senders keep the key rule and never read a demand buffer
+		if (auditStore.reusableIterable !== true) return;
 		let demand = demandByStore.get(auditStore);
 		if (!demand) demandByStore.set(auditStore, (demand = confirmationDemand(auditStore, databaseName)));
 		return demand;

@@ -144,13 +144,14 @@ export async function removeNodeFence(
 }
 
 const FENCE_LOCK_KEY = [Symbol.for('remove-node-fence')];
+class FenceLockTimeout extends ServerError {}
 const syncedFences = new WeakMap<object, string>();
 
 async function withFenceLock<T>(work: () => Promise<T>, deadline = performance.now() + CALL_TIMEOUT_MS): Promise<T> {
 	const store = getHDBNodeTable().primaryStore;
 	for (;;) {
 		if (performance.now() > deadline)
-			throw new ServerError(`Timed out waiting for another ${FENCE_OPERATION} on this node to finish`, 503);
+			throw new FenceLockTimeout(`Timed out waiting for another ${FENCE_OPERATION} on this node to finish`, 503);
 		if (store.tryLock(FENCE_LOCK_KEY)) break;
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
@@ -206,7 +207,6 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 		for (const auditStore of auditStores) {
 			const rootStore = auditStore.rootStore ?? auditStore;
 			const existing = readLocalWriteFence(auditStore);
-			// the fence is set before the target is taken, so the target is above every write it admitted
 			const fenceTarget =
 				existing && isValidFloor(existing.target) ? existing.target : setLocalWriteFence(rootStore, true);
 			if (existing && !localWritesFenced(rootStore)) setLocalWriteFence(rootStore, true);
@@ -402,8 +402,8 @@ export async function drainNode(
 		try {
 			fence = await call(name, record, { operation: FENCE_OPERATION, node: name });
 		} catch (error) {
-			// a local fence change that could not get the lock before the deadline
-			if (error instanceof OutOfBudget || (local && remaining() <= MIN_CALL_MS)) break;
+			// a local fence change that could not get the lock before the drain deadline
+			if (error instanceof OutOfBudget || (error instanceof FenceLockTimeout && remaining() <= MIN_CALL_MS)) break;
 			if (unsupportedOperation(error))
 				throw new ClientError(
 					`${name} runs a version that cannot drain its writes before removal; upgrade it, or use force: true to remove it without draining`,
@@ -424,6 +424,10 @@ export async function drainNode(
 		const notSubscribed: Record<string, number> = {};
 		let budgetSpent = false;
 		for (const [peer, peerDatabases] of byPeer) {
+			if (remaining() <= MIN_CALL_MS) {
+				budgetSpent = true;
+				break;
+			}
 			let answers: Record<string, ReceivedFloor>;
 			try {
 				answers = await call(peer, peer === thisNode ? undefined : await nodeRecord(peer), {
@@ -481,7 +485,7 @@ export async function drainNode(
 				for (const database in finalized.databases) finalized.databases[database].peers = holders[database] ?? [];
 				return finalized;
 			} catch (error) {
-				if (error instanceof OutOfBudget) break;
+				if (error instanceof OutOfBudget || (error instanceof FenceLockTimeout && remaining() <= MIN_CALL_MS)) break;
 				// 409: a database appeared or the fence changed; the next poll fences and checks it
 				if (local && (error as any)?.statusCode !== 409) throw error;
 				shortfalls = [`${name} did not finalize its removal (${errorText(error)})`];
