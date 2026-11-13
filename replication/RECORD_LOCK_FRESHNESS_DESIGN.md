@@ -114,8 +114,9 @@ record of that origin and table this node dropped or failed to apply. Those are 
     `OWN_LINEAGE_POLL_MS` until the lock deadline, counted against `MAX_OUTSTANDING_BARRIERS`) until
     every cursor peer and home has reported returning this node's writes for that epoch. The epoch's
     start is not a proven boundary, so no position before `before` is taken as intact on its own. A
-    report of a failed read, or of a purge past the log's last key, rejects at once
-    (`own-lineage-unprovable`). An own-origin poison row rejects before and again after the wait.
+    peer's report of a purge past the log's last key, or an epoch that could not be recorded, rejects
+    at once (`own-lineage-unprovable`); a failed read is asked again, not recorded. An own-origin
+    poison row rejects before and again after the wait.
   - otherwise the origin must be in `homeMap().homes` at the exact capability level, the table must
     replicate (`replicate !== false`), and `(database, origin, table)` must not be poisoned — any
     failure rejects at once with a 503 naming which. Then request a barrier from the origin

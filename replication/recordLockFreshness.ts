@@ -374,16 +374,16 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	) => {
 		ownWaits++;
 		try {
-			for (;;) {
-				if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
-				if (checkOwnLineage(position, homes)) break;
+			// establish checked once already
+			do {
 				if (deps.monotonicNow() >= deadlineMono)
 					reject(
 						'own-lineage-gap',
 						`this node is still recovering its own writes on ${database} from its peers after a restart`
 					);
 				await new Promise<void>((resolve) => setTimer(resolve, OWN_LINEAGE_POLL_MS));
-			}
+				if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
+			} while (!checkOwnLineage(position, homes));
 		} finally {
 			ownWaits--;
 		}

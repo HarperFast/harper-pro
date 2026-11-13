@@ -8939,7 +8939,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const peer = remoteNodeName;
 						const reportDatabase = databaseName;
 						const rootStore = (auditStore ?? getDatabaseStores().auditStore)?.rootStore;
-						// Queued behind every entry received before it; its commit callback runs once they committed.
+						// its onCommit runs only after every entry received before it committed
 						const barrierEvent: any = {
 							type: 'end_txn',
 							remoteNodeIds: [],
@@ -13132,6 +13132,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				sendSubscriptionRequestUpdate();
 			} catch (error) {
 				logger.warn?.(connectionId, 'could not ask again for own-origin writes', databaseName, error);
+				askOwnOriginAgain();
 			}
 		}, delayMs).unref();
 	}

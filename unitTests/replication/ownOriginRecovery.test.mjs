@@ -3,7 +3,14 @@
  * proves own lineage, which subscription a sender treats as a recovery range, and the coalesced flush.
  */
 import assert from 'node:assert';
-import { flushAfterNow, lineageFromReports, nextEpoch, recoveryStart } from '#src/replication/ownOriginRecovery';
+import {
+	flushAfterNow,
+	lineageFromReports,
+	markOwnOriginRecoveryFailed,
+	nextEpoch,
+	ownLineage,
+	recoveryStart,
+} from '#src/replication/ownOriginRecovery';
 import { findOwnOriginRecoveryRange, ORIGIN_CURSOR_OVERLAP_MS } from '#src/replication/replicationConnection';
 import {
 	buildLocalCapabilities,
@@ -180,5 +187,20 @@ describe('flushAfterNow', () => {
 		await assert.rejects(flushAfterNow(store), /stall/);
 		await flushAfterNow(store);
 		assert.strictEqual(calls, 2);
+	});
+});
+
+describe('markOwnOriginRecoveryFailed', () => {
+	it('makes own lineage unprovable for that database only, through the env workers inherit', () => {
+		const saved = process.env.HARPER_OWN_ORIGIN_RECOVERY_FAILED;
+		try {
+			markOwnOriginRecoveryFailed('own-origin-failed-db');
+			assert.strictEqual(ownLineage('own-origin-failed-db', null, [], 'self').state, 'unprovable');
+			assert.match(process.env.HARPER_OWN_ORIGIN_RECOVERY_FAILED, /own-origin-failed-db/);
+			assert.strictEqual(ownLineage('own-origin-other-db', null, [], 'self').state, 'intact');
+		} finally {
+			if (saved === undefined) delete process.env.HARPER_OWN_ORIGIN_RECOVERY_FAILED;
+			else process.env.HARPER_OWN_ORIGIN_RECOVERY_FAILED = saved;
+		}
 	});
 });

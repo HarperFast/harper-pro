@@ -5,7 +5,7 @@
  * where an own write can be missing here yet held by a peer. Every capable peer is asked for its entries
  * of this node's origin in that window over the ordinary subscription, and reports once it has sent them;
  * record-lock freshness refuses own lineage in the window until every peer that may hold it has reported.
- * Design: replication/DESIGN.md "Own-origin recovery".
+ * Design: replication/DESIGN.md, non-obvious behavior 39.
  *
  * State lives in the database's `dbis` store so every thread reads the same facts: the epoch row, written
  * on the main thread before workers start, and one report row per peer, written by whichever thread holds
@@ -24,6 +24,8 @@ import { existingRow as existingHomesRow } from './recordLockHomes.ts';
 import { findLastCommittedLogKey, ORIGIN_CURSOR_OVERLAP_MS } from './replicationConnection.ts';
 
 const EPOCH = Symbol.for('ownOriginRecovery');
+// Databases whose epoch could not be opened, set on the main thread before workers start, which copy the env.
+const FAILED_ENV = 'HARPER_OWN_ORIGIN_RECOVERY_FAILED';
 const REPORT = Symbol.for('ownOriginRecovered');
 const MIN_START = 1;
 
@@ -104,10 +106,23 @@ function peersWithCursors(dbisDB: any, auditStore: any): string[] {
 	return [...names];
 }
 
+/** Own lineage on `database` stays unprovable in this process and the workers it starts. */
+export function markOwnOriginRecoveryFailed(database: string): void {
+	const failed = new Set((process.env[FAILED_ENV] ?? '').split('\n').filter(Boolean));
+	failed.add(database);
+	process.env[FAILED_ENV] = [...failed].join('\n');
+	cachedEpochs.delete(database);
+}
+
+function recoveryFailed(database: string): boolean {
+	return (process.env[FAILED_ENV] ?? '').split('\n').includes(database);
+}
+
 /**
  * Open this start's epoch for one database, before any worker writes to it: the row is written
  * synchronously so the first subscription a worker builds sees it, and the caller awaits the WAL sync
- * this returns before workers start. A failure to read the log opens the widest window rather than none.
+ * this returns before workers start. A failure to read the log opens the widest window rather than none;
+ * a failure to write or sync the row is the caller's to mark (`markOwnOriginRecoveryFailed`).
  */
 export function openOwnOriginRecoveryEpoch(database: string, auditStore: any, dbisDB: any): Promise<void> | undefined {
 	const rootStore = auditStore?.rootStore;
@@ -174,7 +189,7 @@ function cleanReport(report: OwnOriginReport | undefined, epoch: OwnOriginEpoch)
  * every cursor peer and lock home still a member reported cleanly, so the next start does not carry its
  * window forward. A failed read is no answer: it throws, so the peer is asked again.
  */
-export async function recordReport(database: string, peer: string, report: OwnOriginReport): Promise<void> {
+async function recordReport(database: string, peer: string, report: OwnOriginReport): Promise<void> {
 	if (report.failed) throw new Error(`${peer} could not read this node's writes cleanly`);
 	const dbisDB = dbisFor(database);
 	if (!dbisDB) throw new Error(`no dbis store for ${database}`);
@@ -216,6 +231,8 @@ export function ownLineage(
 	self: string,
 	memberCheck: (name: string) => boolean = isMember
 ): OwnLineage {
+	if (recoveryFailed(database))
+		return { state: 'unprovable', detail: 'its recovery epoch could not be recorded at startup' };
 	let cached = cachedEpochs.get(database);
 	if (!cached) {
 		cached = { epoch: readEpoch(dbisFor(database)), clean: new Set() };
