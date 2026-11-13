@@ -7,13 +7,15 @@
  * page cache without an fsync. rocksdb-js syncs log files only when a memtable flush begins, when an
  * abort marker is written, and before retention deletes a store's last file. A power loss keeps every
  * fsynced byte and may drop any page-cache write. `kill -9` drops the memtable but keeps the page cache,
- * so the test also drops the page cache's share: it restores A's own-origin log store (`local`) to a
- * copy taken while A was idle, before the writes, after checking that no flush started and no purge ran
- * in between. Every other file keeps what was written (the state most favorable to recovery).
+ * so the test drops the page cache's share by hand: it restores A's own-origin log store (`local`) to a
+ * copy taken while A was idle, before the writes. It checks that no flush started and no purge ran in
+ * between; it does not check for abort markers or kernel writeback, so the restore is a forced
+ * truncation to a state power loss can leave, not proof that this run's bytes were unsynced. Every other
+ * file keeps what was written (the state most favorable to recovery).
  *
- * The expected behavior (A converges to what B confirmed, and a lock taken on A sees the lost write)
- * fails on main, so those two tests are marked `todo`. Everything that proves the simulation and the
- * cluster are valid is asserted for real.
+ * The expected behavior fails on main, so those two tests are `todo`. They run in the order a fixed
+ * node would meet them: a lock right after the reconnect (before any catch-up could hide a stale admit),
+ * then convergence within a bounded wait.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,9 +28,9 @@ import {
 	DB,
 	bootstrapHomeMap,
 	call,
-	clusterStatusOf,
 	connectMesh,
 	counter,
+	keyHomedOn,
 	putCounter,
 	restartStoppedNode,
 	startNode,
@@ -39,27 +41,24 @@ import {
 } from './recordLockShared.mjs';
 
 const ISSUE = 'harper-pro#1364: a restarted origin does not recover its own lost writes from peers';
-/** How long the expected-to-fail convergence check waits once both streams are proven live. */
 const SETTLE_MS = 30_000;
 
 const dataDbDir = (node) => join(node.dataRootDir, 'database', DB);
 const ownLogDir = (node) => join(dataDbDir(node), 'transaction_logs', 'local');
 
-/** File name -> size for a directory, so a snapshot can be compared with what came after it. */
 async function fileSizes(directory) {
 	const sizes = {};
 	for (const name of await readdir(directory)) sizes[name] = (await stat(join(directory, name))).size;
 	return sizes;
 }
 
-/** SST and MANIFEST files of the data database: a flush or compaction adds or replaces them. */
 async function tableFiles(node) {
 	return (await readdir(dataDbDir(node)))
 		.filter((name) => name.endsWith('.sst') || name.startsWith('MANIFEST-'))
 		.sort();
 }
 
-/** How many memtable flushes RocksDB's info log records as started. rocksdb-js syncs the transaction logs then. */
+/** rocksdb-js syncs the transaction logs when a memtable flush begins. */
 async function flushesStarted(node) {
 	let count = 0;
 	for (const name of await readdir(dataDbDir(node))) {
@@ -77,28 +76,6 @@ async function upsertConfirmed(node, record) {
 		{ signal: AbortSignal.timeout(30_000) }
 	);
 	assert.deepEqual(response.upserted_hashes, [record.id], JSON.stringify(response));
-}
-
-async function lockStats(node, signal) {
-	return (await clusterStatusOf(node, signal)).recordLocks?.[DB];
-}
-
-/** A fresh key homed on `target`: the node whose `granted` count rises when `from` locks it (as recordLockRestart.test.mjs). */
-async function keyHomedOn(nodes, target, from, prefix) {
-	for (let i = 0; i < 64; i++) {
-		const id = `${prefix}-${Date.now()}-${i}`;
-		await putCounter(from, id, 0);
-		await waitForCounter(nodes, id, 0);
-		const before = await Promise.all(nodes.map((node) => lockStats(node).then((stats) => stats?.granted ?? 0)));
-		const held = await call(from, 'LockHold/', { id, lease: 5_000, timeout: 10_000 });
-		if (held.status === 503) continue;
-		assert.equal(held.status, 200, JSON.stringify(held.body));
-		await call(from, 'LockRelease/', { token: held.body.token });
-		const after = await Promise.all(nodes.map((node) => lockStats(node).then((stats) => stats?.granted ?? 0)));
-		const home = nodes.findIndex((_, index) => after[index] > before[index]);
-		if (home >= 0 && nodes[home] === target) return id;
-	}
-	throw new Error(`no key homed on ${target.hostname} found in 64 probes`);
 }
 
 async function waitForProcessGone(pid) {
@@ -127,6 +104,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 	let nodeA;
 	let nodeB;
 	let lockKey;
+	let simulated = false;
 	const baseline = {};
 
 	before(async () => {
@@ -145,7 +123,6 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		lockKey = await keyHomedOn([nodeA, nodeB], nodeB, nodeA, 'locked');
 		await waitForCounter([nodeA, nodeB], 'upd', 1);
 
-		// Baseline: A idle, its own log no longer growing.
 		let previous;
 		await waitForCondition(
 			async () => {
@@ -163,7 +140,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		baseline.tableFiles = await tableFiles(nodeA);
 		baseline.flushes = await flushesStarted(nodeA);
 
-		// The writes power loss will take from A, each confirmed by B before it returns.
+		// The writes power loss takes from A.
 		await upsertConfirmed(nodeA, { id: 'ins', n: 1 });
 		await upsertConfirmed(nodeA, { id: 'ins', n: 2 });
 		await upsertConfirmed(nodeA, { id: 'upd', n: 2 });
@@ -230,13 +207,28 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			{ ins: 2, upd: 2, [lockKey]: 1 },
 			'B still holds every write it confirmed'
 		);
-		// B -> A is flowing again, so anything B could send A has a live path.
 		await putCounter(nodeB, 'sentinel-from-b', 1);
 		await waitForCounter([nodeA], 'sentinel-from-b', 1);
+		simulated = true;
+	});
+
+	test('a lock taken on A after the restart sees the lost write', { todo: ISSUE }, async (t) => {
+		if (!nodeA) return t.skip('RocksDB only');
+		assert.ok(simulated, 'runs only after the power-loss simulation test passed');
+		// lockKey is homed on B, whose last grant was to A for the write A lost.
+		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
+		const onB = await counter(nodeB, lockKey).catch(() => undefined);
+		assert.equal(increment.status, 200, `the lock on A was refused: ${JSON.stringify(increment.body)}`);
+		assert.equal(
+			increment.body.n,
+			2,
+			`the lock on A answered n=${increment.body.n}: admitted without A's lost increment (expected 2); B now reads ${onB?.n}`
+		);
 	});
 
 	test('A recovers its own writes from B', { todo: ISSUE }, async (t) => {
 		if (!nodeA) return t.skip('RocksDB only');
+		assert.ok(simulated, 'runs only after the power-loss simulation test passed');
 		let onA;
 		await waitForCondition(
 			async () => {
@@ -248,19 +240,6 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 				pollMs: 1000,
 				description: () => `A to hold B's confirmed ins=2, upd=2; A reads ${JSON.stringify(onA)}`,
 			}
-		);
-	});
-
-	test('a lock taken on A after the restart sees the lost write', { todo: ISSUE }, async (t) => {
-		if (!nodeA) return t.skip('RocksDB only');
-		// lockKey is homed on B, whose last grant was to A for the write A lost.
-		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
-		const onB = await counter(nodeB, lockKey).catch(() => undefined);
-		assert.equal(increment.status, 200, `the lock on A was refused: ${JSON.stringify(increment.body)}`);
-		assert.equal(
-			increment.body.n,
-			2,
-			`the lock on A answered n=${increment.body.n}: admitted without A's lost increment (expected 2); B now reads ${onB?.n}`
 		);
 	});
 });

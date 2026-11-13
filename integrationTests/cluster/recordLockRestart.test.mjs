@@ -24,11 +24,11 @@ import {
 	call,
 	clusterStatusOf,
 	connectMesh,
+	keyHomedOn,
+	lockStats,
 	controlEntries,
-	putCounter,
 	startNode,
 	stopNode,
-	waitForCounter,
 	waitForMesh,
 	waitForRing,
 } from './recordLockShared.mjs';
@@ -37,31 +37,6 @@ import {
 const RECALL_BOUND_MS = 90_000;
 /** How long a quarantined home is watched to show the timer is still in force. */
 const TIMER_WATCH_MS = 15_000;
-
-async function lockStats(node, signal) {
-	return (await clusterStatusOf(node, signal)).recordLocks?.[DB];
-}
-
-/**
- * A fresh key homed on `target`: the node whose `granted` count rises when `from` locks it. A probe
- * refused with 503 (the key's home is quarantined) is skipped rather than failed.
- */
-async function keyHomedOn(nodes, target, from, prefix) {
-	for (let i = 0; i < 64; i++) {
-		const id = `${prefix}-${Date.now()}-${i}`;
-		await putCounter(from, id, 0);
-		await waitForCounter(nodes, id, 0);
-		const before = await Promise.all(nodes.map((node) => lockStats(node).then((stats) => stats?.granted ?? 0)));
-		const held = await call(from, 'LockHold/', { id, lease: 5_000, timeout: 10_000 });
-		if (held.status === 503) continue;
-		assert.equal(held.status, 200, JSON.stringify(held.body));
-		await call(from, 'LockRelease/', { token: held.body.token });
-		const after = await Promise.all(nodes.map((node) => lockStats(node).then((stats) => stats?.granted ?? 0)));
-		const home = nodes.findIndex((_, index) => after[index] > before[index]);
-		if (home >= 0 && nodes[home] === target) return id;
-	}
-	throw new Error(`no key homed on ${target.hostname} found in 64 probes`);
-}
 
 /**
  * Restart `node` and return once its NEW incarnation answers `cluster_status` and, when `mesh` is
