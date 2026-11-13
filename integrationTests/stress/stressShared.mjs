@@ -416,7 +416,10 @@ export async function waitForAllConnected(node, opts = {}) {
 			last &&
 			last.peers.length > 0 &&
 			last.peers.every(
-				(p) => Object.values(p.dbs).every((d) => d.connected) && databases.every((db) => p.dbs[db]?.connected)
+				(p) =>
+					Object.keys(p.dbs).length > 0 &&
+					Object.values(p.dbs).every((d) => d.connected) &&
+					databases.every((db) => p.dbs[db]?.connected)
 			)
 		) {
 			return last;
