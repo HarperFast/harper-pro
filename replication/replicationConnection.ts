@@ -612,8 +612,8 @@ const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWater
 // receiver moves past it, so a failure that recurs on every delivery cannot stall a peer's replication forever.
 const FAILED_FRAME_REPLAYS = env.get('replication_failedFrameReplays') ?? 5;
 const failedFrameAttempts = new Map<string, { position: number; attempts: number }>();
-// `<peer>/<database>` routes that skipped a frame: a later marker would cover the skipped write, so this process
-// acknowledges none on any later connection of that route
+// `<peer>/<database>` routes that skipped a frame or a blob the source could not send: a later marker would cover
+// the skipped write, so this process acknowledges none on any later connection of that route
 const markersWithheldRoutes = new Set<string>();
 /** Attempts are counted per peer and database across reconnects; a later position's commit clears them. */
 export function holdFailedFrame(
@@ -12991,6 +12991,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// forever and block every healthy record behind it (harper-pro#403). Leave `hasBlobGap`
 						// unset so the watermark advances past it; the diverged record is left for proactive
 						// blob backfill (harper-pro#388). Recorded loudly below so the skip is never silent.
+						// The cursor may pass it, but no marker may vouch for delivery: one held now, or any later.
+						markersWithheldRoutes.add(`${remoteNodeName}/${databaseName}`);
 						const escalation = getBlobGapEscalation(err);
 						logger.error?.(
 							escalation

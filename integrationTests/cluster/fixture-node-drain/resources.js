@@ -1,4 +1,34 @@
-import { existsSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, writeFileSync } from 'node:fs';
+
+// HARPER_TEST_FAIL_BLOB_READS=1: every read of a blob file fails with ENOENT, so this node can store blobs but
+// never send one, as when a blob is gone at the source (the sender forwards a BLOB_CHUNK error marker).
+if (process.env.HARPER_TEST_FAIL_BLOB_READS === '1') {
+	const open = fs.open;
+	fs.open = function (path, flags, mode, callback) {
+		const done = [callback, mode, flags].find((argument) => typeof argument === 'function');
+		if (typeof path === 'string' && path.includes('/blobs/') && (flags === 'r' || typeof flags === 'function')) {
+			const error = Object.assign(new Error(`ENOENT: no such file or directory, open '${path}'`), {
+				code: 'ENOENT',
+				errno: -2,
+				syscall: 'open',
+				path,
+			});
+			process.nextTick(() => done(error));
+			return;
+		}
+		return open.apply(this, arguments);
+	};
+}
+
+export class BlobWrite extends Resource {
+	static loadAsInstance = false;
+
+	async post(target, { database, table, id }) {
+		const data = createBlob(Buffer.alloc(64 * 1024, 7), { saveBeforeCommit: true });
+		await (database ? databases[database] : tables)[table].put({ id, data });
+		return { written: id };
+	}
+}
 
 export class HeldWrite extends Resource {
 	static loadAsInstance = false;
