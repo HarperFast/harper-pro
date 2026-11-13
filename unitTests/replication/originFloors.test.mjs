@@ -1127,7 +1127,8 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.deepStrictEqual(vector, {
 			peer: cursorBelowFloor(T + 10),
 			relayed: cursorBelowFloor(T + 20),
-			other: cursorBelowFloor(T + 30),
+			// a removed origin keeps its position: its floor stops advancing once it leaves
+			other: T + 300,
 		});
 		assert.deepStrictEqual(reported, [
 			[1, cursorBelowFloor(T + 10), 'g1'],

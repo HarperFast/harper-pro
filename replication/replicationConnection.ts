@@ -4380,7 +4380,7 @@ export function buildOriginCursorVector(
 	/** Highest copied record version per origin from an audit-less base copy; a floor at or below it must not resume floor-only. */
 	minFloorOnlyStart?: ReadonlyMap<number, number>
 ): Record<string, number> {
-	const cursorOf = (node: any, allowFloorOnly = true): number | undefined => {
+	const cursorOf = (node: any, allowFloorOnly: boolean, member: boolean): number | undefined => {
 		const position = isValidFrameTxnLogKey(node?.originLogKey) ? node.originLogKey : undefined;
 		if (!useFloors || !isValidFloor(node?.closedFloor)) return position;
 		// a checkpoint-grade row resumes exactly below its floor, so a transaction reserved below the
@@ -4393,6 +4393,13 @@ export function buildOriginCursorVector(
 				return start;
 			}
 		}
+		// A removed origin's floor stops advancing, so resuming below it would resend everything since on every
+		// reconnect (harper-pro#989). It commits nothing past its position any more (fenced and drained, or forced
+		// out and no longer sent here), and the sender starts it ORIGIN_CURSOR_OVERLAP_MS below the cursor.
+		if (!member)
+			return position === undefined
+				? cursorBelowFloor(node.closedFloor)
+				: Math.max(position, cursorBelowFloor(node.closedFloor));
 		return cursorBelowFloor(node.closedFloor);
 	};
 	const cursors = new Map<string, number>();
@@ -4401,7 +4408,7 @@ export function buildOriginCursorVector(
 		if (!node || typeof node !== 'object' || node.id === 0 || (admits && !admits(peerId, node.id))) continue;
 		const name = nameForId(node.id);
 		if (name === undefined) continue;
-		const cursor = cursorOf(node, true);
+		const cursor = cursorOf(node, true, isMember(name));
 		if (cursor !== undefined) cursors.set(name, cursor);
 	}
 	for (const [id, row] of seqRows) {
@@ -4412,6 +4419,7 @@ export function buildOriginCursorVector(
 		const cursor =
 			cursorOf(
 				ownNodes.find((node) => node?.id === id),
+				false,
 				false
 			) ?? row.seqId;
 		if (isValidFrameTxnLogKey(cursor) && cursor > 1) cursors.set(name, cursor);
