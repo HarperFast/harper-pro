@@ -113,25 +113,35 @@ describe('lineageFromReports', () => {
 });
 
 describe('findOwnOriginRecoveryRange', () => {
-	const range = { name: 'receiver', startTime: NOW - 60_000, endTime: NOW };
+	const range = { name: 'receiver', startTime: NOW - 60_000, endTime: NOW, ownOriginRecovery: true };
 	const subscriptions = [{ name: 'sender', startTime: NOW - 5_000 }, range];
 	it("finds the receiver's own bounded range from a receiver with the capability", () => {
 		assert.strictEqual(findOwnOriginRecoveryRange(subscriptions, 'receiver', true), range);
 	});
-	it("leaves an older receiver's failover self catch-up, another node's range, and an unbounded one alone", () => {
+	it("leaves an older receiver's request, a failover self catch-up, another node's range, and an unbounded one alone", () => {
 		assert.strictEqual(findOwnOriginRecoveryRange(subscriptions, 'receiver', false), undefined);
+		const failover = { name: 'receiver', startTime: NOW - 1_000, endTime: NOW };
+		assert.strictEqual(findOwnOriginRecoveryRange([{ name: 'sender' }, failover, range], 'receiver', true), range);
 		assert.strictEqual(findOwnOriginRecoveryRange(subscriptions, 'other', true), undefined);
 		assert.strictEqual(
-			findOwnOriginRecoveryRange([{ name: 'receiver', startTime: NOW - 60_000 }], 'receiver', true),
+			findOwnOriginRecoveryRange(
+				[{ name: 'receiver', startTime: NOW - 60_000, ownOriginRecovery: true }],
+				'receiver',
+				true
+			),
 			undefined
 		);
 		assert.strictEqual(
-			findOwnOriginRecoveryRange([{ name: 'receiver', startTime: NOW, endTime: NOW }], 'receiver', true),
+			findOwnOriginRecoveryRange(
+				[{ name: 'receiver', startTime: NOW, endTime: NOW, ownOriginRecovery: true }],
+				'receiver',
+				true
+			),
 			undefined
 		);
 	});
 	it('accepts a range starting at 1, which an empty log asks for', () => {
-		const fromOne = { name: 'receiver', startTime: 1, endTime: NOW };
+		const fromOne = { name: 'receiver', startTime: 1, endTime: NOW, ownOriginRecovery: true };
 		assert.strictEqual(findOwnOriginRecoveryRange([fromOne], 'receiver', true), fromOne);
 	});
 });

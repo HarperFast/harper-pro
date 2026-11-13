@@ -441,6 +441,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono))),
 				ownIntact ? undefined : awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono),
 			]);
+			if (!ownIntact && closed) throw unavailable(`record lock freshness for ${database} is closed`);
 			if (dependencies === null) return origins.map((origin, index) => [origin, positions[index]] as const);
 		},
 		noteBarrierApplied(origin, position, nonce) {

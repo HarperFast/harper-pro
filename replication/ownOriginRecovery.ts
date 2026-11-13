@@ -15,10 +15,12 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { getDatabases } from '../core/resources/databases.ts';
+import { getThisNodeName } from '../core/server/nodeName.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
 import { getLogPurgeBounds } from '../core/resources/auditStore.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, probeNodeRow } from './knownNodes.ts';
+import { existingRow as existingHomesRow } from './recordLockHomes.ts';
 import { findLastCommittedLogKey, ORIGIN_CURSOR_OVERLAP_MS } from './replicationConnection.ts';
 
 const EPOCH = Symbol.for('ownOriginRecovery');
@@ -88,7 +90,7 @@ export function nextEpoch(
 }
 
 /** Names of the peers with a replication cursor in this database, i.e. that have sent it here. */
-export function peersWithCursors(dbisDB: any, auditStore: any): string[] {
+function peersWithCursors(dbisDB: any, auditStore: any): string[] {
 	const names = new Set<string>();
 	for (const { key } of dbisDB.getRange({
 		start: Symbol.for('seq'),
@@ -112,6 +114,7 @@ export function openOwnOriginRecoveryEpoch(database: string, auditStore: any, db
 	if (auditStore?.reusableIterable !== true || !dbisDB || typeof rootStore?.getMonotonicTimestamp !== 'function')
 		return undefined;
 	const before = rootStore.getMonotonicTimestamp();
+	const requiredPeers = peersWithCursors(dbisDB, auditStore);
 	let epoch: OwnOriginEpoch;
 	try {
 		epoch = nextEpoch(
@@ -119,11 +122,11 @@ export function openOwnOriginRecoveryEpoch(database: string, auditStore: any, db
 			getLogPurgeBounds(auditStore, 'local')?.get('local'),
 			readEpoch(dbisDB),
 			before,
-			peersWithCursors(dbisDB, auditStore)
+			requiredPeers
 		);
 	} catch (error) {
 		logger.warn?.(`Own-origin recovery: could not read ${database}'s log; asking peers for all of it`, error);
-		epoch = { after: MIN_START, lastKey: 0, before, requiredPeers: [] };
+		epoch = { after: MIN_START, lastKey: 0, before, requiredPeers };
 	}
 	dbisDB.putSync(EPOCH, epoch);
 	cachedEpochs.delete(database);
@@ -133,12 +136,12 @@ export function openOwnOriginRecoveryEpoch(database: string, auditStore: any, db
 	return rootStore.syncWal?.();
 }
 
-export function readEpoch(dbisDB: any): OwnOriginEpoch | undefined {
+function readEpoch(dbisDB: any): OwnOriginEpoch | undefined {
 	const epoch = dbisDB?.getSync(EPOCH);
 	return epoch && typeof epoch.after === 'number' && typeof epoch.before === 'number' ? epoch : undefined;
 }
 
-export function readReport(dbisDB: any, peer: string): OwnOriginReport | undefined {
+function readReport(dbisDB: any, peer: string): OwnOriginReport | undefined {
 	return dbisDB?.getSync([REPORT, peer]);
 }
 
@@ -168,9 +171,11 @@ function cleanReport(report: OwnOriginReport | undefined, epoch: OwnOriginEpoch)
 
 /**
  * Store `peer`'s report; the caller made the rows it returned durable first. Marks the epoch finished once
- * every cursor peer still a member reported cleanly, so the next start does not carry its window forward.
+ * every cursor peer and lock home still a member reported cleanly, so the next start does not carry its
+ * window forward. A failed read is no answer: it throws, so the peer is asked again.
  */
 export async function recordReport(database: string, peer: string, report: OwnOriginReport): Promise<void> {
+	if (report.failed) throw new Error(`${peer} could not read this node's writes cleanly`);
 	const dbisDB = dbisFor(database);
 	if (!dbisDB) throw new Error(`no dbis store for ${database}`);
 	const epoch = readEpoch(dbisDB);
@@ -180,12 +185,16 @@ export async function recordReport(database: string, peer: string, report: OwnOr
 		logger.warn?.(
 			`Own-origin recovery for ${database}: ${peer} purged this node's writes through ${new Date(report.purgedThrough).toISOString()}, past what this node still held; writes it lost before then cannot be recovered, and cluster locks refuse this node's own lineage until it is recloned`
 		);
-	if (report.failed)
-		logger.warn?.(`Own-origin recovery for ${database}: ${peer} could not read this node's writes cleanly`);
 	if (epoch.finished || !cleanReport(report, epoch)) return;
-	for (const name of epoch.requiredPeers) {
-		if (name !== peer && isMember(name) && !cleanReport(readReport(dbisDB, name), epoch)) return;
-	}
+	const homes = (await existingHomesRow(database))?.active?.homes ?? [];
+	const lineage = lineageFromReports(
+		epoch,
+		homes,
+		getThisNodeName(),
+		(name) => (name === peer ? report : readReport(dbisDB, name)),
+		isMember
+	);
+	if (lineage.state !== 'intact') return;
 	await dbisDB.put(EPOCH, { ...epoch, finished: true });
 	logger.info?.(`Own-origin recovery for ${database}: every peer returned this node's writes`);
 }
@@ -235,16 +244,18 @@ export function lineageFromReports(
 	const required = new Set([...epoch.requiredPeers, ...homes]);
 	required.delete(self);
 	for (const peer of required) {
-		if (!memberCheck(peer)) continue;
 		const report = reportOf(peer);
+		if (report && cleanReport(report, epoch)) {
+			onClean?.(peer);
+			continue;
+		}
+		if (!memberCheck(peer)) continue;
 		if (report?.epoch !== epoch.before)
 			return { state: 'pending', detail: `${peer} has not returned this node's writes since it restarted` };
-		if (report.failed || purgedPastLog(report, epoch))
-			return {
-				state: 'unprovable',
-				detail: `${peer} ${report.failed ? 'could not read' : 'had purged'} this node's writes in the recovery window`,
-			};
-		onClean?.(peer);
+		return {
+			state: 'unprovable',
+			detail: `${peer} ${report.failed ? 'could not read' : 'had purged'} this node's writes in the recovery window`,
+		};
 	}
 	return { state: 'intact' };
 }

@@ -338,6 +338,7 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // sender -> receiver: the receiver's own-origin recovery range has been sent in full (harper-pro#1364)
 const OWN_ORIGIN_SENT = 151;
 const OWN_ORIGIN_RETRY_MS = 5_000;
+const OWN_ORIGIN_RETRY_MAX_MS = 300_000;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -4404,9 +4405,9 @@ export interface OwnOriginRecoveryRange {
 }
 
 /**
- * The node subscription naming the receiver itself with a bounded range: its own writes, asked back after a
- * restart (`ownOriginRecovery.ts`). Only from a receiver that advertised the capability; an older one's
- * failover self catch-up has the same shape and keeps its old handling.
+ * The node subscription the receiver tagged as its own writes, asked back after a restart
+ * (`ownOriginRecovery.ts`). Only from a receiver that advertised the capability; a failover self catch-up
+ * names the receiver too and keeps its old handling.
  */
 export function findOwnOriginRecoveryRange(
 	nodeSubscriptions: any[],
@@ -4416,7 +4417,8 @@ export function findOwnOriginRecoveryRange(
 	if (!supported || !receiver) return undefined;
 	return nodeSubscriptions.find(
 		(node) =>
-			node?.name === receiver &&
+			node?.ownOriginRecovery === true &&
+			node.name === receiver &&
 			isValidFrameTxnLogKey(node.startTime) &&
 			isValidFrameTxnLogKey(node.endTime) &&
 			node.startTime < node.endTime
@@ -8926,7 +8928,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					case OWN_ORIGIN_SENT: {
 						const epoch = ownOriginRecoveryRequested;
-						// an unsolicited or repeated report must not clear recovery
 						if (epoch === undefined || data?.epoch !== epoch || !databaseName) break;
 						ownOriginRecoveryRequested = undefined;
 						if (!(await whenSubscriptionResolved()) || wsClosed || connectionSuperseded()) break;
@@ -8943,6 +8944,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							type: 'end_txn',
 							remoteNodeIds: [],
 							txnStream,
+							onFailure(error: unknown, position: number) {
+								askOwnOriginAgain();
+								return onFrameFailure(error, position);
+							},
 							onCommit() {
 								if (!connectionSuperseded())
 									settleOwnOriginReport(reportDatabase, peer, report, rootStore, askOwnOriginAgain);
@@ -9419,7 +9424,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								)
 							: undefined;
 						let ownOriginRangeSettled = false;
-						// read by its own pass, never by the live range
 						if (ownOriginRange && !excludedNodes.includes(ownOriginRange.name)) excludedNodes.push(ownOriginRange.name);
 						const subscriptionSetupRequestId = message[3];
 						let requestedOriginCursors: Record<string, number> | undefined =
@@ -11100,15 +11104,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												currentSequenceId
 											);
 										}
-										// after the first live pass, so it follows any base copy; its end_txn reports the unchanged currentSequenceId
+										// after the first live pass, so after any base copy
 										if (ownOriginRange && !ownOriginRangeSettled) {
 											ownOriginRangeSettled = true;
-											const recoveryRange: any = auditStore.getRange({
-												log: ownOriginRange.name,
-												start: ownOriginRange.startTime,
-												exclusiveStart: true,
-												snapshot: false,
-											});
+											auditStore.loadLogs?.();
+											// a range over a log this node never had would create it
+											const recoveryRange: any = auditStore.logByName?.has(ownOriginRange.name)
+												? auditStore.getRange({
+														log: ownOriginRange.name,
+														start: ownOriginRange.startTime,
+														end: ownOriginRange.endTime,
+														exclusiveStart: true,
+														snapshot: false,
+													})
+												: [];
 											for (const auditRecord of recoveryRange) {
 												if (closed || wsClosed) return;
 												await sendAuditRecord(auditRecord, auditRecord.txnLogKey);
@@ -13038,6 +13047,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let lastSentExcludedNodes: string[] = [];
 	// The recovery epoch this connection's last subscription asked its own writes back for, until answered.
 	let ownOriginRecoveryRequested: number | undefined;
+	let ownOriginRetries = 0;
 	function currentOriginCursorVector(
 		recordOptimistic = false,
 		allowedOptimisticNames?: Set<string>
@@ -13114,8 +13124,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return undefined;
 		}
 	}
-	/** A report that could not be recorded: ask the peer again on this socket, after a pause. */
 	function askOwnOriginAgain() {
+		const delayMs = Math.min(OWN_ORIGIN_RETRY_MS * 2 ** ownOriginRetries++, OWN_ORIGIN_RETRY_MAX_MS);
 		setTimeout(() => {
 			if (wsClosed || connectionSuperseded() || options.connection?.isFinished) return;
 			try {
@@ -13123,7 +13133,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			} catch (error) {
 				logger.warn?.(connectionId, 'could not ask again for own-origin writes', databaseName, error);
 			}
-		}, OWN_ORIGIN_RETRY_MS).unref();
+		}, delayMs).unref();
 	}
 	function sendSubscriptionRequestUpdate() {
 		refreshShardingAdmission();
@@ -13703,6 +13713,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					tables: connected.tables,
 					startTime: recovery.startTime,
 					endTime: recovery.endTime,
+					ownOriginRecovery: true,
 				});
 				ownOriginRecoveryRequested = recovery.endTime;
 			}
