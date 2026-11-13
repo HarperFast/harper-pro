@@ -74,6 +74,13 @@ export const RESIDENCY_NOT_RESIDENT_CAPABILITY = 1;
  */
 export const CONFIRMATION_MARKERS_CAPABILITY = 1;
 
+/**
+ * Level at which a peer serves a receiver's own-origin recovery range in isolation (outside its replay start,
+ * retention decision and log choice) and ends it with `OWN_ORIGIN_SENT`, and asks for its own (harper-pro#1364).
+ * Advertised only by a build whose transaction logs are per origin (RocksDB).
+ */
+export const OWN_ORIGIN_RECOVERY_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	safeCopyAudit: number;
@@ -89,6 +96,7 @@ export interface ResolvedPeerCapabilities {
 	residencySlots: number;
 	shardingRecovery: number;
 	confirmationMarkers: number;
+	ownOriginRecovery: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -143,6 +151,7 @@ export function resolvePeerCapabilities(
 		residencySlots: resolveLevel(bag?.residencySlots, RESIDENCY_SLOTS_CAPABILITY, 0),
 		shardingRecovery: resolveLevel(bag?.shardingRecovery, SHARDING_RECOVERY_CAPABILITY, 0),
 		confirmationMarkers: resolveLevel(bag?.confirmationMarkers, CONFIRMATION_MARKERS_CAPABILITY, 0),
+		ownOriginRecovery: resolveLevel(bag?.ownOriginRecovery, OWN_ORIGIN_RECOVERY_CAPABILITY, 0),
 	});
 }
 
@@ -168,6 +177,10 @@ export function peerSupportsShardingRecovery(resolved: ResolvedPeerCapabilities)
 
 export function peerSupportsConfirmationMarkers(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.confirmationMarkers >= CONFIRMATION_MARKERS_CAPABILITY;
+}
+
+export function peerSupportsOwnOriginRecovery(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.ownOriginRecovery >= OWN_ORIGIN_RECOVERY_CAPABILITY;
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
@@ -230,6 +243,7 @@ export function buildLocalCapabilities(
 		residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 		shardingRecovery: perOriginLogs ? SHARDING_RECOVERY_CAPABILITY : 0,
 		confirmationMarkers: CONFIRMATION_MARKERS_CAPABILITY,
+		ownOriginRecovery: perOriginLogs ? OWN_ORIGIN_RECOVERY_CAPABILITY : 0,
 	});
 }
 
@@ -249,7 +263,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.residencyNotResident === b.residencyNotResident &&
 		a.residencySlots === b.residencySlots &&
 		a.shardingRecovery === b.shardingRecovery &&
-		a.confirmationMarkers === b.confirmationMarkers
+		a.confirmationMarkers === b.confirmationMarkers &&
+		a.ownOriginRecovery === b.ownOriginRecovery
 	);
 }
 

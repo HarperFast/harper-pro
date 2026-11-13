@@ -10,6 +10,7 @@ import {
 	BARRIER_RETRY_MIN_MS,
 	BARRIER_SWEEP_MS,
 	MAX_OUTSTANDING_BARRIERS,
+	OWN_LINEAGE_POLL_MS,
 	createFreshnessBarrier,
 	isValidLogPosition,
 } from '#src/replication/recordLockFreshness';
@@ -683,5 +684,117 @@ describe('createFreshnessBarrier: a poison check that throws', () => {
 		assert.strictEqual(atSettle.barrier.noteBarrierApplied('a', 700, 1), true);
 		const error = await rejection(wait);
 		assert.strictEqual(error.statusCode, 503);
+	});
+});
+
+describe('createFreshnessBarrier: own lineage after a restart (harper-pro#1364)', () => {
+	const lineageHarness = (initial) => {
+		let lineage = initial;
+		const asked = [];
+		const h = harness({
+			ownLineage(position, homes) {
+				asked.push({ position, homes });
+				return lineage;
+			},
+		});
+		return { h, asked, set: (next) => (lineage = next) };
+	};
+	const pending = { state: 'pending', detail: 'b has not returned' };
+
+	it("an own dependency waits until peers returned this node's writes, then admits", async () => {
+		const { h, asked, set } = lineageHarness(pending);
+		let settled = false;
+		const wait = h.barrier.establish('t', [['self', 5]], 5_000).then(() => (settled = true));
+		assert.deepStrictEqual(asked[0], { position: 5, homes: ['self', 'a', 'b'] });
+		h.advance(OWN_LINEAGE_POLL_MS);
+		await flush();
+		assert.strictEqual(settled, false);
+		set({ state: 'intact' });
+		h.advance(OWN_LINEAGE_POLL_MS);
+		await wait;
+		assert.strictEqual(h.requests.length, 0, 'own history asks no origin for a barrier');
+	});
+	it('a grant whose lineage the home lost waits on own lineage as well as every member barrier', async () => {
+		const { h, asked, set } = lineageHarness(pending);
+		let settled = false;
+		const wait = h.barrier.establish('t', null, 5_000).then(() => (settled = true));
+		assert.strictEqual(asked[0].position, null);
+		h.requests[0].resolve(700);
+		h.requests[1].resolve(800);
+		h.barrier.noteBarrierApplied('a', 700, 1);
+		h.barrier.noteBarrierApplied('b', 800, 2);
+		await flush();
+		assert.strictEqual(settled, false, 'admitted on member barriers alone');
+		set({ state: 'intact' });
+		h.advance(OWN_LINEAGE_POLL_MS);
+		await wait;
+	});
+	it('fails with 503 at the lock deadline while recovery is unconfirmed', async () => {
+		const { h } = lineageHarness(pending);
+		const wait = h.barrier.establish('t', [['self', 5]], 1_000);
+		h.advance(1_000 + OWN_LINEAGE_POLL_MS);
+		const error = await rejection(wait);
+		assert.strictEqual(error.statusCode, 503);
+		assert.match(error.message, /still recovering its own writes/);
+		assert.strictEqual(h.barrier.stats().rejected['own-lineage-gap'], 1);
+	});
+	it('refuses at once when own lineage is unprovable or its state cannot be read', async () => {
+		const { h } = lineageHarness({ state: 'unprovable', detail: 'b had purged' });
+		assert.match(
+			(await rejection(h.barrier.establish('t', [['self', 5]], 1_000))).message,
+			/cannot be proven: b had purged/
+		);
+		assert.strictEqual(h.requests.length, 0);
+		const throwing = harness({
+			ownLineage() {
+				throw new Error('store closed');
+			},
+		});
+		assert.match((await rejection(throwing.barrier.establish('t', null, 1_000))).message, /could not be read/);
+	});
+	it('refuses an own dependency on a table with an own-origin replication hole', async () => {
+		const h = harness({ isPoisoned: (origin) => origin === 'self' });
+		assert.match(
+			(await rejection(h.barrier.establish('t', [['self', 5]], 1_000))).message,
+			/own origin has a recorded replication hole/
+		);
+	});
+	it('a dependency set without this node asks nothing about own lineage', async () => {
+		const { h, asked } = lineageHarness(pending);
+		const wait = h.barrier.establish('t', [['a', 5]], 1_000);
+		h.requests[0].resolve(700);
+		h.barrier.noteBarrierApplied('a', 700, 1);
+		await wait;
+		assert.strictEqual(asked.length, 0);
+	});
+	it('rechecks own-origin poison once recovery is confirmed, since a returned write can fail to apply', async () => {
+		let poisoned = false;
+		let lineage = pending;
+		const h = harness({ isPoisoned: (origin) => origin === 'self' && poisoned, ownLineage: () => lineage });
+		const wait = h.barrier.establish('t', [['self', 5]], 5_000);
+		poisoned = true;
+		lineage = { state: 'intact' };
+		h.advance(OWN_LINEAGE_POLL_MS);
+		assert.match((await rejection(wait)).message, /own origin has a recorded replication hole/);
+	});
+	it('a close during the wait answers 503 even if recovery is confirmed meanwhile', async () => {
+		const { h, set } = lineageHarness(pending);
+		const wait = h.barrier.establish('t', [['self', 5]], 5_000);
+		h.barrier.close();
+		set({ state: 'intact' });
+		h.advance(OWN_LINEAGE_POLL_MS);
+		assert.match((await rejection(wait)).message, /closed/);
+	});
+	it('counts own-lineage waits against the cap and in outstanding', async () => {
+		const { h } = lineageHarness(pending);
+		const waits = [];
+		for (let i = 0; i < MAX_OUTSTANDING_BARRIERS; i++)
+			waits.push(h.barrier.establish('t', [['self', 5]], 5_000).catch(() => {}));
+		assert.strictEqual(h.barrier.stats().outstanding, MAX_OUTSTANDING_BARRIERS);
+		assert.match((await rejection(h.barrier.establish('t', [['self', 5]], 5_000))).message, /too many/);
+		h.barrier.close();
+		h.advance(OWN_LINEAGE_POLL_MS);
+		await Promise.all(waits);
+		assert.strictEqual(h.barrier.stats().outstanding, 0);
 	});
 });

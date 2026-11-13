@@ -14,6 +14,7 @@ import {
 	SHARDING_RECOVERY_CAPABILITY,
 	CONFIRMATION_MARKERS_CAPABILITY,
 	peerSupportsConfirmationMarkers,
+	OWN_ORIGIN_RECOVERY_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
@@ -52,6 +53,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				residencySlots: 0,
 				shardingRecovery: 0,
 				confirmationMarkers: 0,
+				ownOriginRecovery: 0,
 			}
 		);
 	});
@@ -74,6 +76,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 			'confirmationMarkers',
 			'originCursors',
 			'originFloors',
+			'ownOriginRecovery',
 			'protocolVersion',
 			'recordLocks',
 			'residencyNotResident',
@@ -262,6 +265,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
 				confirmationMarkers: CONFIRMATION_MARKERS_CAPABILITY,
+				ownOriginRecovery: OWN_ORIGIN_RECOVERY_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -308,6 +312,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
 				confirmationMarkers: CONFIRMATION_MARKERS_CAPABILITY,
+				ownOriginRecovery: OWN_ORIGIN_RECOVERY_CAPABILITY,
 			}
 		);
 	});
