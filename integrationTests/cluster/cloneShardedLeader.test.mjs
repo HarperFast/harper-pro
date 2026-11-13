@@ -111,7 +111,8 @@ suite('Clone from a statically sharded leader', { timeout: 900_000 }, (ctx) => {
 	// Stopped, not torn down: teardown recycles the address, and a node reusing a removed node's name is refused.
 	async function retire(context) {
 		await killHarper(context);
-		await sendOperation(leader, { operation: 'remove_node', hostname: context.harper.hostname });
+		// a stopped node cannot be drained, so the removal is forced
+		await sendOperation(leader, { operation: 'remove_node', hostname: context.harper.hostname, force: true });
 	}
 
 	async function assertServes(node, shard) {

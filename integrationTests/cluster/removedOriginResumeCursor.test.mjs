@@ -273,8 +273,9 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		};
 		deepEqual(await sendOperation(R, rMembership), [{ name: R.hostname }], 'R is a member before removal');
 
-		// A's removal also disables R itself (remove_node_back), so R stops replicating to anyone.
-		await sendOperation(A, { operation: 'remove_node', hostname: R.hostname });
+		// A's removal also disables R itself (remove_node_back), so R stops replicating to anyone. B, which R sends
+		// to, is down, so R cannot drain: the removal is forced.
+		await sendOperation(A, { operation: 'remove_node', hostname: R.hostname, force: true });
 		deepEqual(await sendOperation(R, rMembership), [], 'R confirms its reciprocal membership removal');
 		deepEqual(
 			await postToFixture(A, 'RecordLogs', { ids: [...rOld, ...rMid, ...rLate] }),
@@ -290,7 +291,8 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		await startNode(B);
 		// Removing R lifts its exclusion on B's subscription to A, which re-admits A's log for R live.
 		const markIncludeA = await logMark(A);
-		await sendOperation(B, { operation: 'remove_node', hostname: R.hostname });
+		// R is stopped, so the removal is forced
+		await sendOperation(B, { operation: 'remove_node', hostname: R.hostname, force: true });
 		deepEqual(
 			await postToFixture(B, 'RecordLogs', { ids: [...rOld, ...rMid] }),
 			bRetainedLogs,
