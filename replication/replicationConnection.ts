@@ -796,17 +796,45 @@ export function predatesPurgeTracking(
 }
 
 /**
+ * Whether a single-log store still holds everything after `start` although `start` predates where it began
+ * tracking prunes: no tracked prune reached past `trackedFrom`, so the bound is only the resync epoch a store
+ * without a floor record is stamped with, and retention removes from the oldest key up, so a log whose oldest
+ * retained key is at or below `start` lost nothing after it. A legacy `deleteHistory` that removed one table's
+ * entries above the oldest retained key is not visible here.
+ */
+export function retainedLogCoversStart(
+	start: number,
+	oldestRetainedTime: number | undefined,
+	trackedFrom: number | undefined,
+	logNames: string[],
+	boundOf: (logName: string) => number | undefined,
+	singleLog: boolean
+): boolean {
+	if (!singleLog || !(start > 0) || trackedFrom === undefined || !(start < trackedFrom)) return false;
+	if (oldestRetainedTime === undefined || oldestRetainedTime > start) return false;
+	for (const log of logNames) {
+		const bound = boundOf(log);
+		if (bound === undefined || bound > trackedFrom) return false;
+	}
+	return true;
+}
+
+/**
  * A receiver that owns sharding slots this node cannot copy (`restricted`) refuses every base copy, so a start this
- * node cannot vouch for replays what is retained there instead (harper-pro#1278).
+ * node cannot vouch for replays what is retained there instead (harper-pro#1278). A receiver that can only take a
+ * verified legacy copy (`retainedForLegacyCopy`, set only when the retained log covers its start) replays from that
+ * start: the verification cannot pass for a table without a numeric update timestamp.
  */
 export function retentionResumeDecision(
 	forceForTest: boolean,
 	otherGeneration: boolean,
 	retentionGap: boolean,
-	restricted: boolean
-): 'copy' | 'replay' | 'replay-unvouched' {
+	restricted: boolean,
+	retainedForLegacyCopy = false
+): 'copy' | 'replay' | 'replay-unvouched' | 'replay-retained' {
 	if (forceForTest) return 'copy';
 	if (!retentionGap && !otherGeneration) return 'replay';
+	if (retainedForLegacyCopy && !otherGeneration) return 'replay-retained';
 	return restricted ? 'replay-unvouched' : 'copy';
 }
 
@@ -10347,6 +10375,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											const otherGeneration =
 												ownSubscription !== undefined &&
 												floorFromAnotherGeneration(auditStore, ownSubscription.floorGeneration);
+											let legacyCopyProbe: Promise<boolean> | undefined;
+											const probeLegacyCopy = () =>
+												(legacyCopyProbe ??= requiresLegacyCopyVerification(
+													peerCapabilities.safeCopyAudit,
+													sendOperation,
+													(error) =>
+														logger.warn?.(
+															`Version probe for peer ${remoteNodeName} failed; using baseline verification`,
+															error
+														)
+												));
 											if (currentSequenceId > 0) {
 												const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 												let oldestRetainedTime: number | undefined;
@@ -10398,13 +10437,37 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																Date.now() - auditRetention,
 																getAuditFloor(auditStore)
 															));
+												const forceCopy = forceRetentionCopyForTest(databaseName);
+												let retainedForLegacyCopy = false;
+												if (
+													retentionGap &&
+													!otherGeneration &&
+													!forceCopy &&
+													retainedLogCoversStart(
+														currentSequenceId,
+														oldestRetainedTime,
+														trackedFrom,
+														purgeScope,
+														(name) => purgeBounds?.get(name),
+														auditStore.reusableIterable !== true
+													)
+												) {
+													retainedForLegacyCopy = await probeLegacyCopy();
+													if (closed || wsClosed) return;
+												}
 												const decision = retentionResumeDecision(
-													forceRetentionCopyForTest(databaseName),
+													forceCopy,
 													otherGeneration,
 													retentionGap,
-													refusesCopies
+													refusesCopies,
+													retainedForLegacyCopy
 												);
-												if (decision === 'replay-unvouched') {
+												if (decision === 'replay-retained') {
+													if (shouldWarnUnvouchedReplay(databaseName, remoteNodeName, 'retained before tracking'))
+														logger.warn?.(
+															`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, before ${new Date(trackedFrom).toISOString()} where this node began accounting for its transaction-log history; the retained log reaches back to that start and the peer cannot take an unverified copy, so replay continues from there.`
+														);
+												} else if (decision === 'replay-unvouched') {
 													const from = new Date(currentSequenceId).toISOString();
 													const purged = otherGeneration
 														? undefined
@@ -10437,15 +10500,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (currentSequenceId > 0 || sendingProjection) subscriptionResidencySender?.replaying();
 											if (currentSequenceId === 0) {
 												copying = true;
-												const legacyCopy = await requiresLegacyCopyVerification(
-													peerCapabilities.safeCopyAudit,
-													sendOperation,
-													(error) =>
-														logger.warn?.(
-															`Version probe for peer ${remoteNodeName} failed; using baseline verification`,
-															error
-														)
-												);
+												const legacyCopy = await probeLegacyCopy();
 												if (legacyCopy) copyResume = undefined;
 												if (closed || wsClosed) return;
 												logger.info?.('Replicating all tables to', remoteNodeName);
