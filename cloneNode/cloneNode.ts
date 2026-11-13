@@ -472,7 +472,8 @@ async function establishReplicationSetup(syncStartedAt: number, priorMarker?: Sy
 
 	const clonedConfig = cloneConfig(leaderConfigData, shard);
 	const { registerConfirmationDefaults } = await import('../replication/knownNodes.ts');
-	registerConfirmationDefaults((key) => clonedConfig[key] ?? clonedConfig[key.toLowerCase()]);
+	// an environment overlay was already in this thread's settings at startup; the leader's value was not
+	registerConfirmationDefaults((key) => envMgr.get(key) ?? clonedConfig[key] ?? clonedConfig[key.toLowerCase()]);
 
 	// Refine the leader replication URL using the leader's own config. This is the only way to
 	// pick the right scheme (ws:// vs wss://) when bootstrapping against a leader whose
