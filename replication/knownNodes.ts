@@ -1002,7 +1002,7 @@ function assertConfirmationFeasible(databaseName: string, confirmationCount: num
  */
 export function parseConfirmationDefault(name: string, raw: unknown): number {
 	if (raw == null || raw === '') return 0;
-	const value = typeof raw === 'string' && /^\s*\d+\s*$/.test(raw) ? Number(raw) : raw;
+	const value = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
 	if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
 	throw new Error(`Invalid ${name} ${JSON.stringify(raw)}: expected a non-negative integer`);
 }

@@ -10,11 +10,12 @@ describe('replication confirmation defaults', () => {
 	it('accepts non-negative integers, as numbers or integer strings', () => {
 		assert.strictEqual(parseConfirmationDefault('replication.confirmation', 0), 0);
 		assert.strictEqual(parseConfirmationDefault('replication.confirmation', 2), 2);
-		assert.strictEqual(parseConfirmationDefault('replication.recordLockConfirmation', ' 1 '), 1);
+		for (const raw of [' 1 ', '1.0', '+1', '1e0'])
+			assert.strictEqual(parseConfirmationDefault('replication.recordLockConfirmation', raw), 1, raw);
 	});
 
 	it('throws on any other value rather than turning confirmation off', () => {
-		for (const raw of [-1, 1.5, Number.NaN, 'one', '-1', true, {}, Number.MAX_SAFE_INTEGER + 1])
+		for (const raw of [-1, 1.5, Number.NaN, 'one', '-1', '1.5', true, {}, Number.MAX_SAFE_INTEGER + 1])
 			assert.throws(
 				() => parseConfirmationDefault('replication.recordLockConfirmation', raw),
 				/Invalid replication\.recordLockConfirmation .*: expected a non-negative integer/
