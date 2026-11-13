@@ -28,8 +28,8 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 
 	before(async () => {
 		const started = await Promise.allSettled([
-			startNode(ctx.name, {}, 1, undefined, true, { confirmationTimeout: CONFIRMATION_TIMEOUT_MS }),
-			startNode(ctx.name, {}, 1, undefined, true, { confirmation: 2 }),
+			startNode(ctx.name, {}, 1, undefined, true, [], { confirmationTimeout: CONFIRMATION_TIMEOUT_MS }),
+			startNode(ctx.name, {}, 1, undefined, true, [], { confirmation: 2 }),
 		]);
 		for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
 		const failed = started.find((result) => result.status === 'rejected');

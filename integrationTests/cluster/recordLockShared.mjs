@@ -29,7 +29,15 @@ function poolEnv(threadsCount) {
 	};
 }
 
-function optionsFor(hostname, env = {}, threadsCount = 1, preload, recordLocks = true, replication = {}) {
+function optionsFor(
+	hostname,
+	env = {},
+	threadsCount = 1,
+	preload,
+	recordLocks = true,
+	extraDatabases = [],
+	replication = {}
+) {
 	const options = {
 		config: {
 			analytics: { aggregatePeriod: -1 },
@@ -37,7 +45,7 @@ function optionsFor(hostname, env = {}, threadsCount = 1, preload, recordLocks =
 			threads: { count: threadsCount, preload },
 			replication: {
 				securePort: hostname + ':9933',
-				databases: [DB, 'system'],
+				databases: [DB, 'system', ...extraDatabases],
 				recordLocks,
 				pingInterval: 1000,
 				pingTimeout: 3000,
@@ -58,19 +66,30 @@ function optionsFor(hostname, env = {}, threadsCount = 1, preload, recordLocks =
 /** A node with the fixture pre-installed, bound to a pre-allocated address (see cacheReplicationSource).
  * `threadsCount > 1` runs several http workers, so a cluster lock() served on a non-owner worker relays
  * its admission to the coordinating worker (harper-pro#852). */
-export async function startNode(suiteName, env, threadsCount = 1, preload, recordLocks = true, replication) {
+export async function startNode(
+	suiteName,
+	env,
+	threadsCount = 1,
+	preload,
+	recordLocks = true,
+	extraDatabases = [],
+	replication
+) {
 	const hostname = await getNextAvailableLoopbackAddress();
 	const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
 	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
-	const ctx = { name: suiteName, harper: { hostname, dataRootDir }, recordLocks, replication };
-	await startHarper(ctx, optionsFor(hostname, env, threadsCount, preload, recordLocks, replication));
+	const ctx = { name: suiteName, harper: { hostname, dataRootDir }, recordLocks, extraDatabases, replication };
+	await startHarper(ctx, optionsFor(hostname, env, threadsCount, preload, recordLocks, extraDatabases, replication));
 	return ctx;
 }
 
 export async function restartStoppedNode(ctx, env, threadsCount = 1) {
 	const { hostname, dataRootDir } = ctx.harper;
 	const restarted = { name: ctx.name, harper: { hostname, dataRootDir } };
-	await startHarper(restarted, optionsFor(hostname, env, threadsCount, undefined, ctx.recordLocks, ctx.replication));
+	await startHarper(
+		restarted,
+		optionsFor(hostname, env, threadsCount, undefined, ctx.recordLocks, ctx.extraDatabases, ctx.replication)
+	);
 	ctx.harper = restarted.harper;
 	return ctx;
 }

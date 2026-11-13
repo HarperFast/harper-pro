@@ -488,6 +488,10 @@ The home map changes only when an operator applies a new one, so apply one after
 
 Cluster record locks need the RocksDB storage engine. On LMDB `lock()` is not available, and conditional writes do not take a lock.
 
+<VersionBadge version="v5.4.1" />
+
+What counts is the engine each database is opened on, not `storage.engine`. That setting only picks the engine for databases created from then on, so a node upgraded in place from v4 keeps its existing `.mdb` databases on LMDB. If any database the node replicates is opened on LMDB, including `system`, which `replication.databases: '*'` (the default) replicates, the node starts with cluster record locks off even with `recordLocks: true`. It logs an error naming those databases, peers see it as not taking part, and a cluster `lock()` answers `503` saying that replicated databases are on LMDB. Migrate them with `storage.migrateOnStart` and restart. `describe_all` and `describe_table` report each table's `engine` (`rocksdb` or `lmdb`), so a tool can check a node before turning locks on.
+
 ### Confirming Locked Writes
 
 <VersionBadge version="v5.5.0" />
@@ -503,7 +507,7 @@ replication:
 - **When it applies:** a commit waits when its transaction holds a cluster lock on a table in the database it writes, or writes through a held lock (`hold: true`). A lock in one database doesn't make writes to another database wait. A node-scoped lock never does, and neither do writes made without a lock.
 - **How many:** at least this many peers, or the write's own count if that is larger (including the [`replication.confirmation`](./sharding.md#default-confirmation-count) default). An explicit `0` doesn't lower it.
 - **No peer connected:** when this node is not sending the database to enough connected peers, the commit is refused with `503` before anything is written, and the lock is released. Retry once a peer reconnects. A node that replicates the database to fewer peers than the count, a single-node cluster included, refuses it with `400`; set `recordLockConfirmation: 0` there.
-- **A peer drops during the wait:** the wait ends once the peers that could confirm it have been gone for `pingTimeout`, or at `confirmationTimeout` at the latest. A peer counts as gone when its connection closes, or after `pingTimeout` with nothing heard from it, so the wait ends one to two `pingTimeout`s past the drop, plus up to a second (about 2 minutes at most by default). The `504` says the write committed on this node but was not confirmed.
+- **A peer drops during the wait:** the wait ends once the peers that could confirm it have been gone for `pingTimeout`, or at `confirmationTimeout` at the latest. A peer counts as gone when its connection closes, or after `pingTimeout` with nothing heard from it, so the wait ends within about twice `pingTimeout` of the drop (about 2 minutes by default). The `504` says the write committed on this node but was not confirmed.
 - **An explicit count that meets the minimum** (`X-Replicate-To: *;confirm=<k>` or `replicatedConfirmation`) keeps its own rules: it is [refused or timed out](./sharding.md#replication-control-via-rest-header) as without locks, and waits up to `confirmationTimeout` while its peers are down.
 - **The lock is not held longer:** it is released when the commit lands on this node, before the wait.
 - **When confirmation fails,** the error carries `replicationUnconfirmed: true` and `retryable: false` ([details](./sharding.md#confirmation-failure-after-a-local-commit)). The write is committed on this node. A transaction's lock is already released, so the next holder can have it and may already see the write. A `hold: true` lock stays held until `unlock()` or its lease either way.
