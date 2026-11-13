@@ -37,7 +37,7 @@ export const DEFAULT_DRAIN_TIMEOUT_MS = 300_000;
 const MAX_DRAIN_TIMEOUT_MS = 24 * 3_600_000;
 const CALL_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 1_000;
-// below this a call could not complete; the last round's findings are the answer
+// below this a peer call could not complete, so the drain reports what its last complete poll found
 const MIN_CALL_MS = 250;
 
 export interface DatabaseDrain {
@@ -214,12 +214,11 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 		const generation = getDatabaseGeneration(auditStores[0])?.id;
 		result.databases[database] = { target, sharded, peers, ...(typeof generation === 'string' ? { generation } : {}) };
 	}
-	// a database created while finalize ran is neither fenced nor receipted; the next round covers it
+	// a database created while finalize ran is neither fenced nor receipted; the next poll covers it
 	if (request.finalize !== undefined) {
 		const known = new Set([...roots.values()].flat());
 		const created = [...databaseRoots().values()].flat().some((auditStore) => !known.has(auditStore));
 		if (created) {
-			// back to cancellable, as before this finalize
 			if (!wasRemoving)
 				for (const [auditStore, target] of targets)
 					await persistLocalWriteFence(auditStore, { epoch, target, state: 'fenced' });
@@ -381,7 +380,7 @@ export async function drainNode(
 		return response?.results ?? response;
 	};
 	const pause = () => new Promise((resolve) => setTimeout(resolve, Math.min(POLL_INTERVAL_MS, remaining())));
-	// what the last full round found, kept when a later call only runs out of budget
+	// what the last complete poll of every peer found, kept when a later poll only runs out of budget
 	let shortfalls: string[] = [];
 	let unreachable: string | undefined;
 	while (remaining() > MIN_CALL_MS) {
@@ -435,7 +434,7 @@ export async function drainNode(
 				else (holders[database] ??= []).push(peer);
 			}
 		}
-		// a round cut short by the budget did not ask every peer; the last complete round's findings stand
+		// a poll cut short by the budget did not ask every peer
 		if (budgetSpent) {
 			if (shortfalls.length === 0) shortfalls = round;
 			break;
@@ -460,7 +459,7 @@ export async function drainNode(
 				return finalized;
 			} catch (error) {
 				if (error instanceof OutOfBudget) break;
-				// 409: a database appeared or the fence changed; the next round fences and checks it
+				// 409: a database appeared or the fence changed; the next poll fences and checks it
 				if (local && (error as any)?.statusCode !== 409) throw error;
 				shortfalls = [`${name} did not finalize its removal (${errorText(error)})`];
 			}
