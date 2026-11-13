@@ -285,4 +285,31 @@ suite('cluster record locks on a node with a replicated database opened on LMDB'
 		await putCounter(node.harper, 'mixed-plain', 3);
 		await waitForCounter([node.harper, peer.harper], 'mixed-plain', 3);
 	});
+
+	test('migrating the LMDB database with storage.migrateOnStart turns record locks on in that same start', async () => {
+		const mark = await logMark(node.harper);
+		await stopNodeProcess(node.harper);
+		await restartStoppedNode(node, { STORAGE_MIGRATEONSTART: 'true' }, 2);
+		node.harper.nodeName = (await clusterStatusOf(node.harper)).node_name;
+
+		assert.deepEqual(await engines(node.harper), { data: 'rocksdb', legacy: 'rocksdb' });
+		const records = await sendOperation(node.harper, {
+			operation: 'search_by_id',
+			database: LEGACY,
+			table: 'Old',
+			ids: ['v4'],
+			get_attributes: ['*'],
+		});
+		assert.equal(records.length, 1, 'the migrated record is readable');
+		assert.doesNotMatch(await readLogSince(node.harper, mark), /these are opened on LMDB/);
+		const result = await waitForCondition(
+			async (signal) => {
+				const attempt = await call(node.harper, 'LockOnce/', { id: 'migrated', timeout: 2_000 }, signal);
+				return /record_lock_apply_homes/.test(JSON.stringify(attempt.body)) ? attempt : undefined;
+			},
+			{ timeoutMs: 60_000, description: 'a lock() answer naming record_lock_apply_homes' }
+		);
+		assert.equal(result.status, 503);
+		await waitForObservedLevel(peer.harper, node.harper, (level) => level > 0, 'a record-lock capability level');
+	});
 });
