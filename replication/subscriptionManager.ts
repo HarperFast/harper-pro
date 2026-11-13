@@ -1978,22 +1978,28 @@ export async function startOnMainThread(options) {
 	function scheduleOriginFallback(entry: any, database: string): boolean {
 		if (entry.originFallback || entry.originFallbackTimer) return true;
 		if (originFallbackCandidates(entry, database).length === 0) return false;
+		armOriginFallback(entry, database, () => {
+			if (!openOriginFallback(entry, database)) scheduleOriginFallback(entry, database);
+		});
+		return true;
+	}
+	/** Runs `attempt` after the hold; one that throws (it reads hdb_nodes) is logged and tried again after another. */
+	function armOriginFallback(entry: any, database: string, attempt: () => void): void {
 		entry.originFallbackTimer = setTimeout(() => {
 			entry.originFallbackTimer = undefined;
 			const current = connectionReplicationMap.get(entry.url)?.get(database);
 			if (current !== entry || entry.connected !== false || entry.unsubscribed) return;
 			try {
-				if (!openOriginFallback(entry, database)) scheduleOriginFallback(entry, database);
+				attempt();
 			} catch (error) {
 				logger.warn(
 					`Region topology: could not open a fallback link for ${entry.nodes[0]?.name} on ${database}`,
 					error
 				);
-				scheduleOriginFallback(entry, database);
+				if (!entry.originFallbackTimer) armOriginFallback(entry, database, attempt);
 			}
 		}, TOPOLOGY_HOLD_MS);
 		entry.originFallbackTimer.unref?.();
-		return true;
 	}
 	/**
 	 * Under the grid a node that receives an origin from another region links to nothing else of that origin's region.
@@ -2045,7 +2051,19 @@ export async function startOnMainThread(options) {
 		if (wait > 0) {
 			fallback.recheck ??= setTimeout(() => {
 				fallback.recheck = undefined;
-				if (entry.originFallback === fallback) rotateOriginFallback(entry, database);
+				if (entry.originFallback !== fallback) return;
+				try {
+					rotateOriginFallback(entry, database);
+				} catch (error) {
+					logger.warn(
+						`Region topology: could not move the fallback link for ${entry.nodes[0]?.name} on ${database}`,
+						error
+					);
+					if (!entry.originFallback && !entry.originFallbackTimer)
+						armOriginFallback(entry, database, () => {
+							if (!openOriginFallback(entry, database)) scheduleOriginFallback(entry, database);
+						});
+				}
 			}, wait);
 			fallback.recheck.unref?.();
 			return;
