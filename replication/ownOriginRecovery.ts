@@ -186,9 +186,10 @@ export function openOwnOriginRecoveryEpoch(
 	}
 	const before = rootStore.getMonotonicTimestamp();
 	const requiredPeers = [...new Set([...peersWithCursors(dbisDB, auditStore), ...recipients()])];
-	const epoch: OwnOriginEpoch = logRead
+	// an unread log counts as empty: the widest window, judged against holding nothing
+	const epoch = logRead
 		? nextEpoch(lastKey, purgeBound, previous, before, requiredPeers)
-		: { after: MIN_START, lastKey: 0, before, requiredPeers };
+		: nextEpoch(undefined, undefined, previous, before, requiredPeers);
 	if (continuity.bootId !== undefined) epoch.bootId = continuity.bootId;
 	dbisDB.putSync(EPOCH, epoch);
 	cachedEpochs.delete(database);

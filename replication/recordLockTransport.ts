@@ -1802,13 +1802,18 @@ setRecordLockOwnershipReaders({
 	},
 	tableReplicates: (database, table) => tableReplicates(database, table),
 	ownLineageIntact: (database, table) => {
-		const self = getThisNodeName();
-		if (isPoisoned(database, self, table)) return false;
-		let homes: readonly string[] = NO_HOMES;
 		try {
-			homes = transports.get(database)?.homeMap(database)?.homes ?? NO_HOMES;
-		} catch {}
-		return ownLineage(database, null, homes, self).state === 'intact';
+			const self = getThisNodeName();
+			if (isPoisoned(database, self, table)) return false;
+			let homes: readonly string[] = NO_HOMES;
+			try {
+				homes = transports.get(database)?.homeMap(database)?.homes ?? NO_HOMES;
+			} catch {}
+			return ownLineage(database, null, homes, self).state === 'intact';
+		} catch (error) {
+			logger.warn?.(`Could not check this node's own lineage on ${database}; refusing the barrier`, error);
+			return false;
+		}
 	},
 });
 
