@@ -84,7 +84,7 @@ suite(
 
 		after(() => stopAndTeardownNodes([leader, joiner]));
 
-		// before any restart: a reconnect binds the ids from the database that now exists
+		// before any restart: a reconnect sends a new request, which resolves the ids itself now that the database exists
 		test('records the leader certified floor on the connection that copied the database', async () => {
 			await waitForCondition(
 				async (signal) => {
