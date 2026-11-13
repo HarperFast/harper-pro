@@ -107,6 +107,14 @@ record of that origin and table this node dropped or failed to apply. Those are 
     every node before that node takes cluster locks (a generation change drops every home's lineage,
     `#prepareFreshnessGeneration`). harper-pro#944 (the origin's database generation on the wire)
     decides it mechanically.
+    **A lost log tail (harper-pro#1364).** An intact local log is not given after an OS crash or power
+    loss: table writes run WAL-off, so the tail of `local` can be gone while peers hold it. Each start
+    opens an own-origin recovery epoch `(after, before)` (`ownOriginRecovery.ts`). A self-origin
+    position inside it, and a recovery-marker grant (`null`), additionally wait (`ownLineage`, polled
+    every `OWN_LINEAGE_POLL_MS` until the lock deadline) until every cursor peer and home has reported
+    returning this node's writes for that epoch; a report of a failed read or of a purge past the log's
+    last key rejects at once (`own-lineage-unprovable`), and an own-origin poison row rejects like any
+    other origin's. Outside the window the local log stays authoritative.
   - otherwise the origin must be in `homeMap().homes` at the exact capability level, the table must
     replicate (`replicate !== false`), and `(database, origin, table)` must not be poisoned — any
     failure rejects at once with a 503 naming which. Then request a barrier from the origin

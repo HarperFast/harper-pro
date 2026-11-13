@@ -12,6 +12,7 @@ import {
 	RESIDENCY_NOT_RESIDENT_CAPABILITY,
 	RESIDENCY_SLOTS_CAPABILITY,
 	SHARDING_RECOVERY_CAPABILITY,
+	OWN_ORIGIN_RECOVERY_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
@@ -49,6 +50,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				residencyNotResident: 0,
 				residencySlots: 0,
 				shardingRecovery: 0,
+				ownOriginRecovery: 0,
 			}
 		);
 	});
@@ -70,6 +72,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 		assert.deepStrictEqual(Object.keys(resolved).sort(), [
 			'originCursors',
 			'originFloors',
+			'ownOriginRecovery',
 			'protocolVersion',
 			'recordLocks',
 			'residencyNotResident',
@@ -257,6 +260,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
+				ownOriginRecovery: OWN_ORIGIN_RECOVERY_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -302,6 +306,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
+				ownOriginRecovery: OWN_ORIGIN_RECOVERY_CAPABILITY,
 			}
 		);
 	});
