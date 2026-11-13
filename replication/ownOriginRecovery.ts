@@ -38,7 +38,7 @@ export interface OwnOriginEpoch {
 	lastKey: number;
 	/** The native clock when the epoch opened: every key minted since is above it. Identifies the epoch. */
 	before: number;
-	/** Peers that had replicated this database with this node when the epoch opened. */
+	/** Members that may hold this node's writes when the epoch opened: peers with a cursor here, and members it sends to. */
 	requiredPeers: string[];
 	finished?: boolean;
 	/** The OS boot this epoch opened on, when known: a later start on the same boot continues it. */
@@ -148,7 +148,9 @@ export function openOwnOriginRecoveryEpoch(
 	database: string,
 	auditStore: any,
 	dbisDB: any,
-	continuity: StartContinuity
+	continuity: StartContinuity,
+	/** Members this node sends the database to; a peer that never sent back has no cursor yet may hold its writes. */
+	recipients: () => string[]
 ): Promise<void> | undefined {
 	const rootStore = auditStore?.rootStore;
 	if (auditStore?.reusableIterable !== true) return undefined;
@@ -159,20 +161,27 @@ export function openOwnOriginRecoveryEpoch(
 	let purgeBound: number | undefined;
 	let logRead = true;
 	try {
-		lastKey = findLastCommittedLogKey(auditStore, 'local') || undefined;
+		// 0 is a cleanly read empty log; undefined is a read that failed
+		const last = findLastCommittedLogKey(auditStore, 'local');
+		if (last === undefined) throw new Error('the last committed entry could not be read');
+		lastKey = last || undefined;
 		purgeBound = getLogPurgeBounds(auditStore, 'local')?.get('local');
 	} catch (error) {
 		logRead = false;
 		logger.warn?.(`Own-origin recovery: could not read ${database}'s log; asking peers for all of it`, error);
 	}
-	if (logRead && continuesEpoch(previous, continuity, Math.max(lastKey ?? 0, purgeBound ?? 0))) {
+	if (
+		logRead &&
+		continuesEpoch(previous, continuity, Math.max(lastKey ?? 0, purgeBound ?? 0)) &&
+		!purgeTainted(dbisDB, previous)
+	) {
 		logger.info?.(
 			`Own-origin recovery for ${database}: the OS has not restarted since ${new Date(previous.before).toISOString()}, so this node's own log is intact`
 		);
 		return undefined;
 	}
 	const before = rootStore.getMonotonicTimestamp();
-	const requiredPeers = peersWithCursors(dbisDB, auditStore);
+	const requiredPeers = [...new Set([...peersWithCursors(dbisDB, auditStore), ...recipients()])];
 	const epoch: OwnOriginEpoch = logRead
 		? nextEpoch(lastKey, purgeBound, previous, before, requiredPeers)
 		: { after: MIN_START, lastKey: 0, before, requiredPeers };
@@ -183,6 +192,17 @@ export function openOwnOriginRecoveryEpoch(
 		`Own-origin recovery for ${database}: asking peers for this node's writes after ${new Date(epoch.after).toISOString()}`
 	);
 	return rootStore.syncWal();
+}
+
+/**
+ * A peer reported purging past what the epoch held, so it stays unprovable however long it is continued; a
+ * new epoch judges peers' purges against what the log holds now, as every start did before continuation.
+ */
+function purgeTainted(dbisDB: any, epoch: OwnOriginEpoch): boolean {
+	for (const { value } of dbisDB.getRange({ start: [REPORT], end: [REPORT, Buffer.from([0xff])] })) {
+		if (value?.epoch === epoch.before && purgedPastLog(value, epoch)) return true;
+	}
+	return false;
 }
 
 function readEpoch(dbisDB: any): OwnOriginEpoch | undefined {
@@ -219,7 +239,7 @@ function cleanReport(report: OwnOriginReport | undefined, epoch: OwnOriginEpoch)
 
 /**
  * Store `peer`'s report; the caller made the rows it returned durable first. Marks the epoch finished once
- * every cursor peer and lock home still a member reported cleanly, so the next start does not carry its
+ * every required peer and lock home still a member reported cleanly, so the next start does not carry its
  * window forward. A failed read is no answer: it throws, so the peer is asked again.
  */
 async function recordReport(database: string, peer: string, report: OwnOriginReport): Promise<void> {
@@ -255,8 +275,8 @@ const cachedEpochs = new Map<
 
 /**
  * Whether this node's own history is proven at `position` (null: anywhere, for a grant whose lineage the
- * home lost). A position minted since this start is; one minted before it is proven only once every member
- * that may hold an own write (cursor peers and lock homes) reported cleanly for this epoch, since the
+ * home lost). A position minted since the epoch opened is; one minted before it is proven only once every member
+ * that may hold an own write (required peers and lock homes) reported cleanly for this epoch, since the
  * window's start is not a proven boundary. A peer's report covers the tables its route sends here; a table
  * it does not send is taken as one it never received from here.
  */

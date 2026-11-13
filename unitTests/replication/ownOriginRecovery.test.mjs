@@ -227,7 +227,7 @@ describe('continuesEpoch', () => {
 
 describe('openOwnOriginRecoveryEpoch', () => {
 	const EPOCH = Symbol.for('ownOriginRecovery');
-	function stores(previous) {
+	function stores(previous, { reports = [], logReadFails = false } = {}) {
 		const rows = new Map();
 		if (previous) rows.set(EPOCH, previous);
 		let syncs = 0;
@@ -235,11 +235,17 @@ describe('openOwnOriginRecoveryEpoch', () => {
 			rows,
 			getSync: (key) => rows.get(key),
 			putSync: (key, value) => rows.set(key, value),
-			getRange: () => [],
+			getRange: ({ start }) =>
+				Array.isArray(start) && start[0] === Symbol.for('ownOriginRecovered')
+					? reports.map((value) => ({ key: [start[0], value.peer], value }))
+					: [],
 		};
 		const auditStore = {
 			reusableIterable: true,
-			getRange: () => [],
+			getRange: () => {
+				if (logReadFails) throw new Error('EIO');
+				return [];
+			},
 			getBinary: () => undefined,
 			rootStore: {
 				getMonotonicTimestamp: () => NOW + 1000,
@@ -255,10 +261,13 @@ describe('openOwnOriginRecoveryEpoch', () => {
 
 	it('leaves the previous epoch in force on the same boot: nothing written and nothing synced', () => {
 		const { dbisDB, auditStore, syncs } = stores(settled);
-		const result = openOwnOriginRecoveryEpoch('continued-db', auditStore, dbisDB, {
-			bootId: 'boot-a',
-			syncFailure: false,
-		});
+		const result = openOwnOriginRecoveryEpoch(
+			'continued-db',
+			auditStore,
+			dbisDB,
+			{ bootId: 'boot-a', syncFailure: false },
+			() => []
+		);
 		assert.strictEqual(result, undefined);
 		assert.strictEqual(syncs(), 0);
 		assert.deepStrictEqual(dbisDB.rows.get(EPOCH), settled);
@@ -267,8 +276,50 @@ describe('openOwnOriginRecoveryEpoch', () => {
 	it('keeps an unfinished epoch on the same boot, so peers that never reported are still asked for its window', () => {
 		const unfinished = { ...settled, finished: undefined };
 		const { dbisDB, auditStore } = stores(unfinished);
-		openOwnOriginRecoveryEpoch('unfinished-db', auditStore, dbisDB, { bootId: 'boot-a', syncFailure: false });
+		openOwnOriginRecoveryEpoch('unfinished-db', auditStore, dbisDB, { bootId: 'boot-a', syncFailure: false }, () => []);
 		assert.deepStrictEqual(recoveryRangeFor(dbisDB, 'peer'), { startTime: 5, endTime: NOW });
+	});
+
+	it('does not continue an epoch a peer reported purging past, so a new epoch judges purges against the log now', () => {
+		const { dbisDB, auditStore, syncs } = stores(settled, {
+			reports: [{ peer: 'peer', epoch: NOW, purgedThrough: 1 }],
+		});
+		const result = openOwnOriginRecoveryEpoch(
+			'tainted-db',
+			auditStore,
+			dbisDB,
+			{ bootId: 'boot-a', syncFailure: false },
+			() => []
+		);
+		assert.ok(result);
+		assert.strictEqual(dbisDB.rows.get(EPOCH).before, NOW + 1000);
+		return result.then(() => assert.strictEqual(syncs(), 1));
+	});
+
+	it('opens the widest epoch when the own log cannot be read, even on the same boot', async () => {
+		const { dbisDB, auditStore } = stores(settled, { logReadFails: true });
+		await openOwnOriginRecoveryEpoch(
+			'unreadable-db',
+			auditStore,
+			dbisDB,
+			{ bootId: 'boot-a', syncFailure: false },
+			() => []
+		);
+		const epoch = dbisDB.rows.get(EPOCH);
+		assert.strictEqual(epoch.before, NOW + 1000);
+		assert.strictEqual(epoch.after, 1);
+	});
+
+	it('requires the members it sends the database to, not only peers that sent back', async () => {
+		const { dbisDB, auditStore } = stores(undefined);
+		await openOwnOriginRecoveryEpoch(
+			'recipients-db',
+			auditStore,
+			dbisDB,
+			{ bootId: 'boot-a', syncFailure: false },
+			() => ['receives-only']
+		);
+		assert.deepStrictEqual(dbisDB.rows.get(EPOCH).requiredPeers, ['receives-only']);
 	});
 
 	for (const [label, continuity, previous] of [
@@ -289,7 +340,7 @@ describe('openOwnOriginRecoveryEpoch', () => {
 	]) {
 		it(`opens a new epoch, recording the boot, after ${label}`, async () => {
 			const { dbisDB, auditStore, syncs } = stores(previous);
-			const result = openOwnOriginRecoveryEpoch('opened-db', auditStore, dbisDB, continuity);
+			const result = openOwnOriginRecoveryEpoch('opened-db', auditStore, dbisDB, continuity, () => ['recipient']);
 			await result;
 			assert.strictEqual(syncs(), 1);
 			const epoch = dbisDB.rows.get(EPOCH);

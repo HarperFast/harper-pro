@@ -26,7 +26,7 @@ export function validBootId(value: unknown): string | undefined {
 export function readBootId(platform: NodeJS.Platform = process.platform): string | undefined {
 	const override = process.env.HARPER_TEST_BOOT_ID;
 	if (override !== undefined) {
-		logger.warn?.(`Using HARPER_TEST_BOOT_ID as this start's boot identity`);
+		logger.error?.('HARPER_TEST_BOOT_ID is set, so this node cannot tell an OS restart from a process restart');
 		return validBootId(override);
 	}
 	try {

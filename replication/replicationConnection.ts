@@ -6547,6 +6547,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				error
 			);
 			recordAction(true, FAILED_FRAME_SKIP_METRIC, `${remoteNodeName}.${databaseName}`);
+			ownOriginFrameSkipped = true;
 			return false;
 		}
 	}
@@ -8952,7 +8953,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// a returned row is recovered only once its blobs are saved
 								Promise.allSettled(outstandingBlobsToFinish.slice()).then(() => {
 									if (connectionSuperseded()) return;
-									if (hasBlobGap) askOwnOriginAgain();
+									if (hasBlobGap || ownOriginFrameSkipped) askOwnOriginAgain();
 									else settleOwnOriginReport(reportDatabase, peer, report, rootStore, askOwnOriginAgain);
 								});
 							},
@@ -13048,6 +13049,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	let lastSentExcludedNodes: string[] = [];
 	let ownOriginRecoveryRequested: number | undefined;
+	// a frame given up on since recovery was last asked for may be a returned own write this node never applied
+	let ownOriginFrameSkipped = false;
 	let ownOriginRetries = 0;
 	function currentOriginCursorVector(
 		recordOptimistic = false,
@@ -13718,6 +13721,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					ownOriginRecovery: true,
 				});
 				ownOriginRecoveryRequested = recovery.endTime;
+				ownOriginFrameSkipped = false;
 			}
 		}
 		let excluded: string[];

@@ -37,6 +37,7 @@ import {
 	clearReplicationSharedStatus,
 	type Route,
 	getNodeURL,
+	ownWriteRecipientNames,
 } from './knownNodes.ts';
 import { ownPrivateUrls, samePrivateUrls } from './privatePaths.ts';
 import {
@@ -1182,7 +1183,9 @@ export async function startOnMainThread(options) {
 			if (table.auditStore) {
 				selfCatchupOfDatabase.set(dbName, lastTimeInAuditStore(table.auditStore) as number);
 				try {
-					const synced = openOwnOriginRecoveryEpoch(dbName, table.auditStore, table.dbisDB, continuity);
+					const synced = openOwnOriginRecoveryEpoch(dbName, table.auditStore, table.dbisDB, continuity, () =>
+						ownWriteRecipientNames(dbName)
+					);
 					if (synced) epochSyncs.push({ database: dbName, synced });
 				} catch (error) {
 					epochFailed = true;

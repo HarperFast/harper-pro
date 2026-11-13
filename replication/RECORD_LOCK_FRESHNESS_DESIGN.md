@@ -113,7 +113,7 @@ record of that origin and table this node dropped or failed to apply. Those are 
     (`ownOriginRecovery.ts`); a start on the same boot keeps the previous one. A self-origin position
     minted before the epoch opened, and a recovery-marker grant (`null`), additionally wait (`ownLineage`, polled every
     `OWN_LINEAGE_POLL_MS` until the lock deadline, counted against `MAX_OUTSTANDING_BARRIERS`) until
-    every cursor peer and home has reported returning this node's writes for that epoch. The epoch's
+    every required peer (cursor peers and the members this node sends to) and home has reported returning this node's writes for that epoch. The epoch's
     start is not a proven boundary, so no position before `before` is taken as intact on its own. A
     peer's report of a purge past the log's last key, or an epoch that could not be recorded, rejects
     at once (`own-lineage-unprovable`); a failed read is asked again, not recorded. An own-origin

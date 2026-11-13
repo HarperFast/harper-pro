@@ -251,6 +251,13 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			`a lock admitted before A's recovery was confirmed: ${JSON.stringify(refused.body)}`
 		);
 		assert.match(JSON.stringify(refused.body), /successor freshness/);
+		// B's lock needs A's lineage through a barrier A writes, which A refuses until its writes are back
+		const refusedFromB = await call(nodeB, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
+		assert.equal(
+			refusedFromB.status,
+			503,
+			`a lock on B was admitted before A's recovery was confirmed: ${JSON.stringify(refusedFromB.body)}`
+		);
 		await writeFile(join(reportHoldDir, 'release'), '');
 		const onABefore = (await counter(nodeA, lockKey))?.n;
 		t.diagnostic(`A read ${lockKey}=${onABefore} before the lock`);
