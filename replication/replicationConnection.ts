@@ -7116,11 +7116,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					: [0, ...Object.values(exportIdMapping(store)).filter((id): id is number => typeof id === 'number')];
 			// in memory before any await, so an update committing meanwhile takes no floor for it (dropHoledFloors)
 			if (!projectionCopy)
-				for (const lostId of lost)
-					if (!holedOrigins.has(lostId)) {
-						holedOrigins.set(lostId, undefined);
-						premarked.push(lostId);
-					}
+				for (const lostId of lost) {
+					const calls = holedOrigins.has(lostId) ? provisionalHoles.get(lostId) : 0;
+					if (calls === undefined) continue;
+					holedOrigins.set(lostId, undefined);
+					provisionalHoles.set(lostId, calls + 1);
+					premarked.push(lostId);
+				}
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
 			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
 			passHoles++;
@@ -7163,6 +7165,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					const existingGen = nodes?.find?.((state: any) => state?.id === lostId)?.originGeneration;
 					const gen = typeof existingGen === 'string' ? existingGen : undefined;
 					holedOrigins.set(lostId, gen);
+					provisionalHoles.delete(lostId);
 					pendingRouteState.hole(lostId, gen);
 				}
 				flushRouteState();
@@ -7171,7 +7174,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return !wsClosed;
 		} catch (error) {
 			// the frame is held and replayed, so the hole this call assumed is not one
-			for (const lostId of premarked) holedOrigins.delete(lostId);
+			// unless another call still holds it or it became durable meanwhile
+			for (const lostId of premarked) {
+				const calls = provisionalHoles.get(lostId);
+				if (calls === undefined) continue;
+				if (calls > 1) provisionalHoles.set(lostId, calls - 1);
+				else {
+					provisionalHoles.delete(lostId);
+					holedOrigins.delete(lostId);
+				}
+			}
 			logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error);
 			wsClosed = true;
 			close(1011, 'could not record a replication hole; reconnecting');
@@ -7557,6 +7569,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let partialMarked = new Map<number, string | undefined>();
 	/** Origins with a durable replication hole on this route (`originId -> generation`), preserved across copy-pass restoration. */
 	let holedOrigins = new Map<number, string | undefined>();
+	/** Holes marked in memory by `recordReplicationHole` calls still writing (`originId -> calls`); a durable mark removes the entry. */
+	const provisionalHoles = new Map<number, number>();
 	/** Origins revoked on this route (`originId -> generation`), re-asserted if a settled write fails to persist. */
 	let revokedOrigins = new Map<number, string | undefined>();
 	/** Origins optimistically marked certifiedFrom by the latest subscription request before knowing if the peer copies. */
@@ -8938,7 +8952,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (state && typeof state.id === 'number') {
 									const gen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
 									copyMarkOrigins.set(state.id, gen);
-									if (state.hole === true) holedOrigins.set(state.id, gen);
+									if (state.hole === true) {
+										holedOrigins.set(state.id, gen);
+										provisionalHoles.delete(state.id);
+									}
 								}
 							}
 							if (routeIdForCopy !== undefined && !copyMarkOrigins.has(routeIdForCopy)) {
@@ -13594,6 +13611,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					if (state.hole === true) {
 						holedOrigins.set(state.id, stateGen);
+						provisionalHoles.delete(state.id);
 					} else if (holedOrigins.has(state.id)) {
 						const holedGen = holedOrigins.get(state.id);
 						if (holedGen !== undefined && stateGen !== undefined && stateGen !== holedGen) {
