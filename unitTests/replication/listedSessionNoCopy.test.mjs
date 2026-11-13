@@ -11,7 +11,7 @@ import { decode, encode } from 'msgpackr';
 import { table } from '#src/core/resources/databases';
 import { server } from '#src/core/server/Server';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
-import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
+import { copyBoundScope, databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
 import { setReplicator } from '#src/replication/replicator';
 
 const SUBSCRIPTION_REQUEST = 129;
@@ -115,5 +115,23 @@ describe('a session that excludes its sender', function () {
 		const socket = await subscribe('listed-origin', 0, ['listed-peer']);
 		await until(() => copyStarted(socket), 'a base copy starts');
 		assert.notStrictEqual(socket.closedWith?.reason, REFUSAL);
+	});
+});
+
+describe('copyBoundScope', () => {
+	it('covers every relayed log of a session with exclusions', () => {
+		assert.deepEqual(copyBoundScope(['peer'], ['origin'], 'self'), { aggregate: true });
+		assert.deepEqual(copyBoundScope([], ['self'], 'self'), { aggregate: true });
+	});
+
+	it("covers the one listed log of a request without an exclusion vector when it is another node's", () => {
+		// an older receiver's failover: the session replays that log alone, which this node may hold partly by copy
+		assert.deepEqual(copyBoundScope(undefined, ['origin'], 'self'), { log: 'origin' });
+	});
+
+	it("covers nothing when such a request replays only this node's own log", () => {
+		// a sharded session is restricted to it
+		assert.strictEqual(copyBoundScope(undefined, ['self'], 'self'), undefined);
+		assert.strictEqual(copyBoundScope(undefined, [], 'self'), undefined);
 	});
 });

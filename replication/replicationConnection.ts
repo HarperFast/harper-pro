@@ -917,6 +917,37 @@ export function withheldRecordAction(
 }
 
 /**
+ * The logs a session's copy-bound checks cover: every relayed log of an aggregate range (one with exclusions), or the
+ * one log a request without an exclusion vector replays, when it is another node's (an older receiver's failover).
+ * Undefined when the session replays only this node's own log.
+ */
+export function copyBoundScope(
+	excludedNodes: string[] | undefined,
+	listed: string[],
+	thisNodeName: string
+): { aggregate: true } | { log: string } | undefined {
+	if (excludedNodes) return { aggregate: true };
+	return listed.length === 1 && listed[0] !== thisNodeName ? { log: listed[0] } : undefined;
+}
+
+/**
+ * Clears a copy source's veto only while it still names the walk the caller acted for: a later walk's veto, set while
+ * an older write was in flight, must survive that write's completion.
+ */
+export function clearCopyVeto(
+	vetoed: Map<number, number | undefined> | undefined,
+	sourceId: number,
+	walkStart: number | undefined
+): void {
+	if (vetoed?.has(sourceId) && vetoed.get(sourceId) === walkStart) vetoed.delete(sourceId);
+}
+
+/** Whether a persisted cursor is a newer pass's than the vetoed walk, which ends the veto. */
+export function cursorEndsCopyVeto(veto: number | undefined, copyStartTime: unknown): boolean {
+	return typeof veto === 'number' && typeof copyStartTime === 'number' && copyStartTime > veto;
+}
+
+/**
  * The first relayed log the replay reads that holds rows a base copy wrote here without log entries, above where the
  * follower holds it (compared as `replayStartUnderPurge` does), or undefined. A replay of that log skips those rows.
  */
@@ -6112,9 +6143,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	function markCopyCursorRestart(sourceId: number, cursor: object): void {
+		const walkStart = options.connection?.vetoedCopySources?.get(sourceId);
 		try {
 			Promise.resolve(getDatabaseStores().dbisDB.put([Symbol.for('copyCursor'), sourceId], cursor)).then(
-				() => options.connection?.vetoedCopySources?.delete(sourceId),
+				() => clearCopyVeto(options.connection?.vetoedCopySources, sourceId, walkStart),
 				(error: unknown) =>
 					logger.warn?.(connectionId, 'could not discard the copy resume point for', databaseName, error)
 			);
@@ -7654,11 +7686,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function writeCopyCursor(nodeId: number, cursor: any) {
 		const dbisDB = getDatabaseStores().dbisDB;
 		if (projectionCopy || !dbisDB) return;
+		const vetoAtWrite = options.connection?.vetoedCopySources?.get(nodeId);
 		const persisted = dbisDB.put([Symbol.for('copyCursor'), nodeId], cursor);
 		const credit = () => {
-			// another pass's cursor has replaced a vetoed walk's; a late write of that walk's own has not
-			const vetoed = options.connection?.vetoedCopySources;
-			if (vetoed?.has(nodeId) && vetoed.get(nodeId) !== cursor?.copyStartTime) vetoed.delete(nodeId);
+			// a newer pass's cursor has replaced the vetoed walk's; an older pass's late write, or one issued before a
+			// later veto, has not
+			if (cursorEndsCopyVeto(vetoAtWrite, cursor?.copyStartTime))
+				clearCopyVeto(options.connection?.vetoedCopySources, nodeId, vetoAtWrite);
 			noteCopyStall((tracker) => tracker.noteCursorPersisted(copyStartKey(cursor, encode)));
 		};
 		if (persisted?.then)
@@ -7670,8 +7704,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	async function removeFinishedCopyCursor(nodeId: number) {
 		const dbisDB = getDatabaseStores().dbisDB;
 		if (!dbisDB?.remove) return;
+		const walkStart = options.connection?.vetoedCopySources?.get(nodeId);
 		await dbisDB.remove([Symbol.for('copyCursor'), nodeId]);
-		options.connection?.vetoedCopySources?.delete(nodeId);
+		clearCopyVeto(options.connection?.vetoedCopySources, nodeId, walkStart);
 		noteCopyStall((tracker) => tracker.noteDurableProgress());
 	}
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
@@ -10928,6 +10963,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								};
 								// a listed log of another node (a failover link's) is relayed here too, and checked against copy bounds
 								const isRelayedLog = (name: string) => name !== 'local' && name !== getThisNodeName();
+								const boundScope = copyBoundScope(
+									excludedNodes,
+									nodeSubscriptions.map(({ name }) => name),
+									getThisNodeName()
+								);
+								const singleBoundLog = boundScope && 'log' in boundScope ? boundScope.log : undefined;
 								const replayedRelayedLogs = () =>
 									(purgeBoundLogNames(auditStore, undefined, excludedNodes) ?? []).filter(isRelayedLog);
 								// an origin held only through a base copy has a bound but no log, so the logs alone never name it
@@ -10936,6 +10977,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return new Set(withCopiedOrigins([], sessionCopyBounds).filter((name) => !present.has(name)));
 								};
 								const withCopiedOrigins = (logs: string[], bounds: RelayCopyBounds | undefined) => {
+									// a single-log session replays only its own listed origin, whatever else this node holds by copy
+									if (singleBoundLog !== undefined) return [singleBoundLog];
 									const names = new Set(logs);
 									for (const kind of ['settled', 'reserved'] as const) {
 										for (const name of bounds?.[kind].keys() ?? []) {
@@ -11011,7 +11054,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 										if (isFirst && !closed) {
 											isFirst = false;
-											if (excludedNodes) {
+											if (boundScope) {
 												// read before the bounds, so a write between the two reads rechecks
 												sessionCopyEpoch = readOriginStateEpoch(auditStore.rootStore);
 												sessionLeaseClaims = relayCopyLeaseClaims(auditStore, databaseName);
@@ -11077,9 +11120,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													predatesPurgeTracking(nodeSubscriptions, getThisNodeName(), currentSequenceId, trackedFrom);
 												const shardingResumes =
 													receiverLayout && canResumeShardingHistory(databaseName, receiverShard, currentSequenceId);
-												// only an aggregate range replays relayed logs; a listed origin's start is its own key
 												const copyGap =
-													excludedNodes && !shardingResumes && sessionCopyBounds
+													boundScope && !shardingResumes && sessionCopyBounds
 														? relayedStartBelowCopyBound(
 																withCopiedOrigins(purgeScope.filter(isRelayedLog), sessionCopyBounds),
 																currentSequenceId,
