@@ -486,7 +486,8 @@ function recordLogVouch(
 	stats: LogStats | undefined
 ): void {
 	let vouched = false;
-	let syncFailure = continuity.syncFailure;
+	// an unreadable row may have carried a failure: keep the refusal sticky
+	let syncFailure = true;
 	try {
 		const row = dbisDB.getSync(LOG_VOUCH);
 		const recorded: LogVouch | undefined =
@@ -498,7 +499,7 @@ function recordLogVouch(
 		vouched = vouchesForEarlierLog(recorded, continuity, stats);
 		const rebooted =
 			recorded?.bootId !== undefined && continuity.bootId !== undefined && recorded.bootId !== continuity.bootId;
-		if (!rebooted && recorded?.syncFailure) syncFailure = true;
+		syncFailure = !rebooted && (continuity.syncFailure || recorded?.syncFailure === true);
 	} catch (error) {
 		logger.warn?.(`Own-origin recovery: could not read ${database}'s log vouch`, error);
 	}

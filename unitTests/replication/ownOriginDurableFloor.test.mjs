@@ -275,6 +275,21 @@ describe('openOwnOriginRecoveryEpoch records its log vouch', () => {
 		);
 		assert.deepStrictEqual(rows.get(LOG_VOUCH), { bootId: 'boot-a', vouched: false });
 	});
+	it('does not carry a sync failure from before a reboot onto the new boot', async () => {
+		const rows = new Map([[LOG_VOUCH, { bootId: 'boot-a', vouched: false, syncFailure: true }]]);
+		const { dbisDB, auditStore } = stores(rows, {
+			nextLogPosition: position(2, 10),
+			lastFlushedPosition: position(1, 10),
+		});
+		await openOwnOriginRecoveryEpoch(
+			'rebooted-row-db',
+			auditStore,
+			dbisDB,
+			{ bootId: 'boot-b', syncFailure: true },
+			() => []
+		);
+		assert.deepStrictEqual(rows.get(LOG_VOUCH), { bootId: 'boot-b', vouched: true });
+	});
 	it('carries a sync failure forward on the same boot after the marker is cleared', async () => {
 		const rows = new Map([[LOG_VOUCH, { bootId: 'boot-a', vouched: false, syncFailure: true }]]);
 		const { dbisDB, auditStore } = stores(rows, {
