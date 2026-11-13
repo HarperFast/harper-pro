@@ -191,13 +191,33 @@ describe('vouchesForEarlierLog', () => {
 			false
 		);
 	});
-	it('vouches after a reboot, since whatever survived it is on disk', () => {
+	it('vouches for a log with no flushed position yet only while it has just its first segment', () => {
+		const fresh = { nextLogPosition: position(1, 400), lastFlushedPosition: position(0, 0) };
+		assert.strictEqual(vouchesForEarlierLog(undefined, sameBoot, fresh), true);
+		assert.strictEqual(
+			vouchesForEarlierLog(undefined, sameBoot, {
+				nextLogPosition: position(0, 0),
+				lastFlushedPosition: position(0, 0),
+			}),
+			true
+		);
+		assert.strictEqual(
+			vouchesForEarlierLog(undefined, sameBoot, {
+				nextLogPosition: position(2, 40),
+				lastFlushedPosition: position(0, 0),
+			}),
+			false
+		);
+	});
+	it('vouches after a reboot, since whatever survived it is on disk, even past a sync failure before it', () => {
 		const rebooted = { bootId: 'boot-b', syncFailure: false };
 		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, rebooted, twoSegments), true);
 		assert.strictEqual(vouchesForEarlierLog({ bootId: 'boot-a', vouched: false }, rebooted, twoSegments), true);
+		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, { bootId: 'boot-b', syncFailure: true }, twoSegments), true);
 	});
-	it('never vouches after a recorded sync failure, or without positions', () => {
-		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, { bootId: 'boot-b', syncFailure: true }, oneSegment), false);
+	it('never vouches after a sync failure on this boot, or without positions', () => {
+		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, { bootId: 'boot-a', syncFailure: true }, oneSegment), false);
+		assert.strictEqual(vouchesForEarlierLog(undefined, { bootId: 'boot-a', syncFailure: true }, oneSegment), false);
 		assert.strictEqual(vouchesForEarlierLog(vouchedOnA, sameBoot, undefined), false);
 	});
 });
@@ -298,7 +318,6 @@ describe('sampleDurableFloors on a database', () => {
 		});
 		const { auditStore, dbisDB } = Durable;
 		const rootStore = auditStore.rootStore;
-		await rootStore.flush();
 		await openOwnOriginRecoveryEpoch(
 			'own_origin_durable_floor',
 			auditStore,
@@ -306,6 +325,7 @@ describe('sampleDurableFloors on a database', () => {
 			{ bootId: undefined, syncFailure: false },
 			() => []
 		);
+		assert.strictEqual(dbisDB.getSync(LOG_VOUCH).vouched, true, 'a log with nothing flushed yet can be vouched for');
 		await Durable.put({ id: 1, name: 'before' });
 		let floor;
 		for (let attempt = 0; attempt < 100 && !(floor > 0); attempt++) floor = certifyOriginFloor(rootStore);

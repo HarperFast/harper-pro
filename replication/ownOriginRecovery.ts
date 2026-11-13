@@ -423,8 +423,7 @@ export function advanceDurableFloor(state: DurableFloorState, floor: number, sta
 	const flushed = stats?.lastFlushedPosition;
 	if (!isLogPosition(next) || !isLogPosition(flushed)) return;
 	let samples = state.samples;
-	// a floor sampled over an unchanged log covers no key the last sample did not, and the window never starts
-	// above the overlap below the log's last key
+	// over an unchanged log a newer floor proves nothing that matters: the window never starts above the overlap
 	const appended = !state.sampledAt || compareLogPositions(next, state.sampledAt) !== 0;
 	if (appended && isValidFloor(floor) && floor > state.bound && floor > (samples.at(-1)?.floor ?? 0)) {
 		// thinned rather than shifted: the oldest samples are the first a flush covers
@@ -452,26 +451,28 @@ export interface LogVouch {
  * segments it holds open, so bytes an earlier process on this boot left unsynced in a segment no later process
  * reopens stay unsynced while `lastFlushedPosition` passes them. After a reboot whatever survived is on disk. On
  * the same boot, a start that could not vouch taints every later start until a reboot; otherwise a log whose
- * flushed position is already in the segment it appends to has no such bytes elsewhere. A recorded sync failure
- * vouches for nothing: a page that failed writeback can be marked clean.
+ * flushed position is already in the segment it appends to (or that has only its first segment) has no such bytes
+ * elsewhere. A sync failure since the last start on this boot vouches for nothing: a page that failed writeback
+ * can be marked clean.
  */
 export function vouchesForEarlierLog(
 	recorded: LogVouch | undefined,
 	continuity: StartContinuity,
 	stats: LogStats | undefined
 ): boolean {
-	if (continuity.syncFailure) return false;
 	if (recorded?.bootId !== undefined && continuity.bootId !== undefined && recorded.bootId !== continuity.bootId)
 		return true;
-	if (recorded?.vouched === false) return false;
+	if (continuity.syncFailure || recorded?.vouched === false) return false;
 	const flushed = stats?.lastFlushedPosition;
 	const next = stats?.nextLogPosition;
-	return isLogPosition(flushed) && isLogPosition(next) && flushed.sequence === next.sequence;
+	if (!isLogPosition(flushed) || !isLogPosition(next)) return false;
+	// no flushed position yet reads as sequence 0; segments start at 1
+	return flushed.sequence === next.sequence || (flushed.sequence === 0 && next.sequence <= 1);
 }
 
 /**
- * Decides and records this start's vouch. The row is written on every start, so the next start on this boot reads
- * this one's verdict; before any row exists, the previous epoch's boot is the last start known.
+ * Before any row exists, the previous epoch's boot is the last start known. A refusal this start could not record
+ * is retried by the sampler: until it lands, an older row could let the next start on this boot vouch.
  */
 function recordLogVouch(
 	database: string,
@@ -480,29 +481,32 @@ function recordLogVouch(
 	continuity: StartContinuity,
 	stats: LogStats | undefined
 ): void {
-	let recorded: LogVouch | undefined;
+	let vouched = false;
 	try {
 		const row = dbisDB.getSync(LOG_VOUCH);
-		recorded =
+		const recorded: LogVouch | undefined =
 			typeof row?.vouched === 'boolean'
 				? row
 				: previous?.bootId
 					? { bootId: previous.bootId, vouched: true }
 					: undefined;
+		vouched = vouchesForEarlierLog(recorded, continuity, stats);
 	} catch (error) {
 		logger.warn?.(`Own-origin recovery: could not read ${database}'s log vouch`, error);
-		vouchedDatabases.set(database, false);
-		return;
 	}
-	const vouched = vouchesForEarlierLog(recorded, continuity, stats);
 	vouchedDatabases.set(database, vouched);
+	const row: LogVouch = { vouched };
+	if (continuity.bootId !== undefined) row.bootId = continuity.bootId;
+	if (!writeLogVouch(database, dbisDB, row) && !vouched) unrecordedRefusals.set(database, row);
+}
+
+function writeLogVouch(database: string, dbisDB: any, row: LogVouch): boolean {
 	try {
-		const row: LogVouch = { vouched };
-		if (continuity.bootId !== undefined) row.bootId = continuity.bootId;
 		dbisDB.putSync(LOG_VOUCH, row);
+		return true;
 	} catch (error) {
-		logger.warn?.(`Own-origin recovery: could not record ${database}'s log vouch`, error);
-		vouchedDatabases.set(database, false);
+		warnThrottled(`Own-origin recovery: could not record ${database}'s log vouch`, error);
+		return false;
 	}
 }
 
@@ -524,9 +528,16 @@ function readDurableFloor(dbisDB: any): number | undefined {
 }
 
 const vouchedDatabases = new Map<string, boolean>();
+const unrecordedRefusals = new Map<string, LogVouch>();
 const floorStates = new WeakMap<object, DurableFloorState>();
 let samplerTimer: ReturnType<typeof setInterval> | undefined;
 let samplerErrorLoggedAt = -Infinity;
+
+function warnThrottled(message: string, error: unknown): void {
+	if (performance.now() - samplerErrorLoggedAt < 60_000) return;
+	samplerErrorLoggedAt = performance.now();
+	logger.warn?.(message, error);
+}
 
 export function startDurableFloorSampler(): void {
 	if (samplerTimer || isReadOnlyMode()) return;
@@ -535,14 +546,16 @@ export function startDurableFloorSampler(): void {
 }
 
 export function sampleDurableFloors(): void {
+	for (const [database, row] of unrecordedRefusals) {
+		const dbisDB = dbisFor(database);
+		if (dbisDB && writeLogVouch(database, dbisDB, row)) unrecordedRefusals.delete(database);
+	}
 	for (const [database, vouched] of vouchedDatabases) {
 		if (!vouched) continue;
 		try {
 			sampleDurableFloor(database);
 		} catch (error) {
-			if (performance.now() - samplerErrorLoggedAt < 60_000) continue;
-			samplerErrorLoggedAt = performance.now();
-			logger.warn?.(`Own-origin recovery: could not sample ${database}'s durable floor`, error);
+			warnThrottled(`Own-origin recovery: could not sample ${database}'s durable floor`, error);
 		}
 	}
 }
@@ -581,7 +594,7 @@ function sampleDurableFloor(database: string): void {
 			if (floor > persisting.persisted) persisting.persisted = floor;
 		})
 		.catch((error: unknown) =>
-			logger.warn?.(`Own-origin recovery: could not record ${database}'s durable floor`, error)
+			warnThrottled(`Own-origin recovery: could not record ${database}'s durable floor`, error)
 		)
 		.finally(() => {
 			persisting.persisting = false;
