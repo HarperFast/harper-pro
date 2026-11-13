@@ -235,16 +235,21 @@ export function ownLineage(
 	}
 	const { epoch, clean } = cached;
 	if ((position !== null && position >= epoch.before) || cached.provenFor === homes) return { state: 'intact' };
+	let skippedNonMember = false;
 	const lineage = lineageFromReports(
 		epoch,
 		homes,
 		self,
 		(peer) => (clean.has(peer) ? { epoch: epoch.before } : readReport(dbisFor(database), peer)),
-		memberCheck,
+		(peer) => {
+			if (memberCheck(peer)) return true;
+			skippedNonMember = true;
+			return false;
+		},
 		(peer) => clean.add(peer)
 	);
-	// a home map's array is replaced, never mutated, when it changes
-	if (lineage.state === 'intact') cached.provenFor = homes;
+	// a home map's array is replaced, never mutated, when it changes; a peer removed now may be re-added
+	if (lineage.state === 'intact' && !skippedNonMember) cached.provenFor = homes;
 	return lineage;
 }
 

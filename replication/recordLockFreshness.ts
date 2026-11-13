@@ -423,7 +423,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 							'recloned',
 							`${database} on this node was recloned, so its own earlier record lock lineage cannot be proven`
 						);
-					else ownPosition = position;
+					else ownPosition = ownPosition == null ? position : Math.min(ownPosition, position);
 				}
 			}
 			// Every refusal before the first wait starts: a wait started for an earlier origin would be
