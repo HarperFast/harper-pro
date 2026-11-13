@@ -3338,6 +3338,21 @@ export function cursorBelowFloor(floor: number): number {
 	return FLOOR_SCRATCH[0];
 }
 
+/**
+ * Raise a non-negative status slot to `value` unless it already holds as much. Sockets on different workers write the
+ * same slot; a non-negative double's bits order like the number, so a compare-and-swap on them never lowers it.
+ */
+export function raiseStatusSlot(status: Float64Array, position: number, value: number): boolean {
+	const bits = new BigInt64Array(status.buffer, status.byteOffset, status.length);
+	FLOOR_SCRATCH[0] = value;
+	const next = FLOOR_BITS[0];
+	for (;;) {
+		const current = Atomics.load(bits, position);
+		if (current >= next) return false;
+		if (Atomics.compareExchange(bits, position, current, next) === current) return true;
+	}
+}
+
 export function resumeStartWithFloor(position: number, closedFloor: unknown): number {
 	return isValidFloor(closedFloor) ? Math.max(position, cursorBelowFloor(closedFloor)) : position;
 }
@@ -8741,10 +8756,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// a marker this socket sent; any socket's acknowledgement stays a proof, so the slot only rises
 						if (!Number.isSafeInteger(data) || data <= 0 || data > lastConfirmationMarkerSent) break;
 						const status = getSharedStatus();
-						if (!(status[ACKED_CONFIRMATION_MARKER_POSITION] >= data)) {
-							status[ACKED_CONFIRMATION_MARKER_POSITION] = data;
-							(status.buffer as any).notify();
-						}
+						if (raiseStatusSlot(status, ACKED_CONFIRMATION_MARKER_POSITION, data)) (status.buffer as any).notify();
 						break;
 					}
 					case COMMITTED_UPDATE:
@@ -10317,6 +10329,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								let floorEmissionLatchedRange: unknown;
 								// set once a scan may have skipped an entry: no later marker on this connection proves delivery
 								let markersUnproven = false;
+								const stopMarkers = () => {
+									if (markersUnproven) return;
+									markersUnproven = true;
+									if (demand)
+										logger.warn?.(
+											connectionId,
+											`A transaction-log scan for ${remoteNodeName} may have skipped an entry; writes waiting for confirmation from it time out until this connection reconnects`
+										);
+								};
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
 								const originCertifies = (name: string): number => {
@@ -11102,7 +11123,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											);
 											boundaryLogName = undefined;
 											auditLogIterable = undefined;
-											markersUnproven = true;
+											stopMarkers();
 											if (originFloors?.size) {
 												({ originFloors, originFloorById } = applyRelayedAnchorFloors(
 													originFloors,
@@ -11207,7 +11228,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												liveRange?.failedLogs?.size > 0 ||
 												liveRange?.corruptFrameStop?.breaks > 0
 											)
-												markersUnproven = true;
+												stopMarkers();
 											markersProven = !markersUnproven;
 											if (markersProven && passMarker > lastConfirmationMarkerSent && !closed && !wsClosed) {
 												ws.send(encode([CONFIRMATION_MARKER, passMarker]));

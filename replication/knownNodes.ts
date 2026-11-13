@@ -856,8 +856,8 @@ function replicationConfirmationTimeout(automatic = false): number {
 }
 
 /**
- * Fire `onConfirm(nodeName)` for every waiter in `awaiting` whose `txnTime` falls in
- * `(lastTime, updatedTime]`. Each waiter removes itself from `awaiting` (via `Set.delete`) the
+ * Fire `onConfirm(nodeName)` for every waiter in `awaiting` that `nodeName`'s status now confirms (`peerConfirms`).
+ * Each waiter removes itself from `awaiting` (via `Set.delete`) the
  * moment it fully settles — see createConfirmationWaiter — so nothing here needs to compact,
  * snapshot, or otherwise guard against mutation during iteration: deleting the *current* item
  * mid-for-of over a Set is well-defined and safe (unlike an array, where the equivalent splice

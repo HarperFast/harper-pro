@@ -18,6 +18,7 @@ import {
 	restoreCompletedCopyPass,
 	resumeStartWithFloor,
 	shardingRouteResumeStart,
+	raiseStatusSlot,
 } from '#src/replication/replicationConnection';
 
 const T = 1_790_000_000_000;
@@ -78,6 +79,18 @@ describe('shardingRouteResumeStart (harper-pro#1351)', () => {
 	it('keeps the received position from a peer that does not certify floors', () => {
 		assert.strictEqual(shardingRouteResumeStart(T - 5000, T + 2000, false, { id: 1, closedFloor: T }), T + 2000);
 		assert.strictEqual(shardingRouteResumeStart(T + 3000, T + 2000, false, undefined), T + 3000);
+	});
+});
+
+describe('raiseStatusSlot', () => {
+	it('raises a slot and never lowers it', () => {
+		const status = new Float64Array(new SharedArrayBuffer(4 * 8));
+		assert.strictEqual(raiseStatusSlot(status, 2, 9), true);
+		assert.strictEqual(raiseStatusSlot(status, 2, 8), false);
+		assert.strictEqual(status[2], 9);
+		assert.strictEqual(raiseStatusSlot(status, 2, 2 ** 40), true);
+		assert.strictEqual(status[2], 2 ** 40);
+		assert.strictEqual(status[1], 0);
 	});
 });
 

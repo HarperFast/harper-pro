@@ -81,6 +81,7 @@ describe('drainNode', () => {
 			node: 'leaving',
 			finalize: 'e1',
 			databases: ['data'],
+			receipts: { data: { target: T, generation: 'gen-1' } },
 		});
 		assert.ok(send.calls.every(({ options }) => options.timeoutMs > 0 && options.timeoutMs <= 30_000));
 	});
@@ -178,7 +179,7 @@ describe('drainNode', () => {
 			drainNode('leaving', { name: 'leaving' }, 5000, send, async (peer) => ({ name: peer })),
 			(error) => {
 				assert.equal(error.statusCode, 409);
-				assert.match(error.message, /No peer of leaving receives database data/);
+				assert.match(error.message, /No peer of leaving that must hold its writes to database data/);
 				assert.match(error.message, /leaving accepts local writes again/);
 				return true;
 			}
@@ -188,6 +189,24 @@ describe('drainNode', () => {
 			send.calls.some(({ operation }) => operation.cancel === true),
 			'the refused drain lifts its fence'
 		);
+	});
+
+	it('refuses when every other owner of one shard does not subscribe, even if another shard holds the writes', async () => {
+		const sharded = () => ({
+			...fence(),
+			databases: {
+				data: { target: T, generation: 'gen-1', sharded: true, peers: ['p1', 'p2'], shardOwners: [['p1'], ['p2']] },
+			},
+		});
+		const send = transport((node, operation) => {
+			if (operation.operation === FENCE_OPERATION) return operation.cancel ? { cancelled: true } : sharded();
+			return { data: node.name === 'p1' ? { closedFloor: null, receives: false } : holds };
+		});
+		await assert.rejects(
+			drainNode('leaving', { name: 'leaving' }, 5000, send, async (peer) => ({ name: peer })),
+			(error) => error.statusCode === 409 && /must hold its writes to database data/.test(error.message)
+		);
+		assert.ok(!send.calls.some(({ operation }) => operation.finalize));
 	});
 
 	it('never calls a peer with less than a usable budget left, keeping the last complete round', async () => {
@@ -214,8 +233,10 @@ describe('drainNode', () => {
 	it('times out on time when looking up a peer stalls', async () => {
 		const send = transport(() => fence());
 		const started = performance.now();
+		// mocha timeouts are off: a regression must fail here, not hang the run
+		const hung = new Promise((_, reject) => setTimeout(() => reject(new Error('the drain hung')), 5000).unref());
 		await assert.rejects(
-			drainNode('leaving', { name: 'leaving' }, 1000, send, () => new Promise(() => {})),
+			Promise.race([drainNode('leaving', { name: 'leaving' }, 1000, send, () => new Promise(() => {})), hung]),
 			(error) => error.statusCode === 504
 		);
 		assert.ok(performance.now() - started < 3000, `took ${performance.now() - started}ms`);

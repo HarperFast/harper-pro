@@ -45,6 +45,8 @@ export interface DatabaseDrain {
 	generation?: string;
 	sharded: boolean;
 	peers: string[];
+	/** for a database with a shard map, each shard's other owners: one of them must hold the node's writes */
+	shardOwners?: string[][];
 }
 
 export interface FenceState {
@@ -103,7 +105,10 @@ function assertDrainable(database: string, auditStore: any): void {
  * not subscribe to it says so in its receipt. For a database with a shard map, a shard this node alone owns would
  * lose its records, which no wait can prevent.
  */
-function requiredPeers(database: string, thisNode: string): { peers: string[]; sharded: boolean } {
+function requiredPeers(
+	database: string,
+	thisNode: string
+): { peers: string[]; sharded: boolean; shardOwners?: string[][] } {
 	// writes to tables that do not replicate never leave this node
 	if (!Object.values(databases[database] ?? {}).some((table: any) => tableReplicates(table)))
 		return { peers: [], sharded: false };
@@ -112,19 +117,19 @@ function requiredPeers(database: string, thisNode: string): { peers: string[]; s
 		.map((node: any) => node.name)
 		.sort();
 	const map = readResidencyMap(database);
-	if (map) {
-		for (const shard of new Set(map.ranges.map((range: any) => range.shard))) {
-			const members = (server.shards?.get(shard) ?? []).map((node: any) =>
-				typeof node === 'string' ? node : node.name
+	if (!map) return { peers, sharded: false };
+	const shardOwners: string[][] = [];
+	for (const shard of new Set(map.ranges.map((range: any) => range.shard))) {
+		const members = (server.shards?.get(shard) ?? []).map((node: any) => (typeof node === 'string' ? node : node.name));
+		if (members.includes(thisNode) && !members.some((name: string) => name !== thisNode))
+			throw new ClientError(
+				`${thisNode} is the only owner of shard ${shard} of database ${database}; removing it would lose that shard's records. Add another owner first, or use force: true`,
+				409
 			);
-			if (members.includes(thisNode) && !members.some((name: string) => name !== thisNode))
-				throw new ClientError(
-					`${thisNode} is the only owner of shard ${shard} of database ${database}; removing it would lose that shard's records. Add another owner first, or use force: true`,
-					409
-				);
-		}
+		const others = members.filter((name: string) => name !== thisNode && peers.includes(name));
+		if (others.length > 0) shardOwners.push(others);
 	}
-	return { peers, sharded: Boolean(map) };
+	return { peers, sharded: true, shardOwners };
 }
 
 /**
@@ -189,10 +194,19 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 	const epoch = fences.find((fence) => fence.epoch)?.epoch || randomUUID();
 	if (request.finalize !== undefined) {
 		const expected = new Set(request.databases ?? []);
+		// the receipts vouch for one target and generation per database; a database dropped and created again since
+		// was fenced at another target, with writes before that fence no receipt covers
+		const receipted = request.receipts ?? {};
 		const fenced = [...roots].every(([database, auditStores]) =>
-			auditStores.every(
-				(auditStore) => readLocalWriteFence(auditStore)?.epoch === request.finalize && expected.has(database)
-			)
+			auditStores.every((auditStore) => {
+				const fence = readLocalWriteFence(auditStore);
+				return (
+					fence?.epoch === request.finalize &&
+					expected.has(database) &&
+					fence.target === receipted[database]?.target &&
+					getDatabaseGeneration(auditStore)?.id === receipted[database]?.generation
+				);
+			})
 		);
 		if (request.finalize !== epoch || !fenced || expected.size !== roots.size)
 			throw new ClientError(`${thisNode}'s fence changed since its receipts were collected; retry the removal`, 409);
@@ -221,9 +235,15 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 			targets.set(auditStore, fenceTarget);
 			if (fenceTarget > target) target = fenceTarget;
 		}
-		const { peers, sharded } = required.get(database)!;
+		const { peers, sharded, shardOwners } = required.get(database)!;
 		const generation = getDatabaseGeneration(auditStores[0])?.id;
-		result.databases[database] = { target, sharded, peers, ...(typeof generation === 'string' ? { generation } : {}) };
+		result.databases[database] = {
+			target,
+			sharded,
+			peers,
+			...(shardOwners ? { shardOwners } : {}),
+			...(typeof generation === 'string' ? { generation } : {}),
+		};
 	}
 	// a database created while finalize ran is neither fenced nor receipted; the next poll covers it
 	if (request.finalize !== undefined) {
@@ -422,7 +442,7 @@ export async function drainNode(
 			for (const peer of drain.peers) byPeer.set(peer, [...(byPeer.get(peer) ?? []), database]);
 		const round: string[] = [];
 		const holders: Record<string, string[]> = {};
-		const notSubscribed: Record<string, number> = {};
+		const notSubscribed: Record<string, Set<string>> = {};
 		let budgetSpent = false;
 		for (const [peer, peerDatabases] of byPeer) {
 			if (remaining() <= MIN_CALL_MS) {
@@ -446,7 +466,7 @@ export async function drainNode(
 			}
 			for (const database of peerDatabases) {
 				if (answers?.[database]?.receives === false) {
-					notSubscribed[database] = (notSubscribed[database] ?? 0) + 1;
+					(notSubscribed[database] ??= new Set()).add(peer);
 					continue;
 				}
 				const shortfall = receiptShortfall(answers?.[database], fence.databases[database]);
@@ -458,10 +478,13 @@ export async function drainNode(
 			if (shortfalls.length === 0) shortfalls = round;
 			break;
 		}
-		// every peer it sends a replicated database to said it does not subscribe: its writes there exist only on it
-		const unreceived = Object.entries(fence.databases).find(
-			([database, drain]) => drain.peers.length > 0 && notSubscribed[database] === drain.peers.length
-		)?.[0];
+		// every peer it sends a replicated database to, or every other owner of one shard, said it does not subscribe
+		const unreceived = Object.entries(fence.databases).find(([database, drain]) => {
+			const declined = notSubscribed[database];
+			if (!declined) return false;
+			if (drain.peers.length > 0 && drain.peers.every((peer) => declined.has(peer))) return true;
+			return drain.shardOwners?.some((owners) => owners.every((owner) => declined.has(owner))) ?? false;
+		})?.[0];
 		if (unreceived) {
 			let lifted = '';
 			if (fence.state !== 'removing')
@@ -470,7 +493,7 @@ export async function drainNode(
 					(error) => `; ${name} is still fenced (${errorText(error)}): remove_node with cancel: true lifts it`
 				);
 			throw new ClientError(
-				`No peer of ${name} receives database ${unreceived} from it, so its writes there exist only on ${name}; use force: true to remove it anyway${lifted}`,
+				`No peer of ${name} that must hold its writes to database ${unreceived} receives that database from it, so some of those writes exist only on ${name}; use force: true to remove it anyway${lifted}`,
 				409
 			);
 		}
@@ -482,6 +505,12 @@ export async function drainNode(
 					node: name,
 					finalize: fence.epoch,
 					databases: Object.keys(fence.databases),
+					receipts: Object.fromEntries(
+						Object.entries(fence.databases).map(([database, drain]) => [
+							database,
+							{ target: drain.target, generation: drain.generation },
+						])
+					),
 				});
 				for (const database in finalized.databases) finalized.databases[database].peers = holders[database] ?? [];
 				return finalized;
