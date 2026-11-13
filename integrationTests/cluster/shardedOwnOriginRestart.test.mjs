@@ -26,6 +26,13 @@ suite(
 			await waitForLocal(coOwner.harper, ids);
 			await restartNode(writer.harper);
 			await meshed(contexts, 'the cluster to reconnect after restarting a sharded node');
+			// a link that keeps closing is connected for a moment after each handshake, so a write must also cross it
+			const response = await request(coOwner.harper, 'Drained/own-7', {
+				method: 'PUT',
+				body: { id: 'own-7', body: 'own-7' },
+			});
+			assert.ok(response.status < 300, JSON.stringify(response));
+			await waitForLocal(writer.harper, ['own-7']);
 		});
 	}
 );

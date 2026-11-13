@@ -6479,7 +6479,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// An update queued before a hole was marked takes its floors at commit: a holed origin's floor must not commit
 	// ahead of the durable hole mark and satisfy a removal receipt for the write this node skipped.
 	function dropHoledFloors() {
-		if (holedOrigins.size === 0) return;
+		if (holedOrigins.size === 0 || pendingOriginFloors.size === 0) return;
 		for (const id of holedOrigins.keys()) pendingOriginFloors.drop(id);
 	}
 	function seqUpdateEndTxn(seqId: number, originFloors?: ReceivedOriginFloor[], releasePending = false): any {
