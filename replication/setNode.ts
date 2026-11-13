@@ -98,10 +98,11 @@ export async function setNode(req: any) {
 
 	if (req.operation === 'remove_node') {
 		if (!url && !hostname) throw new ClientError('url or hostname is required for remove_node operation');
+		// Joi's converted values: a string "false" must not reach `if (force)` as a truthy string
 		return removeNodeFromTable(hostname, url, getHDBNodeTable(), sendOperationToNode, {
-			force: req.force,
-			cancel: req.cancel,
-			timeout: req.timeout,
+			force: validated.force,
+			cancel: validated.cancel,
+			timeout: validated.timeout,
 		});
 	}
 
