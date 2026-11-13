@@ -6562,8 +6562,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			logger.warn?.(connectionId, 'could not send the route marks for', databaseName, error);
 		}
 	}
-	// Returns true to hold: core then records no cursor for this connection's later frames either.
-	function onFrameFailure(error: unknown, position: number): boolean {
+	// Resolves true to hold: core then records no cursor for this connection's later frames either.
+	async function onFrameFailure(error: unknown, position: number): Promise<boolean> {
 		if (
 			holdFailedFrame(
 				failedFrameAttempts,
@@ -6587,7 +6587,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			);
 			recordAction(true, FAILED_FRAME_SKIP_METRIC, `${remoteNodeName}.${databaseName}`);
 			markersWithheldRoutes.add(`${remoteNodeName}/${databaseName}`);
-			return false;
+			// the frame's writes are missing here for good, so no floor this route certifies may vouch for them
+			const recorded = await recordReplicationHole(
+				undefined,
+				ANY_TABLE,
+				`transaction failed on ${FAILED_FRAME_REPLAYS + 1} deliveries`,
+				position
+			);
+			return !recorded;
 		}
 	}
 	const txnStream = {};
@@ -7037,9 +7044,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		originId: number | undefined,
 		tableName: string,
 		reason: string,
-		lossKey = Date.now()
+		lossKey = Date.now(),
+		// false where holding would re-deliver the same unrecoverable record forever (a blob its source cannot send)
+		holdSharded = true
 	) {
-		if (admittedLayout && tables?.[tableName]?.residency) {
+		if (holdSharded && admittedLayout && tables?.[tableName]?.residency) {
 			wsClosed = true;
 			close(1011, 'Sharded record was not applied; recovery cursor held: ' + reason);
 			return false;
@@ -11826,7 +11835,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						auditStore?.rootStore,
 						(blob) => {
 							const repairTarget = repairTargets?.[repairIndex++];
-							const localBlob = receiveBlobs(blob, id, copyFrameIndex, repairTarget, tableDecoder.name);
+							const localBlob = receiveBlobs(
+								blob,
+								id,
+								copyFrameIndex,
+								repairTarget,
+								tableDecoder.name,
+								localSourceNodeId
+							);
 							// An in-place-repaired blob is a file a committed record already references (possibly a
 							// coalesced reuse from an earlier record in this message) — never let the decode-failure
 							// cleanup below unlink it.
@@ -12829,7 +12845,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		id: string | number,
 		copyFrameIndex?: number,
 		repairTarget?: any,
-		tableName?: string
+		tableName?: string,
+		originId?: number
 	) {
 		// write the blob to the blob store
 		const blobId = getFileId(remoteBlob);
@@ -12936,7 +12953,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// even though we already logged it here, and it would escape onCommit as an
 			// uncaughtException — observed in prod as ~35/sec ENOENT spam during catch-up.
 			const tracked = finished
-				.catch((err) => {
+				.catch(async (err) => {
 					// This .catch runs inside the same microtask chain that onCommit's
 					// `await Promise.all(outstandingBlobsToFinish)` is waiting on; we deliberately do NOT tear
 					// down here. Classify the failure to decide whether the resume cursor holds or advances.
@@ -12994,6 +13011,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// The cursor may pass it, but no marker may vouch for delivery: one held now, or any later.
 						markersWithheldRoutes.add(`${remoteNodeName}/${databaseName}`);
 						const escalation = getBlobGapEscalation(err);
+						// A source that still holds the bytes (a transient failure escalated past its budget) leaves a
+						// write this node lacks, so no floor of this route may vouch for it. A blob the source reports
+						// gone is gone there too: a receipt for that origin loses nothing more.
+						if (escalation)
+							await recordReplicationHole(
+								originId,
+								tableName ?? ANY_TABLE,
+								'blob its source could not send',
+								undefined,
+								false
+							);
 						logger.error?.(
 							escalation
 								? `Blob ${blobId} for record ${id} stayed transiently unavailable at source ${remoteNodeName} (${errorToString(err)}) — ` +
