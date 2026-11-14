@@ -17,6 +17,7 @@ import { getThisNodeName, hostnameToUrl, getThisNodeUrl } from '../core/server/n
 import * as hdbLogger from '../core/utility/logging/harper_logger.js';
 import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/hdbError.js';
 import { server } from '../core/server/Server.ts';
+import { drainNode, drainTimeoutMs, FENCE_OPERATION, liftFenceAfterRemoval, removeNodeFence } from './nodeRemoval.ts';
 import { ownPrivateUrls, receivedPrivateUrls } from './privatePaths.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
 
@@ -30,6 +31,9 @@ const validationSchema = Joi.object({
 	revoked_certificates: Joi.array(),
 	shard: Joi.number().integer().min(0).max(65535),
 	isLeader: Joi.boolean(),
+	force: Joi.boolean(),
+	cancel: Joi.boolean(),
+	timeout: Joi.number().integer().min(1),
 });
 
 // Strict ISO 8601 with a required UTC/offset designator (Z or +/-HH:MM). `new Date(string)` also accepts
@@ -94,7 +98,12 @@ export async function setNode(req: any) {
 
 	if (req.operation === 'remove_node') {
 		if (!url && !hostname) throw new ClientError('url or hostname is required for remove_node operation');
-		return removeNodeFromTable(hostname, url, getHDBNodeTable(), sendOperationToNode);
+		// Joi's converted values: a string "false" must not reach `if (force)` as a truthy string
+		return removeNodeFromTable(hostname, url, getHDBNodeTable(), sendOperationToNode, {
+			force: validated.force,
+			cancel: validated.cancel,
+			timeout: validated.timeout,
+		});
 	}
 
 	const thisUrl = getThisNodeUrl();
@@ -132,6 +141,7 @@ export async function setNode(req: any) {
 		csr,
 		cert_auth,
 		authorization: req.retain_authorization ? req.authorization : null,
+		joining: req.operation !== 'update_node',
 	};
 	if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) targetAddNodeObj.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
 	const privateUrls = ownPrivateUrls();
@@ -266,7 +276,10 @@ export async function setNode(req: any) {
 	let message: string;
 	if (req.operation === 'update_node') {
 		message = `Successfully updated '${url}'`;
-	} else message = `Successfully added '${url}' to cluster`;
+	} else {
+		await liftFenceAfterRemoval(false);
+		message = `Successfully added '${url}' to cluster`;
+	}
 	if (targetNodeResponseError) {
 		// Opt-in only, so add_node/set_node keep reporting success-with-warning for every other caller:
 		// the local peer row is written either way, but for a caller whose next step depends on the
@@ -353,6 +366,7 @@ export async function addNodeBack(req) {
 		await ensureNode(getThisNodeName(), thisNode);
 	}
 	await ensureNode(req.hostname, nodeRecord);
+	if (req.joining === true) await liftFenceAfterRemoval(false);
 	certs.nodeName = getThisNodeName();
 
 	certs.usingCA = repCa?.certificate; // in addition to the signed CA, we need to return the CA that is being used for the active certificate
@@ -361,10 +375,25 @@ export async function addNodeBack(req) {
 	return certs;
 }
 
+export interface RemoveNodeOptions {
+	force?: boolean;
+	cancel?: boolean;
+	timeout?: number;
+	drain?: typeof drainNode;
+}
+
 /**
- * The local removal stands even when the peer does not confirm its reciprocal; the result says so.
+ * A live node is drained first (`nodeRemoval.ts`): it stops accepting local writes, and its row is deleted only
+ * once every peer that must hold its writes has them. The local removal stands even when the peer does not
+ * confirm its reciprocal; the result says so.
  */
-export async function removeNodeFromTable(hostname: string, url: string, hdbNodes, sendOperation) {
+export async function removeNodeFromTable(
+	hostname: string,
+	url: string,
+	hdbNodes,
+	sendOperation,
+	{ force = false, cancel = false, timeout, drain = drainNode }: RemoveNodeOptions = {}
+) {
 	const found = await findExistingNodeRecord(hostname, url, hdbNodes);
 	// Only the exact name selects this node's own row: removing it takes this node out of replication
 	// with every peer, too broad an effect to reach through an address.
@@ -372,9 +401,25 @@ export async function removeNodeFromTable(hostname: string, url: string, hdbNode
 		throw new ClientError(hostname + ' does not exist');
 	}
 	const { name, record } = found;
+	if (force && cancel) throw new ClientError('force and cancel cannot be combined', 400);
+	if (cancel) {
+		await sendFenceCancel(name, record, sendOperation);
+		return `Cancelled the removal of '${name}': it accepts local writes again and remains a member`;
+	}
 	// An exact-key hit wins over other rows at the same url; refusing it would also refuse their exact
 	// names, leaving no way to remove either.
 	const othersAtUrl = (await rowsAtUrl(record.url, hdbNodes)).filter((node) => node.name !== name);
+	const timeoutMs = drainTimeoutMs(timeout);
+	let drained: string;
+	if (force)
+		drained = '; removed without waiting for its writes to reach its peers, so writes only it held may be lost';
+	else {
+		const fence = await drain(name, record, timeoutMs, sendOperation, (peer) => hdbNodes.get(peer));
+		const peers = new Set(Object.values(fence.databases).flatMap((database) => database.peers));
+		drained = peers.size
+			? `; its writes reached ${peers.size} peer${peers.size === 1 ? '' : 's'} before it was removed`
+			: '';
+	}
 
 	// Revoke locally before notifying the peer: the dynamic send-authorization watch acts on this
 	// delete, so the peer's access must not outlive a round trip to that (possibly offline or
@@ -402,7 +447,14 @@ export async function removeNodeFromTable(hostname: string, url: string, hdbNode
 	if (othersAtUrl.length > 0) {
 		message += `; still registered at ${record.url} and not removed: ${othersAtUrl.map((node) => `'${node.name}'`).join(', ')}`;
 	}
-	return message;
+	return message + drained;
+}
+
+async function sendFenceCancel(name: string, record: any, sendOperation) {
+	const operation = { operation: FENCE_OPERATION, node: name, cancel: true };
+	if (name === getThisNodeName())
+		await removeNodeFence({ ...operation, hdb_user: { name, role: { permission: { super_user: true } } } });
+	else await sendOperation(record, operation, { timeoutMs: REMOVE_NODE_BACK_TIMEOUT_MS });
 }
 
 async function rowsAtUrl(url: string, hdbNodes) {
@@ -418,13 +470,22 @@ async function rowsAtUrl(url: string, hdbNodes) {
  * Is called by other node when remove_node is requested and
  * system tables are not replicating
  */
-export async function removeNodeBackFromTable(req, hdbNodes) {
+export async function removeNodeBackFromTable(req, hdbNodes, liftFence = liftFenceAfterRemoval) {
 	const callerName = req.hdb_user?.name;
 	if (!callerName || (req.name !== callerName && req.name !== getThisNodeName())) {
 		throw new ClientError(`remove_node_back may only remove the authenticated peer or this node, not '${req.name}'`);
 	}
 	//  delete the record
 	await hdbNodes.delete(req.name);
+	// A finalized fence belongs to this node's own removal: deleting one peer's row while others remain is not that
+	// removal, and another coordinator may be about to delete this node on the strength of receipts taken under it.
+	await liftFence(req.name === getThisNodeName() || !(await holdsPeerRow(hdbNodes)));
+}
+
+async function holdsPeerRow(hdbNodes): Promise<boolean> {
+	const thisNode = getThisNodeName();
+	for await (const node of hdbNodes.search({})) if (node?.name && node.name !== thisNode) return true;
+	return false;
 }
 
 export async function removeNodeBack(req) {

@@ -147,6 +147,11 @@ import {
 	FIRE_COUNTER_BASE_POSITION,
 	PEER_CERTIFIES_FLOORS_POSITION,
 	LAST_SEND_LOG_BREAK_RECONNECT_TIME_POSITION,
+	ACKED_CONFIRMATION_MARKER_POSITION,
+	PEER_CONFIRMATION_MARKERS_POSITION,
+	CONFIRMATION_MARKERS_SUPPORTED,
+	CONFIRMATION_MARKERS_UNKNOWN,
+	CONFIRMATION_MARKERS_UNSUPPORTED,
 	CONNECTION_PATH_POSITION,
 	PATH_PRIVATE,
 	PATH_PUBLIC,
@@ -192,6 +197,7 @@ import {
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
+	peerSupportsConfirmationMarkers,
 	peerSupportsOriginCursors,
 	peerSupportsOwnOriginRecovery,
 	peerSupportsOriginFloors,
@@ -244,6 +250,9 @@ import {
 	isGenuineNodeDeletion,
 	probeNodeRow,
 	SEND_AUTH_UNCHANGED,
+	confirmationDemand,
+	DEMAND_MARKER,
+	DEMAND_WAITERS,
 } from './knownNodes.ts';
 import * as process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -339,6 +348,11 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 const OWN_ORIGIN_SENT = 151;
 const OWN_ORIGIN_RETRY_MS = 5_000;
 const OWN_ORIGIN_RETRY_MAX_MS = 300_000;
+// Sender → receiver after a send pass that began once `[1]` was taken (knownNodes.ts `confirmationDemand`); the
+// receiver answers CONFIRMATION_MARKER_ACK once every frame sent before it has committed. Only to a peer
+// advertising `confirmationMarkers`.
+const CONFIRMATION_MARKER = 152;
+const CONFIRMATION_MARKER_ACK = 153;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -604,6 +618,9 @@ const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWater
 // receiver moves past it, so a failure that recurs on every delivery cannot stall a peer's replication forever.
 const FAILED_FRAME_REPLAYS = env.get('replication_failedFrameReplays') ?? 5;
 const failedFrameAttempts = new Map<string, { position: number; attempts: number }>();
+// `<peer>/<database>` routes that skipped a frame or a blob the source could not send: a later marker would cover
+// the skipped write, so this process acknowledges none on any later connection of that route
+const markersWithheldRoutes = new Set<string>();
 /** Attempts are counted per peer and database across reconnects; a later position's commit clears them. */
 export function holdFailedFrame(
 	attemptsByPeer: Map<string, { position: number; attempts: number }>,
@@ -3327,8 +3344,48 @@ export function cursorBelowFloor(floor: number): number {
 	return FLOOR_SCRATCH[0];
 }
 
+/**
+ * Raise a non-negative status slot to `value` unless it already holds as much. Sockets on different workers write the
+ * same slot; a non-negative double's bits order like the number, so a compare-and-swap on them never lowers it.
+ */
+const statusBits = new WeakMap<Float64Array, BigInt64Array>();
+export function raiseStatusSlot(status: Float64Array, position: number, value: number): boolean {
+	let bits = statusBits.get(status);
+	if (!bits) statusBits.set(status, (bits = new BigInt64Array(status.buffer, status.byteOffset, status.length)));
+	FLOOR_SCRATCH[0] = value;
+	const next = FLOOR_BITS[0];
+	for (;;) {
+		const current = Atomics.load(bits, position);
+		if (current >= next) return false;
+		if (Atomics.compareExchange(bits, position, current, next) === current) return true;
+	}
+}
+
+/**
+ * A valid floor is the proven start. A received position above it is a key maximum: an entry reserved below that
+ * position and committed after the link dropped would be filtered by the sender while later floors certify past it.
+ */
 export function resumeStartWithFloor(position: number, closedFloor: unknown): number {
-	return isValidFloor(closedFloor) ? Math.max(position, cursorBelowFloor(closedFloor)) : position;
+	return isValidFloor(closedFloor) ? cursorBelowFloor(closedFloor) : position;
+}
+
+/**
+ * Where a completed sharding projection resumes its peer's own log. The received position is a key maximum: an
+ * entry reserved below it and committed after the link dropped would be filtered by the sender. From a peer that
+ * certifies floors, the route's certified floor (`directState`) is what it has delivered, so it starts below that,
+ * and before the first floor it starts again at the projection, the last proven prefix. A peer that does not
+ * certify keeps the position.
+ */
+export function shardingRouteResumeStart(
+	projectionStart: number,
+	position: number,
+	certifies: boolean,
+	directState: any
+): number {
+	if (!certifies) return Math.max(projectionStart, position);
+	return directState?.floorRevoked !== true && isValidFloor(directState?.closedFloor)
+		? Math.max(projectionStart, cursorBelowFloor(directState.closedFloor))
+		: projectionStart;
 }
 
 /** A level-2 certificate: `floor` alone from a level-1 peer; `generation` and `fullCoverage` from level 2; `revoked` for `0`. */
@@ -4329,7 +4386,7 @@ export function buildOriginCursorVector(
 	/** Highest copied record version per origin from an audit-less base copy; a floor at or below it must not resume floor-only. */
 	minFloorOnlyStart?: ReadonlyMap<number, number>
 ): Record<string, number> {
-	const cursorOf = (node: any, allowFloorOnly = true): number | undefined => {
+	const cursorOf = (node: any, allowFloorOnly: boolean, member: boolean): number | undefined => {
 		const position = isValidFrameTxnLogKey(node?.originLogKey) ? node.originLogKey : undefined;
 		if (!useFloors || !isValidFloor(node?.closedFloor)) return position;
 		// a checkpoint-grade row resumes exactly below its floor, so a transaction reserved below the
@@ -4342,9 +4399,14 @@ export function buildOriginCursorVector(
 				return start;
 			}
 		}
-		return position === undefined
-			? cursorBelowFloor(node.closedFloor)
-			: resumeStartWithFloor(position, node.closedFloor);
+		// A removed origin's floor stops advancing, so resuming below it would resend everything since on every
+		// reconnect (harper-pro#989). It commits nothing past its position any more (fenced and drained, or forced
+		// out and no longer sent here), and the sender starts it ORIGIN_CURSOR_OVERLAP_MS below the cursor.
+		if (!member)
+			return position === undefined
+				? cursorBelowFloor(node.closedFloor)
+				: Math.max(position, cursorBelowFloor(node.closedFloor));
+		return cursorBelowFloor(node.closedFloor);
 	};
 	const cursors = new Map<string, number>();
 	const peerNodes = seqRows.get(peerId)?.nodes;
@@ -4352,7 +4414,7 @@ export function buildOriginCursorVector(
 		if (!node || typeof node !== 'object' || node.id === 0 || (admits && !admits(peerId, node.id))) continue;
 		const name = nameForId(node.id);
 		if (name === undefined) continue;
-		const cursor = cursorOf(node, true);
+		const cursor = cursorOf(node, true, isMember(name));
 		if (cursor !== undefined) cursors.set(name, cursor);
 	}
 	for (const [id, row] of seqRows) {
@@ -4363,6 +4425,7 @@ export function buildOriginCursorVector(
 		const cursor =
 			cursorOf(
 				ownNodes.find((node) => node?.id === id),
+				false,
 				false
 			) ?? row.seqId;
 		if (isValidFrameTxnLogKey(cursor) && cursor > 1) cursors.set(name, cursor);
@@ -5642,6 +5705,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (!sub) return;
 				tableSubscriptionToReplicator = sub;
 				if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
+				bindReceivingNodeIds();
 			})
 			// This handler is detached — nothing awaits it — so a rejection here would surface as a
 			// process-level unhandled rejection rather than a connection error (the DESIGN item-12 /
@@ -5671,6 +5735,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			options.connection?.nodeSubscriptions?.[0]?.name);
 	const awaitingResponse = new Map();
 	let receivingDataFromNodeIds = [];
+	let requestedNodeNames: string[] = [];
+	/**
+	 * A request sent before this database existed here resolved no ids, and without them core writes no `[seq, id]` row:
+	 * no resume cursor and no certified floors for this connection.
+	 */
+	function bindReceivingNodeIds(): void {
+		if (!auditStore || receivingDataFromNodeIds.length === requestedNodeNames.length) return;
+		if (wsClosed || connectionSuperseded()) return;
+		const ids: number[] = [];
+		for (const name of requestedNodeNames) {
+			auditStore.ensureLogExists?.(name);
+			const nodeId = getIdOfRemoteNode(name, auditStore);
+			if (nodeId !== undefined) ids.push(nodeId);
+		}
+		receivingDataFromNodeIds = ids;
+	}
 	/**
 	 * The `[seq, id]` row core writes for this connection's sequence updates (`remoteNodeIds[0]`): the first subscribed
 	 * node, which on a failover subscription is not the socket peer. Route state is read and marked there only.
@@ -6396,6 +6476,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
 	// audited/durable), mid-copy updates below copyStartTime, and projections that publish no cursor — is a plain end_txn with no flush gate. (harper-pro#480)
+	// An update queued before a hole was marked takes its floors at commit: a holed origin's floor must not commit
+	// ahead of the durable hole mark and satisfy a removal receipt for the write this node skipped.
+	function dropHoledFloors() {
+		if (holedOrigins.size === 0 || pendingOriginFloors.size === 0) return;
+		for (const id of holedOrigins.keys()) pendingOriginFloors.drop(id);
+	}
 	function seqUpdateEndTxn(seqId: number, originFloors?: ReceivedOriginFloor[], releasePending = false): any {
 		if (projectionCopy)
 			return {
@@ -6433,6 +6519,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					if (hasFloors) {
 						pendingOriginFloors.note(originFloors);
+						dropHoledFloors();
 						pendingOriginFloors.takeForCommit(event, cursorBlockedByBlob());
 					}
 					if (releasePending) queueCommitConfirmation(seqId);
@@ -6465,6 +6552,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			originCursors,
 			onCommit() {
 				pendingOriginFloors.note(originFloors);
+				dropHoledFloors();
 				pendingOriginFloors.takeForCommit(event, cursorBlockedByBlob());
 				if (releasePending) queueCommitConfirmation(seqId);
 			},
@@ -6523,8 +6611,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			logger.warn?.(connectionId, 'could not send the route marks for', databaseName, error);
 		}
 	}
-	// Returns true to hold: core then records no cursor for this connection's later frames either.
-	function onFrameFailure(error: unknown, position: number): boolean {
+	// Resolves true to hold: core then records no cursor for this connection's later frames either.
+	async function onFrameFailure(error: unknown, position: number): Promise<boolean> {
 		if (
 			holdFailedFrame(
 				failedFrameAttempts,
@@ -6547,8 +6635,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				error
 			);
 			recordAction(true, FAILED_FRAME_SKIP_METRIC, `${remoteNodeName}.${databaseName}`);
+			markersWithheldRoutes.add(`${remoteNodeName}/${databaseName}`);
 			ownOriginFrameSkipped = true;
-			return false;
+			// the frame's writes are missing here for good, so no floor this route certifies may vouch for them
+			const recorded = await recordReplicationHole(
+				undefined,
+				ANY_TABLE,
+				`transaction failed on ${FAILED_FRAME_REPLAYS + 1} deliveries`,
+				position
+			);
+			return !recorded;
 		}
 	}
 	const txnStream = {};
@@ -6564,6 +6660,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// one would make a peer that wedges before its handshake (the #642 failure this registry exists to make
 	// diagnosable) indistinguishable from a genuinely pre-#646 peer.
 	let peerCapabilitiesLearned = false;
+	// Sender: the highest marker sent on this socket, the bound on an acknowledgement it accepts. Receiver: a marker
+	// whose acknowledgement waits for blobs.
+	let lastConfirmationMarkerSent = 0;
+	let heldConfirmationMarkerAck = 0;
 	let lastPostedPeerCapabilities: ResolvedPeerCapabilities | undefined;
 	let peerSupportsSubscriptionSetupAck = false;
 	let peerAcceptedBlobCodecs = new Set<string>();
@@ -6994,19 +7094,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		originId: number | undefined,
 		tableName: string,
 		reason: string,
-		lossKey = Date.now()
+		lossKey = Date.now(),
+		// false where holding would re-deliver the same unrecoverable record forever (a blob its source cannot send)
+		holdSharded = true
 	) {
-		if (admittedLayout && tables?.[tableName]?.residency) {
+		if (holdSharded && admittedLayout && tables?.[tableName]?.residency) {
 			wsClosed = true;
 			close(1011, 'Sharded record was not applied; recovery cursor held: ' + reason);
 			return false;
 		}
 		const origin = getNodeNameForId(auditStore, originId, true);
 		const pass = copyPassToken;
+		const premarked: number[] = [];
 		try {
-			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
-			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
-			passHoles++;
 			const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? databaseAuditStore;
 			// an origin this node cannot name could be any it knows
@@ -7014,6 +7114,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				originId !== undefined
 					? [originId]
 					: [0, ...Object.values(exportIdMapping(store)).filter((id): id is number => typeof id === 'number')];
+			// in memory before any await, so an update committing meanwhile takes no floor for it (dropHoledFloors)
+			if (!projectionCopy)
+				for (const lostId of lost) {
+					const calls = holedOrigins.has(lostId) ? provisionalHoles.get(lostId) : 0;
+					if (calls === undefined) continue;
+					holedOrigins.set(lostId, undefined);
+					provisionalHoles.set(lostId, calls + 1);
+					premarked.push(lostId);
+				}
+			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
+			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
+			passHoles++;
 			if (projectionCopy) {
 				// a projection's end_txn names no route, so its hole is a copy bound no route start passes, durable
 				// before the frame moves on and so before the projection can complete; at any level, so a later engine
@@ -7053,6 +7165,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					const existingGen = nodes?.find?.((state: any) => state?.id === lostId)?.originGeneration;
 					const gen = typeof existingGen === 'string' ? existingGen : undefined;
 					holedOrigins.set(lostId, gen);
+					provisionalHoles.delete(lostId);
 					pendingRouteState.hole(lostId, gen);
 				}
 				flushRouteState();
@@ -7060,6 +7173,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// The connection can close during the write; the caller must not keep applying frames then.
 			return !wsClosed;
 		} catch (error) {
+			// the frame is held and replayed, so the hole this call assumed is not one
+			// unless another call still holds it or it became durable meanwhile
+			for (const lostId of premarked) {
+				const calls = provisionalHoles.get(lostId);
+				if (calls === undefined) continue;
+				if (calls > 1) provisionalHoles.set(lostId, calls - 1);
+				else {
+					provisionalHoles.delete(lostId);
+					holedOrigins.delete(lostId);
+				}
+			}
 			logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error);
 			wsClosed = true;
 			close(1011, 'could not record a replication hole; reconnecting');
@@ -7370,6 +7494,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function advanceDurableWatermark() {
 		lastDurableSequenceId = committedSequence;
 		creditDurableProgress();
+		if (heldConfirmationMarkerAck) acknowledgeConfirmationMarker(heldConfirmationMarkerAck);
+	}
+	/** From an empty sequence update's onCommit, which runs after every frame received before the marker committed. */
+	function acknowledgeConfirmationMarker(marker: number) {
+		if (markersWithheldRoutes.has(`${remoteNodeName}/${databaseName}`) || wsClosed || connectionSuperseded()) return;
+		if (cursorBlockedByBlob()) {
+			if (marker > heldConfirmationMarkerAck) heldConfirmationMarkerAck = marker;
+			return;
+		}
+		try {
+			ws.send(encode([CONFIRMATION_MARKER_ACK, marker]));
+			heldConfirmationMarkerAck = 0;
+		} catch (error) {
+			if (marker > heldConfirmationMarkerAck) heldConfirmationMarkerAck = marker;
+			logger.debug?.(connectionId, 'could not acknowledge a confirmation marker', error);
+		}
 	}
 	function queueCommitConfirmation(sequence: number) {
 		if (projectionCopy || !sequence || connectionSuperseded()) return;
@@ -7429,6 +7569,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let partialMarked = new Map<number, string | undefined>();
 	/** Origins with a durable replication hole on this route (`originId -> generation`), preserved across copy-pass restoration. */
 	let holedOrigins = new Map<number, string | undefined>();
+	/** Holes marked in memory by `recordReplicationHole` calls still writing (`originId -> calls`); a durable mark removes the entry. */
+	const provisionalHoles = new Map<number, number>();
 	/** Origins revoked on this route (`originId -> generation`), re-asserted if a settled write fails to persist. */
 	let revokedOrigins = new Map<number, string | undefined>();
 	/** Origins optimistically marked certifiedFrom by the latest subscription request before knowing if the peer copies. */
@@ -8527,6 +8669,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!tables) tables = getDatabases()?.[newDatabaseName];
 							}
 						}
+						if (schemaDatabaseName === databaseName) bindReceivingNodeIds();
 						if (pendingMarkers.length > 0 && databases[schemaDatabaseName]) {
 							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
 							if (!connectionSuperseded()) releaseHeldMarkers(schemaDatabaseName, pendingMarkers);
@@ -8657,6 +8800,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							tableDecoders[tableId] = { name: tableName, refused: true, decoder };
 							break;
 						}
+						if (!auditStore) auditStore = getDatabaseStores().auditStore;
+						bindReceivingNodeIds();
 						// A pool worker never ran the application, so it cannot maintain an index whose resolver the
 						// application assigns; applying here would leave the index silently wrong. Latch inbound off
 						// and drop a decoder from an earlier structure message, so queued frames cannot apply either.
@@ -8714,6 +8859,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								referenceSnapshots.set(data, snapshot);
 						}
 						break;
+					case CONFIRMATION_MARKER_ACK: {
+						// a marker this socket sent; any socket's acknowledgement stays a proof, so the slot only rises
+						if (!Number.isSafeInteger(data) || data <= 0 || data > lastConfirmationMarkerSent) break;
+						const status = getSharedStatus();
+						if (raiseStatusSlot(status, ACKED_CONFIRMATION_MARKER_POSITION, data)) (status.buffer as any).notify();
+						break;
+					}
 					case COMMITTED_UPDATE:
 						// we need to record the sequence number that the remote node has received
 						getSharedStatus()[CONFIRMATION_STATUS_POSITION] = data;
@@ -8800,7 +8952,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (state && typeof state.id === 'number') {
 									const gen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
 									copyMarkOrigins.set(state.id, gen);
-									if (state.hole === true) holedOrigins.set(state.id, gen);
+									if (state.hole === true) {
+										holedOrigins.set(state.id, gen);
+										provisionalHoles.delete(state.id);
+									}
 								}
 							}
 							if (routeIdForCopy !== undefined && !copyMarkOrigins.has(routeIdForCopy)) {
@@ -8975,6 +9130,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (inCopyMode) copyFinalizeWatchdog?.reset();
 						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
 						break;
+					case CONFIRMATION_MARKER: {
+						if (!Number.isSafeInteger(data) || data <= 0 || projectionCopy) break;
+						if (!(await whenSubscriptionResolved()) || wsClosed || connectionSuperseded()) return;
+						const marker = data;
+						const event = seqUpdateEndTxn(clampedPosition());
+						const priorOnCommit = event.onCommit;
+						event.onCommit = function () {
+							const result = priorOnCommit?.call(this);
+							if (result?.then) return result.then(() => acknowledgeConfirmationMarker(marker));
+							acknowledgeConfirmationMarker(marker);
+							return result;
+						};
+						tableSubscriptionToReplicator.send(event);
+						break;
+					}
 					case SEQUENCE_ID_UPDATE:
 						refreshShardingAdmission();
 						if (!admitsIncomingOrigins(message[2])) return;
@@ -10213,6 +10383,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!resolvedDatabaseSubscription || closed || wsClosed || connectionSuperseded()) return;
 								tableSubscriptionToReplicator = resolvedDatabaseSubscription;
 								auditStore = tableSubscriptionToReplicator.auditStore;
+								bindReceivingNodeIds();
 								residencySender = subscriptionResidencySender = registerResidencySender(
 									auditStore,
 									databaseName,
@@ -10295,6 +10466,33 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								lastFloorCaptureAt = 0;
 								let floorTimer: ReturnType<typeof setTimeout> | undefined;
 								let capturedFloors: Map<string, OriginCertificate> | undefined;
+								const confirmationStatus = getSharedStatus();
+								const sendsOwnLog = excludedNodes
+									? !excludedNodes.includes(getThisNodeName())
+									: nodeSubscriptions.some(({ name }) => name === getThisNodeName());
+								// LMDB keeps the key rule: its shared buffers have no listener removal. Gated on the store, not
+								// STORAGE_IS_ROCKSDB, a config snapshot that can misreport the engine in a worker.
+								const markersSupported =
+									auditStore?.reusableIterable === true &&
+									sendsOwnLog &&
+									peerCapabilitiesLearned &&
+									peerSupportsConfirmationMarkers(peerCapabilities);
+								const demand = markersSupported
+									? confirmationDemand(auditStore, databaseName, () => wakeSender?.())
+									: undefined;
+								lastConfirmationMarkerSent = 0;
+								if (sendsOwnLog && confirmationStatus) {
+									confirmationStatus[PEER_CONFIRMATION_MARKERS_POSITION] = !peerCapabilitiesLearned
+										? CONFIRMATION_MARKERS_UNKNOWN
+										: markersSupported
+											? CONFIRMATION_MARKERS_SUPPORTED
+											: CONFIRMATION_MARKERS_UNSUPPORTED;
+									(confirmationStatus.buffer as any).notify();
+								}
+								const uncoveredMarker = () =>
+									demand && Atomics.load(demand.words, DEMAND_WAITERS) > 0n
+										? Number(Atomics.load(demand.words, DEMAND_MARKER))
+										: 0;
 								const connectionCertifiedFloors = new Map<string, number>();
 								const connectionCertifiedGenerations = new Map<string, string | undefined>();
 								certifiedFloors = connectionCertifiedFloors;
@@ -10303,6 +10501,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								const lastKnownGenerations = new Map<string, string>();
 								const revokedSent = new Set<string>();
 								let floorEmissionLatchedRange: unknown;
+								// set once a scan may have skipped an entry: no later marker on this connection proves delivery
+								let markersUnproven = false;
+								const stopMarkers = () => {
+									if (markersUnproven) return;
+									markersUnproven = true;
+									if (demand)
+										logger.warn?.(
+											connectionId,
+											`A transaction-log scan for ${remoteNodeName} may have skipped an entry; writes waiting for confirmation from it time out until this connection reconnects`
+										);
+								};
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
 								const originCertifies = (name: string): number => {
@@ -11012,6 +11221,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// drains must wake this iteration; subscribing afterward can miss that commit.
 										const nextTransaction = whenNextTransaction(auditStore);
 										capturedFloors = undefined;
+										// taken before the scan: every waiter holding a marker at or below it committed before the scan began
+										const passMarker = uncoveredMarker();
 										if (certifiesOriginFloors() && Date.now() - lastFloorCaptureAt >= originFloorIntervalMs) {
 											lastFloorCaptureAt = Date.now();
 											capturedFloors = captureOriginFloors();
@@ -11086,6 +11297,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											);
 											boundaryLogName = undefined;
 											auditLogIterable = undefined;
+											stopMarkers();
 											if (originFloors?.size) {
 												({ originFloors, originFloorById } = applyRelayedAnchorFloors(
 													originFloors,
@@ -11205,6 +11417,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											} else if (floorEmissionLatchedRange !== liveRange) certifyOriginFloors(capturedFloors);
 											capturedFloors = undefined;
 										}
+										let markersProven = false;
+										if (demand) {
+											const liveRange: any = auditLogIterable;
+											if (
+												(boundaryLogName && liveRange?.exactStartFailures?.size > 0) ||
+												liveRange?.failedLogs?.size > 0 ||
+												liveRange?.corruptFrameStop?.breaks > 0
+											)
+												stopMarkers();
+											markersProven = !markersUnproven;
+											if (markersProven && passMarker > lastConfirmationMarkerSent && !closed && !wsClosed) {
+												ws.send(encode([CONFIRMATION_MARKER, passMarker]));
+												lastConfirmationMarkerSent = passMarker;
+											}
+										}
 										getSharedStatus()[SENDING_TIME_POSITION] = 0;
 										if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
 										// a timed wake can land after the socket was marked closed, before the close event
@@ -11214,6 +11441,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										if (whenNextTransaction(auditStore) !== nextTransaction) continue;
 										// The recovery timer fired during this pass, when no waker was parked to receive it.
 										if (sendLogRecoveryPending && sendLogRecoveryTimer === undefined) continue;
+										// a waiter registered during the pass (its wake found no parked waker) needs a pass that begins after it
+										if (markersProven && uncoveredMarker() > lastConfirmationMarkerSent) continue;
 										// an `includeNodes` update re-admits a log whose entries are already committed
 										let wake: () => void;
 										// one timer per loop; an exit that skips the clear leaks nothing but one unreferenced timer
@@ -11245,6 +11474,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								} finally {
 									clearTimeout(floorTimer);
 									clearTimeout(sendLogRecoveryTimer);
+									demand?.buffer.cancel();
 								}
 							})
 							.catch((error) => {
@@ -11768,7 +11998,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						auditStore?.rootStore,
 						(blob) => {
 							const repairTarget = repairTargets?.[repairIndex++];
-							const localBlob = receiveBlobs(blob, id, copyFrameIndex, repairTarget, tableDecoder.name);
+							const localBlob = receiveBlobs(
+								blob,
+								id,
+								copyFrameIndex,
+								repairTarget,
+								tableDecoder.name,
+								localSourceNodeId
+							);
 							// An in-place-repaired blob is a file a committed record already references (possibly a
 							// coalesced reuse from an earlier record in this message) — never let the decode-failure
 							// cleanup below unlink it.
@@ -12097,7 +12334,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (frameOrigin !== undefined) noteOriginProgress(frameOrigin, frameTxnLogKey);
 					if (frameMoreOrigins) for (const originId of frameMoreOrigins) noteOriginProgress(originId, frameTxnLogKey);
 					endTxnEvent.originCursors = takeDurableOriginCursors();
-					if (!projectionCopy) pendingOriginFloors.takeForCommit(endTxnEvent, cursorBlockedByBlob());
+					if (!projectionCopy) {
+						dropHoledFloors();
+						pendingOriginFloors.takeForCommit(endTxnEvent, cursorBlockedByBlob());
+					}
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
 					// (frameTxnLogKey < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
 					// core persists [seq] = copyStartTime. Otherwise a small copy that finished before the cadence
@@ -12772,7 +13012,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		id: string | number,
 		copyFrameIndex?: number,
 		repairTarget?: any,
-		tableName?: string
+		tableName?: string,
+		originId?: number
 	) {
 		// write the blob to the blob store
 		const blobId = getFileId(remoteBlob);
@@ -12879,7 +13120,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// even though we already logged it here, and it would escape onCommit as an
 			// uncaughtException — observed in prod as ~35/sec ENOENT spam during catch-up.
 			const tracked = finished
-				.catch((err) => {
+				.catch(async (err) => {
 					// This .catch runs inside the same microtask chain that onCommit's
 					// `await Promise.all(outstandingBlobsToFinish)` is waiting on; we deliberately do NOT tear
 					// down here. Classify the failure to decide whether the resume cursor holds or advances.
@@ -12934,7 +13175,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// forever and block every healthy record behind it (harper-pro#403). Leave `hasBlobGap`
 						// unset so the watermark advances past it; the diverged record is left for proactive
 						// blob backfill (harper-pro#388). Recorded loudly below so the skip is never silent.
+						// The cursor may pass it, but no marker may vouch for delivery: one held now, or any later.
+						markersWithheldRoutes.add(`${remoteNodeName}/${databaseName}`);
 						const escalation = getBlobGapEscalation(err);
+						// A source that still holds the bytes (a transient failure escalated past its budget) leaves a
+						// write this node lacks, so no floor of this route may vouch for it. A blob the source reports
+						// gone is gone there too: a receipt for that origin loses nothing more.
+						if (
+							escalation &&
+							!(await recordReplicationHole(
+								originId,
+								tableName ?? ANY_TABLE,
+								'blob its source could not send',
+								undefined,
+								false
+							))
+						) {
+							// the hole was not recorded and the connection is closing: hold, so the reconnect re-streams it
+							hasBlobGap = true;
+							copyBlobGapped = true;
+							return;
+						}
 						logger.error?.(
 							escalation
 								? `Blob ${blobId} for record ${id} stayed transiently unavailable at source ${remoteNodeName} (${errorToString(err)}) — ` +
@@ -13210,6 +13471,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
 		receivingDataFromNodeIds = [];
+		requestedNodeNames = [];
 		lastSentBareFloorCursors.clear();
 		requestIsCopy = false;
 		copyWasResumed = false;
@@ -13310,6 +13572,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
 				let floorOnlyStart: number | undefined;
 				let floorOnlyGeneration: string | undefined;
+				let floorBoundedStart = false;
 				if (copyCursor) requestIsCopy = true;
 				const allNodes: any[] = (sequenceEntry?.nodes ?? [])
 					.filter((state: any) => state && typeof state.id === 'number')
@@ -13348,6 +13611,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					if (state.hole === true) {
 						holedOrigins.set(state.id, stateGen);
+						provisionalHoles.delete(state.id);
 					} else if (holedOrigins.has(state.id)) {
 						const holedGen = holedOrigins.get(state.id);
 						if (holedGen !== undefined && stateGen !== undefined && stateGen !== holedGen) {
@@ -13464,10 +13728,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							floorOnlyStart = startTime;
 							floorOnlyGeneration = ownState.originGeneration;
 						} else {
-							startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
+							startTime = ownFloorStart;
+							floorBoundedStart = true;
 						}
 					} else if (nodeId === undefined || !pendingRouteState.hasPendingRevocation(nodeId)) {
 						startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
+						floorBoundedStart = isValidFloor(ownState?.closedFloor);
 					}
 				}
 				if (copyCursor) {
@@ -13522,14 +13788,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
-				if (nodeId === undefined) {
-					logger.warn('Starting subscription request from node', node, 'but no node id found');
-				} else receivingDataFromNodeIds.push(nodeId);
+				requestedNodeNames.push(node.name);
+				if (nodeId !== undefined) receivingDataFromNodeIds.push(nodeId);
+				else if (auditStore) logger.warn('Starting subscription request from node', node, 'but no node id found');
 				// if another node had previously acted as a proxy, it may not have the same sequence ids, but we can use the last
 				// originating txn time, and sequence ids should always be higher than their originating txn time, and starting from them should overlap
 				// a floor-only start is the proven one; a recorded transaction time above it would let the sender filter
 				// what committed between them, the gap the floor exists to close
-				if (!forceFullCopyOnWidening && floorOnlyStart === undefined && lastTxnTimes.get(nodeId) > startTime) {
+				if (
+					!forceFullCopyOnWidening &&
+					floorOnlyStart === undefined &&
+					!floorBoundedStart &&
+					lastTxnTimes.get(nodeId) > startTime
+				) {
 					startTime = lastTxnTimes.get(nodeId);
 					logger.debug?.('Updating start time from more recent txn recorded', connectedNode.name, startTime);
 				}
@@ -13579,10 +13850,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						{ agreement: string; anchor: number } | undefined;
 					const floor = shardingInitialFloor(databaseName, node.name);
 					if (complete?.agreement === admittedLayout && floor !== undefined) {
-						startTime = Math.max(
-							sequenceEntry?.seqId ?? 0,
+						startTime = shardingRouteResumeStart(
 							Math.min(floor, complete.anchor),
-							lastTxnTimes.get(nodeId) ?? 0
+							Math.max(sequenceEntry?.seqId ?? 0, lastTxnTimes.get(nodeId) ?? 0),
+							certifiesOriginFloors(),
+							allNodes.find((state: any) => state.id === nodeId)
 						);
 					} else {
 						startTime = 0;
@@ -13704,9 +13976,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			});
 		}
 		ownOriginRecoveryRequested = undefined;
+		// A sharded database's returned own writes arrive outside a snapshot copy, which the frame decoder refuses
+		// ("Sharded self-origin recovery requires a valid snapshot"), so asking there would close the link on every
+		// reconnect. That also covers a restricted link, whose admitted layout drops our origin anyway.
 		if (
 			nodeSubscriptions?.length &&
-			!restrictedOrigins &&
+			!(admittedLayout || residencyMapInstalled()) &&
 			peerCapabilitiesLearned &&
 			peerSupportsOwnOriginRecovery(peerCapabilities)
 		) {

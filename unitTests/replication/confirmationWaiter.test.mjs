@@ -43,6 +43,28 @@ import {
 } from '#src/replication/knownNodes';
 
 import { get, setProperty } from '#src/core/utility/environment/environmentManager';
+import {
+	ACKED_CONFIRMATION_MARKER_POSITION,
+	CONFIRMATION_MARKERS_SUPPORTED,
+	CONFIRMATION_MARKERS_UNSUPPORTED,
+	CONFIRMATION_STATUS_POSITION,
+	PEER_CONFIRMATION_MARKERS_POSITION,
+	REPLICATION_SHARED_STATUS_SLOTS,
+} from '#src/replication/sharedStatusSlots';
+
+function keyStatus(confirmed) {
+	const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+	status[PEER_CONFIRMATION_MARKERS_POSITION] = CONFIRMATION_MARKERS_UNSUPPORTED;
+	status[CONFIRMATION_STATUS_POSITION] = confirmed;
+	return status;
+}
+
+function markerStatus(confirmed, acked) {
+	const status = keyStatus(confirmed);
+	status[PEER_CONFIRMATION_MARKERS_POSITION] = CONFIRMATION_MARKERS_SUPPORTED;
+	status[ACKED_CONFIRMATION_MARKER_POSITION] = acked;
+	return status;
+}
 
 describe('createConfirmationWaiter', () => {
 	it('reads the configured explicit timeout when creating each waiter', async () => {
@@ -59,7 +81,7 @@ describe('createConfirmationWaiter', () => {
 					),
 					new Promise((resolve) => setTimeout(() => resolve('still waiting'), 200)),
 				]);
-				notifyConfirmedWaiters(awaiting, 'cleanup', 0, 101);
+				notifyConfirmedWaiters(awaiting, 'cleanup', keyStatus(101));
 				if (setting === 15) {
 					expect(outcome).to.be.instanceOf(Error);
 					expect(outcome.message).to.match(/confirm replication|confirmation/i);
@@ -69,7 +91,7 @@ describe('createConfirmationWaiter', () => {
 				}
 			}
 		} finally {
-			notifyConfirmedWaiters(awaiting, 'cleanup', 0, 101);
+			notifyConfirmedWaiters(awaiting, 'cleanup', keyStatus(101));
 			setProperty('replication_confirmationTimeout', prior);
 		}
 	});
@@ -78,9 +100,9 @@ describe('createConfirmationWaiter', () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 2, 5000);
 		expect(awaiting.size).to.equal(1);
-		notifyConfirmedWaiters(awaiting, 'peer1', 0, 200); // 1st peer acks — not yet at confirmationCount
+		notifyConfirmedWaiters(awaiting, 'peer1', keyStatus(200)); // 1st peer acks — not yet at confirmationCount
 		expect(awaiting.size).to.equal(1);
-		notifyConfirmedWaiters(awaiting, 'peer2', 0, 200); // 2nd distinct peer acks — reaches confirmationCount
+		notifyConfirmedWaiters(awaiting, 'peer2', keyStatus(200)); // 2nd distinct peer acks — reaches confirmationCount
 		await promise;
 		expect(awaiting.size).to.equal(0);
 	});
@@ -105,7 +127,7 @@ describe('createConfirmationWaiter', () => {
 	it('rejects after timeout even if only a partial count of confirmations arrived', async () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 3, 20);
-		notifyConfirmedWaiters(awaiting, 'peer1', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'peer1', keyStatus(200));
 		let error;
 		try {
 			await promise;
@@ -141,8 +163,8 @@ describe('createConfirmationWaiter', () => {
 	it('does not double-count repeated confirmations from the same peer', async () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 2, 20);
-		notifyConfirmedWaiters(awaiting, 'peer1', 0, 200);
-		notifyConfirmedWaiters(awaiting, 'peer1', 0, 200); // same peer again — must not count as a 2nd confirmation
+		notifyConfirmedWaiters(awaiting, 'peer1', keyStatus(200));
+		notifyConfirmedWaiters(awaiting, 'peer1', keyStatus(200)); // same peer again — must not count as a 2nd confirmation
 		let error;
 		try {
 			await promise;
@@ -168,32 +190,97 @@ describe('createConfirmationWaiter', () => {
 			createConfirmationWaiter(awaiting, 'data', 100, 1, 5000),
 		];
 		expect(awaiting.size).to.equal(3);
-		notifyConfirmedWaiters(awaiting, 'peer1', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'peer1', keyStatus(200));
 		await Promise.all(promises);
 		expect(awaiting.size).to.equal(0);
 	});
 
-	it('notifyConfirmedWaiters only confirms waiters whose txnTime falls in (lastTime, updatedTime]', async () => {
+	it('a peer without confirmation markers confirms every waiter whose key its maximum has passed', async () => {
 		const awaiting = new Set();
-		const before = createConfirmationWaiter(awaiting, 'data', 50, 1, 20); // at/before lastTime: excluded, times out
+		const before = createConfirmationWaiter(awaiting, 'data', 50, 1, 5000);
 		const inRange = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000);
-		const after = createConfirmationWaiter(awaiting, 'data', 200, 1, 20); // past updatedTime: excluded, times out
-		notifyConfirmedWaiters(awaiting, 'peer1', 50, 150);
-		await inRange;
-		expect(awaiting.size).to.equal(2); // before + after were not confirmed by this call
-		const [beforeError, afterError] = await Promise.all([
-			before.then(
+		const after = createConfirmationWaiter(awaiting, 'data', 200, 1, 20); // past its maximum: times out
+		notifyConfirmedWaiters(awaiting, 'peer1', keyStatus(150));
+		await Promise.all([before, inRange]);
+		expect(awaiting.size).to.equal(1);
+		expect(
+			await after.then(
 				() => undefined,
 				(err) => err
-			),
-			after.then(
+			)
+		).to.be.an('error');
+		expect(awaiting.size).to.equal(0);
+	});
+
+	it('a peer with confirmation markers confirms only once it acknowledges the waiter marker, whatever its key maximum (harper-pro#1351)', async () => {
+		const awaiting = new Set();
+		// the write committed with key 100 after a write keyed 150 was delivered: the key maximum already passes it
+		const waiting = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), undefined, undefined, 7);
+		notifyConfirmedWaiters(awaiting, 'peer1', markerStatus(150, 6));
+		expect(awaiting.size).to.equal(1);
+		notifyConfirmedWaiters(awaiting, 'peer1', markerStatus(150, 7));
+		await waiting;
+		expect(awaiting.size).to.equal(0);
+	});
+
+	it('a peer whose marker support is not known yet confirms nothing', async () => {
+		const awaiting = new Set();
+		const waiting = createConfirmationWaiter(awaiting, 'data', 100, 1, 20, new Set(), undefined, undefined, 3);
+		const unknown = keyStatus(500);
+		unknown[PEER_CONFIRMATION_MARKERS_POSITION] = 0;
+		unknown[ACKED_CONFIRMATION_MARKER_POSITION] = 9;
+		notifyConfirmedWaiters(awaiting, 'peer1', unknown);
+		expect(
+			await waiting.then(
 				() => undefined,
 				(err) => err
-			),
-		]);
-		expect(beforeError).to.be.an('error');
-		expect(afterError).to.be.an('error');
-		expect(awaiting.size).to.equal(0); // both timeouts removed themselves independently
+			)
+		).to.be.an('error');
+	});
+
+	it('runs onSettled once when a waiter confirms, times out, or is confirmed at registration', async () => {
+		let settled = 0;
+		const awaiting = new Set();
+		const confirmed = createConfirmationWaiter(
+			awaiting,
+			'data',
+			100,
+			1,
+			5000,
+			new Set(),
+			undefined,
+			undefined,
+			1,
+			() => settled++
+		);
+		notifyConfirmedWaiters(awaiting, 'peer1', markerStatus(0, 1));
+		notifyConfirmedWaiters(awaiting, 'peer1', markerStatus(0, 1));
+		await confirmed;
+		await createConfirmationWaiter(
+			awaiting,
+			'data',
+			100,
+			1,
+			10,
+			new Set(),
+			undefined,
+			undefined,
+			2,
+			() => settled++
+		).catch(() => {});
+		await createConfirmationWaiter(
+			awaiting,
+			'data',
+			100,
+			1,
+			10,
+			new Set(['peer1']),
+			undefined,
+			undefined,
+			3,
+			() => settled++
+		);
+		expect(settled).to.equal(3);
 	});
 
 	// notifyConfirmedWaiters must only remove entries that actually settle during this call — a
@@ -203,10 +290,10 @@ describe('createConfirmationWaiter', () => {
 		const awaiting = new Set();
 		const single = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000); // settles this call
 		const needsTwo = createConfirmationWaiter(awaiting, 'data', 100, 2, 5000); // needs a 2nd distinct peer
-		notifyConfirmedWaiters(awaiting, 'peer1', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'peer1', keyStatus(200));
 		await single;
 		expect(awaiting.size).to.equal(1); // needsTwo survives, still counting
-		notifyConfirmedWaiters(awaiting, 'peer2', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'peer2', keyStatus(200));
 		await needsTwo;
 		expect(awaiting.size).to.equal(0);
 	});
@@ -245,7 +332,7 @@ describe('createConfirmationWaiter', () => {
 			const awaiting = new Set();
 			const promise = createConfirmationWaiter(awaiting, 'data', 100, 3, 5000, new Set(['peer1', 'peer2']));
 			expect(awaiting.size).to.equal(1);
-			notifyConfirmedWaiters(awaiting, 'peer3', 0, 200); // the one remaining peer acks
+			notifyConfirmedWaiters(awaiting, 'peer3', keyStatus(200)); // the one remaining peer acks
 			await promise;
 			expect(awaiting.size).to.equal(0);
 		});
@@ -266,7 +353,7 @@ describe('createConfirmationWaiter', () => {
 			const awaiting = new Set();
 			const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000);
 			expect(awaiting.size).to.equal(1);
-			notifyConfirmedWaiters(awaiting, 'peer1', 0, 200);
+			notifyConfirmedWaiters(awaiting, 'peer1', keyStatus(200));
 			await promise;
 		});
 
@@ -279,7 +366,7 @@ describe('createConfirmationWaiter', () => {
 			const awaiting = new Set();
 			const promise = createConfirmationWaiter(awaiting, 'data', 100, 2, 20, new Set(['peer1']));
 			expect(awaiting.size).to.equal(1);
-			notifyConfirmedWaiters(awaiting, 'peer1', 50, 150); // peer1's own callback catching up — must not double-count
+			notifyConfirmedWaiters(awaiting, 'peer1', keyStatus(150)); // peer1's own callback catching up — must not double-count
 			let error;
 			try {
 				await promise;
@@ -291,8 +378,8 @@ describe('createConfirmationWaiter', () => {
 			// but a distinct second peer still completes it
 			const awaiting2 = new Set();
 			const promise2 = createConfirmationWaiter(awaiting2, 'data', 100, 2, 5000, new Set(['peer1']));
-			notifyConfirmedWaiters(awaiting2, 'peer1', 50, 150);
-			notifyConfirmedWaiters(awaiting2, 'peer2', 0, 200);
+			notifyConfirmedWaiters(awaiting2, 'peer1', keyStatus(150));
+			notifyConfirmedWaiters(awaiting2, 'peer2', keyStatus(200));
 			await promise2;
 			expect(awaiting2.size).to.equal(0);
 		});
@@ -320,7 +407,7 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 	it('does not count a non-resident peer that has applied the write', async () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 20, new Set(), [['resident']]);
-		notifyConfirmedWaiters(awaiting, 'non-resident', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'non-resident', keyStatus(200));
 		const error = await timedOut(promise);
 		expect(error.statusCode).to.equal(504);
 		expect(error.message).to.include('received 0 from the residents');
@@ -331,9 +418,9 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 	it('resolves once a resident peer confirms', async () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), [['resident']]);
-		notifyConfirmedWaiters(awaiting, 'non-resident', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'non-resident', keyStatus(200));
 		expect(awaiting.size).to.equal(1);
-		notifyConfirmedWaiters(awaiting, 'resident', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'resident', keyStatus(200));
 		await promise;
 		expect(awaiting.size).to.equal(0);
 	});
@@ -342,7 +429,7 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(['non-resident']), [['resident']]);
 		expect(awaiting.size).to.equal(1);
-		notifyConfirmedWaiters(awaiting, 'resident', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'resident', keyStatus(200));
 		await promise;
 		await createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(['resident']), [['resident']]);
 		expect(awaiting.size).to.equal(0);
@@ -351,9 +438,9 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 	it('requires the count from the residents of each record, not one pool of peers', async () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), [['a'], ['b', 'c']]);
-		notifyConfirmedWaiters(awaiting, 'a', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'a', keyStatus(200));
 		expect(awaiting.size).to.equal(1);
-		notifyConfirmedWaiters(awaiting, 'c', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'c', keyStatus(200));
 		await promise;
 		expect(awaiting.size).to.equal(0);
 	});
@@ -364,11 +451,11 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 			['a', 'b'],
 			['a', 'c'],
 		]);
-		notifyConfirmedWaiters(awaiting, 'b', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'b', keyStatus(200));
 		expect(awaiting.size).to.equal(1);
-		notifyConfirmedWaiters(awaiting, 'b', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'b', keyStatus(200));
 		expect(awaiting.size).to.equal(1);
-		notifyConfirmedWaiters(awaiting, 'c', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'c', keyStatus(200));
 		await promise;
 	});
 
@@ -376,14 +463,14 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), []);
 		expect(awaiting.size).to.equal(1);
-		notifyConfirmedWaiters(awaiting, 'any-peer', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'any-peer', keyStatus(200));
 		await promise;
 	});
 
 	it('reports the per-residency shortfall on timeout', async () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 20, new Set(), [['a'], ['b']]);
-		notifyConfirmedWaiters(awaiting, 'a', 0, 200);
+		notifyConfirmedWaiters(awaiting, 'a', keyStatus(200));
 		const error = await timedOut(promise);
 		expect(error.message).to.include('received 1, 0 from the residents');
 		expect(error.message).to.include('(a; b)');
@@ -393,15 +480,23 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 describe('countAlreadyConfirmedPeers', () => {
 	it('returns the names of peers whose last-known replicated position already reached txnTime', () => {
 		const confirmationsByNode = new Map([
-			['peer1', new Map([['data', Float64Array.of(150)]])],
-			['peer2', new Map([['data', Float64Array.of(100)]])],
-			['peer3', new Map([['data', Float64Array.of(50)]])],
+			['peer1', new Map([['data', keyStatus(150)]])],
+			['peer2', new Map([['data', keyStatus(100)]])],
+			['peer3', new Map([['data', keyStatus(50)]])],
 		]);
 		expect(countAlreadyConfirmedPeers(confirmationsByNode, 'data', 100)).to.deep.equal(new Set(['peer1', 'peer2']));
 	});
 
+	it('never seeds a marker-capable peer from its key maximum: a fresh marker has no acknowledgement yet', () => {
+		const confirmationsByNode = new Map([
+			['capable', new Map([['data', markerStatus(500, 4)]])],
+			['legacy', new Map([['data', keyStatus(500)]])],
+		]);
+		expect(countAlreadyConfirmedPeers(confirmationsByNode, 'data', 100, 5)).to.deep.equal(new Set(['legacy']));
+	});
+
 	it('ignores peers with no tracked status for this database', () => {
-		const confirmationsByNode = new Map([['peer1', new Map([['other-db', Float64Array.of(150)]])]]);
+		const confirmationsByNode = new Map([['peer1', new Map([['other-db', keyStatus(150)]])]]);
 		expect(countAlreadyConfirmedPeers(confirmationsByNode, 'data', 100)).to.deep.equal(new Set());
 	});
 

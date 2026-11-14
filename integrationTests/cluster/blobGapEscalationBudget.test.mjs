@@ -200,6 +200,19 @@ suite('Blob-gap escalation budget bounds a 503-forever source (#432)', { timeout
 			}
 		);
 		const [, blobId, recordId, cyclesText] = escalation;
+		// A still holds the bytes, so B lacks a write A made: B's receipt for A must not vouch for it (harper-pro#1348)
+		const receipt = await waitForCondition(
+			async (signal) => {
+				const { data } = await sendOperation(
+					B,
+					{ operation: 'get_received_origin_floors', origin: A.hostname, databases: ['data'] },
+					{ signal }
+				);
+				return data?.hole === true && data;
+			},
+			{ timeoutMs: 30000, description: "B's receipt for A to record the skipped blob as a hole" }
+		);
+		equal(receipt.hole, true);
 		equal(Number(cyclesText), ESCALATION_CYCLES, `escalated after ${cyclesText} cycles, expected ${ESCALATION_CYCLES}`);
 		let bLog = await readLog(B);
 		const firesAtEscalation = count(bLog, WATCHDOG_FIRE);

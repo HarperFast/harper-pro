@@ -17,6 +17,8 @@ import {
 	settleCopyBounds,
 	restoreCompletedCopyPass,
 	resumeStartWithFloor,
+	shardingRouteResumeStart,
+	raiseStatusSlot,
 } from '#src/replication/replicationConnection';
 
 const T = 1_790_000_000_000;
@@ -40,15 +42,55 @@ describe('cursorBelowFloor', () => {
 });
 
 describe('resumeStartWithFloor', () => {
-	it('takes the floor only where it is newer than the applied position', () => {
+	it('starts below a valid floor, never at a received position above it (harper-pro#1351)', () => {
 		assert.strictEqual(resumeStartWithFloor(T, T + 1000), cursorBelowFloor(T + 1000));
-		assert.strictEqual(resumeStartWithFloor(T, T - 1000), T);
+		assert.strictEqual(resumeStartWithFloor(T, T - 1000), cursorBelowFloor(T - 1000));
 	});
 
 	it('ignores a missing or malformed floor', () => {
 		for (const floor of [undefined, null, 0, -1, NaN, Infinity, 8.64e15, '1']) {
 			assert.strictEqual(resumeStartWithFloor(T, floor), T, String(floor));
 		}
+	});
+});
+
+describe('shardingRouteResumeStart (harper-pro#1351)', () => {
+	it('starts below the certified floor, not at a received key maximum above it', () => {
+		assert.strictEqual(
+			shardingRouteResumeStart(T - 5000, T + 2000, true, { id: 1, closedFloor: T }),
+			cursorBelowFloor(T)
+		);
+	});
+
+	it('never starts below the completed projection', () => {
+		assert.strictEqual(shardingRouteResumeStart(T + 1000, T + 2000, true, { id: 1, closedFloor: T }), T + 1000);
+	});
+
+	it('restarts at the projection before the route has a usable floor from a peer that certifies', () => {
+		for (const state of [
+			undefined,
+			{ id: 1 },
+			{ id: 1, closedFloor: NaN },
+			{ id: 1, closedFloor: T, floorRevoked: true },
+		])
+			assert.strictEqual(shardingRouteResumeStart(T - 5000, T + 2000, true, state), T - 5000, JSON.stringify(state));
+	});
+
+	it('keeps the received position from a peer that does not certify floors', () => {
+		assert.strictEqual(shardingRouteResumeStart(T - 5000, T + 2000, false, { id: 1, closedFloor: T }), T + 2000);
+		assert.strictEqual(shardingRouteResumeStart(T + 3000, T + 2000, false, undefined), T + 3000);
+	});
+});
+
+describe('raiseStatusSlot', () => {
+	it('raises a slot and never lowers it', () => {
+		const status = new Float64Array(new SharedArrayBuffer(4 * 8));
+		assert.strictEqual(raiseStatusSlot(status, 2, 9), true);
+		assert.strictEqual(raiseStatusSlot(status, 2, 8), false);
+		assert.strictEqual(status[2], 9);
+		assert.strictEqual(raiseStatusSlot(status, 2, 2 ** 40), true);
+		assert.strictEqual(status[2], 2 ** 40);
+		assert.strictEqual(status[1], 0);
 	});
 });
 
@@ -105,9 +147,10 @@ describe('buildOriginCursorVector with floors', () => {
 	]);
 
 	it('folds a stored floor into the value only while the peer certifies', () => {
+		// a floor below the applied position still wins: that position is a key maximum
 		assert.deepStrictEqual(buildOriginCursorVector(rows, 1, nameForId, isMember, true), {
 			peer: cursorBelowFloor(T - 10),
-			relayed: T - 20,
+			relayed: cursorBelowFloor(T - 200),
 			other: cursorBelowFloor(T - 30),
 		});
 		assert.deepStrictEqual(buildOriginCursorVector(rows, 1, nameForId, isMember, false), {
@@ -290,14 +333,15 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		const vector = buildOriginCursorVector(rows, 1, nameForId, isMember, true, undefined, (id, start, generation) =>
 			reported.push([id, start, generation])
 		);
-		assert.deepStrictEqual(vector, { peer: cursorBelowFloor(T - 10), relayed: T, other: T });
+		// only the checkpoint-grade row is reported floor-only, but every valid floor is the start
+		const belowFloors = {
+			peer: cursorBelowFloor(T - 10),
+			relayed: cursorBelowFloor(T - 20),
+			other: cursorBelowFloor(T - 30),
+		};
+		assert.deepStrictEqual(vector, belowFloors);
 		assert.deepStrictEqual(reported, [[1, cursorBelowFloor(T - 10), 'g']]);
-		// without the level-2 route the position still wins where it is newer
-		assert.deepStrictEqual(buildOriginCursorVector(rows, 1, nameForId, isMember, true), {
-			peer: T,
-			relayed: T,
-			other: T,
-		});
+		assert.deepStrictEqual(buildOriginCursorVector(rows, 1, nameForId, isMember, true), belowFloors);
 	});
 
 	it('PendingOriginFloors keeps the level-2 fields a same-floor certificate carries and updates fullCoverage', () => {
@@ -626,7 +670,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			new Map([[2, T + 10]])
 		);
 		assert.strictEqual(certified.length, 0, 'floor-only resume is suppressed when floor <= maxCopiedVersion');
-		assert.strictEqual(cursors.relayed, T + 50);
+		assert.strictEqual(cursors.relayed, cursorBelowFloor(T + 10));
 	});
 
 	it('restoreCompletedCopyPass clears partialHistory without certifying copyStartTime', () => {
@@ -886,7 +930,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			(id, start) => certified.push([id, start]),
 			loaded
 		);
-		assert.deepStrictEqual(vector, { relayed: T + 1000 });
+		assert.deepStrictEqual(vector, { relayed: cursorBelowFloor(T + 600) });
 		assert.deepStrictEqual(certified, []);
 		const relayed = collectRelayableCertificates(
 			new Map([[2, seqRow2]]),
@@ -1083,6 +1127,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.deepStrictEqual(vector, {
 			peer: cursorBelowFloor(T + 10),
 			relayed: cursorBelowFloor(T + 20),
+			// a removed origin keeps its position: its floor stops advancing once it leaves
 			other: T + 300,
 		});
 		assert.deepStrictEqual(reported, [

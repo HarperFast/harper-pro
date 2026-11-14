@@ -143,9 +143,11 @@ suite('remove_node by an alias', { timeout: 180000 }, (ctx) => {
 		const added = await sendOperation(ctx.nodeA, { operation: 'add_node', hostname: ctx.offlineAddress });
 		match(added.message, /error updating target node/, JSON.stringify(added));
 
+		// nothing answers there, so only force skips the wait for its writes
 		const { status, body } = await postOperation(ctx.nodeA, {
 			operation: 'remove_node',
 			hostname: ctx.offlineAddress,
+			force: true,
 		});
 		equal(status, 200, JSON.stringify(body));
 		equal(body.message.split(' but ')[0], `Successfully removed '${ctx.offlineAddress}' from cluster`, body.message);

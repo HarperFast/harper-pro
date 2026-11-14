@@ -29,7 +29,7 @@ import {
 	updateExclusionOrigins,
 } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
-import { parentPort } from 'worker_threads';
+import { isMainThread, parentPort } from 'worker_threads';
 import {
 	subscribeToNodeUpdates,
 	getHDBNodeTable,
@@ -41,8 +41,10 @@ import {
 	clearReplicationSharedStatus,
 	type Route,
 	getNodeURL,
+	selfNodeReplicates,
 	ownWriteRecipientNames,
 } from './knownNodes.ts';
+import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 import { ownPrivateUrls, samePrivateUrls } from './privatePaths.ts';
 import {
 	RECEIVING_STATUS_POSITION,
@@ -1019,6 +1021,38 @@ export function computeExclusionOrigins(databaseName: string): string[] {
 		origins.push(node.name);
 	}
 	return origins;
+}
+
+/**
+ * Whether this node subscribes to `databaseName` directly from `nodeName`. Off the main thread the configured routes,
+ * which take precedence over the peer's row, are not loaded, so it answers false only for what routes cannot change
+ * (no row for the peer, a database this node does not replicate with it) and undefined otherwise.
+ */
+export function receivesDirectlyFrom(nodeName: string, databaseName: string): boolean | undefined {
+	const node = getHDBNodeTable().primaryStore.getSync(nodeName);
+	if (!node) return false;
+	// a database not created here yet may still arrive, so its absence is not an answer
+	if (!getDatabases()[databaseName]) return undefined;
+	if (!isMainThread) {
+		if (isExplicitDatabaseSubscription(node.subscriptions, databaseName)) return undefined;
+		const replicatesWith =
+			isReplicatedDatabase(
+				env.get(CONFIG_PARAMS.REPLICATION_DATABASES),
+				databaseName,
+				() => node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD),
+				false
+			) && selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
+		return replicatesWith ? undefined : false;
+	}
+	const matchingRoute = routes.find((route) => route.name === nodeName);
+	const routeReplicates =
+		typeof matchingRoute?.replicates === 'object'
+			? matchingRoute.replicates
+			: node.replicates && typeof node.replicates === 'object'
+				? node.replicates
+				: null;
+	const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
+	return shouldReplicateFromNode({ ...node, routeReplicates, configRouteReplicates } as any, databaseName);
 }
 
 function updateShardingFailover(database: string): void {
