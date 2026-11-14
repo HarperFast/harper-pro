@@ -307,7 +307,6 @@ async function recordReport(database: string, peer: string, report: OwnOriginRep
 }
 
 // the epoch row is fixed once workers run, and a clean report stands for its epoch
-// half the waiters' poll, so a poll never reads an entry made just before the previous one
 export const UNPROVEN_RECHECK_MS = 50;
 const cachedEpochs = new Map<
 	string,
@@ -382,7 +381,6 @@ export function ownLineage(
 	return lineage;
 }
 
-// a home map's array is replaced, never mutated, so identity is the usual match
 function sameHomes(cached: readonly string[] | undefined, homes: readonly string[]): boolean {
 	if (cached === homes) return true;
 	if (cached?.length !== homes.length) return false;

@@ -11702,12 +11702,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						continue;
 					}
 				}
-				// A returned own write this node still holds was not lost. Applied again it would take a fresh
-				// local key, so core would not see a re-delivery and would log it again for every peer to forward.
-				if (localSourceNodeId === 0 && !messageIsCopyFrame && tableDecoder.table) {
-					const held = tableDecoder.table.primaryStore.getEntry(id)?.version;
-					if (held !== undefined && held >= auditRecord.version) {
-						if (auditRecord.extendedType & HAS_BLOBS) discardRecordBlobs(auditRecord, tableDecoder);
+				// A returned own write this node still holds, or that a newer write superseded, was not lost.
+				// Applied again it would take a fresh local key, so core would not see a re-delivery and would log
+				// it again for every peer to forward. A blob-carrying one is left to core, which repairs blobs.
+				if (localSourceNodeId === 0 && !messageIsCopyFrame && !(auditRecord.extendedType & HAS_BLOBS)) {
+					const held = readLocalEntry(tableDecoder, id);
+					if (held && (held.version > auditRecord.version || (held.version === auditRecord.version && !held.nodeId))) {
 						decoder.position = start + eventLength;
 						continue;
 					}
