@@ -22,7 +22,7 @@
  *     installed so the test driver can kill a worker via HTTP
  *
  * Sequence:
- *   1. Start both nodes, connect, deploy components.
+ *   1. Start both nodes, create the tables on both, then connect.
  *   2. Begin a sustained write workload on A targeting multiple databases
  *      (so each one becomes a separate subscription on B → multiple
  *      reassignments on worker death).
@@ -37,8 +37,7 @@
  *   - Subscription-reassignment log lines in the post-kill window are
  *     spaced at intervals ≥ 80 ms (the configured stagger is 100 ms;
  *     allow a 20 ms slop for log-timestamp resolution).
- *   - B continues committing replication after the kill (its
- *     `lastReceivedVersion` for A's connection still advances).
+ *   - B's sockets for all six databases are connected again after the kill.
  *
  * To run locally:
  *   HARPER_RUN_STRESS_TESTS=1 \
@@ -55,14 +54,7 @@ import {
 	getNextAvailableLoopbackAddress,
 	setupHarperWithFixture,
 } from '@harperfast/integration-testing';
-import {
-	stressEnabled,
-	sendOperation,
-	fetchWithRetry,
-	readLog,
-	clusterSnapshot,
-	waitForAllConnected,
-} from './stressShared.mjs';
+import { stressEnabled, sendOperation, fetchWithRetry, readLog, waitForAllConnected } from './stressShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -80,6 +72,7 @@ if (!stressEnabled()) {
 } else {
 	const THREADS_PER_NODE = 4;
 	const DB_COUNT = 6; // 6 dbs × 1 table each → 6 subscriptions to reassign on worker death
+	const DATABASES = Array.from({ length: DB_COUNT }, (_, i) => `stress_db${i}`);
 
 	suite('Worker exit reassignment is staggered, not stampede', { timeout: 240_000 }, (ctx) => {
 		before(async () => {
@@ -102,21 +95,11 @@ if (!stressEnabled()) {
 			});
 			ctx.nodes = [nodeA.harper, nodeB.harper];
 
-			// Mesh: B adds A.
-			const tokenResp = await sendOperation(ctx.nodes[0], {
-				operation: 'create_authentication_tokens',
-				authorization: ctx.nodes[0].admin,
-			});
-			await sendOperation(ctx.nodes[1], {
-				operation: 'add_node',
-				rejectUnauthorized: false,
-				hostname: ctx.nodes[0].hostname,
-				authorization: 'Bearer ' + tokenResp.operation_token,
-			});
-
 			// Create several databases so multiple subscriptions form on B (each
 			// db is a separate WS in replicationConnection). This makes the
 			// stagger observable — with one db there's nothing to space out.
+			// Created on both nodes before meshing: once meshed, A's definition can replicate to B
+			// ahead of B's own create_table, which then fails with "already exists".
 			for (let i = 0; i < DB_COUNT; i++) {
 				for (const n of ctx.nodes) {
 					await sendOperation(n, {
@@ -131,7 +114,19 @@ if (!stressEnabled()) {
 					});
 				}
 			}
-			await waitForAllConnected(ctx.nodes[1], { timeoutMs: 60_000 });
+
+			// Mesh: B adds A.
+			const tokenResp = await sendOperation(ctx.nodes[0], {
+				operation: 'create_authentication_tokens',
+				authorization: ctx.nodes[0].admin,
+			});
+			await sendOperation(ctx.nodes[1], {
+				operation: 'add_node',
+				rejectUnauthorized: false,
+				hostname: ctx.nodes[0].hostname,
+				authorization: 'Bearer ' + tokenResp.operation_token,
+			});
+			await waitForAllConnected(ctx.nodes[1], { timeoutMs: 60_000, databases: DATABASES });
 		});
 
 		after(async () => {
@@ -247,10 +242,8 @@ if (!stressEnabled()) {
 			ok(newPIDs.length <= 1, `expected ≤1 new worker after kill, saw ${newPIDs.length}: ${newPIDs.join(',')}`);
 			ok(goneePIDs.length <= 1, `expected ≤1 worker to have died, saw ${goneePIDs.length}: ${goneePIDs.join(',')}`);
 
-			// (4) Replication still advancing on B.
-			const finalSnap = await clusterSnapshot(B);
-			const allStillConnected = finalSnap.peers.every((p) => Object.values(p.dbs).every((d) => d.connected));
-			ok(allStillConnected, `B not fully reconnected post-kill: ${JSON.stringify(finalSnap)}`);
+			// (4) No subscription is left without a worker after the kill.
+			await waitForAllConnected(B, { timeoutMs: 30_000, databases: DATABASES });
 
 			// (5) Crisp invariant: NO ERR_WORKER_OUT_OF_MEMORY or uncaughtException
 			//     in B's log — even one means the cascade fix regressed.

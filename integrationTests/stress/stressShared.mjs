@@ -402,14 +402,26 @@ export async function clusterSnapshot(node) {
 
 /**
  * Wait until every database socket on `node`'s `cluster_status` reports
- * connected. Returns the final snapshot or throws on timeout.
+ * connected, and every peer lists each of `opts.databases` (sockets appear per
+ * database as they form, so "all connected" alone can pass with some missing).
+ * Returns the final snapshot or throws on timeout.
  */
 export async function waitForAllConnected(node, opts = {}) {
 	const deadline = Date.now() + (opts.timeoutMs ?? 60000);
+	const databases = opts.databases ?? [];
 	let last;
 	while (Date.now() < deadline) {
 		last = await clusterSnapshot(node).catch(() => null);
-		if (last && last.peers.length > 0 && last.peers.every((p) => Object.values(p.dbs).every((d) => d.connected))) {
+		if (
+			last &&
+			last.peers.length > 0 &&
+			last.peers.every(
+				(p) =>
+					Object.keys(p.dbs).length > 0 &&
+					Object.values(p.dbs).every((d) => d.connected) &&
+					databases.every((db) => p.dbs[db]?.connected)
+			)
+		) {
 			return last;
 		}
 		await delay(500);
