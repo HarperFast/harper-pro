@@ -437,10 +437,8 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				}
 			}
 			if (outcome instanceof Error) settleOwn(waiter, outcome);
-			else if (outcome) {
-				if (deps.monotonicNow() < waiter.deadlineMono) settleOwn(waiter);
-				else expireOwn(waiter);
-			}
+			else if (deps.monotonicNow() >= waiter.deadlineMono) expireOwn(waiter);
+			else if (outcome) settleOwn(waiter);
 		}
 		if (ownWaiters.size > 0 && !closed) ownPoll = setTimer(pollOwnLineage, OWN_LINEAGE_POLL_MS);
 	};
