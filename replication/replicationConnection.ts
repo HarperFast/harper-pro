@@ -4405,6 +4405,15 @@ export interface OwnOriginRecoveryRange {
 }
 
 /**
+ * A returned own write that is still this node's row was not lost. Applied again it would take a fresh local key,
+ * so core would not see a re-delivery and would log it again for every peer to forward. An older one may be a
+ * patch core merges out of order, and a blob-carrying one may need its blobs repaired, so core takes both.
+ */
+export function isHeldOwnWrite(held: { version?: number; nodeId?: number } | undefined, version: number): boolean {
+	return held !== undefined && held.version === version && !held.nodeId;
+}
+
+/**
  * The receiver applies its own residency records of a sharded table only from a snapshot copy, and closes the
  * link on one sent live (non-obvious behavior 39, "Known limits"), so the recovery pass leaves them out.
  */
@@ -11702,16 +11711,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						continue;
 					}
 				}
-				// A returned own write that is still this node's row was not lost. Applied again it would take a fresh
-				// local key, so core would not see a re-delivery and would log it again for every peer to forward.
-				// An older one may be a patch core merges out of order, and a blob-carrying one may need its blobs
-				// repaired, so core takes both.
-				if (localSourceNodeId === 0 && !messageIsCopyFrame && !(auditRecord.extendedType & HAS_BLOBS)) {
-					const held = readLocalEntry(tableDecoder, id);
-					if (held && held.version === auditRecord.version && !held.nodeId) {
-						decoder.position = start + eventLength;
-						continue;
-					}
+				if (
+					localSourceNodeId === 0 &&
+					ownOriginRecoveryRequested !== undefined &&
+					!messageIsCopyFrame &&
+					!(auditRecord.extendedType & HAS_BLOBS) &&
+					isHeldOwnWrite(readLocalEntry(tableDecoder, id), auditRecord.version)
+				) {
+					decoder.position = start + eventLength;
+					continue;
 				}
 				const isCopyApply =
 					messageIsCopyFrame &&

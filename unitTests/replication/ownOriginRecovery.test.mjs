@@ -22,6 +22,7 @@ import {
 	findOwnOriginRecoveryRange,
 	ORIGIN_CURSOR_OVERLAP_MS,
 	returnedByOwnOriginRecovery,
+	isHeldOwnWrite,
 } from '#src/replication/replicationConnection';
 import {
 	buildLocalCapabilities,
@@ -190,6 +191,17 @@ describe('returnedByOwnOriginRecovery', () => {
 		assert.strictEqual(returnedByOwnOriginRecovery(sharded, 'lockBarrier'), true);
 		assert.strictEqual(returnedByOwnOriginRecovery({}, 'put'), true, 'an ordinary table in the same database');
 		assert.strictEqual(returnedByOwnOriginRecovery(undefined, 'put'), true);
+	});
+});
+
+describe('isHeldOwnWrite', () => {
+	it('is true only when the stored row is that same own write', () => {
+		assert.strictEqual(isHeldOwnWrite({ version: 5 }, 5), true);
+		assert.strictEqual(isHeldOwnWrite({ version: 5, nodeId: 0 }, 5), true);
+		assert.strictEqual(isHeldOwnWrite({ version: 5, nodeId: 3 }, 5), false, "another node's write at the same version");
+		assert.strictEqual(isHeldOwnWrite({ version: 6 }, 5), false, 'an older own write core may merge out of order');
+		assert.strictEqual(isHeldOwnWrite({ version: 4 }, 5), false, 'a lost write');
+		assert.strictEqual(isHeldOwnWrite(undefined, 5), false);
 	});
 });
 
