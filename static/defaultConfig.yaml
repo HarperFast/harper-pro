@@ -1,4 +1,4 @@
-# HarperDB configuration file. Refer to https://harperdb.io/docs/reference/configuration-file/
+# Harper configuration file. Refer to https://docs.harperdb.io/docs/deployments/configuration
 ---
 http:
   compressionThreshold: 0
