@@ -11702,6 +11702,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						continue;
 					}
 				}
+				// A returned own write this node still holds was not lost. Applied again it would take a fresh
+				// local key, so core would not see a re-delivery and would log it again for every peer to forward.
+				if (localSourceNodeId === 0 && !messageIsCopyFrame && tableDecoder.table) {
+					const held = tableDecoder.table.primaryStore.getEntry(id)?.version;
+					if (held !== undefined && held >= auditRecord.version) {
+						if (auditRecord.extendedType & HAS_BLOBS) discardRecordBlobs(auditRecord, tableDecoder);
+						decoder.position = start + eventLength;
+						continue;
+					}
+				}
 				const isCopyApply =
 					messageIsCopyFrame &&
 					copyApplyActive() &&
