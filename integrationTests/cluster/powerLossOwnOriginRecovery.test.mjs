@@ -56,6 +56,7 @@ const FIRST_BOOT = { HARPER_TEST_BOOT_ID: 'power-loss-boot-1' };
 const SECOND_BOOT = { HARPER_TEST_BOOT_ID: 'power-loss-boot-2' };
 const SYNC_FAILURE_MARKER = 'own-origin-recovery-log-sync-failed';
 const BARRIER_REFUSAL = /cannot yet vouch for its own writes/;
+const HOME_RESTART_WAIT = /restarted and cannot grant until the delegations/;
 
 const dataDbDir = (node) => join(node.dataRootDir, 'database', DB);
 const ownLogDir = (node) => join(dataDbDir(node), 'transaction_logs', 'local');
@@ -182,6 +183,26 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			if (dir) await rm(dir, { recursive: true, force: true });
 	});
 
+	/**
+	 * A lock attempt answered by something other than the home's wait for its previous incarnation's
+	 * delegations to expire: B restarted with A, and that wait says nothing about A's recovery.
+	 */
+	async function lockPastHomeRestart(node) {
+		let response;
+		await waitForCondition(
+			async () => {
+				response = await call(node, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
+				return !HOME_RESTART_WAIT.test(JSON.stringify(response.body));
+			},
+			{
+				timeoutMs: 60_000,
+				pollMs: 500,
+				description: () => `the home's restart wait to end: ${JSON.stringify(response?.body)}`,
+			}
+		);
+		return response;
+	}
+
 	/** Kill A's process with its page cache intact (the OS stays up) and start it again with reports held. */
 	async function crashAndRestartA(env) {
 		const holdDir = await mkdtemp(join(tmpdir(), 'harper-power-loss-report-hold-'));
@@ -260,7 +281,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			description: `B to return A's writes (A's report parked in ${reportHoldDir})`,
 		});
 		// lockKey is homed on B, whose last grant was to A for the write A lost.
-		const refused = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
+		const refused = await lockPastHomeRestart(nodeA);
 		assert.equal(
 			refused.status,
 			503,
@@ -273,7 +294,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			['C', nodeC],
 			['B', nodeB],
 		]) {
-			const refusedThere = await call(node, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
+			const refusedThere = await lockPastHomeRestart(node);
 			assert.equal(
 				refusedThere.status,
 				503,
