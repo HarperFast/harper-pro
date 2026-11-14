@@ -120,11 +120,15 @@ describe('NodeReplicationConnection private dial', () => {
 			for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
 		});
 
-		// the real chooseDial only takes wss: private URLs
+		// The real chooseDial only takes wss: private URLs. Each connection gets its own peer name because
+		// privatePaths keeps a path's outage after its test ends, and on Linux a later test's server can be
+		// handed a port an earlier test already marked down, making it dial the public URL instead.
+		let peers = 0;
 		function connectionVia(privateUrl, publicUrl) {
-			const connection = new NodeReplicationConnection(publicUrl, null, 'data', 'fallback-peer');
+			const peer = `fallback-peer-${++peers}`;
+			const connection = new NodeReplicationConnection(publicUrl, null, 'data', peer);
 			connections.push(connection);
-			const pathKey = privatePathKey(privateUrl, 'fallback-peer');
+			const pathKey = privatePathKey(privateUrl, peer);
 			connection.chooseDial = () => (connection.dial = privatePaths.choose(publicUrl, privateUrl, pathKey, connection));
 			const retries = [];
 			connection.setReconnectTimer = (callback) => {
