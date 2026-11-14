@@ -402,20 +402,24 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		waiter.settle(error);
 	};
 
+	const expireOwn = (waiter: OwnWaiter) => {
+		try {
+			reject(
+				'own-lineage-gap',
+				`this node is still recovering its own writes on ${database} from its peers after a restart`
+			);
+		} catch (error) {
+			settleOwn(waiter, error as Error);
+		}
+	};
+
 	const pollOwnLineage = () => {
 		ownPoll = undefined;
 		// every waiting position is below the epoch's start, where own lineage does not depend on it
 		const evaluated = new Map<readonly string[], Map<string, boolean>>();
 		for (const waiter of ownWaiters) {
 			if (deps.monotonicNow() >= waiter.deadlineMono) {
-				try {
-					reject(
-						'own-lineage-gap',
-						`this node is still recovering its own writes on ${database} from its peers after a restart`
-					);
-				} catch (error) {
-					settleOwn(waiter, error as Error);
-				}
+				expireOwn(waiter);
 				continue;
 			}
 			let byKey = evaluated.get(waiter.homes);
@@ -433,7 +437,10 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				}
 			}
 			if (outcome instanceof Error) settleOwn(waiter, outcome);
-			else if (outcome && deps.monotonicNow() < waiter.deadlineMono) settleOwn(waiter);
+			else if (outcome) {
+				if (deps.monotonicNow() < waiter.deadlineMono) settleOwn(waiter);
+				else expireOwn(waiter);
+			}
 		}
 		if (ownWaiters.size > 0 && !closed) ownPoll = setTimer(pollOwnLineage, OWN_LINEAGE_POLL_MS);
 	};

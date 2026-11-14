@@ -274,13 +274,15 @@ describe('continuesEpoch', () => {
 
 describe('openOwnOriginRecoveryEpoch', () => {
 	const EPOCH = Symbol.for('ownOriginRecovery');
-	function stores(previous, { reports = [], logReadFails = false } = {}) {
+	const rowKey = (key) => (Array.isArray(key) ? `${key[0].description}/${key[1]}` : key);
+	function stores(previous, { reports = [], cleanReports = [], logReadFails = false } = {}) {
 		const rows = new Map();
 		if (previous) rows.set(EPOCH, previous);
+		for (const report of cleanReports) rows.set(rowKey([Symbol.for('ownOriginRecovered'), report.peer]), report);
 		let syncs = 0;
 		const dbisDB = {
 			rows,
-			getSync: (key) => rows.get(key),
+			getSync: (key) => rows.get(rowKey(key)),
 			putSync: (key, value) => rows.set(key, value),
 			getRange: ({ start }) =>
 				Array.isArray(start) && start[0] === Symbol.for('ownOriginPurged')
@@ -341,6 +343,22 @@ describe('openOwnOriginRecoveryEpoch', () => {
 		assert.ok(result);
 		assert.strictEqual(dbisDB.rows.get(EPOCH).before, NOW + 1000);
 		return result.then(() => assert.strictEqual(syncs(), 1));
+	});
+
+	it('continues an epoch whose peer also gave a clean report, which proves it despite a purge-met one', () => {
+		const { dbisDB, auditStore, syncs } = stores(settled, {
+			reports: [{ peer: 'peer', epoch: NOW, purgedThrough: 6 }],
+			cleanReports: [{ peer: 'peer', epoch: NOW }],
+		});
+		const result = openOwnOriginRecoveryEpoch(
+			'clean-beside-purged-db',
+			auditStore,
+			dbisDB,
+			{ bootId: 'boot-a', syncFailure: false },
+			() => []
+		);
+		assert.strictEqual(result, undefined);
+		assert.strictEqual(syncs(), 0);
 	});
 
 	it('opens the widest epoch when the own log cannot be read, even on the same boot', async () => {

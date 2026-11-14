@@ -9471,17 +9471,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (closed || wsClosed) return;
 							const purgeBound = getLogPurgeBounds(auditStore, recovery.name)?.get(recovery.name);
 							const failed = ownOriginRangeCut || range?.failedLogs?.size > 0 || range?.corruptFrameStop?.breaks > 0;
-							ws.send(
-								encode([
-									OWN_ORIGIN_SENT,
-									{
-										epoch: recovery.endTime,
-										...(subscriptionSetupRequestId !== undefined && { request: subscriptionSetupRequestId }),
-										...(purgeBound > recovery.startTime && { purgedThrough: purgeBound }),
-										...(failed && { failed: true }),
-									},
-								])
-							);
+							try {
+								ws.send(
+									encode([
+										OWN_ORIGIN_SENT,
+										{
+											epoch: recovery.endTime,
+											...(subscriptionSetupRequestId !== undefined && { request: subscriptionSetupRequestId }),
+											...(purgeBound > recovery.startTime && { purgedThrough: purgeBound }),
+											...(failed && { failed: true }),
+										},
+									])
+								);
+							} catch (error) {
+								// the receiver asks again on its next subscription
+								logger.warn?.(connectionId, 'could not report returned own-origin writes to', remoteNodeName, error);
+								return;
+							}
 							logger.debug?.(connectionId, 'returned own-origin writes to', remoteNodeName, databaseName, { failed });
 							if (subscribedNodeIds) subscribedNodeIds[getIdOfRemoteNode(recovery.name, auditStore)] = false;
 						};
