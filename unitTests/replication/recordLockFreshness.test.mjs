@@ -804,6 +804,23 @@ describe('createFreshnessBarrier: own lineage after a restart (harper-pro#1364)'
 		await Promise.all(longs);
 		assert.strictEqual(h.timers.size, 0, 'the poll stops once nothing waits');
 	});
+	it('does not admit a waiter whose deadline passed while the poll evaluated', async () => {
+		let clock = 1_000;
+		let lineage = pending;
+		const h = harness({
+			monotonicNow: () => clock,
+			ownLineage() {
+				if (lineage.state === 'intact') clock += 200;
+				return lineage;
+			},
+		});
+		const wait = h.barrier.establish('t', [['self', 5]], 150);
+		lineage = { state: 'intact' };
+		clock = 1_100;
+		h.advance(OWN_LINEAGE_POLL_MS);
+		h.advance(OWN_LINEAGE_POLL_MS);
+		assert.match((await rejection(wait)).message, /still recovering its own writes/);
+	});
 	it('passes the table to the own-lineage check', async () => {
 		const { h, asked } = lineageHarness({ state: 'intact' });
 		await h.barrier.establish('Rows', [['self', 5]], 1_000);

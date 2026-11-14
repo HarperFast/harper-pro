@@ -295,6 +295,10 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		const onC = await call(nodeC, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
 		assert.equal(onC.status, 200, `the lock on C was refused after A recovered: ${JSON.stringify(onC.body)}`);
 		assert.equal(onC.body.n, 3, `C's first lock after A recovered answered n=${onC.body.n} (expected 3)`);
+		// A takes the key back, so the restart tests below depend on A's own lineage
+		const again = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
+		assert.equal(again.status, 200, `the lock on A was refused after C's: ${JSON.stringify(again.body)}`);
+		assert.equal(again.body.n, 4);
 	});
 
 	test('A recovers its own writes from B', async (t) => {
@@ -322,14 +326,14 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		if (!nodeA) return t.skip('RocksDB only');
 		assert.ok(recovered, 'runs only after A recovered');
 		const holdDir = await crashAndRestartA({ boot: SECOND_BOOT });
-		// lockKey's last grant was A's n=2, minted on this boot: a new epoch would hold it behind the parked report
+		// lockKey's last grant was A's n=4, minted on this boot: a new epoch would hold it behind the parked report
 		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 10_000 });
 		assert.equal(increment.status, 200, `the lock on A waited for a recovery: ${JSON.stringify(increment.body)}`);
-		assert.equal(increment.body.n, 4);
+		assert.equal(increment.body.n, 5);
 		// a sentinel from B proves the subscription exchange that would carry a recovery range has run
 		await putCounter(nodeB, 'sentinel-after-crash', 1);
 		await waitForCounter([nodeA], 'sentinel-after-crash', 1);
-		await waitForCounter([nodeB], lockKey, 4);
+		await waitForCounter([nodeB], lockKey, 5);
 		assert.equal(existsSync(join(holdDir, 'held')), false, 'A asked a peer for its own writes after a process restart');
 	});
 
@@ -355,6 +359,6 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		await writeFile(join(holdDir, 'release'), '');
 		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
 		assert.equal(increment.status, 200, `the lock on A was refused: ${JSON.stringify(increment.body)}`);
-		assert.equal(increment.body.n, 5);
+		assert.equal(increment.body.n, 6);
 	});
 });

@@ -399,7 +399,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		// every waiting position is below the epoch's start, where own lineage does not depend on it
 		const evaluated = new Map<readonly string[], Map<string, boolean>>();
 		for (const waiter of ownWaiters) {
-			// read per waiter: an earlier evaluation in this poll can outlast a later waiter's deadline
 			if (deps.monotonicNow() >= waiter.deadlineMono) {
 				try {
 					reject(
@@ -422,12 +421,11 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 					if (outcome) refuseOwnPoison(waiter.table);
 					byKey.set(key, outcome as boolean);
 				} catch (error) {
-					// not shared: each refused waiter is counted in the rejection stats
 					outcome = error as Error;
 				}
 			}
 			if (outcome instanceof Error) settleOwn(waiter, outcome);
-			else if (outcome) settleOwn(waiter);
+			else if (outcome && deps.monotonicNow() < waiter.deadlineMono) settleOwn(waiter);
 		}
 		if (ownWaiters.size > 0 && !closed) ownPoll = setTimer(pollOwnLineage, OWN_LINEAGE_POLL_MS);
 	};
