@@ -311,10 +311,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		send(entry);
 	};
 
-	/**
-	 * Resolves to the barrier's position once the origin's entry has committed on this node. `waiting` collects
-	 * the wait, for a caller that may cancel it.
-	 */
+	/** Resolves to the barrier's position once the origin's entry has committed on this node. */
 	const awaitBarrier = (
 		origin: string,
 		table: string,
@@ -529,7 +526,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			try {
 				positions = ownWait ? (await Promise.all([barriers, ownWait.promise]))[0] : await barriers;
 			} catch (error) {
-				// the first refusal decides; the rest would hold slots until the deadline
 				for (const wait of barrierWaits) cancelBarrierWait(wait);
 				ownWait?.cancel();
 				throw error;
