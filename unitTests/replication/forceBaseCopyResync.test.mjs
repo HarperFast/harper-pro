@@ -15,6 +15,7 @@ import {
 	replayStartUnderPurge,
 	predatesPurgeTracking,
 	retentionResumeDecision,
+	retainedLogCoversStart,
 	receiverRefusesCopies,
 	shouldWarnUnvouchedReplay,
 	ORIGIN_CURSOR_OVERLAP_MS,
@@ -204,6 +205,73 @@ describe('retentionResumeDecision', () => {
 	it('still copies under the test hook, which exercises the refusal', () => {
 		expect(retentionResumeDecision(true, false, false, true)).to.equal('copy');
 		expect(retentionResumeDecision(true, false, false, false)).to.equal('copy');
+		expect(retentionResumeDecision(true, false, true, false, true)).to.equal('copy');
+	});
+
+	it('replays a covered start to a receiver that can only take a verified legacy copy', () => {
+		expect(retentionResumeDecision(false, false, true, false, true)).to.equal('replay-retained');
+		expect(retentionResumeDecision(false, false, true, true, true)).to.equal('replay-retained');
+		expect(retentionResumeDecision(false, false, false, false, true)).to.equal('replay');
+	});
+
+	it('does not replay a covered start certified under another generation', () => {
+		expect(retentionResumeDecision(false, true, true, false, true)).to.equal('copy');
+		expect(retentionResumeDecision(false, true, true, true, true)).to.equal('replay-unvouched');
+	});
+});
+
+describe('retainedLogCoversStart', () => {
+	const TRACKED_FROM = 10_000;
+	const LOGS = ['local'];
+	const atTracking = () => TRACKED_FROM;
+	const covers = (overrides = {}) => {
+		const { start, oldest, cutoff, trackedFrom, logs, boundOf, singleLog } = {
+			start: 6000,
+			oldest: 1000,
+			cutoff: 2000,
+			trackedFrom: TRACKED_FROM,
+			logs: LOGS,
+			boundOf: atTracking,
+			singleLog: true,
+			...overrides,
+		};
+		return retainedLogCoversStart(start, oldest, cutoff, trackedFrom, logs, boundOf, singleLog);
+	};
+
+	it('covers a start below tracking when the retained log reaches back to it and no prune passed tracking', () => {
+		expect(covers()).to.equal(true);
+		expect(covers({ oldest: 6000 })).to.equal(true);
+	});
+
+	it('does not cover when the retained log starts after the follower', () => {
+		expect(covers({ oldest: 6001 })).to.equal(false);
+		expect(covers({ oldest: undefined })).to.equal(false);
+	});
+
+	it('does not cover once a tracked prune bound passes where tracking began', () => {
+		expect(covers({ boundOf: () => TRACKED_FROM + 1 })).to.equal(false);
+	});
+
+	it('fails closed on a log whose bound cannot be read', () => {
+		expect(covers({ boundOf: () => undefined })).to.equal(false);
+		expect(
+			covers({ logs: ['local', 'other'], boundOf: (name) => (name === 'local' ? TRACKED_FROM : undefined) })
+		).to.equal(false);
+	});
+
+	it('does not cover a start retention cleanup is due to remove', () => {
+		expect(covers({ cutoff: 6001 })).to.equal(false);
+		expect(covers({ cutoff: 6000 })).to.equal(true);
+	});
+
+	it('only covers a start that predates tracking', () => {
+		expect(covers({ start: TRACKED_FROM })).to.equal(false);
+		expect(covers({ trackedFrom: undefined })).to.equal(false);
+		expect(covers({ start: 0 })).to.equal(false);
+	});
+
+	it('never covers a store with more than one log', () => {
+		expect(covers({ singleLog: false })).to.equal(false);
 	});
 });
 
