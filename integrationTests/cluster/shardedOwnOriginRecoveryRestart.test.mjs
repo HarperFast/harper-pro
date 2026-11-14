@@ -1,20 +1,33 @@
-// A sharded node restarted on the same boot asks its peers for its own writes back (harper-pro#1364). Its same-shard
-// co-owner holds its sharded rows, which the restarted node takes only from a snapshot copy, so the recovery pass
-// leaves them out; sending them live closed the link on every reconnect (close 1011).
+// A sharded node restarted after an OS restart asks its peers for its own writes back (harper-pro#1364). Its
+// same-shard co-owner holds its sharded rows, which the restarted node takes only from a snapshot copy, so the
+// recovery pass leaves them out; sending them live closed the link on every reconnect (close 1011). Each start
+// names its boot (`HARPER_TEST_BOOT_ID`), so the restart always opens a recovery epoch.
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { appendFile, cp, mkdtemp, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { restartNode, sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
+import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 const fixture = join(import.meta.dirname, 'fixture-sharding-quarantine');
 const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
 
-suite('a sharded node restarted on the same boot', { timeout: 600_000, skip: isLMDB && 'RocksDB only' }, (ctx) => {
+const startOptions = (hostname, shard, bootId) => ({
+	env: { HARPER_TEST_BOOT_ID: bootId },
+	config: {
+		threads: { count: 1 },
+		analytics: { aggregatePeriod: -1 },
+		logging: { colors: false, stdStreams: false, level: 'warn' },
+		replication: { threads: 0, securePort: hostname + ':9933', databases: '*', shard, shards: [0, 1] },
+		operationsApi: { network: { domainSocket: false } },
+	},
+});
+
+suite('a sharded node restarted after an OS restart', { timeout: 600_000, skip: isLMDB && 'RocksDB only' }, (ctx) => {
 	const nodes = [];
+	const contexts = [];
 	const auth = (node) => 'Basic ' + Buffer.from(`${node.admin.username}:${node.admin.password}`).toString('base64');
 	async function localRows(node, signal) {
 		const response = await fetch(`${node.httpURL}/OwnRows`, { headers: { Authorization: auth(node) }, signal });
@@ -75,21 +88,8 @@ export class OwnRows extends Resource {
 }
 `
 			);
-			await startHarper(context, {
-				config: {
-					threads: { count: 1 },
-					analytics: { aggregatePeriod: -1 },
-					logging: { colors: false, stdStreams: false, level: 'warn' },
-					replication: {
-						threads: 0,
-						securePort: hostname + ':9933',
-						databases: '*',
-						shard,
-						shards: [0, 1],
-					},
-					operationsApi: { network: { domainSocket: false } },
-				},
-			});
+			await startHarper(context, startOptions(hostname, shard, 'sharded-restart-boot-1'));
+			contexts.push({ context, shard });
 			nodes.push(context.harper);
 		}
 		const [seed, ...peers] = nodes;
@@ -122,13 +122,18 @@ export class OwnRows extends Resource {
 			},
 			{ timeoutMs: 60_000, description: 'the co-owner to store the writer’s rows of their shard' }
 		);
-		await restartNode(writer);
+		await stopNodeProcess(writer);
+		const { context, shard } = contexts[1];
+		context.harper = { hostname: writer.hostname, dataRootDir: writer.dataRootDir };
+		await startHarper(context, startOptions(writer.hostname, shard, 'sharded-restart-boot-2'));
+		nodes[1] = context.harper;
 		await meshed('the cluster to reconnect after restarting the sharded writer');
 		// a link that keeps closing is connected for a moment after each handshake, so a write must cross it
 		const id = owned[0];
 		await put(coOwner, id, 'from-co-owner');
 		await waitForCondition(
-			async (signal) => (await localRows(writer, signal)).some((row) => row.id === id && row.body === 'from-co-owner'),
+			async (signal) =>
+				(await localRows(nodes[1], signal)).some((row) => row.id === id && row.body === 'from-co-owner'),
 			{ timeoutMs: 60_000, description: 'the co-owner’s write to reach the restarted writer' }
 		);
 	});
