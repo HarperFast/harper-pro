@@ -111,17 +111,33 @@ describe('NodeReplicationConnection private dial', () => {
 	describe('connect', () => {
 		const connections = [];
 		const servers = [];
+		// every outage a test starts, including those from sockets that never set connection.dial
+		const outageKeys = new Set();
+		let failed;
+		before(() => {
+			failed = privatePaths.failed;
+			privatePaths.failed = function (pathKey, ...rest) {
+				outageKeys.add(pathKey);
+				return failed.call(this, pathKey, ...rest);
+			};
+		});
+		after(() => {
+			if (failed) privatePaths.failed = failed;
+		});
 		afterEach(async () => {
-			const pathKeys = new Set();
-			for (const connection of connections.splice(0)) {
+			const ended = connections.splice(0);
+			for (const connection of ended) {
 				connection.intentionallyUnsubscribed = true;
-				if (connection.dial?.pathKey) pathKeys.add(connection.dial.pathKey);
 				privatePaths.forget(connection.dial?.pathKey, connection);
 				connection.socket?.terminate();
 			}
-			// forget only drops the waiter; this drops the outage and its probe timer. Once every waiter is
-			// forgotten, identified() has no one left to schedule a promotion for.
-			for (const pathKey of pathKeys) privatePaths.identified(pathKey);
+			// forget only drops a waiter; identified() drops the outage and its probe timer, and with every
+			// waiter forgotten first it has no one left to schedule a promotion for
+			for (const pathKey of outageKeys) {
+				for (const connection of ended) privatePaths.forget(pathKey, connection);
+				privatePaths.identified(pathKey);
+			}
+			outageKeys.clear();
 			for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
 		});
 
