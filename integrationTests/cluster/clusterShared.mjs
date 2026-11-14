@@ -403,6 +403,41 @@ export async function waitForCondition(probe, opts = {}) {
 	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: lastError ?? signal.reason });
 }
 
+/**
+ * Resolves once `node` has had `peerName`'s answer to a replicated operation (the path `drop_table` and deploys take)
+ * on every poll for `stableMs`. A connected replication socket does not prove that path: `add_node` returns before
+ * the certificates it exchanged reach the TLS contexts, which every thread on both nodes rebuilds on its own 1.5s
+ * debounce, so one answer proves only the threads that served it. `list_releases` is read-only.
+ */
+export function waitForOperationPath(node, peerName, { timeoutMs = 30000, pollMs = 250, stableMs = 2000 } = {}) {
+	let lastAnswer;
+	let answeringSince;
+	return waitForCondition(
+		async (signal) => {
+			const { body } = await postOperation(node, { operation: 'list_releases', replicated: true }, { signal }).catch(
+				(error) => {
+					if (signal.aborted) throw error;
+					return { body: { error: error.message } };
+				}
+			);
+			lastAnswer = body;
+			const peer = body?.nodes?.find((entry) => entry.node === peerName);
+			if (!peer || peer.error || !Array.isArray(peer.components)) {
+				answeringSince = undefined;
+				return false;
+			}
+			answeringSince ??= Date.now();
+			return Date.now() - answeringSince >= stableMs;
+		},
+		{
+			timeoutMs,
+			pollMs,
+			description: () =>
+				`${node.hostname} to get ${peerName}'s answer to a replicated operation for ${stableMs}ms; last: ${JSON.stringify(lastAnswer)}`,
+		}
+	);
+}
+
 /** A missing directory throws instead of reading as purged. */
 export async function logSegments(node, logName, database = 'data') {
 	const { readdir } = await import('node:fs/promises');
