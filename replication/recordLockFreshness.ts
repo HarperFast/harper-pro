@@ -396,11 +396,11 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 
 	const pollOwnLineage = () => {
 		ownPoll = undefined;
-		const now = deps.monotonicNow();
 		// every waiting position is below the epoch's start, where own lineage does not depend on it
 		const evaluated = new Map<readonly string[], Map<string, Error | boolean>>();
 		for (const waiter of ownWaiters) {
-			if (now >= waiter.deadlineMono) {
+			// read per waiter: an earlier evaluation in this poll can outlast a later waiter's deadline
+			if (deps.monotonicNow() >= waiter.deadlineMono) {
 				try {
 					reject(
 						'own-lineage-gap',

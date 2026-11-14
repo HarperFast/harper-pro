@@ -6555,7 +6555,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				error
 			);
 			recordAction(true, FAILED_FRAME_SKIP_METRIC, `${remoteNodeName}.${databaseName}`);
-			ownOriginPass.frameSkipped = true;
+			ownOriginFrameSkips++;
 			return false;
 		}
 	}
@@ -8963,7 +8963,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// a returned row is recovered only once its blobs are saved
 								Promise.allSettled(outstandingBlobsToFinish.slice()).then(() => {
 									if (connectionSuperseded()) return;
-									if (hasBlobGap || pass.frameSkipped) askOwnOriginAgain();
+									if (hasBlobGap || ownOriginFrameSkips > pass.skipsBefore) askOwnOriginAgain();
 									else settleOwnOriginReport(reportDatabase, peer, report, rootStore, askOwnOriginAgain);
 								});
 							},
@@ -13077,9 +13077,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let lastSentExcludedNodes: string[] = [];
 	let ownOriginRecoveryRequested: number | undefined;
 	let ownOriginRecoveryRequestId: number | undefined;
-	// a frame given up on during a request's pass may be a returned own write this node never applied; the
-	// next request's pass re-sends it
-	let ownOriginPass = { frameSkipped: false };
+	// A frame given up on since a request may be a returned own write this node never applied, so that
+	// request's report is not clean; the next request's pass re-sends it. Counted, not flagged: a frame can
+	// fail after a newer request is sent, and it counts against every request still settling.
+	let ownOriginFrameSkips = 0;
+	let ownOriginPass = { skipsBefore: 0 };
 	let ownOriginRetryTimer: ReturnType<typeof setTimeout> | undefined;
 	const ownOriginRetryBackoff = createBackoff({
 		initialMs: OWN_ORIGIN_RETRY_MS,
@@ -13811,11 +13813,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				lastSentExcludedNodes = excluded ? [...excluded] : [];
 				if (requestedOwnOrigin !== undefined) {
 					lastSentExcludedNodes.push(getThisNodeName());
-					// without request ids an earlier request's report can still match, so its skips carry over
-					ownOriginPass = {
-						frameSkipped:
-							requestId === undefined && ownOriginRecoveryRequested !== undefined && ownOriginPass.frameSkipped,
-					};
+					// without request ids an earlier request's report can still match, so it keeps that request's start
+					if (requestId !== undefined || ownOriginRecoveryRequested === undefined)
+						ownOriginPass = { skipsBefore: ownOriginFrameSkips };
 					clearTimeout(ownOriginRetryTimer);
 					ownOriginRetryTimer = undefined;
 				}

@@ -278,7 +278,7 @@ describe('openOwnOriginRecoveryEpoch', () => {
 			getSync: (key) => rows.get(key),
 			putSync: (key, value) => rows.set(key, value),
 			getRange: ({ start }) =>
-				Array.isArray(start) && start[0] === Symbol.for('ownOriginRecovered')
+				Array.isArray(start) && start[0] === Symbol.for('ownOriginPurged')
 					? reports.map((value) => ({ key: [start[0], value.peer], value }))
 					: [],
 		};
@@ -451,6 +451,22 @@ describe('ownLineage caching', () => {
 		assert.strictEqual(ownLineage('own-lineage-pending', NOW, homes, 'self', undefined, () => true).state, 'pending');
 		await delay(UNPROVEN_RECHECK_MS + 10);
 		assert.strictEqual(ownLineage('own-lineage-pending', NOW, homes, 'self', undefined, () => true).state, 'intact');
+	});
+	it('a clean pass proves a peer even when a pass that met a purge is also recorded', async () => {
+		const dbisDB = await epochStore('own-lineage-purged-then-clean');
+		await report(dbisDB, 'c');
+		await dbisDB.put([Symbol.for('ownOriginPurged'), 'b'], { epoch: epoch.before, purgedThrough: epoch.after + 1 });
+		const homes = ['self'];
+		assert.strictEqual(
+			ownLineage('own-lineage-purged-then-clean', NOW, homes, 'self', undefined, () => true).state,
+			'unprovable'
+		);
+		await report(dbisDB, 'b');
+		await delay(UNPROVEN_RECHECK_MS + 10);
+		assert.strictEqual(
+			ownLineage('own-lineage-purged-then-clean', NOW, homes, 'self', undefined, () => true).state,
+			'intact'
+		);
 	});
 	it('admits a position minted since the epoch opened without any report', async () => {
 		await epochStore('own-lineage-new-position');

@@ -36,6 +36,8 @@ function inheritedFailures(value: string | undefined): string[] {
 	return pid === String(process.pid) ? databases.filter(Boolean) : [];
 }
 const REPORT = Symbol.for('ownOriginRecovered');
+// A pass that met a purge is stored apart, so it can never overwrite a clean report from another thread.
+const PURGED = Symbol.for('ownOriginPurged');
 const DURABLE_FLOOR = Symbol.for('ownOriginDurableFloor');
 const LOG_VOUCH = Symbol.for('ownOriginLogVouch');
 const MIN_START = 1;
@@ -227,8 +229,8 @@ export function openOwnOriginRecoveryEpoch(
  * new epoch judges peers' purges against what the log holds now, as every start did before continuation.
  */
 function purgeTainted(dbisDB: any, epoch: OwnOriginEpoch): boolean {
-	for (const { value } of dbisDB.getRange({ start: [REPORT], end: [REPORT, Buffer.from([0xff])] })) {
-		if (value?.epoch === epoch.before && purgedIntoWindow(value, epoch)) return true;
+	for (const { key, value } of dbisDB.getRange({ start: [PURGED], end: [PURGED, Buffer.from([0xff])] })) {
+		if (value?.epoch === epoch.before && !cleanReport(readReport(dbisDB, key?.[1], epoch), epoch)) return true;
 	}
 	return false;
 }
@@ -238,13 +240,17 @@ function readEpoch(dbisDB: any): OwnOriginEpoch | undefined {
 	return epoch && typeof epoch.after === 'number' && typeof epoch.before === 'number' ? epoch : undefined;
 }
 
-function readReport(dbisDB: any, peer: string): OwnOriginReport | undefined {
-	return dbisDB?.getSync([REPORT, peer]);
+/** A clean report for the epoch if any pass gave one, else one that met a purge, else the last clean report. */
+function readReport(dbisDB: any, peer: string, epoch: OwnOriginEpoch): OwnOriginReport | undefined {
+	const clean: OwnOriginReport | undefined = dbisDB?.getSync([REPORT, peer]);
+	if (clean?.epoch === epoch.before) return clean;
+	const purged: OwnOriginReport | undefined = dbisDB?.getSync([PURGED, peer]);
+	return purged?.epoch === epoch.before ? purged : clean;
 }
 
 export function recoveryRangeFor(dbisDB: any, peer: string): { startTime: number; endTime: number } | undefined {
 	const epoch = readEpoch(dbisDB);
-	if (!epoch || readReport(dbisDB, peer)?.epoch === epoch.before) return undefined;
+	if (!epoch || readReport(dbisDB, peer, epoch)?.epoch === epoch.before) return undefined;
 	return { startTime: epoch.after, endTime: epoch.before };
 }
 
@@ -270,43 +276,30 @@ function cleanReport(report: OwnOriginReport | undefined, epoch: OwnOriginEpoch)
 }
 
 /**
- * Store `peer`'s report; the caller made the rows it returned durable first. Marks the epoch finished once
- * every required peer and lock home still a member reported cleanly, so the next start does not carry its
- * window forward. A failed read is no answer: it throws, so the peer is asked again.
+ * Store `peer`'s report; the caller made the rows it returned durable first. A clean report is true whenever
+ * written (that pass returned the whole window), so any clean pass proves the peer, whichever lands last.
+ * Marks the epoch finished once every required peer and lock home still a member reported cleanly, so the
+ * next start does not carry its window forward. A failed read is no answer: it throws, so the peer is asked again.
  */
-const reportWrites = new Map<string, Promise<void>>();
-function recordReport(database: string, peer: string, report: OwnOriginReport): Promise<void> {
-	// the clean-report check and its write must not interleave with another settlement for the same peer
-	const key = `${database}\0${peer}`;
-	const written = (reportWrites.get(key) ?? Promise.resolve())
-		.catch(() => {})
-		.then(() => writeReport(database, peer, report));
-	reportWrites.set(key, written);
-	return written.finally(() => {
-		if (reportWrites.get(key) === written) reportWrites.delete(key);
-	});
-}
-
-async function writeReport(database: string, peer: string, report: OwnOriginReport): Promise<void> {
+async function recordReport(database: string, peer: string, report: OwnOriginReport): Promise<void> {
 	if (report.failed) throw new Error(`${peer} could not read this node's writes cleanly`);
 	const dbisDB = dbisFor(database);
 	if (!dbisDB) throw new Error(`no dbis store for ${database}`);
 	const epoch = readEpoch(dbisDB);
 	if (!epoch || epoch.before !== report.epoch) return;
-	// a purge only advances, so the first report of an epoch stands: a later one cannot be cleaner
-	if (readReport(dbisDB, peer)?.epoch === epoch.before) return;
-	await dbisDB.put([REPORT, peer], report);
-	if (purgedIntoWindow(report, epoch))
+	const clean = cleanReport(report, epoch);
+	await dbisDB.put([clean ? REPORT : PURGED, peer], report);
+	if (!clean)
 		logger.warn?.(
 			`Own-origin recovery for ${database}: ${peer} purged this node's writes through ${new Date(report.purgedThrough).toISOString()}, inside the recovery window; writes it lost there cannot be recovered, and cluster locks refuse this node's own lineage until it is recloned`
 		);
-	if (epoch.finished || !cleanReport(report, epoch)) return;
+	if (epoch.finished || !clean) return;
 	const homes = (await existingHomesRow(database))?.active?.homes ?? [];
 	const lineage = lineageFromReports(
 		epoch,
 		homes,
 		getThisNodeName(),
-		(name) => (name === peer ? report : readReport(dbisDB, name)),
+		(name) => (name === peer ? report : readReport(dbisDB, name, epoch)),
 		isMember
 	);
 	if (lineage.state !== 'intact') return;
@@ -314,7 +307,7 @@ async function writeReport(database: string, peer: string, report: OwnOriginRepo
 	logger.info?.(`Own-origin recovery for ${database}: every peer returned this node's writes`);
 }
 
-// the epoch row is fixed once workers run, and a clean report is never replaced within its epoch
+// the epoch row is fixed once workers run, and a clean report stands for its epoch
 export const UNPROVEN_RECHECK_MS = 100;
 const cachedEpochs = new Map<
 	string,
@@ -375,7 +368,7 @@ export function ownLineage(
 		epoch,
 		homes,
 		self,
-		(peer) => (clean.has(peer) ? { epoch: epoch.before } : readReport(dbisFor(database), peer)),
+		(peer) => (clean.has(peer) ? { epoch: epoch.before } : readReport(dbisFor(database), peer, epoch)),
 		(peer) => {
 			if (memberCheck(peer)) return true;
 			skipped.push(peer);
