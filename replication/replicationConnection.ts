@@ -13741,7 +13741,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				generation: directFloorOnlyGeneration,
 			});
 		}
-		// the outstanding request stays matched until this one is sent
 		let requestedOwnOrigin: number | undefined;
 		if (
 			nodeSubscriptions?.length &&

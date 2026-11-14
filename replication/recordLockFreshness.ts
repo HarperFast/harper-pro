@@ -517,7 +517,6 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			try {
 				[positions] = await Promise.all([Promise.all(barrierWaits.map((wait) => wait.promise)), ownWait?.promise]);
 			} catch (error) {
-				// the first refusal decides; the rest would only hold slots until the deadline
 				for (const wait of barrierWaits) wait.cancel();
 				ownWait?.cancel();
 				throw error;
