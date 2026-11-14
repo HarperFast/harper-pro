@@ -17,6 +17,12 @@
  * within a bounded wait. A restarts with its recovery reports held (`HARPER_TEST_HOLD_OWN_ORIGIN_REPORT_DIR`),
  * so the lock first meets a recovery that is not yet confirmed and must refuse, whatever the rows read.
  *
+ * A third node, C, is down for the lost writes, so after the power loss only B holds them. A lock on C needs
+ * a barrier from A, which A refuses until every peer has reported (`executeBarrier` in recordLockRpc.ts): a
+ * barrier written before then could follow a log still missing writes. With every home reachable, C's
+ * refusal can come only from that guard. The held report parks after the returned rows apply, and A forwards
+ * them to C, so C's state is not asserted while the report is held.
+ *
  * Recovery runs only when the OS may have dropped page-cache data, so each start names its boot through
  * `HARPER_TEST_BOOT_ID`: the power loss restarts A on a new boot, and the last tests restart A's process on
  * the same boot, once plainly and once after a recorded transaction-log sync failure.
@@ -49,6 +55,8 @@ const SETTLE_MS = 30_000;
 const FIRST_BOOT = { HARPER_TEST_BOOT_ID: 'power-loss-boot-1' };
 const SECOND_BOOT = { HARPER_TEST_BOOT_ID: 'power-loss-boot-2' };
 const SYNC_FAILURE_MARKER = 'own-origin-recovery-log-sync-failed';
+const BARRIER_REFUSAL = /cannot yet vouch for its own writes/;
+const HOME_RESTART_WAIT = /restarted and cannot grant until the delegations/;
 
 const dataDbDir = (node) => join(node.dataRootDir, 'database', DB);
 const ownLogDir = (node) => join(dataDbDir(node), 'transaction_logs', 'local');
@@ -111,6 +119,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 	let reportHoldDir;
 	let nodeA;
 	let nodeB;
+	let nodeC;
 	let lockKey;
 	let simulated = false;
 	let recovered = false;
@@ -119,19 +128,23 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 
 	before(async () => {
 		if ((process.env.HARPER_STORAGE_ENGINE ?? 'rocksdb') !== 'rocksdb') return;
-		const started = await Promise.allSettled([startNode(ctx.name, FIRST_BOOT), startNode(ctx.name, FIRST_BOOT)]);
+		const started = await Promise.allSettled([
+			startNode(ctx.name, FIRST_BOOT),
+			startNode(ctx.name, FIRST_BOOT),
+			startNode(ctx.name, FIRST_BOOT),
+		]);
 		for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
 		const failed = started.find((result) => result.status === 'rejected');
 		if (failed) throw failed.reason;
-		[nodeA, nodeB] = contexts.map((c) => c.harper);
-		await connectMesh([nodeA, nodeB]);
-		await bootstrapHomeMap([nodeA, nodeB]);
-		await waitForRing([nodeA, nodeB], 2);
+		[nodeA, nodeB, nodeC] = contexts.map((c) => c.harper);
+		await connectMesh([nodeA, nodeB, nodeC]);
+		await bootstrapHomeMap([nodeA, nodeB, nodeC]);
+		await waitForRing([nodeA, nodeB, nodeC], 3);
 
 		// Durable before the baseline: the old version a lost update leaves behind.
 		await upsertConfirmed(nodeA, { id: 'upd', n: 1 });
-		lockKey = await keyHomedOn([nodeA, nodeB], nodeB, nodeA, 'locked');
-		await waitForCounter([nodeA, nodeB], 'upd', 1);
+		lockKey = await keyHomedOn([nodeA, nodeB, nodeC], nodeB, nodeA, 'locked');
+		await waitForCounter([nodeA, nodeB, nodeC], 'upd', 1);
 
 		let previous;
 		await waitForCondition(
@@ -152,6 +165,8 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		assert.ok((await readdir(dataDbDir(nodeA))).includes('LOG'), 'the flush check reads RocksDB info LOG');
 		baseline.flushes = await flushesStarted(nodeA);
 
+		// C misses the writes A is about to lose, so B is their only other holder.
+		await stopNodeProcess(nodeC);
 		await upsertConfirmed(nodeA, { id: 'ins', n: 1 });
 		await upsertConfirmed(nodeA, { id: 'ins', n: 2 });
 		await upsertConfirmed(nodeA, { id: 'upd', n: 2 });
@@ -168,6 +183,26 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			if (dir) await rm(dir, { recursive: true, force: true });
 	});
 
+	/**
+	 * A lock attempt answered by something other than the home's wait for its previous incarnation's
+	 * delegations to expire: B restarted with A, and that wait says nothing about A's recovery.
+	 */
+	async function lockPastHomeRestart(node) {
+		let response;
+		await waitForCondition(
+			async (signal) => {
+				response = await call(node, 'LockedIncrement/', { id: lockKey, timeout: 3_000 }, signal);
+				return !HOME_RESTART_WAIT.test(JSON.stringify(response.body));
+			},
+			{
+				timeoutMs: 60_000,
+				pollMs: 500,
+				description: () => `the home's restart wait to end: ${JSON.stringify(response?.body)}`,
+			}
+		);
+		return response;
+	}
+
 	/** Kill A's process with its page cache intact (the OS stays up) and start it again with reports held. */
 	async function crashAndRestartA(env) {
 		const holdDir = await mkdtemp(join(tmpdir(), 'harper-power-loss-report-hold-'));
@@ -178,7 +213,7 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		if (env.beforeStart) await env.beforeStart();
 		await restartStoppedNode(contexts[0], { ...env.boot, HARPER_TEST_HOLD_OWN_ORIGIN_REPORT_DIR: holdDir });
 		nodeA = contexts[0].harper;
-		await waitForMesh([nodeA, nodeB]);
+		await waitForMesh([nodeA, nodeB, nodeC]);
 		return holdDir;
 	}
 
@@ -227,7 +262,9 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 
 		await restartStoppedNode(contexts[1], FIRST_BOOT);
 		nodeB = contexts[1].harper;
-		await waitForMesh([nodeA, nodeB]);
+		await restartStoppedNode(contexts[2], FIRST_BOOT);
+		nodeC = contexts[2].harper;
+		await waitForMesh([nodeA, nodeB, nodeC]);
 		assert.deepEqual(
 			await readCounters(nodeB, ['ins', 'upd', lockKey]),
 			{ ins: 2, upd: 2, [lockKey]: 1 },
@@ -244,20 +281,27 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			description: `B to return A's writes (A's report parked in ${reportHoldDir})`,
 		});
 		// lockKey is homed on B, whose last grant was to A for the write A lost.
-		const refused = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
+		const refused = await lockPastHomeRestart(nodeA);
 		assert.equal(
 			refused.status,
 			503,
 			`a lock admitted before A's recovery was confirmed: ${JSON.stringify(refused.body)}`
 		);
 		assert.match(JSON.stringify(refused.body), /successor freshness/);
-		// B's lock needs A's lineage through a barrier A writes, which A refuses until its writes are back
-		const refusedFromB = await call(nodeB, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
-		assert.equal(
-			refusedFromB.status,
-			503,
-			`a lock on B was admitted before A's recovery was confirmed: ${JSON.stringify(refusedFromB.body)}`
-		);
+		// C's lock (B, the key's home, is up) and B's own need A's lineage through a barrier A writes, which A
+		// refuses until its writes are back
+		for (const [name, node] of [
+			['C', nodeC],
+			['B', nodeB],
+		]) {
+			const refusedThere = await lockPastHomeRestart(node);
+			assert.equal(
+				refusedThere.status,
+				503,
+				`a lock on ${name} was admitted before A's recovery was confirmed: ${JSON.stringify(refusedThere.body)}`
+			);
+			assert.match(JSON.stringify(refusedThere.body), BARRIER_REFUSAL, `${name}'s refusal came from A's barrier guard`);
+		}
 		await writeFile(join(reportHoldDir, 'release'), '');
 		const onABefore = (await counter(nodeA, lockKey))?.n;
 		t.diagnostic(`A read ${lockKey}=${onABefore} before the lock`);
@@ -269,6 +313,13 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 			2,
 			`the lock on A answered n=${increment.body.n}: admitted without A's lost increment (expected 2); A read ${onABefore} before the lock, B now reads ${onB?.n}`
 		);
+		const onC = await call(nodeC, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
+		assert.equal(onC.status, 200, `the lock on C was refused after A recovered: ${JSON.stringify(onC.body)}`);
+		assert.equal(onC.body.n, 3, `C's first lock after A recovered answered n=${onC.body.n} (expected 3)`);
+		// A takes the key back, so the restart tests below depend on A's own lineage
+		const again = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
+		assert.equal(again.status, 200, `the lock on A was refused after C's: ${JSON.stringify(again.body)}`);
+		assert.equal(again.body.n, 4);
 	});
 
 	test('A recovers its own writes from B', async (t) => {
@@ -296,14 +347,14 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		if (!nodeA) return t.skip('RocksDB only');
 		assert.ok(recovered, 'runs only after A recovered');
 		const holdDir = await crashAndRestartA({ boot: SECOND_BOOT });
-		// lockKey's last grant was A's n=2, minted on this boot: a new epoch would hold it behind the parked report
+		// lockKey's last grant was A's n=4, minted on this boot: a new epoch would hold it behind the parked report
 		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 10_000 });
 		assert.equal(increment.status, 200, `the lock on A waited for a recovery: ${JSON.stringify(increment.body)}`);
-		assert.equal(increment.body.n, 3);
+		assert.equal(increment.body.n, 5);
 		// a sentinel from B proves the subscription exchange that would carry a recovery range has run
 		await putCounter(nodeB, 'sentinel-after-crash', 1);
 		await waitForCounter([nodeA], 'sentinel-after-crash', 1);
-		await waitForCounter([nodeB], lockKey, 3);
+		await waitForCounter([nodeB], lockKey, 5);
 		assert.equal(existsSync(join(holdDir, 'held')), false, 'A asked a peer for its own writes after a process restart');
 	});
 
@@ -329,6 +380,6 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		await writeFile(join(holdDir, 'release'), '');
 		const increment = await call(nodeA, 'LockedIncrement/', { id: lockKey, timeout: 30_000 });
 		assert.equal(increment.status, 200, `the lock on A was refused: ${JSON.stringify(increment.body)}`);
-		assert.equal(increment.body.n, 4);
+		assert.equal(increment.body.n, 6);
 	});
 });
