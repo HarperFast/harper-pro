@@ -308,7 +308,8 @@ async function recordReport(database: string, peer: string, report: OwnOriginRep
 }
 
 // the epoch row is fixed once workers run, and a clean report stands for its epoch
-export const UNPROVEN_RECHECK_MS = 100;
+// half the waiters' poll, so a poll never reads an entry made just before the previous one
+export const UNPROVEN_RECHECK_MS = 50;
 const cachedEpochs = new Map<
 	string,
 	{
@@ -353,16 +354,16 @@ export function ownLineage(
 		cachedEpochs.set(database, cached);
 	}
 	const { epoch, clean } = cached;
-	if ((position !== null && position >= epoch.before) || cached.provenFor === homes) return { state: 'intact' };
+	if ((position !== null && position >= epoch.before) || sameHomes(cached.provenFor, homes)) return { state: 'intact' };
 	if (table !== undefined && getDatabases()[database]?.[table]?.residency) return { state: 'intact' };
 	const skipping = cached.provenSkipping;
-	if (skipping?.homes === homes) {
+	if (skipping && sameHomes(skipping.homes, homes)) {
 		if (!skipping.skipped.some(memberCheck)) return { state: 'intact' };
 		cached.provenSkipping = undefined;
 	}
 	const now = performance.now();
 	const unproven = cached.unproven;
-	if (unproven && unproven.homes === homes && unproven.until > now) return unproven.lineage;
+	if (unproven && unproven.until > now && sameHomes(unproven.homes, homes)) return unproven.lineage;
 	const skipped: string[] = [];
 	const lineage = lineageFromReports(
 		epoch,
@@ -376,11 +377,18 @@ export function ownLineage(
 		},
 		(peer) => clean.add(peer)
 	);
-	// a home map's array is replaced, never mutated, when it changes
 	if (lineage.state !== 'intact') cached.unproven = { homes, lineage, until: now + UNPROVEN_RECHECK_MS };
 	else if (skipped.length > 0) cached.provenSkipping = { homes, skipped };
 	else cached.provenFor = homes;
 	return lineage;
+}
+
+// a home map's array is replaced, never mutated, so identity is the usual match
+function sameHomes(cached: readonly string[] | undefined, homes: readonly string[]): boolean {
+	if (cached === homes) return true;
+	if (cached?.length !== homes.length) return false;
+	for (let i = 0; i < homes.length; i++) if (cached[i] !== homes[i]) return false;
+	return true;
 }
 
 export function lineageFromReports(

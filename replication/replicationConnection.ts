@@ -11148,8 +11148,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														liveDeclaration(recordTable, recordTable?.tableName),
 														auditRecord.type
 													)
-												)
+												) {
+													await yieldSendLoop();
 													continue;
+												}
 												await sendAuditRecord(auditRecord, auditRecord.txnLogKey);
 											}
 											if (closed || wsClosed) return;

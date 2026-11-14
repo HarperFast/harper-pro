@@ -397,7 +397,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	const pollOwnLineage = () => {
 		ownPoll = undefined;
 		// every waiting position is below the epoch's start, where own lineage does not depend on it
-		const evaluated = new Map<readonly string[], Map<string, Error | boolean>>();
+		const evaluated = new Map<readonly string[], Map<string, boolean>>();
 		for (const waiter of ownWaiters) {
 			// read per waiter: an earlier evaluation in this poll can outlast a later waiter's deadline
 			if (deps.monotonicNow() >= waiter.deadlineMono) {
@@ -414,16 +414,17 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			let byKey = evaluated.get(waiter.homes);
 			if (!byKey) evaluated.set(waiter.homes, (byKey = new Map()));
 			const key = waiter.table;
-			let outcome = byKey.get(key);
+			let outcome: boolean | Error | undefined = byKey.get(key);
 			if (outcome === undefined) {
 				try {
 					outcome = checkOwnLineage(waiter.position, waiter.homes, waiter.table);
 					// a returned write that failed to apply records its hole before its peer's report can land
 					if (outcome) refuseOwnPoison(waiter.table);
+					byKey.set(key, outcome as boolean);
 				} catch (error) {
+					// not shared: each refused waiter is counted in the rejection stats
 					outcome = error as Error;
 				}
-				byKey.set(key, outcome);
 			}
 			if (outcome instanceof Error) settleOwn(waiter, outcome);
 			else if (outcome) settleOwn(waiter);
