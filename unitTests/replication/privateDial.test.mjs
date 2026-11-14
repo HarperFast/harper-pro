@@ -112,17 +112,22 @@ describe('NodeReplicationConnection private dial', () => {
 		const connections = [];
 		const servers = [];
 		afterEach(async () => {
+			const pathKeys = new Set();
 			for (const connection of connections.splice(0)) {
 				connection.intentionallyUnsubscribed = true;
+				if (connection.dial?.pathKey) pathKeys.add(connection.dial.pathKey);
 				privatePaths.forget(connection.dial?.pathKey, connection);
 				connection.socket?.terminate();
 			}
+			// forget only drops the waiter; this drops the outage and its probe timer. Once every waiter is
+			// forgotten, identified() has no one left to schedule a promotion for.
+			for (const pathKey of pathKeys) privatePaths.identified(pathKey);
 			for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
 		});
 
-		// The real chooseDial only takes wss: private URLs. Each connection gets its own peer name because
-		// privatePaths keeps a path's outage after its test ends, and on Linux a later test's server can be
-		// handed a port an earlier test already marked down, making it dial the public URL instead.
+		// The real chooseDial only takes wss: private URLs. Each connection gets its own peer name so an
+		// outage from an earlier test can never apply to a later one: the OS can hand a later test's server a
+		// port an earlier test marked down, and a matching outage makes the dial go to the public URL instead.
 		let peers = 0;
 		function connectionVia(privateUrl, publicUrl) {
 			const peer = `fallback-peer-${++peers}`;
