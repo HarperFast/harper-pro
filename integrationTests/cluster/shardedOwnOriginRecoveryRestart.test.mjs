@@ -4,7 +4,7 @@
 // names its boot (`HARPER_TEST_BOOT_ID`), so the restart always opens a recovery epoch.
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
-import { appendFile, cp, mkdtemp, writeFile } from 'node:fs/promises';
+import { appendFile, cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
@@ -88,7 +88,13 @@ export class OwnRows extends Resource {
 }
 `
 			);
-			await startHarper(context, startOptions(hostname, shard, 'sharded-restart-boot-1'));
+			try {
+				await startHarper(context, startOptions(hostname, shard, 'sharded-restart-boot-1'));
+			} catch (error) {
+				// after() tears down only the nodes that started
+				await rm(dataRootDir, { recursive: true, force: true });
+				throw error;
+			}
 			contexts.push({ context, shard });
 			nodes.push(context.harper);
 		}
