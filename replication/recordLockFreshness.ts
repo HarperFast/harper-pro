@@ -458,7 +458,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		return {
 			promise,
 			cancel() {
-				ownWaiters.delete(waiter);
+				settleOwn(waiter, unavailable(`a sibling wait refused this record lock on ${database}`));
 			},
 		};
 	};

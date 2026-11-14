@@ -9468,6 +9468,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let liveStartByLog: Map<string, number> | undefined;
 						const frame = new FrameWriter();
 						const settleOwnOriginRange = (recovery: OwnOriginRecoveryRange, range: any) => {
+							if (closed || wsClosed) return;
 							const purgeBound = getLogPurgeBounds(auditStore, recovery.name)?.get(recovery.name);
 							const failed = ownOriginRangeCut || range?.failedLogs?.size > 0 || range?.corruptFrameStop?.breaks > 0;
 							ws.send(
