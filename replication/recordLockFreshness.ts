@@ -524,20 +524,17 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			}
 			if (waits.size + ownWaiters.size + origins.length + (ownIntact ? 0 : 1) > MAX_OUTSTANDING_BARRIERS)
 				reject('capacity', `too many record lock barriers are outstanding for ${database}`);
+			const barrierWaits: Array<[Outstanding, Waiter]> = [];
+			const barriers = Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono, barrierWaits)));
+			const ownWait = ownIntact ? undefined : awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono);
 			let positions: number[];
-			if (ownIntact) positions = await Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono)));
-			else {
-				const barrierWaits: Array<[Outstanding, Waiter]> = [];
-				const barriers = Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono, barrierWaits)));
-				const ownWait = awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono);
-				try {
-					[positions] = await Promise.all([barriers, ownWait.promise]);
-				} catch (error) {
-					// the first refusal decides; the rest would hold slots until the deadline
-					for (const wait of barrierWaits) cancelBarrierWait(wait);
-					ownWait.cancel();
-					throw error;
-				}
+			try {
+				positions = ownWait ? (await Promise.all([barriers, ownWait.promise]))[0] : await barriers;
+			} catch (error) {
+				// the first refusal decides; the rest would hold slots until the deadline
+				for (const wait of barrierWaits) cancelBarrierWait(wait);
+				ownWait?.cancel();
+				throw error;
 			}
 			if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
 			if (dependencies === null) return origins.map((origin, index) => [origin, positions[index]] as const);

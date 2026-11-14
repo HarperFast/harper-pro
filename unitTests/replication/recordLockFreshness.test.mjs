@@ -852,6 +852,21 @@ describe('createFreshnessBarrier: own lineage after a restart (harper-pro#1364)'
 		h.advance(OWN_LINEAGE_POLL_MS * 3);
 		assert.strictEqual(asked.length, before, 'the cancelled wait is no longer polled');
 	});
+	it('a refused member barrier cancels the other member waits of the same handoff', async () => {
+		const h = harness();
+		const wait = h.barrier.establish(
+			't',
+			[
+				['a', 5],
+				['b', 5],
+			],
+			5_000
+		);
+		assert.strictEqual(h.barrier.stats().outstanding, 2);
+		h.requests[0].resolve(-1);
+		assert.match((await rejection(wait)).message, /without a usable position/);
+		assert.strictEqual(h.barrier.stats().outstanding, 0);
+	});
 	it('close settles own-lineage waits at once and stops the poll', async () => {
 		const { h } = lineageHarness(pending);
 		const wait = h.barrier.establish('t', [['self', 5]], 5_000);

@@ -9484,8 +9484,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									])
 								);
 							} catch (error) {
-								// the receiver asks again on its next subscription
+								// the receiver asks again on its next connection
 								logger.warn?.(connectionId, 'could not report returned own-origin writes to', remoteNodeName, error);
+								close(1011, 'Could not report returned own-origin writes');
 								return;
 							}
 							logger.debug?.(connectionId, 'returned own-origin writes to', remoteNodeName, databaseName, { failed });
