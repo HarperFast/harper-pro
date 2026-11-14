@@ -240,7 +240,6 @@ function readEpoch(dbisDB: any): OwnOriginEpoch | undefined {
 	return epoch && typeof epoch.after === 'number' && typeof epoch.before === 'number' ? epoch : undefined;
 }
 
-/** A clean report for the epoch if any pass gave one, else one that met a purge, else the last clean report. */
 function readReport(dbisDB: any, peer: string, epoch: OwnOriginEpoch): OwnOriginReport | undefined {
 	const clean: OwnOriginReport | undefined = dbisDB?.getSync([REPORT, peer]);
 	if (clean?.epoch === epoch.before) return clean;
@@ -289,7 +288,7 @@ async function recordReport(database: string, peer: string, report: OwnOriginRep
 	if (!epoch || epoch.before !== report.epoch) return;
 	const clean = cleanReport(report, epoch);
 	await dbisDB.put([clean ? REPORT : PURGED, peer], report);
-	if (!clean)
+	if (!clean && !cleanReport(readReport(dbisDB, peer, epoch), epoch))
 		logger.warn?.(
 			`Own-origin recovery for ${database}: ${peer} purged this node's writes through ${new Date(report.purgedThrough).toISOString()}, inside the recovery window; writes it lost there cannot be recovered, and cluster locks refuse this node's own lineage until it is recloned`
 		);

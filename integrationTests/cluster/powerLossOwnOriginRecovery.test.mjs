@@ -20,8 +20,8 @@
  * A third node, C, is down for the lost writes, so after the power loss only B holds them. A lock on C needs
  * a barrier from A, which A refuses until every peer has reported (`executeBarrier` in recordLockRpc.ts): a
  * barrier written before then could follow a log still missing writes. With every home reachable, C's
- * refusal can come only from that guard, so the test fails with it removed. The held report parks after the
- * returned rows apply, and A forwards them to C, so C's state is not asserted while the report is held.
+ * refusal can come only from that guard. The held report parks after the returned rows apply, and A forwards
+ * them to C, so C's state is not asserted while the report is held.
  *
  * Recovery runs only when the OS may have dropped page-cache data, so each start names its boot through
  * `HARPER_TEST_BOOT_ID`: the power loss restarts A on a new boot, and the last tests restart A's process on
@@ -190,8 +190,8 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 	async function lockPastHomeRestart(node) {
 		let response;
 		await waitForCondition(
-			async () => {
-				response = await call(node, 'LockedIncrement/', { id: lockKey, timeout: 3_000 });
+			async (signal) => {
+				response = await call(node, 'LockedIncrement/', { id: lockKey, timeout: 3_000 }, signal);
 				return !HOME_RESTART_WAIT.test(JSON.stringify(response.body));
 			},
 			{

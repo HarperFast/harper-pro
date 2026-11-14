@@ -195,9 +195,14 @@ describe('returnedByOwnOriginRecovery', () => {
 
 describe('ownOriginRecovery capability', () => {
 	it('is advertised only with per-origin logs and resolved from the peer bag', () => {
-		assert.strictEqual(buildLocalCapabilities(1000, false, true).ownOriginRecovery, 1);
+		assert.strictEqual(buildLocalCapabilities(1000, false, true).ownOriginRecovery, 2);
 		assert.strictEqual(buildLocalCapabilities(1000, false, false).ownOriginRecovery, 0);
-		assert.strictEqual(peerSupportsOwnOriginRecovery(resolvePeerCapabilities({ ownOriginRecovery: 1 })), true);
+		assert.strictEqual(peerSupportsOwnOriginRecovery(resolvePeerCapabilities({ ownOriginRecovery: 2 })), true);
+		assert.strictEqual(
+			peerSupportsOwnOriginRecovery(resolvePeerCapabilities({ ownOriginRecovery: 1 })),
+			false,
+			'level 1 sends no request id in its report'
+		);
 		assert.strictEqual(peerSupportsOwnOriginRecovery(resolvePeerCapabilities({})), false);
 	});
 });

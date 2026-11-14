@@ -311,8 +311,16 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		send(entry);
 	};
 
-	/** Resolves to the barrier's position once the origin's entry has committed on this node. */
-	const awaitBarrier = (origin: string, table: string, deadlineMono: number): Cancellable<number> => {
+	/**
+	 * Resolves to the barrier's position once the origin's entry has committed on this node. `waiting` collects
+	 * the wait, for a caller that may cancel it.
+	 */
+	const awaitBarrier = (
+		origin: string,
+		table: string,
+		deadlineMono: number,
+		waiting?: Array<[Outstanding, Waiter]>
+	): Promise<number> => {
 		const entry: Outstanding = {
 			nonce: nonce(),
 			origin,
@@ -327,7 +335,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 		// Registered before the request leaves, so the applied entry cannot arrive unmatched.
 		waits.add(entry);
 		attempts.set(entry.nonce, entry);
-		let waiter: Waiter;
+		let waiter!: Waiter;
 		const promise = new Promise<number>((resolve, rejectWait) => {
 			let settled = false;
 			waiter = {
@@ -341,17 +349,17 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			};
 			entry.waiters.push(waiter);
 		});
+		waiting?.push([entry, waiter]);
 		armSweep();
 		send(entry);
-		return {
-			promise,
-			cancel() {
-				const index = entry.waiters.indexOf(waiter);
-				if (index < 0) return;
-				entry.waiters.splice(index, 1);
-				if (entry.waiters.length === 0) settleEntry(entry);
-			},
-		};
+		return promise;
+	};
+
+	const cancelBarrierWait = ([entry, waiter]: [Outstanding, Waiter]) => {
+		const index = entry.waiters.indexOf(waiter);
+		if (index < 0) return;
+		entry.waiters.splice(index, 1);
+		if (entry.waiters.length === 0) settleEntry(entry);
 	};
 
 	const checkOrigin = (origin: string, table: string, homeMap: LockHomeMap) => {
@@ -509,15 +517,20 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			}
 			if (waits.size + ownWaiters.size + origins.length + (ownIntact ? 0 : 1) > MAX_OUTSTANDING_BARRIERS)
 				reject('capacity', `too many record lock barriers are outstanding for ${database}`);
-			const barrierWaits = origins.map((origin) => awaitBarrier(origin, table, deadlineMono));
-			const ownWait = ownIntact ? undefined : awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono);
 			let positions: number[];
-			try {
-				[positions] = await Promise.all([Promise.all(barrierWaits.map((wait) => wait.promise)), ownWait?.promise]);
-			} catch (error) {
-				for (const wait of barrierWaits) wait.cancel();
-				ownWait?.cancel();
-				throw error;
+			if (ownIntact) positions = await Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono)));
+			else {
+				const barrierWaits: Array<[Outstanding, Waiter]> = [];
+				const barriers = Promise.all(origins.map((origin) => awaitBarrier(origin, table, deadlineMono, barrierWaits)));
+				const ownWait = awaitOwnLineage(table, ownPosition, homeMap.homes, deadlineMono);
+				try {
+					[positions] = await Promise.all([barriers, ownWait.promise]);
+				} catch (error) {
+					// the first refusal decides; the rest would hold slots until the deadline
+					for (const wait of barrierWaits) cancelBarrierWait(wait);
+					ownWait.cancel();
+					throw error;
+				}
 			}
 			if (closed) throw unavailable(`record lock freshness for ${database} is closed`);
 			if (dependencies === null) return origins.map((origin, index) => [origin, positions[index]] as const);
