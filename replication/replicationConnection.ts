@@ -13833,9 +13833,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				lastSentExcludedNodes = excluded ? [...excluded] : [];
 				if (requestedOwnOrigin !== undefined) {
 					lastSentExcludedNodes.push(getThisNodeName());
-					// without request ids an earlier request's report can still match, so it keeps that request's start
-					if (requestId !== undefined || ownOriginRecoveryRequested === undefined)
-						ownOriginPass = { skipsBefore: ownOriginFrameSkips };
+					ownOriginPass = { skipsBefore: ownOriginFrameSkips };
 					clearTimeout(ownOriginRetryTimer);
 					ownOriginRetryTimer = undefined;
 				}
