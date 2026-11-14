@@ -18,21 +18,25 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { getDatabases } from '../core/resources/databases.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
-import { getLogPurgeBounds } from '../core/resources/auditStore.ts';
+import { getLogPurgeBounds, readOriginClosedFloor } from '../core/resources/auditStore.ts';
+import { isValidFloor, ORIGIN_FLOOR_TICK_MS } from '../core/resources/originClosedFloor.ts';
+import { isReadOnlyMode } from '../core/resources/readOnlyMode.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, probeNodeRow } from './knownNodes.ts';
 import { existingRow as existingHomesRow } from './recordLockHomes.ts';
-import { findLastCommittedLogKey, ORIGIN_CURSOR_OVERLAP_MS } from './replicationConnection.ts';
+import { cursorBelowFloor, findLastCommittedLogKey, ORIGIN_CURSOR_OVERLAP_MS } from './replicationConnection.ts';
 
 const EPOCH = Symbol.for('ownOriginRecovery');
 // Databases whose epoch could not be opened, set on the main thread before workers start, which copy the env.
 const FAILED_ENV = 'HARPER_OWN_ORIGIN_RECOVERY_FAILED';
 const failedDatabases = new Set((process.env[FAILED_ENV] ?? '').split('\n').filter(Boolean));
 const REPORT = Symbol.for('ownOriginRecovered');
+const DURABLE_FLOOR = Symbol.for('ownOriginDurableFloor');
+const LOG_VOUCH = Symbol.for('ownOriginLogVouch');
 const MIN_START = 1;
 
 export interface OwnOriginEpoch {
-	/** Where peers start returning own writes: the log's last key less the commit-order overlap, or 1. */
+	/** Where peers start returning own writes (exclusive): see `recoveryStart`. */
 	after: number;
 	/** The highest own key the log held (or had purged through) when the epoch opened; 0 if none. */
 	lastKey: number;
@@ -88,18 +92,26 @@ function dbisFor(database: string): any {
 }
 
 /**
- * The start of the window. The log is appended in commit order, not key order, so an entry lost after the
- * last durable one can carry a lower key; this takes the same overlap ordinary resume does
- * (`ORIGIN_CURSOR_OVERLAP_MS`), which is not a proven bound. An empty or unreadable log starts at 1. An
- * unfinished earlier epoch keeps its start, since its window may still hold writes no peer has returned.
+ * The start of the window (exclusive). The log is appended in commit order, not key order, so an entry lost
+ * after the last durable one can carry a lower key. Below a durable floor (`advanceDurableFloor`) nothing can
+ * have been lost; it is a reservation's bound, so the start is just below it. Without one (an upgrade's first
+ * start, a new database, no flush since a floor was sampled) the start is the overlap ordinary resume takes
+ * (`ORIGIN_CURSOR_OVERLAP_MS`), which is not a proven bound. The start is never above that overlap, so a floor
+ * can widen the window but not narrow it. An empty or unreadable log starts at 1. An unfinished earlier epoch
+ * keeps its start, since its window may still hold writes no peer has returned.
  */
 export function recoveryStart(
 	lastKey: number | undefined,
 	purgeBound: number | undefined,
-	previous: OwnOriginEpoch | undefined
+	previous: OwnOriginEpoch | undefined,
+	durableFloor?: number
 ): number {
 	const known = Math.max(lastKey ?? 0, purgeBound ?? 0);
-	let after = known > 0 ? Math.max(MIN_START, known - ORIGIN_CURSOR_OVERLAP_MS) : MIN_START;
+	let after = MIN_START;
+	if (known > 0) {
+		after = Math.max(MIN_START, known - ORIGIN_CURSOR_OVERLAP_MS);
+		if (isValidFloor(durableFloor)) after = Math.max(MIN_START, Math.min(after, cursorBelowFloor(durableFloor)));
+	}
 	if (previous && !previous.finished && previous.after < after) after = Math.max(MIN_START, previous.after);
 	return after;
 }
@@ -109,7 +121,8 @@ export function nextEpoch(
 	purgeBound: number | undefined,
 	previous: OwnOriginEpoch | undefined,
 	before: number,
-	requiredPeers: string[]
+	requiredPeers: string[],
+	durableFloor?: number
 ): OwnOriginEpoch {
 	let held = Math.max(lastKey ?? 0, purgeBound ?? 0);
 	// an unfinished window is judged against what the log held when it opened, not what it holds since, and
@@ -118,7 +131,7 @@ export function nextEpoch(
 		held = Math.min(held, previous.lastKey);
 		requiredPeers = [...new Set([...previous.requiredPeers, ...requiredPeers])];
 	}
-	return { after: recoveryStart(lastKey, purgeBound, previous), lastKey: held, before, requiredPeers };
+	return { after: recoveryStart(lastKey, purgeBound, previous, durableFloor), lastKey: held, before, requiredPeers };
 }
 
 function peersWithCursors(dbisDB: any, auditStore: any): string[] {
@@ -161,6 +174,8 @@ export function openOwnOriginRecoveryEpoch(
 	if (!dbisDB || typeof rootStore?.getMonotonicTimestamp !== 'function' || typeof rootStore.syncWal !== 'function')
 		throw new Error(`${database} has per-origin logs but no store to record a recovery epoch in`);
 	const previous = readEpoch(dbisDB);
+	// decided once per process, before workers append: a reload's view of the log includes this process's writes
+	if (!vouchedDatabases.has(database)) recordLogVouch(database, dbisDB, previous, continuity, logStats(auditStore));
 	let lastKey: number | undefined;
 	let purgeBound: number | undefined;
 	let logRead = true;
@@ -188,7 +203,7 @@ export function openOwnOriginRecoveryEpoch(
 	const requiredPeers = [...new Set([...peersWithCursors(dbisDB, auditStore), ...recipients()])];
 	// an unread log counts as empty: the widest window, judged against holding nothing
 	const epoch = logRead
-		? nextEpoch(lastKey, purgeBound, previous, before, requiredPeers)
+		? nextEpoch(lastKey, purgeBound, previous, before, requiredPeers, readDurableFloor(dbisDB))
 		: nextEpoch(undefined, undefined, previous, before, requiredPeers);
 	if (continuity.bootId !== undefined) epoch.bootId = continuity.bootId;
 	dbisDB.putSync(EPOCH, epoch);
@@ -360,6 +375,240 @@ export function lineageFromReports(
 		return { state: 'unprovable', detail: `${peer} had purged this node's writes in the recovery window` };
 	}
 	return { state: 'intact' };
+}
+
+export interface LogPosition {
+	sequence: number;
+	offset: number;
+}
+
+interface LogStats {
+	nextLogPosition?: unknown;
+	lastFlushedPosition?: unknown;
+}
+
+function isLogPosition(value: any): value is LogPosition {
+	return (
+		Number.isSafeInteger(value?.sequence) &&
+		value.sequence >= 0 &&
+		Number.isSafeInteger(value.offset) &&
+		value.offset >= 0
+	);
+}
+
+function compareLogPositions(a: LogPosition, b: LogPosition): number {
+	return a.sequence - b.sequence || a.offset - b.offset;
+}
+
+export interface DurableFloorState {
+	/** `(floor, position)` pairs in sampling order, so ascending in both. */
+	samples: Array<{ floor: number; position: LogPosition }>;
+	bound: number;
+	persisted: number;
+	persisting?: boolean;
+	sampledAt?: LogPosition;
+}
+
+const MAX_FLOOR_SAMPLES = 64;
+
+/**
+ * One sampling step: `floor` is a persisted origin-closed floor read before `stats`. Every key below a persisted
+ * floor was released, so its commit, and with it its append, had finished; `stats.nextLogPosition` is therefore
+ * past every such entry. rocksdb-js syncs every open log segment when a memtable flush begins, before it moves
+ * `lastFlushedPosition` past what that flush covers, so once `lastFlushedPosition` reaches a sample's position
+ * that sample's floor is durable: no own write keyed below it can be lost. Returns the bound when it rose.
+ */
+export function advanceDurableFloor(state: DurableFloorState, floor: number, stats: LogStats): number | undefined {
+	const next = stats?.nextLogPosition;
+	const flushed = stats?.lastFlushedPosition;
+	if (!isLogPosition(next) || !isLogPosition(flushed)) return;
+	let samples = state.samples;
+	if (isValidFloor(floor) && floor > state.bound && floor > (samples.at(-1)?.floor ?? 0)) {
+		const last = samples.at(-1);
+		// a higher floor over an unchanged log raises its pending sample; once covered, it would only rewrite the row
+		if (state.sampledAt && compareLogPositions(next, state.sampledAt) === 0) {
+			if (last && compareLogPositions(last.position, next) === 0) last.floor = floor;
+		} else {
+			// thinned rather than shifted: the oldest samples are the first a flush covers
+			if (samples.length >= MAX_FLOOR_SAMPLES) samples = state.samples = samples.filter((_, index) => index % 2 === 0);
+			samples.push({ floor, position: next });
+			state.sampledAt = next;
+		}
+	}
+	let covered = 0;
+	while (covered < samples.length && compareLogPositions(samples[covered].position, flushed) <= 0) covered++;
+	if (covered === 0) return;
+	const proven = samples[covered - 1].floor;
+	samples.splice(0, covered);
+	if (proven <= state.bound) return;
+	state.bound = proven;
+	return proven;
+}
+
+export interface LogVouch {
+	bootId?: string;
+	vouched: boolean;
+	/** A sync failure was recorded on this boot: a page that failed writeback can be marked clean and never written. */
+	syncFailure?: boolean;
+}
+
+/**
+ * Whether this process can advance a durable floor over the log earlier processes left. rocksdb-js syncs only the
+ * segments it holds open, so bytes an earlier process on this boot left unsynced in a segment no later process
+ * reopens stay unsynced while `lastFlushedPosition` passes them. After a reboot whatever survived is on disk. On
+ * the same boot, a start that could not vouch taints every later start until a reboot; otherwise a log whose
+ * flushed position is already in the segment it appends to (or that has only its first segment) has no such bytes
+ * elsewhere. A sync failure on this boot vouches for nothing, whatever the segment.
+ */
+export function vouchesForEarlierLog(
+	recorded: LogVouch | undefined,
+	continuity: StartContinuity,
+	stats: LogStats | undefined
+): boolean {
+	if (recorded?.bootId !== undefined && continuity.bootId !== undefined && recorded.bootId !== continuity.bootId)
+		return true;
+	if (continuity.syncFailure || recorded?.syncFailure) return false;
+	const flushed = stats?.lastFlushedPosition;
+	const next = stats?.nextLogPosition;
+	if (!isLogPosition(flushed) || !isLogPosition(next)) return false;
+	// segments start at 1: a log still in its first has no closed segment
+	if (next.sequence <= 1) return true;
+	return recorded?.vouched !== false && flushed.sequence === next.sequence;
+}
+
+// Before any row exists, the previous epoch's boot is the last start known. A verdict that could not be recorded is
+// retried by the sampler: until it lands, the older row speaks for this start.
+function recordLogVouch(
+	database: string,
+	dbisDB: any,
+	previous: OwnOriginEpoch | undefined,
+	continuity: StartContinuity,
+	stats: LogStats | undefined
+): void {
+	let vouched = false;
+	// an unreadable row may have carried a failure: keep the refusal sticky
+	let syncFailure = true;
+	try {
+		const row = dbisDB.getSync(LOG_VOUCH);
+		const recorded: LogVouch | undefined =
+			typeof row?.vouched === 'boolean'
+				? row
+				: previous?.bootId
+					? { bootId: previous.bootId, vouched: true }
+					: undefined;
+		vouched = vouchesForEarlierLog(recorded, continuity, stats);
+		const rebooted =
+			recorded?.bootId !== undefined && continuity.bootId !== undefined && recorded.bootId !== continuity.bootId;
+		syncFailure = !rebooted && (continuity.syncFailure || recorded?.syncFailure === true);
+	} catch (error) {
+		logger.warn?.(`Own-origin recovery: could not read ${database}'s log vouch`, error);
+	}
+	vouchedDatabases.set(database, vouched);
+	const row: LogVouch = { vouched };
+	if (continuity.bootId !== undefined) row.bootId = continuity.bootId;
+	if (syncFailure) row.syncFailure = true;
+	if (!writeLogVouch(database, dbisDB, row)) unrecordedVouches.set(database, row);
+}
+
+function writeLogVouch(database: string, dbisDB: any, row: LogVouch): boolean {
+	try {
+		dbisDB.putSync(LOG_VOUCH, row);
+		return true;
+	} catch (error) {
+		warnThrottled(`Own-origin recovery: could not record ${database}'s log vouch`, error);
+		return false;
+	}
+}
+
+function logStats(auditStore: any): LogStats | undefined {
+	try {
+		return auditStore?.log?.getStats?.();
+	} catch (error) {
+		logger.warn?.(`Own-origin recovery: could not read the positions of ${auditStore?.rootStore?.path}'s log`, error);
+	}
+}
+
+function readDurableFloor(dbisDB: any): number | undefined {
+	try {
+		const floor = dbisDB?.getSync(DURABLE_FLOOR);
+		return isValidFloor(floor) ? floor : undefined;
+	} catch (error) {
+		logger.warn?.('Own-origin recovery: could not read the durable floor; using the overlap', error);
+	}
+}
+
+const vouchedDatabases = new Map<string, boolean>();
+const unrecordedVouches = new Map<string, LogVouch>();
+const floorStates = new WeakMap<object, DurableFloorState>();
+let samplerTimer: ReturnType<typeof setInterval> | undefined;
+let samplerErrorLoggedAt = -Infinity;
+
+function warnThrottled(message: string, error: unknown): void {
+	if (performance.now() - samplerErrorLoggedAt < 60_000) return;
+	samplerErrorLoggedAt = performance.now();
+	logger.warn?.(message, error);
+}
+
+export function startDurableFloorSampler(): void {
+	if (samplerTimer || isReadOnlyMode()) return;
+	samplerTimer = setInterval(sampleDurableFloors, ORIGIN_FLOOR_TICK_MS);
+	samplerTimer.unref?.();
+}
+
+export function sampleDurableFloors(): void {
+	for (const [database, row] of unrecordedVouches) {
+		const dbisDB = dbisFor(database);
+		if (dbisDB && writeLogVouch(database, dbisDB, row)) unrecordedVouches.delete(database);
+	}
+	for (const [database, vouched] of vouchedDatabases) {
+		if (!vouched) continue;
+		try {
+			sampleDurableFloor(database);
+		} catch (error) {
+			warnThrottled(`Own-origin recovery: could not sample ${database}'s durable floor`, error);
+		}
+	}
+}
+
+function sampleDurableFloor(database: string): void {
+	let auditStore: any;
+	const tables = getDatabases()[database];
+	for (const tableName in tables) {
+		auditStore = tables[tableName]?.auditStore;
+		if (auditStore) break;
+	}
+	const rootStore = auditStore?.rootStore;
+	const dbisDB = dbisFor(database);
+	if (
+		auditStore?.reusableIterable !== true ||
+		!auditStore.log ||
+		!dbisDB ||
+		!rootStore ||
+		rootStore.status === 'closed'
+	)
+		return;
+	let state = floorStates.get(rootStore);
+	if (!state) {
+		const bound = readDurableFloor(dbisDB) ?? 0;
+		floorStates.set(rootStore, (state = { samples: [], bound, persisted: bound }));
+	}
+	advanceDurableFloor(state, readOriginClosedFloor(auditStore), auditStore.log.getStats());
+	if (state.bound <= state.persisted || state.persisting) return;
+	// no sync of its own: the floor tick's syncWal makes it durable, and a lost put only leaves an older, true floor
+	const floor = state.bound;
+	const persisting = state;
+	persisting.persisting = true;
+	Promise.resolve()
+		.then(() => dbisDB.put(DURABLE_FLOOR, floor))
+		.then(() => {
+			if (floor > persisting.persisted) persisting.persisted = floor;
+		})
+		.catch((error: unknown) =>
+			warnThrottled(`Own-origin recovery: could not record ${database}'s durable floor`, error)
+		)
+		.finally(() => {
+			persisting.persisting = false;
+		});
 }
 
 const FLUSH_TIMEOUT_MS = 60_000;
