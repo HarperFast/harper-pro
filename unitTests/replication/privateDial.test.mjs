@@ -111,20 +111,45 @@ describe('NodeReplicationConnection private dial', () => {
 	describe('connect', () => {
 		const connections = [];
 		const servers = [];
+		// every outage a test starts, including those from sockets that never set connection.dial
+		const outageKeys = new Set();
+		let failed;
+		before(() => {
+			failed = privatePaths.failed;
+			privatePaths.failed = function (pathKey, ...rest) {
+				outageKeys.add(pathKey);
+				return failed.call(this, pathKey, ...rest);
+			};
+		});
+		after(() => {
+			if (failed) privatePaths.failed = failed;
+		});
 		afterEach(async () => {
-			for (const connection of connections.splice(0)) {
+			const ended = connections.splice(0);
+			for (const connection of ended) {
 				connection.intentionallyUnsubscribed = true;
 				privatePaths.forget(connection.dial?.pathKey, connection);
 				connection.socket?.terminate();
 			}
+			// forget only drops a waiter; identified() drops the outage and its probe timer, and with every
+			// waiter forgotten first it has no one left to schedule a promotion for
+			for (const pathKey of outageKeys) {
+				for (const connection of ended) privatePaths.forget(pathKey, connection);
+				privatePaths.identified(pathKey);
+			}
+			outageKeys.clear();
 			for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
 		});
 
-		// the real chooseDial only takes wss: private URLs
+		// The real chooseDial only takes wss: private URLs. Each connection gets its own peer name so an
+		// outage from an earlier test can never apply to a later one: the OS can hand a later test's server a
+		// port an earlier test marked down, and a matching outage makes the dial go to the public URL instead.
+		let peers = 0;
 		function connectionVia(privateUrl, publicUrl) {
-			const connection = new NodeReplicationConnection(publicUrl, null, 'data', 'fallback-peer');
+			const peer = `fallback-peer-${++peers}`;
+			const connection = new NodeReplicationConnection(publicUrl, null, 'data', peer);
 			connections.push(connection);
-			const pathKey = privatePathKey(privateUrl, 'fallback-peer');
+			const pathKey = privatePathKey(privateUrl, peer);
 			connection.chooseDial = () => (connection.dial = privatePaths.choose(publicUrl, privateUrl, pathKey, connection));
 			const retries = [];
 			connection.setReconnectTimer = (callback) => {
