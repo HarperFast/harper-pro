@@ -7,7 +7,7 @@
  * Design: replication/DESIGN.md "Removing a live node".
  */
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, openSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { databases, resetDatabases } from '../core/resources/databases.ts';
 import {
@@ -102,9 +102,6 @@ function syncDirectory(path: string): void {
 	}
 }
 
-// the marker this thread has seen durable: one renamed in place by a call whose directory sync failed is not
-let syncedMarker: string | undefined;
-
 export function markRemoval(epoch: string): void {
 	const path = removalMarkerPath();
 	if (!path) throw new ServerError('This node has no root path to record its removal in', 500);
@@ -118,14 +115,21 @@ export function markRemoval(epoch: string): void {
 			closeSync(fd);
 		}
 		renameSync(temporary, path);
-	} else if (syncedMarker === path) return;
+	}
+	// also for a marker found in place: the call that renamed it, on any thread, may have failed this sync
 	syncDirectory(path);
-	syncedMarker = path;
+}
+
+function markedEpoch(): string {
+	try {
+		return JSON.parse(readFileSync(removalMarkerPath()!, 'utf8')).epoch ?? '';
+	} catch {
+		return '';
+	}
 }
 
 export function unmarkRemoval(): void {
 	const path = removalMarkerPath();
-	syncedMarker = undefined;
 	if (!path || !existsSync(path)) return;
 	rmSync(path, { force: true });
 	syncDirectory(path);
@@ -333,8 +337,16 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 	// finalize persisted across awaits: a database created, or a peer that became required, meanwhile has no
 	// receipt, so the state goes back to fenced and the next poll covers it
 	if (request.finalize !== undefined) {
-		const known = new Set([...roots.values()].flat());
-		const created = [...databaseRoots().values()].flat().some((auditStore) => !known.has(auditStore));
+		const rootPath = (auditStore: any) => (auditStore.rootStore ?? auditStore).path;
+		const known = new Set([...roots.values()].flat().map(rootPath));
+		let created: boolean;
+		try {
+			// a root another thread opened may not be in this thread's catalog yet
+			resetDatabases();
+			created = [...databaseRoots().values()].flat().some((auditStore) => !known.has(rootPath(auditStore)));
+		} catch {
+			created = true; // unverified: back to fenced, and the next poll retries
+		}
 		const rebound = [...roots.keys()].some((database) => {
 			try {
 				return !receiptsBindRequired(request.receipts?.[database], requiredPeers(database, thisNode));
@@ -384,13 +396,23 @@ function currentStores(): any[] {
 }
 
 async function clearFences(): Promise<void> {
+	const epoch = removalMarked() ? markedEpoch() : undefined;
 	// first, so a root opened while these are cleared does not start fenced with nothing left to lift it
 	unmarkRemoval();
-	for (const auditStore of currentStores()) {
-		if (!holdsFence(auditStore)) continue;
-		syncedFences.delete(auditStore);
-		await persistLocalWriteFence(auditStore, undefined);
-		setLocalWriteFence(auditStore.rootStore ?? auditStore, false);
+	try {
+		for (const auditStore of currentStores()) {
+			if (!holdsFence(auditStore)) continue;
+			syncedFences.delete(auditStore);
+			await persistLocalWriteFence(auditStore, undefined);
+			setLocalWriteFence(auditStore.rootStore ?? auditStore, false);
+		}
+	} catch (error) {
+		// a later lift finds a root another thread opened only through the mark
+		if (epoch !== undefined)
+			try {
+				markRemoval(epoch);
+			} catch {}
+		throw error;
 	}
 }
 

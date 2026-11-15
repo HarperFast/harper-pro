@@ -10,7 +10,7 @@ import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integr
 import { sendOperation, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
-export const FIXTURE = join(import.meta.dirname, 'fixture-node-drain');
+const FIXTURE = join(import.meta.dirname, 'fixture-node-drain');
 const PAUSE_INJECTOR = join(import.meta.dirname, 'replicationSendPauseInjector.mjs');
 export const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
 
