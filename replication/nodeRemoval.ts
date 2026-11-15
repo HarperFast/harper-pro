@@ -303,7 +303,7 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 	}
 	markRemoval(epoch);
 	const state: FenceState['state'] = request.finalize !== undefined || wasRemoving ? 'removing' : 'fenced';
-	const result: FenceState = { node: thisNode, epoch, state, databases: {} };
+	const result: FenceState = { node: thisNode, epoch, state, databases: Object.create(null) };
 	const targets = new Map<any, number>();
 	for (const [database, auditStores] of roots) {
 		let target = 0;
@@ -461,7 +461,7 @@ export async function getReceivedOriginFloors(request: any): Promise<{ databases
 	if (typeof origin !== 'string' || !origin) throw new ClientError('origin is required', 400);
 	if (!Array.isArray(request.databases) || request.databases.some((name: unknown) => typeof name !== 'string'))
 		throw new ClientError('databases must be an array of database names', 400);
-	const answers: Record<string, ReceivedFloor> = {};
+	const answers: Record<string, ReceivedFloor> = Object.create(null);
 	const roots = new Set<any>();
 	for (const database of new Set<string>(request.databases)) {
 		answers[database] = { closedFloor: null };

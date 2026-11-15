@@ -306,7 +306,7 @@ describe('drainNode', () => {
 	});
 
 	it('reads the receipts of databases named like the operation envelope keys or Object members', async () => {
-		const names = ['constructor', 'error', 'requestId', 'results'];
+		const names = ['__proto__', 'constructor', 'error', 'requestId', 'results'];
 		const drains = Object.fromEntries(
 			names.map((name) => [name, { target: T, generation: 'gen-1', sharded: false, peers: ['p1'] }])
 		);
