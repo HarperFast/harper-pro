@@ -5,6 +5,7 @@ import {
 	RECEIPT_OPERATION,
 	drainNode,
 	drainTimeoutMs,
+	getReceivedOriginFloors,
 	receiptShortfall,
 	receiptsBindRequired,
 	markRemoval,
@@ -20,6 +21,7 @@ import { databases, table } from '#src/core/resources/databases';
 import { persistLocalWriteFence, readLocalWriteFence } from '#src/core/resources/auditStore';
 import { localWritesFenced, setLocalWriteFence } from '#src/core/resources/originClosedFloor';
 import { getThisNodeName } from '#src/core/server/nodeName';
+import { getHDBNodeTable } from '#src/replication/knownNodes';
 import { CONFIG_PARAMS } from '#src/core/utility/hdbTerms';
 import * as env from '#src/core/utility/environment/environmentManager';
 
@@ -451,5 +453,43 @@ describe('lifting a removal fence (harper-pro#1348)', () => {
 		assert.equal(localWritesFenced(rootStore), true);
 		assert.deepEqual(await fenceCall({ cancel: true, force: true }), { cancelled: true });
 		assert.equal(localWritesFenced(rootStore), false);
+	});
+});
+
+describe('a receipt for a database this node does not have (harper-pro#1348)', () => {
+	const peer = 'receipt-peer';
+	const self = getThisNodeName();
+	let selfRow;
+	let configured;
+	before(async () => {
+		selfRow = getHDBNodeTable().primaryStore.getSync(self);
+		configured = env.get(CONFIG_PARAMS.REPLICATION_DATABASES);
+		await getHDBNodeTable().put(peer, { name: peer, replicates: true });
+		await getHDBNodeTable().put(self, { ...selfRow, name: self, replicates: true });
+	});
+	after(async () => {
+		env.setProperty(CONFIG_PARAMS.REPLICATION_DATABASES, configured);
+		await getHDBNodeTable().delete(peer);
+		if (selfRow) await getHDBNodeTable().put(self, selfRow);
+		else await getHDBNodeTable().delete(self);
+	});
+
+	const receipt = async () =>
+		(
+			await getReceivedOriginFloors({
+				origin: peer,
+				databases: ['never_created_here'],
+				hdb_user: { name: 'admin', role: { permission: { super_user: true } } },
+			})
+		).databases.never_created_here;
+
+	it('answers receives: false when this node does not replicate it, so a drain does not wait for it', async () => {
+		env.setProperty(CONFIG_PARAMS.REPLICATION_DATABASES, ['system']);
+		assert.deepEqual(await receipt(), { closedFloor: null, receives: false });
+	});
+
+	it('gives no answer when this node replicates it, since it may still arrive', async () => {
+		env.setProperty(CONFIG_PARAMS.REPLICATION_DATABASES, '*');
+		assert.deepEqual(await receipt(), { closedFloor: null });
 	});
 });

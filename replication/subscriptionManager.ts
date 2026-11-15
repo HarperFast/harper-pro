@@ -1031,19 +1031,22 @@ export function computeExclusionOrigins(databaseName: string): string[] {
 export function receivesDirectlyFrom(nodeName: string, databaseName: string): boolean | undefined {
 	const node = getHDBNodeTable().primaryStore.getSync(nodeName);
 	if (!node) return false;
-	// a database not created here yet may still arrive, so its absence is not an answer
-	if (!getDatabases()[databaseName]) return undefined;
-	if (!isMainThread) {
-		if (isExplicitDatabaseSubscription(node.subscriptions, databaseName)) return undefined;
-		const replicatesWith =
+	// a database it does not replicate with that peer never arrives from it, whether or not it exists here
+	if (
+		!isExplicitDatabaseSubscription(node.subscriptions, databaseName) &&
+		!(
 			isReplicatedDatabase(
 				env.get(CONFIG_PARAMS.REPLICATION_DATABASES),
 				databaseName,
 				() => node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD),
 				false
-			) && selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
-		return replicatesWith ? undefined : false;
-	}
+			) && selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName())
+		)
+	)
+		return false;
+	// a database not created here yet may still arrive, so its absence is not an answer
+	if (!getDatabases()[databaseName]) return undefined;
+	if (!isMainThread) return undefined;
 	const matchingRoute = routes.find((route) => route.name === nodeName);
 	const routeReplicates =
 		typeof matchingRoute?.replicates === 'object'
