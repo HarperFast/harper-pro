@@ -70,9 +70,10 @@ export const RESIDENCY_NOT_RESIDENT_CAPABILITY = 1;
 /**
  * Level at which a peer serves a receiver's own-origin recovery range in isolation (outside its replay start,
  * retention decision and log choice) and ends it with `OWN_ORIGIN_SENT`, and asks for its own (harper-pro#1364).
- * Advertised only by a build whose transaction logs are per origin (RocksDB).
+ * Level 2 echoes the subscription request id in `OWN_ORIGIN_SENT`; level 1 never shipped in a release and is
+ * not used. Advertised only by a build whose transaction logs are per origin (RocksDB).
  */
-export const OWN_ORIGIN_RECOVERY_CAPABILITY = 1;
+export const OWN_ORIGIN_RECOVERY_CAPABILITY = 2;
 
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {

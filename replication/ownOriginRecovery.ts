@@ -28,9 +28,16 @@ import { cursorBelowFloor, findLastCommittedLogKey, ORIGIN_CURSOR_OVERLAP_MS } f
 
 const EPOCH = Symbol.for('ownOriginRecovery');
 // Databases whose epoch could not be opened, set on the main thread before workers start, which copy the env.
+// Tagged with the process id: a replacement main process that inherits the env opened its own epochs.
 const FAILED_ENV = 'HARPER_OWN_ORIGIN_RECOVERY_FAILED';
-const failedDatabases = new Set((process.env[FAILED_ENV] ?? '').split('\n').filter(Boolean));
+const failedDatabases = new Set(inheritedFailures(process.env[FAILED_ENV]));
+function inheritedFailures(value: string | undefined): string[] {
+	const [pid, ...databases] = (value ?? '').split('\n');
+	return pid === String(process.pid) ? databases.filter(Boolean) : [];
+}
 const REPORT = Symbol.for('ownOriginRecovered');
+// A pass that met a purge is stored apart, so it can never overwrite a clean report from another thread.
+const PURGED = Symbol.for('ownOriginPurged');
 const DURABLE_FLOOR = Symbol.for('ownOriginDurableFloor');
 const LOG_VOUCH = Symbol.for('ownOriginLogVouch');
 const MIN_START = 1;
@@ -38,7 +45,10 @@ const MIN_START = 1;
 export interface OwnOriginEpoch {
 	/** Where peers start returning own writes (exclusive): see `recoveryStart`. */
 	after: number;
-	/** The highest own key the log held (or had purged through) when the epoch opened; 0 if none. */
+	/**
+	 * The highest own key the log held (or had purged through) when the epoch opened; 0 if none. Not a complete
+	 * prefix: a lower key can append after it and be lost. Only a later start's tripwire (`continuesEpoch`).
+	 */
 	lastKey: number;
 	/** The native clock when the epoch opened: every key minted since is above it. Identifies the epoch. */
 	before: number;
@@ -150,7 +160,7 @@ function peersWithCursors(dbisDB: any, auditStore: any): string[] {
 
 export function markOwnOriginRecoveryFailed(database: string): void {
 	failedDatabases.add(database);
-	process.env[FAILED_ENV] = [...failedDatabases].join('\n');
+	process.env[FAILED_ENV] = [process.pid, ...failedDatabases].join('\n');
 }
 
 /**
@@ -215,12 +225,12 @@ export function openOwnOriginRecoveryEpoch(
 }
 
 /**
- * A peer reported purging past what the epoch held, so it stays unprovable however long it is continued; a
+ * A peer reported purging into the epoch's window, so it stays unprovable however long it is continued; a
  * new epoch judges peers' purges against what the log holds now, as every start did before continuation.
  */
 function purgeTainted(dbisDB: any, epoch: OwnOriginEpoch): boolean {
-	for (const { value } of dbisDB.getRange({ start: [REPORT], end: [REPORT, Buffer.from([0xff])] })) {
-		if (value?.epoch === epoch.before && purgedPastLog(value, epoch)) return true;
+	for (const { key, value } of dbisDB.getRange({ start: [PURGED], end: [PURGED, Buffer.from([0xff])] })) {
+		if (value?.epoch === epoch.before && !cleanReport(readReport(dbisDB, key?.[1], epoch), epoch)) return true;
 	}
 	return false;
 }
@@ -230,13 +240,16 @@ function readEpoch(dbisDB: any): OwnOriginEpoch | undefined {
 	return epoch && typeof epoch.after === 'number' && typeof epoch.before === 'number' ? epoch : undefined;
 }
 
-function readReport(dbisDB: any, peer: string): OwnOriginReport | undefined {
-	return dbisDB?.getSync([REPORT, peer]);
+function readReport(dbisDB: any, peer: string, epoch: OwnOriginEpoch): OwnOriginReport | undefined {
+	const clean: OwnOriginReport | undefined = dbisDB?.getSync([REPORT, peer]);
+	if (clean?.epoch === epoch.before) return clean;
+	const purged: OwnOriginReport | undefined = dbisDB?.getSync([PURGED, peer]);
+	return purged?.epoch === epoch.before ? purged : clean;
 }
 
 export function recoveryRangeFor(dbisDB: any, peer: string): { startTime: number; endTime: number } | undefined {
 	const epoch = readEpoch(dbisDB);
-	if (!epoch || readReport(dbisDB, peer)?.epoch === epoch.before) return undefined;
+	if (!epoch || readReport(dbisDB, peer, epoch)?.epoch === epoch.before) return undefined;
 	return { startTime: epoch.after, endTime: epoch.before };
 }
 
@@ -248,19 +261,24 @@ function isMember(name: string): boolean {
 	}
 }
 
-/** A peer that purged past everything this node still held may have purged what it lost. */
-function purgedPastLog(report: OwnOriginReport, epoch: OwnOriginEpoch): boolean {
-	return report.purgedThrough !== undefined && report.purgedThrough > epoch.lastKey;
+/**
+ * The window's start is the only key below which this node's log is taken as a complete prefix, under the
+ * same overlap the window assumes: a write lost here can carry any key above it, so a peer that purged past
+ * it may have purged what was lost.
+ */
+function purgedIntoWindow(report: OwnOriginReport, epoch: OwnOriginEpoch): boolean {
+	return report.purgedThrough !== undefined && report.purgedThrough > epoch.after;
 }
 
 function cleanReport(report: OwnOriginReport | undefined, epoch: OwnOriginEpoch): boolean {
-	return report?.epoch === epoch.before && !purgedPastLog(report, epoch);
+	return report?.epoch === epoch.before && !purgedIntoWindow(report, epoch);
 }
 
 /**
- * Store `peer`'s report; the caller made the rows it returned durable first. Marks the epoch finished once
- * every required peer and lock home still a member reported cleanly, so the next start does not carry its
- * window forward. A failed read is no answer: it throws, so the peer is asked again.
+ * Store `peer`'s report; the caller made the rows it returned durable first. A clean report is true whenever
+ * written (that pass returned the whole window), so any clean pass proves the peer, whichever lands last.
+ * Marks the epoch finished once every required peer and lock home still a member reported cleanly, so the
+ * next start does not carry its window forward. A failed read is no answer: it throws, so the peer is asked again.
  */
 async function recordReport(database: string, peer: string, report: OwnOriginReport): Promise<void> {
 	if (report.failed) throw new Error(`${peer} could not read this node's writes cleanly`);
@@ -268,18 +286,19 @@ async function recordReport(database: string, peer: string, report: OwnOriginRep
 	if (!dbisDB) throw new Error(`no dbis store for ${database}`);
 	const epoch = readEpoch(dbisDB);
 	if (!epoch || epoch.before !== report.epoch) return;
-	await dbisDB.put([REPORT, peer], report);
-	if (purgedPastLog(report, epoch))
+	const clean = cleanReport(report, epoch);
+	await dbisDB.put([clean ? REPORT : PURGED, peer], report);
+	if (!clean && !cleanReport(readReport(dbisDB, peer, epoch), epoch))
 		logger.warn?.(
-			`Own-origin recovery for ${database}: ${peer} purged this node's writes through ${new Date(report.purgedThrough).toISOString()}, past what this node still held; writes it lost before then cannot be recovered, and cluster locks refuse this node's own lineage until it is recloned`
+			`Own-origin recovery for ${database}: ${peer} purged this node's writes through ${new Date(report.purgedThrough).toISOString()}, inside the recovery window; writes it lost there cannot be recovered, and cluster locks refuse this node's own lineage until it is recloned`
 		);
-	if (epoch.finished || !cleanReport(report, epoch)) return;
+	if (epoch.finished || !clean) return;
 	const homes = (await existingHomesRow(database))?.active?.homes ?? [];
 	const lineage = lineageFromReports(
 		epoch,
 		homes,
 		getThisNodeName(),
-		(name) => (name === peer ? report : readReport(dbisDB, name)),
+		(name) => (name === peer ? report : readReport(dbisDB, name, epoch)),
 		isMember
 	);
 	if (lineage.state !== 'intact') return;
@@ -287,14 +306,16 @@ async function recordReport(database: string, peer: string, report: OwnOriginRep
 	logger.info?.(`Own-origin recovery for ${database}: every peer returned this node's writes`);
 }
 
-// the epoch row is fixed once workers run, and a clean report is never replaced within its epoch
-const UNPROVEN_RECHECK_MS = 100;
+// the epoch row is fixed once workers run, and a clean report stands for its epoch
+export const UNPROVEN_RECHECK_MS = 50;
 const cachedEpochs = new Map<
 	string,
 	{
 		epoch: OwnOriginEpoch;
 		clean: Set<string>;
 		provenFor?: readonly string[];
+		/** Proven by skipping required peers that were not members; holds only while each stays removed. */
+		provenSkipping?: { homes: readonly string[]; skipped: string[] };
 		unproven?: { homes: readonly string[]; lineage: OwnLineage; until: number };
 	} | null
 >();
@@ -304,13 +325,15 @@ const cachedEpochs = new Map<
  * home lost). A position minted since the epoch opened is; one minted before it is proven only once every member
  * that may hold an own write (required peers and lock homes) reported cleanly for this epoch, since the
  * window's start is not a proven boundary. A peer's report covers the tables its route sends here; a table
- * it does not send is taken as one it never received from here.
+ * it does not send is taken as one it never received from here. A table with a residency policy is not
+ * recovered (its own rows return only in a snapshot copy), so its lineage is not held for recovery.
  */
 export function ownLineage(
 	database: string,
 	position: number | null,
 	homes: readonly string[],
 	self: string,
+	table?: string,
 	memberCheck: (name: string) => boolean = isMember
 ): OwnLineage {
 	if (failedDatabases.has(database))
@@ -329,28 +352,40 @@ export function ownLineage(
 		cachedEpochs.set(database, cached);
 	}
 	const { epoch, clean } = cached;
-	if ((position !== null && position >= epoch.before) || cached.provenFor === homes) return { state: 'intact' };
+	if ((position !== null && position >= epoch.before) || sameHomes(cached.provenFor, homes)) return { state: 'intact' };
+	if (table !== undefined && getDatabases()[database]?.[table]?.residency) return { state: 'intact' };
+	const skipping = cached.provenSkipping;
+	if (skipping && sameHomes(skipping.homes, homes)) {
+		if (!skipping.skipped.some(memberCheck)) return { state: 'intact' };
+		cached.provenSkipping = undefined;
+	}
 	const now = performance.now();
 	const unproven = cached.unproven;
-	if (unproven && unproven.homes === homes && unproven.until > now) return unproven.lineage;
-	let skippedNonMember = false;
+	if (unproven && unproven.until > now && sameHomes(unproven.homes, homes)) return unproven.lineage;
+	const skipped: string[] = [];
 	const lineage = lineageFromReports(
 		epoch,
 		homes,
 		self,
-		(peer) => (clean.has(peer) ? { epoch: epoch.before } : readReport(dbisFor(database), peer)),
+		(peer) => (clean.has(peer) ? { epoch: epoch.before } : readReport(dbisFor(database), peer, epoch)),
 		(peer) => {
 			if (memberCheck(peer)) return true;
-			skippedNonMember = true;
+			skipped.push(peer);
 			return false;
 		},
 		(peer) => clean.add(peer)
 	);
-	// a home map's array is replaced, never mutated, when it changes; a peer removed now may be re-added
-	if (lineage.state === 'intact' && !skippedNonMember) cached.provenFor = homes;
-	// waiters poll this; one evaluation per interval serves them all, and a report lands at most that much later
-	else if (lineage.state !== 'intact') cached.unproven = { homes, lineage, until: now + UNPROVEN_RECHECK_MS };
+	if (lineage.state !== 'intact') cached.unproven = { homes, lineage, until: now + UNPROVEN_RECHECK_MS };
+	else if (skipped.length > 0) cached.provenSkipping = { homes, skipped };
+	else cached.provenFor = homes;
 	return lineage;
+}
+
+function sameHomes(cached: readonly string[] | undefined, homes: readonly string[]): boolean {
+	if (cached === homes) return true;
+	if (cached?.length !== homes.length) return false;
+	for (let i = 0; i < homes.length; i++) if (cached[i] !== homes[i]) return false;
+	return true;
 }
 
 export function lineageFromReports(

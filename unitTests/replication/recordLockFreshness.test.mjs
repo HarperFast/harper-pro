@@ -691,9 +691,11 @@ describe('createFreshnessBarrier: own lineage after a restart (harper-pro#1364)'
 	const lineageHarness = (initial) => {
 		let lineage = initial;
 		const asked = [];
+		const homeMap = { generation: 1, homes: ['self', 'a', 'b'], homeIncarnation: 1 };
 		const h = harness({
-			ownLineage(position, homes) {
-				asked.push({ position, homes });
+			homeMap: () => homeMap,
+			ownLineage(position, homes, table) {
+				asked.push({ position, homes, table });
 				return lineage;
 			},
 		});
@@ -705,7 +707,7 @@ describe('createFreshnessBarrier: own lineage after a restart (harper-pro#1364)'
 		const { h, asked, set } = lineageHarness(pending);
 		let settled = false;
 		const wait = h.barrier.establish('t', [['self', 5]], 5_000).then(() => (settled = true));
-		assert.deepStrictEqual(asked[0], { position: 5, homes: ['self', 'a', 'b'] });
+		assert.deepStrictEqual(asked[0], { position: 5, homes: ['self', 'a', 'b'], table: 't' });
 		h.advance(OWN_LINEAGE_POLL_MS);
 		await flush();
 		assert.strictEqual(settled, false);
@@ -784,6 +786,94 @@ describe('createFreshnessBarrier: own lineage after a restart (harper-pro#1364)'
 		set({ state: 'intact' });
 		h.advance(OWN_LINEAGE_POLL_MS);
 		assert.match((await rejection(wait)).message, /closed/);
+	});
+	it('one poll per interval serves every waiter on the same position, and each keeps its own deadline', async () => {
+		const { h, asked, set } = lineageHarness(pending);
+		const short = h.barrier.establish('t', [['self', 5]], 300);
+		const longs = [h.barrier.establish('t', [['self', 5]], 5_000), h.barrier.establish('t', [['self', 5]], 5_000)];
+		const initial = asked.length;
+		h.advance(OWN_LINEAGE_POLL_MS);
+		assert.strictEqual(asked.length, initial + 1, 'three waiters, one evaluation');
+		assert.strictEqual([...h.timers.values()].length, 1, 'one poll timer for the database');
+		h.advance(300);
+		assert.match((await rejection(short)).message, /still recovering its own writes/);
+		assert.strictEqual(h.barrier.stats().outstanding, 2);
+		set({ state: 'intact' });
+		h.advance(OWN_LINEAGE_POLL_MS);
+		await Promise.all(longs);
+		assert.strictEqual(h.timers.size, 0, 'the poll stops once nothing waits');
+	});
+	for (const outcome of ['intact', 'pending'])
+		it(`expires a waiter in the same poll when evaluation outlasts its deadline (${outcome})`, async () => {
+			let clock = 1_000;
+			let lineage = pending;
+			const h = harness({
+				monotonicNow: () => clock,
+				ownLineage() {
+					if (clock >= 1_100) clock += 200;
+					return lineage;
+				},
+			});
+			const wait = h.barrier.establish('t', [['self', 5]], 150);
+			if (outcome === 'intact') lineage = { state: 'intact' };
+			clock = 1_100;
+			h.advance(OWN_LINEAGE_POLL_MS);
+			assert.match((await rejection(wait)).message, /still recovering its own writes/);
+			assert.strictEqual(h.barrier.stats().outstanding, 0);
+		});
+	it('passes the table to the own-lineage check', async () => {
+		const { h, asked } = lineageHarness({ state: 'intact' });
+		await h.barrier.establish('Rows', [['self', 5]], 1_000);
+		assert.strictEqual(asked[0].table, 'Rows');
+	});
+	it('an own-lineage refusal cancels the member barrier waits of the same handoff', async () => {
+		const { h, set } = lineageHarness(pending);
+		const wait = h.barrier.establish('t', null, 5_000);
+		assert.strictEqual(h.barrier.stats().outstanding, 3);
+		set({ state: 'unprovable', detail: 'b had purged' });
+		h.advance(OWN_LINEAGE_POLL_MS);
+		assert.match((await rejection(wait)).message, /cannot be proven/);
+		assert.strictEqual(h.barrier.stats().outstanding, 0, 'no barrier wait is left holding a slot');
+	});
+	it('a member barrier refusal cancels the own-lineage wait of the same handoff', async () => {
+		const { h, asked } = lineageHarness(pending);
+		const wait = h.barrier.establish(
+			't',
+			[
+				['a', 5],
+				['self', 5],
+			],
+			5_000
+		);
+		h.requests[0].resolve(-1);
+		assert.match((await rejection(wait)).message, /without a usable position/);
+		assert.strictEqual(h.barrier.stats().outstanding, 0);
+		const before = asked.length;
+		h.advance(OWN_LINEAGE_POLL_MS * 3);
+		assert.strictEqual(asked.length, before, 'the cancelled wait is no longer polled');
+	});
+	it('a refused member barrier cancels the other member waits of the same handoff', async () => {
+		const h = harness();
+		const wait = h.barrier.establish(
+			't',
+			[
+				['a', 5],
+				['b', 5],
+			],
+			5_000
+		);
+		assert.strictEqual(h.barrier.stats().outstanding, 2);
+		h.requests[0].resolve(-1);
+		assert.match((await rejection(wait)).message, /without a usable position/);
+		assert.strictEqual(h.barrier.stats().outstanding, 0);
+	});
+	it('close settles own-lineage waits at once and stops the poll', async () => {
+		const { h } = lineageHarness(pending);
+		const wait = h.barrier.establish('t', [['self', 5]], 5_000);
+		h.barrier.close();
+		assert.match((await rejection(wait)).message, /closed/);
+		assert.strictEqual(h.timers.size, 0);
+		assert.strictEqual(h.barrier.stats().outstanding, 0);
 	});
 	it('counts own-lineage waits against the cap and in outstanding', async () => {
 		const { h } = lineageHarness(pending);

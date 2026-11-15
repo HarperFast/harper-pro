@@ -111,13 +111,15 @@ record of that origin and table this node dropped or failed to apply. Those are 
     loss: table writes run WAL-off, so the tail of `local` can be gone while peers hold it. A start on
     a new or unknown OS boot, or after a recorded log sync failure, opens an own-origin recovery epoch
     (`ownOriginRecovery.ts`); a start on the same boot keeps the previous one. A self-origin position
-    minted before the epoch opened, and a recovery-marker grant (`null`), additionally wait (`ownLineage`, polled every
-    `OWN_LINEAGE_POLL_MS` until the lock deadline, counted against `MAX_OUTSTANDING_BARRIERS`) until
+    minted before the epoch opened, and a recovery-marker grant (`null`), additionally wait (`ownLineage`, polled once per
+    `OWN_LINEAGE_POLL_MS` for every waiter on the database, each until its own lock deadline, counted against
+    `MAX_OUTSTANDING_BARRIERS`; the first refusal of a handoff cancels its other waits) until
     every required peer (cursor peers and the members this node sends to) and home has reported returning this node's writes for that epoch. The epoch's
     start is not a proven boundary, so no position before `before` is taken as intact on its own. A
-    peer's report of a purge past the log's last key, or an epoch that could not be recorded, rejects
+    peer's report of a purge past the window's start, or an epoch that could not be recorded, rejects
     at once (`own-lineage-unprovable`); a failed read is asked again, not recorded. An own-origin
-    poison row rejects before and again after the wait. Until its own lineage is intact, the node also
+    poison row rejects before and again after the wait. A table with a residency policy is not
+    recovered and not held. Until its own lineage is intact, the node also
     refuses to write a `lockBarrier` for a peer, as it does for a table holding own-origin poison (503,
     which the requester rides through): a barrier written then would sit ahead of the returned writes in
     its log, or past a skipped one, and prove nothing about them.
