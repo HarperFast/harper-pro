@@ -122,7 +122,7 @@ Removes a Harper node from the cluster and stops all replication to and from tha
 
 A node accepts writes locally and sends them to its peers afterward, so a live node can hold writes no peer has received yet: writes accepted just before removal, while a peer link was down, or, for a sharded table, writes to records it does not own. `remove_node` does not delete the node's membership until those writes are on its peers:
 
-1. The node being removed stops accepting local writes. A write to it returns `503` ("This node is being removed from its cluster"). Transactions it already started commit. This fence is persisted, so the node stays fenced across a restart, except a restart of its operating system (below). Writes it receives from peers still apply. The `system` database is not fenced.
+1. The node being removed stops accepting local writes. A write to it returns `503` ("This node is being removed from its cluster"). Transactions it already started commit. This fence is persisted, so the node stays fenced across a restart, except a restart that could have lost its latest writes (below). Writes it receives from peers still apply. The `system` database is not fenced.
 2. `remove_node` waits until every peer the node sends a database to reports that it has committed all of the node's writes to that database. A peer that does not subscribe to the database from the node says so and is not waited for. A database the node sends to no peer (configured local-only) is not drained. For a sharded database, a peer on another shard reports the records it owns. Each peer confirms with the next delivery checkpoint the node sends it, every 30 seconds, so even a node with nothing left to send takes up to 30 seconds to remove.
 3. Then the node's membership is deleted, as before. The removed node accepts local writes again once it receives the removal notice, or when it is added to a cluster again with `add_node`.
 
@@ -135,12 +135,12 @@ The wait has a limit (`timeout`, five minutes by default). When it runs out, the
 - the node is the only owner of a shard in a database's [shard map](./residency.md#installed-maps), so its records exist nowhere else,
 - a database is stored on LMDB, which keeps no origin floors to confirm delivery with,
 - a database keeps its tables in more than one storage root (per-table `path`),
-- the node restarted after an operating-system crash, power loss or reboot, which can lose its latest writes, and its peers have yet to return its own writes ([cluster record locks](./overview.md#cluster-record-locks) wait for the same thing), or
+- the node's peers have yet to return its own writes after a start that could have lost the latest ones: one that followed an operating-system crash, power loss or reboot, or its first start on v5.5 ([cluster record locks](./overview.md#cluster-record-locks) wait for the same thing), or
 - no peer the node sends a database to subscribes to it, or, for a sharded database, no owner of one of its shards receives it from the node, so some of its writes exist only on that node.
 
 In the last five cases the node accepts local writes again, even when an earlier `remove_node` that timed out left it fenced, unless that removal was finalized.
 
-A node that restarts that way while fenced lifts its own fence at startup, unless its removal was finalized. A returned write is applied as one of the node's own, which a fence would refuse, and the node then sends it to the peers that never received it. Run `remove_node` again: it is refused until every peer has returned the node's writes, which usually takes seconds but waits for a peer that is down. In a database with both sharded and ordinary tables a peer on another shard is never asked, so that removal needs `force`.
+A node that restarts that way while fenced lifts its own fence at startup, unless its removal was finalized. A returned write is applied as one of the node's own, which a fence would refuse, and the node then sends it to the peers that never received it. Run `remove_node` again: it is refused until every peer has returned the node's writes, which usually takes seconds but waits for a peer that is down. In a database with both sharded and ordinary tables a peer on another shard is never asked, so a node's removal there needs `force` from its first such start onward.
 
 `force: true` removes the node without fencing or waiting. Writes that only that node held are lost. Use it for a node that is permanently down.
 

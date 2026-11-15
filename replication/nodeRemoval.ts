@@ -232,8 +232,8 @@ function assertOwnWritesRecovered(database: string, thisNode: string): void {
 	if (!unrecovered) return;
 	throw new ClientError(
 		unrecovered.state === 'pending'
-			? `${thisNode} restarted after its operating system did, which can lose its latest writes, and its peers have yet to return its own writes to database ${database} (${unrecovered.detail}), so they cannot be drained yet; retry once they are back, or use force: true to remove it without draining`
-			: `${thisNode} restarted after its operating system did, which can lose its latest writes, and cannot prove it has its own writes to database ${database} back from its peers (${unrecovered.detail}), so they cannot be drained; use force: true to remove it without draining`,
+			? `${thisNode} has not confirmed that it holds every write it made before a restart that could have lost the latest ones: its peers have yet to return its own writes to database ${database} (${unrecovered.detail}), so they cannot be drained yet; retry once they are back, or use force: true to remove it without draining`
+			: `${thisNode} cannot confirm that it holds every write it made before a restart that could have lost the latest ones: it cannot prove its own writes to database ${database} are back from its peers (${unrecovered.detail}), so they cannot be drained; use force: true to remove it without draining`,
 		409
 	);
 }
@@ -505,7 +505,7 @@ export async function liftFenceForOwnRecovery(): Promise<void> {
 		if (recovering.length === 0) return;
 		await clearFences();
 		hdbLogger.notify(
-			`${thisNode} restarted after its operating system did while it was being removed, and its peers have yet to return its own writes to ${recovering.join(', ')}: local writes are accepted again; run remove_node again once they are back`
+			`${thisNode} restarted while it was being removed, in a way that could have lost its latest writes, and its peers have yet to return its own writes to ${recovering.join(', ')}: local writes are accepted again; run remove_node again once they are back`
 		);
 	});
 }
