@@ -542,7 +542,6 @@ describe('a removal fence while own writes are still coming back (harper-pro#134
 		assert.equal(localWritesFenced(rootStore), false);
 		assert.equal(readLocalWriteFence(fenced.auditStore), undefined);
 		assert.equal(removalMarked(), false);
-		// once the peer reported, the same call is no longer refused for this
 		await recovered();
 		await fenceCall({}).catch((error) => assert.doesNotMatch(error.message, REFUSAL));
 		assert.deepEqual(await fenceCall({ cancel: true }), { cancelled: true });

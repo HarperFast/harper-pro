@@ -168,7 +168,6 @@ suite('power loss on a node that is being removed', { timeout: 900_000 }, (ctx) 
 		nodeC = contexts[2].harper;
 		await waitForMesh([nodeA, nodeB, nodeC]);
 
-		// B returns them, A applies them as its own writes and forwards them to C
 		await waitForCounter([nodeA, nodeB, nodeC], 'ins', 2);
 		await waitForCounter([nodeA, nodeB, nodeC], 'upd', 2);
 		assert.doesNotMatch(await readLog(nodeA), /Replicated transaction failed/);

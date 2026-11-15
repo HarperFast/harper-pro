@@ -57,13 +57,13 @@ suite(
 		const started = [];
 
 		before(async () => {
-			// settled, so a node that started is still torn down when the other fails to
+			// settled, and tracked before each start: a node that started, or spawned and then failed, is torn down
 			const starts = await Promise.allSettled(
 				[0, 1].map(async () => {
 					const hostname = await getNextAvailableLoopbackAddress();
 					const nodeCtx = { name: ctx.name, harper: { hostname } };
+					started.push(nodeCtx);
 					await startHarper(nodeCtx, nodeConfig(hostname));
-					started.push(nodeCtx.harper);
 					return nodeCtx.harper;
 				})
 			);
@@ -87,7 +87,7 @@ suite(
 			await holds(joiner, 'before-join');
 		});
 
-		after(() => stopAndTeardownNodes(started));
+		after(() => stopAndTeardownNodes(started.map((nodeCtx) => nodeCtx.harper)));
 
 		// before any restart: a reconnect sends a new request, which resolves the ids itself now that the database exists
 		test('records the leader certified floor on the connection that copied the database', async () => {

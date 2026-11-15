@@ -58,8 +58,8 @@ export interface OwnOriginEpoch {
 	/** The OS boot this epoch opened on, when known: a later start on the same boot continues it. */
 	bootId?: string;
 	/**
-	 * Opened only because the database had no epoch, by a start that knew the OS had kept running since this node's
-	 * previous start (`sameBootAsPreviousStart`): its log lost nothing, and peers are asked as a precaution.
+	 * Opened for a database no earlier start had found, by a start that knew the OS had kept running since this
+	 * node's previous start (`sameBootAsPreviousStart`): its log lost nothing, and peers are asked as a precaution.
 	 */
 	pageCacheKept?: true;
 }
@@ -205,6 +205,13 @@ export function openOwnOriginRecoveryEpoch(
 	if (!dbisDB || typeof rootStore?.getMonotonicTimestamp !== 'function' || typeof rootStore.syncWal !== 'function')
 		throw new Error(`${database} has per-origin logs but no store to record a recovery epoch in`);
 	const previous = readEpoch(dbisDB);
+	// an earlier start that found this database left a vouch row even if its epoch could not be written
+	let firstSeen = !previous;
+	try {
+		if (dbisDB.getSync(LOG_VOUCH) !== undefined) firstSeen = false;
+	} catch {
+		firstSeen = false;
+	}
 	// decided once per process, before workers append: a reload's view of the log includes this process's writes
 	if (!vouchedDatabases.has(database)) recordLogVouch(database, dbisDB, previous, continuity, logStats(auditStore));
 	let lastKey: number | undefined;
@@ -237,7 +244,7 @@ export function openOwnOriginRecoveryEpoch(
 		? nextEpoch(lastKey, purgeBound, previous, before, requiredPeers, readDurableFloor(dbisDB))
 		: nextEpoch(undefined, undefined, previous, before, requiredPeers);
 	if (continuity.bootId !== undefined) epoch.bootId = continuity.bootId;
-	if (!previous && logRead && continuity.sameBootAsPreviousStart) epoch.pageCacheKept = true;
+	if (firstSeen && logRead && continuity.sameBootAsPreviousStart) epoch.pageCacheKept = true;
 	dbisDB.putSync(EPOCH, epoch);
 	cachedEpochs.delete(database);
 	logger.info?.(
