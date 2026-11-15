@@ -54,17 +54,22 @@ suite(
 	{ timeout: 300_000, skip: isLMDB && 'RocksDB floors' },
 	(ctx) => {
 		let leader, joiner;
+		const started = [];
 
 		before(async () => {
-			const contexts = await Promise.all(
+			// settled, so a node that started is still torn down when the other fails to
+			const starts = await Promise.allSettled(
 				[0, 1].map(async () => {
 					const hostname = await getNextAvailableLoopbackAddress();
 					const nodeCtx = { name: ctx.name, harper: { hostname } };
 					await startHarper(nodeCtx, nodeConfig(hostname));
+					started.push(nodeCtx.harper);
 					return nodeCtx.harper;
 				})
 			);
-			[leader, joiner] = contexts;
+			const failed = starts.find((start) => start.status === 'rejected');
+			if (failed) throw failed.reason;
+			[leader, joiner] = starts.map((start) => start.value);
 			await sendOperation(leader, { operation: 'create_table', database: 'data', table: TABLE, primary_key: 'id' });
 			await sendOperation(leader, {
 				operation: 'upsert',
@@ -82,7 +87,7 @@ suite(
 			await holds(joiner, 'before-join');
 		});
 
-		after(() => stopAndTeardownNodes([leader, joiner].filter(Boolean)));
+		after(() => stopAndTeardownNodes(started));
 
 		// before any restart: a reconnect sends a new request, which resolves the ids itself now that the database exists
 		test('records the leader certified floor on the connection that copied the database', async () => {
