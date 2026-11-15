@@ -303,8 +303,8 @@ describe('drainNode', () => {
 		assert.equal(send.calls.length, 1);
 	});
 
-	it('reads the receipts of databases named like the operation envelope keys', async () => {
-		const names = ['error', 'requestId', 'results'];
+	it('reads the receipts of databases named like the operation envelope keys or Object members', async () => {
+		const names = ['constructor', 'error', 'requestId', 'results'];
 		const drains = Object.fromEntries(
 			names.map((name) => [name, { target: T, generation: 'gen-1', sharded: false, peers: ['p1'] }])
 		);
@@ -433,6 +433,23 @@ describe('lifting a removal fence (harper-pro#1348)', () => {
 		// as on a thread that another thread's schema change has not reached
 		delete databases.opened_elsewhere;
 		assert.deepEqual(await fenceCall({ cancel: true }), { cancelled: true });
+		assert.equal(localWritesFenced(rootStore), false);
+	});
+
+	it('refuses a cancel without force when a database this thread has not loaded was finalized', async () => {
+		markRemoval('epoch-3');
+		const finalizedTable = open('finalized_elsewhere', 'Finalized');
+		const rootStore = finalizedTable.primaryStore.rootStore;
+		const target = setLocalWriteFence(rootStore, true);
+		await persistLocalWriteFence(finalizedTable.auditStore, { epoch: 'epoch-3', target, state: 'removing' });
+		delete databases.finalized_elsewhere;
+		await assert.rejects(fenceCall({ cancel: true }), (error) => {
+			assert.equal(error.statusCode, 409);
+			assert.match(error.message, /was finalized/);
+			return true;
+		});
+		assert.equal(localWritesFenced(rootStore), true);
+		assert.deepEqual(await fenceCall({ cancel: true, force: true }), { cancelled: true });
 		assert.equal(localWritesFenced(rootStore), false);
 	});
 });

@@ -102,24 +102,30 @@ function syncDirectory(path: string): void {
 	}
 }
 
+// the marker this thread has seen durable: one renamed in place by a call whose directory sync failed is not
+let syncedMarker: string | undefined;
+
 export function markRemoval(epoch: string): void {
 	const path = removalMarkerPath();
 	if (!path) throw new ServerError('This node has no root path to record its removal in', 500);
-	if (existsSync(path)) return;
-	const temporary = `${path}.${process.pid}.tmp`;
-	const fd = openSync(temporary, 'w');
-	try {
-		writeSync(fd, JSON.stringify({ epoch }));
-		fsyncSync(fd);
-	} finally {
-		closeSync(fd);
-	}
-	renameSync(temporary, path);
+	if (!existsSync(path)) {
+		const temporary = `${path}.${process.pid}.tmp`;
+		const fd = openSync(temporary, 'w');
+		try {
+			writeSync(fd, JSON.stringify({ epoch }));
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+		renameSync(temporary, path);
+	} else if (syncedMarker === path) return;
 	syncDirectory(path);
+	syncedMarker = path;
 }
 
 export function unmarkRemoval(): void {
 	const path = removalMarkerPath();
+	syncedMarker = undefined;
 	if (!path || !existsSync(path)) return;
 	rmSync(path, { force: true });
 	syncDirectory(path);
@@ -241,7 +247,7 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 	const wasRemoving = fences.some((fence) => fence.state === 'removing');
 	if (request.cancel) {
 		// `force` is the operator's word that the removal finished but its notice never arrived
-		if (wasRemoving && request.force !== true)
+		if (request.force !== true && finalized(currentStores()))
 			throw new ClientError(
 				`${thisNode}'s removal was finalized; complete it with remove_node, or, if it was already removed, run ${FENCE_OPERATION} with cancel and force on it`,
 				409
@@ -263,7 +269,7 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 				);
 		required = new Map([...roots.keys()].map((database) => [database, requiredPeers(database, thisNode)]));
 	} catch (error) {
-		throw await liftRefusedFence(error, thisNode, wasRemoving);
+		throw await liftRefusedFence(error, thisNode);
 	}
 	const epoch = fences.find((fence) => fence.epoch)?.epoch || randomUUID();
 	if (request.finalize !== undefined) {
@@ -364,18 +370,24 @@ const holdsFence = (auditStore: any): boolean =>
 // a clear whose WAL sync failed leaves the word set with no record
 const fenceHeld = (stores: any[]): boolean => removalMarked() || stores.some(holdsFence);
 
+const finalized = (stores: any[]): boolean =>
+	stores.some((auditStore) => readLocalWriteFence(auditStore)?.state === 'removing');
+
+/**
+ * This thread's fenceable roots after a catalog rescan: a root another thread opened under the mark is fenced in
+ * every thread before that thread's schema change reaches this one. A failed rescan throws, so no clear reports
+ * writes accepted on a root it could not see, and no lift misses a finalized one.
+ */
+function currentStores(): any[] {
+	resetDatabases();
+	return [...databaseRoots().values()].flat().filter(canBeFenced);
+}
+
 async function clearFences(): Promise<void> {
 	// first, so a root opened while these are cleared does not start fenced with nothing left to lift it
 	unmarkRemoval();
-	// a root another thread opened under the mark is fenced in every thread, but this thread's catalog may not hold
-	// it until that thread's schema change arrives
-	try {
-		resetDatabases();
-	} catch (error) {
-		hdbLogger.warn('Could not rescan databases before lifting the removal fence', error);
-	}
-	for (const auditStore of [...databaseRoots().values()].flat()) {
-		if (!canBeFenced(auditStore) || !holdsFence(auditStore)) continue;
+	for (const auditStore of currentStores()) {
+		if (!holdsFence(auditStore)) continue;
 		syncedFences.delete(auditStore);
 		await persistLocalWriteFence(auditStore, undefined);
 		setLocalWriteFence(auditStore.rootStore ?? auditStore, false);
@@ -386,10 +398,10 @@ async function clearFences(): Promise<void> {
  * A refusal to fence means no wait can drain this node until the cluster changes, so a fence an earlier poll or
  * `remove_node` left would only refuse its writes: lift it unless the removal was finalized, and say so.
  */
-async function liftRefusedFence(refusal: any, thisNode: string, wasRemoving: boolean): Promise<unknown> {
-	if (!isRefusal(refusal) || wasRemoving || !fenceHeld([...databaseRoots().values()].flat().filter(canBeFenced)))
-		return refusal;
+async function liftRefusedFence(refusal: any, thisNode: string): Promise<unknown> {
+	if (!isRefusal(refusal) || !fenceHeld([...databaseRoots().values()].flat().filter(canBeFenced))) return refusal;
 	try {
+		if (finalized(currentStores())) return refusal;
 		await clearFences();
 	} catch (error) {
 		return new ClientError(
@@ -409,9 +421,8 @@ async function liftRefusedFence(refusal: any, thisNode: string, wasRemoving: boo
  */
 export async function liftFenceAfterRemoval(removed: boolean): Promise<void> {
 	await withFenceLock(async () => {
-		const stores = [...databaseRoots().values()].flat().filter(canBeFenced);
-		if (!fenceHeld(stores)) return;
-		if (!removed && stores.some((auditStore) => readLocalWriteFence(auditStore)?.state === 'removing')) return;
+		if (!fenceHeld([...databaseRoots().values()].flat().filter(canBeFenced))) return;
+		if (!removed && finalized(currentStores())) return;
 		await clearFences();
 		hdbLogger.notify(`${getThisNodeName()} left its cluster; local writes are accepted again`);
 	});
@@ -579,8 +590,8 @@ export async function drainNode(
 		for (const [database, drain] of Object.entries(fence.databases))
 			for (const peer of drain.peers) byPeer.set(peer, [...(byPeer.get(peer) ?? []), database]);
 		const round: string[] = [];
-		const holders: Record<string, string[]> = {};
-		const notSubscribed: Record<string, Set<string>> = {};
+		const holders: Record<string, string[]> = Object.create(null);
+		const notSubscribed: Record<string, Set<string>> = Object.create(null);
 		let budgetSpent = false;
 		for (const [peer, peerDatabases] of byPeer) {
 			if (remaining() <= MIN_CALL_MS) {
