@@ -98,6 +98,21 @@ describe('openOwnOriginRecoveryEpoch after a lost tail', () => {
 		assert.ok(recoveryRangeFor(dbisDB, 'peer').startTime < LOST_KEY);
 	});
 
+	it('marks an epoch opened for a database without one as lossless only when the OS kept running', async () => {
+		const open = async (continuity, previous) => {
+			const { dbisDB, auditStore } = stores(undefined);
+			if (previous) dbisDB.rows.set(EPOCH, previous);
+			await openOwnOriginRecoveryEpoch('page-cache-db', auditStore, dbisDB, continuity, () => ['peer']);
+			return dbisDB.rows.get(EPOCH);
+		};
+		const sameBoot = { bootId: 'boot-b', syncFailure: false, sameBootAsPreviousStart: true };
+		assert.strictEqual((await open(sameBoot)).pageCacheKept, true);
+		assert.strictEqual((await open({ bootId: 'boot-b', syncFailure: false })).pageCacheKept, undefined);
+		// an epoch from an earlier boot is replaced by one that may have lost writes
+		const earlier = { after: 1, lastKey: 0, before: NOW - 1, requiredPeers: [], bootId: 'boot-a', pageCacheKept: true };
+		assert.strictEqual((await open(sameBoot, earlier)).pageCacheKept, undefined);
+	});
+
 	it('keeps the overlap when no durable floor was recorded', async () => {
 		const { dbisDB, auditStore } = stores(undefined);
 		await openOwnOriginRecoveryEpoch(

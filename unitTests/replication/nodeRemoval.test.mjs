@@ -7,6 +7,7 @@ import {
 	drainTimeoutMs,
 	getReceivedOriginFloors,
 	liftFenceAfterRemoval,
+	liftFenceForOwnRecovery,
 	receiptShortfall,
 	receiptsBindRequired,
 	markRemoval,
@@ -475,6 +476,116 @@ describe('lifting a removal fence (harper-pro#1348)', () => {
 		assert.equal(localWritesFenced(rootStore), true);
 		assert.deepEqual(await fenceCall({ cancel: true, force: true }), { cancelled: true });
 		assert.equal(localWritesFenced(rootStore), false);
+	});
+});
+
+describe('a removal fence while own writes are still coming back (harper-pro#1348, #1364)', () => {
+	const attributes = [{ name: 'id', isPrimaryKey: true }];
+	const peer = 'returning-peer';
+	const EPOCH = Symbol.for('ownOriginRecovery');
+	const REPORT = Symbol.for('ownOriginRecovered');
+	const REFUSAL = /its peers have yet to return its own writes/;
+	let rootPath;
+	let sequence = 0;
+	before(async () => {
+		rootPath = env.get(CONFIG_PARAMS.ROOTPATH);
+		env.setProperty(CONFIG_PARAMS.ROOTPATH, mkdtempSync(join(tmpdir(), 'removal-recovery-')));
+		await getHDBNodeTable().put(peer, { name: peer });
+	});
+	after(async () => {
+		unmarkRemoval();
+		env.setProperty(CONFIG_PARAMS.ROOTPATH, rootPath);
+		await getHDBNodeTable().delete(peer);
+	});
+
+	const fenceCall = (request) =>
+		removeNodeFence({
+			operation: FENCE_OPERATION,
+			node: getThisNodeName(),
+			hdb_user: { name: 'admin', role: { permission: { super_user: true } } },
+			...request,
+		});
+	// a database whose recovery epoch still waits for `peer`, fenced as an earlier poll left it
+	async function fencedWhileRecovering(state, recovering = true, pageCacheKept) {
+		const database = `recovering_${++sequence}`;
+		const fenced = table({ table: 'Recovering', database, attributes });
+		const before = Date.now();
+		if (recovering)
+			await fenced.dbisDB.put(EPOCH, {
+				after: 1,
+				lastKey: 0,
+				before,
+				requiredPeers: [peer],
+				...(pageCacheKept ? { pageCacheKept: true } : {}),
+			});
+		const rootStore = fenced.primaryStore.rootStore;
+		markRemoval(`epoch-${database}`);
+		const target = setLocalWriteFence(rootStore, true);
+		await persistLocalWriteFence(fenced.auditStore, { epoch: `epoch-${database}`, target, state });
+		// the peer's clean report, after which this database no longer holds any fence call back
+		const recovered = async () => {
+			await fenced.dbisDB.put([REPORT, peer], { epoch: before });
+			await new Promise((resolve) => setTimeout(resolve, 100)); // past the cached verdict (UNPROVEN_RECHECK_MS)
+		};
+		return { fenced, rootStore, recovered };
+	}
+
+	it("refuses to fence and lifts an earlier fence while a peer has not returned this node's writes", async () => {
+		const { fenced, rootStore, recovered } = await fencedWhileRecovering('fenced');
+		await assert.rejects(fenceCall({}), (error) => {
+			assert.equal(error.statusCode, 409);
+			assert.match(error.message, REFUSAL);
+			assert.match(error.message, new RegExp(`${peer} has not returned`));
+			assert.match(error.message, /accepts local writes again$/);
+			return true;
+		});
+		assert.equal(localWritesFenced(rootStore), false);
+		assert.equal(readLocalWriteFence(fenced.auditStore), undefined);
+		assert.equal(removalMarked(), false);
+		// once the peer reported, the same call is no longer refused for this
+		await recovered();
+		await fenceCall({}).catch((error) => assert.doesNotMatch(error.message, REFUSAL));
+		assert.deepEqual(await fenceCall({ cancel: true }), { cancelled: true });
+	});
+
+	it('does not refuse a removal finalized before the restart, whose receipts were already taken', async () => {
+		const { rootStore, recovered } = await fencedWhileRecovering('removing');
+		await fenceCall({}).then(
+			(result) => assert.equal(result.state, 'removing'),
+			(error) => assert.doesNotMatch(error.message, REFUSAL)
+		);
+		assert.equal(localWritesFenced(rootStore), true);
+		assert.deepEqual(await fenceCall({ cancel: true, force: true }), { cancelled: true });
+		await recovered();
+	});
+
+	it('lifts at startup a fence that would refuse the returned writes, unless the removal was finalized', async () => {
+		const pending = await fencedWhileRecovering('fenced');
+		await liftFenceForOwnRecovery();
+		assert.equal(localWritesFenced(pending.rootStore), false);
+		assert.equal(readLocalWriteFence(pending.fenced.auditStore), undefined);
+		assert.equal(removalMarked(), false);
+		await pending.recovered();
+
+		const finalized = await fencedWhileRecovering('removing');
+		await liftFenceForOwnRecovery();
+		assert.equal(localWritesFenced(finalized.rootStore), true);
+		assert.deepEqual(await fenceCall({ cancel: true, force: true }), { cancelled: true });
+		await finalized.recovered();
+
+		const intact = await fencedWhileRecovering('fenced', false);
+		await liftFenceForOwnRecovery();
+		assert.equal(localWritesFenced(intact.rootStore), true);
+		assert.deepEqual(await fenceCall({ cancel: true }), { cancelled: true });
+	});
+
+	it('keeps and renews a fence while peers answer an epoch opened with nothing to have lost', async () => {
+		// the OS kept running: the epoch exists only because the database had none, and may never finish
+		const { rootStore } = await fencedWhileRecovering('fenced', true, true);
+		await liftFenceForOwnRecovery();
+		assert.equal(localWritesFenced(rootStore), true);
+		await fenceCall({}).catch((error) => assert.doesNotMatch(error.message, REFUSAL));
+		assert.deepEqual(await fenceCall({ cancel: true }), { cancelled: true });
 	});
 });
 

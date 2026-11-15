@@ -33,6 +33,7 @@ import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import * as hdbLogger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, getReplicationRecipients } from './knownNodes.ts';
+import { ownLineage, recoveryEpochKeptPageCache, type OwnLineage } from './ownOriginRecovery.ts';
 import { receivesDirectlyFrom } from './subscriptionManager.ts';
 import { principalNodeName } from './recordLockRpc.ts';
 import { tableReplicates } from './replicatedDatabases.ts';
@@ -206,6 +207,37 @@ function requiredPeers(
 	return { peers, sharded: true, shardOwners };
 }
 
+const NO_HOMES: readonly string[] = [];
+
+/**
+ * Set while a peer may still be returning this node's own writes after a restart that could have lost them
+ * (own-origin recovery, DESIGN.md invariant 39). Core applies a returned write as a local one, so a fence refuses
+ * it, and a floor certified meanwhile vouches for a log that lacks it: no receipt taken now proves delivery.
+ * Not for an epoch opened with the page cache kept: that log lost nothing, and in a database with both sharded
+ * and ordinary tables a peer on another shard never reports, so such an epoch can stay unfinished for good.
+ */
+function ownWritesUnrecovered(
+	database: string,
+	thisNode: string
+): Exclude<OwnLineage, { state: 'intact' }> | undefined {
+	if (recoveryEpochKeptPageCache(database)) return undefined;
+	for (const tableName in databases[database]) {
+		const lineage = ownLineage(database, null, NO_HOMES, thisNode, tableName);
+		if (lineage.state !== 'intact') return lineage;
+	}
+}
+
+function assertOwnWritesRecovered(database: string, thisNode: string): void {
+	const unrecovered = ownWritesUnrecovered(database, thisNode);
+	if (!unrecovered) return;
+	throw new ClientError(
+		unrecovered.state === 'pending'
+			? `${thisNode} restarted after its operating system did, which can lose its latest writes, and its peers have yet to return its own writes to database ${database} (${unrecovered.detail}), so they cannot be drained yet; retry once they are back, or use force: true to remove it without draining`
+			: `${thisNode} restarted after its operating system did, which can lose its latest writes, and cannot prove it has its own writes to database ${database} back from its peers (${unrecovered.detail}), so they cannot be drained; use force: true to remove it without draining`,
+		409
+	);
+}
+
 /**
  * Fence (the default), finalize or cancel this node's removal. Idempotent: a repeat call returns the persisted
  * epoch and targets, and fences any database created since under the same epoch.
@@ -271,6 +303,8 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 					`Database ${database} keeps its tables in more than one storage root, so its writes cannot be drained before removal; use force: true to remove without draining`,
 					400
 				);
+		// a finalized removal took its receipts before the restart; until then none proves delivery
+		if (!wasRemoving) for (const database of roots.keys()) assertOwnWritesRecovered(database, thisNode);
 		required = new Map([...roots.keys()].map((database) => [database, requiredPeers(database, thisNode)]));
 	} catch (error) {
 		throw await liftRefusedFence(error, thisNode);
@@ -411,7 +445,12 @@ async function clearFences(): Promise<void> {
 		if (epoch !== undefined)
 			try {
 				markRemoval(epoch);
-			} catch {}
+			} catch (markError) {
+				hdbLogger.error(
+					'Could not restore the removal mark after a failed fence lift; remove_node with cancel: true lifts every fence',
+					markError
+				);
+			}
 		throw error;
 	}
 }
@@ -447,6 +486,27 @@ export async function liftFenceAfterRemoval(removed: boolean): Promise<void> {
 		if (!removed && finalized(currentStores())) return;
 		await clearFences();
 		hdbLogger.notify(`${getThisNodeName()} left its cluster; local writes are accepted again`);
+	});
+}
+
+/**
+ * At startup, before workers run: lift a fence restored from before a restart that may have lost this node's latest
+ * writes (`ownWritesUnrecovered`), unless the removal was finalized. Left set, it would refuse the writes its peers
+ * return, and the frames given up on would leave a hole on every route they came by. The removal's next poll is
+ * refused until every peer reported, then fences at a new target above the returned writes.
+ */
+export async function liftFenceForOwnRecovery(): Promise<void> {
+	await withFenceLock(async () => {
+		const roots = databaseRoots();
+		const stores = [...roots.values()].flat().filter(canBeFenced);
+		if (!fenceHeld(stores) || finalized(stores)) return;
+		const thisNode = getThisNodeName();
+		const recovering = [...roots.keys()].filter((database) => ownWritesUnrecovered(database, thisNode));
+		if (recovering.length === 0) return;
+		await clearFences();
+		hdbLogger.notify(
+			`${thisNode} restarted after its operating system did while it was being removed, and its peers have yet to return its own writes to ${recovering.join(', ')}: local writes are accepted again; run remove_node again once they are back`
+		);
 	});
 }
 

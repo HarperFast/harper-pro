@@ -16,6 +16,8 @@ import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import {
 	markOwnOriginRecoveryFailed,
 	openOwnOriginRecoveryEpoch,
+	sameBootAsPreviousStart,
+	type StartContinuity,
 	startDurableFloorSampler,
 } from './ownOriginRecovery.ts';
 import { clearSyncFailureMarker, readBootId, readSyncFailureMarker, watchLogSyncFailures } from './bootIdentity.ts';
@@ -1213,7 +1215,9 @@ export async function startOnMainThread(options) {
 	const rootPath = env.getHdbBasePath();
 	watchLogSyncFailures(rootPath);
 	const syncFailure = rootPath ? readSyncFailureMarker(rootPath) : { present: true };
-	const continuity = { bootId: readBootId(), syncFailure: syncFailure.present };
+	const continuity: StartContinuity = { bootId: readBootId(), syncFailure: syncFailure.present };
+	// before any epoch opens: read from the one `system` holds from the previous start
+	continuity.sameBootAsPreviousStart = sameBootAsPreviousStart(continuity);
 	let epochFailed = false;
 	// find all the databases last recorded audit entry so that we can inquire from the first node for self catch-up
 	// of any records that may have been missed
