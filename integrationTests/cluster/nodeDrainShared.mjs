@@ -7,7 +7,7 @@ import { basename, join } from 'node:path';
 import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, waitForCondition } from './clusterShared.mjs';
+import { sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 const FIXTURE = join(import.meta.dirname, 'fixture-node-drain');
@@ -41,31 +41,37 @@ export function nodeOptions(context) {
 /** `schema` replaces the fixture's schema.graphql; `database` is the one whose sockets `meshed` waits for. */
 export async function startShardedCluster(ctx, shards, { env, schema, database } = {}) {
 	const contexts = [];
-	for (const shard of shards) {
-		const hostname = await getNextAvailableLoopbackAddress();
-		const dataRootDir = await mkdtemp(
-			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-')
-		);
-		const pauseDir = await mkdtemp(join(tmpdir(), 'node-drain-pause-'));
-		const context = { name: ctx.name, shard, hostname, pauseDir, env, harper: { hostname, dataRootDir } };
-		contexts.push(context);
-		await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
-		if (schema) await writeFile(join(dataRootDir, 'components', basename(FIXTURE), 'schema.graphql'), schema);
-		await startHarper(context, nodeOptions(context));
-	}
-	const [seed, ...peers] = contexts.map((context) => context.harper);
-	const { operation_token: token } = await sendOperation(seed, {
-		operation: 'create_authentication_tokens',
-		authorization: seed.admin,
-	});
-	for (const peer of peers)
-		await sendOperation(peer, {
-			operation: 'add_node',
-			hostname: seed.hostname,
-			authorization: 'Bearer ' + token,
-			rejectUnauthorized: false,
+	try {
+		for (const shard of shards) {
+			const hostname = await getNextAvailableLoopbackAddress();
+			const dataRootDir = await mkdtemp(
+				join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-')
+			);
+			const pauseDir = await mkdtemp(join(tmpdir(), 'node-drain-pause-'));
+			const context = { name: ctx.name, shard, hostname, pauseDir, env, harper: { hostname, dataRootDir } };
+			contexts.push(context);
+			await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
+			if (schema) await writeFile(join(dataRootDir, 'components', basename(FIXTURE), 'schema.graphql'), schema);
+			await startHarper(context, nodeOptions(context));
+		}
+		const [seed, ...peers] = contexts.map((context) => context.harper);
+		const { operation_token: token } = await sendOperation(seed, {
+			operation: 'create_authentication_tokens',
+			authorization: seed.admin,
 		});
-	await meshed(contexts, undefined, database);
+		for (const peer of peers)
+			await sendOperation(peer, {
+				operation: 'add_node',
+				hostname: seed.hostname,
+				authorization: 'Bearer ' + token,
+				rejectUnauthorized: false,
+			});
+		await meshed(contexts, undefined, database);
+	} catch (error) {
+		// the caller's after() never receives these contexts, so nothing else stops the nodes already started
+		await stopAndTeardownNodes(contexts.map((context) => context.harper)).catch(() => {});
+		throw error;
+	}
 	return contexts;
 }
 
