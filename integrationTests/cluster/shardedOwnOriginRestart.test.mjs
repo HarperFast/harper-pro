@@ -1,6 +1,6 @@
 // A sharded node restarted on the same boot continues an own-origin recovery epoch its cross-shard peers never
-// finish. Asking its same-shard co-owner for its own writes back would bring its sharded records outside a
-// snapshot copy, which the decoder refuses by closing the link, on every reconnect (harper-pro#1364).
+// finish, so it asks its same-shard co-owner for its own writes back. The co-owner's recovery pass leaves out
+// sharded records, which the decoder refuses outside a snapshot copy by closing the link (harper-pro#1364).
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { restartNode, stopAndTeardownNodes } from './clusterShared.mjs';

@@ -1019,7 +1019,7 @@ const productionDeps: RecordLockTransportDeps = {
 			tableReplicates: (table) => tableReplicates(database, table),
 			isPoisoned: (origin, table) => isPoisoned(database, origin, table),
 			everRecloned: () => everRecloned(database),
-			ownLineage: (position, homes) => ownLineage(database, position, homes, getThisNodeName()),
+			ownLineage: (position, homes, table) => ownLineage(database, position, homes, getThisNodeName(), table),
 			async requestBarrier(origin, table, nonce, timeoutMs) {
 				const reply = await sendRecordLockOperation(
 					origin,
@@ -1809,9 +1809,13 @@ setRecordLockOwnershipReaders({
 			try {
 				homes = transports.get(database)?.homeMap(database)?.homes ?? NO_HOMES;
 			} catch {}
-			return ownLineage(database, null, homes, self).state === 'intact';
+			return ownLineage(database, null, homes, self, table).state === 'intact';
 		} catch (error) {
-			logger.warn?.(`Could not check this node's own lineage on ${database}; refusing the barrier`, error);
+			const now = performance.now();
+			if (!(lineageWarnedAt.get(database) > now - LINEAGE_WARNING_INTERVAL_MS)) {
+				lineageWarnedAt.set(database, now);
+				logger.warn?.(`Could not check this node's own lineage on ${database}; refusing barriers`, error);
+			}
 			return false;
 		}
 	},
@@ -1819,6 +1823,8 @@ setRecordLockOwnershipReaders({
 
 // one identity, so ownLineage's per-home-list proof cache holds while no home map is known
 const NO_HOMES: readonly string[] = Object.freeze([]);
+const LINEAGE_WARNING_INTERVAL_MS = 60_000;
+const lineageWarnedAt = new Map<string, number>();
 
 function tableReplicates(database: string, table: string): boolean {
 	const definition = getDatabases()[database]?.[table];
