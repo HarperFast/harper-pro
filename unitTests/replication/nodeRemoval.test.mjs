@@ -6,6 +6,7 @@ import {
 	drainNode,
 	drainTimeoutMs,
 	getReceivedOriginFloors,
+	liftFenceAfterRemoval,
 	receiptShortfall,
 	receiptsBindRequired,
 	markRemoval,
@@ -14,7 +15,7 @@ import {
 	unmarkRemoval,
 } from '#src/replication/nodeRemoval';
 import { materializeOperationResponse } from '#src/replication/materializeOperationResponse';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { databases, table } from '#src/core/resources/databases';
@@ -435,6 +436,27 @@ describe('lifting a removal fence (harper-pro#1348)', () => {
 		// as on a thread that another thread's schema change has not reached
 		delete databases.opened_elsewhere;
 		assert.deepEqual(await fenceCall({ cancel: true }), { cancelled: true });
+		assert.equal(localWritesFenced(rootStore), false);
+	});
+
+	it('keeps the mark when deleting it cannot be synced, so a retry still finds a database this thread has not loaded', async function () {
+		// a directory without read permission lets the mark be unlinked, then fails the directory sync
+		if (process.platform === 'win32' || process.getuid?.() === 0) return this.skip();
+		const markDirectory = env.get(CONFIG_PARAMS.ROOTPATH);
+		markRemoval('epoch-sync');
+		const rootStore = open('sync_fails_elsewhere', 'Elsewhere').primaryStore.rootStore;
+		assert.equal(localWritesFenced(rootStore), true);
+		delete databases.sync_fails_elsewhere;
+		chmodSync(markDirectory, 0o300);
+		try {
+			await assert.rejects(liftFenceAfterRemoval(true), { code: 'EACCES' });
+		} finally {
+			chmodSync(markDirectory, 0o700);
+		}
+		assert.equal(removalMarked(), true);
+		assert.equal(localWritesFenced(rootStore), true);
+		await liftFenceAfterRemoval(true);
+		assert.equal(removalMarked(), false);
 		assert.equal(localWritesFenced(rootStore), false);
 	});
 

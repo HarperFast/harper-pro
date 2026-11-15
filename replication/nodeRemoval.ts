@@ -397,9 +397,9 @@ function currentStores(): any[] {
 
 async function clearFences(): Promise<void> {
 	const epoch = removalMarked() ? markedEpoch() : undefined;
-	// first, so a root opened while these are cleared does not start fenced with nothing left to lift it
-	unmarkRemoval();
 	try {
+		// first, so a root opened while these are cleared does not start fenced with nothing left to lift it
+		unmarkRemoval();
 		for (const auditStore of currentStores()) {
 			if (!holdsFence(auditStore)) continue;
 			syncedFences.delete(auditStore);
