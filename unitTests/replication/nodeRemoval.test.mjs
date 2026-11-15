@@ -9,13 +9,17 @@ import {
 	receiptsBindRequired,
 	markRemoval,
 	removalMarked,
+	removeNodeFence,
 	unmarkRemoval,
 } from '#src/replication/nodeRemoval';
-import { mkdtempSync } from 'node:fs';
+import { materializeOperationResponse } from '#src/replication/materializeOperationResponse';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { table } from '#src/core/resources/databases';
+import { databases, table } from '#src/core/resources/databases';
+import { persistLocalWriteFence, readLocalWriteFence } from '#src/core/resources/auditStore';
 import { localWritesFenced, setLocalWriteFence } from '#src/core/resources/originClosedFloor';
+import { getThisNodeName } from '#src/core/server/nodeName';
 import { CONFIG_PARAMS } from '#src/core/utility/hdbTerms';
 import * as env from '#src/core/utility/environment/environmentManager';
 
@@ -111,7 +115,7 @@ describe('drainNode', () => {
 				return operation.finalize ? { ...fence(), state: 'removing' } : fence();
 			assert.equal(operation.operation, RECEIPT_OPERATION);
 			assert.deepEqual(operation.databases, ['data']);
-			return { data: holds };
+			return { databases: { data: holds } };
 		});
 		const result = await drainNode('leaving', { name: 'leaving' }, 5000, send, async (peer) => ({ name: peer }));
 		assert.equal(result.state, 'removing');
@@ -131,7 +135,7 @@ describe('drainNode', () => {
 		const send = transport((node, operation) => {
 			if (operation.operation === FENCE_OPERATION) return fence();
 			receipts++;
-			return { data: node.name === 'p2' && receipts < 4 ? { ...holds, closedFloor: T - 1 } : holds };
+			return { databases: { data: node.name === 'p2' && receipts < 4 ? { ...holds, closedFloor: T - 1 } : holds } };
 		});
 		await drainNode('leaving', { name: 'leaving' }, 10_000, send, async (peer) => ({ name: peer }));
 		assert.ok(receipts >= 4);
@@ -141,7 +145,7 @@ describe('drainNode', () => {
 		const send = transport((node, operation) => {
 			if (operation.operation === FENCE_OPERATION) return fence();
 			if (node.name === 'p2') throw new Error('connect ECONNREFUSED');
-			return { data: { ...holds, closedFloor: T - 1 } };
+			return { databases: { data: { ...holds, closedFloor: T - 1 } } };
 		});
 		await assert.rejects(
 			drainNode('leaving', { name: 'leaving' }, 1200, send, async (peer) => ({ name: peer })),
@@ -204,7 +208,7 @@ describe('drainNode', () => {
 		const send = transport((node, operation) => {
 			if (operation.operation === FENCE_OPERATION)
 				return operation.finalize ? { ...fence(), state: 'removing' } : fence();
-			return { data: node.name === 'p2' ? { closedFloor: null, receives: false } : holds };
+			return { databases: { data: node.name === 'p2' ? { closedFloor: null, receives: false } : holds } };
 		});
 		const result = await drainNode('leaving', { name: 'leaving' }, 5000, send, async (peer) => ({ name: peer }));
 		assert.deepEqual(result.databases.data.peers, ['p1']);
@@ -213,7 +217,7 @@ describe('drainNode', () => {
 	it('refuses when no peer the node sends a database to subscribes to it', async () => {
 		const send = transport((node, operation) => {
 			if (operation.operation === FENCE_OPERATION) return fence();
-			return { data: { closedFloor: null, receives: false } };
+			return { databases: { data: { closedFloor: null, receives: false } } };
 		});
 		await assert.rejects(
 			drainNode('leaving', { name: 'leaving' }, 5000, send, async (peer) => ({ name: peer })),
@@ -240,7 +244,7 @@ describe('drainNode', () => {
 		});
 		const send = transport((node, operation) => {
 			if (operation.operation === FENCE_OPERATION) return operation.cancel ? { cancelled: true } : sharded();
-			return { data: node.name === 'p1' ? { closedFloor: null, receives: false } : holds };
+			return { databases: { data: node.name === 'p1' ? { closedFloor: null, receives: false } : holds } };
 		});
 		await assert.rejects(
 			drainNode('leaving', { name: 'leaving' }, 5000, send, async (peer) => ({ name: peer })),
@@ -253,7 +257,7 @@ describe('drainNode', () => {
 		const send = transport(async (node, operation) => {
 			if (operation.operation === FENCE_OPERATION) return fence();
 			await new Promise((resolve) => setTimeout(resolve, 200));
-			return { data: { ...holds, closedFloor: T - 1 } };
+			return { databases: { data: { ...holds, closedFloor: T - 1 } } };
 		});
 		await assert.rejects(
 			drainNode('leaving', { name: 'leaving' }, 1500, send, async (peer) => ({ name: peer })),
@@ -299,6 +303,34 @@ describe('drainNode', () => {
 		assert.equal(send.calls.length, 1);
 	});
 
+	it('reads the receipts of databases named like the operation envelope keys', async () => {
+		const names = ['error', 'requestId', 'results'];
+		const drains = Object.fromEntries(
+			names.map((name) => [name, { target: T, generation: 'gen-1', sharded: false, peers: ['p1'] }])
+		);
+		// what an operation connection does to an answer: the peer stamps its request id on it, and the caller
+		// rejects one that carries `error`
+		const overTheWire = async (answer) => {
+			const response = await materializeOperationResponse(answer);
+			response.requestId = 7;
+			if (response.error) throw new Error(response.error);
+			return response;
+		};
+		const send = transport((node, operation) => {
+			if (operation.operation === FENCE_OPERATION)
+				return overTheWire({
+					node: 'leaving',
+					epoch: 'e1',
+					state: operation.finalize ? 'removing' : 'fenced',
+					databases: drains,
+				});
+			return overTheWire({ databases: Object.fromEntries(operation.databases.map((name) => [name, holds])) });
+		});
+		const result = await drainNode('leaving', { name: 'leaving' }, 5000, send, async (peer) => ({ name: peer }));
+		assert.equal(result.state, 'removing');
+		for (const name of names) assert.deepEqual(result.databases[name].peers, ['p1'], name);
+	});
+
 	it('re-fences after a refused finalize, for a database created during the drain', async () => {
 		let fences = 0;
 		const send = transport((node, operation) => {
@@ -307,7 +339,7 @@ describe('drainNode', () => {
 				if (!operation.finalize) fences++;
 				return operation.finalize ? { ...fence(), state: 'removing' } : fence();
 			}
-			return { data: holds };
+			return { databases: { data: holds } };
 		});
 		const result = await drainNode('leaving', {}, 10_000, send, async (peer) => ({ name: peer }));
 		assert.equal(result.state, 'removing');
@@ -338,5 +370,69 @@ describe('a database created while a removal is marked (harper-pro#1348)', () =>
 		unmarkRemoval();
 		assert.equal(removalMarked(), false);
 		assert.equal(localWritesFenced(open('created_after_removal')), false);
+	});
+});
+
+describe('lifting a removal fence (harper-pro#1348)', () => {
+	const attributes = [{ name: 'id', isPrimaryKey: true }];
+	let rootPath;
+	before(() => {
+		rootPath = env.get(CONFIG_PARAMS.ROOTPATH);
+		env.setProperty(CONFIG_PARAMS.ROOTPATH, mkdtempSync(join(tmpdir(), 'removal-lift-')));
+	});
+	after(() => {
+		unmarkRemoval();
+		env.setProperty(CONFIG_PARAMS.ROOTPATH, rootPath);
+	});
+
+	const open = (database, tableName) => table({ table: tableName, database, attributes });
+	const fenceCall = (request) =>
+		removeNodeFence({
+			operation: FENCE_OPERATION,
+			node: getThisNodeName(),
+			hdb_user: { name: 'admin', role: { permission: { super_user: true } } },
+			...request,
+		});
+
+	it('lifts the fence an earlier poll left when a later poll is refused', async () => {
+		const fenced = open('fenced_then_refused', 'Fenced');
+		const rootStore = fenced.primaryStore.rootStore;
+		markRemoval('epoch-1');
+		const target = setLocalWriteFence(rootStore, true);
+		await persistLocalWriteFence(fenced.auditStore, { epoch: 'epoch-1', target, state: 'fenced' });
+		// a database on LMDB has no durable floor, so the poll is refused before it fences anything
+		const engine = process.env.HARPER_STORAGE_ENGINE;
+		process.env.HARPER_STORAGE_ENGINE = 'lmdb';
+		let legacy;
+		try {
+			legacy = open('refusing_lmdb', 'Legacy').primaryStore.rootStore;
+		} finally {
+			if (engine === undefined) delete process.env.HARPER_STORAGE_ENGINE;
+			else process.env.HARPER_STORAGE_ENGINE = engine;
+		}
+		await assert.rejects(fenceCall({}), (error) => {
+			assert.equal(error.statusCode, 400);
+			assert.match(error.message, /no durable origin-closed floor/);
+			assert.match(error.message, /accepts local writes again$/);
+			return true;
+		});
+		assert.equal(localWritesFenced(rootStore), false);
+		assert.equal(readLocalWriteFence(fenced.auditStore), undefined);
+		assert.equal(removalMarked(), false);
+		// gone from disk, so no catalog rescan in a later suite finds an LMDB database
+		delete databases.refusing_lmdb;
+		await legacy.close();
+		rmSync(legacy.path, { force: true });
+		rmSync(`${legacy.path}-lock`, { force: true });
+	});
+
+	it('lifts on cancel a fence on a database this thread has not loaded yet', async () => {
+		markRemoval('epoch-2');
+		const rootStore = open('opened_elsewhere', 'Elsewhere').primaryStore.rootStore;
+		assert.equal(localWritesFenced(rootStore), true);
+		// as on a thread that another thread's schema change has not reached
+		delete databases.opened_elsewhere;
+		assert.deepEqual(await fenceCall({ cancel: true }), { cancelled: true });
+		assert.equal(localWritesFenced(rootStore), false);
 	});
 });

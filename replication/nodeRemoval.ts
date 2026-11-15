@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, openSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { databases } from '../core/resources/databases.ts';
+import { databases, resetDatabases } from '../core/resources/databases.ts';
 import {
 	isValidFloor,
 	localWritesFenced,
@@ -246,21 +246,26 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 				`${thisNode}'s removal was finalized; complete it with remove_node, or, if it was already removed, run ${FENCE_OPERATION} with cancel and force on it`,
 				409
 			);
-		await clearFences(roots);
+		await clearFences();
 		hdbLogger.notify(`Removal of ${thisNode} from its cluster was cancelled; local writes are accepted again`);
 		return { cancelled: true };
 	}
-	for (const [database, auditStores] of roots)
-		for (const auditStore of auditStores) assertDrainable(database, auditStore);
-	for (const [database, auditStores] of roots)
-		// replication sends and certifies floors for one root per database; another root's writes have no receipt
-		if (auditStores.length > 1)
-			throw new ClientError(
-				`Database ${database} keeps its tables in more than one storage root, so its writes cannot be drained before removal; use force: true to remove without draining`,
-				400
-			);
+	let required: Map<string, ReturnType<typeof requiredPeers>>;
+	try {
+		for (const [database, auditStores] of roots)
+			for (const auditStore of auditStores) assertDrainable(database, auditStore);
+		for (const [database, auditStores] of roots)
+			// replication sends and certifies floors for one root per database; another root's writes have no receipt
+			if (auditStores.length > 1)
+				throw new ClientError(
+					`Database ${database} keeps its tables in more than one storage root, so its writes cannot be drained before removal; use force: true to remove without draining`,
+					400
+				);
+		required = new Map([...roots.keys()].map((database) => [database, requiredPeers(database, thisNode)]));
+	} catch (error) {
+		throw await liftRefusedFence(error, thisNode, wasRemoving);
+	}
 	const epoch = fences.find((fence) => fence.epoch)?.epoch || randomUUID();
-	const required = new Map([...roots.keys()].map((database) => [database, requiredPeers(database, thisNode)]));
 	if (request.finalize !== undefined) {
 		const expected = new Set(request.databases ?? []);
 		// the receipts vouch for one target and generation per database; a database dropped and created again since
@@ -353,20 +358,47 @@ async function changeFence(request: any, thisNode: string): Promise<FenceState |
 // only a durable-floor (RocksDB) root can hold a fence; reading one on an LMDB root would build a registry it lacks
 const canBeFenced = (auditStore: any): boolean => originFloorsDurable(auditStore.rootStore ?? auditStore);
 
-async function clearFences(roots: Map<string, any[]>): Promise<void> {
+const holdsFence = (auditStore: any): boolean =>
+	readLocalWriteFence(auditStore) !== undefined || localWritesFenced(auditStore.rootStore ?? auditStore);
+
+// a clear whose WAL sync failed leaves the word set with no record
+const fenceHeld = (stores: any[]): boolean => removalMarked() || stores.some(holdsFence);
+
+async function clearFences(): Promise<void> {
 	// first, so a root opened while these are cleared does not start fenced with nothing left to lift it
 	unmarkRemoval();
-	for (const auditStores of roots.values())
-		for (const auditStore of auditStores) {
-			if (
-				!canBeFenced(auditStore) ||
-				(!readLocalWriteFence(auditStore) && !localWritesFenced(auditStore.rootStore ?? auditStore))
-			)
-				continue;
-			syncedFences.delete(auditStore);
-			await persistLocalWriteFence(auditStore, undefined);
-			setLocalWriteFence(auditStore.rootStore ?? auditStore, false);
-		}
+	// a root another thread opened under the mark is fenced in every thread, but this thread's catalog may not hold
+	// it until that thread's schema change arrives
+	try {
+		resetDatabases();
+	} catch (error) {
+		hdbLogger.warn('Could not rescan databases before lifting the removal fence', error);
+	}
+	for (const auditStore of [...databaseRoots().values()].flat()) {
+		if (!canBeFenced(auditStore) || !holdsFence(auditStore)) continue;
+		syncedFences.delete(auditStore);
+		await persistLocalWriteFence(auditStore, undefined);
+		setLocalWriteFence(auditStore.rootStore ?? auditStore, false);
+	}
+}
+
+/**
+ * A refusal to fence means no wait can drain this node until the cluster changes, so a fence an earlier poll or
+ * `remove_node` left would only refuse its writes: lift it unless the removal was finalized, and say so.
+ */
+async function liftRefusedFence(refusal: any, thisNode: string, wasRemoving: boolean): Promise<unknown> {
+	if (!isRefusal(refusal) || wasRemoving || !fenceHeld([...databaseRoots().values()].flat().filter(canBeFenced)))
+		return refusal;
+	try {
+		await clearFences();
+	} catch (error) {
+		return new ClientError(
+			`${refusal.message}; ${thisNode} is still fenced (${errorText(error)}): remove_node with cancel: true lifts it`,
+			refusal.statusCode
+		);
+	}
+	hdbLogger.notify(`Removal of ${thisNode} from its cluster was refused; local writes are accepted again`);
+	return new ClientError(`${refusal.message}; ${thisNode} accepts local writes again`, refusal.statusCode);
 }
 
 /**
@@ -377,27 +409,20 @@ async function clearFences(roots: Map<string, any[]>): Promise<void> {
  */
 export async function liftFenceAfterRemoval(removed: boolean): Promise<void> {
 	await withFenceLock(async () => {
-		const roots = databaseRoots();
-		const stores = [...roots.values()].flat().filter(canBeFenced);
-		const fences = stores.map(readLocalWriteFence).filter(Boolean) as LocalWriteFence[];
-		// a clear whose WAL sync failed leaves the word set with no record
-		if (
-			fences.length === 0 &&
-			!stores.some((auditStore) => localWritesFenced(auditStore.rootStore ?? auditStore)) &&
-			!removalMarked()
-		)
-			return;
-		if (!removed && fences.some((fence) => fence.state === 'removing')) return;
-		await clearFences(roots);
+		const stores = [...databaseRoots().values()].flat().filter(canBeFenced);
+		if (!fenceHeld(stores)) return;
+		if (!removed && stores.some((auditStore) => readLocalWriteFence(auditStore)?.state === 'removing')) return;
+		await clearFences();
 		hdbLogger.notify(`${getThisNodeName()} left its cluster; local writes are accepted again`);
 	});
 }
 
 /**
  * The certified floor this node has recorded for `origin` on its direct route from it, per database, after a WAL
- * sync: the answer and the records below it survive power loss once it is sent.
+ * sync: the answer and the records below it survive power loss once it is sent. Keyed under `databases`, since the
+ * operation envelope owns its top-level keys (`requestId`, `error`, `results`) and a database can bear any of them.
  */
-export async function getReceivedOriginFloors(request: any): Promise<Record<string, ReceivedFloor>> {
+export async function getReceivedOriginFloors(request: any): Promise<{ databases: Record<string, ReceivedFloor> }> {
 	authorize(request, RECEIPT_OPERATION);
 	const { origin } = request;
 	if (typeof origin !== 'string' || !origin) throw new ClientError('origin is required', 400);
@@ -442,7 +467,7 @@ export async function getReceivedOriginFloors(request: any): Promise<Record<stri
 		if (typeof rootStore.syncWal === 'function') await rootStore.syncWal();
 		else rootStore.flushSync?.({ allowWriteStall: true });
 	}
-	return answers;
+	return { databases: answers };
 }
 
 /**
@@ -525,8 +550,7 @@ export async function drainNode(
 			if (operation.operation === FENCE_OPERATION) return removeNodeFence(request, deadline);
 			return withinBudget(getReceivedOriginFloors(request));
 		}
-		const response = await sendOperation(peerRecord, operation, { timeoutMs: Math.min(CALL_TIMEOUT_MS, remaining()) });
-		return response?.results ?? response;
+		return sendOperation(peerRecord, operation, { timeoutMs: Math.min(CALL_TIMEOUT_MS, remaining()) });
 	};
 	const pause = () => new Promise((resolve) => setTimeout(resolve, Math.min(POLL_INTERVAL_MS, remaining())));
 	let shortfalls: string[] = [];
@@ -563,13 +587,14 @@ export async function drainNode(
 				budgetSpent = true;
 				break;
 			}
-			let answers: Record<string, ReceivedFloor>;
+			let answers: Record<string, ReceivedFloor> | undefined;
 			try {
-				answers = await call(peer, peer === thisNode ? undefined : await withinBudget(nodeRecord(peer)), {
+				const receipt = await call(peer, peer === thisNode ? undefined : await withinBudget(nodeRecord(peer)), {
 					operation: RECEIPT_OPERATION,
 					origin: name,
 					databases: peerDatabases,
 				});
+				answers = receipt?.databases;
 			} catch (error) {
 				if (error instanceof OutOfBudget) {
 					budgetSpent = true;

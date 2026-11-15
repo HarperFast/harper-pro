@@ -203,11 +203,12 @@ suite('Blob-gap escalation budget bounds a 503-forever source (#432)', { timeout
 		// A still holds the bytes, so B lacks a write A made: B's receipt for A must not vouch for it (harper-pro#1348)
 		const receipt = await waitForCondition(
 			async (signal) => {
-				const { data } = await sendOperation(
+				const receipt = await sendOperation(
 					B,
 					{ operation: 'get_received_origin_floors', origin: A.hostname, databases: ['data'] },
 					{ signal }
 				);
+				const data = receipt?.databases?.data;
 				return data?.hole === true && data;
 			},
 			{ timeoutMs: 30000, description: "B's receipt for A to record the skipped blob as a hole" }

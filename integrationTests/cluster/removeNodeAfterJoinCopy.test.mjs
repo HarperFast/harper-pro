@@ -93,7 +93,7 @@ suite(
 						{ operation: 'get_received_origin_floors', origin: leader.hostname, databases: ['data'] },
 						{ signal }
 					);
-					return typeof receipt?.data?.closedFloor === 'number';
+					return typeof receipt?.databases?.data?.closedFloor === 'number';
 				},
 				{ timeoutMs: 30_000, description: `${joiner.hostname} to record a certified floor for ${leader.hostname}` }
 			);

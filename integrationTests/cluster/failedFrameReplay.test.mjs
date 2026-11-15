@@ -72,11 +72,13 @@ suite('Replication of a frame whose transaction fails', { timeout: 180000 }, (ct
 		// the skipped write is missing on A for good: A's receipt for B must not vouch for it (harper-pro#1348)
 		let receipt;
 		for (const until = Date.now() + 30000; Date.now() < until; await delay(250)) {
-			({ data: receipt } = await sendOperation(nodeA, {
-				operation: 'get_received_origin_floors',
-				origin: nodeB.hostname,
-				databases: ['data'],
-			}));
+			receipt = (
+				await sendOperation(nodeA, {
+					operation: 'get_received_origin_floors',
+					origin: nodeB.hostname,
+					databases: ['data'],
+				})
+			)?.databases?.data;
 			if (receipt?.hole === true) break;
 		}
 		equal(receipt?.hole, true, `A's receipt for B after the skip: ${JSON.stringify(receipt)}`);
