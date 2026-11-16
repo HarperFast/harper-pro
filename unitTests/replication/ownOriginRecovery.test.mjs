@@ -23,6 +23,8 @@ import {
 	ORIGIN_CURSOR_OVERLAP_MS,
 	returnedByOwnOriginRecovery,
 	isHeldOwnWrite,
+	loggedMessageIdentity,
+	messagesLoggedAt,
 } from '#src/replication/replicationConnection';
 import {
 	buildLocalCapabilities,
@@ -202,6 +204,82 @@ describe('isHeldOwnWrite', () => {
 		assert.strictEqual(isHeldOwnWrite({ version: 6 }, 5), false, 'an older own write core may merge out of order');
 		assert.strictEqual(isHeldOwnWrite({ version: 4 }, 5), false, 'a lost write');
 		assert.strictEqual(isHeldOwnWrite(undefined, 5), false);
+	});
+});
+
+describe('messagesLoggedAt', () => {
+	before(() => setupTestDBPath());
+	it("vouches for an own message the log still holds that the topic's record no longer does", async () => {
+		const Messages = table({
+			database: 'own-logged-messages',
+			table: 'Messages',
+			attributes: [{ name: 'id', isPrimaryKey: true }],
+		});
+		if (!Messages.auditStore?.reusableIterable) return; // per-origin logs are RocksDB's
+		await Messages.publish('sensor/1', { n: 1 });
+		await Messages.publish('sensor/1', { n: 2 });
+		const logged = [];
+		for (const entry of Messages.auditStore.getRange({ log: 'local', start: 1, snapshot: false }))
+			if (entry.type === 'message' && entry.tableId === Messages.tableId) logged.push(entry);
+		assert.strictEqual(logged.length, 2);
+		const [first, second] = logged;
+		assert.strictEqual(
+			isHeldOwnWrite(Messages.primaryStore.getEntry('sensor/1'), first.version),
+			false,
+			'the record holds only the newest message, so it cannot vouch for the first'
+		);
+		for (const entry of [first, second])
+			assert.ok(
+				messagesLoggedAt(Messages.auditStore, 'local', entry.txnLogKey).has(
+					loggedMessageIdentity(Messages.tableId, 'sensor/1', entry.version)
+				)
+			);
+		assert.strictEqual(
+			messagesLoggedAt(Messages.auditStore, 'local', first.txnLogKey).has(
+				loggedMessageIdentity(Messages.tableId, 'sensor/1', second.version)
+			),
+			false,
+			"another frame's message is not vouched for at this key"
+		);
+		assert.strictEqual(
+			messagesLoggedAt(Messages.auditStore, 'local', second.txnLogKey + 0.001).size,
+			0,
+			'a key the log lost holds nothing, so a returned message there is applied'
+		);
+	});
+	it('vouches only for a whole transaction: a read that stops at a torn frame or failed log vouches for nothing', () => {
+		const entry = { txnLogKey: NOW, type: 'message', tableId: 1, recordId: 'sensor/1', version: NOW };
+		const store = (entries, status) => ({
+			getRange() {
+				return Object.assign(entries, status);
+			},
+		});
+		const identity = loggedMessageIdentity(1, 'sensor/1', NOW);
+		assert.ok(messagesLoggedAt(store([entry]), 'local', NOW).has(identity), 'an intact last transaction');
+		assert.ok(
+			messagesLoggedAt(
+				store([entry, { ...entry, txnLogKey: NOW + 1 }], { corruptFrameStop: { breaks: 1 } }),
+				'local',
+				NOW
+			).has(identity),
+			'a later transaction was reached, so this one is whole'
+		);
+		assert.ok(
+			messagesLoggedAt(store([{ ...entry, endTxn: true }], { corruptFrameStop: { breaks: 1 } }), 'local', NOW).has(
+				identity
+			),
+			'its end was read, so a torn frame after it does not count'
+		);
+		assert.strictEqual(messagesLoggedAt(store([entry], { corruptFrameStop: { breaks: 1 } }), 'local', NOW).size, 0);
+		assert.strictEqual(messagesLoggedAt(store([entry], { failedLogs: new Set(['local']) }), 'local', NOW).size, 0);
+	});
+	it('vouches for nothing when the log cannot be read', () => {
+		const failing = {
+			getRange() {
+				throw new Error('unreadable');
+			},
+		};
+		assert.strictEqual(messagesLoggedAt(failing, 'local', NOW).size, 0);
 	});
 });
 

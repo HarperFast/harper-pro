@@ -4430,6 +4430,32 @@ export function isHeldOwnWrite(held: { version?: number; nodeId?: number } | und
 	return held !== undefined && held.version === version && !held.nodeId;
 }
 
+export const loggedMessageIdentity = (tableId: number, id: unknown, version: number) =>
+	`${tableId}:${version}:${toBufferKey(id as any).toString('latin1')}`;
+
+// A topic's row holds at most its newest message, so only the own log can vouch that a returned one survived.
+// Only a whole transaction vouches: replayLogs may not restore a torn one's readable prefix.
+export function messagesLoggedAt(auditStore: any, log: string, txnLogKey: number): Set<string> {
+	const logged = new Set<string>();
+	try {
+		const range = auditStore.getRange({ log, start: txnLogKey, exactStart: true, snapshot: false });
+		let complete = false;
+		for (const entry of range) {
+			if (entry.txnLogKey !== txnLogKey) {
+				complete = true;
+				break;
+			}
+			if (entry.type === 'message') logged.add(loggedMessageIdentity(entry.tableId, entry.recordId, entry.version));
+			if (entry.endTxn) complete = true;
+		}
+		if (!complete && (range?.corruptFrameStop?.breaks > 0 || range?.failedLogs?.size > 0)) logged.clear();
+	} catch (error) {
+		logger.trace?.('own-origin recovery: could not read', log, 'at', txnLogKey, error);
+		logged.clear();
+	}
+	return logged;
+}
+
 /**
  * The receiver applies its own residency records of a sharded table only from a snapshot copy, and closes the
  * link on one sent live (non-obvious behavior 39, "Known limits"), so the recovery pass leaves them out.
@@ -11403,6 +11429,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// Read only after proving the header is there: a body shorter than its own 8-byte header is
 			// malformed, and getFloat64 would throw a RangeError past every graceful path below.
 			const frameTxnLogKey = body.byteLength >= 8 ? decoder.getFloat64(0) : NaN;
+			let ownLoggedMessages: Set<string> | undefined;
 			if (!isValidFrameTxnLogKey(frameTxnLogKey)) {
 				// Hold rather than skip, as the missing-table-decoder path does: nothing durable or
 				// status-visible has moved yet, so closing leaves the cursor where it was and the peer
@@ -11775,7 +11802,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					ownOriginRecoveryRequested !== undefined &&
 					!messageIsCopyFrame &&
 					!(auditRecord.extendedType & HAS_BLOBS) &&
-					isHeldOwnWrite(readLocalEntry(tableDecoder, id), auditRecord.version)
+					(auditRecord.type === 'message'
+						? tableDecoder.table?.tableId !== undefined &&
+							(ownLoggedMessages ??= messagesLoggedAt(auditStore, 'local', frameTxnLogKey)).has(
+								loggedMessageIdentity(tableDecoder.table.tableId, id, auditRecord.version)
+							)
+						: isHeldOwnWrite(readLocalEntry(tableDecoder, id), auditRecord.version))
 				) {
 					decoder.position = start + eventLength;
 					continue;
