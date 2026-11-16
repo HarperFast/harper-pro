@@ -6,6 +6,7 @@ import assert from 'node:assert';
 import { createRequire } from 'node:module';
 import { setTimeout as delay } from 'node:timers/promises';
 import { table } from '#src/core/resources/databases';
+import { transaction } from '#src/core/resources/transaction';
 import {
 	continuesEpoch,
 	flushAfterNow,
@@ -22,7 +23,9 @@ import {
 	findOwnOriginRecoveryRange,
 	ORIGIN_CURSOR_OVERLAP_MS,
 	returnedByOwnOriginRecovery,
+	isHeldOwnMessage,
 	isHeldOwnWrite,
+	ownMessagesLoggedAt,
 } from '#src/replication/replicationConnection';
 import {
 	buildLocalCapabilities,
@@ -202,6 +205,84 @@ describe('isHeldOwnWrite', () => {
 		assert.strictEqual(isHeldOwnWrite({ version: 6 }, 5), false, 'an older own write core may merge out of order');
 		assert.strictEqual(isHeldOwnWrite({ version: 4 }, 5), false, 'a lost write');
 		assert.strictEqual(isHeldOwnWrite(undefined, 5), false);
+	});
+});
+
+describe('a returned own message', () => {
+	const database = 'ownOriginHeldMessages';
+	const attributes = [{ name: 'id', isPrimaryKey: true }];
+	let Topics;
+	let Other;
+	let auditStore;
+
+	const logged = () => [...auditStore.getRange({ start: 1, log: 'local' })];
+	const messageAt = (entries, id) =>
+		entries.findLast((entry) => entry.type === 'message' && entry.tableId === Topics.tableId && entry.recordId === id);
+
+	before(function () {
+		setupTestDBPath();
+		Topics = table({ database, table: 'Topics', audit: true, attributes });
+		Other = table({ database, table: 'Other', audit: true, attributes });
+		auditStore = Topics.auditStore;
+		// only per-origin logs keep this node's entries apart, under its own keys
+		if (auditStore.reusableIterable !== true) this.skip();
+	});
+
+	it('is held when the own log has that message at the returned key, whatever the row says', async () => {
+		await Topics.publish('news', { n: 0 });
+		await Topics.publish('news', { n: 1 });
+		const entries = logged().filter((entry) => entry.type === 'message' && entry.recordId === 'news');
+		assert.strictEqual(entries.length, 2);
+		const [older, newer] = entries.map(({ txnLogKey, version }) => ({ txnLogKey, version }));
+		assert.notStrictEqual(older.txnLogKey, newer.txnLogKey);
+		assert.strictEqual(
+			isHeldOwnWrite(Topics.primaryStore.getEntry('news'), older.version),
+			false,
+			'the row ties only the newest publish'
+		);
+		const atOlder = ownMessagesLoggedAt(auditStore, older.txnLogKey);
+		assert.strictEqual(atOlder.length, 1);
+		assert.strictEqual(isHeldOwnMessage(atOlder, Topics.tableId, 'news', older.version), true);
+		assert.strictEqual(isHeldOwnMessage(atOlder, Topics.tableId, 'news', newer.version), false, 'another version');
+		assert.strictEqual(isHeldOwnMessage(atOlder, Topics.tableId, 'sport', older.version), false, 'another topic');
+		assert.strictEqual(isHeldOwnMessage(atOlder, Other.tableId, 'news', older.version), false, 'another table');
+		assert.strictEqual(isHeldOwnMessage(atOlder, undefined, 'news', older.version), false, 'an unknown table');
+	});
+
+	it('finds every message of a transaction that also wrote records, and compound topics', async () => {
+		await transaction({}, async () => {
+			await Topics.put('stored', { id: 'stored' });
+			await Topics.publish('first', { n: 1 });
+			await Topics.publish(['room', 7], { n: 2 });
+			await Other.publish('first', { n: 3 });
+		});
+		const first = messageAt(logged(), 'first');
+		const atKey = ownMessagesLoggedAt(auditStore, first.txnLogKey);
+		assert.strictEqual(atKey.length, 3, 'the put is not a message');
+		assert.strictEqual(isHeldOwnMessage(atKey, Topics.tableId, 'first', first.version), true);
+		assert.strictEqual(isHeldOwnMessage(atKey, Topics.tableId, ['room', 7], first.version), true);
+		assert.strictEqual(isHeldOwnMessage(atKey, Other.tableId, 'first', first.version), true);
+		assert.strictEqual(isHeldOwnMessage(atKey, Topics.tableId, ['room', 8], first.version), false);
+		assert.strictEqual(isHeldOwnMessage(atKey, Topics.tableId, 'stored', first.version), false, 'a record write');
+	});
+
+	it('is not held at a key the own log lacks, so a lost message is applied', async () => {
+		await Topics.publish('lost', { n: 0 });
+		const { txnLogKey, version } = messageAt(logged(), 'lost');
+		for (const missing of [txnLogKey + 0.25, txnLogKey - 0.25, 1]) {
+			const atKey = ownMessagesLoggedAt(auditStore, missing);
+			assert.deepStrictEqual(atKey, [], `nothing at ${missing}`);
+			assert.strictEqual(isHeldOwnMessage(atKey, Topics.tableId, 'lost', version), false);
+		}
+	});
+
+	it('proves nothing when the log cannot be read', () => {
+		const unreadable = {
+			getRange() {
+				throw new Error('log unavailable');
+			},
+		};
+		assert.deepStrictEqual(ownMessagesLoggedAt(unreadable, 5), []);
 	});
 });
 

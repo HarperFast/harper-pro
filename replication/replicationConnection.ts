@@ -4430,6 +4430,50 @@ export function isHeldOwnWrite(held: { version?: number; nodeId?: number } | und
 	return held !== undefined && held.version === version && !held.nodeId;
 }
 
+export interface OwnLoggedMessage {
+	tableId: number;
+	recordKey: Buffer;
+	version: number;
+}
+
+/**
+ * The messages in this node's own log at `txnLogKey`: a publish stores no row for `isHeldOwnWrite` to tie, so
+ * its logged entry is the proof it was not lost. A log that cannot be read proves nothing, and the message is
+ * applied.
+ */
+export function ownMessagesLoggedAt(auditStore: any, txnLogKey: number): OwnLoggedMessage[] {
+	const logged: OwnLoggedMessage[] = [];
+	try {
+		for (const entry of auditStore.getRange({ start: txnLogKey, exactStart: true, log: 'local' })) {
+			if (entry.txnLogKey !== txnLogKey) break;
+			if (entry.type === 'message')
+				logged.push({ tableId: entry.tableId, recordKey: toBufferKey(entry.recordId), version: entry.version });
+		}
+	} catch (error) {
+		logger.trace?.('could not read the own log for a returned message, letting it flow', txnLogKey, error);
+		return [];
+	}
+	return logged;
+}
+
+export function isHeldOwnMessage(
+	logged: OwnLoggedMessage[],
+	tableId: number | undefined,
+	id: any,
+	version: number
+): boolean {
+	if (logged.length === 0 || tableId === undefined) return false;
+	let recordKey: Buffer;
+	try {
+		recordKey = toBufferKey(id);
+	} catch {
+		return false;
+	}
+	return logged.some(
+		(entry) => entry.tableId === tableId && entry.version === version && entry.recordKey.equals(recordKey)
+	);
+}
+
 /**
  * The receiver applies its own residency records of a sharded table only from a snapshot copy, and closes the
  * link on one sent live (non-obvious behavior 39, "Known limits"), so the recovery pass leaves them out.
@@ -11418,6 +11462,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 			// A valid prefix must not commit the frame cursor past a later forbidden origin or owner projection.
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
+			let frameOwnMessages: OwnLoggedMessage[] | undefined;
 			let selfCopyBound = 0;
 			if (admittedLayout || residencyMapInstalled()) {
 				decoder.position = 8;
@@ -11775,7 +11820,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					ownOriginRecoveryRequested !== undefined &&
 					!messageIsCopyFrame &&
 					!(auditRecord.extendedType & HAS_BLOBS) &&
-					isHeldOwnWrite(readLocalEntry(tableDecoder, id), auditRecord.version)
+					(isHeldOwnWrite(readLocalEntry(tableDecoder, id), auditRecord.version) ||
+						(auditRecord.type === 'message' &&
+							isHeldOwnMessage(
+								(frameOwnMessages ??= ownMessagesLoggedAt(auditStore, frameTxnLogKey)),
+								tableDecoder.table?.tableId,
+								id,
+								auditRecord.version
+							)))
 				) {
 					decoder.position = start + eventLength;
 					continue;

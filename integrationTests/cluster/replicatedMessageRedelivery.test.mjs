@@ -214,6 +214,24 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 				timeoutMs: WAIT_MS,
 				description: 'the cluster to reconnect',
 			});
+			// this start asks B for A's own writes back (replication/DESIGN.md note 39); the delivery check covers them
+			let epoch;
+			await waitForCondition(
+				async (signal) => {
+					try {
+						epoch = await postToFixture(ctx.A, 'OwnOriginEpoch', {}, signal);
+					} catch (error) {
+						// the operations API answers before the component's routes do
+						if (signal.aborted) throw error;
+						return false;
+					}
+					return epoch.before > since && epoch.finished === true;
+				},
+				{
+					timeoutMs: WAIT_MS,
+					description: () => `B to return A's own writes, last ${JSON.stringify(epoch)}`,
+				}
+			);
 			return nextNAfter(ctx.publisher.connections, since, 'the publisher to reconnect to A');
 		});
 		// the lowest start a route certifies stays, so only this first resume shows it was floor-only
