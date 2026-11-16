@@ -156,7 +156,8 @@ suite('A copy hole is cleared by replacing its node (harper-pro#1092)', { timeou
 		delete contexts.B;
 		for (const node of [A, C]) {
 			// the removal on A replicates, so C may already have none
-			const response = await postOperation(node, { operation: 'remove_node', hostname: B.hostname });
+			// B is stopped, so the removal is forced rather than waiting for it to drain
+			const response = await postOperation(node, { operation: 'remove_node', hostname: B.hostname, force: true });
 			if (response.status !== 200) equal(response.body.error, B.hostname + ' does not exist');
 		}
 		const D = await provision('D', 1);

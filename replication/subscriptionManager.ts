@@ -16,6 +16,8 @@ import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import {
 	markOwnOriginRecoveryFailed,
 	openOwnOriginRecoveryEpoch,
+	sameBootAsPreviousStart,
+	type StartContinuity,
 	startDurableFloorSampler,
 } from './ownOriginRecovery.ts';
 import { clearSyncFailureMarker, readBootId, readSyncFailureMarker, watchLogSyncFailures } from './bootIdentity.ts';
@@ -29,7 +31,7 @@ import {
 	updateExclusionOrigins,
 } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
-import { parentPort } from 'worker_threads';
+import { isMainThread, parentPort } from 'worker_threads';
 import {
 	subscribeToNodeUpdates,
 	getHDBNodeTable,
@@ -41,8 +43,10 @@ import {
 	clearReplicationSharedStatus,
 	type Route,
 	getNodeURL,
+	selfNodeReplicates,
 	ownWriteRecipientNames,
 } from './knownNodes.ts';
+import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 import { ownPrivateUrls, samePrivateUrls } from './privatePaths.ts';
 import {
 	RECEIVING_STATUS_POSITION,
@@ -1021,6 +1025,41 @@ export function computeExclusionOrigins(databaseName: string): string[] {
 	return origins;
 }
 
+/**
+ * Whether this node subscribes to `databaseName` directly from `nodeName`. Off the main thread the configured routes,
+ * which take precedence over the peer's row, are not loaded, so it answers false only for what routes cannot change
+ * (no row for the peer, a database this node does not replicate with it) and undefined otherwise.
+ */
+export function receivesDirectlyFrom(nodeName: string, databaseName: string): boolean | undefined {
+	const node = getHDBNodeTable().primaryStore.getSync(nodeName);
+	if (!node) return false;
+	// a database it does not replicate with that peer never arrives from it, whether or not it exists here
+	if (
+		!isExplicitDatabaseSubscription(node.subscriptions, databaseName) &&
+		!(
+			isReplicatedDatabase(
+				env.get(CONFIG_PARAMS.REPLICATION_DATABASES),
+				databaseName,
+				() => node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD),
+				false
+			) && selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName())
+		)
+	)
+		return false;
+	// a database not created here yet may still arrive, so its absence is not an answer
+	if (!getDatabases()[databaseName]) return undefined;
+	if (!isMainThread) return undefined;
+	const matchingRoute = routes.find((route) => route.name === nodeName);
+	const routeReplicates =
+		typeof matchingRoute?.replicates === 'object'
+			? matchingRoute.replicates
+			: node.replicates && typeof node.replicates === 'object'
+				? node.replicates
+				: null;
+	const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
+	return shouldReplicateFromNode({ ...node, routeReplicates, configRouteReplicates } as any, databaseName);
+}
+
 function updateShardingFailover(database: string): void {
 	const entries = [...connectionReplicationMap.values()].map((databases) => databases.get(database)).filter(Boolean);
 	const canRelay =
@@ -1176,7 +1215,9 @@ export async function startOnMainThread(options) {
 	const rootPath = env.getHdbBasePath();
 	watchLogSyncFailures(rootPath);
 	const syncFailure = rootPath ? readSyncFailureMarker(rootPath) : { present: true };
-	const continuity = { bootId: readBootId(), syncFailure: syncFailure.present };
+	const continuity: StartContinuity = { bootId: readBootId(), syncFailure: syncFailure.present };
+	// before any epoch opens: read from the one `system` holds from the previous start
+	continuity.sameBootAsPreviousStart = sameBootAsPreviousStart(continuity);
 	let epochFailed = false;
 	// find all the databases last recorded audit entry so that we can inquire from the first node for self catch-up
 	// of any records that may have been missed

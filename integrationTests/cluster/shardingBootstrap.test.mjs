@@ -544,7 +544,12 @@ export class BootstrapLocal extends Resource {
 		await stopNodeProcess(contexts[2].harper);
 		await start(contexts[0], 0);
 		const removeOld = async (i) => {
-			const response = await postOperation(contexts[i].harper, { operation: 'remove_node', hostname: oldName });
+			// the old node is gone, so the removal is forced rather than waiting for it to drain
+			const response = await postOperation(contexts[i].harper, {
+				operation: 'remove_node',
+				hostname: oldName,
+				force: true,
+			});
 			if (response.status !== 200) {
 				assert.equal(response.status, 400);
 				assert.equal(response.body.error, oldName + ' does not exist');

@@ -57,12 +57,33 @@ export interface OwnOriginEpoch {
 	finished?: boolean;
 	/** The OS boot this epoch opened on, when known: a later start on the same boot continues it. */
 	bootId?: string;
+	/**
+	 * Opened for a database no earlier start had found, by a start that knew the OS had kept running since this
+	 * node's previous start (`sameBootAsPreviousStart`): its log lost nothing, and peers are asked as a precaution.
+	 */
+	pageCacheKept?: true;
 }
 
 export interface StartContinuity {
 	bootId?: string;
 	/** A transaction-log sync failure was recorded since the previous start. */
 	syncFailure: boolean;
+	/** The OS has kept running, with no sync failure recorded, since this node's previous start. */
+	sameBootAsPreviousStart?: boolean;
+}
+
+/**
+ * Judged by the epoch `system` holds from the previous start, before this start opens any: every start leaves it
+ * on its own boot, or fails and leaves an older one.
+ */
+export function sameBootAsPreviousStart(continuity: StartContinuity): boolean {
+	const previous = readEpoch(dbisFor('system'));
+	return !continuity.syncFailure && continuity.bootId !== undefined && previous?.bootId === continuity.bootId;
+}
+
+/** A database whose epoch opened with nothing to have lost; false when it has none, or its epoch could not be recorded. */
+export function recoveryEpochKeptPageCache(database: string): boolean {
+	return !failedDatabases.has(database) && readEpoch(dbisFor(database))?.pageCacheKept === true;
 }
 
 /**
@@ -184,6 +205,13 @@ export function openOwnOriginRecoveryEpoch(
 	if (!dbisDB || typeof rootStore?.getMonotonicTimestamp !== 'function' || typeof rootStore.syncWal !== 'function')
 		throw new Error(`${database} has per-origin logs but no store to record a recovery epoch in`);
 	const previous = readEpoch(dbisDB);
+	// an earlier start that found this database left a vouch row even if its epoch could not be written
+	let firstSeen = !previous;
+	try {
+		if (dbisDB.getSync(LOG_VOUCH) !== undefined) firstSeen = false;
+	} catch {
+		firstSeen = false;
+	}
 	// decided once per process, before workers append: a reload's view of the log includes this process's writes
 	if (!vouchedDatabases.has(database)) recordLogVouch(database, dbisDB, previous, continuity, logStats(auditStore));
 	let lastKey: number | undefined;
@@ -216,6 +244,7 @@ export function openOwnOriginRecoveryEpoch(
 		? nextEpoch(lastKey, purgeBound, previous, before, requiredPeers, readDurableFloor(dbisDB))
 		: nextEpoch(undefined, undefined, previous, before, requiredPeers);
 	if (continuity.bootId !== undefined) epoch.bootId = continuity.bootId;
+	if (firstSeen && logRead && continuity.sameBootAsPreviousStart) epoch.pageCacheKept = true;
 	dbisDB.putSync(EPOCH, epoch);
 	cachedEpochs.delete(database);
 	logger.info?.(

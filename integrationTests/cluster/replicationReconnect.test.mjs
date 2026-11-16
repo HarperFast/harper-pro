@@ -181,9 +181,11 @@ suite('Replication Reconnect', { timeout: 120000 }, (ctx) => {
 		// attempts — the intentionallyUnsubscribed guard in connect() ensures the
 		// pending retry timer fires but returns immediately rather than opening a
 		// new socket.
+		// An unreachable node cannot be drained, so the removal is forced.
 		await sendOperation(ctx.nodes[1], {
 			operation: 'remove_node',
 			hostname: ctx.nodes[0].hostname,
+			force: true,
 		});
 		const afterRemove = await waitForConnected(ctx.nodes[1], 0, false);
 		equal(afterRemove.connections.length, 0, 'expected 0 connections immediately after remove_node');

@@ -71,6 +71,8 @@ X-Replicate-To: 2;confirm=1
 - **RocksDB:** a peer counts only for records it is resident for; with no residency (every node holds every record), any N peers count. When the written records have different residents, each set of other residents must reach N on its own. A count larger than this node's replication recipients, or than a written record's reachable residents, is refused before the write lands; see [Confirmation Failure After a Local Commit](#confirmation-failure-after-a-local-commit) for failures after it does.
 - **LMDB:** any N peers that replicate the database count, including peers outside the record's residency that hold only an invalidation entry. A count larger than this node's replication recipients is refused before the write lands.
 
+A peer counts only once it has committed every write the sending node sent it before your write was visible, not merely a write with a later timestamp: transactions commit out of timestamp order, so a later-timestamped write can arrive before yours. Peers running a version before 5.5 cannot report this, and count by timestamp as before; so does every peer when the writing node stores the database on LMDB.
+
 A count of `0` or less does not wait. <VersionBadge type="changed" version="v5.5.0" /> Neither does a write to a table declared `replicate: false`, which no peer receives; earlier releases waited out the timeout and then reported it unconfirmed.
 
 Specify exact destination nodes by hostname:
@@ -260,7 +262,7 @@ A cluster can hold its data in one shard (the backbone) and add read capacity wi
 
 Clone a replica node with `--shard replica` (or `CLONE_SHARD=replica`) from any member. It joins a spare shard, owns no slots, copies only the projections that indexed tables need, and reads full records from the owners, keeping local replicas that invalidations keep current. Replica nodes join the same spare unless you pass a shard number. Joining a spare shard ID, not no shard, matters because a shard is node identity: slots can later be moved into that ID, which makes its members owners without a new node. Clones with `--shard auto` skip spares and join a shard that owns slots. A replica node appears in [`cluster_status.sharding.<database>.nodesOwningNoSlots`](./clustering.md#sharding-status).
 
-Writes on a replica node commit locally and reach the owners asynchronously, unless the request asks for [confirmation](#replication-control-via-rest-header), which counts only owners. Every write still reaches every owner, so this adds read capacity, not write capacity. [`remove_node`](./clustering.md#remove-node) does not wait for a node's writes to reach the owners, so do not remove a replica node that has taken writes the owners may not have yet.
+Writes on a replica node commit locally and reach the owners asynchronously, unless the request asks for [confirmation](#replication-control-via-rest-header), which counts only owners. Every write still reaches every owner, so this adds read capacity, not write capacity. From v5.5.0, [`remove_node`](./clustering.md#remove-node) removes a live replica node only once the owners hold its writes. On earlier versions it does not wait, so do not remove a replica node that has taken writes the owners may not have yet.
 
 ### Other shard configuration
 

@@ -186,7 +186,8 @@ suite('WAF matcher after a full copy', { timeout: 420000 }, (ctx) => {
 	test('a rejoin converges on rule and control changes made while the node was out', async () => {
 		const { leader, receiver } = ctx;
 		await sendOperation(receiver, { operation: 'remove_node', hostname: leader.hostname });
-		await sendOperation(leader, { operation: 'remove_node', hostname: receiver.hostname });
+		// the receiver has already dropped the leader, so it refuses the leader's fence call: only force removes it
+		await sendOperation(leader, { operation: 'remove_node', hostname: receiver.hostname, force: true });
 
 		await sendOperation(leader, {
 			operation: 'alter_waf_rule',
@@ -227,7 +228,8 @@ suite('WAF matcher after a full copy', { timeout: 420000 }, (ctx) => {
 	test('a rejoin with no rules left on the leader empties the matcher', async () => {
 		const { leader, receiver } = ctx;
 		await sendOperation(receiver, { operation: 'remove_node', hostname: leader.hostname });
-		await sendOperation(leader, { operation: 'remove_node', hostname: receiver.hostname });
+		// the receiver has already dropped the leader, so it refuses the leader's fence call: only force removes it
+		await sendOperation(leader, { operation: 'remove_node', hostname: receiver.hostname, force: true });
 
 		await sendOperation(leader, { operation: 'drop_waf_rule', id: BLOCK_RULE.id });
 		await sendOperation(leader, { operation: 'drop_waf_rule', id: SCORE_RULE.id });

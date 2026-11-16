@@ -73,6 +73,7 @@ import { clearThisNodeName } from '../core/server/nodeName';
 
 // allow this to register operations
 import './setNode.ts';
+import { liftFenceForOwnRecovery } from './nodeRemoval.ts';
 import './clusterStatus.ts';
 import './blobRepair.ts';
 import '../security/keyService.ts';
@@ -123,6 +124,10 @@ export async function startOnMainThread(options) {
 	await migrateSSHConfigOnce();
 	admitRecordLocks(() => replicatedLmdbDatabases(options));
 	await startSubscriptionsOnMainThread(options);
+	// after the recovery epochs open; a failure leaves the fence, and the removal's next poll is refused and lifts it
+	await liftFenceForOwnRecovery().catch((error) =>
+		logger.error?.('Could not check whether a removal fence must be lifted for own-origin recovery', error)
+	);
 	startShardingBootstrap();
 }
 

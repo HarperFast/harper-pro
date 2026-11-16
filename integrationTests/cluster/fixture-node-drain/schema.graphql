@@ -1,0 +1,12 @@
+type Drained @table @export @sharded(slots: 10, slotFrom: "Number(id.slice(-1))") {
+	id: ID @primaryKey
+	body: String
+}
+type Plain @table @export {
+	id: ID @primaryKey
+	body: String
+}
+type Unsharded @table(database: "unsharded") @export {
+	id: ID @primaryKey
+	body: String
+}

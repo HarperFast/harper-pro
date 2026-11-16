@@ -62,6 +62,13 @@ export const STUCK_COPY_SINCE_POSITION = allocate();
 export const STUCK_COPY_RETRY_AT_POSITION = allocate();
 // The address the current outbound subscription socket dialed (privatePaths.ts PATH_*); 0 before any handshake.
 export const CONNECTION_PATH_POSITION = allocate();
+// Written only by the connection sending this node's own log to the peer. The peer's `confirmationMarkers` support:
+// 0 unknown (no sending socket yet), 1 unsupported, 2 supported; and the highest marker it has acknowledged.
+export const PEER_CONFIRMATION_MARKERS_POSITION = allocate();
+export const ACKED_CONFIRMATION_MARKER_POSITION = allocate();
+export const CONFIRMATION_MARKERS_UNKNOWN = 0;
+export const CONFIRMATION_MARKERS_UNSUPPORTED = 1;
+export const CONFIRMATION_MARKERS_SUPPORTED = 2;
 
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
 export const ALLOCATED_SLOTS = cursor;

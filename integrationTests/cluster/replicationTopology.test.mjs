@@ -649,10 +649,11 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 		if (!legacyPath || !legacy) return;
 
 		// The legacy node was added to ctx.nodes[0] in 'Replicate data from
-		// a legacy node', so remove it from there.
+		// a legacy node', so remove it from there. A v4 node cannot fence its writes, so the removal is forced.
 		await sendOperation(ctx.nodes[0], {
 			operation: 'remove_node',
 			hostname: legacy.hostname,
+			force: true,
 		});
 
 		// cluster_status on the bridge should no longer list the legacy peer.

@@ -397,7 +397,10 @@ suite(
 				// that exact registered edge so the positive control cannot depend on a peer row that a
 				// system-database base copy may have replaced on the opposite side.
 				const [preRemoveLogA, preRemoveLogB] = await Promise.all([readLog(nodeA), readLog(nodeB)]);
-				await sendOperation(nodeB, { operation: 'remove_node', hostname: nodeA.hostname });
+				// Forced: this checks the gate, not the drain. An unforced removal waits for B's receipt of A's writes,
+				// which B withholds while its route from A is marked partial: the state its first `data` copy leaves
+				// when it began before A's hdb_nodes row arrived.
+				await sendOperation(nodeB, { operation: 'remove_node', hostname: nodeA.hostname, force: true });
 				console.log('[QA756] B issued remove_node against A -- expecting genuine de-authorization this time');
 
 				// Poll for the verified B->A system socket to disappear / disconnect.

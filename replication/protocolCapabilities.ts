@@ -68,6 +68,13 @@ export const SHARDING_RECOVERY_CAPABILITY = 2;
 export const RESIDENCY_NOT_RESIDENT_CAPABILITY = 1;
 
 /**
+ * Level at which a receiver acknowledges `CONFIRMATION_MARKER` with `CONFIRMATION_MARKER_ACK` once every frame sent
+ * before the marker has committed: a sender counts a `replicatedConfirmation` waiter delivered by that, not by the
+ * key maximum `COMMITTED_UPDATE` carries (harper-pro#1351).
+ */
+export const CONFIRMATION_MARKERS_CAPABILITY = 1;
+
+/**
  * Level at which a peer serves a receiver's own-origin recovery range in isolation (outside its replay start,
  * retention decision and log choice) and ends it with `OWN_ORIGIN_SENT`, and asks for its own (harper-pro#1364).
  * Level 2 echoes the subscription request id in `OWN_ORIGIN_SENT`; level 1 never shipped in a release and is
@@ -89,6 +96,7 @@ export interface ResolvedPeerCapabilities {
 	residencyNotResident: number;
 	residencySlots: number;
 	shardingRecovery: number;
+	confirmationMarkers: number;
 	ownOriginRecovery: number;
 }
 
@@ -143,6 +151,7 @@ export function resolvePeerCapabilities(
 		residencyNotResident: resolveLevel(bag?.residencyNotResident, RESIDENCY_NOT_RESIDENT_CAPABILITY, 0),
 		residencySlots: resolveLevel(bag?.residencySlots, RESIDENCY_SLOTS_CAPABILITY, 0),
 		shardingRecovery: resolveLevel(bag?.shardingRecovery, SHARDING_RECOVERY_CAPABILITY, 0),
+		confirmationMarkers: resolveLevel(bag?.confirmationMarkers, CONFIRMATION_MARKERS_CAPABILITY, 0),
 		ownOriginRecovery: resolveLevel(bag?.ownOriginRecovery, OWN_ORIGIN_RECOVERY_CAPABILITY, 0),
 	});
 }
@@ -165,6 +174,10 @@ export function peerSupportsResidencySlots(resolved: ResolvedPeerCapabilities): 
 
 export function peerSupportsShardingRecovery(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.shardingRecovery >= SHARDING_RECOVERY_CAPABILITY;
+}
+
+export function peerSupportsConfirmationMarkers(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.confirmationMarkers >= CONFIRMATION_MARKERS_CAPABILITY;
 }
 
 export function peerSupportsOwnOriginRecovery(resolved: ResolvedPeerCapabilities): boolean {
@@ -230,6 +243,7 @@ export function buildLocalCapabilities(
 		residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 		residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 		shardingRecovery: perOriginLogs ? SHARDING_RECOVERY_CAPABILITY : 0,
+		confirmationMarkers: CONFIRMATION_MARKERS_CAPABILITY,
 		ownOriginRecovery: perOriginLogs ? OWN_ORIGIN_RECOVERY_CAPABILITY : 0,
 	});
 }
@@ -250,6 +264,7 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.residencyNotResident === b.residencyNotResident &&
 		a.residencySlots === b.residencySlots &&
 		a.shardingRecovery === b.shardingRecovery &&
+		a.confirmationMarkers === b.confirmationMarkers &&
 		a.ownOriginRecovery === b.ownOriginRecovery
 	);
 }
