@@ -164,8 +164,12 @@ async function deliversOnce(ctx, topic, interrupt) {
 		const logged = await postToFixture(B, 'LoggedMessages', { peer: A.hostname, topic });
 		const published = await postToFixture(A, 'LoggedMessages', { own: true, topic });
 		const byVersion = (versions) => Object.keys(versions).sort((a, b) => a - b);
-		// every message A committed, the segment B was down or reconnecting through included
 		deepEqual(byVersion(logged), byVersion(published), "the message versions B logged from A, against A's own log");
+		deepEqual(
+			Object.entries(published).filter(([, count]) => count > 1),
+			[],
+			'message versions A logged more than once'
+		);
 		deepEqual(
 			Object.entries(logged).filter(([, count]) => count > 1),
 			[],
@@ -225,8 +229,7 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 	test(
 		"the receiving node's HTTP workers restart",
 		{
-			// pool workers own the replication sockets and restart_service replaces only HTTP workers, so no
-			// resume would run; the two full restarts cover the pool
+			// the two full restarts cover the pool
 			skip: replicationPoolActive() && 'replication runs on the pool, which an http_workers restart leaves running',
 		},
 		() =>

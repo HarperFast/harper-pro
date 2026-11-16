@@ -4433,11 +4433,7 @@ export function isHeldOwnWrite(held: { version?: number; nodeId?: number } | und
 export const loggedMessageIdentity = (tableId: number, id: unknown, version: number) =>
 	`${tableId}:${version}:${toBufferKey(id as any).toString('latin1')}`;
 
-/**
- * The messages `log` holds at `txnLogKey`, by `loggedMessageIdentity`. A topic's record holds only its newest
- * message, so `isHeldOwnWrite` cannot vouch for an older one; one still in the own log survived (replayLogs
- * restores the store from it), and applying it again would publish it twice. An unreadable log vouches for nothing.
- */
+// A topic's row holds at most its newest message, so only the own log can vouch that a returned one survived.
 export function messagesLoggedAt(auditStore: any, log: string, txnLogKey: number): Set<string> {
 	const logged = new Set<string>();
 	try {
@@ -11798,12 +11794,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					ownOriginRecoveryRequested !== undefined &&
 					!messageIsCopyFrame &&
 					!(auditRecord.extendedType & HAS_BLOBS) &&
-					(isHeldOwnWrite(readLocalEntry(tableDecoder, id), auditRecord.version) ||
-						(auditRecord.type === 'message' &&
-							tableDecoder.table?.tableId !== undefined &&
+					(auditRecord.type === 'message'
+						? tableDecoder.table?.tableId !== undefined &&
 							(ownLoggedMessages ??= messagesLoggedAt(auditStore, 'local', frameTxnLogKey)).has(
 								loggedMessageIdentity(tableDecoder.table.tableId, id, auditRecord.version)
-							)))
+							)
+						: isHeldOwnWrite(readLocalEntry(tableDecoder, id), auditRecord.version))
 				) {
 					decoder.position = start + eventLength;
 					continue;

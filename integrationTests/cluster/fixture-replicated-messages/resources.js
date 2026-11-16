@@ -22,7 +22,7 @@ export class LoggedMessages extends Resource {
 		const Message = databases.data.Message;
 		const counts = {};
 		Message.auditStore.loadLogs();
-		// `own` reads this node's own messages; getRange would create a peer log it does not find
+		// getRange would create a peer log it does not find
 		if (!data.own && !Message.auditStore.logByName.has(data.peer)) return counts;
 		for (const entry of Message.auditStore.getRange({ start: 1, log: data.own ? 'local' : data.peer })) {
 			if (entry.type !== 'message' || entry.tableId !== Message.tableId || entry.recordId !== data.topic) continue;
