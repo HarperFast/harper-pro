@@ -13,7 +13,11 @@ import { replicationWorkers } from './replicationWorkers.ts';
 import { isWorkerPoolActive } from '../core/server/threads/workerPools.ts';
 import { setSessionHolderReader } from './recordLockRpc.ts';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
-import { markOwnOriginRecoveryFailed, openOwnOriginRecoveryEpoch } from './ownOriginRecovery.ts';
+import {
+	markOwnOriginRecoveryFailed,
+	openOwnOriginRecoveryEpoch,
+	startDurableFloorSampler,
+} from './ownOriginRecovery.ts';
 import { clearSyncFailureMarker, readBootId, readSyncFailureMarker, watchLogSyncFailures } from './bootIdentity.ts';
 import {
 	subscribeToNode,
@@ -1212,6 +1216,7 @@ export async function startOnMainThread(options) {
 	});
 	// every epoch this marker called for is now durable, so a later start on this boot may continue them
 	if (syncFailure.token !== undefined && !epochFailed) clearSyncFailureMarker(rootPath, syncFailure.token);
+	startDurableFloorSampler();
 	// we need to wait for the threads to start before we can start adding nodes
 	// but don't await this because this start function has to finish before the threads can start
 	whenThreadsStarted.then(async () => {

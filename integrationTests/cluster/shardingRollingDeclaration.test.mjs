@@ -149,7 +149,8 @@ suite('Rolling local sharding declaration', { timeout: 360_000 }, (ctx) => {
 					'type RollingRows @table @export @sharded(slots: 2, slotFrom: "Number(id)")'
 				)
 			);
-			await restartHttpWorkers(node);
+			// Two passes of restart + poll must fit the 360s suite timeout, so cap the job below the helper's 120s default.
+			await restartHttpWorkers(node, { timeoutMs: 60_000 });
 			const workers = new Set();
 			await waitForCondition(
 				async (signal) => {
