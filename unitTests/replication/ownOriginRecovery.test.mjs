@@ -264,6 +264,12 @@ describe('messagesLoggedAt', () => {
 			).has(identity),
 			'a later transaction was reached, so this one is whole'
 		);
+		assert.ok(
+			messagesLoggedAt(store([{ ...entry, endTxn: true }], { corruptFrameStop: { breaks: 1 } }), 'local', NOW).has(
+				identity
+			),
+			'its end was read, so a torn frame after it does not count'
+		);
 		assert.strictEqual(messagesLoggedAt(store([entry], { corruptFrameStop: { breaks: 1 } }), 'local', NOW).size, 0);
 		assert.strictEqual(messagesLoggedAt(store([entry], { failedLogs: new Set(['local']) }), 'local', NOW).size, 0);
 	});

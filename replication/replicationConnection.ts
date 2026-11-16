@@ -4446,6 +4446,7 @@ export function messagesLoggedAt(auditStore: any, log: string, txnLogKey: number
 				break;
 			}
 			if (entry.type === 'message') logged.add(loggedMessageIdentity(entry.tableId, entry.recordId, entry.version));
+			if (entry.endTxn) complete = true;
 		}
 		if (!complete && (range?.corruptFrameStop?.breaks > 0 || range?.failedLogs?.size > 0)) logged.clear();
 	} catch (error) {
