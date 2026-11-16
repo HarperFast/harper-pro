@@ -275,18 +275,6 @@ describe('a returned own message', () => {
 		}
 	});
 
-	it('is not lost at or below the own log purge bound: retention removed it', async () => {
-		await Topics.publish('old', { n: 0 });
-		const { txnLogKey, version } = messageAt(logged(), 'old');
-		for (const bound of [txnLogKey, txnLogKey + 1]) {
-			const purged = ownMessagesLoggedAt(auditStore, txnLogKey, bound);
-			assert.strictEqual(purged, null);
-			assert.strictEqual(isHeldOwnMessage(purged, Topics.tableId, 'never-logged', version), true);
-			assert.strictEqual(isHeldOwnMessage(purged, undefined, 'old', version), false, 'an unknown table');
-		}
-		assert.strictEqual(ownMessagesLoggedAt(auditStore, txnLogKey, txnLogKey - 0.25).size, 1, 'above the bound');
-	});
-
 	it('keeps what it read and proves nothing more when the log cannot be read cleanly', () => {
 		const entry = { txnLogKey: 5, type: 'message', tableId: 3, recordId: 'read', version: 5 };
 		const throwing = {
@@ -294,9 +282,9 @@ describe('a returned own message', () => {
 				throw new Error('log unavailable');
 			},
 		};
-		assert.strictEqual(ownMessagesLoggedAt(throwing, 5, undefined).size, 0);
+		assert.strictEqual(ownMessagesLoggedAt(throwing, 5).size, 0);
 		const stoppedEarly = { getRange: () => Object.assign([entry], { failedLogs: new Set(['local']) }) };
-		const partial = ownMessagesLoggedAt(stoppedEarly, 5, undefined);
+		const partial = ownMessagesLoggedAt(stoppedEarly, 5);
 		assert.strictEqual(isHeldOwnMessage(partial, 3, 'read', 5), true);
 		assert.strictEqual(isHeldOwnMessage(partial, 3, 'unread', 5), false);
 	});

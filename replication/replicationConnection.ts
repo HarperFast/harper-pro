@@ -4434,15 +4434,10 @@ const ownMessageIdentity = (tableId: number, id: any, version: number) =>
 	`${tableId}:${version}:${toBufferKey(id).toString('latin1')}`;
 
 /**
- * The messages this node's own log holds at `txnLogKey`, or null at or below the log's purge bound, where
- * retention removed the entry and nothing was lost. An unreadable log proves nothing, so its messages are applied.
+ * The messages this node's own log holds at `txnLogKey`. A log that cannot be read cleanly proves nothing more
+ * than what was read, so the rest are applied.
  */
-export function ownMessagesLoggedAt(
-	auditStore: any,
-	txnLogKey: number,
-	purgeBound: number | undefined = getLogPurgeBounds(auditStore, 'local')?.get('local')
-): Set<string> | null {
-	if (txnLogKey <= purgeBound) return null;
+export function ownMessagesLoggedAt(auditStore: any, txnLogKey: number): Set<string> {
 	const logged = new Set<string>();
 	try {
 		const range: any = auditStore.getRange({ start: txnLogKey, exactStart: true, log: 'local' });
@@ -4461,15 +4456,8 @@ export function ownMessagesLoggedAt(
 	return logged;
 }
 
-export function isHeldOwnMessage(
-	logged: Set<string> | null,
-	tableId: number | undefined,
-	id: any,
-	version: number
-): boolean {
-	if (tableId === undefined) return false;
-	if (logged === null) return true;
-	if (logged.size === 0) return false;
+export function isHeldOwnMessage(logged: Set<string>, tableId: number | undefined, id: any, version: number): boolean {
+	if (logged.size === 0 || tableId === undefined) return false;
 	try {
 		return logged.has(ownMessageIdentity(tableId, id, version));
 	} catch {
@@ -11465,7 +11453,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 			// A valid prefix must not commit the frame cursor past a later forbidden origin or owner projection.
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
-			let frameOwnMessages: Set<string> | null | undefined;
+			let frameOwnMessages: Set<string> | undefined;
 			let selfCopyBound = 0;
 			if (admittedLayout || residencyMapInstalled()) {
 				decoder.position = 8;
@@ -11826,9 +11814,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					(isHeldOwnWrite(readLocalEntry(tableDecoder, id), auditRecord.version) ||
 						(auditRecord.type === 'message' &&
 							isHeldOwnMessage(
-								frameOwnMessages === undefined
-									? (frameOwnMessages = ownMessagesLoggedAt(auditStore, frameTxnLogKey))
-									: frameOwnMessages,
+								(frameOwnMessages ??= ownMessagesLoggedAt(auditStore, frameTxnLogKey)),
 								tableDecoder.table?.tableId,
 								id,
 								auditRecord.version
