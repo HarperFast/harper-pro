@@ -5,7 +5,7 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { deepEqual, ok } from 'node:assert/strict';
-import { cp, mkdtemp } from 'node:fs/promises';
+import { cp, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -66,6 +66,8 @@ function connectOptions(node, clientId) {
 		protocolVersion: 5,
 		reconnectPeriod: 1000,
 		connectTimeout: 8000,
+		// mqtt.js would resubscribe on its own after a reconnect and answer subscribe() before the SUBACK
+		resubscribe: false,
 	};
 }
 
@@ -85,8 +87,8 @@ function subscribe(node, topic, publisher, label) {
 	const client = mqtt.connect(wsUrl, connectOptions(node, `${label}-${topic}`));
 	const subscriber = { client, seen: new Map(), subscriptions: [] };
 	client.on('connect', () =>
-		client.subscribe(`Message/${topic}`, { qos: 0 }, (error) => {
-			if (!error) subscriber.subscriptions.push({ at: Date.now(), nextN: publisher.n });
+		client.subscribe(`Message/${topic}`, { qos: 0 }, (error, granted) => {
+			if (!error && granted[0]?.qos === 0) subscriber.subscriptions.push({ at: Date.now(), nextN: publisher.n });
 		})
 	);
 	client.on('message', (_topic, payload) => {
@@ -209,11 +211,30 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 	test('the publishing node restarts while a subscriber on the other node stays connected', async () => {
 		await deliversOnce(ctx, 'origin-restart', async () => {
 			const since = Date.now();
+			// a start that cannot vouch for its own log asks B for A's writes back (replication/DESIGN.md note 39)
+			await writeFile(join(ctx.A.dataRootDir, 'own-origin-recovery-log-sync-failed'), 'replicatedMessageRedelivery');
 			await restartNode(ctx.A);
 			await waitForCondition((signal) => clusterConnected([ctx.A, ctx.B], signal), {
 				timeoutMs: WAIT_MS,
 				description: 'the cluster to reconnect',
 			});
+			let epoch;
+			await waitForCondition(
+				async (signal) => {
+					try {
+						epoch = await postToFixture(ctx.A, 'OwnOriginEpoch', {}, signal);
+					} catch (error) {
+						// the operations API answers before the component's routes do
+						if (signal.aborted) throw error;
+						return false;
+					}
+					return epoch.before > since && epoch.finished === true;
+				},
+				{
+					timeoutMs: WAIT_MS,
+					description: () => `A's own-origin recovery on this start to finish, last ${JSON.stringify(epoch)}`,
+				}
+			);
 			return nextNAfter(ctx.publisher.connections, since, 'the publisher to reconnect to A');
 		});
 		// the lowest start a route certifies stays, so only this first resume shows it was floor-only

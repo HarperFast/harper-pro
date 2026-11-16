@@ -16,6 +16,13 @@ export class RouteState extends Resource {
 	}
 }
 
+export class OwnOriginEpoch extends Resource {
+	static loadAsInstance = false;
+	post() {
+		return databases.data.Message.dbisDB.getSync(Symbol.for('ownOriginRecovery')) ?? {};
+	}
+}
+
 export class LoggedMessages extends Resource {
 	static loadAsInstance = false;
 	post(target, data) {
