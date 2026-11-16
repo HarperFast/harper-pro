@@ -229,7 +229,6 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 	test(
 		"the receiving node's HTTP workers restart",
 		{
-			// the two full restarts cover the pool
 			skip: replicationPoolActive() && 'replication runs on the pool, which an http_workers restart leaves running',
 		},
 		() =>

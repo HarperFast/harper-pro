@@ -4434,13 +4434,20 @@ export const loggedMessageIdentity = (tableId: number, id: unknown, version: num
 	`${tableId}:${version}:${toBufferKey(id as any).toString('latin1')}`;
 
 // A topic's row holds at most its newest message, so only the own log can vouch that a returned one survived.
+// Only a whole transaction vouches: replayLogs may not restore a torn one's readable prefix.
 export function messagesLoggedAt(auditStore: any, log: string, txnLogKey: number): Set<string> {
 	const logged = new Set<string>();
 	try {
-		for (const entry of auditStore.getRange({ log, start: txnLogKey, exactStart: true, snapshot: false })) {
-			if (entry.txnLogKey !== txnLogKey) break;
+		const range = auditStore.getRange({ log, start: txnLogKey, exactStart: true, snapshot: false });
+		let complete = false;
+		for (const entry of range) {
+			if (entry.txnLogKey !== txnLogKey) {
+				complete = true;
+				break;
+			}
 			if (entry.type === 'message') logged.add(loggedMessageIdentity(entry.tableId, entry.recordId, entry.version));
 		}
+		if (!complete && (range?.corruptFrameStop?.breaks > 0 || range?.failedLogs?.size > 0)) logged.clear();
 	} catch (error) {
 		logger.trace?.('own-origin recovery: could not read', log, 'at', txnLogKey, error);
 		logged.clear();

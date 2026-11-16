@@ -247,6 +247,26 @@ describe('messagesLoggedAt', () => {
 			'a key the log lost holds nothing, so a returned message there is applied'
 		);
 	});
+	it('vouches only for a whole transaction: a read that stops at a torn frame or failed log vouches for nothing', () => {
+		const entry = { txnLogKey: NOW, type: 'message', tableId: 1, recordId: 'sensor/1', version: NOW };
+		const store = (entries, status) => ({
+			getRange() {
+				return Object.assign(entries, status);
+			},
+		});
+		const identity = loggedMessageIdentity(1, 'sensor/1', NOW);
+		assert.ok(messagesLoggedAt(store([entry]), 'local', NOW).has(identity), 'an intact last transaction');
+		assert.ok(
+			messagesLoggedAt(
+				store([entry, { ...entry, txnLogKey: NOW + 1 }], { corruptFrameStop: { breaks: 1 } }),
+				'local',
+				NOW
+			).has(identity),
+			'a later transaction was reached, so this one is whole'
+		);
+		assert.strictEqual(messagesLoggedAt(store([entry], { corruptFrameStop: { breaks: 1 } }), 'local', NOW).size, 0);
+		assert.strictEqual(messagesLoggedAt(store([entry], { failedLogs: new Set(['local']) }), 'local', NOW).size, 0);
+	});
 	it('vouches for nothing when the log cannot be read', () => {
 		const failing = {
 			getRange() {
