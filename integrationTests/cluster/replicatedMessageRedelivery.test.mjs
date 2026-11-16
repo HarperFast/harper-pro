@@ -216,7 +216,6 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 				timeoutMs: WAIT_MS,
 				description: 'the cluster to reconnect',
 			});
-			// this start asks B for A's own writes back (replication/DESIGN.md note 39); the delivery check covers them
 			let epoch;
 			await waitForCondition(
 				async (signal) => {
@@ -231,7 +230,7 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 				},
 				{
 					timeoutMs: WAIT_MS,
-					description: () => `B to return A's own writes, last ${JSON.stringify(epoch)}`,
+					description: () => `A's own-origin recovery on this start to finish, last ${JSON.stringify(epoch)}`,
 				}
 			);
 			return nextNAfter(ctx.publisher.connections, since, 'the publisher to reconnect to A');

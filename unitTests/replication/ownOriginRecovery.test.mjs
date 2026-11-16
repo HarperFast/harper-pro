@@ -228,20 +228,19 @@ describe('a returned own message', () => {
 		if (auditStore.reusableIterable !== true) this.skip();
 	});
 
-	it('is held when the own log has that message at the returned key, whatever the row says', async () => {
+	it('is held when the own log has that message at the returned key, though the row ties only the newest', async () => {
 		await Topics.publish('news', { n: 0 });
 		await Topics.publish('news', { n: 1 });
 		const entries = logged().filter((entry) => entry.type === 'message' && entry.recordId === 'news');
 		assert.strictEqual(entries.length, 2);
 		const [older, newer] = entries.map(({ txnLogKey, version }) => ({ txnLogKey, version }));
 		assert.notStrictEqual(older.txnLogKey, newer.txnLogKey);
-		assert.strictEqual(
-			isHeldOwnWrite(Topics.primaryStore.getEntry('news'), older.version),
-			false,
-			'the row ties only the newest publish'
-		);
+		const row = Topics.primaryStore.getEntry('news');
+		assert.strictEqual(row.version, newer.version, 'the row carries the newest publish');
+		assert.strictEqual(isHeldOwnWrite(row, newer.version), true);
+		assert.strictEqual(isHeldOwnWrite(row, older.version), false);
 		const atOlder = ownMessagesLoggedAt(auditStore, older.txnLogKey);
-		assert.strictEqual(atOlder.length, 1);
+		assert.strictEqual(atOlder.size, 1);
 		assert.strictEqual(isHeldOwnMessage(atOlder, Topics.tableId, 'news', older.version), true);
 		assert.strictEqual(isHeldOwnMessage(atOlder, Topics.tableId, 'news', newer.version), false, 'another version');
 		assert.strictEqual(isHeldOwnMessage(atOlder, Topics.tableId, 'sport', older.version), false, 'another topic');
@@ -258,7 +257,7 @@ describe('a returned own message', () => {
 		});
 		const first = messageAt(logged(), 'first');
 		const atKey = ownMessagesLoggedAt(auditStore, first.txnLogKey);
-		assert.strictEqual(atKey.length, 3, 'the put is not a message');
+		assert.strictEqual(atKey.size, 3, 'the put is not a message');
 		assert.strictEqual(isHeldOwnMessage(atKey, Topics.tableId, 'first', first.version), true);
 		assert.strictEqual(isHeldOwnMessage(atKey, Topics.tableId, ['room', 7], first.version), true);
 		assert.strictEqual(isHeldOwnMessage(atKey, Other.tableId, 'first', first.version), true);
@@ -271,18 +270,35 @@ describe('a returned own message', () => {
 		const { txnLogKey, version } = messageAt(logged(), 'lost');
 		for (const missing of [txnLogKey + 0.25, txnLogKey - 0.25, 1]) {
 			const atKey = ownMessagesLoggedAt(auditStore, missing);
-			assert.deepStrictEqual(atKey, [], `nothing at ${missing}`);
+			assert.strictEqual(atKey.size, 0, `nothing at ${missing}`);
 			assert.strictEqual(isHeldOwnMessage(atKey, Topics.tableId, 'lost', version), false);
 		}
 	});
 
-	it('proves nothing when the log cannot be read', () => {
-		const unreadable = {
+	it('is not lost at or below the own log purge bound: retention removed it', async () => {
+		await Topics.publish('old', { n: 0 });
+		const { txnLogKey, version } = messageAt(logged(), 'old');
+		for (const bound of [txnLogKey, txnLogKey + 1]) {
+			const purged = ownMessagesLoggedAt(auditStore, txnLogKey, bound);
+			assert.strictEqual(purged, null);
+			assert.strictEqual(isHeldOwnMessage(purged, Topics.tableId, 'never-logged', version), true);
+			assert.strictEqual(isHeldOwnMessage(purged, undefined, 'old', version), false, 'an unknown table');
+		}
+		assert.strictEqual(ownMessagesLoggedAt(auditStore, txnLogKey, txnLogKey - 0.25).size, 1, 'above the bound');
+	});
+
+	it('keeps what it read and proves nothing more when the log cannot be read cleanly', () => {
+		const entry = { txnLogKey: 5, type: 'message', tableId: 3, recordId: 'read', version: 5 };
+		const throwing = {
 			getRange() {
 				throw new Error('log unavailable');
 			},
 		};
-		assert.deepStrictEqual(ownMessagesLoggedAt(unreadable, 5), []);
+		assert.strictEqual(ownMessagesLoggedAt(throwing, 5, undefined).size, 0);
+		const stoppedEarly = { getRange: () => Object.assign([entry], { failedLogs: new Set(['local']) }) };
+		const partial = ownMessagesLoggedAt(stoppedEarly, 5, undefined);
+		assert.strictEqual(isHeldOwnMessage(partial, 3, 'read', 5), true);
+		assert.strictEqual(isHeldOwnMessage(partial, 3, 'unread', 5), false);
 	});
 });
 

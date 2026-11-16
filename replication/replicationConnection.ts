@@ -4430,48 +4430,51 @@ export function isHeldOwnWrite(held: { version?: number; nodeId?: number } | und
 	return held !== undefined && held.version === version && !held.nodeId;
 }
 
-export interface OwnLoggedMessage {
-	tableId: number;
-	recordKey: Buffer;
-	version: number;
-}
+const ownMessageIdentity = (tableId: number, id: any, version: number) =>
+	`${tableId}:${version}:${toBufferKey(id).toString('latin1')}`;
 
 /**
- * The messages in this node's own log at `txnLogKey`: a publish stores no row for `isHeldOwnWrite` to tie, so
- * its logged entry is the proof it was not lost. A log that cannot be read proves nothing, and the message is
- * applied.
+ * The messages this node's own log holds at `txnLogKey`, or null at or below the log's purge bound, where
+ * retention removed the entry and nothing was lost. An unreadable log proves nothing, so its messages are applied.
  */
-export function ownMessagesLoggedAt(auditStore: any, txnLogKey: number): OwnLoggedMessage[] {
-	const logged: OwnLoggedMessage[] = [];
+export function ownMessagesLoggedAt(
+	auditStore: any,
+	txnLogKey: number,
+	purgeBound: number | undefined = getLogPurgeBounds(auditStore, 'local')?.get('local')
+): Set<string> | null {
+	if (txnLogKey <= purgeBound) return null;
+	const logged = new Set<string>();
 	try {
-		for (const entry of auditStore.getRange({ start: txnLogKey, exactStart: true, log: 'local' })) {
+		const range: any = auditStore.getRange({ start: txnLogKey, exactStart: true, log: 'local' });
+		for (const entry of range) {
 			if (entry.txnLogKey !== txnLogKey) break;
-			if (entry.type === 'message')
-				logged.push({ tableId: entry.tableId, recordKey: toBufferKey(entry.recordId), version: entry.version });
+			if (entry.type === 'message') logged.add(ownMessageIdentity(entry.tableId, entry.recordId, entry.version));
 		}
+		if (range.failedLogs?.size > 0 || range.corruptFrameStop?.breaks > 0)
+			throw new Error('the own log could not be read cleanly');
 	} catch (error) {
-		logger.trace?.('could not read the own log for a returned message, letting it flow', txnLogKey, error);
-		return [];
+		logger.warn?.(
+			`Own-origin recovery: could not read the own log at ${txnLogKey}; a returned message it holds is published again`,
+			error
+		);
 	}
 	return logged;
 }
 
 export function isHeldOwnMessage(
-	logged: OwnLoggedMessage[],
+	logged: Set<string> | null,
 	tableId: number | undefined,
 	id: any,
 	version: number
 ): boolean {
-	if (logged.length === 0 || tableId === undefined) return false;
-	let recordKey: Buffer;
+	if (tableId === undefined) return false;
+	if (logged === null) return true;
+	if (logged.size === 0) return false;
 	try {
-		recordKey = toBufferKey(id);
+		return logged.has(ownMessageIdentity(tableId, id, version));
 	} catch {
 		return false;
 	}
-	return logged.some(
-		(entry) => entry.tableId === tableId && entry.version === version && entry.recordKey.equals(recordKey)
-	);
 }
 
 /**
@@ -11462,7 +11465,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 			// A valid prefix must not commit the frame cursor past a later forbidden origin or owner projection.
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
-			let frameOwnMessages: OwnLoggedMessage[] | undefined;
+			let frameOwnMessages: Set<string> | null | undefined;
 			let selfCopyBound = 0;
 			if (admittedLayout || residencyMapInstalled()) {
 				decoder.position = 8;
@@ -11823,7 +11826,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					(isHeldOwnWrite(readLocalEntry(tableDecoder, id), auditRecord.version) ||
 						(auditRecord.type === 'message' &&
 							isHeldOwnMessage(
-								(frameOwnMessages ??= ownMessagesLoggedAt(auditStore, frameTxnLogKey)),
+								frameOwnMessages === undefined
+									? (frameOwnMessages = ownMessagesLoggedAt(auditStore, frameTxnLogKey))
+									: frameOwnMessages,
 								tableDecoder.table?.tableId,
 								id,
 								auditRecord.version
