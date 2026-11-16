@@ -5,7 +5,7 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { deepEqual, ok } from 'node:assert/strict';
-import { cp, mkdtemp } from 'node:fs/promises';
+import { cp, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -211,6 +211,8 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 	test('the publishing node restarts while a subscriber on the other node stays connected', async () => {
 		await deliversOnce(ctx, 'origin-restart', async () => {
 			const since = Date.now();
+			// a start that cannot vouch for its own log asks B for A's writes back (replication/DESIGN.md note 39)
+			await writeFile(join(ctx.A.dataRootDir, 'own-origin-recovery-log-sync-failed'), 'replicatedMessageRedelivery');
 			await restartNode(ctx.A);
 			await waitForCondition((signal) => clusterConnected([ctx.A, ctx.B], signal), {
 				timeoutMs: WAIT_MS,
