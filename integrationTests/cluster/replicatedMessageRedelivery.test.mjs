@@ -66,6 +66,8 @@ function connectOptions(node, clientId) {
 		protocolVersion: 5,
 		reconnectPeriod: 1000,
 		connectTimeout: 8000,
+		// mqtt.js would resubscribe on its own after a reconnect and answer subscribe() before the SUBACK
+		resubscribe: false,
 	};
 }
 
@@ -85,8 +87,8 @@ function subscribe(node, topic, publisher, label) {
 	const client = mqtt.connect(wsUrl, connectOptions(node, `${label}-${topic}`));
 	const subscriber = { client, seen: new Map(), subscriptions: [] };
 	client.on('connect', () =>
-		client.subscribe(`Message/${topic}`, { qos: 0 }, (error) => {
-			if (!error) subscriber.subscriptions.push({ at: Date.now(), nextN: publisher.n });
+		client.subscribe(`Message/${topic}`, { qos: 0 }, (error, granted) => {
+			if (!error && granted[0]?.qos === 0) subscriber.subscriptions.push({ at: Date.now(), nextN: publisher.n });
 		})
 	);
 	client.on('message', (_topic, payload) => {
