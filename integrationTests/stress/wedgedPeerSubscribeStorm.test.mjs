@@ -293,8 +293,9 @@ if (!stressEnabled()) {
 				} else {
 					console.log(`[wedge] cycle ${cycle}: remove_node + add_node ${target.hostname}`);
 					// remove_node/add_node are the reliability operations under test — if either fails,
-					// that IS the regression, so let it throw rather than swallowing it.
-					await sendOperation(leader, { operation: 'remove_node', hostname: target.hostname });
+					// that IS the regression, so let it throw rather than swallowing it. Forced: the doomed peer is
+					// still a member the target sends to, and a dead peer can never confirm it holds the target's writes.
+					await sendOperation(leader, { operation: 'remove_node', hostname: target.hostname, force: true });
 					await delay(2000);
 					await sendOperation(target, {
 						operation: 'add_node',
