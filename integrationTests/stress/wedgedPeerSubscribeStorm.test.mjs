@@ -219,7 +219,7 @@ if (!stressEnabled()) {
 			await Promise.all(ctx.nodes.map((n) => teardownHarper({ harper: n }).catch(() => null)));
 		});
 
-		test('dead peer stays wedged without a subscribe storm while survivors restart/re-add reliably', async () => {
+		test('dead peer stays wedged without a subscribe storm while survivors restart/re-add reliably', async (t) => {
 			// node[0] is the bootstrap/leader; the LAST node is the doomed peer.
 			const leader = ctx.nodes[0];
 			const doomed = ctx.nodes[ctx.nodes.length - 1];
@@ -234,6 +234,7 @@ if (!stressEnabled()) {
 			const incarnations = survivors.map(logHandle);
 
 			const samplers = survivors.map((n) => sampleMetrics(n, { intervalMs: 2000 }));
+			t.after(() => samplers.forEach((sampler) => sampler.stop()));
 
 			// Permanently kill the doomed peer — it remains in hdb_nodes (desired) on
 			// every survivor, so it is a perpetual wedge-reconcile target.
