@@ -479,9 +479,10 @@ export function sampleMetrics(node, opts = {}) {
 				})),
 			});
 		}
-		timer = setTimeout(tick, interval);
+		timer = setTimeout(tick, interval).unref();
 	};
-	timer = setTimeout(tick, interval);
+	// unref: a test that throws before stop() must not be kept alive by its sampler
+	timer = setTimeout(tick, interval).unref();
 	return {
 		samples,
 		stop() {
