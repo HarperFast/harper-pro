@@ -570,12 +570,40 @@ describe('sharding setup authority', function () {
 			server.nodes = priorNodes;
 		}
 	});
-	it('requires a replication principal before setup for a configured database', () => {
+	it('requires a replication principal before setup for a configured database', async () => {
+		const database = 'slot_setup_principal';
 		const socket = new Socket();
 		sockets.push(socket);
-		replicateOverWS(socket, { database: 'slot_setup_principal' }, { username: 'reader', role: { permission: {} } });
-		assert.deepEqual(socket.closes, [{ code: 1008, reason: 'Unauthorized replication principal' }]);
-		assert.deepEqual(socket.sent, []);
+		const finishClose = socket.close.bind(socket);
+		socket.close = (code, reason) => {
+			socket.closes.push({ code, reason });
+			socket.readyState = 2;
+		};
+		const priorNodes = server.nodes;
+		server.nodes = [{ name: 'slot-setup-peer' }];
+		try {
+			await connect(database, { name: 'slot-setup-peer', replicates: true });
+			assert.deepEqual(residencyTopologyErrors(database), []);
+			replicateOverWS(socket, { database }, Promise.resolve({ username: 'reader', role: { permission: {} } }));
+			socket.emit(
+				'message',
+				encode([
+					140,
+					'slot-setup-peer',
+					database,
+					[],
+					buildLocalCapabilities(90_000, false, true),
+					{ shardsDigest: 'invalid' },
+				])
+			);
+			await turns();
+			assert.deepEqual(socket.closes, [{ code: 1008, reason: 'Unauthorized replication principal' }]);
+			assert.deepEqual(socket.sent, []);
+			assert.deepEqual(residencyTopologyErrors(database), []);
+		} finally {
+			finishClose(1000);
+			server.nodes = priorNodes;
+		}
 	});
 	for (const [name, authorization, options] of [
 		['false_grant', { name: 'slot-setup-peer', replicates: false }, {}],

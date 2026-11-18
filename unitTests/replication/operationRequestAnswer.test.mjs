@@ -14,7 +14,9 @@ import { ClientError, ServerError } from '#src/core/utility/errors/hdbError';
 
 const OPERATION_REQUEST = 136;
 const OPERATION_RESPONSE = 137;
+const DISCONNECT = 142;
 const OPEN = 1;
+const CLOSING = 2;
 const CLOSED = 3;
 
 class FakeSocket extends EventEmitter {
@@ -37,6 +39,16 @@ class FakeSocket extends EventEmitter {
 	ping() {}
 	pause() {}
 	resume() {}
+}
+
+class DelayedCloseSocket extends FakeSocket {
+	close(code) {
+		this.closes.push(code);
+		this.readyState = CLOSING;
+	}
+	finishClose() {
+		super.close(1000);
+	}
 }
 
 async function settled(socket) {
@@ -143,8 +155,8 @@ describe('answering an OPERATION_REQUEST', function () {
 			});
 		}
 
-		it('stops queued messages when admission is denied', async () => {
-			const denied = new FakeSocket();
+		it('stops queued messages before the socket emits close', async () => {
+			const denied = new DelayedCloseSocket();
 			try {
 				replicateOverWS(denied, {}, Promise.resolve({ username: 'reader', role: { permission: {} } }));
 				for (const requestId of [1, 2])
@@ -154,7 +166,7 @@ describe('answering an OPERATION_REQUEST', function () {
 				expect(received).to.deep.equal([]);
 				expect(denied.sent).to.deep.equal([]);
 			} finally {
-				denied.close(1000);
+				denied.finishClose();
 			}
 		});
 
@@ -475,6 +487,26 @@ describe("an operation error's status across the connection", function () {
 });
 
 describe('receiving operation replies', () => {
+	it('settles a disconnected operation as closed before accepting later replies', async () => {
+		const socket = new DelayedCloseSocket();
+		try {
+			const session = replicateOverWS(socket, {}, undefined, 'operation-replies');
+			const result = session.sendOperation({ operation: 'user_info' }, 1_000).then(
+				() => 'fulfilled',
+				(error) => error.message
+			);
+			const [, { requestId }] = socket.sent[0];
+			socket.emit('message', encode([DISCONNECT]));
+			socket.emit('message', encode([OPERATION_RESPONSE, { requestId }]));
+			await new Promise(setImmediate);
+			expect(socket.readyState).to.equal(CLOSING);
+			socket.finishClose();
+			expect(await result).to.match(/^Connection closed/);
+		} finally {
+			if (socket.readyState !== CLOSED) socket.finishClose();
+		}
+	});
+
 	it('correlates the reply to the outgoing request', async () => {
 		const socket = new FakeSocket();
 		try {

@@ -7743,7 +7743,6 @@ export function replicateOverWS(
 			// Stores not yet initialized; will bind once available.
 		}
 	}
-	bindSharedRouteSafety();
 	let postSeqWriteBarrierInFlight = false;
 	let postSeqWriteCheckDeferred = false;
 	let postSeqWriteNeedsAnotherPass = false;
@@ -8476,18 +8475,22 @@ export function replicateOverWS(
 					connectionId,
 					`Credential ${JSON.stringify(String(authorization.username ?? '<unknown>'))} is not authorized for replication`
 				);
-			} else {
-				rejectAuthorization('Unauthorized');
+			} else if (rejectAuthorization('Unauthorized')) {
 				logger.error?.(connectionId, 'No authorization provided');
 			}
 			return;
 		}
 		remoteNodeName ??= authorization.name;
-		if (databaseName) setDatabase(databaseName);
+		if (databaseName) {
+			setDatabase(databaseName);
+			bindSharedRouteSafety();
+		}
 	}
-	function rejectAuthorization(reason: string): void {
+	function rejectAuthorization(reason: string): boolean {
 		wsClosed = true;
-		if (ws.readyState !== WebSocket.CLOSING && ws.readyState !== WebSocket.CLOSED) close(1008, reason);
+		if (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) return false;
+		close(1008, reason);
+		return true;
 	}
 	/**
 	 * Resolve `tableSubscriptionToReplicator` before the receive path delivers to it. Until
@@ -8547,8 +8550,10 @@ export function replicateOverWS(
 			if (operationRepliesOnly) {
 				const [command, data] = body[0] > 127 ? decode(body) : [];
 				if (command === OPERATION_RESPONSE) receiveOperationResponse(data);
-				else if (command === DISCONNECT) close();
-				else rejectAuthorization('Expected an operation response');
+				else if (command === DISCONNECT) {
+					wsClosed = true;
+					close();
+				} else rejectAuthorization('Expected an operation response');
 				return;
 			}
 			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
