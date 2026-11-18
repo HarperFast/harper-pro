@@ -226,10 +226,17 @@ suite('power loss on the origin: own replicated writes come back from peers', { 
 		process.kill(pid, 'SIGKILL');
 		await waitForProcessGone(pid);
 
+		// Pre-baseline compactions unlink obsolete inputs asynchronously without syncing the transaction log.
+		const tableFilesAtKill = await tableFiles(nodeA);
+		const baselineTableFiles = new Set(baseline.tableFiles);
+		assert.ok(
+			tableFilesAtKill.some((name) => name.startsWith('MANIFEST-')),
+			`A's RocksDB manifest is present at kill: ${JSON.stringify(tableFilesAtKill)}`
+		);
 		assert.deepEqual(
-			await tableFiles(nodeA),
-			baseline.tableFiles,
-			'no flush or compaction wrote table files after the baseline'
+			tableFilesAtKill.filter((name) => !baselineTableFiles.has(name)),
+			[],
+			`no flush or compaction wrote table files after the baseline: ${JSON.stringify({ baseline: baseline.tableFiles, tableFilesAtKill })}`
 		);
 		assert.equal(
 			await flushesStarted(nodeA),
