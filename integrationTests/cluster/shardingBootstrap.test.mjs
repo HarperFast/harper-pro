@@ -339,9 +339,10 @@ export class BootstrapLocal extends Resource {
 			const source = await local(from, AbortSignal.timeout(10_000));
 			const appendKey = source.localAudit.find((entry) => entry.id === id && entry.type === 'put')?.key;
 			assert.ok(appendKey > above, `node ${from} appended ${id} above ${above}`);
+			let state;
 			await waitForCondition(
 				async (signal) => {
-					const state = await local(to, signal, sender.hostname);
+					state = await local(to, signal, sender.hostname);
 					return (
 						!state.copyPending &&
 						state.directSeqId >= appendKey &&
@@ -350,11 +351,14 @@ export class BootstrapLocal extends Resource {
 				},
 				{
 					timeoutMs: 30_000,
-					description: `node ${to} has a complete baseline and a direct cursor for ${id} from node ${from}`,
+					description: () =>
+						`node ${to} to resume from node ${from} at ${appendKey} for ${id} ` +
+						`(direct cursor ${state?.directSeqId}, copy pending ${state?.copyPending}, ` +
+						`row ${JSON.stringify(state?.rows.find((row) => row.id === id))})`,
 				}
 			);
 		}
-		// A cursorless reverse copy can return our own newer write and fence this owner while the reservation is held.
+		// A copy from node 2 can return node 0's newer write and fence node 0 while it holds the reservation.
 		await establishResumeCursor(2, 0, 'resume-baseline2', 'reverse-stream-ready');
 		const held = await control();
 		assert.ok(held.threadId > 0, 'a real request worker owns the reservation');
@@ -362,13 +366,15 @@ export class BootstrapLocal extends Resource {
 			await establishResumeCursor(0, 2, 'resume-cursor1', 'committed-above-reservation', held.key);
 			const logPath = join(node.logDir ?? join(node.dataRootDir, 'test-logs'), 'hdb.log');
 			const logStart = (await readFile(logPath, 'utf8')).length;
+			const readReconnectLog = async (signal) =>
+				(await readFile(logPath, { encoding: 'utf8', signal })).slice(logStart);
 			await stopNodeProcess(contexts[2].harper);
 			// a level-2 route resumes just below its certified floor, which the held reservation keeps below itself, so
 			// it needs no wait; at level 1 the peer resumes at its cursor above the reservation, the start this admits
 			await start(contexts[2], 2, { HARPER_TEST_FORCE_ORIGIN_FLOORS_LEVEL_1: '1' });
 			await waitForCondition(
 				async (signal) => {
-					const log = (await readFile(logPath, { encoding: 'utf8', signal })).slice(logStart);
+					const log = await readReconnectLog(signal);
 					const waits = log.matchAll(
 						/Waiting for older local transactions before resuming sharding subscription at [\d.]+ for ([\w.-]+)/g
 					);
@@ -391,6 +397,11 @@ export class BootstrapLocal extends Resource {
 					records: [{ id: 'resume-independent1', region: 'asia', body: 'writer-remains-live' }],
 				},
 				{ signal: AbortSignal.timeout(10_000) }
+			);
+			const reconnectLog = await readReconnectLog(AbortSignal.timeout(10_000));
+			assert.ok(
+				!reconnectLog.includes(`copy of database data from wss://${contexts[2].harper.hostname}:`),
+				'node 0 resumes the data subscription from node 2 without requesting a reverse copy'
 			);
 		} finally {
 			await control(true);
