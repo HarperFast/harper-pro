@@ -5757,10 +5757,24 @@ function operationAnswerError(answer: { error: unknown; statusCode?: unknown }) 
 	return error;
 }
 
+function hasNodeOrReplicationGrant(authorization: any): boolean {
+	return !!(authorization?.name || authorization?.replicates);
+}
+
+function hasReplicationPrincipal(authorization: any): boolean {
+	return hasNodeOrReplicationGrant(authorization) || !!authorization?.role?.permission?.super_user;
+}
+
 /**
  * This handles both incoming and outgoing WS allowing either one to issue a subscription and get replication and/or handle subscription requests
  */
-export function replicateOverWS(ws: ReplicationWebSocket, options: any, authorization: any) {
+export function replicateOverWS(
+	ws: ReplicationWebSocket,
+	options: any,
+	authorization: any,
+	mode?: 'operation-replies'
+) {
+	const operationRepliesOnly = mode === 'operation-replies';
 	const p = options.port || options.securePort;
 	const connectionId =
 		(process.pid % 1000) +
@@ -5846,7 +5860,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * node, which on a failover subscription is not the socket peer. Route state is read and marked there only.
 	 */
 	const routeRowId = (): number | undefined => receivingDataFromNodeIds[0];
-	remoteNodeName = authorization.name;
+	remoteNodeName = authorization?.name;
 	if (remoteNodeName && options.connection) options.connection.nodeName = remoteNodeName;
 	const blobGapGeneration: number = options.connection ? ++options.connection.blobGapGeneration : 0;
 	options.connection?.blobGapBudget?.beginGeneration(blobGapGeneration);
@@ -7310,9 +7324,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			publishPeerCertifiesFloors(status);
 		}
 	}
-	if (databaseName) {
-		setDatabase(databaseName);
-	}
 	let schemaUpdateListener, dbRemovalListener, dropRecordedListener;
 	const tableDecoders = [];
 	// The declaration to judge a send by. The live map wins: a drop removes the entry and a recreate
@@ -8413,6 +8424,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const receiveQueue = createReceiveQueueGate(RECEIVE_QUEUE_HIGH_WATER_MARK);
 	const receiveQueueWarnThrottle = createThrottleState();
 	ws.on('message', (body: Buffer) => {
+		if (wsClosed) return;
 		// Reset the receive watchdog synchronously on every frame — async processing below may
 		// take a long time and we want a single late frame to count as proof of life immediately.
 		resetPingTimer();
@@ -8455,17 +8467,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			logger.error?.(connectionId, 'Error applying inbound frame queue back-pressure', error);
 		}
 	});
-	let authorizationFinished = false;
-	function checkAuthorization(): boolean {
-		authorizationFinished = true;
-		if (!authorization) {
-			logger.error?.(connectionId, 'No authorization provided');
-			// don't send disconnect because we want the client to potentially retry
-			close(1008, 'Unauthorized');
-			return false;
+	function checkAuthorization(): void {
+		if (operationRepliesOnly) return;
+		if (!hasReplicationPrincipal(authorization)) {
+			if (authorization) {
+				rejectAuthorization('Unauthorized replication principal');
+				logger.warn?.(
+					connectionId,
+					`Credential ${JSON.stringify(String(authorization.username ?? '<unknown>'))} is not authorized for replication`
+				);
+			} else {
+				rejectAuthorization('Unauthorized');
+				logger.error?.(connectionId, 'No authorization provided');
+			}
+			return;
 		}
 		remoteNodeName ??= authorization.name;
-		return true;
+		if (databaseName) setDatabase(databaseName);
+	}
+	function rejectAuthorization(reason: string): void {
+		wsClosed = true;
+		if (ws.readyState !== WebSocket.CLOSING && ws.readyState !== WebSocket.CLOSED) close(1008, reason);
 	}
 	/**
 	 * Resolve `tableSubscriptionToReplicator` before the receive path delivers to it. Until
@@ -8513,25 +8535,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return true;
 	}
 	async function onWSMessage(body: Buffer): Promise<void> {
-		if (!authorizationFinished) {
-			if (authorization?.then) {
-				try {
-					authorization = await authorization;
-					if (connectionSuperseded()) return;
-				} catch (error) {
-					authorizationFinished = true;
-					logger.error?.(connectionId, 'Authorization failed', error);
-					// don't send disconnect because we want the client to potentially retry
-					close(1008, 'Unauthorized');
-					return;
-				}
-				if (!checkAuthorization()) return;
-			} else if (!checkAuthorization()) {
-				return;
-			}
-			// fall through to handle this message now that authorization succeeded
-		}
-		if (!authorization) return;
 		// A replication header should begin with either a transaction timestamp or messagepack message of
 		// of an array that begins with the command code
 		if (databaseName && databaseResidencyBlockReason(databaseName)) {
@@ -8541,6 +8544,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		lastMessageTime = performance.now();
 		try {
+			if (operationRepliesOnly) {
+				const [command, data] = body[0] > 127 ? decode(body) : [];
+				if (command === OPERATION_RESPONSE) receiveOperationResponse(data);
+				else if (command === DISCONNECT) close();
+				else rejectAuthorization('Expected an operation response');
+				return;
+			}
 			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
 			if (body[0] > 127) {
 				// not a transaction, special message
@@ -8724,12 +8734,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 						if (databaseResidencyBlockReason(schemaDatabaseName)) break;
 						// Markers drop tables, so they need the authority the subscription path requires to receive.
-						const markersAuthorized =
-							authorization?.name || authorization?.replicates || authorization?.role?.permission?.super_user;
 						// filtered by this peer's receive route here, so held markers keep their sender's rules
 						const routeExcluded = excludedTablesFromPeer(schemaDatabaseName);
 						const peerDropMarkers =
-							markersAuthorized && checkDatabaseAccess(schemaDatabaseName)
+							hasReplicationPrincipal(authorization) && checkDatabaseAccess(schemaDatabaseName)
 								? incomingMarkers.filter(
 										(marker) =>
 											!routeExcluded?.has(marker.table) &&
@@ -8841,7 +8849,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									.catch((error) => logger.warn?.('Could not answer private sharding bootstrap request', error));
 								break;
 							}
-							const isAuthorizedNode = authorization?.replicates || authorization?.subscribers || authorization?.name;
+							const isAuthorizedNode = hasNodeOrReplicationGrant(authorization) || authorization?.subscribers;
 							// data may carry a secret (registry token / ssh key / password); redact before
 							// logging. The conditional logger skips arg evaluation when debug is inactive.
 							logger.debug?.('Received operation request', redactOperationForLog(data), 'from', remoteNodeName);
@@ -8875,15 +8883,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							answerOperationError(data, error);
 						}
 						break;
-					case OPERATION_RESPONSE: {
-						const pending = awaitingResponse.get(data.requestId);
-						logger.debug?.('Received completed operation request', remoteNodeName, data);
-						if (!pending) break;
-						if (data.error) pending.reject(operationAnswerError(data));
-						else pending.resolve(data);
-						awaitingResponse.delete(data.requestId);
+					case OPERATION_RESPONSE:
+						receiveOperationResponse(data);
 						break;
-					}
 					case TABLE_FIXED_STRUCTURE:
 						declaresNoResidency = false;
 						if (data.residency !== undefined) authorizeResidencySchema(databaseName);
@@ -9880,7 +9882,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 									});
 							}
-						} else if (!(authorization?.role?.permission?.super_user || authorization.replicates)) {
+						} else if (!hasReplicationPrincipal(authorization)) {
 							logger.warn?.(
 								connectionId,
 								`Credential ${JSON.stringify(String(authorization.username ?? '<unknown>'))} is not authorized to subscribe to ${JSON.stringify(String(databaseName))}: no super_user permission and no replicates grant; closing the subscription`
@@ -12864,6 +12866,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			logger.warn?.('Could not answer a failed operation request from', remoteNodeName, sendError);
 		}
 	}
+	function receiveOperationResponse(data) {
+		const pending = awaitingResponse.get(data.requestId);
+		logger.debug?.('Received completed operation request', remoteNodeName, data);
+		if (!pending) return;
+		if (data.error) pending.reject(operationAnswerError(data));
+		else pending.resolve(data);
+		awaitingResponse.delete(data.requestId);
+	}
 	// Track the blobs being sent, so we can wait for them to finish before sending the next blob.
 	// The same blobs can't be sent concurrently of the packets will get mixed up. The receiving
 	// end should handle aggregated the results of the same blob for separate record requests.
@@ -14348,7 +14358,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (databaseName && databaseName !== 'system' && databaseName !== targetDatabase)
 			throw new Error('Sharding metadata does not belong to an authorized database frame');
 		const superUser = authorization?.role?.permission?.super_user;
-		if (!superUser && !(authorization?.name || authorization?.replicates))
+		if (!hasReplicationPrincipal(authorization))
 			throw new Error('Only an authorized replication peer may declare sharding policies');
 		const subscription = options.connection?.nodeSubscriptions?.[0];
 		const configuredRoute = Array.from(iterateRoutes(options)).find((route) => route.name === remoteNodeName);
@@ -14383,7 +14393,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			!enabledDatabases.includes?.(databaseName) &&
 			!enabledDatabases.some?.((dbConfig) => dbConfig.name === databaseName)
 		) {
-			// TODO: Check the authorization as well
 			return false;
 		}
 		return true;
@@ -14683,6 +14692,25 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 		});
 	}
+	if (typeof authorization?.then === 'function') {
+		messageProcessing = Promise.resolve(authorization)
+			.then((principal) => {
+				if (connectionSuperseded()) {
+					wsClosed = true;
+					return;
+				}
+				authorization = principal;
+				checkAuthorization();
+			})
+			.catch((error) => {
+				if (connectionSuperseded()) {
+					wsClosed = true;
+					return;
+				}
+				rejectAuthorization('Unauthorized');
+				logger.error?.(connectionId, 'Authorization failed', error);
+			});
+	} else checkAuthorization();
 	return {
 		end() {
 			// cleanup

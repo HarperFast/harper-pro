@@ -91,8 +91,8 @@ describe('answering an OPERATION_REQUEST', function () {
 		beforeEach(() => {
 			realOperation = server.operation;
 			received = [];
-			server.operation = (data, context) => {
-				received.push({ data, context });
+			server.operation = (data, context, authorize) => {
+				received.push({ data, context, authorize });
 				return Promise.resolve({});
 			};
 		});
@@ -121,6 +121,41 @@ describe('answering an OPERATION_REQUEST', function () {
 			operationSocket.close(1000);
 			expect(received).to.have.length(1);
 			expect(received[0].context.replicatedFrom).to.equal('peer-b');
+		});
+
+		for (const [label, principal, authorize] of [
+			['node identity', { name: 'peer-c' }, false],
+			['directional grant', { replicates: { sendsTo: [{ database: 'data' }] } }, false],
+			['super_user', { role: { permission: { super_user: true } } }, true],
+		]) {
+			it(`admits a ${label} principal`, async () => {
+				const admitted = new FakeSocket();
+				try {
+					replicateOverWS(admitted, {}, Promise.resolve(principal));
+					admitted.emit('message', encode([OPERATION_REQUEST, { operation: 'user_info', requestId: 1 }]));
+					await settled(admitted);
+					expect(admitted.closes).to.deep.equal([]);
+					expect(received).to.have.length(1);
+					expect(received[0].authorize).to.equal(authorize);
+				} finally {
+					admitted.close(1000);
+				}
+			});
+		}
+
+		it('stops queued messages when admission is denied', async () => {
+			const denied = new FakeSocket();
+			try {
+				replicateOverWS(denied, {}, Promise.resolve({ username: 'reader', role: { permission: {} } }));
+				for (const requestId of [1, 2])
+					denied.emit('message', encode([OPERATION_REQUEST, { operation: 'user_info', requestId }]));
+				await new Promise(setImmediate);
+				expect(denied.closes).to.deep.equal([1008]);
+				expect(received).to.deep.equal([]);
+				expect(denied.sent).to.deep.equal([]);
+			} finally {
+				denied.close(1000);
+			}
 		});
 
 		it('is left unset on every other operation', async () => {
@@ -437,4 +472,38 @@ describe("an operation error's status across the connection", function () {
 			expect(socket.closes).to.deep.equal([]);
 		});
 	});
+});
+
+describe('receiving operation replies', () => {
+	it('correlates the reply to the outgoing request', async () => {
+		const socket = new FakeSocket();
+		try {
+			const session = replicateOverWS(socket, {}, undefined, 'operation-replies');
+			const result = session.sendOperation({ operation: 'user_info' }, 1_000);
+			const [, { requestId }] = socket.sent[0];
+			const answer = { requestId, username: 'peer-user' };
+			socket.emit('message', encode([OPERATION_RESPONSE, answer]));
+			expect(await result).to.deep.equal(answer);
+		} finally {
+			socket.close(1000);
+		}
+	});
+
+	for (const [label, frame] of [
+		['operation request', encode([OPERATION_REQUEST, { operation: 'user_info', requestId: 1 }])],
+		['binary frame', Buffer.alloc(1)],
+	]) {
+		it(`closes the reply-only session on a ${label}`, async () => {
+			const socket = new FakeSocket();
+			try {
+				replicateOverWS(socket, {}, undefined, 'operation-replies');
+				socket.emit('message', frame);
+				await settled(socket);
+				expect(socket.closes).to.deep.equal([1008]);
+				expect(socket.sent).to.deep.equal([]);
+			} finally {
+				socket.close(1000);
+			}
+		});
+	}
 });

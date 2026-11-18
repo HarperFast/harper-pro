@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import WebSocket from 'ws';
-import { encode } from 'msgpackr';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { ensureTableExists, readLog, sendOperation } from './clusterShared.mjs';
 
@@ -11,19 +10,20 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 
 const DATABASE = 'data';
 const TABLE = 'subscription_auth_logging';
-const CLOSE_REASON = `Unauthorized database subscription to ${DATABASE}`;
+const CLOSE_REASON = 'Unauthorized replication principal';
 const LOG_TIMEOUT_MS = 30_000;
+const ADMISSION_TIMEOUT_MS = 10_000;
 
-function optionsFor(hostname, peerHostname, replicates) {
+function optionsFor(port, routes = []) {
 	return {
 		config: {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: false, console: true, level: 'warn' },
 			replication: {
-				port: hostname + ':9933',
+				port,
 				securePort: null,
 				databases: [DATABASE],
-				routes: [{ hostname: peerHostname, port: 9933, replicates }],
+				routes,
 			},
 		},
 		env: { HARPER_NO_FLUSH_ON_EXIT: true },
@@ -41,16 +41,16 @@ async function waitForLog(node, expected) {
 	throw new Error(`Timed out waiting for ${JSON.stringify(expected)} in ${node.hostname}'s log:\n${log}`);
 }
 
-function requestUnauthorizedSubscription(node, localAddress, username, password) {
+function observeReplicationAdmission(url, localAddress, username, password) {
 	return new Promise((resolve, reject) => {
-		const socket = new WebSocket(`ws://${node.hostname}:9933`, 'harperdb-replication-v1', {
+		const socket = new WebSocket(url, 'harperdb-replication-v1', {
 			headers: { Authorization: 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64') },
 			localAddress,
 		});
 		const timeout = setTimeout(() => {
 			socket.terminate();
-			reject(new Error('Timed out waiting for unauthorized replication subscription to close'));
-		}, LOG_TIMEOUT_MS);
+			reject(new Error('Timed out waiting for replication admission to close'));
+		}, ADMISSION_TIMEOUT_MS);
 		socket.once('error', (error) => {
 			clearTimeout(timeout);
 			reject(error);
@@ -59,14 +59,27 @@ function requestUnauthorizedSubscription(node, localAddress, username, password)
 			clearTimeout(timeout);
 			resolve({ code, reason: reason.toString() });
 		});
-		socket.once('open', () => {
-			socket.send(encode([140, 'unprivileged-replication-client', DATABASE]));
-			socket.send(encode([129, [], []]));
+		socket.once('message', () => {
+			clearTimeout(timeout);
+			socket.terminate();
+			reject(new Error('Received a message before replication admission closed'));
 		});
 	});
 }
 
-suite('subscription authorization close logging', { timeout: 120_000 }, (ctx) => {
+async function assertConnectionAdmission(node, url, clientHostname) {
+	const role = 'replication-principal-role';
+	const username = 'replication-principal-user';
+	const password = 'replication-principal-password';
+	await sendOperation(node, { operation: 'add_role', role, permission: { super_user: false } });
+	await sendOperation(node, { operation: 'add_user', username, password, role, active: true });
+
+	const close = await observeReplicationAdmission(url, clientHostname, username, password);
+	assert.deepEqual(close, { code: 1008, reason: CLOSE_REASON });
+	await waitForLog(node, `Credential ${JSON.stringify(username)} is not authorized for replication`);
+}
+
+suite('replication authorization close logging', { timeout: 120_000 }, (ctx) => {
 	before(async () => {
 		const sourceHostname = await getNextAvailableLoopbackAddress();
 		const subscriberHostname = await getNextAvailableLoopbackAddress();
@@ -75,8 +88,18 @@ suite('subscription authorization close logging', { timeout: 120_000 }, (ctx) =>
 		const subscriberContext = { name: ctx.name, harper: { hostname: subscriberHostname } };
 
 		await Promise.all([
-			startHarper(sourceContext, optionsFor(sourceHostname, subscriberHostname, { sends: false, receives: false })),
-			startHarper(subscriberContext, optionsFor(subscriberHostname, sourceHostname, { sends: false, receives: true })),
+			startHarper(
+				sourceContext,
+				optionsFor(sourceHostname + ':9933', [
+					{ hostname: subscriberHostname, port: 9933, replicates: { sends: false, receives: false } },
+				])
+			),
+			startHarper(
+				subscriberContext,
+				optionsFor(subscriberHostname + ':9933', [
+					{ hostname: sourceHostname, port: 9933, replicates: { sends: false, receives: true } },
+				])
+			),
 		]);
 		ctx.source = sourceContext.harper;
 		ctx.subscriber = subscriberContext.harper;
@@ -107,18 +130,21 @@ suite('subscription authorization close logging', { timeout: 120_000 }, (ctx) =>
 		);
 	});
 
-	test('logs and preserves the 1008 reason when a non-replicating user subscribes', async () => {
-		const role = `subscription-log-unprivileged-role-${Date.now()}`;
-		const username = `subscription-log-unprivileged-user-${Date.now()}`;
-		const password = 'subscription-log-unprivileged-password';
-		await sendOperation(ctx.source, { operation: 'add_role', role, permission: { super_user: false } });
-		await sendOperation(ctx.source, { operation: 'add_user', username, password, role, active: true });
+	test('requires a replication principal at setup on the dedicated listener', () =>
+		assertConnectionAdmission(ctx.source, `ws://${ctx.source.hostname}:9933`, ctx.clientHostname));
 
-		const close = await requestUnauthorizedSubscription(ctx.source, ctx.clientHostname, username, password);
-		assert.deepEqual(close, { code: 1008, reason: CLOSE_REASON });
-		await waitForLog(
-			ctx.source,
-			`Credential ${JSON.stringify(username)} is not authorized to subscribe to ${JSON.stringify(DATABASE)}: no super_user permission and no replicates grant; closing the subscription`
-		);
+	test('requires a replication principal at setup on the operations listener', async () => {
+		const context = {
+			name: `${ctx.name}-operations-listener`,
+			harper: { hostname: await getNextAvailableLoopbackAddress() },
+		};
+		try {
+			const options = optionsFor(null);
+			await startHarper(context, { ...options, config: { ...options.config, threads: { count: 0 } } });
+			const node = context.harper;
+			await assertConnectionAdmission(node, node.operationsAPIURL.replace(/^http/, 'ws'), ctx.clientHostname);
+		} finally {
+			await teardownHarper(context);
+		}
 	});
 });

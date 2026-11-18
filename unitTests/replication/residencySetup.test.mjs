@@ -250,7 +250,6 @@ describe('sharding setup authority', function () {
 		}
 	});
 	for (const [name, authorization, options] of [
-		['credential', { username: 'reader', role: { permission: {} } }, {}],
 		['false_grant', { name: 'slot-setup-peer', replicates: false }, {}],
 		['receive_only_grant', { name: 'slot-setup-peer', replicates: { receives: true } }, {}],
 		['receive_from_grant', { name: 'slot-setup-peer', replicates: { receivesFrom: ['*'] } }, {}],
@@ -571,30 +570,12 @@ describe('sharding setup authority', function () {
 			server.nodes = priorNodes;
 		}
 	});
-	it('ignores shard-list claims from a credential without replication authority', async () => {
-		const database = 'slot_setup_untrusted_digest';
-		const priorNodes = server.nodes;
-		server.nodes = [{ name: 'slot-setup-peer' }];
-		try {
-			await connect(database, { name: 'slot-setup-peer', replicates: true });
-			assert.deepEqual(residencyTopologyErrors(database), []);
-			const socket = await connect(database, { username: 'reader', role: { permission: {} } });
-			socket.emit(
-				'message',
-				encode([
-					140,
-					'slot-setup-peer',
-					database,
-					[],
-					buildLocalCapabilities(90_000, false, true),
-					{ shardsDigest: 'forged' },
-				])
-			);
-			await processed(socket, true);
-			assert.deepEqual(residencyTopologyErrors(database), []);
-		} finally {
-			server.nodes = priorNodes;
-		}
+	it('requires a replication principal before setup for a configured database', () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		replicateOverWS(socket, { database: 'slot_setup_principal' }, { username: 'reader', role: { permission: {} } });
+		assert.deepEqual(socket.closes, [{ code: 1008, reason: 'Unauthorized replication principal' }]);
+		assert.deepEqual(socket.sent, []);
 	});
 	for (const [name, authorization, options] of [
 		['false_grant', { name: 'slot-setup-peer', replicates: false }, {}],

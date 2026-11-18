@@ -68,7 +68,7 @@ The protocol decoder. Reads incoming binary commands — each is a top-level nam
 
 A code this build does not know falls to the switch's `default:`, which counts it on the connection and warns through a throttle shared by every socket in that worker thread, then keeps processing. It does **not** close: an unknown code means the peer is running a NEWER build, so closing would hard-loop the link — the reconnect replays the same frame. Note the consequence: the durable resume cursor still advances past a frame this build did not understand. Sender-side gating (below) is the invariant that makes that safe.
 
-The `authorization` parameter is a **promise that may resolve asynchronously**; on rejection the socket closes without a DISCONNECT frame (relevant to JWT failure flows).
+`replicateOverWS` settles authorization before database setup or frame dispatch. A node name, `replicates` grant, or `super_user` permission admits the socket.
 
 ### Protocol capabilities (`protocolCapabilities.ts`)
 
@@ -401,7 +401,7 @@ A read never relocates (#436 step 1). The GET_RECORD response resolver hands the
 
 ## Non-obvious behaviors
 
-1. **Auth failures don't send DISCONNECT.** When the `authorization` promise rejects in `replicateOverWS`, the connection closes with "Unauthorized" but no DISCONNECT frame is sent — the client is expected to retry.
+1. **Auth failures close with 1008.** Operation-only outbound sockets accept operation replies and DISCONNECT. The local caller selects that mode in `sendOperationToNode`.
 
 2. **A skipped record still advances the peer's cursor.** `sendAuditRecord` skips a record the subscriber must not receive (`LOCAL_ONLY`, a gated lock control entry, an unsubscribed or excluded table, an origin the subscription does not cover, a residency omission). Every skip branch returns `skipAuditRecord()`, which consults the shared send budget (note 28) and, at most once per `SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY` (300 ms), sends a `SEQUENCE_ID_UPDATE` when the last sent sequence id has fallen behind, so a long skipped run still moves the peer's resume cursor.
 
