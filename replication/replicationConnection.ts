@@ -8494,7 +8494,11 @@ export function replicateOverWS(
 	}
 	function closeOnDatabaseSetupError(error: unknown, sendDisconnect = false): void {
 		wsClosed = true;
-		logger.warn?.(connectionId, 'Error setting database', error);
+		try {
+			logger.warn?.(connectionId, 'Error setting database', error);
+		} catch {
+			// The socket still needs to close if the log sink fails.
+		}
 		if (sendDisconnect) ws.send(encode([DISCONNECT]));
 		close(1008, sendDisconnect && error instanceof Error ? error.message : 'Replication database setup failed');
 	}

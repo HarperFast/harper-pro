@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 const { Transaction: NativeTransaction } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
+const { forComponent } = createRequire(import.meta.url)('#src/core/utility/logging/harper_logger');
 import * as env from '#src/core/utility/environment/environmentManager';
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
@@ -612,6 +613,26 @@ describe('sharding setup authority', function () {
 		await turns();
 		assert.deepStrictEqual(socket.closes, [{ code: 1008, reason: 'Replication database setup failed' }]);
 		assert.deepStrictEqual(socket.sent, []);
+	});
+	it('closes a failed database setup when warning logging throws', async () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		const logger = forComponent('replication').conditional;
+		const originalWarn = logger.warn;
+		let setupWarning;
+		logger.warn = (...args) => {
+			if (args[1] !== 'Error setting database') return originalWarn?.(...args);
+			setupWarning = args[2];
+			throw new Error('Fixture warning sink failed');
+		};
+		try {
+			replicateOverWS(socket, { database: 'system' }, Promise.resolve({ name: server.hostname }));
+			await turns();
+			assert.match(setupWarning?.message, /Should not connect to self/);
+			assert.deepStrictEqual(socket.closes, [{ code: 1008, reason: 'Replication database setup failed' }]);
+		} finally {
+			logger.warn = originalWarn;
+		}
 	});
 	it('reports a rejected authorization promise as unauthorized', async () => {
 		const socket = new Socket();
