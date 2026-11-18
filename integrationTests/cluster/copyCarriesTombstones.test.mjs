@@ -162,7 +162,7 @@ suite('a base copy carries deletions', { timeout: 900_000, skip: isLMDB && 'copy
 
 		await nodes.start(A);
 		await sendOperation(A.harper, { operation: 'delete', database: 'data', table: TABLE, ids: ['k-put', 'k-patch'] });
-		await sendOperation(A.harper, { operation: 'remove_node', hostname: D.harper.hostname });
+		await sendOperation(A.harper, { operation: 'remove_node', hostname: D.harper.hostname, force: true });
 		await put(A.harper, 'sentinel', { name: 'after the deletes' });
 		for (const [id, read] of [
 			['k-put', dataRow],
