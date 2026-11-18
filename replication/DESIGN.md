@@ -68,7 +68,7 @@ The protocol decoder. Reads incoming binary commands — each is a top-level nam
 
 Replication sessions count unknown codes in `default:` and warn through a worker-wide throttle. They keep processing so a reconnect does not replay the same frame in a loop. The durable cursor can advance past an unknown frame, so senders gate codes by peer capability (below).
 
-`replicateOverWS` settles authorization before database setup or frame dispatch. A node name, `replicates` grant, or `super_user` permission admits the socket.
+`replicateOverWS` admits a node name, `replicates` grant, or `super_user` permission before database setup or dispatch.
 
 ### Protocol capabilities (`protocolCapabilities.ts`)
 
@@ -401,7 +401,7 @@ A read never relocates (#436 step 1). The GET_RECORD response resolver hands the
 
 ## Non-obvious behaviors
 
-1. **Auth failures close with 1008.** Setup sends the close frame directly so the dialing replication peer retries. `sendOperationToNode` opens sockets that accept `OPERATION_RESPONSE` and `DISCONNECT`. Other frames close with 1008. Decode errors close with 1011.
+1. **Setup closes.** Inbound admission and database setup failures latch before closing with 1008, with distinct reasons. `sendOperationToNode` accepts `OPERATION_RESPONSE` and `DISCONNECT`. Other frames close with 1008. Decode errors close with 1011.
 
 2. **A skipped record still advances the peer's cursor.** `sendAuditRecord` skips a record the subscriber must not receive (`LOCAL_ONLY`, a gated lock control entry, an unsubscribed or excluded table, an origin the subscription does not cover, a residency omission). Every skip branch returns `skipAuditRecord()`, which consults the shared send budget (note 28) and, at most once per `SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY` (300 ms), sends a `SEQUENCE_ID_UPDATE` when the last sent sequence id has fallen behind, so a long skipped run still moves the peer's resume cursor.
 

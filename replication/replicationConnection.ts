@@ -8492,6 +8492,12 @@ export function replicateOverWS(
 		close(1008, reason);
 		return true;
 	}
+	function closeOnDatabaseSetupError(error: unknown, sendDisconnect = false): void {
+		wsClosed = true;
+		logger.warn?.(connectionId, 'Error setting database', error);
+		if (sendDisconnect) ws.send(encode([DISCONNECT]));
+		close(1008, sendDisconnect && error instanceof Error ? error.message : 'Replication database setup failed');
+	}
 	/**
 	 * Resolve `tableSubscriptionToReplicator` before the receive path delivers to it. Until
 	 * `Replicator.subscribe()` registers this database's queue on this thread, it is the unresolved
@@ -8673,10 +8679,7 @@ export function replicateOverWS(
 										}
 									}
 								} catch (error) {
-									// if this fails, we should close the connection and indicate that we should not reconnect
-									logger.warn?.(connectionId, 'Error setting database', error);
-									ws.send(encode([DISCONNECT]));
-									close(1008, error.message);
+									closeOnDatabaseSetupError(error, true);
 									return;
 								}
 							}
@@ -14698,6 +14701,7 @@ export function replicateOverWS(
 		});
 	}
 	if (typeof authorization?.then === 'function') {
+		let authorizationResolved = false;
 		messageProcessing = Promise.resolve(authorization)
 			.then((principal) => {
 				if (connectionSuperseded()) {
@@ -14705,11 +14709,16 @@ export function replicateOverWS(
 					return;
 				}
 				authorization = principal;
+				authorizationResolved = true;
 				checkAuthorization();
 			})
 			.catch((error) => {
 				if (connectionSuperseded()) {
 					wsClosed = true;
+					return;
+				}
+				if (authorizationResolved) {
+					closeOnDatabaseSetupError(error);
 					return;
 				}
 				rejectAuthorization('Unauthorized');

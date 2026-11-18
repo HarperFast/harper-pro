@@ -605,6 +605,52 @@ describe('sharding setup authority', function () {
 			server.nodes = priorNodes;
 		}
 	});
+	it('reports configured database setup failures after authorization resolves', async () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		replicateOverWS(socket, { database: 'system' }, Promise.resolve({ name: server.hostname }));
+		await turns();
+		assert.deepStrictEqual(socket.closes, [{ code: 1008, reason: 'Replication database setup failed' }]);
+		assert.deepStrictEqual(socket.sent, []);
+	});
+	it('reports a rejected authorization promise as unauthorized', async () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		replicateOverWS(socket, {}, Promise.reject(new Error('Fixture authorization failure')));
+		await turns();
+		assert.deepStrictEqual(socket.closes, [{ code: 1008, reason: 'Unauthorized' }]);
+	});
+	it('stops sending requests when the database handshake fails before transport close', async () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		const finishClose = socket.close.bind(socket);
+		const failure = new Error('Fixture database handshake send failed');
+		const send = socket.send.bind(socket);
+		socket.send = (data) => {
+			if (decode(data)[0] === 140) throw failure;
+			send(data);
+		};
+		socket.close = (code, reason) => {
+			socket.closes.push({ code, reason });
+			socket.readyState = 2;
+		};
+		let rejection;
+		try {
+			const session = replicateOverWS(socket, {}, { name: 'slot-setup-peer', replicates: true });
+			socket.emit('message', encode([140, 'slot-setup-peer', 'slot_setup_failed_handshake', [], {}]));
+			await turns();
+			assert.deepStrictEqual(socket.closes, [{ code: 1008, reason: failure.message }]);
+			assert.deepStrictEqual(socket.sent, [[142]]);
+			rejection = assert.rejects(
+				session.sendOperation({ operation: 'user_info' }),
+				/Connection closed before operation request/
+			);
+		} finally {
+			socket.close = finishClose;
+			finishClose(1000);
+		}
+		await rejection;
+	});
 	for (const [name, authorization, options] of [
 		['false_grant', { name: 'slot-setup-peer', replicates: false }, {}],
 		[
