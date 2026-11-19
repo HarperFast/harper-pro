@@ -4146,6 +4146,8 @@ type CopyPassState = {
 	routeId?: number;
 	/** The hole rows that stood when this pass began: the only ones its completion may fill. */
 	holes?: CopyHole[];
+	/** The pass began on a route proven to carry every table, with a request that left none out: only then may it fill. */
+	deliversEveryTable?: boolean;
 };
 
 /**
@@ -7861,6 +7863,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let passHoles = 0;
 	/** Records this pass dropped because its route filters their table: no hole, but those tables were not delivered. */
 	let passFilteredRecords = 0;
+	/** The latest subscription request for the route's own node asked for every table this node holds. */
+	let requestedEveryTable = false;
 	/** Highest audit-less copyApply record version applied per origin, bounding floor-only resume. */
 	const maxCopiedVersionByOrigin = new Map<number, number>();
 	/**
@@ -8018,15 +8022,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const peerId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
 			// only a pass known to deliver every table can vouch for what an earlier pass dropped: not a resumed one, one
-			// that skipped a table, or a projection, whose sender's table scope this node cannot see (its route certifies
-			// no coverage)
+			// that skipped a table, one whose route coverage is unproven, or a projection (its route certifies no coverage)
 			const filled =
 				passHoles === 0 &&
 				passFilteredRecords === 0 &&
 				passState !== undefined &&
 				!passState.resumed &&
 				!projectionCopy &&
-				passState.fullCoverage !== false
+				passState.deliversEveryTable === true
 					? (passState.holes ?? [])
 					: [];
 			const rootStore = store?.rootStore ?? (dbisDB as any)?.rootStore;
@@ -9104,6 +9107,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							resumed: copyWasResumed,
 							resumedWithWidening: copyResumedWithWidening,
 							fullCoverage: options.connection?.routeFullCoverage !== false,
+							deliversEveryTable: requestedEveryTable && options.connection?.routeFullCoverage === true,
 							seqDurableAtCopyStart: false,
 							completeReceived: false,
 							restored: false,
@@ -9121,7 +9125,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								copyStartKey(readDbisCursorSync(getDatabaseStores().dbisDB, 'copyCursor', copyFromNodeId), encode)
 							)
 						);
-						if (copyApplyActive() && supportsCheckpointFloors()) {
+						if (currentCopyPass.deliversEveryTable && copyApplyActive() && supportsCheckpointFloors()) {
 							try {
 								// any complete pass refills an ordinary table, whichever peer's pass dropped the record
 								currentCopyPass.holes = readCopyHoles(getDatabaseStores().dbisDB);
@@ -10653,7 +10657,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								};
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
-								// read once per floor capture, so emission does no catalog read
+								// captured with the floors, so emission compares against what capture saw and reads no catalog
 								let relayAgreement: string | undefined;
 								const originCertifies = (name: string): number => {
 									const status = getReplicationSharedStatus(auditStore, databaseName, name);
@@ -13701,6 +13705,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!error.message.includes('Can not re')) throw error;
 		}
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
+		requestedEveryTable = false;
 		receivingDataFromNodeIds = [];
 		requestedNodeNames = [];
 		lastSentBareFloorCursors.clear();
@@ -13751,6 +13756,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
+				if (node === connectedNode) requestedEveryTable = replicateByDefault !== false && tableSubs.length === 0;
 
 				const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 				auditStore?.ensureLogExists?.(node.name);

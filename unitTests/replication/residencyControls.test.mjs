@@ -3018,7 +3018,6 @@ describe('Declarative tables keep control and event traffic independent of place
 			Table.tableId,
 			Table.tableName,
 		]);
-	// the three records a route never owes: a correct sender skips each and advances the cursor (harper-pro#1213)
 	const unownedDrops = ['local-only', 'non-replicating', 'route-excluded'];
 	const unownedSubscription = (peer, drop) => ({
 		name: peer,
@@ -3036,8 +3035,15 @@ describe('Declarative tables keep control and event traffic independent of place
 			...(drop === 'non-replicating' ? { replicate: false } : {}),
 		});
 
-	for (const drops of [false, 'owed', 'unowed', 'filtered'])
-		it(`releases the hole rows that stood only after a complete copy that drops nothing it owed (drops=${drops})`, () =>
+	// level 1: a route whose full coverage is never proven, so it may not fill a hole even when it drops nothing
+	for (const [drops, level] of [
+		[false, 2],
+		['owed', 2],
+		['unowed', 2],
+		['filtered', 2],
+		[false, 1],
+	])
+		it(`releases the hole rows that stood only after a complete copy that drops nothing it owed (drops=${drops}, level=${level})`, () =>
 			atCheckpointLevel(async () => {
 				const peer = 'slot-control-peer';
 				const connection = new EventEmitter();
@@ -3046,11 +3052,11 @@ describe('Declarative tables keep control and event traffic independent of place
 				let Local;
 				const { Records, socket, database } = await connect(
 					false,
-					`copy_hole_release_${drops}`,
+					`copy_hole_release_${drops}_${level}`,
 					true,
-					checkpointCapabilities(),
+					level === 2 ? checkpointCapabilities() : buildLocalCapabilities(90_000, true, true),
 					(database) => {
-						Local = plainTable(database, 'non-replicating');
+						if (drops === 'filtered') Local = plainTable(database, 'non-replicating');
 					},
 					connection
 				);
@@ -3131,8 +3137,12 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.ok(reserved.length > 0, 'the pass reserved its copy start');
 				for (const row of reserved)
 					assert.ok(!Object.values(row).includes(HOLE_COPY_BOUND), 'a reservation never carries a hole');
-				if (drops === 'owed' || drops === 'filtered')
-					assert.equal(holes().length, 2, 'a pass that drops a record it owed, or skips a table, fills no hole');
+				if (drops === 'owed' || drops === 'filtered' || level === 1)
+					assert.equal(
+						holes().length,
+						2,
+						'a pass that drops a record it owed, skips a table or lacks proven coverage fills no hole'
+					);
 				else {
 					assert.deepEqual(holes(), [], 'a complete pass that dropped nothing fills every hole that stood');
 					assert.deepEqual(copyHoleStatus(Records.dbisDB, Records.auditStore), []);
