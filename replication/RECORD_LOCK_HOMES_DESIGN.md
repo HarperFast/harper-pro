@@ -573,10 +573,12 @@ true }` or the per-node operations with `default: true`). On a node, a database 
   activate hop's `explicit` plus `staged.explicit`, which the apply also unions from every surveyed
   `staged.explicit`), under the default row's lock, after `planActivate` validated the promotion and
   before its write. A child row commits through its own handle, so each first row and marker re-reads
-  the default and refuses if it moved (`guardedBy`). Only a staged default is promoted, so no marked database
-  holds inherited authority there; an already-active default writes none, since that would retract a
-  live map without a drain, so an apply that finds a home already active at the target without a name
-  the union carries opens the next generation instead of resuming. `resolveEffectiveRow` reads a database's own row again after the default,
+  the default and refuses if it moved or if less than `LOCK_LEASE_SKEW_MS` of the default row's lease
+  remains (`guardedBy`); only a pause longer than that skew could land it late. Only a staged default
+  is promoted, so no marked database holds inherited authority there; an already-active default writes
+  none, since that would retract a live map without a drain. Its activation refuses a name it has no
+  row for, and an apply (or the fenced recovery it prints) that finds a home already active at the
+  target without a name the union carries opens the next generation instead of resuming. `resolveEffectiveRow` reads a database's own row again after the default,
   so a refresh never pairs a pre-marker absence with the default the marker preceded. Nesting order is
   default → database (`withEffectiveRow`, which `record_lock_fence_external` also takes).
 - **Clone lineage.** A row created while a default row exists takes the default's `cloneAttempt`, so a

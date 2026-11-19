@@ -1,7 +1,4 @@
-/**
- * Fresh nodes are in their first incarnation, so the first default proves its drain at once. Same
- * fixture as `recordLockCluster.test.mjs`.
- */
+/** Fresh nodes are in their first incarnation, so the first default proves its drain at once. */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { ensureTableExists, sendOperation, waitForCondition } from './clusterShared.mjs';
@@ -198,7 +195,8 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		const id = 'shrink-' + Date.now();
 		await putCounter(nodes[0], id, 0);
 		await waitForCounter(nodes, id, 0);
-		const held = await call(nodes[2], 'LockHold/', { id, lease: 8_000, timeout: 10_000 });
+		// Poll (4 s), linger and rival (4 s) fit inside the lease, which fits inside the 10 s stage drain budget.
+		const held = await call(nodes[2], 'LockHold/', { id, lease: 9_000, timeout: 10_000 });
 		assert.equal(held.status, 200, JSON.stringify(held.body));
 		let settled = false;
 		const shrinking = applyDefault(nodes[0], { homes: names.slice(0, 2), quiesce: names }).finally(
@@ -209,9 +207,10 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 				const entry = await recordLocksOf(nodes[2], DB, signal);
 				return entry && entry.members === undefined ? true : undefined;
 			},
-			{ timeoutMs: 6_000, pollMs: 100, description: 'the leaver to stop serving the default while it holds the lock' }
+			{ timeoutMs: 4_000, pollMs: 100, description: 'the leaver to stop serving the default while it holds the lock' }
 		);
-		await new Promise((resolve) => setTimeout(resolve, 1_500));
+		// Past the 2 s backstop between the last stage and activation, so a drain that proved early would have activated.
+		await new Promise((resolve) => setTimeout(resolve, 3_000));
 		assert.equal(settled, false, 'the shrink waits for the held lock to drain');
 		assert.notEqual(
 			(await call(nodes[0], 'LockedIncrement/', { id, timeout: 1_000 })).status,

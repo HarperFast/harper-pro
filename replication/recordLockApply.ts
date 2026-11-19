@@ -364,10 +364,20 @@ function manualRecovery(
 			reply && !('error' in reply) ? [...(reply.explicit ?? []), ...(reply.staged?.explicit ?? [])] : []
 		)
 	);
+	const isDefault = database === DEFAULT_HOMES_KEY;
 	for (const generation of new Set([...preferred, floor + 1])) {
 		if (!Number.isSafeInteger(generation)) continue;
-		const stages = planStages(database, homes, quiesce, rows, generation, digestFor(database, generation, homes));
+		const stages = planStages(
+			database,
+			homes,
+			quiesce,
+			rows,
+			generation,
+			digestFor(database, generation, homes),
+			isDefault ? explicit : undefined
+		);
 		if ('rejected' in stages) continue;
+		if (isDefault && unmarkedOn(stages.alreadyActive, explicit, (node) => rows.get(node)).length > 0) continue;
 		const activate = JSON.stringify({ operation: 'record_lock_activate_generation', ...target, generation, homes });
 		const departing = canonicalizeHomes([...rows.keys()].filter((node) => !homes.includes(node)));
 		if (
@@ -382,11 +392,26 @@ function manualRecovery(
 			generation,
 			homes,
 			quiesce,
-			...(database === DEFAULT_HOMES_KEY ? { explicit } : {}),
+			...(isDefault ? { explicit } : {}),
 		});
 		return `apply without fenced once it is reachable, or, if ${JSON.stringify(fenced)} will never run again from their current data, re-home without them by hand: send ${stage} to each of ${JSON.stringify(stageOn)}; after the last of those succeeds, wait ${DELEGATION_DRAIN_MS} ms, then send ${activate} to each of ${JSON.stringify(homes)}. Never activate after a failed stage; if interrupted, re-send this call for steps that match the current state`;
 	}
 	return `apply without fenced once it is reachable; no generation above ${floor} is left to re-home them by hand`;
+}
+
+/** The nodes whose survey lacks a mark for some name in `explicit`; an active default is never re-marked. */
+function unmarkedOn(
+	nodes: Iterable<string>,
+	explicit: Iterable<string>,
+	replyOf: (node: string) => SurveyReply | { error: string } | undefined
+): string[] {
+	const required = [...explicit];
+	return [...nodes].filter((node) => {
+		const reply = replyOf(node);
+		if (!reply || 'error' in reply) return false;
+		const marks = new Set(reply.explicit);
+		return required.some((name) => !marks.has(name));
+	});
 }
 
 export type ActivationPlan =
@@ -560,8 +585,7 @@ async function runApply(
 		observer = { node: self, reply: await survey(self) };
 		report.initiator = { node: self, survey: surveyed(observer.reply) };
 	}
-	// Marked on every node before the default activates there, so the union includes what earlier calls
-	// already staged; bounded before anything is staged.
+	// Includes names earlier calls staged, since each must be marked on every node the default activates on.
 	const explicit = new Set<string>();
 	const tooManyExplicit = () =>
 		`${explicit.size} databases have home maps of their own, more than the ${MAX_EXPLICIT_DATABASES} a default transition carries`;
@@ -576,11 +600,7 @@ async function runApply(
 	if (explicit.size > MAX_EXPLICIT_DATABASES) return refuse(tooManyExplicit(), 409);
 	const planFor = (generation: number | undefined) =>
 		planSurvey(database, homes, quiesce, generation, replies, observer, fenced, isDefault ? [...explicit] : undefined);
-	const unmarkedOn = (nodes: Iterable<string>) =>
-		[...nodes].filter((node) => {
-			const reply = replies.get(node);
-			return reply && !('error' in reply) && [...explicit].some((name) => !reply.explicit?.includes(name));
-		});
+	const unmarked = (nodes: Iterable<string>) => unmarkedOn(nodes, explicit, (node) => replies.get(node));
 	let plan = planFor(request.generation);
 	if (plan.action === 'refuse')
 		return refuse(
@@ -591,7 +611,7 @@ async function runApply(
 		);
 	// A home already active at the target promoted without some of these marks, and an active default is
 	// never re-marked, so finishing this generation would leave the homes split: open the next one.
-	const diverged = unmarkedOn(plan.alreadyActive);
+	const diverged = unmarked(plan.alreadyActive);
 	if (diverged.length > 0) {
 		if (request.generation !== undefined)
 			return refuse(
@@ -642,7 +662,7 @@ async function runApply(
 		report.reason = 'staging did not complete on every node; nothing was activated. Re-run this call';
 		throw new ApplyRefusedError(report, 503);
 	}
-	const lateUnmarked = unmarkedOn(plan.alreadyActive);
+	const lateUnmarked = unmarked(plan.alreadyActive);
 	if (explicit.size > MAX_EXPLICIT_DATABASES || lateUnmarked.length > 0) {
 		report.outcome = 'incomplete';
 		report.reason =

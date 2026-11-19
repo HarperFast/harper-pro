@@ -23,6 +23,7 @@
  * *elapsed time*. See RECORD_LOCK_HOMES_DESIGN.md for the two rejected mechanisms and why.
  */
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import Joi from 'joi';
 import { getDatabases, table } from '../core/resources/databases.ts';
 import {
@@ -75,7 +76,7 @@ export interface RecordLockHomesRow {
 	fenced: FenceEntry[];
 	/** The clone attempt in flight when the row was created; never written afterwards. */
 	cloneAttempt?: string;
-	/** Never stored: this database has no row here, so these fields are the default row's (`effectiveRow`). */
+	/** Never stored: this database has no row here, so these fields are the default row's (`resolveEffectiveRow`). */
 	inherited?: true;
 }
 
@@ -304,13 +305,16 @@ const ROW_LOCK_TIMEOUT_MS = 30_000;
 const rowQueues = new Map<string, Promise<unknown>>();
 type RowPlan<T> = (
 	existing: RecordLockHomesRow | undefined,
-	write: (row: RecordLockHomesRow) => Promise<void>
+	write: (row: RecordLockHomesRow) => Promise<void>,
+	leaseDeadline: number
 ) => Promise<T>;
 
 /** `inheritFrom` is the default row this database's planning sees while it has no row of its own. */
 function withRow<T>(database: string, plan: RowPlan<T>, inheritFrom?: RecordLockHomesRow): Promise<T> {
 	const prior = rowQueues.get(database) ?? Promise.resolve();
 	const run = prior.then(async () => {
+		// Taken before the request, so it is never later than the lease's real deadline.
+		const leaseDeadline = performance.now() + ROW_LOCK_LEASE_MS;
 		const locked: any = await getRecordLockHomesTable().lock(database, {
 			scope: 'node',
 			hold: true,
@@ -320,7 +324,7 @@ function withRow<T>(database: string, plan: RowPlan<T>, inheritFrom?: RecordLock
 		try {
 			const own = await readRow(database);
 			const existing = own ?? (inheritFrom && inheritedFrom(database, inheritFrom));
-			return await plan(existing, (row) => writeRow(locked, withCreationAttempt(existing, row)));
+			return await plan(existing, (row) => writeRow(locked, withCreationAttempt(existing, row)), leaseDeadline);
 		} finally {
 			// Never let an unlock failure replace the real outcome: if the write failed 409 because the row
 			// lease was lost to a storage stall, `unlock()` on the expired handle throws too, and the
@@ -349,24 +353,36 @@ function withRow<T>(database: string, plan: RowPlan<T>, inheritFrom?: RecordLock
  */
 async function withEffectiveRow<T>(key: string, plan: RowPlan<T>): Promise<T> {
 	if (key === DEFAULT_HOMES_KEY || (await readRow(key))) return withRow(key, plan);
-	return withRow(DEFAULT_HOMES_KEY, (defaultRow) =>
-		withRow(key, (existing, write) => plan(existing, guardedBy(defaultRow, write)), defaultRow)
+	return withRow(DEFAULT_HOMES_KEY, (defaultRow, _write, defaultDeadline) =>
+		withRow(
+			key,
+			(existing, write, leaseDeadline) => plan(existing, guardedBy(defaultRow, defaultDeadline, write), leaseDeadline),
+			defaultRow
+		)
 	);
 }
 
 /**
- * A child row's write commits through its own handle, so the default row's lease does not fence it. If
- * that lease ran out while the child waited and another transition moved the default, the write refuses
- * instead of landing on a plan made against the old default.
+ * A child row's write commits through its own handle, so the default row's lease does not fence it. The
+ * write refuses unless the default is unchanged and that lease has at least `LOCK_LEASE_SKEW_MS` left,
+ * so only a pause longer than the skew every lease here already assumes could land it after another
+ * transition moved the default.
  */
 function guardedBy(
 	defaultRow: RecordLockHomesRow | undefined,
+	defaultDeadline: number,
 	write: (row: RecordLockHomesRow) => Promise<void>
 ): (row: RecordLockHomesRow) => Promise<void> {
 	const planned = transitionOf(defaultRow);
 	return async (row) => {
-		if (transitionOf(await readRow(DEFAULT_HOMES_KEY)) !== planned)
-			throw new ClientError('the default home map changed while this row was being written; retry', 409);
+		const unchanged = transitionOf(await readRow(DEFAULT_HOMES_KEY)) === planned;
+		if (!unchanged || performance.now() > defaultDeadline - LOCK_LEASE_SKEW_MS)
+			throw new ClientError(
+				unchanged
+					? 'the default home map lock is about to lapse before this row was written; retry'
+					: 'the default home map changed while this row was being written; retry',
+				409
+			);
 		await write(row);
 	};
 }
@@ -761,17 +777,24 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 	const generation = request.generation;
 	const digest = digestFor(key, generation, homes);
 	const explicit = key === DEFAULT_HOMES_KEY ? validateExplicit(request.explicit) : [];
-	return withRow(key, async (existing, write) => {
+	return withRow(key, async (existing, write, leaseDeadline) => {
 		const plan = planActivate(existing, key, generation, digest);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
 		if (plan.action === 'noop') {
 			// See the matching comment in `stageGeneration`: a retry must still reconcile threads the
 			// prior call's durable write outran.
 			await notifyChanged(key);
+			const own = new Set(ownRowDatabases());
+			const unmarked = explicit.filter((database) => !own.has(database));
+			if (unmarked.length > 0)
+				throw new ClientError(
+					`generation ${generation} is active here without a mark for ${unmarked.slice(0, 5).join(', ')}${unmarked.length > 5 ? ` and ${unmarked.length - 5} more` : ''}; re-run with generation ${generation + 1}`,
+					409
+				);
 			return { active: plan.active };
 		}
 		if (key === DEFAULT_HOMES_KEY)
-			await markExplicitDatabases(existing!, [...explicit, ...(existing!.staged!.explicit ?? [])]);
+			await markExplicitDatabases(existing!, [...explicit, ...(existing!.staged!.explicit ?? [])], leaseDeadline);
 		await write(plan.row);
 		logger.info?.(`Record lock home map for ${describeKey(key)}: activated generation ${generation}`);
 		await notifyChanged(key);
@@ -785,7 +808,11 @@ export async function activateGeneration(request: any): Promise<{ active: Record
  * inherits it. Only a staged default is promoted, so none of these databases holds inherited authority
  * here; an already-active default writes none, since that would retract a live map without a drain.
  */
-async function markExplicitDatabases(defaultRow: RecordLockHomesRow, explicit: string[]): Promise<void> {
+async function markExplicitDatabases(
+	defaultRow: RecordLockHomesRow,
+	explicit: string[],
+	defaultDeadline: number
+): Promise<void> {
 	const databases = canonicalizeHomes(explicit);
 	if (databases.length > MAX_EXPLICIT_DATABASES)
 		throw new ClientError(`more than ${MAX_EXPLICIT_DATABASES} databases have home maps of their own`, 409);
@@ -799,7 +826,7 @@ async function markExplicitDatabases(defaultRow: RecordLockHomesRow, explicit: s
 			database,
 			async (existing, write) => {
 				if (existing && !existing.inherited) return;
-				await guardedBy(defaultRow, write)({ database, highestActedOn: floor, fenced: [] });
+				await guardedBy(defaultRow, defaultDeadline, write)({ database, highestActedOn: floor, fenced: [] });
 			},
 			defaultRow
 		);

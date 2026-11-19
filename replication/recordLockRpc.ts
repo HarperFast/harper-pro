@@ -759,11 +759,20 @@ async function quiesceOwned(database: string, deadlineMs: number): Promise<any> 
 		}
 	}
 	const result = await quiesceDelegations(database, deadlineMs);
-	if (tableCount === 0 && tables && coordinatedForALease(database)) {
-		result.outstanding = result.outstanding.filter((entry) => entry.table !== '*');
-		result.complete = result.outstanding.length === 0;
-	}
+	if (tableCount === 0 && tables && coordinatedForALease(database)) dropNoCoordinatorEntry(result);
 	return result;
+}
+
+const NO_COORDINATOR_REASON = 'no lock coordinator exists';
+
+/** Removes only core's no-coordinator entry: `*` is also a legal table name, whose parked grants must stay. */
+export function dropNoCoordinatorEntry(result: { complete: boolean; outstanding: any[] }): void {
+	const index = result.outstanding.findIndex(
+		(entry) => entry.table === '*' && entry.key === undefined && entry.reason?.startsWith(NO_COORDINATOR_REASON)
+	);
+	if (index < 0) return;
+	result.outstanding.splice(index, 1);
+	result.complete = result.outstanding.length === 0;
 }
 
 /**

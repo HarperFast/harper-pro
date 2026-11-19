@@ -26,6 +26,7 @@ import {
 	validateExplicit,
 } from '#src/replication/recordLockHomes';
 import { applyHomes, planSurvey } from '#src/replication/recordLockApply';
+import { dropNoCoordinatorEntry } from '#src/replication/recordLockRpc';
 import { getThisNodeName } from '#src/core/server/nodeName';
 import {
 	cachedActiveGeneration,
@@ -194,6 +195,56 @@ describe('planSurvey resumes only a generation every node can take', () => {
 			['b', { node: 'b', active: ring(1, ['a', 'b']), highestActedOn: 1, inherited: true, supportsFenced: true }],
 		]);
 		assert.strictEqual(planSurvey('x', ['a', 'b'], ['a', 'b'], undefined, inheritedAtFloor).generation, 2);
+	});
+});
+
+describe('fenced recovery instructions for the default', () => {
+	it('restage every live home at the next generation when an active home lacks a mark', () => {
+		const replies = new Map([
+			['a', { node: 'a', active: ring(2, ['a', 'b']), highestActedOn: 2, explicit: [], supportsFenced: true }],
+			[
+				'b',
+				{
+					node: 'b',
+					staged: { ...ring(2, ['a', 'b']), quiesce: ['a', 'b', 'c'] },
+					highestActedOn: 2,
+					explicit: [],
+					supportsFenced: true,
+				},
+			],
+		]);
+		const observer = { node: 'o', reply: { node: 'o', highestActedOn: 0, explicit: ['x'], supportsFenced: true } };
+		const plan = planSurvey(DEFAULT_HOMES_KEY, ['a', 'b'], ['a', 'b', 'c'], undefined, replies, observer, ['c'], ['x']);
+		assert.strictEqual(plan.action, 'refuse');
+		assert.match(plan.reason, /"generation":3/);
+		assert.match(plan.reason, /"explicit":\["x"\]/);
+		assert.match(plan.reason, /send \{[^}]*\} to each of \["a","b"\]/);
+		assert.doesNotMatch(plan.reason, /"generation":2/);
+	});
+});
+
+describe('a database with no table, once coordinated for a lease', () => {
+	const sentinel = {
+		table: '*',
+		key: undefined,
+		reason: 'no lock coordinator exists for this database on this thread, so there is nothing to prove quiescence from',
+	};
+	const parked = {
+		table: '*',
+		key: undefined,
+		reason: 'a closed coordinator for this table issued grants that remain valid on their delegates for another 900ms',
+	};
+
+	it("drops only core's no-coordinator entry, never a table named *", () => {
+		const alone = { complete: false, outstanding: [sentinel] };
+		dropNoCoordinatorEntry(alone);
+		assert.deepStrictEqual(alone, { complete: true, outstanding: [] });
+		const withParked = { complete: false, outstanding: [sentinel, parked] };
+		dropNoCoordinatorEntry(withParked);
+		assert.deepStrictEqual(withParked, { complete: false, outstanding: [parked] });
+		const noSentinel = { complete: false, outstanding: [parked] };
+		dropNoCoordinatorEntry(noSentinel);
+		assert.deepStrictEqual(noSentinel, { complete: false, outstanding: [parked] });
 	});
 });
 
@@ -489,8 +540,12 @@ describe('the default row, on a real table', function () {
 		);
 	});
 
-	it('an already-active default writes no marker, even for a name it has not seen', async () => {
-		await activateGeneration({ default: true, generation: 1, homes: both, explicit: ['inh-a'], ...operator });
+	it('an already-active default writes no marker, and refuses an activation naming one it lacks', async () => {
+		await activateGeneration({ default: true, generation: 1, homes: both, explicit: ['marked'], ...operator });
+		await assert.rejects(
+			activateGeneration({ default: true, generation: 1, homes: both, explicit: ['inh-a'], ...operator }),
+			/without a mark for inh-a; re-run with generation 2/
+		);
 		assert.strictEqual(await ownRow('inh-a'), undefined, 'a live inherited map is never retracted undrained');
 		assert.strictEqual(cachedActiveGeneration('inh-a'), 1);
 	});

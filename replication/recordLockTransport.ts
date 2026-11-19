@@ -491,7 +491,6 @@ export function createDisabledRecordLockTransport(
 // ---- per-thread active-generation cache, refreshed only on change --------------------------------
 
 const activeCache = new Map<string, RecordLockGenerationState | undefined>();
-/** Whether each database's effective state on this thread came from its own row or the default. */
 const homeMapSources = new Map<string, 'default' | 'database'>();
 
 function cacheForDatabase(database: string): RecordLockGenerationState | undefined {
@@ -542,7 +541,6 @@ export function homeMapSourceOf(database: string): 'default' | 'database' | unde
 	return homeMapSources.get(database);
 }
 
-/** Resolves whether it re-announced this database's digest. */
 async function refreshCache(database: string, freshBudget = false): Promise<boolean> {
 	let state = refreshState.get(database);
 	if (!state)
