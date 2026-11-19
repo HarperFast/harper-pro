@@ -3276,7 +3276,8 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.deepEqual(socket.closes, []);
 			}));
 
-	it('a route sharding restricts stores a received floor as not relayable (harper-pro#1214)', () =>
+	// its genless relay is what clears a downstream route's level-2 qualifiers once it loses coverage
+	it('a route sharding restricts keeps a received floor relayable but never stores level-2 coverage (harper-pro#1214)', () =>
 		atCheckpointLevel(async () => {
 			const peer = 'slot-control-peer';
 			const connection = new EventEmitter();
@@ -3298,8 +3299,8 @@ describe('Declarative tables keep control and event traffic independent of place
 			socket.emit('message', encode([143, floor + 500, { [peer]: [floor, 'peer-generation', true] }]));
 			await until(() => peerNode()?.closedFloor === floor || socket.closes.length);
 			assert.deepEqual(socket.closes, []);
-			assert.equal(peerNode().relayable, false, 'a restricted route relays nothing');
-			assert.notEqual(peerNode().fullCoverage, true);
+			assert.equal(peerNode().relayable, true);
+			assert.notEqual(peerNode().fullCoverage, true, 'what it relays carries no generation');
 		}));
 
 	async function waitForOwnReservation(Records, peerId) {

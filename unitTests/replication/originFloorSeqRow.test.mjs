@@ -399,7 +399,6 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 				'no route certifies an origin missing a record'
 			);
 
-			// a later pass from Q settles: nothing it reports shows it carried the dropped record, so the hole stands
 			await settleCopyBounds(T.dbisDB, new Map(), copier, rootStore, 'later-pass');
 			assert.equal(readCopyHoles(T.dbisDB).length, 1);
 			await assert.rejects(

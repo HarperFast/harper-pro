@@ -8052,8 +8052,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * A received floor vector as `[localOriginId, floor, relayable]` entries. Names resolve through the durable id
 	 * mapping and never mint an id; this node's own floor is not a certificate for it; a copy's updates carry none.
 	 * `relayable` records whether this node receives the origin directly with full table coverage (the main thread's
-	 * exclusion-origin set, on a route sharding does not restrict), which is what lets a relay forward the floor to its
-	 * own subscribers.
+	 * exclusion-origin set), which is what lets a relay forward the floor to its own subscribers. A sharding-restricted
+	 * route keeps it: the bare floor it then relays is what clears a downstream route's level-2 qualifiers.
 	 */
 	function receivedOriginFloors(value: unknown): ReceivedOriginFloor[] | undefined {
 		if (projectionCopy || value == null || !certifiesOriginFloors()) return undefined;
@@ -8146,11 +8146,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					continue;
 				}
 				if (!floorsAccepted || pendingRouteState.hasPendingRevocation(id)) continue;
-				const entry: ReceivedOriginFloor = [
-					id,
-					certificate.floor!,
-					!restrictedOrigins && directFullCoverage.includes(name),
-				];
+				const entry: ReceivedOriginFloor = [id, certificate.floor!, directFullCoverage.includes(name)];
 				if (checkpointGrade && typeof certificate.generation === 'string') {
 					entry[3] = certificate.generation;
 					// complete here only if the whole route is: this socket carries every table, and so did the
