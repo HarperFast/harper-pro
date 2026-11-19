@@ -4210,8 +4210,7 @@ function mergeCopyBoundRecordInto(target: Map<number, number>, source: unknown):
 /**
  * Merges every peer's `[copyBound, peerId]` row (core's `readCopyBounds`, which throws on a malformed row) and an
  * optional copy cursor's `maxCopiedVersionByOrigin` into `target`. Without `holes`, a `[copyBound, *, 'hole']` row is
- * left out: that is the connection's own certification gate, where a start recorded while a hole stands must survive
- * to be admitted once a fill's settled bound lies below it (admission and the relay gate refuse it meanwhile).
+ * left out of the connection's own certification gate: admission and the relay gate read hole rows themselves.
  */
 export function mergePersistedCopyBounds(
 	target: Map<number, number>,
@@ -7982,8 +7981,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const pass = copyPassToken;
 		const passState = currentCopyPass;
 		const passId = passState?.passId ?? copyWatermark.currentPass;
-		// a pass this socket has since replaced (COPY_START moves the watermark before it mints the token), or a closed
-		// socket, settles nothing under the old token and reports nothing its caller could act on for the new one
+		// COPY_START moves the watermark before it mints the token
 		const replaced = () =>
 			pass !== copyPassToken ||
 			passState !== currentCopyPass ||
@@ -7999,6 +7997,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		try {
 			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? dbAuditStore;
+			if (!dbisDB) return false;
 			const peerId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
 			const rootStore = store?.rootStore ?? (dbisDB as any)?.rootStore;

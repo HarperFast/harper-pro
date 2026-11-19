@@ -3035,7 +3035,6 @@ describe('Declarative tables keep control and event traffic independent of place
 			...(drop === 'non-replicating' ? { replicate: false } : {}),
 		});
 
-	// level 1: a route whose full coverage is never proven, so it may not fill a hole even when it drops nothing
 	for (const drops of [false, 'owed', 'unowed', 'filtered'])
 		it(`a complete copy releases no hole row, and one it never owed re-asserts no route hole (drops=${drops})`, () =>
 			atCheckpointLevel(async () => {
@@ -3055,7 +3054,6 @@ describe('Declarative tables keep control and event traffic independent of place
 					connection
 				);
 				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
-				const holes = () => readCopyHoles(Records.dbisDB);
 				const departed = getIdOfRemoteNode('departed-peer', Records.auditStore);
 				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
 				assert.deepEqual(socket.closes, []);
@@ -3130,9 +3128,11 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.ok(reserved.length > 0, 'the pass reserved its copy start');
 				for (const row of reserved)
 					assert.ok(!Object.values(row).includes(HOLE_COPY_BOUND), 'a reservation never carries a hole');
-				// nothing a copy reports shows its walk carried a lost record, so only rebuilding the node clears a hole
-				assert.equal(holes().length, 2);
-				assert.equal(copyHoleStatus(Records.dbisDB, Records.auditStore).length, 2);
+				assert.equal(
+					copyHoleStatus(Records.dbisDB, Records.auditStore).length,
+					2,
+					'only rebuilding the node clears a hole'
+				);
 				const bounds = readCopyBounds(Records.dbisDB);
 				assert.equal(bounds.get(peerId), HOLE_COPY_BOUND);
 				assert.equal(bounds.get(departed), HOLE_COPY_BOUND);

@@ -16,7 +16,7 @@ import { table } from '#src/core/resources/databases';
 import { getDatabaseGeneration, persistOriginClosedFloor } from '#src/core/resources/auditStore';
 import { certifyOriginFloor, publishOriginFloor, getOriginClosedFloor } from '#src/core/resources/originClosedFloor';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
-import { membersDigest } from '#src/core/resources/subscriptionCheckpoint';
+import { membersDigest, readCopyBounds } from '#src/core/resources/subscriptionCheckpoint';
 import { setOriginCaptureIntervalForTests } from '#src/core/resources/transactionBroadcast';
 import { getThisNodeName } from '#src/core/server/nodeName';
 import {
@@ -24,6 +24,7 @@ import {
 	persistCopyHole,
 	readCopyHoles,
 	settleCopyBounds,
+	HOLE_COPY_BOUND,
 } from '#src/replication/replicationConnection';
 import { PrimaryRocksDatabase } from '#src/core/resources/PrimaryRocksDatabase';
 import { OpenDBIObject } from '#src/core/utility/lmdb/OpenDBIObject';
@@ -411,5 +412,28 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 			sendRecertification(undefined);
 			subscription.end();
 		}
+	});
+
+	it('a revision replaces the one before it and keeps every origin the pass lost', async () => {
+		const T = table({
+			table: 'CopyHoleRevisions',
+			database: 'copy_hole_revisions',
+			audit: true,
+			attributes: [{ name: 'id', isPrimaryKey: true }],
+		});
+		const copier = getIdOfRemoteNode('copier-q', T.auditStore);
+		const [x, y] = ['origin-x', 'origin-y'].map((name) => getIdOfRemoteNode(name, T.auditStore));
+		const rootStore = T.primaryStore.rootStore;
+		await persistCopyHole(T.dbisDB, copier, rootStore, 'pass-a', 1, [x], 100);
+		const [first] = readCopyHoles(T.dbisDB);
+		await persistCopyHole(T.dbisDB, copier, rootStore, 'pass-a', 2, [x, y], 200, first.slot);
+		await settleCopyBounds(T.dbisDB, new Map(), copier, rootStore, 'pass-b');
+		assert.deepEqual(
+			readCopyHoles(T.dbisDB).map(({ origins, lossKey }) => [origins.sort(), lossKey]),
+			[[[x, y].sort(), 200]]
+		);
+		const bounds = readCopyBounds(T.dbisDB);
+		assert.strictEqual(bounds.get(x), HOLE_COPY_BOUND);
+		assert.strictEqual(bounds.get(y), HOLE_COPY_BOUND);
 	});
 });
