@@ -4,8 +4,8 @@ import assert from 'node:assert';
 import { cp, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition } from '../cluster/clusterShared.mjs';
+import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { sendOperation, stopAndTeardownNodes, waitForCondition } from '../cluster/clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
@@ -113,14 +113,21 @@ suite('Clone Node - temporary admin', SUITE_OPTIONS, (ctx) => {
 			},
 			{ timeoutMs: WAIT_MS, description: `the leader to apply the token clone's delete of ${TEMP_ADMIN}` }
 		);
-		assert.ok(deleted.fullWriteHead, `premise: the leader holds ${TEMP_ADMIN} as a flagged tombstone`);
+		assert.deepEqual(
+			{ fullWriteHead: deleted.fullWriteHead, origin: deleted.origin, audited: deleted.audited },
+			{ fullWriteHead: true, origin: tokenClone.hostname, audited: true },
+			`premise: the leader holds the token clone's deletion of ${TEMP_ADMIN} as a flagged tombstone`
+		);
 		assert.deepEqual(
 			await poisonedPairs(tokenClone),
 			[],
 			`${tokenClone.hostname} records a replication hole in system`
 		);
 		// the leader is then the joiner's only source for the deletion, as in a two-node cluster
-		await stopNodeProcess(tokenClone);
+		await killHarper(
+			contexts.find((context) => context.harper === tokenClone),
+			{ graceMs: 30_000 }
+		);
 		// torn down only in after(): teardown frees the address, and a joiner on it would take the token clone's node
 		// name. Its pid file goes now, since by after() that pid could belong to another process.
 		await rm(join(tokenClone.dataRootDir, 'hdb.pid'), { force: true });
@@ -134,7 +141,6 @@ suite('Clone Node - temporary admin', SUITE_OPTIONS, (ctx) => {
 			async (signal) => {
 				const row = await storedTempAdmin(copyJoiner, signal);
 				if (row?.stored) return row;
-				// a joiner that recorded the hole stores nothing, so stop waiting on the row
 				if (row && (await systemPoison(copyJoiner, signal))?.length) return row;
 			},
 			{ timeoutMs: WAIT_MS, description: `${copyJoiner.hostname} to copy the leader's ${TEMP_ADMIN} row` }
@@ -144,8 +150,15 @@ suite('Clone Node - temporary admin', SUITE_OPTIONS, (ctx) => {
 			assert.deepEqual(await poisonedPairs(node), [], `${node.hostname} records a replication hole in system`);
 		assert.deepEqual(
 			copied,
-			{ stored: true, present: false, version: deleted.version, fullWriteHead: true },
-			`${copyJoiner.hostname} must hold the leader's deletion of ${TEMP_ADMIN}`
+			{
+				stored: true,
+				present: false,
+				version: deleted.version,
+				fullWriteHead: true,
+				origin: tokenClone.hostname,
+				audited: false,
+			},
+			`${copyJoiner.hostname} must hold the deletion of ${TEMP_ADMIN} as the leader's base copy delivered it`
 		);
 	});
 });
