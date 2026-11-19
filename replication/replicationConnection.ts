@@ -7767,7 +7767,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
-	/** Superseded, or a close handshake has begun: a request now would not be sent. */
 	const socketEnding = () => connectionSuperseded() || (ws.readyState ?? 1) >= 2;
 	// The clone's sync monitor runs on the main thread and names this in place of "no data received yet". Only
 	// during an attempt: nothing else reads it, and the text already went to the log above. This thread's env var
@@ -8116,7 +8115,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let socketRequestScope: RouteScope | undefined;
 	/** The route-scope revision this socket's latest request left: a pass starting on it began under that one. */
 	let socketScopeRev: number | undefined;
-	/** The route whose scope record this socket's requests wrote. */
 	let socketScopeRouteId: number | undefined;
 	/** Set once the route lost coverage after this socket's request; it certifies no full coverage again. */
 	let coverageNarrowedOnSocket = false;
@@ -13972,6 +13970,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const routeId = socketScopeRouteId ?? routeRowId();
 		if (!routeNode || origins.includes(routeNode) || routeId === undefined) return;
 		coverageNarrowedOnSocket = true;
+		// a coverage restoration or certification queued under the wider coverage must not land after it
+		pendingRouteState.retainOnlySafetyMarks();
 		if (socketRequestScope) socketRequestScope = { ...socketRequestScope, full: false };
 		if (currentCopyPass && !currentCopyPass.finalized) currentCopyPass.fullCoverage = false;
 		try {
@@ -14249,8 +14249,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					const current = routeScope(fullCoverage, replicateByDefault, tableSubs);
 					let recorded: RouteScope;
 					let recordedRev: number;
+					let repaired: boolean;
 					try {
-						({ recorded, rev: recordedRev } = recordRequestScope(dbisDB, nodeId, current, {
+						({
+							recorded,
+							rev: recordedRev,
+							repaired,
+						} = recordRequestScope(dbisDB, nodeId, current, {
 							legacyFull: previous !== false && ownState?.fullCoverage !== false,
 						}));
 					} catch (error) {
@@ -14258,8 +14263,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						return undefined;
 					}
 					if (certifiesCheckpointFloors()) {
-						// a copy is attributable only to its socket's one scope: COPY_START names no request
-						if (socketRequestScope && !sameScope(socketRequestScope, current)) scopeChangedOnSocket = true;
+						// a copy is attributable only to its socket's one request: COPY_START names none
+						if (socketRequestScope && (!sameScope(socketRequestScope, current) || socketScopeRev !== recordedRev))
+							scopeChangedOnSocket = true;
 						socketRequestScope = current;
 						socketScopeRev = recordedRev;
 						socketScopeRouteId = nodeId;
@@ -14281,7 +14287,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							fullCoverage &&
 							(copyScope
 								? scopeWidens(copyScope, current) ||
-									((!cursorScope || copyCursor?.scopeRev !== recordedRev) && scopeWidens(recorded, current))
+									((!cursorScope || repaired || copyCursor?.scopeRev !== recordedRev) && scopeWidens(recorded, current))
 								: scopeWidens(recorded, current));
 						const persistedPartial = ownState?.partialHistory === true;
 						const narrowedFromFullCoverage =

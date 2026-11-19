@@ -13,7 +13,7 @@ export interface RouteScope {
  * asked for (`submitted`). `rev` moves on a narrowing and on any change of the submitted scope, so a copy promotes
  * only if no other request intervened.
  */
-type RecordedRouteScope = RouteScope & { rev: number; submitted?: RouteScope };
+type RecordedRouteScope = RouteScope & { rev: number; submitted?: RouteScope; malformed?: true };
 
 export const ROUTE_SCOPE_KEY = Symbol.for('routeScope');
 
@@ -87,7 +87,7 @@ function isRecordedScope(value: any): value is RecordedRouteScope {
 export function readRouteScope(dbisDB: any, routeId: number): RecordedRouteScope | undefined {
 	const value = dbisDB.getSync([ROUTE_SCOPE_KEY, routeId]);
 	if (value === undefined) return undefined;
-	if (!isRecordedScope(value)) return { full: false, byDefault: false, tables: [], rev: 0 };
+	if (!isRecordedScope(value)) return { full: false, byDefault: false, tables: [], rev: 0, malformed: true };
 	const submitted = isScope(value.submitted)
 		? routeScope(value.submitted.full, value.submitted.byDefault, value.submitted.tables)
 		: undefined;
@@ -141,7 +141,7 @@ export function recordRequestScope(
 	routeId: number,
 	current: RouteScope,
 	{ legacyFull }: RequestScopeContext
-): { recorded: RouteScope; rev: number } {
+): { recorded: RouteScope; rev: number; repaired: boolean } {
 	return withRouteScopeLock(dbisDB, routeId, () => {
 		const stored = readRouteScope(dbisDB, routeId);
 		const recorded = stored ?? { ...current, full: current.full && legacyFull, rev: 0 };
@@ -152,7 +152,11 @@ export function recordRequestScope(
 		const rev = narrowed || resubmitted ? recorded.rev + 1 : recorded.rev;
 		if (!stored || rev !== recorded.rev || !sameScope(proven, recorded))
 			writeRouteScope(dbisDB, routeId, { ...proven, rev, submitted: current });
-		return { recorded: routeScope(recorded.full, recorded.byDefault, recorded.tables), rev };
+		return {
+			recorded: routeScope(recorded.full, recorded.byDefault, recorded.tables),
+			rev,
+			repaired: stored?.malformed === true,
+		};
 	});
 }
 
