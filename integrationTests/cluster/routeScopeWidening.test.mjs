@@ -207,6 +207,9 @@ suite(
 			await startNode(C, []);
 			await waitForRows(C, 'Skipped', skipped);
 			ok(narrowed.scope?.full === false, `C recorded B's route as narrowed: ${JSON.stringify(narrowed.scope)}`);
+			// the older rule copies for a route whose own entry is marked partial; only the scope record names this one
+			const direct = narrowed.nodes.find((node) => node.id === narrowed.peerId);
+			ok(!direct?.partialHistory, `premise: B's own entry carries no partial mark: ${JSON.stringify(direct)}`);
 			ok(
 				(await logSince(C, mark)).includes(`Route coverage widened to full for ${B.hostname} on database data`),
 				'C requested the copy because the route widened'

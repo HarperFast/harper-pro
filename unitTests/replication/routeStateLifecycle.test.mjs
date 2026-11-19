@@ -184,6 +184,26 @@ describe('route-state facts keyed by generation and connection (harper-pro#1145)
 		]);
 	});
 
+	it('retries a failed batch without a certification the row can no longer take', () => {
+		for (const node of [
+			{ id: 1, lastGeneration: 'g1' },
+			{ id: 1, originGeneration: 'g1', fullCoverage: false },
+		]) {
+			const routeState = new PendingRouteState(() => {});
+			routeState.certifiedFrom(1, 100, 'g1');
+			routeState.hole(2, 'g2');
+			const event = { remoteNodeIds: [1] };
+			routeState.takeInto(event);
+			assert.strictEqual(
+				routeState.verifyPersisted(() => [node, { id: 2, originGeneration: 'g2' }], event),
+				false
+			);
+			const retry = { remoteNodeIds: [1] };
+			routeState.takeInto(retry);
+			assert.deepStrictEqual(retry.originRouteStates, [[2, undefined, undefined, true, 'g2']], JSON.stringify(node));
+		}
+	});
+
 	it('writes no certification captured before a new request when its commit runs after it', async () => {
 		const routeState = new PendingRouteState();
 		routeState.certifiedFrom(5, 200, 'g5');
