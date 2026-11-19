@@ -95,13 +95,17 @@ export class LockRelease extends Resource {
 
 const gates = new Map();
 
-/** POST { id, n, lease? }: lock, wait for GateControl to open this id's gate, then write `n`. */
+/**
+ * POST { id, n, lease?, afterSave? }: lock, wait for GateControl to open this id's gate, then write `n`. With
+ * `afterSave`, write `n` first, which reserves the commit's log key, and wait before the commit instead.
+ */
 export class GatedLockedWrite extends Resource {
 	async post(data) {
 		const record = await tables.Counter.lock(data.id, lockOptions(data));
-		await new Promise((resolve) => gates.set(data.id, resolve));
+		if (!data.afterSave) await new Promise((resolve) => gates.set(data.id, resolve));
 		record.set('n', data.n);
 		await record.save();
+		if (data.afterSave) await new Promise((resolve) => gates.set(data.id, resolve));
 		return { n: data.n };
 	}
 }
@@ -115,6 +119,18 @@ export class GateControl extends Resource {
 			open();
 		}
 		return { waiting: Boolean(open) };
+	}
+}
+
+/** This node's own Counter entries in its local transaction log, in log (commit) order: id, log key and type. */
+export class CounterLog extends Resource {
+	async get() {
+		const entries = [];
+		for (const entry of tables.Counter.auditStore.getRange({ start: 1, log: 'local' })) {
+			if (entry.tableId === tables.Counter.tableId)
+				entries.push({ id: entry.recordId, key: entry.txnLogKey, type: entry.type });
+		}
+		return entries;
 	}
 }
 

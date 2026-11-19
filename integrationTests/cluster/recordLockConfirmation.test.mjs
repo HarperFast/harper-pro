@@ -3,8 +3,12 @@
 // applies A's writes, because the default skips the system database and replication apply.
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
+	DB,
 	bootstrapHomeMap,
 	call,
 	connectMesh,
@@ -15,20 +19,27 @@ import {
 	waitForCounter,
 	waitForRing,
 } from './recordLockShared.mjs';
-import { readNodePid, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
+import { readNodePid, sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 
 // long, so a wait that ends well before it was ended by the peers being gone
 const CONFIRMATION_TIMEOUT_MS = 120_000;
 // recordLockShared's pingTimeout: how long a sender with no receipt still counts as connected
 const PING_TIMEOUT_MS = 3_000;
+// holds A's frames to B while the file `pause-<B's address>` exists in A's pause dir; pings are not held
+const PAUSE_INJECTOR = join(import.meta.dirname, 'replicationSendPauseInjector.mjs');
+// how long a committed write's frame is held back before checking it was not confirmed
+const HOLD_MS = 3_000;
 
 suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 	const contexts = [];
-	let a, b, bPid;
+	let a, b, bPid, aPauseDir;
 
 	before(async () => {
+		aPauseDir = await mkdtemp(join(tmpdir(), 'lock-confirmation-pause-'));
 		const started = await Promise.allSettled([
-			startNode(ctx.name, {}, 1, undefined, true, [], { confirmationTimeout: CONFIRMATION_TIMEOUT_MS }),
+			startNode(ctx.name, { HARPER_TEST_REPLICATION_PAUSE_DIR: aPauseDir }, 1, [PAUSE_INJECTOR], true, [], {
+				confirmationTimeout: CONFIRMATION_TIMEOUT_MS,
+			}),
 			startNode(ctx.name, {}, 1, undefined, true, [], { confirmation: 2 }),
 		]);
 		for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
@@ -43,12 +54,13 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 	after(async () => {
 		if (bPid) process.kill(bPid, 'SIGCONT');
 		for (const c of contexts) await stopNode(c);
+		if (aPauseDir) await rm(aPauseDir, { recursive: true, force: true });
 	});
 
 	// lock while B is up, so the cluster lock itself does not depend on B
-	async function holdGatedWrite(id, n) {
+	async function holdGatedWrite(id, n, afterSave = false) {
 		let settled = false;
-		const writing = call(a, 'GatedLockedWrite/', { id, n, lease: 60_000, timeout: 10_000 }).finally(() => {
+		const writing = call(a, 'GatedLockedWrite/', { id, n, lease: 60_000, timeout: 10_000, afterSave }).finally(() => {
 			settled = true;
 		});
 		await waitForCondition(
@@ -86,6 +98,54 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 		const result = await call(a, 'LockedIncrement/', { id: 'locked-confirmed' });
 		assert.equal(result.status, 200, JSON.stringify(result.body));
 		assert.equal((await counter(b, 'locked-confirmed'))?.n, 1);
+	});
+
+	async function counterLog(node, signal) {
+		const response = await fetch(`${node.httpURL}/CounterLog/`, { headers: { Accept: 'application/json' }, signal });
+		const text = await response.text();
+		assert.equal(response.status, 200, text);
+		return JSON.parse(text).filter((entry) => !entry.type.startsWith('lock'));
+	}
+
+	test('a locked commit logged after a later-keyed write B already acknowledged waits until B applies it (harper-pro#1391)', async () => {
+		const id = 'locked-out-of-order';
+		// the gated write has reserved its log key and holds its commit
+		const gated = await holdGatedWrite(id, 3, true);
+		const pauseFile = join(aPauseDir, `pause-${b.hostname}`);
+		try {
+			// the operations API runs on the main thread, so this commits while the gated transaction is open
+			await sendOperation(a, {
+				operation: 'upsert',
+				database: DB,
+				table: 'Counter',
+				records: [{ id: 'logged-first', n: 1 }],
+				replicatedConfirmation: 1,
+			});
+			assert.equal((await counter(b, 'logged-first'))?.n, 1, 'B applied the later-keyed write');
+			await writeFile(pauseFile, '');
+			assert.equal((await call(a, 'GateControl/', { id, open: true })).body.waiting, true);
+			await waitForCondition(
+				async (signal) => ((await counterLog(a, signal)).some((entry) => entry.id === id) ? true : undefined),
+				{ timeoutMs: 10_000, description: 'the gated write to commit on A' }
+			);
+			await delay(HOLD_MS);
+			assert.equal(gated.settled(), false, 'confirmed while its frame was held back from B');
+			assert.equal(await counter(b, id), undefined, 'B has not received the held frame');
+		} finally {
+			await rm(pauseFile, { force: true });
+			await call(a, 'GateControl/', { id, open: true }).catch(() => {});
+		}
+
+		const result = await gated.writing;
+		assert.equal(result.status, 200, JSON.stringify(result.body));
+		assert.equal((await counter(b, id))?.n, 3, 'confirmed once B applied it');
+		const log = await counterLog(a);
+		const loggedFirst = log.findIndex((entry) => entry.id === 'logged-first');
+		const held = log.findIndex((entry) => entry.id === id);
+		assert.ok(
+			loggedFirst >= 0 && loggedFirst < held && log[held].key < log[loggedFirst].key,
+			`the gated write reached A's log after a later-keyed write: ${JSON.stringify(log)}`
+		);
 	});
 
 	test('when the peer stops answering mid-wait, the locked commit fails as unconfirmed well before confirmationTimeout', async () => {
