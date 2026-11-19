@@ -188,7 +188,7 @@ export function stopNodeUpdateWatcher(key: string = DEFAULT_WATCHER_KEY) {
 export async function runNodeUpdateWatcher(
 	listener: (node: any, id: string) => void,
 	options: WatcherOptions & { key?: string } = {}
-) {
+): Promise<void> {
 	// The watcher outlives the request that may have started it; a subscription made under that request's
 	// user is registered for live re-authorization and revoked when the user can't read hdb_nodes.
 	if (contextStorage.getStore() !== undefined) {
@@ -656,10 +656,11 @@ export function scanNodesForSubscription(store: any, onNode: (node: any, key: an
 	}
 }
 
-export function subscribeToNodeUpdates(listener: (node: any, id: string) => void, watcherKey?: string) {
+export function subscribeToNodeUpdates(listener: (node: any, id: string) => void, watcherKey?: string): void {
 	// the initial scan runs the listener, which sets up process-lifetime watchers of its own
 	if (contextStorage.getStore() !== undefined) {
-		return contextStorage.exit(() => subscribeToNodeUpdates(listener, watcherKey));
+		contextStorage.exit(() => subscribeToNodeUpdates(listener, watcherKey));
+		return;
 	}
 	// `watcherKey` namespaces the underlying watcher so a re-invocation of the SAME caller (e.g. a
 	// deploy_component reload re-running startOnMainThread, harper-pro#460) supersedes its prior

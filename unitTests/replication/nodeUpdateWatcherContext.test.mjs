@@ -16,7 +16,7 @@ const LIVE_PEER = 'watcher-context-live';
 
 async function waitFor(condition, description, timeoutMs = 10_000) {
 	const deadline = Date.now() + timeoutMs;
-	while (!condition()) {
+	while (!(await condition())) {
 		if (Date.now() > deadline) assert.fail(`timed out waiting for ${description}`);
 		await delay(10);
 	}
@@ -91,9 +91,14 @@ describe('hdb_nodes watcher started from a request runs outside it (harper-pro#1
 			contextStorage.run(requestContext(), () =>
 				subscribeToNodeUpdates((node, id) => calls.push({ id, store: contextStorage.getStore() }), WATCHER)
 			);
-			await delay(100);
-			await Nodes.put(LIVE_PEER, peer(LIVE_PEER));
-			await waitFor(() => calls.some((call) => call.id === LIVE_PEER), 'the live put to reach the listener');
+			// re-put until delivered: subscribeToNodeUpdates gives no signal that its subscription is live
+			let attempt = 0;
+			await waitFor(async () => {
+				if (calls.some((call) => call.id === LIVE_PEER)) return true;
+				await Nodes.put(LIVE_PEER, { ...peer(LIVE_PEER), attempt: attempt++ });
+				await delay(50);
+				return false;
+			}, 'a live put to reach the listener');
 			assert.equal(_liveSubscriptionCount(), before, 'no live re-authorization entry for an internal watcher');
 			for (const id of [SCANNED_PEER, LIVE_PEER]) {
 				const call = calls.find((candidate) => candidate.id === id);
