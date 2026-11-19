@@ -513,7 +513,7 @@ export async function liftFenceForOwnRecovery(): Promise<void> {
 /**
  * The certified floor this node has recorded for `origin` on its direct route from it, per database, after a WAL
  * sync: the answer and the records below it survive power loss once it is sent. Keyed under `databases`, since the
- * operation envelope owns its top-level keys (`requestId`, `error`, `results`) and a database can bear any of them.
+ * operation envelope owns its top-level keys (`requestId`, `error`, `statusCode`, `results`) and a database can bear any of them.
  */
 export async function getReceivedOriginFloors(request: any): Promise<{ databases: Record<string, ReceivedFloor> }> {
 	authorize(request, RECEIPT_OPERATION);
@@ -603,7 +603,7 @@ function unsupportedOperation(error: unknown): boolean {
 	).test(message);
 }
 
-/** By class name, not status: a peer's 4xx of another class was retried before answers carried a status, and still is. */
+/** By class name, not status, so a peer's 4xx of another class is retried. */
 function refusedByPeer(error: any): boolean {
 	return /^ClientError\b/.test(String(error?.message ?? ''));
 }

@@ -5749,9 +5749,7 @@ function operationErrorAnswer(requestId: unknown, error: unknown) {
 	try {
 		const statusCode = (error as { statusCode?: unknown })?.statusCode;
 		if (isErrorStatus(statusCode)) answer.statusCode = statusCode;
-	} catch {
-		// a getter that throws must not cost the requester its answer
-	}
+	} catch {}
 	return answer;
 }
 
@@ -12824,7 +12822,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		ws.send(encode([OPERATION_RESPONSE, answer]));
 	}
-	// Two of its callers are detached promise reactions, where a throw would be an unhandled rejection.
+	// An encode or send failure in a detached promise reaction must not become an unhandled rejection.
 	function answerOperationError(request, error) {
 		try {
 			answerOperation(request, operationErrorAnswer(request?.requestId, error));
