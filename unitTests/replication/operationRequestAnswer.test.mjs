@@ -256,8 +256,8 @@ describe("an operation error's status across the connection", function () {
 		});
 
 		afterEach(() => {
-			requesterSocket.close(1000);
-			answererSocket.close(1000);
+			requesterSocket?.close(1000);
+			answererSocket?.close(1000);
 		});
 
 		const fail = () => rejectionOf(requester.sendOperation({ operation: 'remove_node_fence' }, ANSWER_DEADLINE_MS));
@@ -384,7 +384,7 @@ describe("an operation error's status across the connection", function () {
 		});
 
 		afterEach(() => {
-			socket.close(1000);
+			socket?.close(1000);
 		});
 
 		async function rejectionFor(answer) {
