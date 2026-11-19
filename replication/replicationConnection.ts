@@ -4144,10 +4144,6 @@ type CopyPassState = {
 	holedOrigins?: ReadonlySet<number> | ReadonlyMap<number, string | undefined>;
 	/** The `[seq, id]` row this pass's marks were written to. */
 	routeId?: number;
-	/** The hole rows that stood when this pass began: the only ones its completion may fill. */
-	holes?: CopyHole[];
-	/** A full, non-resumed copy on a socket whose every request asked for every table with coverage proven: only it may fill. */
-	deliversEveryTable?: boolean;
 };
 
 /**
@@ -4309,8 +4305,7 @@ export type CopyHole = { peerId: number; slot: (string | number)[]; origins: num
 /**
  * Records that the copy pass `pass` from `peerId` dropped records of `origins`, the highest keyed at `lossKey`, at
  * `HOLE_COPY_BOUND`, which no route start passes. A row is never rewritten: the pass's next drop writes the next
- * revision, carrying every origin and the highest key so far, and releases `previous` in the same commit, so a pass
- * that captured a revision when it began never releases a loss recorded after.
+ * revision, carrying every origin and the highest key so far, and releases `previous` in the same commit.
  */
 export function persistCopyHole(
 	dbisDB: DbisStore | undefined,
@@ -4367,30 +4362,21 @@ export function copyHoleStatus(
 
 /**
  * Once a pass's rows are durable: merges the exact versions it copied into the settled row and drops its
- * reservation in the same commit, so a route can certify again from just above what was actually copied. A pass
- * that copied everything again and dropped nothing fills the holes that stood when it began (`filled`): its snapshot
- * restored their records but not their audit entries, so each of their origins keeps a bound at the later of its loss
- * key and the pass's copy start (`filledFrom`), voiding every route start and checkpoint from before. This peer's hole
- * rows go in the same commit; the caller releases another peer's after it.
+ * reservation in the same commit, so a route can certify again from just above what was actually copied. It releases
+ * no hole row: nothing a copy reports shows that its walk carried a lost record.
  */
 export function settleCopyBounds(
 	dbisDB: DbisStore | undefined,
 	copied: ReadonlyMap<number, number>,
 	peerId = 0,
 	rootStore?: any,
-	pass: number | string = 0,
-	filled: readonly CopyHole[] = [],
-	filledFrom = 0
+	pass: number | string = 0
 ): Promise<boolean> {
 	if (!dbisDB?.put) return Promise.resolve(false);
 	const raise = validBounds(copied);
-	for (const { origins, lossKey } of filled) {
-		const bound = Math.max(lossKey, filledFrom);
-		for (const originId of origins) if (!(raise.get(originId)! >= bound)) raise.set(originId, bound);
-	}
 	return writeCopyBoundRows(dbisDB, peerId, rootStore, {
 		raise: raise.size > 0 ? raise : undefined,
-		release: [['reserved', pass], ...filled.filter((hole) => hole.peerId === peerId).map(({ slot }) => slot)],
+		release: [['reserved', pass]],
 	});
 }
 
@@ -7198,7 +7184,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
 			// nothing bounded can replay the dropped record, so no checkpoint may certify this origin here again
-			passHoles++;
 			if (projectionCopy) {
 				// a projection's end_txn names no route, so its hole is a copy bound no route start passes, durable
 				// before the frame moves on and so before the projection can complete; at any level, so a later engine
@@ -7860,14 +7845,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		string,
 		{ revision: number; origins: Set<number>; lossKey: number; slot?: (string | number)[] }
 	>();
-	let passHoles = 0;
-	/** Records this pass dropped because its route filters their table: no hole, but those tables were not delivered. */
-	let passFilteredRecords = 0;
-	/**
-	 * Every subscription request on this socket asked the route's node for every table, with full coverage proven on
-	 * this socket. A copy cannot say which request it answers, nor does the route's coverage flag outlive a reconnect.
-	 */
-	let socketRequestsCoverEveryTable = true;
 	/** Highest audit-less copyApply record version applied per origin, bounding floor-only resume. */
 	const maxCopiedVersionByOrigin = new Map<number, number>();
 	/**
@@ -8024,26 +8001,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const store = auditStore ?? dbAuditStore;
 			const peerId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
-			// a projection's route certifies no coverage, and a resumed pass did not re-send what an earlier pass dropped
-			const filled =
-				passHoles === 0 && passFilteredRecords === 0 && passState?.deliversEveryTable === true
-					? (passState.holes ?? [])
-					: [];
 			const rootStore = store?.rootStore ?? (dbisDB as any)?.rootStore;
-			await settleCopyBounds(dbisDB, copiedVersionByOrigin, peerId, rootStore, pass, filled, passState?.startTime ?? 0);
+			await settleCopyBounds(dbisDB, copiedVersionByOrigin, peerId, rootStore, pass);
 			settledPass = pass;
-			// the bounds that keep earlier starts void are committed above, so another peer's row can go now; a release
-			// that fails leaves its hole, which still refuses
-			const elsewhere = new Map<number, (string | number)[][]>();
-			for (const hole of filled)
-				if (hole.peerId !== peerId) elsewhere.set(hole.peerId, [...(elsewhere.get(hole.peerId) ?? []), hole.slot]);
-			for (const [otherPeer, slots] of elsewhere) {
-				try {
-					await writeCopyBoundRows(dbisDB, otherPeer, rootStore, { release: slots });
-				} catch (error) {
-					logger.warn?.(connectionId, 'could not release a filled copy hole for', databaseName, error);
-				}
-			}
 			if (copyPassToken === pass) {
 				committedCopyBounds.clear();
 				lastCopyBoundLoadEpoch = -1;
@@ -9058,8 +9018,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						copyPassToken = `${data}:${randomUUID()}`;
 						passReservedBounds.clear();
-						passHoles = 0;
-						passFilteredRecords = 0;
 						const copyMarkOrigins = new Map<number, string | undefined>();
 						// only an engine that can certify a checkpoint has a route history to mark partial; a sharding
 						// projection publishes no route state (its end_txn carries no remote ids), so there is nothing to mark
@@ -9104,7 +9062,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							resumed: copyWasResumed,
 							resumedWithWidening: copyResumedWithWidening,
 							fullCoverage: options.connection?.routeFullCoverage !== false,
-							deliversEveryTable: !projectionCopy && !copyWasResumed && socketRequestsCoverEveryTable,
 							seqDurableAtCopyStart: false,
 							completeReceived: false,
 							restored: false,
@@ -9122,14 +9079,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								copyStartKey(readDbisCursorSync(getDatabaseStores().dbisDB, 'copyCursor', copyFromNodeId), encode)
 							)
 						);
-						if (currentCopyPass.deliversEveryTable && copyApplyActive() && supportsCheckpointFloors()) {
-							try {
-								// such a pass refills an ordinary table, whichever peer's pass dropped the record
-								currentCopyPass.holes = readCopyHoles(getDatabaseStores().dbisDB);
-							} catch {
-								// none to fill: a hole this pass cannot read stays
-							}
-						}
 						loadPersistedCopyBounds();
 						if (copyApplyActive() && supportsCheckpointFloors()) reserveCopyStartBounds(copyModeStartTime);
 						if (
@@ -11981,7 +11930,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						dropReason
 					);
 					if (auditRecord.extendedType & HAS_BLOBS) discardRecordBlobs(auditRecord, tableDecoder);
-					if (messageIsCopyFrame) passFilteredRecords++;
 					if (
 						!(await recordUnowedDrop(remoteShortIdToLocalId.get(auditRecord.nodeId), tableDecoder.name, dropReason)) ||
 						connectionSuperseded()
@@ -13752,7 +13700,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
-				const requestsEveryTable = replicateByDefault !== false && tableSubs.length === 0;
 
 				const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 				auditStore?.ensureLogExists?.(node.name);
@@ -13873,7 +13820,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 				}
 				let forceFullCopyOnWidening = false;
-				let coverageProven = false;
 				if (
 					nodeId !== undefined &&
 					connectedNode === node &&
@@ -13884,7 +13830,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					const fullCoverage = !restrictedOrigins && (options.connection.exclusionOrigins ?? []).includes(node.name);
 					const previous = options.connection.routeFullCoverage;
 					options.connection.routeFullCoverage = fullCoverage;
-					coverageProven = fullCoverage;
 					const ownState = allNodes.find((state) => state.id === nodeId);
 					const copyFromPartialCoverage =
 						copyCursor?.fullCoverage === true
@@ -13939,7 +13884,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
-				if (node === connectedNode) socketRequestsCoverEveryTable &&= requestsEveryTable && coverageProven;
 				// A floor the peer certified is a proven start, used only while the peer still certifies: a
 				// downgraded peer may write below a floor it saved.
 				if (!forceFullCopyOnWidening && hasPersistedResumeCursor && connectedNode === node && certifiesOriginFloors()) {
