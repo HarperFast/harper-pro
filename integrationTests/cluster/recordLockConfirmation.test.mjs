@@ -27,7 +27,6 @@ const CONFIRMATION_TIMEOUT_MS = 120_000;
 const PING_TIMEOUT_MS = 3_000;
 // holds A's frames to B while the file `pause-<B's address>` exists in A's pause dir; pings are not held
 const PAUSE_INJECTOR = join(import.meta.dirname, 'replicationSendPauseInjector.mjs');
-// how long a committed write's frame is held back before checking it was not confirmed
 const HOLD_MS = 3_000;
 
 suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
@@ -109,7 +108,6 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 
 	test('a locked commit logged after a later-keyed write B already acknowledged waits until B applies it (harper-pro#1391)', async () => {
 		const id = 'locked-out-of-order';
-		// the gated write has reserved its log key and holds its commit
 		const gated = await holdGatedWrite(id, 3, true);
 		const pauseFile = join(aPauseDir, `pause-${b.hostname}`);
 		try {
@@ -122,6 +120,9 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 				replicatedConfirmation: 1,
 			});
 			assert.equal((await counter(b, 'logged-first'))?.n, 1, 'B applied the later-keyed write');
+			// B sends its key acknowledgment 2 ms after the marker acknowledgment the upsert returned on; let it land, so a
+			// waiter seeded from B's key maximum would be seeded as confirmed
+			await delay(200);
 			await writeFile(pauseFile, '');
 			assert.equal((await call(a, 'GateControl/', { id, open: true })).body.waiting, true);
 			await waitForCondition(
@@ -134,6 +135,7 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 		} finally {
 			await rm(pauseFile, { force: true });
 			await call(a, 'GateControl/', { id, open: true }).catch(() => {});
+			await gated.writing.catch(() => {});
 		}
 
 		const result = await gated.writing;
