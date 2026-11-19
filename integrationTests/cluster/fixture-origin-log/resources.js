@@ -164,6 +164,12 @@ export class SetRouteCoverage extends Resource {
 			fullCoverage: data?.fullCoverage ?? false,
 		}));
 		await Table.dbisDB.put(seqKey, { ...row, nodes });
+		// the route's own record of a partial window is what a later request widens from
+		const scopeKey = [Symbol.for('routeScope'), peerId];
+		const scope = Table.dbisDB.getSync(scopeKey);
+		if (scope && !(data?.fullCoverage ?? false)) {
+			await Table.dbisDB.put(scopeKey, { ...scope, full: false, rev: scope.rev + 1 });
+		}
 		return { updated: true };
 	}
 }
