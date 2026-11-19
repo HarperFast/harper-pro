@@ -98,14 +98,15 @@ const gates = new Map();
 // a test that fails before opening a gate must not leave the transaction staged for the rest of the suite
 function waitForGate(id) {
 	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => {
-			gates.delete(id);
-			reject(Object.assign(new Error(`gate ${id} was never opened`), { statusCode: 504 }));
-		}, 60_000);
-		gates.set(id, () => {
+		const open = () => {
 			clearTimeout(timer);
 			resolve();
-		});
+		};
+		const timer = setTimeout(() => {
+			if (gates.get(id) === open) gates.delete(id);
+			reject(Object.assign(new Error(`gate ${id} was never opened`), { statusCode: 504 }));
+		}, 60_000);
+		gates.set(id, open);
 	});
 }
 

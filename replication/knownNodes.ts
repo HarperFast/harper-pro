@@ -778,7 +778,7 @@ function peerConfirms(status: Float64Array, waiter: { txnTime: number; marker: n
 	const support = status[PEER_CONFIRMATION_MARKERS_POSITION];
 	if (support === CONFIRMATION_MARKERS_SUPPORTED)
 		return waiter.marker > 0 && status[ACKED_CONFIRMATION_MARKER_POSITION] >= waiter.marker;
-	// a peer that cannot acknowledge markers keeps the key rule, since refusing it would hold a locked commit whose count
+	// a peer that cannot acknowledge markers keeps the key rule, since refusing it would hold a confirmation whose count
 	// needs such a peer to its timeout; one not yet known counts once it is
 	return support === CONFIRMATION_MARKERS_UNSUPPORTED && status[CONFIRMATION_STATUS_POSITION] >= waiter.txnTime;
 }

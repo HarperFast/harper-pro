@@ -119,19 +119,23 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 		const pauseFrom = { pauseDir: aPauseDir };
 		try {
 			// the operations API runs on the main thread, so this commits while the gated transaction is open
-			await sendOperation(a, {
-				operation: 'upsert',
-				database: DB,
-				table: 'Counter',
-				records: [{ id: 'logged-first', n: 1 }],
-				replicatedConfirmation: 1,
-			});
+			await sendOperation(
+				a,
+				{
+					operation: 'upsert',
+					database: DB,
+					table: 'Counter',
+					records: [{ id: 'logged-first', n: 1 }],
+					replicatedConfirmation: 1,
+				},
+				{ signal: AbortSignal.timeout(30_000) }
+			);
 			assert.equal((await counter(b, 'logged-first'))?.n, 1, 'B applied the later-keyed write');
 			// B sends its key acknowledgment 2 ms after the marker acknowledgment the upsert returned on; let it land, so a
 			// waiter seeded from B's key maximum would be seeded as confirmed (confirmationWaiter.test.mjs pins the seed rule)
 			await delay(200);
 			await pauseLink(pauseFrom, b);
-			assert.equal((await call(a, 'GateControl/', { id, open: true })).body.waiting, true);
+			assert.equal((await call(a, 'GateControl/', { id, open: true }, AbortSignal.timeout(30_000))).body.waiting, true);
 			await waitForCondition(
 				async (signal) => ((await counterLog(a, signal)).some((entry) => entry.id === id) ? true : undefined),
 				{ timeoutMs: 10_000, description: 'the gated write to commit on A' }
