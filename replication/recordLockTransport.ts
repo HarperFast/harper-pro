@@ -77,9 +77,11 @@ import {
 import { tableReplicates as declarationReplicates } from './replicatedDatabases.ts';
 import { createBackoff, type Backoff } from './backoff.ts';
 import {
+	DEFAULT_HOMES_KEY,
 	currentRow,
 	onRecordLockHomesChanged,
 	type RecordLockHomesRow,
+	setHomesDrainCandidates,
 	setHomesDrainReader,
 	setHomesMembershipReaders,
 	type RecordLockGenerationState,
@@ -115,7 +117,7 @@ import {
 	unregisterReplicatedApplyFailureListener,
 	type ReplicatedApplyFailureListener,
 } from '../core/resources/replicatedApplyFailure.ts';
-import { getRepairConnectionsForDB } from './replicator.ts';
+import { getRepairConnectionsForDB, replicatedDatabaseNames } from './replicator.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import './recordLockApply.ts';
 
@@ -399,7 +401,7 @@ export function createRecordLockTransport(
 		// that succeeded and found no active generation says the operator has not applied a map.
 		homeMapUnavailableReason(): string | undefined {
 			return mapConfirmedAbsent()
-				? 'this node has read none applied: apply one with record_lock_apply_homes, run on any node and naming every node that replicates the database'
+				? 'this node has read none applied: apply one with record_lock_apply_homes, run on any node and naming every node that replicates the database (or default: true for every database without a map of its own)'
 				: undefined;
 		},
 		requestDelegation(node: string, db: string, table: string, request: DelegationRequest): Promise<DelegationReply> {
@@ -489,6 +491,8 @@ export function createDisabledRecordLockTransport(
 // ---- per-thread active-generation cache, refreshed only on change --------------------------------
 
 const activeCache = new Map<string, RecordLockGenerationState | undefined>();
+/** Where each database's effective state came from on this thread, for `cluster_status` only. */
+const homeMapSources = new Map<string, 'default' | 'database'>();
 
 function cacheForDatabase(database: string): RecordLockGenerationState | undefined {
 	return activeCache.get(database);
@@ -531,6 +535,11 @@ export function forgetRecordLockHomesCache(database: string): void {
 	if (state) clearTimeout(state.timer);
 	refreshState.delete(database);
 	activeCache.delete(database);
+	homeMapSources.delete(database);
+}
+
+export function homeMapSourceOf(database: string): 'default' | 'database' | undefined {
+	return homeMapSources.get(database);
 }
 
 async function refreshCache(database: string, freshBudget = false): Promise<void> {
@@ -557,10 +566,14 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		const row = await readHomesRow(database);
 		if (!current()) return;
 		activeCache.set(database, row?.active);
-		// A peer digest that arrived while the row was unreadable was recorded as a mismatch against
-		// no digest at all, and a socket that handshook then received none; both need the recovered one.
-		// The backoff resets only once this is done, so a failure here re-arms the whole cycle.
-		if (state.backoff.attempts > 0) {
+		if (row) homeMapSources.set(database, row.inherited ? 'default' : 'database');
+		else homeMapSources.delete(database);
+		// Our digest changed, or a peer digest arrived while the row was unreadable (recorded as a mismatch
+		// against no digest at all) or a socket handshook while the cache was empty and sent none: both
+		// sides need the current one. A database created at runtime inherits the default here, after its
+		// subscription may already have handshaken. The backoff resets only once this is done, so a failure
+		// here re-arms the whole cycle.
+		if (state.backoff.attempts > 0 || before?.digest !== row?.active?.digest) {
 			pushHomesDigestToPeers(database);
 			reconcileAllPeerHomesAgreement(database);
 		}
@@ -570,6 +583,7 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		// A storage error must not leave a stale (possibly superseded) generation cached; undefined is
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
+		homeMapSources.delete(database);
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
 		state.timer = setTimeout(() => {
 			if (current())
@@ -596,6 +610,14 @@ const HOMES_CHANGED_ACK_TIMEOUT_MS = 2_000;
  * exactly the case this protocol exists to catch (a real pre-push review finding).
  */
 const HOMES_CHANGED_RELAY_TIMEOUT_MS = HOMES_CHANGED_ACK_TIMEOUT_MS + 1_500;
+/** A default change refreshes every database a thread registered, so its leaf bound is larger; both stay under the 30 s row lease. */
+const DEFAULT_CHANGED_ACK_TIMEOUT_MS = 10_000;
+function homesChangedAckTimeout(database: string): number {
+	return database === DEFAULT_HOMES_KEY ? DEFAULT_CHANGED_ACK_TIMEOUT_MS : HOMES_CHANGED_ACK_TIMEOUT_MS;
+}
+function homesChangedRelayTimeout(database: string): number {
+	return homesChangedAckTimeout(database) + HOMES_CHANGED_RELAY_TIMEOUT_MS - HOMES_CHANGED_ACK_TIMEOUT_MS;
+}
 let nextHomesChangedRequestId = 1;
 const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
 
@@ -605,6 +627,12 @@ const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
  * racing an unawaited refresh (a real pre-push review finding).
  */
 async function applyHomesChanged(database: string): Promise<void> {
+	if (database === DEFAULT_HOMES_KEY) {
+		// Every registered database re-reads its own row first, so one with a map of its own keeps it;
+		// `refreshCache` re-announces each one whose digest changed.
+		await Promise.all([...transports.keys()].map((registered) => refreshCache(registered, true)));
+		return;
+	}
 	await refreshCache(database, true);
 	pushHomesDigestToPeers(database);
 	reconcileAllPeerHomesAgreement(database);
@@ -647,7 +675,7 @@ function waitForHomesChangedAck(requestId: number, timeoutMs: number, database: 
  */
 function sendHomesChangedAndWaitAck(worker: any, database: string): Promise<void> {
 	const requestId = nextHomesChangedRequestId++;
-	const wait = waitForHomesChangedAck(requestId, HOMES_CHANGED_ACK_TIMEOUT_MS, database, 'a worker');
+	const wait = waitForHomesChangedAck(requestId, homesChangedAckTimeout(database), database, 'a worker');
 	try {
 		worker.postMessage({ type: 'record-lock-homes-changed', database, requestId });
 	} catch (error) {
@@ -673,7 +701,7 @@ onRecordLockHomesChanged(async (database) => {
 		// every sibling worker) has refreshed — fail-closed and on a budget that can outlast main's own
 		// fan-out (see `HOMES_CHANGED_RELAY_TIMEOUT_MS`).
 		const requestId = nextHomesChangedRequestId++;
-		const wait = waitForHomesChangedAck(requestId, HOMES_CHANGED_RELAY_TIMEOUT_MS, database, 'main');
+		const wait = waitForHomesChangedAck(requestId, homesChangedRelayTimeout(database), database, 'main');
 		try {
 			parentPort!.postMessage({ type: 'record-lock-homes-changed', database, requestId });
 		} catch (error) {
@@ -1203,6 +1231,8 @@ export interface RecordLockDatabaseStats {
 	outbound?: OutboundOperationStats;
 	/** The home map's member set as this thread sees it, or undefined while the map is withheld. */
 	members?: string[];
+	/** Whether this database follows its own row or inherits the default, once this thread has read either. */
+	homeMapSource?: 'default' | 'database';
 	/** Successor-freshness barrier counters, from the coordinating thread only. */
 	freshness?: FreshnessStats;
 	/** `origin:table` pairs with a recorded replication hole; cluster locks fail closed on them. */
@@ -1255,6 +1285,7 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 		total.restartRecall = restartRecall.status(database);
 		total.delegateEpoch = delegateEpochOf(database);
 	}
+	total.homeMapSource = homeMapSourceOf(database);
 	try {
 		total.members = transports.get(database)?.homeMap(database)?.homes;
 		total.freshness = freshnessBarriers.get(database)?.stats();
@@ -1295,6 +1326,10 @@ if (parentPort) {
 		}
 	});
 	onMessageByType('record-lock-incarnation', (message) => setHomeIncarnation(message.value, message.first));
+	onMessageByType('record-lock-registered-reply', (message) => {
+		const databases = Array.isArray(message?.databases) ? message.databases : undefined;
+		pendingRegistered.get(message?.requestId)?.(databases);
+	});
 	onMessageByType('record-lock-homes-changed', (message) => {
 		const ack = (ok: boolean) => {
 			try {
@@ -1719,6 +1754,7 @@ export async function collectRecordLockStatus(
 				entry.granted = stats.granted;
 				entry.admitted = stats.admitted;
 				entry.members = stats.members;
+				entry.homeMapSource = stats.homeMapSource;
 				entry.freshness = stats.freshness;
 				entry.poisoned = stats.poisoned;
 				entry.unprovenMs = stats.unprovenMs;
@@ -1764,6 +1800,34 @@ export async function collectRecordLockStatus(
 }
 
 setHomesDrainReader((database, deadlineMs) => quiesceOnOwner(database, deadlineMs));
+
+const REGISTERED_REQUEST_TIMEOUT_MS = 5_000;
+let nextRegisteredRequestId = 1;
+const pendingRegistered = new Map<number, (databases: string[] | undefined) => void>();
+/** Every database any thread registered: each registration asks main for an owner before anything can grant. */
+function databasesWithOwners(): Promise<string[] | undefined> {
+	if (!parentPort) return Promise.resolve([...recordLockOwners.keys()]);
+	const requestId = nextRegisteredRequestId++;
+	return new Promise((resolve) => {
+		const timer = setTimeout(() => settle(undefined), REGISTERED_REQUEST_TIMEOUT_MS).unref();
+		const settle = (databases: string[] | undefined) => {
+			clearTimeout(timer);
+			pendingRegistered.delete(requestId);
+			resolve(databases);
+		};
+		pendingRegistered.set(requestId, settle);
+		try {
+			parentPort!.postMessage({ type: 'record-lock-registered-request', requestId });
+		} catch (error) {
+			logger.debug?.('Could not ask main for the databases with record lock owners', error);
+			settle(undefined);
+		}
+	});
+}
+setHomesDrainCandidates(async () => {
+	const registered = await databasesWithOwners();
+	return registered && [...new Set([...registered, ...replicatedDatabaseNames()])];
+});
 
 setHomesMembershipReaders({
 	thisNodeName: getThisNodeName,
@@ -1851,6 +1915,17 @@ export function admitRecordLocks(listLmdbDatabases: () => readonly string[]): vo
 }
 
 if (!parentPort) {
+	onMessageByType('record-lock-registered-request', (message, worker) => {
+		try {
+			worker?.postMessage({
+				type: 'record-lock-registered-reply',
+				requestId: message?.requestId,
+				databases: [...recordLockOwners.keys()],
+			});
+		} catch (error) {
+			logger.debug?.('Could not answer a worker asking for the databases with record lock owners', error);
+		}
+	});
 	onMessageByType('record-lock-incarnation-request', (_message, worker) => {
 		if (worker && homeIncarnation > 0) confer(worker, 'record-lock-incarnation', homeIncarnation, isFirstIncarnation());
 	});

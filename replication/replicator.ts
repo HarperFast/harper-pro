@@ -996,15 +996,26 @@ function forReplicatedDatabase(databaseName, options, callback) {
 	if (databaseResidencyBlockReason(databaseName)) return;
 	const database = databases[databaseName];
 	logger.trace('Checking replication status of ', databaseName, options?.databases);
-	if (
-		options?.databases === undefined ||
-		options.databases === '*' ||
-		options.databases.includes(databaseName) ||
-		options.databases.some?.((dbConfig) => dbConfig.name === databaseName) ||
-		!database
-	)
-		callback(database, databaseName, true);
+	if (replicatesWholeDatabase(databaseName, options?.databases) || !database) callback(database, databaseName, true);
 	else if (hasExplicitlyReplicatedTable(databaseName)) callback(database, databaseName, false);
+}
+function replicatesWholeDatabase(databaseName, configured) {
+	return (
+		configured === undefined ||
+		configured === '*' ||
+		configured.includes(databaseName) ||
+		configured.some?.((dbConfig) => dbConfig.name === databaseName)
+	);
+}
+/** Every database present on this thread that `forReplicatedDatabase` would replicate. */
+export function replicatedDatabaseNames(configured = env.get(CONFIG_PARAMS.REPLICATION_DATABASES)): string[] {
+	const names: string[] = [];
+	for (const databaseName of Object.getOwnPropertyNames(databases)) {
+		if (!databases[databaseName] || databaseResidencyBlockReason(databaseName)) continue;
+		if (replicatesWholeDatabase(databaseName, configured) || hasExplicitlyReplicatedTable(databaseName))
+			names.push(databaseName);
+	}
+	return names;
 }
 function hasExplicitlyReplicatedTable(databaseName) {
 	const database = databases[databaseName];

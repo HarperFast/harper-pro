@@ -22,6 +22,7 @@ import { performance } from 'node:perf_hooks';
 import { randomBytes } from 'node:crypto';
 import { onMessageByType, onThreadExit, sendToThread } from '../core/server/threads/manageThreads.js';
 import { server } from '../core/server/Server.ts';
+import { getDatabases } from '../core/resources/databases.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import {
@@ -722,7 +723,7 @@ async function executeLocally(kind: RelayKind, database: string, table: string, 
 		if (!ownerIncarnationReady()) return LEGACY_WIRE ? GENERATION_MISMATCH : RECOVERING;
 		return deliverDelegationRequest(database, table, payload);
 	}
-	if (kind === 'quiesce') return quiesceDelegations(database, payload?.deadlineMs);
+	if (kind === 'quiesce') return quiesceOwned(database, payload?.deadlineMs);
 	if (kind === 'recall-incarnation') {
 		if (!ownerIncarnationReady()) return undefined;
 		if (payload.probe === true) return { probed: true, ...ownEpochOf(database) };
@@ -739,6 +740,24 @@ async function executeLocally(kind: RelayKind, database: string, table: string, 
 }
 
 /**
+ * Builds each table's coordinator before sweeping, as `cluster_status` does: core reports a database with
+ * no coordinator as unprovable, and one built now on the owner thread dates its ownership from when this
+ * thread began coordinating the database (`coordinationStartedMono`), so a database nothing has locked
+ * proves exactly when that coordination is old enough or its restart recall attested.
+ */
+function quiesceOwned(database: string, deadlineMs: number): Promise<any> {
+	const tables = getDatabases()[database];
+	for (const tableName in tables) {
+		try {
+			void tables[tableName]?.lockCoordinator;
+		} catch {
+			// An unusable identity or the disabled transport: core's sweep reports the database unprovable.
+		}
+	}
+	return quiesceDelegations(database, deadlineMs);
+}
+
+/**
  * Drain this database's delegations on the thread that actually coordinates them (harper-pro#856).
  *
  * The operations API answers on whichever thread took the request, and coordinator state is
@@ -748,7 +767,7 @@ async function executeLocally(kind: RelayKind, database: string, table: string, 
  * error rather than an empty result, so the operator falls back to the drain interval.
  */
 export async function quiesceOnOwner(database: string, deadlineMs: number): Promise<any> {
-	if (ownership.ownsDatabase(database)) return quiesceDelegations(database, deadlineMs);
+	if (ownership.ownsDatabase(database)) return quiesceOwned(database, deadlineMs);
 	const answer = await relay('quiesce', database, '', { deadlineMs });
 	if (!answer || typeof answer !== 'object' || !Array.isArray(answer.outstanding))
 		throw new ClientError('the record lock drain did not reach the coordinating worker in time', 503);
