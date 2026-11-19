@@ -6209,6 +6209,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	/** A copy run with full coverage makes the route whole again: the mark rides this route's next update. */
 	function restoreRouteFullCoverage(): void {
 		if (
+			coverageNarrowedOnSocket ||
 			!currentCopyPass?.marksRoute ||
 			!currentCopyPass.finalized ||
 			currentCopyPass.resumedWithWidening ||
@@ -6771,8 +6772,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// An update queued before a hole was marked takes its floors at commit: a holed origin's floor must not commit
 	// ahead of the durable hole mark and satisfy a removal receipt for the write this node skipped.
 	function dropHoledFloors() {
-		if (holedOrigins.size === 0 || pendingOriginFloors.size === 0) return;
+		if ((holedOrigins.size === 0 && provisionalHoles.size === 0) || pendingOriginFloors.size === 0) return;
 		for (const id of holedOrigins.keys()) pendingOriginFloors.drop(id);
+		for (const id of provisionalHoles.keys()) pendingOriginFloors.drop(id);
 	}
 	function seqUpdateEndTxn(seqId: number, originFloors?: ReceivedOriginFloor[], releasePending = false): any {
 		if (projectionCopy)
@@ -7404,9 +7406,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const retireProvisionalHoles = () => {
 			for (const lostId of premarked) {
 				const holders = provisionalHoles.get(lostId);
-				if (!holders?.delete(holeToken) || holders.size > 0) continue;
-				provisionalHoles.delete(lostId);
-				if (holedOrigins.get(lostId) === undefined) holedOrigins.delete(lostId);
+				if (holders?.delete(holeToken) && holders.size === 0) provisionalHoles.delete(lostId);
 			}
 		};
 		try {
@@ -7425,9 +7425,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// in memory before any await, so an update committing meanwhile takes no floor for it (dropHoledFloors)
 			if (!projectionCopy)
 				for (const lostId of lost) {
+					if (holedOrigins.has(lostId)) continue;
 					const holders = provisionalHoles.get(lostId);
-					if (holedOrigins.has(lostId) && !holders) continue;
-					holedOrigins.set(lostId, undefined);
 					if (holders) holders.add(holeToken);
 					else provisionalHoles.set(lostId, new Set([holeToken]));
 					premarked.push(lostId);
@@ -7752,6 +7751,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
+	/** Superseded, or a close handshake has begun: a request now would not be sent. */
+	const socketEnding = () => connectionSuperseded() || (ws.readyState ?? 1) >= 2;
 	// The clone's sync monitor runs on the main thread and names this in place of "no data received yet". Only
 	// during an attempt: nothing else reads it, and the text already went to the log above. This thread's env var
 	// outlives the attempt; the marker does not.
@@ -7891,9 +7892,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	/** Origins with a durable replication hole on this route (`originId -> generation`), preserved across copy-pass restoration. */
 	let holedOrigins = new Map<number, string | undefined>();
 	/**
-	 * Holes marked in memory by `recordReplicationHole` calls still writing (`originId -> each call's token`), shared
-	 * with the route's other sockets: a durable mark removes the entry, and a call retires only its own token, so a
-	 * superseded call never retires a hole confirmed or assumed by another call.
+	 * Holes `recordReplicationHole` calls are still writing (`originId -> each call's token`), shared with the route's
+	 * other sockets. They suppress floors only: no route mark is written from one until its call confirms it into
+	 * `holedOrigins`, and a call retires only its own token.
 	 */
 	let provisionalHoles = new Map<number, Set<symbol>>();
 	/** Origins revoked on this route (`originId -> generation`), re-asserted if a settled write fails to persist. */
@@ -8095,7 +8096,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	let copyWasResumed = false;
 	let copyResumedWithWidening = false;
-	/** Every request scope sent on this socket, intersected: a copy started on it fills no more than the narrowest. */
+	/** The one scope this socket's requests asked for; a request asking another reconnects. */
 	let socketRequestScope: RouteScope | undefined;
 	/** The route-scope revision this socket's latest request left: a pass starting on it began under that one. */
 	let socketScopeRev: number | undefined;
@@ -8366,7 +8367,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		withRouteScopeLock(dbisDB, routeId, () => {
 			const recorded = readRouteScope(dbisDB, routeId);
 			if (!recorded || recorded.rev !== scopeRev || sameScope(recorded, scope)) return;
-			writeRouteScope(dbisDB, routeId, { ...scope, rev: recorded.rev });
+			writeRouteScope(dbisDB, routeId, { ...scope, rev: recorded.rev, submitted: recorded.submitted });
 		});
 	}
 	function tryRestoreCopyPass(pass: CopyPassState | undefined, eventForImmediateTake?: any, deferFlush = false): void {
@@ -8451,7 +8452,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						pendingRouteState.partialHistory(id, true, gen);
 					}
 				}
-				if (holedOrigins.has(id) && !provisionalHoles.has(id)) {
+				if (holedOrigins.has(id)) {
 					const holedGen = holedOrigins.get(id);
 					if (
 						holedGen !== undefined &&
@@ -13958,7 +13959,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			withRouteScopeLock(dbisDB, routeId, () => {
 				const recorded = readRouteScope(dbisDB, routeId);
 				// a new revision even on a partial record: a copy that began before this must not promote over it
-				if (recorded) writeRouteScope(dbisDB, routeId, { ...recorded, full: false, rev: recorded.rev + 1 });
+				if (recorded)
+					writeRouteScope(dbisDB, routeId, {
+						...recorded,
+						full: false,
+						rev: recorded.rev + 1,
+						submitted: recorded.submitted && { ...recorded.submitted, full: false },
+					});
 			});
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not record the route scope for', databaseName, error);
@@ -13967,7 +13974,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	function sendSubscriptionRequestUpdate() {
-		if (wsClosed || connectionSuperseded()) return;
+		if (socketEnding()) return;
 		refreshShardingAdmission();
 		// once we have received the node name, and we know the database name that this connection is for,
 		// we can send a subscription request, if no other threads have subscribed.
@@ -13982,7 +13989,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// config (harper-pro#498).
 			if (options.connection) {
 				options.connection.on('exclusion-origins-updated', (origins: string[], failedOpen?: boolean) => {
-					if (wsClosed || connectionSuperseded()) return;
+					if (socketEnding()) return;
 					refreshShardingAdmission();
 					if (restrictedOrigins) return;
 					recordLiveCoverage(origins, failedOpen === true);
@@ -14047,6 +14054,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		resumedCopyScope = undefined;
 		let routeScopeFailure: unknown;
 		let freshCopyRequired = false;
+		let scopeChangedOnSocket = false;
 		let directFloorOnlyNodeId: number | undefined;
 		let directFloorOnlyStart: number | undefined;
 		let directFloorOnlyGeneration: string | undefined;
@@ -14183,7 +14191,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (state.hole === true) {
 						holedOrigins.set(state.id, stateGen);
 						provisionalHoles.delete(state.id);
-					} else if (holedOrigins.has(state.id) && !provisionalHoles.has(state.id)) {
+					} else if (holedOrigins.has(state.id)) {
 						const holedGen = holedOrigins.get(state.id);
 						if (holedGen !== undefined && stateGen !== undefined && stateGen !== holedGen) {
 							holedOrigins.delete(state.id);
@@ -14212,13 +14220,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				let forceFullCopyOnWidening = false;
 				let cursorScope: RouteScope | undefined;
-				if (
-					nodeId !== undefined &&
-					connectedNode === node &&
-					options.connection &&
-					supportsCheckpointFloors() &&
-					certifiesCheckpointFloors()
-				) {
+				// recorded even while the peer certifies nothing, so a narrowing then is still known when it certifies again
+				if (nodeId !== undefined && connectedNode === node && options.connection && supportsCheckpointFloors()) {
 					const fullCoverage = !restrictedOrigins && (options.connection.exclusionOrigins ?? []).includes(node.name);
 					const previous = options.connection.routeFullCoverage;
 					options.connection.routeFullCoverage = fullCoverage;
@@ -14229,87 +14232,93 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					try {
 						({ recorded, rev: recordedRev } = recordRequestScope(dbisDB, nodeId, current, {
 							legacyFull: previous !== false && ownState?.fullCoverage !== false,
-							previousOnSocket: socketRequestScope,
 						}));
 					} catch (error) {
 						routeScopeFailure = error;
 						return undefined;
 					}
-					socketRequestScope = socketRequestScope ? intersectScope(socketRequestScope, current) : current;
-					socketScopeRev = recordedRev;
-					socketScopeRouteId = nodeId;
-					cursorScope = cursorRouteScope(copyCursor);
-					// what an interrupted copy is filling; a cursor from before scopes were recorded fills the request's tables
-					const copyScope =
-						cursorScope ??
-						(copyCursor &&
-							routeScope(
-								copyCursor.widened !== true &&
-									previous !== false &&
-									(copyCursor.fullCoverage === true ||
-										(copyCursor.fullCoverage !== false && ownState?.fullCoverage !== false)),
-								current.byDefault,
-								current.tables
-							));
-					// a narrowing since the copy began may have cut tables the copy had not reached yet
-					const widened =
-						fullCoverage &&
-						(copyScope
-							? scopeWidens(copyScope, current) ||
-								((!cursorScope || copyCursor?.scopeRev !== recordedRev) && scopeWidens(recorded, current))
-							: scopeWidens(recorded, current));
-					const persistedPartial = ownState?.partialHistory === true;
-					const narrowedFromFullCoverage =
-						!fullCoverage &&
-						(previous === true ||
-							allNodes.some((state) => state.fullCoverage === true || typeof state.certifiedFrom === 'number'));
-					if (
-						widened ||
-						(fullCoverage && persistedPartial) ||
-						copyCursor?.widened === true ||
-						narrowedFromFullCoverage
-					) {
-						for (const state of allNodes) {
-							const gen = markGeneration(state);
-							pendingRouteState.partialHistory(state.id, true, gen);
-							partialMarked.set(state.id, gen);
-						}
-						if (!allNodes.some((state) => state.id === nodeId)) {
-							pendingRouteState.partialHistory(nodeId, true);
-							partialMarked.set(nodeId, undefined);
-						}
-						if (copyCursor && widened) {
-							copyCursor = {
-								...copyCursor,
-								widened: undefined,
-								fullCoverage: true,
-								restartFullCopy: true,
-								scope: undefined,
-								scopeRev: undefined,
-							};
-							cursorScope = undefined;
-							freshCopyRequired = true;
-							socketRequestScope = current;
-							try {
-								dbisDB
-									?.put?.([Symbol.for('copyCursor'), nodeId], copyCursor)
-									?.catch?.((error: unknown) =>
-										logger.warn?.(connectionId, 'could not persist restarted full-copy cursor for', databaseName, error)
-									);
-							} catch (error) {
-								logger.warn?.(connectionId, 'could not persist restarted full-copy cursor for', databaseName, error);
+					if (certifiesCheckpointFloors()) {
+						// a copy is attributable only to its socket's one scope: COPY_START names no request
+						if (socketRequestScope && !sameScope(socketRequestScope, current)) scopeChangedOnSocket = true;
+						socketRequestScope = current;
+						socketScopeRev = recordedRev;
+						socketScopeRouteId = nodeId;
+						cursorScope = cursorRouteScope(copyCursor);
+						// what an interrupted copy is filling; a cursor from before scopes were recorded fills the request's tables
+						const copyScope =
+							cursorScope ??
+							(copyCursor &&
+								routeScope(
+									copyCursor.widened !== true &&
+										previous !== false &&
+										(copyCursor.fullCoverage === true ||
+											(copyCursor.fullCoverage !== false && ownState?.fullCoverage !== false)),
+									current.byDefault,
+									current.tables
+								));
+						// a narrowing since the copy began may have cut tables the copy had not reached yet
+						const widened =
+							fullCoverage &&
+							(copyScope
+								? scopeWidens(copyScope, current) ||
+									((!cursorScope || copyCursor?.scopeRev !== recordedRev) && scopeWidens(recorded, current))
+								: scopeWidens(recorded, current));
+						const persistedPartial = ownState?.partialHistory === true;
+						const narrowedFromFullCoverage =
+							!fullCoverage &&
+							(previous === true ||
+								allNodes.some((state) => state.fullCoverage === true || typeof state.certifiedFrom === 'number'));
+						if (
+							widened ||
+							(fullCoverage && persistedPartial) ||
+							copyCursor?.widened === true ||
+							narrowedFromFullCoverage
+						) {
+							for (const state of allNodes) {
+								const gen = markGeneration(state);
+								pendingRouteState.partialHistory(state.id, true, gen);
+								partialMarked.set(state.id, gen);
 							}
-						} else if (fullCoverage && (widened || persistedPartial) && !copyCursor) {
-							forceFullCopyOnWidening = true;
-							freshCopyRequired = true;
-							socketRequestScope = current;
-							requestIsCopy = true;
-							logger.warn?.(
-								connectionId,
-								recorded.full && !persistedPartial
-									? `Route table scope widened for ${node.name} on database ${databaseName} without an active copy; requesting a full copy to populate newly included tables`
-									: `Route coverage widened to full for ${node.name} on database ${databaseName} without an active copy; requesting a full copy to populate newly covered tables`
-							);
+							if (!allNodes.some((state) => state.id === nodeId)) {
+								pendingRouteState.partialHistory(nodeId, true);
+								partialMarked.set(nodeId, undefined);
+							}
+							if (copyCursor && widened) {
+								copyCursor = {
+									...copyCursor,
+									widened: undefined,
+									fullCoverage: true,
+									restartFullCopy: true,
+									scope: undefined,
+									scopeRev: undefined,
+								};
+								cursorScope = undefined;
+								freshCopyRequired = true;
+								try {
+									dbisDB
+										?.put?.([Symbol.for('copyCursor'), nodeId], copyCursor)
+										?.catch?.((error: unknown) =>
+											logger.warn?.(
+												connectionId,
+												'could not persist restarted full-copy cursor for',
+												databaseName,
+												error
+											)
+										);
+								} catch (error) {
+									logger.warn?.(connectionId, 'could not persist restarted full-copy cursor for', databaseName, error);
+								}
+							} else if (fullCoverage && (widened || persistedPartial) && !copyCursor) {
+								forceFullCopyOnWidening = true;
+								freshCopyRequired = true;
+								requestIsCopy = true;
+								logger.warn?.(
+									connectionId,
+									recorded.full && !persistedPartial
+										? `Route table scope widened for ${node.name} on database ${databaseName} without an active copy; requesting a full copy to populate newly included tables`
+										: `Route coverage widened to full for ${node.name} on database ${databaseName} without an active copy; requesting a full copy to populate newly covered tables`
+								);
+							}
 						}
 					}
 				}
@@ -14576,6 +14585,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			logger.warn?.(connectionId, 'could not record the route scope for', databaseName, routeScopeFailure);
 			wsClosed = true;
 			close(1011, 'Could not record the route scope; reconnecting');
+			return;
+		}
+		if (scopeChangedOnSocket) {
+			logger.info?.(
+				connectionId,
+				'Route scope for',
+				databaseName,
+				'changed on an open connection; reconnecting so its request starts a socket of its own'
+			);
+			wsClosed = true;
+			if (options.connection) options.connection.forceReconnect();
+			else ws.terminate();
 			return;
 		}
 		// the sender resumes from whichever cursor it is sent last, so a copy the route needs whole carries none

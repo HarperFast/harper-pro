@@ -8,8 +8,12 @@ export interface RouteScope {
 	tables: string[];
 }
 
-/** The narrowest scope a route accepted progress under since its last completed copy; `rev` counts narrowings. */
-type RecordedRouteScope = RouteScope & { rev: number };
+/**
+ * The narrowest scope a route accepted progress under since its last completed copy, and the scope its last request
+ * asked for (`submitted`). `rev` moves on a narrowing and on any change of the submitted scope, so a copy promotes
+ * only if no other request intervened.
+ */
+type RecordedRouteScope = RouteScope & { rev: number; submitted?: RouteScope };
 
 export const ROUTE_SCOPE_KEY = Symbol.for('routeScope');
 
@@ -61,17 +65,19 @@ export function sameScope(a: RouteScope, b: RouteScope): boolean {
 	);
 }
 
-function isRecordedScope(value: any): value is RecordedRouteScope {
+function isScope(value: any): value is RouteScope {
 	return (
 		value !== null &&
 		typeof value === 'object' &&
 		typeof value.full === 'boolean' &&
 		typeof value.byDefault === 'boolean' &&
 		Array.isArray(value.tables) &&
-		value.tables.every((table: unknown) => typeof table === 'string') &&
-		Number.isSafeInteger(value.rev) &&
-		value.rev >= 0
+		value.tables.every((table: unknown) => typeof table === 'string')
 	);
+}
+
+function isRecordedScope(value: any): value is RecordedRouteScope {
+	return isScope(value) && Number.isSafeInteger((value as any).rev) && (value as any).rev >= 0;
 }
 
 /**
@@ -82,7 +88,10 @@ export function readRouteScope(dbisDB: any, routeId: number): RecordedRouteScope
 	const value = dbisDB.getSync([ROUTE_SCOPE_KEY, routeId]);
 	if (value === undefined) return undefined;
 	if (!isRecordedScope(value)) return { full: false, byDefault: false, tables: [], rev: 0 };
-	return { ...routeScope(value.full, value.byDefault, value.tables), rev: value.rev };
+	const submitted = isScope(value.submitted)
+		? routeScope(value.submitted.full, value.submitted.byDefault, value.submitted.tables)
+		: undefined;
+	return { ...routeScope(value.full, value.byDefault, value.tables), rev: value.rev, ...(submitted && { submitted }) };
 }
 
 /**
@@ -95,14 +104,15 @@ export function writeRouteScope(dbisDB: any, routeId: number, scope: RecordedRou
 		byDefault: scope.byDefault,
 		tables: scope.tables,
 		rev: scope.rev,
+		...(scope.submitted && {
+			submitted: { full: scope.submitted.full, byDefault: scope.submitted.byDefault, tables: scope.submitted.tables },
+		}),
 	});
 }
 
 interface RequestScopeContext {
 	/** An older build's evidence of partial coverage, for seeding an absent record. */
 	legacyFull: boolean;
-	/** What earlier requests on this socket covered: a copy one of them started must not promote past a narrowing. */
-	previousOnSocket?: RouteScope;
 }
 
 /**
@@ -130,20 +140,19 @@ export function recordRequestScope(
 	dbisDB: any,
 	routeId: number,
 	current: RouteScope,
-	{ legacyFull, previousOnSocket }: RequestScopeContext
+	{ legacyFull }: RequestScopeContext
 ): { recorded: RouteScope; rev: number } {
 	return withRouteScopeLock(dbisDB, routeId, () => {
 		const stored = readRouteScope(dbisDB, routeId);
 		const recorded = stored ?? { ...current, full: current.full && legacyFull, rev: 0 };
-		const bump = previousOnSocket !== undefined && scopeWidens(current, previousOnSocket) ? 1 : 0;
-		let next: RecordedRouteScope;
-		if (!current.full) next = { ...current, rev: recorded.full ? recorded.rev + 1 : recorded.rev + bump };
-		else {
-			const narrowed = intersectScope(recorded, current);
-			next = { ...narrowed, rev: sameScope(narrowed, recorded) ? recorded.rev + bump : recorded.rev + 1 };
-		}
-		if (!stored || next.rev !== recorded.rev || !sameScope(next, recorded)) writeRouteScope(dbisDB, routeId, next);
-		return { recorded: routeScope(recorded.full, recorded.byDefault, recorded.tables), rev: next.rev };
+		const proven = current.full ? intersectScope(recorded, current) : current;
+		const narrowed = current.full ? !sameScope(proven, recorded) : recorded.full;
+		// a replacement worker narrowing back to the proven scope still changes what was last asked for
+		const resubmitted = stored !== undefined && !(stored.submitted && sameScope(stored.submitted, current));
+		const rev = narrowed || resubmitted ? recorded.rev + 1 : recorded.rev;
+		if (!stored || rev !== recorded.rev || !sameScope(proven, recorded))
+			writeRouteScope(dbisDB, routeId, { ...proven, rev, submitted: current });
+		return { recorded: routeScope(recorded.full, recorded.byDefault, recorded.tables), rev };
 	});
 }
 
