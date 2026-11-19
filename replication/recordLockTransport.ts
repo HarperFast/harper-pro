@@ -491,7 +491,7 @@ export function createDisabledRecordLockTransport(
 // ---- per-thread active-generation cache, refreshed only on change --------------------------------
 
 const activeCache = new Map<string, RecordLockGenerationState | undefined>();
-/** Where each database's effective state came from on this thread, for `cluster_status` only. */
+/** Whether each database's effective state on this thread came from its own row or the default. */
 const homeMapSources = new Map<string, 'default' | 'database'>();
 
 function cacheForDatabase(database: string): RecordLockGenerationState | undefined {
@@ -635,7 +635,8 @@ async function applyHomesChanged(database: string): Promise<void> {
 		// Each registered database reads its own row first, so one with a map of its own keeps it.
 		await Promise.all(
 			[...transports.keys()].map(async (registered) => {
-				if (!(await refreshCache(registered, true)) && homeMapSources.get(registered) === 'default')
+				const inherited = homeMapSources.get(registered) === 'default';
+				if (!(await refreshCache(registered, true)) && (inherited || homeMapSources.get(registered) === 'default'))
 					announceHomesDigest(registered);
 			})
 		);

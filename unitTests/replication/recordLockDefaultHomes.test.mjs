@@ -30,6 +30,7 @@ import {
 	validateExplicit,
 } from '#src/replication/recordLockHomes';
 import { applyHomes, planSurvey } from '#src/replication/recordLockApply';
+import { getThisNodeName } from '#src/core/server/nodeName';
 import {
 	cachedActiveGeneration,
 	createDisabledRecordLockTransport,
@@ -108,6 +109,19 @@ describe('a first own map, planned against the inherited default', () => {
 		assert.strictEqual(plan.row.highestActedOn, 4);
 	});
 
+	it('is allowed on a node the staged default leaves out, against the rings it remembers', () => {
+		const departed = inheritedFrom(
+			'data',
+			defaultRow({ staged: { ...ring(4, ['a']), quiesce: ['a', 'c'] }, highestActedOn: 4 })
+		);
+		const uncovered = planStage(departed, 'data', 5, ['c'], digestOf(5, ['c']), 0, ['c'], undefined, 'c');
+		assert.strictEqual(uncovered.action, 'reject');
+		assert.match(uncovered.reason, /missing a/);
+		const plan = planStage(departed, 'data', 5, ['c'], digestOf(5, ['c']), 0, ['a', 'c'], undefined, 'c');
+		assert.strictEqual(plan.action, 'write');
+		assert.strictEqual(plan.row.staged.generation, 5);
+	});
+
 	it('is refused while the default is staged on this node, whatever it covers', () => {
 		const staged = inheritedFrom(
 			'data',
@@ -179,6 +193,11 @@ describe('planSurvey resumes only a generation every node can take', () => {
 			['b', { node: 'b', highestActedOn: 0, supportsFenced: true }],
 		]);
 		assert.strictEqual(planSurvey('x', ['a', 'b'], ['a', 'b'], undefined, resumable).generation, 1);
+		const inheritedAtFloor = new Map([
+			['a', { node: 'a', staged, highestActedOn: 1, supportsFenced: true }],
+			['b', { node: 'b', active: ring(1, ['a', 'b']), highestActedOn: 1, inherited: true, supportsFenced: true }],
+		]);
+		assert.strictEqual(planSurvey('x', ['a', 'b'], ['a', 'b'], undefined, inheritedAtFloor).generation, 2);
 	});
 });
 
@@ -302,6 +321,9 @@ describe('the default stage drains every inheriting database', () => {
 describe('the default row, on a real table', function () {
 	this.timeout(20_000);
 	const operator = { hdb_user: { username: 'op' } };
+	// This node must be a member of the default for its own stage to count as mid-transition.
+	const self = getThisNodeName();
+	const both = [self, 'n2'].sort();
 	const drained = [];
 	const registered = ['inh-a', 'own-b', 'inh-c', 'inh-d'];
 	let firstIncarnation = false;
@@ -313,7 +335,7 @@ describe('the default row, on a real table', function () {
 		});
 		setHomesDrainCandidates({ candidates: async () => ['inh-a', 'own-b'], neverGranted: () => firstIncarnation });
 		for (const database of registered) ensureRecordLockTransport(database, () => createDisabledRecordLockTransport());
-		await stageGeneration({ database: 'own-b', generation: 1, homes: ['n1'], quiesce: ['n1'], ...operator });
+		await stageGeneration({ database: 'own-b', generation: 1, homes: [self], quiesce: [self], ...operator });
 		drained.length = 0;
 	});
 
@@ -328,8 +350,8 @@ describe('the default row, on a real table', function () {
 		const result = await stageGeneration({
 			default: true,
 			generation: 1,
-			homes: ['n1', 'n2'],
-			quiesce: ['n1', 'n2'],
+			homes: both,
+			quiesce: both,
 			explicit: ['elsewhere'],
 			...operator,
 		});
@@ -353,8 +375,8 @@ describe('the default row, on a real table', function () {
 			const retry = await stageGeneration({
 				default: true,
 				generation: 1,
-				homes: ['n1', 'n2'],
-				quiesce: ['n1', 'n2'],
+				homes: both,
+				quiesce: both,
 				...operator,
 			});
 			assert.strictEqual(retry.staged.fresh, true);
@@ -367,7 +389,7 @@ describe('the default row, on a real table', function () {
 
 	it('refuses a first own map while the default is staged here', async () => {
 		await assert.rejects(
-			stageGeneration({ database: 'inh-c', generation: 5, homes: ['n1', 'n2'], quiesce: ['n1', 'n2'], ...operator }),
+			stageGeneration({ database: 'inh-c', generation: 5, homes: both, quiesce: both, ...operator }),
 			/default home map is staged/
 		);
 		assert.strictEqual(await ownRow('inh-c'), undefined);
@@ -375,7 +397,7 @@ describe('the default row, on a real table', function () {
 
 	it('activating it marks the databases with rows of their own elsewhere, then every database without one inherits', async () => {
 		await delay(MIN_DRAIN_BACKSTOP_MS + 100);
-		await activateGeneration({ default: true, generation: 1, homes: ['n1', 'n2'], explicit: ['marked'], ...operator });
+		await activateGeneration({ default: true, generation: 1, homes: both, explicit: ['marked'], ...operator });
 		for (const database of ['marked', 'elsewhere']) {
 			const marker = await ownRow(database);
 			assert.strictEqual(marker.highestActedOn, 1, database);
@@ -385,8 +407,8 @@ describe('the default row, on a real table', function () {
 		assert.strictEqual((await ownRow('own-b')).staged.generation, 1, 'an own row is never replaced by a marker');
 		const row = await currentRow('inh-a');
 		assert.strictEqual(row.inherited, true);
-		assert.deepStrictEqual(row.active.homes, ['n1', 'n2']);
-		assert.strictEqual(row.active.digest, digestFor(DEFAULT_HOMES_KEY, 1, ['n1', 'n2']));
+		assert.deepStrictEqual(row.active.homes, both);
+		assert.strictEqual(row.active.digest, digestFor(DEFAULT_HOMES_KEY, 1, both));
 		assert.strictEqual(cachedActiveGeneration('inh-a'), 1, 'the default fan-out refreshed every registered database');
 		assert.strictEqual(homeMapSourceOf('inh-a'), 'default');
 		assert.strictEqual(cachedActiveGeneration('own-b'), undefined);
@@ -398,20 +420,26 @@ describe('the default row, on a real table', function () {
 		);
 	});
 
+	it('an already-active default writes no marker, even for a name it has not seen', async () => {
+		await activateGeneration({ default: true, generation: 1, homes: both, explicit: ['inh-a'], ...operator });
+		assert.strictEqual(await ownRow('inh-a'), undefined, 'a live inherited map is never retracted undrained');
+		assert.strictEqual(cachedActiveGeneration('inh-a'), 1);
+	});
+
 	it('a first own map must cover the default ring and name a generation above it', async () => {
 		await assert.rejects(
-			stageGeneration({ database: 'inh-d', generation: 2, homes: ['n1'], quiesce: ['n1'], ...operator }),
+			stageGeneration({ database: 'inh-d', generation: 2, homes: [self], quiesce: [self], ...operator }),
 			/missing n2/
 		);
 		await assert.rejects(
-			stageGeneration({ database: 'inh-d', generation: 1, homes: ['n1'], quiesce: ['n1', 'n2'], ...operator }),
+			stageGeneration({ database: 'inh-d', generation: 1, homes: [self], quiesce: both, ...operator }),
 			/not greater than 1/
 		);
 		const { staged } = await stageGeneration({
 			database: 'inh-d',
 			generation: 2,
-			homes: ['n1'],
-			quiesce: ['n1', 'n2'],
+			homes: [self],
+			quiesce: both,
 			...operator,
 		});
 		assert.strictEqual(staged.generation, 2);

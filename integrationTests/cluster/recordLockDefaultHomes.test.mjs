@@ -35,28 +35,44 @@ function lockedIncrementIn(node, id, signal) {
 	return call(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 }, signal);
 }
 
-async function itemCount(node, id) {
-	const rows = await sendOperation(node, {
-		operation: 'search_by_id',
-		database: FRESH,
-		table: ITEM,
-		ids: [id],
-		get_attributes: ['id', 'n'],
-		authorization: node.admin,
-	});
+async function itemCount(node, id, signal) {
+	const rows = await sendOperation(
+		node,
+		{
+			operation: 'search_by_id',
+			database: FRESH,
+			table: ITEM,
+			ids: [id],
+			get_attributes: ['id', 'n'],
+			authorization: node.admin,
+		},
+		{ signal }
+	);
 	return rows[0]?.n;
 }
 
 function waitForItem(nodes, id, expected) {
 	return waitForCondition(
-		async () =>
-			(await Promise.all(nodes.map((node) => itemCount(node, id)))).every((n) => n === expected) ? true : undefined,
+		async (signal) =>
+			(await Promise.all(nodes.map((node) => itemCount(node, id, signal)))).every((n) => n === expected)
+				? true
+				: undefined,
 		{ timeoutMs: CONVERGE_TIMEOUT_MS, description: `${FRESH}.${ITEM}/${id} to read ${expected} on every node` }
 	);
 }
 
-async function recordLocksOf(node, database) {
-	return (await clusterStatusOf(node)).recordLocks?.[database];
+async function recordLocksOf(node, database, signal) {
+	return (await clusterStatusOf(node, signal)).recordLocks?.[database];
+}
+
+function waitForProvable(nodes, database) {
+	return waitForCondition(
+		async (signal) => {
+			const stats = await Promise.all(nodes.map((node) => recordLocksOf(node, database, signal)));
+			return stats.every((entry) => entry?.unprovenMs === 0) ? stats : undefined;
+		},
+		{ timeoutMs: 420_000, pollMs: 5_000, description: `${database} to be able to prove a drain on every node` }
+	);
 }
 
 suite('record lock default home map on a three-node cluster', { timeout: 900_000 }, (ctx) => {
@@ -92,10 +108,10 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		const id = 'default-' + Date.now();
 		await putCounter(nodes[0], id, 0);
 		await waitForCounter(nodes, id, 0);
-		await waitForCondition(async () => (await call(nodes[0], 'LockedIncrement/', { id })).status === 200, {
-			timeoutMs: 30_000,
-			description: `${DB} to be lockable on ${names[0]} under the default`,
-		});
+		await waitForCondition(
+			async (signal) => (await call(nodes[0], 'LockedIncrement/', { id }, signal)).status === 200,
+			{ timeoutMs: 30_000, description: `${DB} to be lockable on ${names[0]} under the default` }
+		);
 		assert.equal((await call(nodes[1], 'LockedIncrement/', { id })).status, 200);
 		await waitForCounter(nodes, id, 2);
 		assert.equal(await lockStatus(nodes[2], id), 503, 'a node the default does not name has no map');
@@ -142,13 +158,7 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(refused.status, 409, JSON.stringify(refused.body));
 		assert.match(refused.body.error, new RegExp(`${names[1]} \\(in .*'s ring\\)`));
 		assert.equal(refused.body.nodes[names[0]].survey.inherited, true);
-		await waitForCondition(
-			async () => {
-				const stats = await Promise.all(nodes.slice(0, 2).map((node) => recordLocksOf(node, FRESH)));
-				return stats.every((entry) => entry?.unprovenMs === 0) ? stats : undefined;
-			},
-			{ timeoutMs: 420_000, pollMs: 5_000, description: `${FRESH} to be able to prove a drain on both default nodes` }
-		);
+		await waitForProvable(nodes.slice(0, 2), FRESH);
 		const { status, body } = await operation(nodes[0], {
 			operation: 'record_lock_apply_homes',
 			database: FRESH,
@@ -168,10 +178,10 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		const id = 'join-' + Date.now();
 		await putCounter(nodes[0], id, 0);
 		await waitForCounter(nodes, id, 0);
-		await waitForCondition(async () => (await call(nodes[2], 'LockedIncrement/', { id })).status === 200, {
-			timeoutMs: 30_000,
-			description: `${DB} to be lockable on the joined node`,
-		});
+		await waitForCondition(
+			async (signal) => (await call(nodes[2], 'LockedIncrement/', { id }, signal)).status === 200,
+			{ timeoutMs: 30_000, description: `${DB} to be lockable on the joined node` }
+		);
 		await waitForCounter(nodes, id, 1);
 		for (const node of nodes) assert.deepEqual((await recordLocksOf(node, DB)).members, [...names].sort());
 		const fresh = 'joined-' + Date.now();
@@ -194,8 +204,15 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		await waitForCounter(nodes, id, 0);
 		const held = await call(nodes[2], 'LockHold/', { id, lease: 8_000, timeout: 10_000 });
 		assert.equal(held.status, 200, JSON.stringify(held.body));
-		const shrinking = applyDefault(nodes[0], { homes: names.slice(0, 2), quiesce: names });
-		await new Promise((resolve) => setTimeout(resolve, 1_000));
+		let settled = false;
+		const shrinking = applyDefault(nodes[0], { homes: names.slice(0, 2), quiesce: names }).finally(
+			() => (settled = true)
+		);
+		await waitForCondition(
+			async (signal) => ((await recordLocksOf(nodes[2], DB, signal))?.members === undefined ? true : undefined),
+			{ timeoutMs: 8_000, pollMs: 100, description: 'the leaver to stop serving the default while it holds the lock' }
+		);
+		assert.equal(settled, false, 'the shrink waits for the held lock to drain');
 		const wrote = await call(nodes[2], 'LockWrite/', { token: held.body.token, n: 10 });
 		assert.equal(wrote.status, 200, JSON.stringify(wrote.body));
 		assert.equal((await call(nodes[2], 'LockRelease/', { token: held.body.token })).status, 200);
@@ -218,6 +235,25 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(status, 409, JSON.stringify(body));
 		assert.equal(body.outcome, 'refused');
 		assert.match(body.error, new RegExp(`${names[1]} \\(in .*'s ring\\)`));
+		assert.equal(body.nodes[names[0]].stage, undefined, 'nothing was staged');
 		for (const node of nodes.slice(0, 2)) assert.equal(await lockStatus(node, 'still-' + Date.now()), 200);
+	});
+
+	test('the node a shrink left out can still take a map of its own for a database that inherited', async () => {
+		await waitForProvable(nodes, DB);
+		const { status, body } = await operation(nodes[1], {
+			operation: 'record_lock_apply_homes',
+			database: DB,
+			homes: names.slice(1),
+			quiesce: names,
+		});
+		assert.equal(status, 200, JSON.stringify(body));
+		assert.equal(body.outcome, 'activated', JSON.stringify(body));
+		assert.equal(body.generation, 4, 'above the default generation it inherited');
+		const id = 'own-' + Date.now();
+		await putCounter(nodes[1], id, 0);
+		await waitForCounter(nodes, id, 0);
+		assert.equal((await call(nodes[2], 'LockedIncrement/', { id })).status, 200);
+		assert.equal(await lockStatus(nodes[0], id), 503, 'the node its map leaves out is staged');
 	});
 });

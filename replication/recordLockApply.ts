@@ -256,14 +256,12 @@ export function planSurvey(
 		for (const state of [reply.active, reply.staged])
 			if (state?.generation === floor && sameSet(state.homes, homes)) resumable = true;
 	}
-	// A node holding the floor with neither ring (a default activation's marker) cannot take that
-	// generation again, so resuming there would refuse every retry.
+	// A node holding the floor with neither ring (a default activation's marker), or through the default
+	// it inherits, cannot take that generation again, so resuming there would refuse every retry.
 	const bareFloor = [...rows.values()].some(
 		(reply) =>
-			!reply.inherited &&
 			floorOf(reply) === floor &&
-			reply.active?.generation !== floor &&
-			reply.staged?.generation !== floor
+			(reply.inherited || (reply.active?.generation !== floor && reply.staged?.generation !== floor))
 	);
 	const resumeTarget = resumable && !bareFloor ? floor : floor + 1;
 	const generation = requestedGeneration ?? resumeTarget;
@@ -336,7 +334,7 @@ function planStages(
 			fenced: [],
 		};
 		if (reply.inherited) row.inherited = true;
-		const plan = planStage(row, database, generation, homes, digest, Date.now(), quiesce);
+		const plan = planStage(row, database, generation, homes, digest, Date.now(), quiesce, undefined, node);
 		if (plan.action === 'reject') return { rejected: node, reason: plan.reason };
 		if (plan.action === 'noop') alreadyStaged.add(node);
 	}

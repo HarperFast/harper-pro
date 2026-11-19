@@ -745,23 +745,16 @@ async function executeLocally(kind: RelayKind, database: string, table: string, 
  * thread began coordinating the database (`coordinationStartedMono`), so a database nothing has locked
  * proves exactly when that coordination is old enough or its restart recall attested.
  */
-async function quiesceOwned(database: string, deadlineMs: number): Promise<any> {
+function quiesceOwned(database: string, deadlineMs: number): Promise<any> {
 	const tables = getDatabases()[database];
-	let tableCount = 0;
 	for (const tableName in tables) {
-		tableCount++;
 		try {
 			void tables[tableName]?.lockCoordinator;
 		} catch {
 			// An unusable identity or the disabled transport: core's sweep reports the database unprovable.
 		}
 	}
-	const result = await quiesceDelegations(database, deadlineMs);
-	// With no table there is no coordinator to build and nothing a lock could name; grants a dropped
-	// table's coordinator parked are still reported under that table's name.
-	if (tableCount === 0 && tables)
-		result.outstanding = result.outstanding.filter((entry) => !(entry.table === '*' && entry.key === undefined));
-	return result;
+	return quiesceDelegations(database, deadlineMs);
 }
 
 /**

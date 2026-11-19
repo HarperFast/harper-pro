@@ -239,7 +239,10 @@ async function resolveEffectiveRow(
 	const own = await read(key);
 	if (own || key === DEFAULT_HOMES_KEY) return own;
 	const defaultRow = await read(DEFAULT_HOMES_KEY);
-	return defaultRow && inheritedFrom(key, defaultRow);
+	if (!defaultRow) return undefined;
+	// A marker is written before the default it excludes is promoted, and rows are never deleted, so
+	// reading the own row again after the default sees any marker that promotion depended on.
+	return (await read(key)) ?? inheritedFrom(key, defaultRow);
 }
 
 /**
@@ -391,7 +394,8 @@ export function planStage(
 	digest: string,
 	now: number = Date.now(),
 	quiesce?: string[],
-	explicit?: string[]
+	explicit?: string[],
+	self?: string
 ): StagePlan {
 	const floor = Math.max(
 		existing?.active?.generation ?? 0,
@@ -399,8 +403,14 @@ export function planStage(
 		existing?.highestActedOn ?? 0
 	);
 	// Between this node's default stage and activation, its drain set and the databases it reported as
-	// having rows of their own must not change, so no inheriting database takes a row of its own here.
-	if (existing?.inherited && existing.staged && !existing.active)
+	// having rows of their own must not change, so no inheriting database takes a row of its own here. A
+	// node the staged default leaves out never activates it, and plans against its remembered rings.
+	if (
+		existing?.inherited &&
+		existing.staged &&
+		!existing.active &&
+		(self === undefined || existing.staged.homes.includes(self))
+	)
 		return {
 			action: 'reject',
 			reason: `the default home map is staged at generation ${existing.staged.generation} on this node; complete that transition (record_lock_apply_homes with default: true) before giving ${database} a home map of its own`,
@@ -417,6 +427,8 @@ export function planStage(
 		// old generation. `stagedAt` is kept — nothing about when this node stopped granting has changed.
 		const widened = quiesce && canonicalizeHomes([...(existing.staged.quiesce ?? []), ...quiesce]);
 		const widenedExplicit = explicit?.length && canonicalizeHomes([...(existing.staged.explicit ?? []), ...explicit]);
+		if (widenedExplicit && widenedExplicit.length > MAX_EXPLICIT_DATABASES)
+			return { action: 'reject', reason: `more than ${MAX_EXPLICIT_DATABASES} databases have home maps of their own` };
 		const quiesceGrew = widened && widened.length !== (existing.staged.quiesce?.length ?? 0);
 		const explicitGrew = widenedExplicit && widenedExplicit.length !== (existing.staged.explicit?.length ?? 0);
 		if (quiesceGrew || explicitGrew) {
@@ -585,7 +597,17 @@ async function stageRow(
 	const quiesce = canonicalizeHomes([...request.quiesce, ...homes]);
 	const explicit = isDefault ? validateExplicit(request.explicit) : undefined;
 	return withEffectiveRow(key, async (existing, write) => {
-		const plan = planStage(existing, key, generation, homes, digest, Date.now(), quiesce, explicit);
+		const plan = planStage(
+			existing,
+			key,
+			generation,
+			homes,
+			digest,
+			Date.now(),
+			quiesce,
+			explicit,
+			membership.thisNodeName()
+		);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
 		const fenced = withFences(
 			plan.action === 'write' ? plan.row.fenced : (existing?.fenced ?? []),
@@ -630,9 +652,9 @@ export async function fenceExternal(request: any): Promise<{ fenced: true }> {
 	const key = rowKeyOf(request);
 	const operator = operatorPrincipal(request);
 	const { node } = request;
-	return withRow(key, async (existing, write) => {
+	return withEffectiveRow(key, async (existing, write) => {
 		// A first row here would detach the database from the default it follows, with no map of its own.
-		if (!existing && key !== DEFAULT_HOMES_KEY && (await readRow(DEFAULT_HOMES_KEY)))
+		if (existing?.inherited)
 			throw new ClientError(
 				`${key} has no home map of its own on this node and follows the default home map; record the fence with default: true`,
 				409
@@ -714,7 +736,7 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
 	const digest = digestFor(key, generation, homes);
-	if (key === DEFAULT_HOMES_KEY) await markExplicitDatabases(validateExplicit(request.explicit), generation, digest);
+	const explicit = key === DEFAULT_HOMES_KEY ? validateExplicit(request.explicit) : [];
 	return withRow(key, async (existing, write) => {
 		const plan = planActivate(existing, key, generation, digest);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
@@ -724,6 +746,8 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 			await notifyChanged(key);
 			return { active: plan.active };
 		}
+		if (key === DEFAULT_HOMES_KEY)
+			await markExplicitDatabases(existing!, [...explicit, ...(existing!.staged!.explicit ?? [])]);
 		await write(plan.row);
 		logger.info?.(`Record lock home map for ${describeKey(key)}: activated generation ${generation}`);
 		await notifyChanged(key);
@@ -732,23 +756,18 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 }
 
 /**
- * Before the default activates, every database some node reported a row of its own for gets one here
- * too (a marker with no map), so this node never inherits it. Each marker takes only its own row's lock;
- * a marker removes authority and never adds any, so it may land at any point before the promotion, and
- * the promotion's fan-out refreshes every database.
+ * Under the default row's lock, between a validated promotion plan and its write: every database some
+ * node reported a row of its own for gets one here too (a marker with no map), so this node never
+ * inherits it. Only a staged default is promoted, so none of these databases holds inherited authority
+ * here; an already-active default never writes one, since that would retract a live map undrained.
  */
-async function markExplicitDatabases(explicit: string[], generation: number, digest: string): Promise<void> {
-	const defaultRow = await readRow(DEFAULT_HOMES_KEY);
-	const transition = [defaultRow?.staged, defaultRow?.active].find(
-		(state) => state?.generation === generation && state.digest === digest
-	);
-	if (!defaultRow || !transition) return;
+async function markExplicitDatabases(defaultRow: RecordLockHomesRow, explicit: string[]): Promise<void> {
 	const floor = Math.max(
 		defaultRow.active?.generation ?? 0,
 		defaultRow.staged?.generation ?? 0,
 		defaultRow.highestActedOn ?? 0
 	);
-	for (const database of canonicalizeHomes([...explicit, ...(transition.explicit ?? [])])) {
+	for (const database of canonicalizeHomes(explicit)) {
 		await withRow(
 			database,
 			async (existing, write) => {
