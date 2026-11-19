@@ -1,6 +1,6 @@
 const FULL_WRITE_HEAD = 0x40000;
 
-// the stored row itself, so a test can see a tombstone, which no query returns
+// a tombstone, which no query returns
 export class StoredRow extends Resource {
 	static loadAsInstance = false;
 
