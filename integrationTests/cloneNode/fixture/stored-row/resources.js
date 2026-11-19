@@ -1,6 +1,5 @@
 const FULL_WRITE_HEAD = 0x40000;
 
-// a tombstone, which no query returns
 export class StoredRow extends Resource {
 	static loadAsInstance = false;
 

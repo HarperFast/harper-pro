@@ -1,7 +1,7 @@
 // harper-pro#1451
 import { suite, test, after } from 'node:test';
 import assert from 'node:assert';
-import { cp, mkdtemp } from 'node:fs/promises';
+import { cp, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
@@ -13,7 +13,9 @@ const STORED_ROW_FIXTURE = join(import.meta.dirname, 'fixture', 'stored-row');
 const TEMP_ADMIN = 'clone-temp-admin';
 const WAIT_MS = 180_000;
 
-suite('Clone Node - temporary admin', { skip: isLMDB && 'cluster record locks require RocksDB' }, (ctx) => {
+const SUITE_OPTIONS = { timeout: 900_000, skip: isLMDB && 'cluster record locks require RocksDB' };
+
+suite('Clone Node - temporary admin', SUITE_OPTIONS, (ctx) => {
 	const contexts = [];
 
 	after(() => stopAndTeardownNodes(contexts.map((context) => context.harper)));
@@ -54,7 +56,6 @@ suite('Clone Node - temporary admin', { skip: isLMDB && 'cluster record locks re
 		);
 	}
 
-	// undefined until the node serves the cloned application
 	async function storedTempAdmin(node, signal) {
 		let response;
 		try {
@@ -120,6 +121,9 @@ suite('Clone Node - temporary admin', { skip: isLMDB && 'cluster record locks re
 		);
 		// the leader is then the joiner's only source for the deletion, as in a two-node cluster
 		await stopNodeProcess(tokenClone);
+		// torn down only in after(): teardown frees the address, and a joiner on it would take the token clone's node
+		// name. Its pid file goes now, since by after() that pid could belong to another process.
+		await rm(join(tokenClone.dataRootDir, 'hdb.pid'), { force: true });
 
 		const copyJoiner = await startClone(leader, {
 			HDB_LEADER_USERNAME: leader.admin.username,
