@@ -578,7 +578,8 @@ async function readIntoCache(database: string, freshBudget: boolean): Promise<Re
 		const row = await readHomesRow(database);
 		if (!current()) return newer();
 		activeCache.set(database, row?.active);
-		if (row) homeMapSources.set(database, row.inherited ? 'default' : 'database');
+		if (row?.inherited) homeMapSources.set(database, 'default');
+		else if (row?.active || row?.staged || (row?.highestActedOn ?? 0) > 0) homeMapSources.set(database, 'database');
 		else homeMapSources.delete(database);
 		// A peer digest recorded while the row was unreadable, or a handshake that found the cache empty (a
 		// database created at runtime), left peers without our current digest. The backoff resets only once
@@ -596,6 +597,7 @@ async function readIntoCache(database: string, freshBudget: boolean): Promise<Re
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
 		homeMapSources.delete(database);
+		reconcileAllPeerHomesAgreement(database);
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
 		state.timer = setTimeout(() => {
 			if (current())
@@ -1476,10 +1478,12 @@ function watchOwnerExit(worker: any): void {
 	if (worker === MAIN_OWNER || ownersWithExitHandler.has(worker)) return;
 	ownersWithExitHandler.add(worker);
 	worker.once('exit', () => {
+		pruneReleasedOwners();
+		const exitedAt = performance.now();
 		for (const [database, owner] of recordLockOwners) {
 			if (owner !== worker) continue;
 			recordLockOwners.delete(database);
-			noteReleasedOwner(database);
+			releasedOwners.set(database, exitedAt);
 			// Tell every worker the owner is gone NOW, before the successor is assigned and can grant, so a
 			// surviving relayed handle for this database is fenced fail-closed ahead of any new grant rather
 			// than only after the reassignment broadcast lands (harper-pro#852).

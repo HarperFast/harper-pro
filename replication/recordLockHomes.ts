@@ -198,8 +198,9 @@ export function validateExplicit(explicit: unknown): string[] {
 	if (!Array.isArray(explicit) || explicit.length > MAX_EXPLICIT_DATABASES)
 		throw new ClientError(`explicit must be an array of at most ${MAX_EXPLICIT_DATABASES} database names`, 400);
 	for (const database of explicit) {
-		if (typeof database !== 'string' || database.length === 0 || database.length > MAX_NODE_NAME_LENGTH)
-			throw new ClientError('every explicit entry must be a non-empty, bounded database name', 400);
+		// No length bound beyond a row key's own: a database with a row of its own must be listable.
+		if (typeof database !== 'string' || database.length === 0)
+			throw new ClientError('every explicit entry must be a non-empty database name', 400);
 		if (database === DEFAULT_HOMES_KEY) throw new ClientError(`explicit must not name ${DEFAULT_HOMES_KEY}`, 400);
 	}
 	return canonicalizeHomes(explicit);
@@ -581,7 +582,11 @@ export async function drainInheriting(
 	fenced: readonly string[] = [],
 	drain: (database: string, budgetMs: number) => Promise<QuiesceResult | { error: string }> = drainReader
 ): Promise<QuiesceResult | { error: string }> {
-	if (!databases) return { error: 'no record lock drain candidates are wired on this node' };
+	if (!databases)
+		return {
+			error:
+				'this node could not list the databases that could hold record-lock authority (main did not answer, or nothing is wired)',
+		};
 	const settled = await Promise.allSettled(databases.map((database) => drain(database, STAGE_DRAIN_BUDGET_MS)));
 	const aggregate: QuiesceResult = { complete: true, surrendered: 0, recalled: 0, outstanding: [] };
 	settled.forEach((outcome, index) => {
