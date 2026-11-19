@@ -8,6 +8,7 @@ import {
 	routeScope,
 	sameScope,
 	scopeWidens,
+	withRouteScopeLock,
 } from '#src/replication/routeScope';
 
 function scopeStore(initial) {
@@ -143,6 +144,35 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 			recordRequestScope(unchanged, 7, excluding('t'), { legacyFull: true, previousOnSocket: excluding('t') }).rev,
 			1
 		);
+	});
+
+	it('writes the record only while holding the route’s cross-thread lock, and refuses while another thread holds it', () => {
+		const locks = new Set();
+		const dbisDB = Object.assign(scopeStore({ ...excluding('t'), rev: 1 }), {
+			tryLock: (key) => {
+				const name = String(key[1]);
+				if (locks.has(name)) return false;
+				locks.add(name);
+				return true;
+			},
+			unlock: (key) => locks.delete(String(key[1])),
+		});
+		recordRequestScope(dbisDB, 7, excluding('t', 'u'), { legacyFull: true });
+		assert.strictEqual(locks.size, 0, 'released after the write');
+		assert.strictEqual(dbisDB.writes.length, 1);
+		withRouteScopeLock(dbisDB, 7, () => {
+			assert.throws(
+				() => recordRequestScope(dbisDB, 7, excluding('t', 'u', 'v'), { legacyFull: true }),
+				/another thread/
+			);
+		});
+		assert.strictEqual(dbisDB.writes.length, 1, 'nothing written while the lock was held');
+		assert.throws(() =>
+			withRouteScopeLock(dbisDB, 7, () => {
+				throw new Error('failed');
+			})
+		);
+		assert.strictEqual(locks.size, 0, 'released after a failed update');
 	});
 
 	it('reads a row that is not a scope as the narrowest one, and propagates a store that cannot be read', () => {

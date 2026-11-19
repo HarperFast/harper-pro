@@ -106,6 +106,22 @@ interface RequestScopeContext {
 }
 
 /**
+ * Runs a read and write of the route's record under a cross-thread lock: connections for one route on two workers
+ * overlap at a failover handoff, and neither may overwrite a revision the other wrote after its read. Synchronous, so a
+ * held lock throws and the caller reconnects or retries rather than waits. A store without the lock runs it unlocked.
+ */
+export function withRouteScopeLock<T>(dbisDB: any, routeId: number, update: () => T): T {
+	if (typeof dbisDB?.tryLock !== 'function') return update();
+	const key = [ROUTE_SCOPE_KEY, routeId];
+	if (!dbisDB.tryLock(key)) throw new Error(`The scope record of route ${routeId} is being written by another thread`);
+	try {
+		return update();
+	} finally {
+		dbisDB.unlock(key);
+	}
+}
+
+/**
  * Records what a request on the route covers and returns the scope recorded before it, which widening is judged
  * against, with the revision now stored. Seeded on first sight from the request. A full route's record only narrows
  * here; it widens when a copy completes. A route that is not full never certifies, so only its coverage is kept.
@@ -116,17 +132,19 @@ export function recordRequestScope(
 	current: RouteScope,
 	{ legacyFull, previousOnSocket }: RequestScopeContext
 ): { recorded: RouteScope; rev: number } {
-	const stored = readRouteScope(dbisDB, routeId);
-	const recorded = stored ?? { ...current, full: current.full && legacyFull, rev: 0 };
-	const bump = previousOnSocket !== undefined && scopeWidens(current, previousOnSocket) ? 1 : 0;
-	let next: RecordedRouteScope;
-	if (!current.full) next = { ...current, rev: recorded.full ? recorded.rev + 1 : recorded.rev + bump };
-	else {
-		const narrowed = intersectScope(recorded, current);
-		next = { ...narrowed, rev: sameScope(narrowed, recorded) ? recorded.rev + bump : recorded.rev + 1 };
-	}
-	if (!stored || next.rev !== recorded.rev || !sameScope(next, recorded)) writeRouteScope(dbisDB, routeId, next);
-	return { recorded: routeScope(recorded.full, recorded.byDefault, recorded.tables), rev: next.rev };
+	return withRouteScopeLock(dbisDB, routeId, () => {
+		const stored = readRouteScope(dbisDB, routeId);
+		const recorded = stored ?? { ...current, full: current.full && legacyFull, rev: 0 };
+		const bump = previousOnSocket !== undefined && scopeWidens(current, previousOnSocket) ? 1 : 0;
+		let next: RecordedRouteScope;
+		if (!current.full) next = { ...current, rev: recorded.full ? recorded.rev + 1 : recorded.rev + bump };
+		else {
+			const narrowed = intersectScope(recorded, current);
+			next = { ...narrowed, rev: sameScope(narrowed, recorded) ? recorded.rev + bump : recorded.rev + 1 };
+		}
+		if (!stored || next.rev !== recorded.rev || !sameScope(next, recorded)) writeRouteScope(dbisDB, routeId, next);
+		return { recorded: routeScope(recorded.full, recorded.byDefault, recorded.tables), rev: next.rev };
+	});
 }
 
 /** The scope a copy cursor says its pass fills; undefined for a cursor written before scopes were recorded. */
