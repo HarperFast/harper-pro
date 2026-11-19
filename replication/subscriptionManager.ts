@@ -1086,6 +1086,7 @@ function scheduleExclusionOriginsBroadcast() {
 		exclusionBroadcastScheduled = false;
 		try {
 			const originsByDatabase = new Map<string, string[]>();
+			const failedOpen = new Set<string>();
 			// One message per (worker, database): application is database-wide on the worker, so
 			// entries for different peer URLs on the same worker would repeat identical work.
 			const notifiedByTarget = new Map<any, Set<string>>();
@@ -1101,6 +1102,8 @@ function scheduleExclusionOriginsBroadcast() {
 						try {
 							origins = computeExclusionOrigins(databaseName);
 						} catch (error) {
+							// a receiver must not read the fallback as a route losing coverage
+							failedOpen.add(databaseName);
 							// Fail OPEN per database: pushing the empty set turns exclusions off (relay
 							// duplicates) until a later broadcast recomputes. Keeping the last-sent set
 							// instead could pin an exclusion for an origin that lost direct coverage,
@@ -1110,7 +1113,12 @@ function scheduleExclusionOriginsBroadcast() {
 						}
 						originsByDatabase.set(databaseName, origins);
 					}
-					const message = { type: 'update-exclusion-origins', database: databaseName, origins };
+					const message = {
+						type: 'update-exclusion-origins',
+						database: databaseName,
+						origins,
+						...(failedOpen.has(databaseName) && { failedOpen: true }),
+					};
 					if (entry.worker) entry.worker.postMessage(message);
 					else updateExclusionOrigins(message);
 				}
