@@ -27,12 +27,12 @@ suite('Clone Node - temporary admin', SUITE_OPTIONS, (ctx) => {
 
 	async function startNode({ replication, env, harperBinPath, components } = {}) {
 		const parentDir = process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir();
-		const hostname = await getNextAvailableLoopbackAddress();
 		const context = {
 			name: ctx.name,
-			harper: { hostname, dataRootDir: await mkdtemp(join(parentDir, 'harper-integration-test-')) },
+			harper: { dataRootDir: await mkdtemp(join(parentDir, 'harper-integration-test-')) },
 		};
 		contexts.push(context);
+		const hostname = (context.harper.hostname = await getNextAvailableLoopbackAddress());
 		if (components)
 			await cp(components, join(context.harper.dataRootDir, 'components', 'stored-row'), { recursive: true });
 		await startHarper(context, {
