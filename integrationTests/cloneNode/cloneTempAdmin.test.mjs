@@ -1,19 +1,15 @@
-/**
- * harper-pro#1451: a token clone installs `clone-temp-admin` and deletes it once synced, so its leader holds that
- * user's deleted row. A node that later joins the leader by base copy must keep `system.hdb_user` provable for
- * record locks: the copy carries the row as a delete (harper-pro#1331), not as a put with no record, which the
- * joiner would record as a permanent replication hole.
- */
+// harper-pro#1451
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { join } from 'node:path';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, waitForCondition } from '../cluster/clusterShared.mjs';
+import { readLog, sendOperation, stopAndTeardownNodes, waitForCondition } from '../cluster/clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
+const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
 const TEMP_ADMIN = 'clone-temp-admin';
-// sorts after TEMP_ADMIN, so a copy walk that delivers it has already walked TEMP_ADMIN's row
-const WITNESS_USER = 'zz-copy-witness';
+// a copied tombstone has no audit entry and no read path, so the joiner's debug log is where its arrival shows
+const RECEIVED_TEMP_ADMIN = /received replication message (\S+) id clone-temp-admin /g;
 const WAIT_MS = 180_000;
 
 function nodeConfig(hostname, replication) {
@@ -50,7 +46,7 @@ async function usernames(node, signal) {
 	return (await sendOperation(node, { operation: 'list_users' }, { signal })).map((user) => user.username);
 }
 
-suite('Clone Node - temporary admin', (ctx) => {
+suite('Clone Node - temporary admin', { skip: isLMDB && 'cluster record locks require RocksDB' }, (ctx) => {
 	const nodes = [];
 
 	before(async () => {
@@ -97,32 +93,37 @@ suite('Clone Node - temporary admin', (ctx) => {
 			{ timeoutMs: WAIT_MS, description: `the leader to apply the token clone's delete of ${TEMP_ADMIN}` }
 		);
 
-		await sendOperation(leader, {
-			operation: 'add_user',
-			role: 'super_user',
-			username: WITNESS_USER,
-			password: `witness-${Date.now()}`,
-			active: true,
-		});
 		const copyJoiner = await startClone(ctx, leader, {
 			HDB_LEADER_USERNAME: leader.admin.username,
 			HDB_LEADER_PASSWORD: leader.admin.password,
 		});
 		nodes.push(copyJoiner);
 		await waitForCloned(copyJoiner);
-		await waitForCondition(async (signal) => (await usernames(copyJoiner, signal)).includes(WITNESS_USER), {
-			timeoutMs: WAIT_MS,
-			description: `${copyJoiner.hostname} to copy ${WITNESS_USER} from the leader`,
-		});
+		const receivedTypes = await waitForCondition(
+			async () => {
+				const types = [...(await readLog(copyJoiner)).matchAll(RECEIVED_TEMP_ADMIN)].map((match) => match[1]);
+				return types.length > 0 && types;
+			},
+			{ timeoutMs: WAIT_MS, description: `${copyJoiner.hostname} to copy the leader's ${TEMP_ADMIN} row` }
+		);
+		assert.ok(
+			receivedTypes.every((type) => type === 'delete'),
+			`${copyJoiner.hostname} received ${TEMP_ADMIN} as ${receivedTypes}, not only as a deletion`
+		);
 
 		for (const node of nodes) {
-			const locks = (await sendOperation(node, { operation: 'cluster_status' })).recordLocks?.system;
-			assert.ok(
-				Array.isArray(locks?.poisoned),
-				`${node.hostname} reports no record-lock poison state for system: ${JSON.stringify(locks)}`
+			const locks = await waitForCondition(
+				async (signal) => {
+					const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
+					return Array.isArray(status.recordLocks?.system?.poisoned) && status.recordLocks.system;
+				},
+				{ timeoutMs: WAIT_MS, description: `${node.hostname} to report its record-lock state for system` }
 			);
 			assert.deepEqual(locks.poisoned, [], `${node.hostname} records a replication hole in system`);
-			assert.ok(!(await usernames(node)).includes(TEMP_ADMIN), `${TEMP_ADMIN} is back on ${node.hostname}`);
+			assert.ok(
+				!(await usernames(node, AbortSignal.timeout(30_000))).includes(TEMP_ADMIN),
+				`${TEMP_ADMIN} is back on ${node.hostname}`
+			);
 		}
 	});
 });
