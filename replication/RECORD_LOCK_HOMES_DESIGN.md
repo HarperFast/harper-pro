@@ -529,17 +529,6 @@ boundary:
 
 Accepted on that basis, by the task owner's ruling on #822.
 
-### Approaches considered
-
-| Axis                | Candidate                                                                                                                                                                                                                                                                                                                         | Ruling                                                                                                                                                                                                                                                                                                                                 |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Different layer** | Orchestrate outside Harper: a script or CLI that authenticates to every node and drives the per-node operations, with a read-only survey added.                                                                                                                                                                                   | Valid as a manual fallback, and the per-node operations stay for exactly that. Not chosen because it cannot express "unreachable is a hard failure" for a node the script's credentials cannot reach, cannot persist the participant set anywhere the survey can find it again, and carries the operator's secret to N nodes per call. |
-| **Deeper cause**    | Derive the set (from `hdb_nodes`, or by agreement), so no list is needed.                                                                                                                                                                                                                                                         | Rejected twice already, above, with the mechanism recorded: a digest cannot detect an omitted participant, and no local state proves the absence of prior authority. Not reopened.                                                                                                                                                     |
-| **Do less**         | Forward the operator's credentials per hop and reuse the existing `requiresSuperUser` operations unchanged.                                                                                                                                                                                                                       | Rejected: the operator's secret in flight to N peers per call is a new exposure for no gain, and — the fact above — the hop is authenticated as a node principal anyway, so what actually has to exist is the receiving node's own re-validation, not a forwarded permission.                                                          |
-| **Do less**         | Stage-and-activate in one call with a fixed wait, no drain evidence.                                                                                                                                                                                                                                                              | Rejected: holds an HTTP request for ~6 minutes, and the drain (#856/#861) already exists to make that wait unnecessary in the planned case.                                                                                                                                                                                            |
-| **Manifest**        | A manifest-backed transition: persist `{generation, digest, homes, quiesce, transitionId}`, return a receipt, refuse an attested retry that staged anything new.                                                                                                                                                                  | Adopted except the identifier: `quiesce` is persisted on the staged row, the wait is relative, the attestation covers only nodes already staged at survey. A `transitionId` would be a second identity `planStage`/`planActivate` never check; `(generation, digest)` is already exact.                                                |
-| **Chosen**          | One `super_user` call: survey → refuse on any incompleteness → stage everywhere (persisting `quiesce`) → activate immediately on proof, else report a relative wait and let an attested second call finish what was already staged. A node-principal peer operation that re-validates, including its own place in the transition. | The only shape that makes "unreachable is a hard failure" expressible while keeping every authority-bearing decision on the node that owns the row.                                                                                                                                                                                    |
-
 ### Not in scope
 
 A survey-only dry run (`plan: true`) is cheap — phase 1 is already factored as a pure decision over
@@ -548,34 +537,63 @@ Narrowing the outage to only the keys whose home moves remains the open lever on
 `record_lock_propose_homes` stays the read-only helper that suggests a list. `homeMap()`, the
 freshness barrier and the poison rules are untouched; nothing here runs on a lock path.
 
-### Testing
+## The cluster default home map (harper-pro#1452)
 
-- Unit (`recordLockApply.test.mjs`): the survey decision — unreachable, wrong self-name, an unlisted
-  ring member including one only a staged row's persisted `quiesce` still names or one the initiating
-  node's own row names, a staged row with no recorded participants, active disagreement, two raced
-  staged sets superseded by an explicit generation, resume of an in-flight generation, already-active
-  nodes skipping the stage; a hop that never answers failing at its deadline; the activation decision — proof on every node activates, one
-  unproven node withholds with a relative wait, the attestation covers only nodes already staged at
-  survey; the orchestrator over fake peers — no stage is sent after a refusal, departing nodes are
-  staged and never activated, a hop failure mid-stage or mid-activate reports every node and the retry
-  completes, an attested call that staged a node itself reports `staged` again; the peer operation —
-  403 without a node principal, a digest mismatch refuses, a node not named in `quiesce` refuses to
-  stage and one outside `homes` refuses to activate, and the write goes through the per-node planners.
-- Cluster integration, two files so each shards on its own (both wait out core's lease once, ~6
-  minutes, to reach a provable drain; the wait is setup, not the outage). `recordLockApplyHomes.test.mjs`:
-  one call, no attestation, bootstraps generation 1 on a fresh three-node cluster whose coordinators
-  can prove, and locks work with no per-node loop; refusal before staging on an unlisted ring member,
-  a staged mismatch, and a stopped node. `recordLockApplyRetry.test.mjs`: a call without `drained` on a
-  cluster that cannot prove reports `staged` with `retryAfterMs` and locks are 503 until the attested
-  call; a failure injected between stage and activate leaves every node staged and refusing, and the
-  same call from another node completes it; an attested call that had to stage a node itself reports
-  `staged` again; the peer hop refuses an operator caller; a topology change activates in seconds once
-  every node proves, with the departing node staged and never activated; a list that omits the node
-  taking the call, or the ring a staged node was drained for, is refused.
-- Fenced transitions (harper-pro#973). Unit: `recordLockApply.test.mjs` (validation, survey skip,
-  the `supportsFenced` gate, one-call activation, recall to an unfenced node withholding, the retry
-  contract, relayed attribution); `recordLockHomes.test.mjs` (the `provesQuiescence` matrix, the fence
-  recorded with the stage and deduplicated); `recordLockFencedAuthority.test.mjs` drives core's real
-  coordinator through each row of the authority table above. Cluster:
-  `recordLockApplyFenced.test.mjs` stops a node holding delegations from both survivors, applies
-  with it fenced, re-locks the exact keys it held, then restarts it and checks it has no home map.
+**Invariant:** for every database at most one map is live cluster-wide, whether from its own row or
+from the default, and a database's map changes only through a fenced transition, never because a node
+switched sources.
+
+- **Storage and precedence.** The default is the row `DEFAULT_HOMES_KEY` (`/default`, which no database
+  name can be) in the same table, moved only by stage/activate (`record_lock_apply_homes { default:
+true }` or the per-node operations with `default: true`). On a node, a database with a row of its own
+  (active, staged, or a marker with neither) follows it; one with none inherits the default
+  (`resolveEffectiveRow`, `inheritedFrom`). Inheritance is resolved when the cache is filled
+  (`refreshCache`), never on the lock path. Rows are never deleted, so an own row wins for good.
+- **Digest scope.** `digestFor` hashes a `default` tag first, so a node inheriting a database and a node
+  serving it from its own row never agree, even on equal `(generation, homes)`.
+- **One fenced transition moves every inheriting database.** Staging the default retracts all of them in
+  one durable write. The stage then drains each one on its owner (`drainInheriting`), and the node
+  proves only if every database's drain proves. The drain set is fixed under the default row lock at
+  the stage write (`defaultStageScope`): every database main has an owner entry for plus every database
+  this thread's catalog replicates (`replicatedDatabaseNames`), minus those with own rows. It is empty
+  only when the node had no default row before (`staged.fresh`) and is in its first incarnation, the
+  fact core's cold-start waiver rests on. Owner-side quiesce builds coordinators first
+  (`quiesceOwned`), which core dates from `coordinationStartedMono`.
+- **No first own row mid-transition.** While the default is staged on a node, `planStage` refuses a
+  database's first row of its own there, so the drain set and the reported own-row list cannot change
+  between a node's stage and its activation, retries included.
+- **Own rows never coexist with an agreed inherited ring.** Inherited X is agreed only if every member of
+  the live default ring inherits X. A per-database apply on an inheriting database plans against the
+  effective row, so `planSurvey`'s unlisted check and the local `planStage` force `quiesce` to cover the
+  default ring, and its generation is above the default's. A default activation first writes a marker
+  (`markExplicitDatabases`) for every database any surveyed or staged node reported an own row for (the
+  activate hop's `explicit` plus `staged.explicit`), each under its own row lock, outside the default's.
+  A marker only removes authority, so it is safe at any point. Nesting order is default → database
+  (`withEffectiveRow`).
+- **Clone lineage.** A row created while a default row exists takes the default's `cloneAttempt`, so a
+  re-clone still marks the database ever-recloned (`markReclonedIfLockHistory` reads the effective row).
+- **Fan-out.** A default write sends one acked notice per thread; each thread re-reads every registered
+  database's own row (`applyHomesChanged`) under a larger ack budget, and `refreshCache` re-announces
+  whenever a cached digest changes, which a database created at runtime needs.
+
+Why no two maps for a database can be live, by case:
+
+1. **Two live defaults.** The default row follows §4.3 exactly, including the fenced majority anchor,
+   so the per-database argument carries over.
+2. **Own row vs. inherited.** The bullet above. A stage that lands on a node before its default stage is
+   in that stage's own-row list; one that lands after is refused unless it covers the staged default's
+   `quiesce`, so its apply stages every new member. While such an apply is still landing, its own map
+   is only staged, so the inherited map is the only live one, and the database's own stage drains it.
+3. **A node joining mid-flight** has no default row until an apply names it, so it inherits nothing; the
+   apply that adds it stages the whole new ring before any node activates. `system` tables do not
+   replicate, so a clone copies no default.
+4. **Two members with different defaults** is case 1: it needs an activation that skipped a live member
+   of the earlier ring, which the survey refuses.
+5. **The relay-only case (harper-pro#1313)** needs a node to create a first map. Here only an apply
+   creates one, and agreement needs a direct digest frame on each database's own socket between every
+   pair of ring members, so a relay confers nothing. Two operator lists covering disjoint nodes remain
+   the operator error a per-database apply has.
+
+A database not replicated by every default-ring member never agrees under the default (503, never two
+maps) and needs a map of its own. The per-node operations stay sharp tools: a leaver can still activate
+a singleton own map, as it can on a per-database leaver.

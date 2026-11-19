@@ -502,6 +502,24 @@ Cluster record locks need the RocksDB storage engine. On LMDB `lock()` is not av
 
 What counts is the engine each database is opened on, not `storage.engine`. That setting only picks the engine for databases created from then on, so a node upgraded in place from v4 keeps its existing `.mdb` databases on LMDB. If any database the node replicates is opened on LMDB, including `system`, which `replication.databases: '*'` (the default) replicates, the node starts with cluster record locks off even with `recordLocks: true`. It logs an error naming those databases, peers see it as not taking part, and a cluster `lock()` answers `503` saying that replicated databases are on LMDB. Migrate them with `storage.migrateOnStart` and restart. `describe_all` and `describe_table` report each table's `engine` (`rocksdb` or `lmdb`), so a tool can check a node before turning locks on.
 
+### Default Home Map
+
+<VersionBadge version="v5.5.0" /> Instead of one map per database, you can apply one default home map for the cluster. Every database that has no map of its own on a node then uses it, including databases created later, so a database a component creates is lockable as soon as it exists on the nodes:
+
+```json
+{
+	"operation": "record_lock_apply_homes",
+	"default": true,
+	"homes": ["node-1", "node-2", "node-3"]
+}
+```
+
+It takes the same `quiesce`, `generation`, `drained` and `fenced` fields and returns the same outcomes as a per-database map, and a membership change is applied the same way: list the new nodes in `homes` and the old and new nodes in `quiesce`. Applying a new default moves every database that uses it in one call; until it activates, those databases refuse locks on the nodes being changed.
+
+- A map of a database's own takes precedence over the default, permanently. Apply one to a database that is not replicated by every node in the default, for example a sharded database or one some nodes leave out of `replication.databases`: under the default it answers `503`, because every node in a map must replicate the database. Its `quiesce` must include the default's nodes.
+- Every node in `quiesce` must run v5.5.0 or later; a node on an earlier version refuses the call before anything changes.
+- `cluster_status` reports `homeMapSource: "default"` or `"database"` for each database under `recordLocks`.
+
 ### Confirming Locked Writes
 
 <VersionBadge version="v5.5.0" />

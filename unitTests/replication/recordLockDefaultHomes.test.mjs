@@ -66,7 +66,7 @@ describe('the default home map: keys and digests', () => {
 		assert.throws(() => validateExplicit([DEFAULT_HOMES_KEY]), /must not name/);
 		assert.throws(() => validateExplicit(['']), /non-empty/);
 		assert.throws(() => validateExplicit('data'), /array/);
-		assert.throws(() => validateExplicit(new Array(MAX_EXPLICIT_DATABASES + 1).fill('x')), /at most/);
+		assert.throws(() => validateExplicit(Array.from({ length: MAX_EXPLICIT_DATABASES + 1 }, () => 'x')), /at most/);
 	});
 });
 
@@ -233,13 +233,14 @@ describe('the default row, on a real table', function () {
 	const operator = { hdb_user: { username: 'op' } };
 	const drained = [];
 	const registered = ['inh-a', 'own-b', 'inh-c', 'inh-d'];
+	let firstIncarnation = false;
 
 	before(async () => {
 		setHomesDrainReader(async (database) => {
 			drained.push(database);
 			return { complete: true, surrendered: 0, recalled: 0, outstanding: [] };
 		});
-		setHomesDrainCandidates(async () => ['inh-a', 'own-b']);
+		setHomesDrainCandidates({ candidates: async () => ['inh-a', 'own-b'], neverGranted: () => firstIncarnation });
 		for (const database of registered) ensureRecordLockTransport(database, () => createDisabledRecordLockTransport());
 		await stageGeneration({ database: 'own-b', generation: 1, homes: ['n1'], quiesce: ['n1'], ...operator });
 		drained.length = 0;
@@ -249,7 +250,7 @@ describe('the default row, on a real table', function () {
 		await getRecordLockHomesTable().delete(DEFAULT_HOMES_KEY);
 		for (const database of registered) releaseRecordLockTransport(database);
 		setHomesDrainReader(async () => ({ error: 'no record lock drain is wired on this node' }));
-		setHomesDrainCandidates(async () => undefined);
+		setHomesDrainCandidates();
 	});
 
 	it('staging the default drains exactly the candidates with no row of their own, and reports the rest', async () => {
@@ -272,6 +273,25 @@ describe('the default row, on a real table', function () {
 		assert.strictEqual(row.staged.generation, 1);
 		assert.strictEqual(homeMapSourceOf('inh-a'), 'default');
 		assert.strictEqual(cachedActiveGeneration('inh-a'), undefined);
+	});
+
+	it('a first-incarnation node that never had a default row drains nothing, across a retried stage too', async () => {
+		drained.length = 0;
+		firstIncarnation = true;
+		try {
+			const retry = await stageGeneration({
+				default: true,
+				generation: 1,
+				homes: ['n1', 'n2'],
+				quiesce: ['n1', 'n2'],
+				...operator,
+			});
+			assert.strictEqual(retry.staged.fresh, true);
+			assert.deepStrictEqual(drained, []);
+			assert.strictEqual(retry.quiesced.complete, true);
+		} finally {
+			firstIncarnation = false;
+		}
 	});
 
 	it('refuses a first own map while the default is staged here', async () => {

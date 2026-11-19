@@ -63,6 +63,8 @@ export interface RecordLockGenerationState {
 	quiesce?: string[];
 	/** Staged default only: databases some node reported a row of their own for, marked here at activation. */
 	explicit?: string[];
+	/** Staged default only: this node had no default row before, so no database here ever inherited a map. */
+	fresh?: true;
 }
 
 export interface RecordLockHomesRow {
@@ -444,6 +446,7 @@ export function planStage(
 	const staged: RecordLockGenerationState = { generation, homes, digest, stagedAt: now };
 	if (quiesce) staged.quiesce = quiesce;
 	if (explicit?.length) staged.explicit = explicit;
+	if (database === DEFAULT_HOMES_KEY && !existing) staged.fresh = true;
 	return {
 		action: 'write',
 		row: {
@@ -489,10 +492,14 @@ export async function stageGeneration(
  * of its own inherited the default until that write. While the default stays staged no database can
  * take a row of its own here (`planStage`), so a retry fixes the same set.
  */
-async function defaultStageScope(): Promise<{ drain?: string[]; explicit: string[] }> {
+async function defaultStageScope(staged: RecordLockGenerationState): Promise<{ drain?: string[]; explicit: string[] }> {
 	const explicit = ownRowDatabases();
+	// No default row before this transition and no earlier process of this node: nothing here ever
+	// inherited a map, so nothing can hold authority under one. The same first-incarnation fact core's
+	// cold-start waiver rests on; a handoff clears it.
+	if (staged.fresh && drainCandidates.neverGranted()) return { drain: [], explicit };
 	const own = new Set(explicit);
-	const candidates = await drainCandidates();
+	const candidates = await drainCandidates.candidates();
 	return { drain: candidates && canonicalizeHomes(candidates.filter((database) => !own.has(database))), explicit };
 }
 
@@ -591,7 +598,7 @@ async function stageRow(
 		);
 		if (plan.action === 'noop') {
 			if (fenced) await write({ ...existing!, fenced });
-			const scope = isDefault ? await defaultStageScope() : undefined;
+			const scope = isDefault ? await defaultStageScope(plan.staged) : undefined;
 			// Idempotent retry, not a genuine transition — but the PRIOR call may have durably written
 			// this exact state and then failed to confirm every thread applied it (a relay timeout, a
 			// dead worker). Re-notifying is harmless when nothing changed and is the only way a retry
@@ -601,7 +608,7 @@ async function stageRow(
 			return { staged: plan.staged, scope };
 		}
 		await write(fenced ? { ...plan.row, fenced } : plan.row);
-		const scope = isDefault ? await defaultStageScope() : undefined;
+		const scope = isDefault ? await defaultStageScope(plan.row.staged!) : undefined;
 		logger.info?.(`Record lock home map for ${describeKey(key)}: staged generation ${generation}, retracted active`);
 		await notifyChanged(key);
 		return { staged: plan.row.staged!, scope };
@@ -858,12 +865,19 @@ export function setHomesDrainReader(reader: typeof drainReader): void {
 	drainReader = reader;
 }
 /**
- * Installed by `recordLockTransport.ts`: every database on this node that could hold record-lock authority,
- * own row or not. `undefined` (nothing installed) makes a default stage's drain unproven.
+ * Installed by `recordLockTransport.ts`: `candidates` is every database on this node that could hold
+ * record-lock authority, own row or not, and `undefined` (nothing installed) makes a default stage's drain
+ * unproven; `neverGranted` is whether no earlier process of this node issued anything (its first
+ * incarnation, with no coordinating-worker handoff since).
  */
-let drainCandidates: () => Promise<string[] | undefined> = async () => undefined;
-export function setHomesDrainCandidates(reader: typeof drainCandidates): void {
-	drainCandidates = reader;
+interface DrainCandidates {
+	candidates(): Promise<string[] | undefined>;
+	neverGranted(): boolean;
+}
+const NO_DRAIN_CANDIDATES: DrainCandidates = { candidates: async () => undefined, neverGranted: () => false };
+let drainCandidates: DrainCandidates = NO_DRAIN_CANDIDATES;
+export function setHomesDrainCandidates(readers: DrainCandidates = NO_DRAIN_CANDIDATES): void {
+	drainCandidates = readers;
 }
 
 export interface HomesProposal {

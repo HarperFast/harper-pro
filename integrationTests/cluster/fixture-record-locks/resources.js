@@ -39,6 +39,19 @@ export class LockedIncrement extends Resource {
 	}
 }
 
+/** POST { database, table, id, timeout? }: LockedIncrement on a table this fixture does not declare. */
+export class LockedIncrementIn extends Resource {
+	async post(data) {
+		const table = databases[data.database]?.[data.table];
+		if (!table) throw Object.assign(new Error(`no table ${data.database}.${data.table}`), { statusCode: 404 });
+		const record = await table.lock(data.id, lockOptions(data));
+		const n = (record.getProperty('n') ?? 0) + 1;
+		record.set('n', n);
+		await record.save();
+		return { n };
+	}
+}
+
 /** POST { id, ifMatch, revision, workMs? }: an application's read-check-write under a cluster lock. */
 export class LockedRevision extends Resource {
 	async post(data) {

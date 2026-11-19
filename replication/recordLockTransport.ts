@@ -1824,9 +1824,12 @@ function databasesWithOwners(): Promise<string[] | undefined> {
 		}
 	});
 }
-setHomesDrainCandidates(async () => {
-	const registered = await databasesWithOwners();
-	return registered && [...new Set([...registered, ...replicatedDatabaseNames()])];
+setHomesDrainCandidates({
+	async candidates() {
+		const registered = await databasesWithOwners();
+		return registered && [...new Set([...registered, ...replicatedDatabaseNames()])];
+	},
+	neverGranted: isFirstIncarnation,
 });
 
 setHomesMembershipReaders({
