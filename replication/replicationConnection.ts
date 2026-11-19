@@ -3596,7 +3596,6 @@ function markGeneration(node: any): string | undefined {
 	if (typeof node?.originGeneration === 'string') return node.originGeneration;
 	return typeof node?.lastGeneration === 'string' ? node.lastGeneration : undefined;
 }
-/** A mark to restore without the `partialHistory` and clear a later settled value replaced; undefined if nothing is left. */
 function supersededPartialDropped(
 	entry: PendingRouteMarkEntry,
 	newerVersion: number | undefined
@@ -3641,7 +3640,6 @@ function withoutRefusedCertifications(
 	}
 	return retry;
 }
-/** The safety part of marks captured under an earlier epoch: partial history, clears and holes, no certification. */
 function safetyMarksOf(
 	marks: Map<number, PendingRouteMarkEntry> | undefined
 ): Map<number, PendingRouteMarkEntry> | undefined {
@@ -6771,6 +6769,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// audited/durable), mid-copy updates below copyStartTime, and projections that publish no cursor — is a plain end_txn with no flush gate. (harper-pro#480)
 	// An update queued before a hole was marked takes its floors at commit: a holed origin's floor must not commit
 	// ahead of the durable hole mark and satisfy a removal receipt for the write this node skipped.
+	/** A clear re-asserts a confirmed hole only under the generation it was lost in, never onto a later one. */
+	function holeHeldUnder(id: number, state: any, generation: string | undefined): boolean {
+		if (state?.hole === true && markGeneration(state) === generation) return true;
+		return holedOrigins.has(id) && (holedOrigins.get(id) ?? markGeneration(state)) === generation;
+	}
 	function dropHoledFloors() {
 		if ((holedOrigins.size === 0 && provisionalHoles.size === 0) || pendingOriginFloors.size === 0) return;
 		for (const id of holedOrigins.keys()) pendingOriginFloors.drop(id);
@@ -8518,7 +8521,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						) {
 							pendingRouteState.partialHistory(id, true, certificate.generation);
 							pendingRouteState.partialHistory(id, false, certificate.generation);
-							if (holedOrigins.has(id) || state?.hole === true) {
+							if (holeHeldUnder(id, state, certificate.generation)) {
 								pendingRouteState.hole(id, certificate.generation);
 							}
 						}
@@ -8536,7 +8539,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const gen = typeof state?.originGeneration === 'string' ? state.originGeneration : optimistic?.generation;
 							pendingRouteState.partialHistory(id, true, gen);
 							pendingRouteState.partialHistory(id, false, gen);
-							if (holedOrigins.has(id) || state?.hole === true) {
+							if (holeHeldUnder(id, state, gen)) {
 								pendingRouteState.hole(id, gen);
 							}
 						}

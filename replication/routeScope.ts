@@ -21,7 +21,6 @@ export function routeScope(full: boolean, byDefault: boolean, tables: Iterable<s
 	return { full, byDefault, tables: [...new Set(tables)].sort() };
 }
 
-/** Whether `current` reaches history `recorded` never held: coverage turning full, or a table newly in scope. */
 export function scopeWidens(recorded: RouteScope, current: RouteScope): boolean {
 	if (current.full && !recorded.full) return true;
 	if (recorded.byDefault) {
@@ -149,7 +148,8 @@ export function recordRequestScope(
 		const narrowed = current.full ? !sameScope(proven, recorded) : recorded.full;
 		// a replacement worker narrowing back to the proven scope still changes what was last asked for
 		const resubmitted = stored !== undefined && !(stored.submitted && sameScope(stored.submitted, current));
-		const rev = narrowed || resubmitted ? recorded.rev + 1 : recorded.rev;
+		// a repaired row lost its revision; the clock is above every revision a cursor or pass could still hold
+		const rev = stored?.malformed ? Date.now() : narrowed || resubmitted ? recorded.rev + 1 : recorded.rev;
 		if (!stored || rev !== recorded.rev || !sameScope(proven, recorded))
 			writeRouteScope(dbisDB, routeId, { ...proven, rev, submitted: current });
 		return {
@@ -160,7 +160,7 @@ export function recordRequestScope(
 	});
 }
 
-/** The scope a copy cursor says its pass fills; undefined for a cursor written before scopes were recorded. */
+/** Undefined for a cursor written before scopes were recorded. */
 export function cursorRouteScope(cursor: { scope?: unknown; scopeRev?: unknown } | undefined): RouteScope | undefined {
 	const scope: any = cursor?.scope;
 	if (scope === undefined || scope === null) return undefined;
