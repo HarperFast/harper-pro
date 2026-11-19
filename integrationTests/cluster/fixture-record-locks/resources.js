@@ -95,6 +95,20 @@ export class LockRelease extends Resource {
 
 const gates = new Map();
 
+// a test that fails before opening a gate must not leave the transaction staged for the rest of the suite
+function waitForGate(id) {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			gates.delete(id);
+			reject(Object.assign(new Error(`gate ${id} was never opened`), { statusCode: 504 }));
+		}, 60_000);
+		gates.set(id, () => {
+			clearTimeout(timer);
+			resolve();
+		});
+	});
+}
+
 /**
  * POST { id, n, lease?, afterSave? }: lock, wait for GateControl to open this id's gate, then write `n`. With
  * `afterSave`, write `n` first, which reserves the commit's log key, and wait before the commit instead.
@@ -102,10 +116,10 @@ const gates = new Map();
 export class GatedLockedWrite extends Resource {
 	async post(data) {
 		const record = await tables.Counter.lock(data.id, lockOptions(data));
-		if (!data.afterSave) await new Promise((resolve) => gates.set(data.id, resolve));
+		if (!data.afterSave) await waitForGate(data.id);
 		record.set('n', data.n);
 		await record.save();
-		if (data.afterSave) await new Promise((resolve) => gates.set(data.id, resolve));
+		if (data.afterSave) await waitForGate(data.id);
 		return { n: data.n };
 	}
 }
