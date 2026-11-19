@@ -152,6 +152,12 @@ async function routeState(node, peer, clear) {
 const logPath = (node) => join(node.logDir ?? join(node.dataRootDir, 'log'), 'hdb.log');
 const readText = (path) =>
 	readFile(path, 'utf8').catch((error) => (error.code === 'ENOENT' ? '' : Promise.reject(error)));
+const logMark = async (node) => ({ path: logPath(node), length: (await readText(logPath(node))).length });
+/** What the node logged since `mark`; a restart may have moved its log. */
+async function logSince(node, mark) {
+	const log = await readText(logPath(node));
+	return logPath(node) === mark.path ? log.slice(mark.length) : log;
+}
 
 suite(
 	'A widened route copies what it never received (harper-pro#1142, #1212)',
@@ -194,11 +200,17 @@ suite(
 				ok(!(await holds(C, 'Skipped', [id])), `premise: the narrowed route did not deliver ${id}`);
 
 			await stopNodeProcess(B);
-			await routeState(C, B, 'direct');
+			const narrowed = await routeState(C, B, 'direct');
 			await stopNodeProcess(C);
 			await startNode(B);
+			const mark = await logMark(C);
 			await startNode(C, []);
 			await waitForRows(C, 'Skipped', skipped);
+			ok(narrowed.scope?.full === false, `C recorded B's route as narrowed: ${JSON.stringify(narrowed.scope)}`);
+			ok(
+				(await logSince(C, mark)).includes(`Route coverage widened to full for ${B.hostname} on database data`),
+				'C requested the copy because the route widened'
+			);
 		});
 
 		test('a table whose replicate turns on is copied below the old floor (#1212)', async () => {
@@ -210,18 +222,14 @@ suite(
 			for (const id of flipped)
 				ok(!(await holds(B, 'Flipped', [id])), `premise: ${id} stays on A while Flipped does not replicate`);
 
-			const logBefore = logPath(C);
-			const logFrom = (await readText(logBefore)).length;
+			const mark = await logMark(C);
 			await deploy(A, true, true);
 			await deploy(B, true, true);
 			await waitForRows(B, 'Flipped', flipped);
 			await deploy(C, true, true);
 			await waitForRows(C, 'Flipped', flipped);
-			const log = await readText(logPath(C));
 			ok(
-				log
-					.slice(logPath(C) === logBefore ? logFrom : 0)
-					.includes(`Route table scope widened for ${B.hostname} on database data`),
+				(await logSince(C, mark)).includes(`Route table scope widened for ${B.hostname} on database data`),
 				'C requested the copy because the table scope widened'
 			);
 		});

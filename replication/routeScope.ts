@@ -100,25 +100,35 @@ export function writeRouteScope(dbisDB: any, routeId: number, scope: RecordedRou
 	});
 }
 
+export interface RequestScopeContext {
+	/** An older build's evidence of partial coverage, for seeding an absent record. */
+	legacyFull: boolean;
+	/** What earlier requests on this socket covered: a copy one of them started must not promote past a narrowing. */
+	previousOnSocket?: RouteScope;
+	/** The coverage recompute failed open, so `current.full` is a fallback, not a narrowing. */
+	coverageUnknown?: boolean;
+}
+
 /**
  * Records what a request on the route covers and returns the scope recorded before it, which widening is judged
- * against, with the revision now stored. Seeded on first sight from the request (`legacyFull` carries an older build's
- * evidence of partial coverage). A full route's record only narrows here; it widens when a copy completes. A route that
- * is not full never certifies, so only its coverage is kept.
+ * against, with the revision now stored. Seeded on first sight from the request. A full route's record only narrows
+ * here; it widens when a copy completes. A route that is not full never certifies, so only its coverage is kept.
  */
 export function recordRequestScope(
 	dbisDB: any,
 	routeId: number,
-	current: RouteScope,
-	legacyFull: boolean
+	requested: RouteScope,
+	{ legacyFull, previousOnSocket, coverageUnknown }: RequestScopeContext
 ): { recorded: RouteScope; rev: number } {
 	const stored = readRouteScope(dbisDB, routeId);
-	const recorded = stored ?? { ...current, full: current.full && legacyFull, rev: 0 };
+	const recorded = stored ?? { ...requested, full: requested.full && legacyFull, rev: 0 };
+	const current = coverageUnknown ? { ...requested, full: recorded.full } : requested;
+	const bump = previousOnSocket !== undefined && scopeWidens(current, previousOnSocket) ? 1 : 0;
 	let next: RecordedRouteScope;
-	if (!current.full) next = { ...current, rev: recorded.full ? recorded.rev + 1 : recorded.rev };
+	if (!current.full) next = { ...current, rev: recorded.full ? recorded.rev + 1 : recorded.rev + bump };
 	else {
 		const narrowed = intersectScope(recorded, current);
-		next = { ...narrowed, rev: sameScope(narrowed, recorded) ? recorded.rev : recorded.rev + 1 };
+		next = { ...narrowed, rev: sameScope(narrowed, recorded) ? recorded.rev + bump : recorded.rev + 1 };
 	}
 	if (!stored || next.rev !== recorded.rev || !sameScope(next, recorded)) writeRouteScope(dbisDB, routeId, next);
 	return { recorded: routeScope(recorded.full, recorded.byDefault, recorded.tables), rev: next.rev };
