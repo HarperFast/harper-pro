@@ -36,7 +36,7 @@ async function itemCount(node, id, signal) {
 			database: FRESH,
 			table: ITEM,
 			ids: [id],
-			get_attributes: ['id', 'n'],
+			get_attributes: ['*'],
 			authorization: node.admin,
 		},
 		{ signal }
