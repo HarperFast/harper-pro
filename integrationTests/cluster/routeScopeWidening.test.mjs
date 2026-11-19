@@ -190,7 +190,8 @@ suite(
 			await waitForRows(B, 'Skipped', skipped);
 			await upsert(A, 'Progress', ['after-skipped']);
 			await waitForRows(C, 'Progress', ['after-skipped']);
-			ok(!(await holds(C, 'Skipped', skipped)), 'premise: the narrowed route delivered no Skipped row');
+			for (const id of skipped)
+				ok(!(await holds(C, 'Skipped', [id])), `premise: the narrowed route did not deliver ${id}`);
 
 			await stopNodeProcess(B);
 			await routeState(C, B, 'direct');
@@ -206,7 +207,8 @@ suite(
 			await upsert(A, 'Flipped', flipped);
 			await upsert(A, 'Progress', ['after-flipped']);
 			await Promise.all([waitForRows(B, 'Progress', ['after-flipped']), waitForRows(C, 'Progress', ['after-flipped'])]);
-			ok(!(await holds(B, 'Flipped', flipped)), 'premise: Flipped stays on A while it does not replicate');
+			for (const id of flipped)
+				ok(!(await holds(B, 'Flipped', [id])), `premise: ${id} stays on A while Flipped does not replicate`);
 
 			const logBefore = logPath(C);
 			const logFrom = (await readText(logBefore)).length;

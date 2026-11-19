@@ -27,7 +27,6 @@ export interface CopyCursorValue {
 	copyOrder: any;
 	widened?: boolean;
 	fullCoverage?: boolean;
-	/** The route scope the pass fills and the revision it began under (`replication/routeScope.ts`). */
 	scope?: RouteScope;
 	scopeRev?: number;
 	maxCopiedVersionByOrigin?: Record<number, number>;
