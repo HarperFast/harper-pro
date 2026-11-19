@@ -7847,11 +7847,29 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * Which tables every subscription request on this socket, in every entry the sender could serve, left out: only a
 	 * record of one of them was never owed, since a copy or frame names no request or entry and a table redeclared after a
 	 * request is still owed by it. While every entry was an explicit list, `names` is their union (everything else was
-	 * left out); once one listed exclusions, `names` is what all of them excluded. Undefined until the first request.
+	 * left out); once one listed exclusions, `names` is what all of them excluded. Undefined until a request is sent.
 	 */
 	let socketRequestScope: { allowlist: boolean; names: Set<string> } | undefined;
 	const requestsLeftOut = (tableName: string) =>
 		socketRequestScope !== undefined && socketRequestScope.allowlist !== socketRequestScope.names.has(tableName);
+	/** Folds a request into `socketRequestScope`, only once it was sent: an unsent one must not widen what was left out. */
+	const foldSentRequestScope = (entries: { replicateByDefault?: boolean; tables: string[] }[]) => {
+		for (const { replicateByDefault, tables: listedTables } of entries) {
+			if (socketRequestScope && !socketRequestScope.allowlist && socketRequestScope.names.size === 0) return;
+			// `tables` lists what the entry excludes when it replicates by default, else all it asks for
+			const listed = new Set<string>(listedTables);
+			if (!socketRequestScope) socketRequestScope = { allowlist: !replicateByDefault, names: listed };
+			else if (!replicateByDefault) {
+				if (socketRequestScope.allowlist) for (const name of listed) socketRequestScope.names.add(name);
+				else for (const name of listed) socketRequestScope.names.delete(name);
+			} else if (socketRequestScope.allowlist) {
+				const asked = socketRequestScope.names;
+				socketRequestScope = { allowlist: false, names: new Set([...listed].filter((name) => !asked.has(name))) };
+			} else {
+				for (const name of socketRequestScope.names) if (!listed.has(name)) socketRequestScope.names.delete(name);
+			}
+		}
+	};
 	/** Highest audit-less copyApply record version applied per origin, bounding floor-only resume. */
 	const maxCopiedVersionByOrigin = new Map<number, number>();
 	/**
@@ -13697,21 +13715,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
-				if (!(socketRequestScope && !socketRequestScope.allowlist && socketRequestScope.names.size === 0)) {
-					// tableSubs lists what this entry excludes when it replicates by default, else all it asks for
-					const listed = new Set<string>(tableSubs);
-					if (!socketRequestScope) socketRequestScope = { allowlist: !replicateByDefault, names: listed };
-					else if (!replicateByDefault) {
-						if (socketRequestScope.allowlist) for (const name of listed) socketRequestScope.names.add(name);
-						else for (const name of listed) socketRequestScope.names.delete(name);
-					} else if (socketRequestScope.allowlist) {
-						const asked = socketRequestScope.names;
-						socketRequestScope = { allowlist: false, names: new Set([...listed].filter((name) => !asked.has(name))) };
-					} else {
-						for (const name of socketRequestScope.names) if (!listed.has(name)) socketRequestScope.names.delete(name);
-					}
-				}
-
 				const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 				auditStore?.ensureLogExists?.(node.name);
 				const sequenceEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
@@ -14225,6 +14228,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					)
 				);
 				subscriptionRequestSent = true;
+				foldSentRequestScope(nodeSubscriptions);
 				// Start a fresh request -> first application-response window on every non-empty request. This is
 				// intentionally after send(): a synchronous send failure must not leave an orphaned timer.
 				if (requestId === undefined) {
