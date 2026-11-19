@@ -3036,8 +3036,6 @@ describe('Declarative tables keep control and event traffic independent of place
 			...(drop === 'non-replicating' ? { replicate: false } : {}),
 		});
 
-	// owed: a record the pass lost; unowed: a local-only record; filtered: a table this node does not replicate, which
-	// voids no checkpoint but leaves that table undelivered
 	for (const drops of [false, 'owed', 'unowed', 'filtered'])
 		it(`releases the hole rows that stood only after a complete copy that drops nothing it owed (drops=${drops})`, () =>
 			atCheckpointLevel(async () => {
@@ -3155,9 +3153,8 @@ describe('Declarative tables keep control and event traffic independent of place
 				}
 			}));
 
-	// route-excluded-quiet: a correct sender, which sends the excluded table nothing
-	for (const drop of [...unownedDrops, 'route-excluded-quiet'])
-		it(`a projection that skips a record its route never owed writes no hole, and fills one only if it delivered every table (${drop})`, () =>
+	for (const drop of unownedDrops)
+		it(`a projection that skips a record its route never owed writes no hole, and fills none (${drop})`, () =>
 			atCheckpointLevel(async () => {
 				env.setProperty('replication_shards', [0, 1]);
 				const peer = 'slot-control-peer';
@@ -3192,19 +3189,18 @@ describe('Declarative tables keep control and event traffic independent of place
 					socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
 					socket.emit('message', structureFrame(Plain));
 					socket.emit('message', encode([148, anchor, 1, undefined, { shardingProjection: true }]));
-					if (drop !== 'route-excluded-quiet')
-						socket.emit(
-							'message',
-							recordFrame(
-								Plain,
-								'put',
-								'dropped',
-								{ id: 'dropped', body: 'never applied' },
-								anchor - 1,
-								undefined,
-								drop === 'local-only' ? { extendedType: LOCAL_ONLY } : {}
-							)
-						);
+					socket.emit(
+						'message',
+						recordFrame(
+							Plain,
+							'put',
+							'dropped',
+							{ id: 'dropped', body: 'never applied' },
+							anchor - 1,
+							undefined,
+							drop === 'local-only' ? { extendedType: LOCAL_ONLY } : {}
+						)
+					);
 					socket.emit('message', encode([149]));
 					await until(() => marker() || socket.closes.length);
 					assert.equal(marker()?.anchor, anchor, 'the projection completes');
@@ -3225,11 +3221,10 @@ describe('Declarative tables keep control and event traffic independent of place
 					);
 					assert.equal(
 						readCopyHoles(Records.dbisDB).length,
-						drop === 'local-only' ? 0 : 1,
-						'only a pass that delivered every table fills the hole that stood'
+						1,
+						"a projection's table scope is unknown here, so the hole that stood stays"
 					);
-					if (drop !== 'route-excluded-quiet')
-						assert.ok(poisonedPairs(database).includes(`${peer}:Plain`), 'record locks still refuse the pair');
+					assert.ok(poisonedPairs(database).includes(`${peer}:Plain`), 'record locks still refuse the pair');
 				} finally {
 					logger.warn = originalWarn;
 					env.setProperty('replication_shards', [0]);
@@ -3335,7 +3330,6 @@ describe('Declarative tables keep control and event traffic independent of place
 						const row = await Records.getResource(origin, context);
 						return row._writeInvalidate(origin, { id: origin, region: 1 }, { nodeId: originId, version });
 					});
-					// stored relayable while the link carried every table
 					await Records.dbisDB.put([SEQ, originId], {
 						seqId: floor,
 						nodes: [{ id: originId, closedFloor: floor, relayable: true }],

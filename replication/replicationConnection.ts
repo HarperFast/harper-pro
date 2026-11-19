@@ -7272,7 +7272,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		try {
 			const origin = getNodeNameForId(auditStore, originId, true);
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
-			return !wsClosed && !connectionSuperseded();
+			return !wsClosed;
 		} catch (error) {
 			logger.error?.(connectionId, 'could not record a dropped record for record locks; holding', error);
 			wsClosed = true;
@@ -7449,14 +7449,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let updateSendingSubscription: ((data: any) => void) | undefined;
 	// undefined = not yet computed; null = nothing blocked; Map = table name -> why it is dropped.
 	let receiveBlockedTables: Map<string, string> | null | undefined;
-	function receiveRouteExcludedTables(): Set<string> | null {
-		const receivesFromEntries =
-			options.connection?.nodeSubscriptions?.[0]?.routeReplicates?.receivesFrom ??
-			(authorization?.replicates && typeof authorization.replicates === 'object'
-				? authorization.replicates.receivesFrom
-				: undefined);
-		return getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName);
-	}
 	// Discarded on a table replacement, or a pre-fix sender keeps writing into a table that has left
 	// the live map for the life of the socket. Per connection: the receive path also runs on
 	// inbound-only sockets, which never reach the sender-side listener below.
@@ -8025,13 +8017,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const store = auditStore ?? dbAuditStore;
 			const peerId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
-			// a resumed pass, or one that did not deliver every table, did not re-send what an earlier pass dropped
+			// only a pass known to deliver every table can vouch for what an earlier pass dropped: not a resumed one, one
+			// that skipped a table, or a projection, whose sender's table scope this node cannot see (its route certifies
+			// no coverage)
 			const filled =
 				passHoles === 0 &&
 				passFilteredRecords === 0 &&
 				passState !== undefined &&
 				!passState.resumed &&
-				(projectionCopy ? !receiveRouteExcludedTables() : passState.fullCoverage !== false)
+				!projectionCopy &&
+				passState.fullCoverage !== false
 					? (passState.holes ?? [])
 					: [];
 			const rootStore = store?.rootStore ?? (dbisDB as any)?.rootStore;
@@ -10674,7 +10669,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								const captureOriginFloors = (): Map<string, OriginCertificate> | undefined => {
 									let floors: Map<string, OriginCertificate> | undefined;
 									try {
-										relayAgreement = shardingSourceAgreement(databaseName);
 										const thisNodeName = getThisNodeName();
 										const own = readOriginClosedFloor(auditStore);
 										if (isValidFloor(own) && !excludedNodes?.includes(thisNodeName)) {
@@ -10696,6 +10690,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											}
 											const { dbisDB } = names.length > 0 ? getDatabaseStores() : ({} as any);
 											if (dbisDB) {
+												relayAgreement = shardingSourceAgreement(databaseName);
 												const seqRows = collectSeqRows(
 													dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([0xff])] })
 												);
@@ -11959,8 +11954,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// Route exclusions plus this node's non-replicating tables: a backstop for an older
 				// sender that still forwards both. The sender's gate is the enforcement point.
 				if (receiveBlockedTables === undefined) {
+					const firstNode = options.connection?.nodeSubscriptions?.[0];
+					const receivesFromEntries =
+						firstNode?.routeReplicates?.receivesFrom ??
+						(authorization?.replicates && typeof authorization.replicates === 'object'
+							? authorization.replicates.receivesFrom
+							: undefined);
 					const blocked = new Map<string, string>();
-					const routeExcluded = receiveRouteExcludedTables();
+					const routeExcluded = getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName);
 					if (routeExcluded)
 						for (const tableName of routeExcluded) blocked.set(tableName, 'table excluded by the receive route');
 					for (const tableName in tables)
@@ -11980,7 +11981,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					);
 					if (auditRecord.extendedType & HAS_BLOBS) discardRecordBlobs(auditRecord, tableDecoder);
 					if (messageIsCopyFrame) passFilteredRecords++;
-					if (!(await recordUnowedDrop(remoteShortIdToLocalId.get(auditRecord.nodeId), tableDecoder.name, dropReason)))
+					if (
+						!(await recordUnowedDrop(remoteShortIdToLocalId.get(auditRecord.nodeId), tableDecoder.name, dropReason)) ||
+						connectionSuperseded()
+					)
 						return;
 					decoder.position = start + eventLength;
 					continue;
@@ -12003,7 +12007,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							remoteShortIdToLocalId.get(auditRecord.nodeId),
 							tableDecoder?.name ?? ANY_TABLE,
 							'local-only record forwarded by the peer'
-						))
+						)) ||
+						connectionSuperseded()
 					)
 						return;
 					decoder.position = start + eventLength;
