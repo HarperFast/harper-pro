@@ -176,7 +176,8 @@ export function planSurvey(
 	requestedGeneration: number | undefined,
 	replies: Map<string, SurveyReply | { error: string }>,
 	observer?: { node: string; reply: SurveyReply | { error: string } },
-	fenced: string[] = []
+	fenced: string[] = [],
+	explicit?: string[]
 ): SurveyPlan {
 	const unreachable: string[] = [];
 	const misnamed: string[] = [];
@@ -303,7 +304,7 @@ export function planSurvey(
 			status: 409,
 			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; ${manualRecovery(database, homes, quiesce, fenced, rows, [generation, resumeTarget], floor, observer)}`,
 		};
-	const stages = planStages(database, homes, quiesce, rows, generation, digest);
+	const stages = planStages(database, homes, quiesce, rows, generation, digest, explicit);
 	if ('rejected' in stages)
 		return { action: 'refuse', status: 409, reason: `${stages.rejected} would refuse to stage: ${stages.reason}` };
 	return { action: 'proceed', generation, digest, ...stages };
@@ -317,7 +318,8 @@ function planStages(
 	quiesce: string[],
 	rows: Map<string, SurveyReply>,
 	generation: number,
-	digest: string
+	digest: string,
+	explicit?: string[]
 ): StagePlans {
 	const alreadyActive = new Set<string>();
 	const alreadyStaged = new Set<string>();
@@ -334,7 +336,7 @@ function planStages(
 			fenced: [],
 		};
 		if (reply.inherited) row.inherited = true;
-		const plan = planStage(row, database, generation, homes, digest, Date.now(), quiesce, undefined, node);
+		const plan = planStage(row, database, generation, homes, digest, Date.now(), quiesce, explicit, node);
 		if (plan.action === 'reject') return { rejected: node, reason: plan.reason };
 		if (plan.action === 'noop') alreadyStaged.add(node);
 	}
@@ -358,7 +360,9 @@ function manualRecovery(
 ): string {
 	const target: Record<string, unknown> = database === DEFAULT_HOMES_KEY ? { default: true } : { database };
 	const explicit = canonicalizeHomes(
-		[...rows.values(), observer?.reply].flatMap((reply) => (reply && !('error' in reply) ? (reply.explicit ?? []) : []))
+		[...rows.values(), observer?.reply].flatMap((reply) =>
+			reply && !('error' in reply) ? [...(reply.explicit ?? []), ...(reply.staged?.explicit ?? [])] : []
+		)
 	);
 	for (const generation of new Set([...preferred, floor + 1])) {
 		if (!Number.isSafeInteger(generation)) continue;
@@ -556,25 +560,46 @@ async function runApply(
 		observer = { node: self, reply: await survey(self) };
 		report.initiator = { node: self, survey: surveyed(observer.reply) };
 	}
-	const plan = planSurvey(database, homes, quiesce, request.generation, replies, observer, fenced);
-	if (plan.action === 'refuse') {
-		report.reason =
-			isDefault && plan.status === 503
-				? `${plan.reason}; a node that predates the default home map refuses a default: true transition`
-				: plan.reason;
-		throw new ApplyRefusedError(report, plan.status);
-	}
-	// Marked on every node before the default activates there; bounded before anything is staged.
+	// Marked on every node before the default activates there, so the union includes what earlier calls
+	// already staged; bounded before anything is staged.
 	const explicit = new Set<string>();
 	const tooManyExplicit = () =>
 		`${explicit.size} databases have home maps of their own, more than the ${MAX_EXPLICIT_DATABASES} a default transition carries`;
-	if (isDefault) {
+	if (isDefault)
 		for (const reply of [...replies.values(), observer?.reply])
-			if (reply && !('error' in reply)) for (const name of reply.explicit ?? []) explicit.add(name);
-		if (explicit.size > MAX_EXPLICIT_DATABASES) {
-			report.reason = tooManyExplicit();
-			throw new ApplyRefusedError(report, 409);
-		}
+			if (reply && !('error' in reply))
+				for (const name of [...(reply.explicit ?? []), ...(reply.staged?.explicit ?? [])]) explicit.add(name);
+	const refuse = (reason: string, status: number): never => {
+		report.reason = reason;
+		throw new ApplyRefusedError(report, status);
+	};
+	if (explicit.size > MAX_EXPLICIT_DATABASES) return refuse(tooManyExplicit(), 409);
+	const planFor = (generation: number | undefined) =>
+		planSurvey(database, homes, quiesce, generation, replies, observer, fenced, isDefault ? [...explicit] : undefined);
+	const unmarkedOn = (nodes: Iterable<string>) =>
+		[...nodes].filter((node) => {
+			const reply = replies.get(node);
+			return reply && !('error' in reply) && [...explicit].some((name) => !reply.explicit?.includes(name));
+		});
+	let plan = planFor(request.generation);
+	if (plan.action === 'refuse')
+		return refuse(
+			isDefault && plan.status === 503
+				? `${plan.reason}; a node that predates the default home map refuses a default: true transition`
+				: plan.reason,
+			plan.status
+		);
+	// A home already active at the target promoted without some of these marks, and an active default is
+	// never re-marked, so finishing this generation would leave the homes split: open the next one.
+	const diverged = unmarkedOn(plan.alreadyActive);
+	if (diverged.length > 0) {
+		if (request.generation !== undefined)
+			return refuse(
+				`${diverged.join(', ')} activated generation ${plan.generation} before every database with a map of its own was marked there; re-run with generation ${plan.generation + 1}`,
+				409
+			);
+		plan = planFor(plan.generation + 1);
+		if (plan.action === 'refuse') return refuse(plan.reason, plan.status);
 	}
 	const { generation, digest } = plan;
 	report.generation = generation;
@@ -617,9 +642,13 @@ async function runApply(
 		report.reason = 'staging did not complete on every node; nothing was activated. Re-run this call';
 		throw new ApplyRefusedError(report, 503);
 	}
-	if (explicit.size > MAX_EXPLICIT_DATABASES) {
+	const lateUnmarked = unmarkedOn(plan.alreadyActive);
+	if (explicit.size > MAX_EXPLICIT_DATABASES || lateUnmarked.length > 0) {
 		report.outcome = 'incomplete';
-		report.reason = `${tooManyExplicit()}; nothing was activated`;
+		report.reason =
+			explicit.size > MAX_EXPLICIT_DATABASES
+				? `${tooManyExplicit()}; nothing was activated`
+				: `a database took a map of its own on a node while this call staged, after ${lateUnmarked.join(', ')} activated; nothing was activated. Re-run this call`;
 		throw new ApplyRefusedError(report, 409);
 	}
 	if (FAIL_BEFORE_ACTIVATE) {

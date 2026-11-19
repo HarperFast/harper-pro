@@ -558,7 +558,8 @@ true }` or the per-node operations with `default: true`). On a node, a database 
   this thread's catalog replicates (`replicatedDatabaseNames`), minus those with own rows. It is empty
   only when the node had no default row before (`staged.fresh`) and is in its first incarnation, the
   fact core's cold-start waiver rests on. Owner-side quiesce builds coordinators first
-  (`quiesceOwned`), which core dates from `coordinationStartedMono`.
+  (`quiesceOwned`), which core dates from `coordinationStartedMono`; a database with no table has none
+  to build and proves only once this thread has coordinated it for a lease (`coordinatedForALease`).
 - **No first own row mid-transition.** While a node holds a staged default whose `homes` include it,
   `planStage` refuses a database's first row of its own there, so the drain set and the reported
   own-row list cannot change between that node's stage and its activation, retries included. A node the
@@ -569,10 +570,13 @@ true }` or the per-node operations with `default: true`). On a node, a database 
   effective row, so `planSurvey`'s unlisted check and the local `planStage` force `quiesce` to cover the
   default ring, and its generation is above the default's. A default activation writes a marker
   (`markExplicitDatabases`) for every database any surveyed or staged node reported an own row for (the
-  activate hop's `explicit` plus `staged.explicit`), under the default row's lock, after `planActivate`
-  validated the promotion and before its write. Only a staged default is promoted, so no marked database
+  activate hop's `explicit` plus `staged.explicit`, which the apply also unions from every surveyed
+  `staged.explicit`), under the default row's lock, after `planActivate` validated the promotion and
+  before its write. A child row commits through its own handle, so each first row and marker re-reads
+  the default and refuses if it moved (`guardedBy`). Only a staged default is promoted, so no marked database
   holds inherited authority there; an already-active default writes none, since that would retract a
-  live map without a drain. `resolveEffectiveRow` reads a database's own row again after the default,
+  live map without a drain, so an apply that finds a home already active at the target without a name
+  the union carries opens the next generation instead of resuming. `resolveEffectiveRow` reads a database's own row again after the default,
   so a refresh never pairs a pre-marker absence with the default the marker preceded. Nesting order is
   default → database (`withEffectiveRow`, which `record_lock_fence_external` also takes).
 - **Clone lineage.** A row created while a default row exists takes the default's `cloneAttempt`, so a

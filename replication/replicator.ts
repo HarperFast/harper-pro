@@ -1007,7 +1007,6 @@ function replicatesWholeDatabase(databaseName, configured) {
 		configured.some?.((dbConfig) => dbConfig.name === databaseName)
 	);
 }
-/** Every database present on this thread that `forReplicatedDatabase` would replicate. */
 export function replicatedDatabaseNames(configured = env.get(CONFIG_PARAMS.REPLICATION_DATABASES)): string[] {
 	const names: string[] = [];
 	for (const databaseName of Object.getOwnPropertyNames(databases)) {

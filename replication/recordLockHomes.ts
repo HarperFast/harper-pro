@@ -302,11 +302,13 @@ const ROW_LOCK_TIMEOUT_MS = 30_000;
  * re-entrantly and defeating the exclusion.
  */
 const rowQueues = new Map<string, Promise<unknown>>();
-function withRow<T>(
-	database: string,
-	plan: (existing: RecordLockHomesRow | undefined, write: (row: RecordLockHomesRow) => Promise<void>) => Promise<T>,
-	inheritFrom?: RecordLockHomesRow
-): Promise<T> {
+type RowPlan<T> = (
+	existing: RecordLockHomesRow | undefined,
+	write: (row: RecordLockHomesRow) => Promise<void>
+) => Promise<T>;
+
+/** `inheritFrom` is the default row this database's planning sees while it has no row of its own. */
+function withRow<T>(database: string, plan: RowPlan<T>, inheritFrom?: RecordLockHomesRow): Promise<T> {
 	const prior = rowQueues.get(database) ?? Promise.resolve();
 	const run = prior.then(async () => {
 		const locked: any = await getRecordLockHomesTable().lock(database, {
@@ -342,14 +344,36 @@ function withRow<T>(
 /**
  * `withRow` over the effective row. A database with no row of its own is planned against the default it
  * inherits, under the default row's lock taken first (default → database is the only nesting order), so
- * a default transition and this database's first row of its own cannot interleave on this node.
+ * a default transition and this database's first row of its own cannot interleave on this node. Rows
+ * are never deleted, so a database that has one needs only its own lock.
  */
-async function withEffectiveRow<T>(
-	key: string,
-	plan: (existing: RecordLockHomesRow | undefined, write: (row: RecordLockHomesRow) => Promise<void>) => Promise<T>
-): Promise<T> {
+async function withEffectiveRow<T>(key: string, plan: RowPlan<T>): Promise<T> {
 	if (key === DEFAULT_HOMES_KEY || (await readRow(key))) return withRow(key, plan);
-	return withRow(DEFAULT_HOMES_KEY, (defaultRow) => withRow(key, plan, defaultRow));
+	return withRow(DEFAULT_HOMES_KEY, (defaultRow) =>
+		withRow(key, (existing, write) => plan(existing, guardedBy(defaultRow, write)), defaultRow)
+	);
+}
+
+/**
+ * A child row's write commits through its own handle, so the default row's lease does not fence it. If
+ * that lease ran out while the child waited and another transition moved the default, the write refuses
+ * instead of landing on a plan made against the old default.
+ */
+function guardedBy(
+	defaultRow: RecordLockHomesRow | undefined,
+	write: (row: RecordLockHomesRow) => Promise<void>
+): (row: RecordLockHomesRow) => Promise<void> {
+	const planned = transitionOf(defaultRow);
+	return async (row) => {
+		if (transitionOf(await readRow(DEFAULT_HOMES_KEY)) !== planned)
+			throw new ClientError('the default home map changed while this row was being written; retry', 409);
+		await write(row);
+	};
+}
+
+function transitionOf(defaultRow: RecordLockHomesRow | undefined): string {
+	const { active, staged } = defaultRow ?? {};
+	return JSON.stringify([active?.generation, active?.digest, staged?.generation, staged?.digest]);
 }
 
 export function operatorPrincipal(request: any): string {
@@ -759,20 +783,23 @@ export async function activateGeneration(request: any): Promise<{ active: Record
  * Under the default row's lock, between a validated promotion plan and its write: every database some
  * node reported a row of its own for gets one here too (a marker with no map), so this node never
  * inherits it. Only a staged default is promoted, so none of these databases holds inherited authority
- * here; an already-active default never writes one, since that would retract a live map undrained.
+ * here; an already-active default writes none, since that would retract a live map without a drain.
  */
 async function markExplicitDatabases(defaultRow: RecordLockHomesRow, explicit: string[]): Promise<void> {
+	const databases = canonicalizeHomes(explicit);
+	if (databases.length > MAX_EXPLICIT_DATABASES)
+		throw new ClientError(`more than ${MAX_EXPLICIT_DATABASES} databases have home maps of their own`, 409);
 	const floor = Math.max(
 		defaultRow.active?.generation ?? 0,
 		defaultRow.staged?.generation ?? 0,
 		defaultRow.highestActedOn ?? 0
 	);
-	for (const database of canonicalizeHomes(explicit)) {
+	for (const database of databases) {
 		await withRow(
 			database,
 			async (existing, write) => {
 				if (existing && !existing.inherited) return;
-				await write({ database, highestActedOn: floor, fenced: [] });
+				await guardedBy(defaultRow, write)({ database, highestActedOn: floor, fenced: [] });
 			},
 			defaultRow
 		);

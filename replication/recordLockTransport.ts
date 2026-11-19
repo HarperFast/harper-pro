@@ -570,11 +570,9 @@ async function refreshCache(database: string, freshBudget = false): Promise<bool
 		activeCache.set(database, row?.active);
 		if (row) homeMapSources.set(database, row.inherited ? 'default' : 'database');
 		else homeMapSources.delete(database);
-		// Our digest changed, or a peer digest arrived while the row was unreadable (recorded as a mismatch
-		// against no digest at all) or a socket handshook while the cache was empty and sent none: both
-		// sides need the current one. A database created at runtime inherits the default here, after its
-		// subscription may already have handshaken. The backoff resets only once this is done, so a failure
-		// here re-arms the whole cycle.
+		// A peer digest recorded while the row was unreadable, or a handshake that found the cache empty (a
+		// database created at runtime), left peers without our current digest. The backoff resets only once
+		// this is done, so a failure here re-arms the whole cycle.
 		if (state.backoff.attempts > 0 || before?.digest !== row?.active?.digest) {
 			pushHomesDigestToPeers(database);
 			reconcileAllPeerHomesAgreement(database);
@@ -632,11 +630,11 @@ const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
  */
 async function applyHomesChanged(database: string): Promise<void> {
 	if (database === DEFAULT_HOMES_KEY) {
-		// Each registered database reads its own row first, so one with a map of its own keeps it.
 		await Promise.all(
 			[...transports.keys()].map(async (registered) => {
-				const inherited = homeMapSources.get(registered) === 'default';
-				if (!(await refreshCache(registered, true)) && (inherited || homeMapSources.get(registered) === 'default'))
+				const inheritedBefore = homeMapSources.get(registered) === 'default';
+				const announced = await refreshCache(registered, true);
+				if (!announced && (inheritedBefore || homeMapSources.get(registered) === 'default'))
 					announceHomesDigest(registered);
 			})
 		);
@@ -1880,6 +1878,7 @@ setRecordLockOwnershipReaders({
 		return auditStore ? readPeerLockLevel(getReplicationSharedStatus(auditStore, database, node)) : 0;
 	},
 	tableReplicates: (database, table) => tableReplicates(database, table),
+	coordinationStartedMono: coordinationStartedMonoOf,
 	ownLineageIntact: (database, table) => {
 		try {
 			const self = getThisNodeName();

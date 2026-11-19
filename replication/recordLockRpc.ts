@@ -155,6 +155,8 @@ interface OwnershipReaders {
 	/** The peer's exact advertised `recordLocks` level, 0 while unknown. */
 	peerLevel?(database: string, node: string): number;
 	tableReplicates?(database: string, table: string): boolean;
+	/** `performance.now()` when this thread began coordinating the database, on the coordinating thread only. */
+	coordinationStartedMono?(database: string): number | undefined;
 	/**
 	 * Whether this node's own writes to the table are proven here (`ownOriginRecovery.ts`) and none failed to apply
 	 * (own-origin poison), so a barrier it writes follows them.
@@ -745,16 +747,33 @@ async function executeLocally(kind: RelayKind, database: string, table: string, 
  * thread began coordinating the database (`coordinationStartedMono`), so a database nothing has locked
  * proves exactly when that coordination is old enough or its restart recall attested.
  */
-function quiesceOwned(database: string, deadlineMs: number): Promise<any> {
+async function quiesceOwned(database: string, deadlineMs: number): Promise<any> {
 	const tables = getDatabases()[database];
+	let tableCount = 0;
 	for (const tableName in tables) {
+		tableCount++;
 		try {
 			void tables[tableName]?.lockCoordinator;
 		} catch {
 			// An unusable identity or the disabled transport: core's sweep reports the database unprovable.
 		}
 	}
-	return quiesceDelegations(database, deadlineMs);
+	const result = await quiesceDelegations(database, deadlineMs);
+	if (tableCount === 0 && tables && coordinatedForALease(database)) {
+		result.outstanding = result.outstanding.filter((entry) => entry.table !== '*');
+		result.complete = result.outstanding.length === 0;
+	}
+	return result;
+}
+
+/**
+ * A database with no table has no coordinator to build, so core reports it unprovable. Coordinating it
+ * here for a full lease rules out authority from before, exactly as core's horizon would for a
+ * coordinator built now; a dropped table's parked grants stay reported under that table's name.
+ */
+function coordinatedForALease(database: string): boolean {
+	const started = ownership.coordinationStartedMono?.(database);
+	return started !== undefined && performance.now() - started >= DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS;
 }
 
 /**

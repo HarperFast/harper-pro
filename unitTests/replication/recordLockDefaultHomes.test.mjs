@@ -1,13 +1,9 @@
 /**
- * The cluster default home map (harper-pro#1452): precedence between a database's own row and the default,
- * the digest scope that keeps the two from agreeing, a database's first own map planned against the default
- * it inherited, the default stage's drain set and its aggregation, and the markers a default activation
- * writes. The `on a real table` cases drive the real `hdb_record_lock_homes` row and remove the default row
- * afterwards, since every later test in this process would otherwise inherit it.
+ * The `on a real table` cases write the real default row and remove it afterwards: every later test in
+ * this process would otherwise inherit it.
  */
 import assert from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-// Loaded first, as the other record-lock suites do: it closes the module cycle the others enter through.
 import '#src/replication/recordLockTransport';
 import {
 	DEFAULT_HOMES_KEY,
@@ -250,6 +246,79 @@ describe('a default apply carries every database with a map of its own', functio
 					['x'],
 					`${action} on ${node}`
 				);
+	});
+});
+
+describe('a resumed default never finishes on homes that missed a mark', function () {
+	this.timeout(20_000);
+
+	it('opens the next generation when a home already active at the target lacks a mark', async () => {
+		const active = { ...ring(1, ['a', 'b']), stagedAt: 0, quiesce: ['a', 'b'] };
+		const rows = new Map([
+			['a', { database: DEFAULT_HOMES_KEY, active, highestActedOn: 1, fenced: [] }],
+			['b', { database: DEFAULT_HOMES_KEY, staged: active, highestActedOn: 1, fenced: [] }],
+		]);
+		const stagedOn = [];
+		const peers = {
+			self: () => 'a',
+			async send(node, operation) {
+				const row = rows.get(node);
+				if (operation.action === 'survey')
+					return {
+						node,
+						active: row.active,
+						staged: row.staged,
+						highestActedOn: row.highestActedOn,
+						supportsFenced: true,
+						explicit: node === 'b' ? ['x'] : [],
+					};
+				if (operation.action === 'stage') {
+					stagedOn.push(node);
+					const plan = planStage(
+						row,
+						DEFAULT_HOMES_KEY,
+						operation.generation,
+						operation.homes,
+						operation.digest,
+						0,
+						operation.quiesce,
+						operation.explicit,
+						node
+					);
+					if (plan.action === 'reject') throw new Error(plan.reason);
+					if (plan.action === 'write') rows.set(node, plan.row);
+					return {
+						staged: rows.get(node).staged,
+						quiesced: { complete: true, surrendered: 0, recalled: 0, outstanding: [] },
+						explicit: [],
+					};
+				}
+				const plan = planActivate(row, DEFAULT_HOMES_KEY, operation.generation, operation.digest, 0, 0);
+				if (plan.action === 'reject') throw new Error(plan.reason);
+				if (plan.action === 'write') rows.set(node, plan.row);
+				return { active: rows.get(node).active };
+			},
+		};
+		const report = await applyHomes({ default: true, homes: ['a', 'b'] }, peers);
+		assert.strictEqual(report.outcome, 'activated', JSON.stringify(report));
+		assert.strictEqual(report.generation, 2);
+		assert.deepStrictEqual(stagedOn.sort(), ['a', 'b'], 'the active home is staged again, so it drains and marks');
+		await assert.rejects(
+			applyHomes(
+				{ default: true, homes: ['a', 'b'], generation: 2 },
+				{
+					...peers,
+					async send(node, operation) {
+						if (operation.action === 'survey') {
+							const reply = await peers.send(node, operation);
+							return { ...reply, explicit: node === 'b' ? ['x', 'y'] : ['x'] };
+						}
+						return peers.send(node, operation);
+					},
+				}
+			),
+			/re-run with generation 3/
+		);
 	});
 });
 
