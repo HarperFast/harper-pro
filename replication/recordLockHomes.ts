@@ -780,6 +780,11 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 	const key = rowKeyOf(request);
 	if (key !== DEFAULT_HOMES_KEY && request.explicit !== undefined)
 		throw new ClientError('explicit applies only to the default home map', 400);
+	if (key === DEFAULT_HOMES_KEY && request.explicit === undefined)
+		throw new ClientError(
+			"a default activation must list explicit: every database the survey found with a map of its own (the apply's stage step lists them)",
+			400
+		);
 	validateGenerationInput(request.generation, request.homes);
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
@@ -792,9 +797,17 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 			// See the matching comment in `stageGeneration`: a retry must still reconcile threads the
 			// prior call's durable write outran.
 			await notifyChanged(key);
-			if (explicit.length > 0) {
-				const own = new Set(ownRowDatabases());
-				const unmarked = explicit.filter((database) => !own.has(database));
+			if (key === DEFAULT_HOMES_KEY) {
+				// Every home of a generation promotes the same exclusions, so a retry must name exactly them.
+				const requested = new Set(explicit);
+				const unlisted = (plan.active.explicit ?? []).filter((database) => !requested.has(database));
+				if (unlisted.length > 0)
+					throw new ClientError(
+						`this node activated generation ${generation} also excluding ${listed(unlisted)}, which this activation does not list; re-run this call`,
+						409
+					);
+				const own = explicit.length > 0 ? new Set(ownRowDatabases()) : undefined;
+				const unmarked = explicit.filter((database) => !own!.has(database));
 				if (unmarked.length > 0)
 					throw new ClientError(
 						`generation ${generation} is active here without a mark for ${listed(unmarked)}; re-run with generation ${generation + 1}`,
@@ -803,7 +816,8 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 			}
 			return { active: plan.active };
 		}
-		if (key === DEFAULT_HOMES_KEY && request.explicit !== undefined) {
+		let markers: RecordLockHomesRow[] | undefined;
+		if (key === DEFAULT_HOMES_KEY) {
 			const requested = new Set(explicit);
 			const unlisted = (existing!.staged!.explicit ?? []).filter((database) => !requested.has(database));
 			if (unlisted.length > 0)
@@ -811,11 +825,10 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 					`this node's staged default also excludes ${listed(unlisted)}, which this activation does not list; re-run this call`,
 					409
 				);
+			markers = await markerRows(existing!, explicit);
+			const { explicit: _staged, ...active } = plan.row.active!;
+			plan.row.active = explicit.length > 0 ? { ...active, explicit } : active;
 		}
-		const markers =
-			key === DEFAULT_HOMES_KEY
-				? await markerRows(existing!, [...explicit, ...(existing!.staged!.explicit ?? [])])
-				: undefined;
 		await write(plan.row, markers);
 		logger.info?.(`Record lock home map for ${describeKey(key)}: activated generation ${generation}`);
 		await notifyChanged(key);

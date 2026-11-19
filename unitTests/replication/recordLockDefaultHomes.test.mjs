@@ -35,7 +35,9 @@ import {
 	createDisabledRecordLockTransport,
 	ensureRecordLockTransport,
 	homeMapSourceOf,
+	refreshRecordLockHomesCache,
 	releaseRecordLockTransport,
+	setRecordLockHomesRowReader,
 } from '#src/replication/recordLockTransport';
 
 const ownRow = (database) => getRecordLockHomesTable().primaryStore.get(database);
@@ -253,10 +255,11 @@ describe('a database with no table, once coordinated for a lease', () => {
 describe('a default apply carries every database with a map of its own', function () {
 	this.timeout(20_000);
 
-	it("includes the initiating node's own rows when it is not in quiesce", async () => {
+	it("carries the initiating node's own rows, and refuses an initiator outside quiesce", async () => {
 		const rows = new Map([
 			['a', undefined],
 			['b', undefined],
+			['c', undefined],
 		]);
 		const hops = [];
 		const peers = {
@@ -289,9 +292,11 @@ describe('a default apply carries every database with a map of its own', functio
 				return { active: plan.row.active };
 			},
 		};
-		const report = await applyHomes({ default: true, homes: ['a', 'b'] }, peers);
+		await assert.rejects(applyHomes({ default: true, homes: ['a', 'b'] }, peers), /must be in quiesce: add c/);
+		assert.deepStrictEqual(hops, [], 'refused before any hop');
+		const report = await applyHomes({ default: true, homes: ['a', 'b'], quiesce: ['a', 'b', 'c'] }, peers);
 		assert.strictEqual(report.outcome, 'activated');
-		assert.deepStrictEqual(report.initiator.survey.active, undefined);
+		assert.strictEqual(report.nodes.c.role, 'departing');
 		for (const action of ['stage', 'activate'])
 			for (const node of ['a', 'b'])
 				assert.deepStrictEqual(
@@ -310,7 +315,10 @@ describe('a default apply carries every database with a map of its own', functio
 					: reply;
 			},
 		};
-		assert.strictEqual((await applyHomes({ default: true, homes: ['a', 'b'] }, widened)).outcome, 'activated');
+		assert.strictEqual(
+			(await applyHomes({ default: true, homes: ['a', 'b'], quiesce: ['a', 'b', 'c'] }, widened)).outcome,
+			'activated'
+		);
 		for (const node of ['a', 'b'])
 			assert.deepStrictEqual(
 				hops.find((hop) => hop.node === node && hop.action === 'activate').explicit,
@@ -325,18 +333,17 @@ describe('what a default apply refuses before it changes anything', function () 
 		throw new Error('no hop should be sent');
 	};
 
-	it('every node this one knows must be surveyed, and a fenced node is not surveyed', async () => {
+	it('every node this one knows, and this node, must be in quiesce; a fenced one counts', async () => {
 		const peers = { self: () => 'a', known: () => ['b', 'c'], send: unreached };
-		await assert.rejects(
-			applyHomes({ default: true, homes: ['a', 'b'] }, peers),
-			/every node this one knows must be surveyed: add c to quiesce/
-		);
+		await assert.rejects(applyHomes({ default: true, homes: ['a', 'b'] }, peers), /must be in quiesce: add c$/);
+		await assert.rejects(applyHomes({ default: true, homes: ['b', 'c'] }, peers), /must be in quiesce: add a$/);
 		await assert.rejects(
 			applyHomes(
 				{ default: true, homes: ['a', 'b'], quiesce: ['a', 'b', 'c'], fenced: ['c'], hdb_user: { username: 'op' } },
 				peers
 			),
-			/add c to quiesce without fencing/
+			/not every named node answered/,
+			'past the roster check, the survey runs (and anchors the fence)'
 		);
 	});
 
@@ -610,13 +617,46 @@ describe('the default row, on a real table', function () {
 		);
 	});
 
-	it('an already-active default writes no marker, and refuses an activation naming one it lacks', async () => {
-		await activateGeneration({ default: true, generation: 1, homes: both, explicit: ['marked'], ...operator });
+	it('an already-active default writes no marker, and a retry must name exactly what it promoted', async () => {
+		const promoted = ['elsewhere', 'marked'];
+		await activateGeneration({ default: true, generation: 1, homes: both, explicit: promoted, ...operator });
 		await assert.rejects(
-			activateGeneration({ default: true, generation: 1, homes: both, explicit: ['inh-a'], ...operator }),
+			activateGeneration({ default: true, generation: 1, homes: both, explicit: ['marked'], ...operator }),
+			/also excluding elsewhere, which this activation does not list/
+		);
+		await assert.rejects(
+			activateGeneration({ default: true, generation: 1, homes: both, explicit: [...promoted, 'inh-a'], ...operator }),
 			/without a mark for inh-a; re-run with generation 2/
 		);
+		await assert.rejects(
+			activateGeneration({ default: true, generation: 1, homes: both, ...operator }),
+			/must list explicit/
+		);
 		assert.strictEqual(await ownRow('inh-a'), undefined, 'a live inherited map is never retracted undrained');
+		assert.strictEqual(cachedActiveGeneration('inh-a'), 1);
+	});
+
+	it('a default change a thread could not read for some database fails the call that made it', async () => {
+		const previous = setRecordLockHomesRowReader(async (database) => {
+			if (database === 'inh-a') throw new Error('unreadable');
+			return previous(database);
+		});
+		try {
+			await assert.rejects(
+				activateGeneration({
+					default: true,
+					generation: 1,
+					homes: both,
+					explicit: ['elsewhere', 'marked'],
+					...operator,
+				}),
+				/could not refresh the record lock home map for inh-a after a default change/
+			);
+			assert.strictEqual(cachedActiveGeneration('inh-a'), undefined, 'it serves nothing for that database');
+		} finally {
+			setRecordLockHomesRowReader(previous);
+			await refreshRecordLockHomesCache('inh-a', true);
+		}
 		assert.strictEqual(cachedActiveGeneration('inh-a'), 1);
 	});
 

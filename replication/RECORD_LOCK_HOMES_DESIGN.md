@@ -551,19 +551,25 @@ true }` or the per-node operations with `default: true`). On a node, a database 
   row with no ring is no default (`hasRing`). Inheritance is resolved when the cache is filled
   (`refreshCache`), never on the lock path. Rows are never deleted, so an own row wins for good.
 - **Every node is surveyed.** A default apply refuses unless every node the initiator's `hdb_nodes`
-  names is in `quiesce` and not fenced (`runApply`, `known`): a node left out could hold an own row for a
-  database whose default homes would then inherit it, and both rings would agree.
+  names, and the initiator, is in `quiesce` (`runApply`, `known`): a node left out could hold, or take
+  after its survey, an own row for a database whose default homes would then inherit it, and both
+  rings would agree. A fenced node counts, under the survey's majority anchor: every own row it took
+  through `record_lock_apply_homes` was mirrored on the live members of the ring it took it under
+  (the default-ring coverage rule), and those are surveyed.
 - **Digest scope.** `digestFor` hashes a `default` tag first, so a node inheriting a database and a node
   serving it from its own row never agree, even on equal `(generation, homes)`.
 - **One fenced transition moves every inheriting database.** Staging the default retracts all of them in
   one durable write. The stage then drains each one on its owner (`drainInheriting`), and the node
   proves only if every database's drain proves. The drain set is fixed under the default row lock at
-  the stage write (`defaultStageScope`): every database main has an owner entry for plus every database
-  this thread's catalog replicates (`replicatedDatabaseNames`), minus those with own rows. It is empty
-  only when the node had no default ring before (`staged.fresh`) and is in its first incarnation, the
-  fact core's cold-start waiver rests on. Owner-side quiesce builds coordinators first
-  (`quiesceOwned`), which core dates from `coordinationStartedMono`; a database with no table has none
-  to build and proves only once this thread has coordinated it for a lease (`coordinatedForALease`).
+  the stage write (`defaultStageScope`): every database main has an owner entry for, or released one
+  for within `DELEGATION_DRAIN_MS` (`ownedOrRecentlyReleased`), plus, after the node's first
+  incarnation, every database this thread's catalog replicates (`replicatedDatabaseNames`), minus those
+  with own rows. It is empty only when the node had no default ring before (`staged.fresh`) and is in
+  its first incarnation, the fact core's cold-start waiver rests on. Owner-side quiesce builds
+  coordinators first (`quiesceOwned`), which core dates from `coordinationStartedMono`; a database with
+  no coordinator (no tables, none that replicate, or dropped) proves on the first incarnation or once
+  this thread has coordinated it for a lease (`coordinatedForALease`), while core still reports grants
+  its closed coordinators issued.
 - **No first own row mid-transition.** While a node holds a staged default whose `homes` include it,
   `planStage` refuses a database's first row of its own there, so the drain set and the reported
   own-row list cannot change between that node's stage and its activation, retries included. A node the
@@ -574,13 +580,14 @@ true }` or the per-node operations with `default: true`). On a node, a database 
   effective row, so `planSurvey`'s unlisted check and the local `planStage` force `quiesce` to cover the
   default ring, and its generation is above the default's. A default activation writes a marker
   (`markerRows`) for every database any surveyed or staged node reported an own row for (the activate
-  hop's `explicit`, which the apply unions from every survey and stage reply's own rows and
-  `staged.explicit`, plus this node's `staged.explicit`; an activation refuses a staged name its list
-  lacks). Only a staged default is promoted, so no marked database holds inherited authority there; an
-  already-active default writes none, since that would retract a live map without a drain. Its
-  activation refuses a name it has no row for, and an apply (or the fenced recovery it prints) that
-  finds a home already active at the target without a name the union carries opens the next generation
-  instead of resuming. `resolveEffectiveRow` reads a database's own row again after the default, so a
+  hop's `explicit`, required on a default activation, which the apply unions from every survey and
+  stage reply's own rows and `staged.explicit`). The promotion records that list as `active.explicit`,
+  so every home of a generation promotes the same exclusions: an activation refuses a staged name its
+  list lacks, and a retry of an active one refuses unless it names exactly the promoted list and every
+  name has a row here. Only a staged default is promoted, so no marked database holds inherited
+  authority there; an already-active default writes no marker, since that would retract a live map
+  without a drain, so an apply (or the fenced recovery it prints) that finds a home already active at
+  the target without a name the union carries opens the next generation instead of resuming. `resolveEffectiveRow` reads a database's own row again after the default, so a
   refresh never pairs a pre-marker absence with the default the marker preceded.
 - **Rows planned under the default lock commit under its lease.** A database without a detaching row is
   planned under the default row's lock only (`withEffectiveRow`, which `record_lock_fence_external` also
@@ -594,8 +601,9 @@ true }` or the per-node operations with `default: true`). On a node, a database 
 - **Clone lineage.** A row created while a default row exists takes the default's `cloneAttempt`, so a
   re-clone still marks the database ever-recloned (`markReclonedIfLockHistory` reads the effective row).
 - **Fan-out.** A default write sends one acked notice per thread; each thread re-reads every registered
-  database's own row (`applyHomesChanged`) under a larger ack budget, and `refreshCache` re-announces
-  whenever a cached digest changes, which a database created at runtime needs.
+  database's own row (`applyHomesChanged`) under a larger ack budget and acks false if any read failed,
+  and `refreshCache` re-announces whenever a cached digest changes, which a database created at runtime
+  needs.
 
 Why no two maps for a database can be live, by case:
 

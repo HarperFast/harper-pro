@@ -162,6 +162,8 @@ interface OwnershipReaders {
 	 * (own-origin poison), so a barrier it writes follows them.
 	 */
 	ownLineageIntact?(database: string, table: string): boolean;
+	/** The node's first-ever incarnation, before any handoff between threads. */
+	firstIncarnation?(): boolean;
 }
 let ownership: OwnershipReaders = {
 	ownsDatabase: () => false,
@@ -749,17 +751,17 @@ async function executeLocally(kind: RelayKind, database: string, table: string, 
  */
 async function quiesceOwned(database: string, deadlineMs: number): Promise<any> {
 	const tables = getDatabases()[database];
-	let tableCount = 0;
+	let coordinators = 0;
 	for (const tableName in tables) {
-		tableCount++;
 		try {
-			void tables[tableName]?.lockCoordinator;
+			if (tables[tableName]?.lockCoordinator) coordinators++;
 		} catch {
 			// An unusable identity or the disabled transport: core's sweep reports the database unprovable.
 		}
 	}
 	const result = await quiesceDelegations(database, deadlineMs);
-	if (tableCount === 0 && tables && coordinatedForALease(database)) dropNoCoordinatorEntry(result);
+	if (coordinators === 0 && (ownership.firstIncarnation?.() || coordinatedForALease(database)))
+		dropNoCoordinatorEntry(result);
 	return result;
 }
 
@@ -776,9 +778,11 @@ export function dropNoCoordinatorEntry(result: { complete: boolean; outstanding:
 }
 
 /**
- * A database with no table has no coordinator to build, so core reports it unprovable. Coordinating it
- * here for a full lease rules out authority from before, exactly as core's horizon would for a
- * coordinator built now; a dropped table's parked grants stay reported under that table's name.
+ * A database with no coordinator (no tables, only tables that do not replicate, or dropped) has none to
+ * build, so core reports it unprovable. Grants a coordinator closed on this thread stay reported under
+ * their table's name; what core cannot see is authority from before this thread coordinated it, which a
+ * full lease of coordination rules out, as core's horizon would, and which a node's first incarnation
+ * never had (a handoff between threads ends it).
  */
 function coordinatedForALease(database: string): boolean {
 	const started = ownership.coordinationStartedMono?.(database);

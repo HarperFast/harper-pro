@@ -78,6 +78,7 @@ import { tableReplicates as declarationReplicates } from './replicatedDatabases.
 import { createBackoff, type Backoff } from './backoff.ts';
 import {
 	DEFAULT_HOMES_KEY,
+	DELEGATION_DRAIN_MS,
 	currentRow,
 	onRecordLockHomesChanged,
 	type RecordLockHomesRow,
@@ -507,7 +508,9 @@ interface RefreshState {
 	token: object;
 	backoff: Backoff;
 	timer?: NodeJS.Timeout;
+	inflight?: Promise<RefreshOutcome>;
 }
+type RefreshOutcome = 'announced' | 'unchanged' | 'failed';
 const refreshState = new Map<string, RefreshState>();
 const REFRESH_RETRY_INITIAL_MS = Number(process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS) || 1_000;
 const REFRESH_RETRY_MAX_MS = REFRESH_RETRY_INITIAL_MS * 30;
@@ -541,7 +544,14 @@ export function homeMapSourceOf(database: string): 'default' | 'database' | unde
 	return homeMapSources.get(database);
 }
 
-async function refreshCache(database: string, freshBudget = false): Promise<boolean> {
+/** A refresh a newer one superseded answers with the newer one's outcome. */
+function refreshCache(database: string, freshBudget = false): Promise<RefreshOutcome> {
+	const run = readIntoCache(database, freshBudget);
+	refreshState.get(database)!.inflight = run;
+	return run;
+}
+
+async function readIntoCache(database: string, freshBudget: boolean): Promise<RefreshOutcome> {
 	let state = refreshState.get(database);
 	if (!state)
 		refreshState.set(
@@ -560,11 +570,12 @@ async function refreshCache(database: string, freshBudget = false): Promise<bool
 	state.timer = undefined;
 	if (freshBudget) state.backoff.reset();
 	const current = () => refreshState.get(database)?.token === token;
+	const newer = () => refreshState.get(database)!.inflight!;
 	const before = activeCache.get(database);
-	let announced = false;
+	let outcome: RefreshOutcome = 'unchanged';
 	try {
 		const row = await readHomesRow(database);
-		if (!current()) return false;
+		if (!current()) return newer();
 		activeCache.set(database, row?.active);
 		if (row) homeMapSources.set(database, row.inherited ? 'default' : 'database');
 		else homeMapSources.delete(database);
@@ -574,11 +585,12 @@ async function refreshCache(database: string, freshBudget = false): Promise<bool
 		if (state.backoff.attempts > 0 || before?.digest !== row?.active?.digest) {
 			pushHomesDigestToPeers(database);
 			reconcileAllPeerHomesAgreement(database);
-			announced = true;
+			outcome = 'announced';
 		}
 		state.backoff.reset();
 	} catch (error) {
-		if (!current()) return false;
+		if (!current()) return newer();
+		outcome = 'failed';
 		// A storage error must not leave a stale (possibly superseded) generation cached; undefined is
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
@@ -598,7 +610,7 @@ async function refreshCache(database: string, freshBudget = false): Promise<bool
 		if (CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF && ownedDatabases.has(database))
 			restartRecall.schedule(database);
 	}
-	return announced;
+	return outcome;
 }
 
 /** Leaf bound: main waiting on ONE worker (or a worker waiting on main's own local refresh alone). */
@@ -631,17 +643,23 @@ const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
  */
 async function applyHomesChanged(database: string): Promise<void> {
 	if (database === DEFAULT_HOMES_KEY) {
+		const failed: string[] = [];
 		await Promise.all(
 			[...transports.keys()].map(async (registered) => {
 				const inheritedBefore = homeMapSources.get(registered) === 'default';
-				const announced = await refreshCache(registered, true);
-				if (!announced && (inheritedBefore || homeMapSources.get(registered) === 'default'))
+				const outcome = await refreshCache(registered, true);
+				if (outcome === 'unchanged' && (inheritedBefore || homeMapSources.get(registered) === 'default'))
 					announceHomesDigest(registered);
+				if (outcome === 'failed') failed.push(registered);
 			})
 		);
+		// A thread that could not read a database's row serves nothing for it, but a stage or activate it
+		// acknowledged would read as applied everywhere.
+		if (failed.length > 0)
+			throw new Error(`could not refresh the record lock home map for ${failed.join(', ')} after a default change`);
 		return;
 	}
-	if (!(await refreshCache(database, true))) announceHomesDigest(database);
+	if ((await refreshCache(database, true)) !== 'announced') announceHomesDigest(database);
 }
 
 function announceHomesDigest(database: string): void {
@@ -1178,7 +1196,9 @@ export function ensureRecordLockTransport(database: string, buildTransport?: () 
 	transports.set(database, transport);
 	if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
 	listenForApplyFailures(database);
-	refreshCache(database);
+	refreshCache(database).catch((error) =>
+		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error)
+	);
 	if (parentPort) {
 		parentPort.postMessage({ type: 'record-lock-owner-request', database });
 		// harper-pro#852: learn which thread owns it, so a relayed acquire can reach the owner. A worker
@@ -1700,6 +1720,7 @@ export function releaseRecordLockOwner(database: string): void {
 	const owner = recordLockOwners.get(database);
 	if (!owner) return;
 	recordLockOwners.delete(database);
+	releasedOwners.set(database, performance.now());
 	// A release racing an in-flight handoff bump: deleting the entry (rather than leaving
 	// PENDING_BUMP) is what makes the bump's own completion check see itself superseded and abandon.
 	if (owner === PENDING_BUMP) return;
@@ -1815,9 +1836,17 @@ setHomesDrainReader((database, deadlineMs) => quiesceOnOwner(database, deadlineM
 const REGISTERED_REQUEST_TIMEOUT_MS = 5_000;
 let nextRegisteredRequestId = 1;
 const pendingRegistered = new Map<number, (databases: string[] | undefined) => void>();
+/** Released owners stay drain candidates while grants they issued can still be live. */
+const releasedOwners = new Map<string, number>();
+function ownedOrRecentlyReleased(): string[] {
+	const now = performance.now();
+	for (const [database, at] of releasedOwners) if (now - at >= DELEGATION_DRAIN_MS) releasedOwners.delete(database);
+	return [...new Set([...recordLockOwners.keys(), ...releasedOwners.keys()])];
+}
+
 /** Every database any thread registered: each registration asks main for an owner before anything can grant. */
 function databasesWithOwners(): Promise<string[] | undefined> {
-	if (!parentPort) return Promise.resolve([...recordLockOwners.keys()]);
+	if (!parentPort) return Promise.resolve(ownedOrRecentlyReleased());
 	const requestId = nextRegisteredRequestId++;
 	return new Promise((resolve) => {
 		const timer = setTimeout(() => settle(undefined), REGISTERED_REQUEST_TIMEOUT_MS).unref();
@@ -1838,7 +1867,10 @@ function databasesWithOwners(): Promise<string[] | undefined> {
 setHomesDrainCandidates({
 	async candidates() {
 		const registered = await databasesWithOwners();
-		return registered && [...new Set([...registered, ...replicatedDatabaseNames()])];
+		// A database with no owner was never coordinated in this process, so on the node's first
+		// incarnation nothing can have granted it; otherwise an earlier process may have.
+		if (!registered || isFirstIncarnation()) return registered;
+		return [...new Set([...registered, ...replicatedDatabaseNames()])];
 	},
 	neverGranted: isFirstIncarnation,
 });
@@ -1864,6 +1896,7 @@ setHomesMembershipReaders({
 
 setRecordLockOwnershipReaders({
 	ownsDatabase: ownsRecordLockCoordination,
+	firstIncarnation: isFirstIncarnation,
 	homeIncarnation: currentHomeIncarnation,
 	ownerFor: (database) => {
 		const owner = recordLockOwners.get(database);
@@ -1941,7 +1974,7 @@ if (!parentPort) {
 			worker?.postMessage({
 				type: 'record-lock-registered-reply',
 				requestId: message?.requestId,
-				databases: [...recordLockOwners.keys()],
+				databases: ownedOrRecentlyReleased(),
 			});
 		} catch (error) {
 			logger.debug?.('Could not answer a worker asking for the databases with record lock owners', error);

@@ -49,14 +49,14 @@ export interface HopTimeouts {
 	stageMs: number;
 	/**
 	 * A default stage or activate on the peer: the row-lock wait (30 s), owner listing (5 s), the
-	 * every-thread fan-out (21.5 s) and, for a stage, the drain.
+	 * origin's own refresh (10 s), the relay to every other thread (21.5 s) and, for a stage, the drain.
 	 */
 	defaultMs?: number;
 }
 export const DEFAULT_HOP_TIMEOUTS: HopTimeouts = {
 	hopMs: 15_000,
 	stageMs: STAGE_DRAIN_BUDGET_MS + 15_000,
-	defaultMs: STAGE_DRAIN_BUDGET_MS + 65_000,
+	defaultMs: STAGE_DRAIN_BUDGET_MS + 80_000,
 };
 /** `quiesce` may name 256 nodes and each hop may open a socket. */
 export const HOP_CONCURRENCY = 16;
@@ -350,7 +350,12 @@ function planStages(
 		if (plan.action === 'reject') return { rejected: node, reason: plan.reason };
 		// A re-stage that only widens what the staged generation records keeps `stagedAt`: the node stopped
 		// granting when it did, so an attested interval still covers it.
-		if (plan.action === 'noop' || (reply.staged && plan.row.staged?.stagedAt === reply.staged.stagedAt))
+		if (
+			plan.action === 'noop' ||
+			(reply.staged?.generation === generation &&
+				reply.staged.digest === digest &&
+				plan.row.staged?.stagedAt === reply.staged.stagedAt)
+		)
 			alreadyStaged.add(node);
 	}
 	return { alreadyActive, alreadyStaged };
@@ -391,7 +396,13 @@ function manualRecovery(
 		);
 		if ('rejected' in stages) continue;
 		if (isDefault && unmarkedOn(stages.alreadyActive, explicit, (node) => rows.get(node)).length > 0) continue;
-		const activate = JSON.stringify({ operation: 'record_lock_activate_generation', ...target, generation, homes });
+		const activate = JSON.stringify({
+			operation: 'record_lock_activate_generation',
+			...target,
+			generation,
+			homes,
+			...(isDefault ? { explicit } : {}),
+		});
 		const departing = canonicalizeHomes([...rows.keys()].filter((node) => !homes.includes(node)));
 		if (
 			homes.every((node) => stages.alreadyActive.has(node)) &&
@@ -410,6 +421,15 @@ function manualRecovery(
 		return `apply without fenced once it is reachable, or, if ${JSON.stringify(fenced)} will never run again from their current data, re-home without them by hand: send ${stage} to each of ${JSON.stringify(stageOn)}; after the last of those succeeds, wait ${DELEGATION_DRAIN_MS} ms, then send ${activate} to each of ${JSON.stringify(homes)}. Never activate after a failed stage; if interrupted, re-send this call for steps that match the current state`;
 	}
 	return `apply without fenced once it is reachable; no generation above ${floor} is left to re-home them by hand`;
+}
+
+function isNameList(value: unknown): boolean {
+	return (
+		value === undefined ||
+		(Array.isArray(value) &&
+			value.length <= MAX_EXPLICIT_DATABASES &&
+			value.every((name) => typeof name === 'string' && name.length > 0))
+	);
 }
 
 /** The nodes whose survey lacks a mark for some name in `explicit`; an active default is never re-marked. */
@@ -573,10 +593,13 @@ async function runApply(
 	for (const node of quiesce)
 		report.nodes[node] = { role: fenced.includes(node) ? 'fenced' : homes.includes(node) ? 'home' : 'departing' };
 	if (isDefault) {
-		// A node left out could hold a map of its own for a database the default's homes would then inherit.
-		const unsurveyed = (peers.known?.() ?? []).filter((node) => node !== peers.self() && !live.includes(node));
-		if (unsurveyed.length > 0) {
-			report.reason = `a default home map covers every database, so every node this one knows must be surveyed: add ${unsurveyed.join(', ')} to quiesce without fencing them, or remove_node any that are gone`;
+		// A node left out could hold, or take after its survey, a map of its own for a database the default's
+		// homes would then inherit. A fenced node's own rows are mirrored on the live members of every ring
+		// it took them under, and the survey anchors the fence.
+		const self = peers.self();
+		const unlisted = [...(peers.known?.() ?? []), ...(self ? [self] : [])].filter((node) => !quiesce.includes(node));
+		if (unlisted.length > 0) {
+			report.reason = `a default home map covers every database, so every node this one knows, and this node, must be in quiesce: add ${[...new Set(unlisted)].join(', ')}`;
 			throw new ApplyRefusedError(report, 409);
 		}
 	}
@@ -586,7 +609,9 @@ async function runApply(
 	const survey = async (node: string): Promise<SurveyReply | { error: string }> => {
 		try {
 			const reply = await hop(node, { operation: TRANSITION_OPERATION, ...target, action: 'survey' }, timeouts.hopMs);
-			return reply && typeof reply === 'object' ? reply : { error: `malformed survey reply: ${JSON.stringify(reply)}` };
+			return reply && typeof reply === 'object' && isNameList(reply.explicit) && isNameList(reply.staged?.explicit)
+				? reply
+				: { error: `malformed survey reply: ${JSON.stringify(reply)?.slice(0, 200)}` };
 		} catch (error) {
 			return { error: hopError(error) };
 		}
@@ -670,7 +695,13 @@ async function runApply(
 		}
 		try {
 			const reply: StageReply = await hop(node, stage, stageMs);
-			if (!reply || typeof reply !== 'object') throw new Error(`malformed stage reply: ${JSON.stringify(reply)}`);
+			if (
+				reply?.staged?.generation !== generation ||
+				reply.staged.digest !== digest ||
+				!isNameList(reply.explicit) ||
+				!isNameList(reply.staged.explicit)
+			)
+				throw new Error(`malformed stage reply: ${JSON.stringify(reply)?.slice(0, 200)}`);
 			entry.stage = {
 				action: plan.alreadyStaged.has(node) ? 'noop' : 'staged',
 				quiesced: reply.quiesced,
@@ -732,7 +763,9 @@ async function runApply(
 			};
 			if (isDefault) activate.explicit = [...explicit].sort();
 			// A default activation also writes markers and refreshes every database on every thread.
-			await hop(node, activate, isDefault ? stageMs : timeouts.hopMs);
+			const reply = await hop(node, activate, isDefault ? stageMs : timeouts.hopMs);
+			if (reply?.active?.generation !== generation || reply.active.digest !== digest)
+				throw new Error(`malformed activate reply: ${JSON.stringify(reply)?.slice(0, 200)}`);
 			entry.activate = { action: entry.stage?.action === 'already-active' ? 'noop' : 'activated' };
 		} catch (error) {
 			failed = true;

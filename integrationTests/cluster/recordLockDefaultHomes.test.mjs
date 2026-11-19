@@ -238,7 +238,7 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		const { status, body } = await applyDefault(nodes[0], { homes: [names[0]] });
 		assert.equal(status, 409, JSON.stringify(body));
 		assert.equal(body.outcome, 'refused');
-		assert.match(body.error, /every node this one knows must be surveyed/);
+		assert.match(body.error, /every node this one knows, and this node, must be in quiesce/);
 		for (const name of names.slice(1)) assert.match(body.error, new RegExp(name));
 		assert.equal(body.nodes[names[0]].stage, undefined, 'nothing was staged');
 		for (const node of nodes.slice(0, 2)) assert.equal(await lockStatus(node, 'still-' + Date.now()), 200);

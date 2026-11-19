@@ -516,11 +516,11 @@ What counts is the engine each database is opened on, not `storage.engine`. That
 
 It takes the same `quiesce`, `generation`, `drained` and `fenced` fields and returns the same outcomes as a per-database map, and a membership change is applied the same way: list the new nodes in `homes` and the old and new nodes in `quiesce`. Applying a new default moves every database that uses it in one call; until it activates, those databases refuse locks on the nodes being changed.
 
-- `quiesce` must name every node the node taking the call knows (its `hdb_nodes`), not fenced, so a node outside `homes` goes in `quiesce` only. A node that is gone must be removed with `remove_node` first. The call is refused with `409`, before anything changes, while a known node is left out, because that node could hold a map of its own for a database the default would otherwise also serve.
+- `quiesce` must name the node taking the call and every node it knows (its `hdb_nodes`); a node outside `homes` goes in `quiesce` only, and a node that is down goes in `fenced` as for a per-database map. The call is refused with `409`, before anything changes, while a node is left out, because that node could hold a map of its own for a database the default would otherwise also serve.
 
 - A map of a database's own takes precedence over the default, permanently. Apply one to a database that is not replicated by every node in the default, for example a sharded database or one some nodes leave out of `replication.databases`: under the default it answers `503`, because every node in a map must replicate the database. Its `quiesce` must include the default's nodes.
 - Every node in `quiesce` must run v5.5.0 or later; a node on an earlier version refuses the call before anything changes. Before downgrading a node below v5.5.0, apply a map of its own to each database that uses the default, since an earlier version does not read the default and those databases would refuse locks.
-- At most 10,000 databases in a cluster can have maps of their own while a default exists. Each one is recorded on every node, and a default change is refused once the count is above that.
+- At most 10,000 databases in a cluster can have maps of their own while a default exists, counting databases since dropped. Each one is recorded on every node, and a default change is refused once the count is above that.
 - `cluster_status` reports `homeMapSource: "default"` or `"database"` for each database under `recordLocks`.
 
 ### Confirming Locked Writes
