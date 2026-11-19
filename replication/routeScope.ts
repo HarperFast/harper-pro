@@ -9,9 +9,7 @@ export interface RouteScope {
 }
 
 /** The narrowest scope a route accepted progress under since its last completed copy; `rev` counts narrowings. */
-export interface RecordedRouteScope extends RouteScope {
-	rev: number;
-}
+type RecordedRouteScope = RouteScope & { rev: number };
 
 export const ROUTE_SCOPE_KEY = Symbol.for('routeScope');
 

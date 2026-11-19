@@ -8056,6 +8056,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let socketRequestScope: RouteScope | undefined;
 	/** The route-scope revision this socket's latest request left: a pass starting on it began under that one. */
 	let socketScopeRev: number | undefined;
+	/** The route whose scope record this socket's requests wrote. */
+	let socketScopeRouteId: number | undefined;
 	/** Set once the route lost coverage after this socket's request; it certifies no full coverage again. */
 	let coverageNarrowedOnSocket = false;
 	let resumedCopyScope: { scope: RouteScope; rev: number } | undefined;
@@ -8287,6 +8289,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let currentCopyPass: CopyPassState | undefined;
 	/** What a pass starting now fills: the narrowest scope this socket requested, under the revision its request left. */
 	function copyPassScope(routeId: number | undefined): { scope: RouteScope; scopeRev: number } | undefined {
+		if (routeId === undefined || routeId !== socketScopeRouteId) return undefined;
 		if (copyWasResumed) {
 			// a cursor from before scopes were recorded never widens the record
 			if (!resumedCopyScope) return undefined;
@@ -8296,12 +8299,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			};
 		}
 		// the revision the request left, not one read now: a narrowing since must stop promotion
-		if (!socketRequestScope || socketScopeRev === undefined || routeId === undefined) return undefined;
+		if (!socketRequestScope || socketScopeRev === undefined) return undefined;
 		return { scope: socketRequestScope, scopeRev: socketScopeRev };
 	}
 	/**
 	 * A completed pass's scope becomes the route's unless the route narrowed since the pass began. Synchronous, so no
-	 * narrowing can land between the revision check and the write.
+	 * narrowing can land between the revision check and the write. An absent record is the next request's to seed.
 	 */
 	function promoteRouteScope(pass: CopyPassState): void {
 		if (
@@ -8316,7 +8319,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return;
 		const { dbisDB } = getDatabaseStores();
 		const recorded = readRouteScope(dbisDB, pass.routeId);
-		if (recorded?.rev !== pass.scopeRev || sameScope(recorded, pass.scope)) return;
+		if (!recorded || recorded.rev !== pass.scopeRev || sameScope(recorded, pass.scope)) return;
 		writeRouteScope(dbisDB, pass.routeId, { ...pass.scope, rev: recorded.rev });
 	}
 	function tryRestoreCopyPass(pass: CopyPassState | undefined, eventForImmediateTake?: any, deferFlush = false): void {
@@ -13896,7 +13899,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function recordLiveCoverage(origins: string[], failedOpen: boolean) {
 		if (failedOpen || coverageNarrowedOnSocket || options.connection?.routeFullCoverage !== true) return;
 		const routeNode = options.connection.nodeSubscriptions?.[0]?.name;
-		const routeId = routeRowId();
+		const routeId = socketScopeRouteId ?? routeRowId();
 		if (!routeNode || origins.includes(routeNode) || routeId === undefined) return;
 		coverageNarrowedOnSocket = true;
 		if (socketRequestScope) socketRequestScope = { ...socketRequestScope, full: false };
@@ -14183,6 +14186,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					socketRequestScope = socketRequestScope ? intersectScope(socketRequestScope, current) : current;
 					socketScopeRev = recordedRev;
+					socketScopeRouteId = nodeId;
 					cursorScope = cursorRouteScope(copyCursor);
 					// what an interrupted copy is filling; a cursor from before scopes were recorded fills the request's tables
 					const copyScope =
