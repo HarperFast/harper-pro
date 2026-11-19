@@ -155,6 +155,7 @@ describe('route-state facts keyed by generation and connection (harper-pro#1145)
 		const first = { remoteNodeIds: [1] };
 		routeState.takeInto(first);
 		routeState.certifiedFrom(1, 100, 'g1');
+		routeState.hole(3, 'g3');
 		const certified = { remoteNodeIds: [1] };
 		routeState.takeInto(certified);
 		routeState.partialHistory(1, true, 'g1');
@@ -163,6 +164,7 @@ describe('route-state facts keyed by generation and connection (harper-pro#1145)
 		const row = [
 			{ id: 1, originGeneration: 'g1', partialHistory: false },
 			{ id: 2, originGeneration: 'g2' },
+			{ id: 3, originGeneration: 'g3' },
 		];
 		assert.strictEqual(
 			routeState.verifyPersisted(() => row, first),
@@ -171,9 +173,15 @@ describe('route-state facts keyed by generation and connection (harper-pro#1145)
 		);
 		assert.strictEqual(
 			routeState.verifyPersisted(() => row, certified),
-			true,
-			'the clear that settled after the certification still voids it'
+			false
 		);
+		const retry = { remoteNodeIds: [1] };
+		routeState.takeInto(retry);
+		// the clear that settled after the certification still voids it, though an older batch's clear rolled back
+		assert.deepStrictEqual(retry.originRouteStates, [
+			[2, undefined, undefined, true, 'g2'],
+			[3, undefined, undefined, true, 'g3'],
+		]);
 	});
 
 	it('writes no certification captured before a new request when its commit runs after it', async () => {
