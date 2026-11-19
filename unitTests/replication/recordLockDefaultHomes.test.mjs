@@ -34,6 +34,7 @@ import {
 	cachedActiveGeneration,
 	createDisabledRecordLockTransport,
 	ensureRecordLockTransport,
+	forgetRecordLockHomesCache,
 	homeMapSourceOf,
 	refreshRecordLockHomesCache,
 	releaseRecordLockTransport,
@@ -658,6 +659,21 @@ describe('the default row, on a real table', function () {
 			await refreshRecordLockHomesCache('inh-a', true);
 		}
 		assert.strictEqual(cachedActiveGeneration('inh-a'), 1);
+	});
+
+	it('a refresh whose database was forgotten during the read settles without an error', async () => {
+		let release;
+		const previous = setRecordLockHomesRowReader((database) =>
+			database === 'forgotten' ? new Promise((resolve) => (release = resolve)) : previous(database)
+		);
+		try {
+			const pending = refreshRecordLockHomesCache('forgotten', true);
+			forgetRecordLockHomesCache('forgotten');
+			release(undefined);
+			await pending;
+		} finally {
+			setRecordLockHomesRowReader(previous);
+		}
 	});
 
 	it('a first own map must cover the default ring and name a generation above it', async () => {

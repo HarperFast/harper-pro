@@ -804,7 +804,7 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 			// prior call's durable write outran.
 			await notifyChanged(key);
 			if (key === DEFAULT_HOMES_KEY) {
-				// Every home of a generation promotes the same exclusions, so a retry must name exactly them.
+				// Every home of a generation promotes the same exclusions, so a retry must name at least them.
 				const requested = new Set(explicit);
 				const unlisted = (plan.active.explicit ?? []).filter((database) => !requested.has(database));
 				if (unlisted.length > 0)
@@ -812,8 +812,8 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 						`this node activated generation ${generation} also excluding ${listed(unlisted)}, which this activation does not list; re-run this call`,
 						409
 					);
-				const own = explicit.length > 0 ? new Set(ownRowDatabases()) : undefined;
-				const unmarked = explicit.filter((database) => !own!.has(database));
+				const unmarked: string[] = [];
+				for (const database of explicit) if (!detaches(await readRow(database))) unmarked.push(database);
 				if (unmarked.length > 0)
 					throw new ClientError(
 						`generation ${generation} is active here without a mark for ${listed(unmarked)}; re-run with generation ${generation + 1}`,

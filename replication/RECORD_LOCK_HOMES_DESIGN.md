@@ -586,8 +586,8 @@ true }` or the per-node operations with `default: true`). On a node, a database 
   hop's `explicit`, required on a default activation, which the apply unions from every survey and
   stage reply's own rows and `staged.explicit`). The promotion records that list as `active.explicit`,
   so every home of a generation promotes the same exclusions: an activation refuses a staged name its
-  list lacks, and a retry of an active one refuses unless it names exactly the promoted list and every
-  name has a row here. Only a staged default is promoted, so no marked database holds inherited
+  list lacks, and a retry of an active one refuses unless it names every promoted name and every name it
+  lists has a row here (a name beyond the promoted list took a row of its own since). Only a staged default is promoted, so no marked database holds inherited
   authority there; an already-active default writes no marker, since that would retract a live map
   without a drain, so an apply (or the fenced recovery it prints) that finds a home already active at
   the target without a name the union carries opens the next generation instead of resuming. `resolveEffectiveRow` reads a database's own row again after the default, so a

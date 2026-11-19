@@ -443,7 +443,13 @@ function isSurveyReply(reply: any): boolean {
 		(reply.highestActedOn === undefined || Number.isSafeInteger(reply.highestActedOn)) &&
 		(reply.fenced === undefined ||
 			(Array.isArray(reply.fenced) &&
-				reply.fenced.every((entry: any) => typeof entry === 'object' && entry !== null))) &&
+				reply.fenced.every(
+					(entry: any) =>
+						typeof entry === 'object' &&
+						entry !== null &&
+						typeof entry.node === 'string' &&
+						(entry.fencedWith === undefined || (Array.isArray(entry.fencedWith) && isNameList(entry.fencedWith)))
+				))) &&
 		isNameList(reply.explicit)
 	);
 }

@@ -510,7 +510,8 @@ interface RefreshState {
 	timer?: NodeJS.Timeout;
 	inflight?: Promise<RefreshOutcome>;
 }
-type RefreshOutcome = 'announced' | 'unchanged' | 'failed';
+/** `gone`: the database was forgotten (dropped) while its row was being read. */
+type RefreshOutcome = 'announced' | 'unchanged' | 'failed' | 'gone';
 const refreshState = new Map<string, RefreshState>();
 const REFRESH_RETRY_INITIAL_MS = Number(process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS) || 1_000;
 const REFRESH_RETRY_MAX_MS = REFRESH_RETRY_INITIAL_MS * 30;
@@ -570,7 +571,7 @@ async function readIntoCache(database: string, freshBudget: boolean): Promise<Re
 	state.timer = undefined;
 	if (freshBudget) state.backoff.reset();
 	const current = () => refreshState.get(database)?.token === token;
-	const newer = () => refreshState.get(database)!.inflight!;
+	const newer = (): Promise<RefreshOutcome> | RefreshOutcome => refreshState.get(database)?.inflight ?? 'gone';
 	const before = activeCache.get(database);
 	let outcome: RefreshOutcome = 'unchanged';
 	try {
@@ -659,7 +660,8 @@ async function applyHomesChanged(database: string): Promise<void> {
 			throw new Error(`could not refresh the record lock home map for ${failed.join(', ')} after a default change`);
 		return;
 	}
-	if ((await refreshCache(database, true)) !== 'announced') announceHomesDigest(database);
+	const outcome = await refreshCache(database, true);
+	if (outcome === 'unchanged' || outcome === 'failed') announceHomesDigest(database);
 }
 
 function announceHomesDigest(database: string): void {
@@ -1458,6 +1460,17 @@ function nextOwnerHandoffAttempt(database: string): number {
 	return attempt;
 }
 
+/** Owner entries lost on main stay drain candidates while grants their owners issued can still be live. */
+const releasedOwners = new Map<string, number>();
+function pruneReleasedOwners(): void {
+	const now = performance.now();
+	for (const [database, at] of releasedOwners) if (now - at >= DELEGATION_DRAIN_MS) releasedOwners.delete(database);
+}
+function noteReleasedOwner(database: string): void {
+	pruneReleasedOwners();
+	releasedOwners.set(database, performance.now());
+}
+
 const ownersWithExitHandler = new WeakSet<object>();
 function watchOwnerExit(worker: any): void {
 	if (worker === MAIN_OWNER || ownersWithExitHandler.has(worker)) return;
@@ -1466,6 +1479,7 @@ function watchOwnerExit(worker: any): void {
 		for (const [database, owner] of recordLockOwners) {
 			if (owner !== worker) continue;
 			recordLockOwners.delete(database);
+			noteReleasedOwner(database);
 			// Tell every worker the owner is gone NOW, before the successor is assigned and can grant, so a
 			// surviving relayed handle for this database is fenced fail-closed ahead of any new grant rather
 			// than only after the reassignment broadcast lands (harper-pro#852).
@@ -1701,7 +1715,10 @@ export function recordLockOwnerFor(
 			// lock 503s) rather than confer ownership while a stale incarnation, an unfenced handle or a
 			// dead thread could take it. Retry shortly: a wedged or restarting worker will be back by then,
 			// and a wedged one's exit resolves the fence.
-			if (recordLockOwners.get(database) === PENDING_BUMP) recordLockOwners.delete(database);
+			if (recordLockOwners.get(database) === PENDING_BUMP) {
+				recordLockOwners.delete(database);
+				noteReleasedOwner(database);
+			}
 			logger.warn?.(`Deferring record lock owner reassignment for ${database}`, error);
 			setTimeout(() => {
 				if (ownerHandoffAttempts.get(database) !== attempt) return;
@@ -1720,7 +1737,7 @@ export function releaseRecordLockOwner(database: string): void {
 	const owner = recordLockOwners.get(database);
 	if (!owner) return;
 	recordLockOwners.delete(database);
-	releasedOwners.set(database, performance.now());
+	noteReleasedOwner(database);
 	// A release racing an in-flight handoff bump: deleting the entry (rather than leaving
 	// PENDING_BUMP) is what makes the bump's own completion check see itself superseded and abandon.
 	if (owner === PENDING_BUMP) return;
@@ -1836,11 +1853,8 @@ setHomesDrainReader((database, deadlineMs) => quiesceOnOwner(database, deadlineM
 const REGISTERED_REQUEST_TIMEOUT_MS = 5_000;
 let nextRegisteredRequestId = 1;
 const pendingRegistered = new Map<number, (databases: string[] | undefined) => void>();
-/** Released owners stay drain candidates while grants they issued can still be live. */
-const releasedOwners = new Map<string, number>();
 function ownedOrRecentlyReleased(): string[] {
-	const now = performance.now();
-	for (const [database, at] of releasedOwners) if (now - at >= DELEGATION_DRAIN_MS) releasedOwners.delete(database);
+	pruneReleasedOwners();
 	return [...new Set([...recordLockOwners.keys(), ...releasedOwners.keys()])];
 }
 
