@@ -80,7 +80,7 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 		const dbisDB = scopeStore({ ...excluding('t'), rev: 0, submitted: excluding('t') });
 		// the replicate flip: t is in scope now, and the record keeps the older, narrower scope
 		const widened = recordRequestScope(dbisDB, 7, excluding(), { legacyFull: true });
-		assert.deepStrictEqual(widened, { recorded: excluding('t'), rev: 1 });
+		assert.deepStrictEqual(widened, { recorded: excluding('t'), rev: 1, repaired: false });
 		assert.ok(scopeWidens(widened.recorded, excluding()));
 		assert.deepStrictEqual(
 			dbisDB.writes,
@@ -89,7 +89,7 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 		);
 
 		const narrowed = recordRequestScope(dbisDB, 7, excluding('t', 'u'), { legacyFull: true });
-		assert.deepStrictEqual(narrowed, { recorded: excluding('t'), rev: 2 });
+		assert.deepStrictEqual(narrowed, { recorded: excluding('t'), rev: 2, repaired: false });
 		assert.deepStrictEqual(dbisDB.writes.at(-1), { ...excluding('t', 'u'), rev: 2, submitted: excluding('t', 'u') });
 		assert.strictEqual(recordRequestScope(dbisDB, 7, excluding('t', 'u'), { legacyFull: true }).rev, 2);
 		assert.strictEqual(dbisDB.writes.length, 2, 'an unchanged request writes nothing');
@@ -100,6 +100,7 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 		assert.deepStrictEqual(recordRequestScope(fresh, 7, excluding('t'), { legacyFull: true }), {
 			recorded: excluding('t'),
 			rev: 0,
+			repaired: false,
 		});
 		assert.deepStrictEqual(fresh.writes, [{ ...excluding('t'), rev: 0, submitted: excluding('t') }]);
 
@@ -174,9 +175,14 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 			byDefault: false,
 			tables: [],
 			rev: 0,
+			malformed: true,
 		});
 		assert.deepStrictEqual(readRouteScope(scopeStore({ ...excluding('t'), rev: -1 }), 7).tables, []);
 		assert.strictEqual(readRouteScope(scopeStore(), 7), undefined);
+		// a repair request reports it, so no saved cursor resumes on the revision the repair writes
+		const repair = recordRequestScope(scopeStore({ full: 'yes' }), 7, excluding(), { legacyFull: true });
+		assert.strictEqual(repair.repaired, true);
+		assert.ok(scopeWidens(repair.recorded, excluding()));
 		const unreadable = {
 			getSync() {
 				throw new Error('closed');

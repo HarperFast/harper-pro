@@ -60,7 +60,6 @@ const addNode = (node, peer) =>
 		authorization: peer.admin,
 	});
 
-// B's route to C carries `data` without Skipped; the system database stays whole
 const narrowedRoute = (peer) => ({
 	hostname: peer.hostname,
 	port: 9933,
