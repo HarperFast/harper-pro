@@ -12353,10 +12353,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const version = auditRecord.version;
 						if (!(copiedVersionByOrigin.get(event.nodeId)! >= version))
 							copiedVersionByOrigin.set(event.nodeId, version);
-						if (
-							!(passReservedBounds.get(event.nodeId)! >= version) &&
-							!(committedCopyBounds.get(event.nodeId)! >= version)
-						) {
+						const committed = committedCopyBounds.get(event.nodeId)! >= version;
+						if (!committed && !(passReservedBounds.get(event.nodeId)! >= version)) {
 							const reserved = copyBoundReservation(version, copyModeStartTime);
 							passReservedBounds.set(event.nodeId, reserved);
 							if (!(maxCopiedVersionByOrigin.get(event.nodeId)! >= reserved)) {
@@ -12365,10 +12363,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 						}
 						// the row is applied only behind a committed bound, so admission never sees it uncovered
-						if (
-							!(committedCopyBounds.get(event.nodeId)! >= version) &&
-							(!(await persistCopyBounds()) || wsClosed || connectionSuperseded())
-						) {
+						if (!committed && (!(await persistCopyBounds()) || wsClosed || connectionSuperseded())) {
 							if (!connectionSuperseded()) {
 								wsClosed = true;
 								ws.close(1011, 'Copy bound persistence failed before applying snapshot row');
