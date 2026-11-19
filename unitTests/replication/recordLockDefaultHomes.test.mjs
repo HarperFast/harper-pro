@@ -17,6 +17,7 @@ import {
 	fenceExternal,
 	getRecordLockHomesTable,
 	inheritedFrom,
+	ownRowDatabases,
 	planActivate,
 	planStage,
 	rowKeyOf,
@@ -27,6 +28,7 @@ import {
 } from '#src/replication/recordLockHomes';
 import { applyHomes, planSurvey } from '#src/replication/recordLockApply';
 import { dropNoCoordinatorEntry } from '#src/replication/recordLockRpc';
+import { transaction } from '#src/core/resources/transaction';
 import { getThisNodeName } from '#src/core/server/nodeName';
 import {
 	cachedActiveGeneration,
@@ -297,6 +299,63 @@ describe('a default apply carries every database with a map of its own', functio
 					['x'],
 					`${action} on ${node}`
 				);
+		hops.length = 0;
+		rows.clear();
+		const widened = {
+			...peers,
+			async send(node, operation) {
+				const reply = await peers.send(node, operation);
+				return operation.action === 'stage' && node === 'b'
+					? { ...reply, staged: { ...reply.staged, explicit: ['late', 'x'] } }
+					: reply;
+			},
+		};
+		assert.strictEqual((await applyHomes({ default: true, homes: ['a', 'b'] }, widened)).outcome, 'activated');
+		for (const node of ['a', 'b'])
+			assert.deepStrictEqual(
+				hops.find((hop) => hop.node === node && hop.action === 'activate').explicit,
+				['late', 'x'],
+				`a name another call staged on b reaches the activation on ${node}`
+			);
+	});
+});
+
+describe('what a default apply refuses before it changes anything', function () {
+	const unreached = async () => {
+		throw new Error('no hop should be sent');
+	};
+
+	it('every node this one knows must be surveyed, and a fenced node is not surveyed', async () => {
+		const peers = { self: () => 'a', known: () => ['b', 'c'], send: unreached };
+		await assert.rejects(
+			applyHomes({ default: true, homes: ['a', 'b'] }, peers),
+			/every node this one knows must be surveyed: add c to quiesce/
+		);
+		await assert.rejects(
+			applyHomes(
+				{ default: true, homes: ['a', 'b'], quiesce: ['a', 'b', 'c'], fenced: ['c'], hdb_user: { username: 'op' } },
+				peers
+			),
+			/add c to quiesce without fencing/
+		);
+	});
+
+	it('a survey reply that is not an object is an unanswered node, not a thrown error', async () => {
+		const peers = { self: () => 'a', send: async () => null };
+		await assert.rejects(applyHomes({ default: true, homes: ['a'] }, peers), /malformed survey reply: null/);
+	});
+});
+
+describe('planSurvey over a re-stage that only widens what is staged', () => {
+	it('counts the node as already staged, so an attested interval still covers it', () => {
+		const staged = { ...ring(2, ['a', 'b']), stagedAt: 5, quiesce: ['a', 'b'] };
+		const replies = new Map(
+			['a', 'b'].map((node) => [node, { node, staged, highestActedOn: 2, explicit: [], supportsFenced: true }])
+		);
+		const plan = planSurvey(DEFAULT_HOMES_KEY, ['a', 'b'], ['a', 'b'], undefined, replies, undefined, [], ['x']);
+		assert.strictEqual(plan.action, 'proceed');
+		assert.strictEqual(plan.generation, 2);
+		assert.deepStrictEqual([...plan.alreadyStaged].sort(), ['a', 'b']);
 	});
 });
 
@@ -517,7 +576,18 @@ describe('the default row, on a real table', function () {
 
 	it('activating it marks the databases with rows of their own elsewhere, then every database without one inherits', async () => {
 		await delay(MIN_DRAIN_BACKSTOP_MS + 100);
-		await activateGeneration({ default: true, generation: 1, homes: both, explicit: ['marked'], ...operator });
+		await assert.rejects(
+			activateGeneration({ default: true, generation: 1, homes: both, explicit: ['marked'], ...operator }),
+			/also excludes elsewhere, which this activation does not list/
+		);
+		assert.strictEqual(await ownRow('marked'), undefined, 'a refused activation writes no marker');
+		await activateGeneration({
+			default: true,
+			generation: 1,
+			homes: both,
+			explicit: ['elsewhere', 'marked'],
+			...operator,
+		});
 		for (const database of ['marked', 'elsewhere']) {
 			const marker = await ownRow(database);
 			assert.strictEqual(marker.highestActedOn, 1, database);
@@ -569,6 +639,48 @@ describe('the default row, on a real table', function () {
 		assert.strictEqual(staged.generation, 2);
 		assert.strictEqual((await ownRow('inh-d')).staged.generation, 2);
 		assert.strictEqual(homeMapSourceOf('inh-d'), 'database');
+	});
+
+	it('an audit-only fence row does not detach its database, and a first own map keeps its fences', async () => {
+		const fences = [{ node: 'old', operator: 'op', at: 1 }];
+		await getRecordLockHomesTable().put('fence-only', { database: 'fence-only', highestActedOn: 0, fenced: fences });
+		const row = await currentRow('fence-only');
+		assert.strictEqual(row.inherited, true);
+		assert.ok(!ownRowDatabases().includes('fence-only'));
+		await assert.rejects(
+			stageGeneration({ database: 'fence-only', generation: 2, homes: [self], quiesce: [self], ...operator }),
+			/missing n2/
+		);
+		await stageGeneration({ database: 'fence-only', generation: 2, homes: [self], quiesce: both, ...operator });
+		const own = await ownRow('fence-only');
+		assert.strictEqual(own.staged.generation, 2);
+		assert.deepStrictEqual(own.fenced, fences);
+	});
+
+	it('a row written beside a held lock commits only while that lock holds its lease', async () => {
+		const homes = getRecordLockHomesTable();
+		for (const lapse of [false, true]) {
+			const parentKey = `lease-parent-${lapse}`;
+			const childKey = `lease-child-${lapse}`;
+			const context = {};
+			const locked = await homes.lock(parentKey, { scope: 'node', hold: true, lease: 300, timeout: 5_000 }, context);
+			const commit = transaction(context, async () => {
+				await homes.put(childKey, { database: childKey, highestActedOn: 1, fenced: [] }, context);
+				if (lapse) await delay(500);
+				await locked._writeUpdate(parentKey, { database: parentKey, highestActedOn: 1, fenced: [] }, true, {
+					localOnly: true,
+				});
+				await locked.save();
+			});
+			if (lapse) await assert.rejects(commit, /lease expired/);
+			else await commit;
+			try {
+				await locked.unlock();
+			} catch {}
+			assert.strictEqual(homes.primaryStore.get(childKey)?.highestActedOn, lapse ? undefined : 1, `lapse: ${lapse}`);
+			await homes.delete(childKey);
+			await homes.delete(parentKey);
+		}
 	});
 
 	it('records a fence for an inheriting database on the default, never as a first row of its own', async () => {

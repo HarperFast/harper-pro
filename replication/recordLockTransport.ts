@@ -610,13 +610,16 @@ const HOMES_CHANGED_ACK_TIMEOUT_MS = 2_000;
  * exactly the case this protocol exists to catch (a real pre-push review finding).
  */
 const HOMES_CHANGED_RELAY_TIMEOUT_MS = HOMES_CHANGED_ACK_TIMEOUT_MS + 1_500;
-/** A default change refreshes every database a thread registered, so its leaf bound is larger; both stay under the 30 s row lease. */
+/** A default change refreshes every database a thread registered, so its leaf bound is larger; its relay stays under the default row's 60 s lease. */
 const DEFAULT_CHANGED_ACK_TIMEOUT_MS = 10_000;
 function homesChangedAckTimeout(database: string): number {
 	return database === DEFAULT_HOMES_KEY ? DEFAULT_CHANGED_ACK_TIMEOUT_MS : HOMES_CHANGED_ACK_TIMEOUT_MS;
 }
+/** Main refreshes every database itself before each sibling gets its own leaf bound. */
 function homesChangedRelayTimeout(database: string): number {
-	return homesChangedAckTimeout(database) + HOMES_CHANGED_RELAY_TIMEOUT_MS - HOMES_CHANGED_ACK_TIMEOUT_MS;
+	return database === DEFAULT_HOMES_KEY
+		? 2 * DEFAULT_CHANGED_ACK_TIMEOUT_MS + HOMES_CHANGED_RELAY_TIMEOUT_MS - HOMES_CHANGED_ACK_TIMEOUT_MS
+		: HOMES_CHANGED_RELAY_TIMEOUT_MS;
 }
 let nextHomesChangedRequestId = 1;
 const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
@@ -1850,6 +1853,12 @@ setHomesMembershipReaders({
 			if (shouldReplicateFromNode(node as any, database)) peers.push(node.name);
 		}
 		return peers;
+	},
+	knownNodes() {
+		const self = getThisNodeName();
+		const nodes: string[] = [];
+		for (const node of getHDBNodeTable().search([])) if (node?.name && node.name !== self) nodes.push(node.name);
+		return nodes;
 	},
 });
 

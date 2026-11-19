@@ -89,15 +89,15 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 
 	test('one default apply on two fresh nodes activates in seconds; the node it does not name cannot lock', async () => {
 		const started = Date.now();
-		const { status, body } = await applyDefault(nodes[0], { homes: names.slice(0, 2) });
+		const { status, body } = await applyDefault(nodes[0], { homes: names.slice(0, 2), quiesce: names });
 		assert.equal(status, 200, JSON.stringify(body));
 		assert.equal(body.outcome, 'activated', JSON.stringify(body));
 		assert.equal(body.default, true);
 		assert.equal(body.database, undefined);
 		assert.equal(body.generation, 1);
 		assert.ok(Date.now() - started < 60_000, `took ${Date.now() - started}ms`);
-		for (const name of names.slice(0, 2))
-			assert.equal(body.nodes[name].stage.proven, true, JSON.stringify(body.nodes[name]));
+		for (const name of names) assert.equal(body.nodes[name].stage.proven, true, JSON.stringify(body.nodes[name]));
+		assert.equal(body.nodes[names[2]].role, 'departing');
 		const id = 'default-' + Date.now();
 		await putCounter(nodes[0], id, 0);
 		await waitForCounter(nodes, id, 0);
@@ -209,7 +209,7 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 			},
 			{ timeoutMs: 4_000, pollMs: 100, description: 'the leaver to stop serving the default while it holds the lock' }
 		);
-		// Past the 2 s backstop between the last stage and activation, so a drain that proved early would have activated.
+		// Long enough for an activation after a drain that proved early to have finished (the fixture's backstop is 0).
 		await new Promise((resolve) => setTimeout(resolve, 3_000));
 		assert.equal(settled, false, 'the shrink waits for the held lock to drain');
 		assert.notEqual(
@@ -234,11 +234,12 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(await lockStatus(nodes[2], id), 503, 'the leaver is staged and serves no lock');
 	});
 
-	test('refuses a default change whose list leaves out a member of the current default ring', async () => {
+	test('refuses, before staging anything, a default change that does not survey every known node', async () => {
 		const { status, body } = await applyDefault(nodes[0], { homes: [names[0]] });
 		assert.equal(status, 409, JSON.stringify(body));
 		assert.equal(body.outcome, 'refused');
-		assert.match(body.error, new RegExp(`${names[1]} \\(in .*'s ring\\)`));
+		assert.match(body.error, /every node this one knows must be surveyed/);
+		for (const name of names.slice(1)) assert.match(body.error, new RegExp(name));
 		assert.equal(body.nodes[names[0]].stage, undefined, 'nothing was staged');
 		for (const node of nodes.slice(0, 2)) assert.equal(await lockStatus(node, 'still-' + Date.now()), 200);
 	});

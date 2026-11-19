@@ -34,6 +34,7 @@ import {
 	type RecordLockGenerationState,
 	type RecordLockHomesRow,
 	type StageFence,
+	knownNodeNames,
 } from './recordLockHomes.ts';
 import { principalNodeName, sendRecordLockOperation } from './recordLockRpc.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
@@ -46,8 +47,17 @@ export interface HopTimeouts {
 	hopMs: number;
 	/** A stage also runs the #856 drain on the peer. */
 	stageMs: number;
+	/**
+	 * A default stage or activate on the peer: the row-lock wait (30 s), owner listing (5 s), the
+	 * every-thread fan-out (21.5 s) and, for a stage, the drain.
+	 */
+	defaultMs?: number;
 }
-export const DEFAULT_HOP_TIMEOUTS: HopTimeouts = { hopMs: 15_000, stageMs: STAGE_DRAIN_BUDGET_MS + 15_000 };
+export const DEFAULT_HOP_TIMEOUTS: HopTimeouts = {
+	hopMs: 15_000,
+	stageMs: STAGE_DRAIN_BUDGET_MS + 15_000,
+	defaultMs: STAGE_DRAIN_BUDGET_MS + 65_000,
+};
 /** `quiesce` may name 256 nodes and each hop may open a socket. */
 export const HOP_CONCURRENCY = 16;
 
@@ -338,7 +348,10 @@ function planStages(
 		if (reply.inherited) row.inherited = true;
 		const plan = planStage(row, database, generation, homes, digest, Date.now(), quiesce, explicit, node);
 		if (plan.action === 'reject') return { rejected: node, reason: plan.reason };
-		if (plan.action === 'noop') alreadyStaged.add(node);
+		// A re-stage that only widens what the staged generation records keeps `stagedAt`: the node stopped
+		// granting when it did, so an attested interval still covers it.
+		if (plan.action === 'noop' || (reply.staged && plan.row.staged?.stagedAt === reply.staged.stagedAt))
+			alreadyStaged.add(node);
 	}
 	return { alreadyActive, alreadyStaged };
 }
@@ -446,6 +459,8 @@ export function planActivation(nodes: Record<string, NodeReport>, drained: boole
 
 export interface TransitionPeers {
 	self(): string | undefined;
+	/** Every other node this node's `hdb_nodes` names; a default apply must survey each of them. */
+	known?(): string[];
 	/** Runs `operation` on `node`, locally for this node, and must settle within `timeoutMs`. */
 	send(node: string, operation: TransitionOperation, timeoutMs: number): Promise<any>;
 }
@@ -557,11 +572,21 @@ async function runApply(
 	if (fence) report.fenced = fenced;
 	for (const node of quiesce)
 		report.nodes[node] = { role: fenced.includes(node) ? 'fenced' : homes.includes(node) ? 'home' : 'departing' };
+	if (isDefault) {
+		// A node left out could hold a map of its own for a database the default's homes would then inherit.
+		const unsurveyed = (peers.known?.() ?? []).filter((node) => node !== peers.self() && !live.includes(node));
+		if (unsurveyed.length > 0) {
+			report.reason = `a default home map covers every database, so every node this one knows must be surveyed: add ${unsurveyed.join(', ')} to quiesce without fencing them, or remove_node any that are gone`;
+			throw new ApplyRefusedError(report, 409);
+		}
+	}
+	const stageMs = isDefault ? (timeouts.defaultMs ?? timeouts.stageMs) : timeouts.stageMs;
 	const hop = (node: string, operation: TransitionOperation, ms: number) =>
 		withHopDeadline(peers.send(node, operation, ms), ms, `${node} ${operation.action}`);
 	const survey = async (node: string): Promise<SurveyReply | { error: string }> => {
 		try {
-			return await hop(node, { operation: TRANSITION_OPERATION, ...target, action: 'survey' }, timeouts.hopMs);
+			const reply = await hop(node, { operation: TRANSITION_OPERATION, ...target, action: 'survey' }, timeouts.hopMs);
+			return reply && typeof reply === 'object' ? reply : { error: `malformed survey reply: ${JSON.stringify(reply)}` };
 		} catch (error) {
 			return { error: hopError(error) };
 		}
@@ -644,14 +669,15 @@ async function runApply(
 			return;
 		}
 		try {
-			const reply: StageReply = await hop(node, stage, timeouts.stageMs);
+			const reply: StageReply = await hop(node, stage, stageMs);
+			if (!reply || typeof reply !== 'object') throw new Error(`malformed stage reply: ${JSON.stringify(reply)}`);
 			entry.stage = {
 				action: plan.alreadyStaged.has(node) ? 'noop' : 'staged',
 				quiesced: reply.quiesced,
 				proven: provesQuiescence(reply.quiesced, fenced),
 			};
 			entry.survey = { ...entry.survey, staged: reply.staged };
-			for (const name of reply.explicit ?? []) explicit.add(name);
+			for (const name of [...(reply.explicit ?? []), ...(reply.staged?.explicit ?? [])]) explicit.add(name);
 		} catch (error) {
 			failed = true;
 			entry.stage = { action: 'failed', error: hopError(error) };
@@ -706,7 +732,7 @@ async function runApply(
 			};
 			if (isDefault) activate.explicit = [...explicit].sort();
 			// A default activation also writes markers and refreshes every database on every thread.
-			await hop(node, activate, isDefault ? timeouts.stageMs : timeouts.hopMs);
+			await hop(node, activate, isDefault ? stageMs : timeouts.hopMs);
 			entry.activate = { action: entry.stage?.action === 'already-active' ? 'noop' : 'activated' };
 		} catch (error) {
 			failed = true;
@@ -807,6 +833,7 @@ export async function executeTransition(request: any) {
 
 const productionPeers: TransitionPeers = {
 	self: getThisNodeName,
+	known: knownNodeNames,
 	send(node, operation, timeoutMs) {
 		if (node === getThisNodeName()) return executeTransitionLocally(operation);
 		return sendRecordLockOperation(node, operation.database ?? DEFAULT_HOMES_KEY, operation, timeoutMs);

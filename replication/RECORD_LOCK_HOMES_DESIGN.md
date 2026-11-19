@@ -545,10 +545,14 @@ switched sources.
 
 - **Storage and precedence.** The default is the row `DEFAULT_HOMES_KEY` (`/default`, which no database
   name can be) in the same table, moved only by stage/activate (`record_lock_apply_homes { default:
-true }` or the per-node operations with `default: true`). On a node, a database with a row of its own
-  (active, staged, or a marker with neither) follows it; one with none inherits the default
-  (`resolveEffectiveRow`, `inheritedFrom`). Inheritance is resolved when the cache is filled
+true }` or the per-node operations with `default: true`). On a node, a database with a detaching row of
+  its own (a ring, or a marker's floor; `detaches`) follows it; any other inherits the default
+  (`resolveEffectiveRow`, `inheritedFrom`), so an audit-only fence row detaches nothing, and a default
+  row with no ring is no default (`hasRing`). Inheritance is resolved when the cache is filled
   (`refreshCache`), never on the lock path. Rows are never deleted, so an own row wins for good.
+- **Every node is surveyed.** A default apply refuses unless every node the initiator's `hdb_nodes`
+  names is in `quiesce` and not fenced (`runApply`, `known`): a node left out could hold an own row for a
+  database whose default homes would then inherit it, and both rings would agree.
 - **Digest scope.** `digestFor` hashes a `default` tag first, so a node inheriting a database and a node
   serving it from its own row never agree, even on equal `(generation, homes)`.
 - **One fenced transition moves every inheriting database.** Staging the default retracts all of them in
@@ -556,7 +560,7 @@ true }` or the per-node operations with `default: true`). On a node, a database 
   proves only if every database's drain proves. The drain set is fixed under the default row lock at
   the stage write (`defaultStageScope`): every database main has an owner entry for plus every database
   this thread's catalog replicates (`replicatedDatabaseNames`), minus those with own rows. It is empty
-  only when the node had no default row before (`staged.fresh`) and is in its first incarnation, the
+  only when the node had no default ring before (`staged.fresh`) and is in its first incarnation, the
   fact core's cold-start waiver rests on. Owner-side quiesce builds coordinators first
   (`quiesceOwned`), which core dates from `coordinationStartedMono`; a database with no table has none
   to build and proves only once this thread has coordinated it for a lease (`coordinatedForALease`).
@@ -569,18 +573,24 @@ true }` or the per-node operations with `default: true`). On a node, a database 
   the live default ring inherits X. A per-database apply on an inheriting database plans against the
   effective row, so `planSurvey`'s unlisted check and the local `planStage` force `quiesce` to cover the
   default ring, and its generation is above the default's. A default activation writes a marker
-  (`markExplicitDatabases`) for every database any surveyed or staged node reported an own row for (the
-  activate hop's `explicit` plus `staged.explicit`, which the apply also unions from every surveyed
-  `staged.explicit`), under the default row's lock, after `planActivate` validated the promotion and
-  before its write. A child row commits through its own handle, so each first row and marker re-reads
-  the default and refuses if it moved or if less than `LOCK_LEASE_SKEW_MS` of the default row's lease
-  remains (`guardedBy`); only a pause longer than that skew could land it late. Only a staged default
-  is promoted, so no marked database holds inherited authority there; an already-active default writes
-  none, since that would retract a live map without a drain. Its activation refuses a name it has no
-  row for, and an apply (or the fenced recovery it prints) that finds a home already active at the
-  target without a name the union carries opens the next generation instead of resuming. `resolveEffectiveRow` reads a database's own row again after the default,
-  so a refresh never pairs a pre-marker absence with the default the marker preceded. Nesting order is
-  default → database (`withEffectiveRow`, which `record_lock_fence_external` also takes).
+  (`markerRows`) for every database any surveyed or staged node reported an own row for (the activate
+  hop's `explicit`, which the apply unions from every survey and stage reply's own rows and
+  `staged.explicit`, plus this node's `staged.explicit`; an activation refuses a staged name its list
+  lacks). Only a staged default is promoted, so no marked database holds inherited authority there; an
+  already-active default writes none, since that would retract a live map without a drain. Its
+  activation refuses a name it has no row for, and an apply (or the fenced recovery it prints) that
+  finds a home already active at the target without a name the union carries opens the next generation
+  instead of resuming. `resolveEffectiveRow` reads a database's own row again after the default, so a
+  refresh never pairs a pre-marker absence with the default the marker preceded.
+- **Rows planned under the default lock commit under its lease.** A database without a detaching row is
+  planned under the default row's lock only (`withEffectiveRow`, which `record_lock_fence_external` also
+  takes), and every writer that creates such a row holds that lock, so its presence is stable there.
+  The new row, and every marker, commits in one transaction with a write through the default row's
+  held lock (`writeRows`; a ring-less placeholder when no default row exists), and core's pre-submit
+  fence refuses the whole transaction once that lease lapsed. A child row committed through its own
+  lock could land after another worker moved the default; an off-key write through the locked resource
+  is dropped, not fenced. A database with a detaching row takes only its own lock (default → database
+  is the only nesting order).
 - **Clone lineage.** A row created while a default row exists takes the default's `cloneAttempt`, so a
   re-clone still marks the database ever-recloned (`markReclonedIfLockHistory` reads the effective row).
 - **Fan-out.** A default write sends one acked notice per thread; each thread re-reads every registered
@@ -602,8 +612,9 @@ Why no two maps for a database can be live, by case:
    of the earlier ring, which the survey refuses.
 5. **The relay-only case (harper-pro#1313)** needs a node to create a first map. Here only an apply
    creates one, and agreement needs a direct digest frame on each database's own socket between every
-   pair of ring members, so a relay confers nothing. Two operator lists covering disjoint nodes remain
-   the operator error a per-database apply has.
+   pair of ring members, so a relay confers nothing. A default applied on a subset of the nodes is
+   refused by the survey rule above; a node missing from the initiator's own `hdb_nodes` view
+   (membership lag) remains the operator error a per-database apply has.
 
 A database not replicated by every default-ring member never agrees under the default (503, never two
 maps) and needs a map of its own. The per-node operations stay sharp tools: a leaver can still activate
