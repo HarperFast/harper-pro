@@ -3023,7 +3023,7 @@ describe('Declarative tables keep control and event traffic independent of place
 	const unownedSubscription = (peer, drop) => ({
 		name: peer,
 		replicateByDefault: true,
-		...(drop === 'route-excluded'
+		...(drop.startsWith('route-excluded')
 			? { routeReplicates: { receivesFrom: [{ source: peer, excludeTables: ['Plain'] }] } }
 			: {}),
 	});
@@ -3155,8 +3155,9 @@ describe('Declarative tables keep control and event traffic independent of place
 				}
 			}));
 
-	for (const drop of unownedDrops)
-		it(`a projection that drops a record its route never owed writes no hole and completes (${drop})`, () =>
+	// route-excluded-quiet: a correct sender, which sends the excluded table nothing
+	for (const drop of [...unownedDrops, 'route-excluded-quiet'])
+		it(`a projection that skips a record its route never owed writes no hole, and fills one only if it delivered every table (${drop})`, () =>
 			atCheckpointLevel(async () => {
 				env.setProperty('replication_shards', [0, 1]);
 				const peer = 'slot-control-peer';
@@ -3178,6 +3179,8 @@ describe('Declarative tables keep control and event traffic independent of place
 					]
 				);
 				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				const departed = getIdOfRemoteNode('departed-peer', Records.auditStore);
+				await persistCopyHole(Records.dbisDB, departed, Records.auditStore.rootStore, 'earlier-pass', 1, [departed], 1);
 				const marker = () => Records.dbisDB.getSync([Symbol.for('shardingProjectionComplete'), peerId]);
 				const warnings = [];
 				const originalWarn = logger.warn;
@@ -3189,30 +3192,44 @@ describe('Declarative tables keep control and event traffic independent of place
 					socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
 					socket.emit('message', structureFrame(Plain));
 					socket.emit('message', encode([148, anchor, 1, undefined, { shardingProjection: true }]));
-					socket.emit(
-						'message',
-						recordFrame(
-							Plain,
-							'put',
-							'dropped',
-							{ id: 'dropped', body: 'never applied' },
-							anchor - 1,
-							undefined,
-							drop === 'local-only' ? { extendedType: LOCAL_ONLY } : {}
-						)
-					);
+					if (drop !== 'route-excluded-quiet')
+						socket.emit(
+							'message',
+							recordFrame(
+								Plain,
+								'put',
+								'dropped',
+								{ id: 'dropped', body: 'never applied' },
+								anchor - 1,
+								undefined,
+								drop === 'local-only' ? { extendedType: LOCAL_ONLY } : {}
+							)
+						);
 					socket.emit('message', encode([149]));
 					await until(() => marker() || socket.closes.length);
 					assert.equal(marker()?.anchor, anchor, 'the projection completes');
 					assert.equal(Plain.primaryStore.getEntry('dropped'), undefined);
-					assert.deepEqual(readCopyHoles(Records.dbisDB), [], 'no hole row');
+					assert.deepEqual(
+						readCopyHoles(Records.dbisDB).filter((hole) => hole.peerId === peerId),
+						[],
+						'no hole row of its own'
+					);
 					assert.notEqual(readCopyBounds(Records.dbisDB).get(peerId), HOLE_COPY_BOUND, 'the origin stays admissible');
-					assert.equal(residencyStatus()[database].checkpointHoles, undefined);
+					assert.deepEqual(
+						(residencyStatus()[database].checkpointHoles ?? []).filter((hole) => hole.source === peer),
+						[]
+					);
 					assert.deepEqual(
 						warnings.filter((warning) => warning.includes('checkpoint admission is void')),
 						[]
 					);
-					assert.ok(poisonedPairs(database).includes(`${peer}:Plain`), 'record locks still refuse the pair');
+					assert.equal(
+						readCopyHoles(Records.dbisDB).length,
+						drop === 'local-only' ? 0 : 1,
+						'only a pass that delivered every table fills the hole that stood'
+					);
+					if (drop !== 'route-excluded-quiet')
+						assert.ok(poisonedPairs(database).includes(`${peer}:Plain`), 'record locks still refuse the pair');
 				} finally {
 					logger.warn = originalWarn;
 					env.setProperty('replication_shards', [0]);

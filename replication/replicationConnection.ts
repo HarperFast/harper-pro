@@ -7449,6 +7449,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let updateSendingSubscription: ((data: any) => void) | undefined;
 	// undefined = not yet computed; null = nothing blocked; Map = table name -> why it is dropped.
 	let receiveBlockedTables: Map<string, string> | null | undefined;
+	function receiveRouteExcludedTables(): Set<string> | null {
+		const receivesFromEntries =
+			options.connection?.nodeSubscriptions?.[0]?.routeReplicates?.receivesFrom ??
+			(authorization?.replicates && typeof authorization.replicates === 'object'
+				? authorization.replicates.receivesFrom
+				: undefined);
+		return getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName);
+	}
 	// Discarded on a table replacement, or a pre-fix sender keeps writing into a table that has left
 	// the live map for the life of the socket. Per connection: the receive path also runs on
 	// inbound-only sockets, which never reach the sender-side listener below.
@@ -8017,13 +8025,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const store = auditStore ?? dbAuditStore;
 			const peerId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
-			// a resumed or partial-coverage pass did not re-send what an earlier pass dropped
+			// a resumed pass, or one that did not deliver every table, did not re-send what an earlier pass dropped
 			const filled =
 				passHoles === 0 &&
 				passFilteredRecords === 0 &&
 				passState !== undefined &&
 				!passState.resumed &&
-				(projectionCopy || passState.fullCoverage !== false)
+				(projectionCopy ? !receiveRouteExcludedTables() : passState.fullCoverage !== false)
 					? (passState.holes ?? [])
 					: [];
 			const rootStore = store?.rootStore ?? (dbisDB as any)?.rootStore;
@@ -11951,14 +11959,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// Route exclusions plus this node's non-replicating tables: a backstop for an older
 				// sender that still forwards both. The sender's gate is the enforcement point.
 				if (receiveBlockedTables === undefined) {
-					const firstNode = options.connection?.nodeSubscriptions?.[0];
-					const receivesFromEntries =
-						firstNode?.routeReplicates?.receivesFrom ??
-						(authorization?.replicates && typeof authorization.replicates === 'object'
-							? authorization.replicates.receivesFrom
-							: undefined);
 					const blocked = new Map<string, string>();
-					const routeExcluded = getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName);
+					const routeExcluded = receiveRouteExcludedTables();
 					if (routeExcluded)
 						for (const tableName of routeExcluded) blocked.set(tableName, 'table excluded by the receive route');
 					for (const tableName in tables)
