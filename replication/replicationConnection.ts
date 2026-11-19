@@ -7844,10 +7844,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		{ revision: number; origins: Set<number>; lossKey: number; slot?: (string | number)[] }
 	>();
 	/**
-	 * Which tables every subscription request on this socket left out for the route's own node: only a record of one of
-	 * them was never owed, since a copy or frame names no request and a table redeclared after a request is still owed by
-	 * it. While every request was an explicit list, `names` is their union (everything else was left out); once one
-	 * listed exclusions, `names` is what all of them excluded. Undefined until the first request: nothing is left out.
+	 * Which tables every subscription request on this socket, in every entry the sender could serve, left out: only a
+	 * record of one of them was never owed, since a copy or frame names no request or entry and a table redeclared after a
+	 * request is still owed by it. While every entry was an explicit list, `names` is their union (everything else was
+	 * left out); once one listed exclusions, `names` is what all of them excluded. Undefined until the first request.
 	 */
 	let socketRequestScope: { allowlist: boolean; names: Set<string> } | undefined;
 	const requestsLeftOut = (tableName: string) =>
@@ -11927,7 +11927,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (auditRecord.extendedType & HAS_BLOBS) discardRecordBlobs(auditRecord, tableDecoder);
 					const originId = remoteShortIdToLocalId.get(auditRecord.nodeId);
 					if (
-						!(requestsLeftOut(tableDecoder.name)
+						!(requestsLeftOut(tableDecoder.name) || auditRecord.extendedType & LOCAL_ONLY
 							? await recordUnowedDrop(originId, tableDecoder.name, dropReason)
 							: await recordReplicationHole(
 									originId,
@@ -13697,8 +13697,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
-				if (node === connectedNode) {
-					// tableSubs lists what this request excludes when it replicates by default, else all it asks for
+				if (!(socketRequestScope && !socketRequestScope.allowlist && socketRequestScope.names.size === 0)) {
+					// tableSubs lists what this entry excludes when it replicates by default, else all it asks for
 					const listed = new Set<string>(tableSubs);
 					if (!socketRequestScope) socketRequestScope = { allowlist: !replicateByDefault, names: listed };
 					else if (!replicateByDefault) {
