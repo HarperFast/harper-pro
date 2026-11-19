@@ -77,18 +77,22 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 	});
 
 	it('records a narrowing before the request and judges widening against the scope recorded before it', () => {
-		const dbisDB = scopeStore({ ...excluding('t'), rev: 0 });
+		const dbisDB = scopeStore({ ...excluding('t'), rev: 0, submitted: excluding('t') });
 		// the replicate flip: t is in scope now, and the record keeps the older, narrower scope
 		const widened = recordRequestScope(dbisDB, 7, excluding(), { legacyFull: true });
-		assert.deepStrictEqual(widened, { recorded: excluding('t'), rev: 0 });
+		assert.deepStrictEqual(widened, { recorded: excluding('t'), rev: 1 });
 		assert.ok(scopeWidens(widened.recorded, excluding()));
-		assert.strictEqual(dbisDB.writes.length, 0, 'a widening is written only when a copy completes');
+		assert.deepStrictEqual(
+			dbisDB.writes,
+			[{ ...excluding('t'), rev: 1, submitted: excluding() }],
+			'only a completed copy widens the scope itself'
+		);
 
 		const narrowed = recordRequestScope(dbisDB, 7, excluding('t', 'u'), { legacyFull: true });
-		assert.deepStrictEqual(narrowed, { recorded: excluding('t'), rev: 1 });
-		assert.deepStrictEqual(dbisDB.writes, [{ ...excluding('t', 'u'), rev: 1 }]);
-		assert.strictEqual(recordRequestScope(dbisDB, 7, excluding('t', 'u'), { legacyFull: true }).rev, 1);
-		assert.strictEqual(dbisDB.writes.length, 1, 'an unchanged scope writes nothing');
+		assert.deepStrictEqual(narrowed, { recorded: excluding('t'), rev: 2 });
+		assert.deepStrictEqual(dbisDB.writes.at(-1), { ...excluding('t', 'u'), rev: 2, submitted: excluding('t', 'u') });
+		assert.strictEqual(recordRequestScope(dbisDB, 7, excluding('t', 'u'), { legacyFull: true }).rev, 2);
+		assert.strictEqual(dbisDB.writes.length, 2, 'an unchanged request writes nothing');
 	});
 
 	it('seeds an absent record from the request and an older build’s evidence of partial coverage', () => {
@@ -97,53 +101,42 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 			recorded: excluding('t'),
 			rev: 0,
 		});
-		assert.deepStrictEqual(fresh.writes, [{ ...excluding('t'), rev: 0 }]);
+		assert.deepStrictEqual(fresh.writes, [{ ...excluding('t'), rev: 0, submitted: excluding('t') }]);
 
 		const partialBefore = scopeStore();
 		const { recorded } = recordRequestScope(partialBefore, 7, excluding(), { legacyFull: false });
 		assert.ok(scopeWidens(recorded, excluding()), 'a #1092-era row with fullCoverage: false still widens');
-		assert.deepStrictEqual(partialBefore.writes, [{ ...routeScope(false, true, []), rev: 0 }]);
+		assert.deepStrictEqual(partialBefore.writes, [{ ...routeScope(false, true, []), rev: 0, submitted: excluding() }]);
 	});
 
 	it('keeps only coverage on a route that is not full, which never certifies', () => {
-		const dbisDB = scopeStore({ ...excluding('t'), rev: 2 });
+		const dbisDB = scopeStore({ ...excluding('t'), rev: 2, submitted: excluding('t') });
 		const partial = routeScope(false, true, []);
 		assert.deepStrictEqual(
 			recordRequestScope(dbisDB, 7, partial, { legacyFull: true }).rev,
 			3,
 			'losing coverage is a narrowing'
 		);
-		assert.deepStrictEqual(dbisDB.writes.at(-1), { ...partial, rev: 3 });
-		// a table entering scope on a partial route is tracked without a copy, and is not a narrowing
-		const wider = routeScope(false, true, []);
+		assert.deepStrictEqual(dbisDB.writes.at(-1), { ...partial, rev: 3, submitted: partial });
+		// a table entering scope on a partial route is tracked without a copy
 		const tables = routeScope(false, true, ['u']);
 		recordRequestScope(dbisDB, 7, tables, { legacyFull: true });
-		assert.deepStrictEqual(recordRequestScope(dbisDB, 7, wider, { legacyFull: true }), { recorded: tables, rev: 3 });
+		assert.deepStrictEqual(recordRequestScope(dbisDB, 7, partial, { legacyFull: true }).recorded, tables);
 	});
 
-	it('revises the record when a request narrows what an earlier request on the same socket covered', () => {
-		// a widening request leaves the record and its revision, and the copy it starts carries that revision
-		const tables = scopeStore({ ...excluding('t'), rev: 1 });
-		assert.strictEqual(recordRequestScope(tables, 7, excluding(), { legacyFull: true }).rev, 1);
-		const renarrowed = recordRequestScope(tables, 7, excluding('t'), {
-			legacyFull: true,
-			previousOnSocket: excluding(),
+	it('moves the revision on every change in what is asked for, so no copy begun before it promotes', () => {
+		// worker A asks for the wider scope; a replacement worker then asks for the narrower one the record already holds
+		const dbisDB = scopeStore({ ...excluding('t'), rev: 1, submitted: excluding('t') });
+		const widening = recordRequestScope(dbisDB, 7, excluding(), { legacyFull: true });
+		const handoff = recordRequestScope(dbisDB, 7, excluding('t'), { legacyFull: true });
+		assert.ok(handoff.rev > widening.rev, 'the widening copy must not promote over the narrower request');
+		assert.deepStrictEqual(readRouteScope(dbisDB, 7), {
+			...excluding('t'),
+			rev: handoff.rev,
+			submitted: excluding('t'),
 		});
-		assert.strictEqual(renarrowed.rev, 2, 'the copy must not promote over the narrowing');
-		assert.deepStrictEqual(tables.writes, [{ ...excluding('t'), rev: 2 }]);
-
-		const coverage = scopeStore({ ...routeScope(false, true, []), rev: 1 });
-		recordRequestScope(coverage, 7, excluding(), { legacyFull: true });
-		assert.strictEqual(
-			recordRequestScope(coverage, 7, routeScope(false, true, []), { legacyFull: true, previousOnSocket: excluding() })
-				.rev,
-			2
-		);
-		const unchanged = scopeStore({ ...excluding('t'), rev: 1 });
-		assert.strictEqual(
-			recordRequestScope(unchanged, 7, excluding('t'), { legacyFull: true, previousOnSocket: excluding('t') }).rev,
-			1
-		);
+		// asking again for the same scope leaves the revision, so a copy on that request still promotes
+		assert.strictEqual(recordRequestScope(dbisDB, 7, excluding('t'), { legacyFull: true }).rev, handoff.rev);
 	});
 
 	it('writes the record only while holding the route’s cross-thread lock, and refuses while another thread holds it', () => {
