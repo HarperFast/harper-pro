@@ -7843,6 +7843,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		string,
 		{ revision: number; origins: Set<number>; lossKey: number; slot?: (string | number)[] }
 	>();
+	/**
+	 * The tables every subscription request on this socket left out for the route's own node: only a record of one of
+	 * them was never owed. A copy or frame names no request, and a table redeclared after a request is still owed by it.
+	 */
+	let socketRequestExcludedTables: Set<string> | undefined;
 	/** Highest audit-less copyApply record version applied per origin, bounding floor-only resume. */
 	const maxCopiedVersionByOrigin = new Map<number, number>();
 	/**
@@ -11916,8 +11921,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						dropReason
 					);
 					if (auditRecord.extendedType & HAS_BLOBS) discardRecordBlobs(auditRecord, tableDecoder);
+					const originId = remoteShortIdToLocalId.get(auditRecord.nodeId);
 					if (
-						!(await recordUnowedDrop(remoteShortIdToLocalId.get(auditRecord.nodeId), tableDecoder.name, dropReason)) ||
+						!(socketRequestExcludedTables?.has(tableDecoder.name)
+							? await recordUnowedDrop(originId, tableDecoder.name, dropReason)
+							: await recordReplicationHole(
+									originId,
+									tableDecoder.name,
+									dropReason,
+									Math.max(frameTxnLogKey, auditRecord.version || 0)
+								)) ||
 						connectionSuperseded()
 					)
 						return;
@@ -11936,7 +11949,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						'from',
 						remoteNodeName
 					);
-					if (auditRecord.extendedType & HAS_BLOBS && tableDecoder) discardRecordBlobs(auditRecord, tableDecoder);
 					if (
 						!(await recordUnowedDrop(
 							remoteShortIdToLocalId.get(auditRecord.nodeId),
@@ -13680,6 +13692,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							tableSubs.push(tableName);
 						}
 					}
+				}
+				if (node === connectedNode) {
+					const excluded = replicateByDefault
+						? new Set<string>(tableSubs)
+						: new Set(Object.keys(tables ?? {}).filter((tableName) => !tableSubs.includes(tableName)));
+					if (socketRequestExcludedTables)
+						for (const tableName of socketRequestExcludedTables)
+							if (!excluded.has(tableName)) socketRequestExcludedTables.delete(tableName);
+					socketRequestExcludedTables ??= excluded;
 				}
 
 				const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);

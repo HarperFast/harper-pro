@@ -3065,7 +3065,6 @@ describe('Declarative tables keep control and event traffic independent of place
 						[peer, [peer]],
 					]
 				);
-				// a reservation can outlive the pass that wrote it, so it never carries a hole row
 				const reserved = [];
 				const boundStore = Records.auditStore.rootStore.dbisDb;
 				const putSync = boundStore.putSync;
@@ -3276,7 +3275,39 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.deepEqual(socket.closes, []);
 			}));
 
-	// its genless relay is what clears a downstream route's level-2 qualifiers once it loses coverage
+	it('a record of a table redeclared non-replicating after the request asked for it is still a hole (harper-pro#1213)', () =>
+		atCheckpointLevel(async () => {
+			const peer = 'slot-control-peer';
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+			connection.exclusionOrigins = [peer];
+			let Plain;
+			const { Records, socket } = await connect(
+				false,
+				'live_redeclared',
+				true,
+				checkpointCapabilities(),
+				(database) => {
+					Plain = plainTable(database, 'replicating');
+				},
+				connection
+			);
+			const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+			const peerNode = () => Records.dbisDB.getSync([SEQ, peerId])?.nodes?.find((node) => node.id === peerId);
+			await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			const floor = Date.now() - 1000;
+			socket.emit('message', encode([143, floor + 500, { [peer]: [floor, 'peer-generation', true] }]));
+			await until(() => peerNode()?.originGeneration === 'peer-generation' || socket.closes.length);
+			Plain.replicate = false;
+			socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+			socket.emit('message', structureFrame(Plain));
+			socket.emit('message', recordFrame(Plain, 'put', 'in-flight', { id: 'in-flight' }, Date.now()));
+			await until(() => peerNode()?.hole === true || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			assert.equal(Plain.primaryStore.getEntry('in-flight'), undefined);
+		}));
+
 	it('a route sharding restricts keeps a received floor relayable but never stores level-2 coverage (harper-pro#1214)', () =>
 		atCheckpointLevel(async () => {
 			const peer = 'slot-control-peer';

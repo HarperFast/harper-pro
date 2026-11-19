@@ -347,9 +347,8 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 		const listener = (event) => listener.values.push(event?.value?.value);
 		listener.values = [];
 		const subscription = await T.subscribe({ omitCurrent: true, reportProgress: true, listener });
-		let releaseSource, sendRecertification;
+		let releaseSource;
 		const held = new Promise((resolve) => (releaseSource = resolve));
-		const recertification = new Promise((resolve) => (sendRecertification = resolve));
 		const txnStream = {};
 		const routeUpdate = (floor, routeStates) => {
 			const event = {
@@ -375,7 +374,6 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 					subscribeOnThisThread: () => true,
 					async *subscribe() {
 						yield routeUpdate(floor, [[origin, floor - 1000, undefined, undefined, 'origin-generation']]);
-						yield await recertification;
 						await held;
 					},
 				},
@@ -408,7 +406,6 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 			);
 		} finally {
 			releaseSource();
-			sendRecertification(undefined);
 			subscription.end();
 		}
 	});
