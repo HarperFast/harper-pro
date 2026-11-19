@@ -8362,11 +8362,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!socketRequestScope || socketScopeRev === undefined) return undefined;
 		return { scope: socketRequestScope, scopeRev: socketScopeRev };
 	}
-	/**
-	 * A completed pass's scope becomes the route's unless the route narrowed since the pass began, checked and written
-	 * under the route's scope lock. A held lock throws, and the caller retries the removal. An absent record is the next
-	 * request's to seed.
-	 */
+	/** A held scope lock throws, and the caller retries the removal. An absent record is the next request's to seed. */
 	function promoteRouteScope(pass: CopyPassState): void {
 		if (
 			!pass.marksRoute ||
