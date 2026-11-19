@@ -603,7 +603,7 @@ function unsupportedOperation(error: unknown): boolean {
 	).test(message);
 }
 
-/** Only a peer's `ClientError` ends a drain: its 4xx of any other class is retried, as before answers carried a status. */
+/** By class name, not status: a peer's 4xx of another class was retried before answers carried a status, and still is. */
 function refusedByPeer(error: any): boolean {
 	return /^ClientError\b/.test(String(error?.message ?? ''));
 }

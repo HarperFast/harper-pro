@@ -5760,11 +5760,11 @@ function operationErrorAnswer(requestId: unknown, error: unknown) {
  * from before answers carried one names a refusal by its class alone, and 400 is that class's default.
  */
 function operationAnswerError(answer: { error: unknown; statusCode?: unknown }) {
-	const error: Error & { statusCode?: number } = new Error(
-		typeof answer.error === 'string' ? answer.error : errorToString(answer.error)
-	);
+	// text a peer did not send must not name an error class, which callers match on
+	const text = typeof answer.error === 'string' ? answer.error : 'The peer answered with an error that is not text';
+	const error: Error & { statusCode?: number } = new Error(text);
 	if (isErrorStatus(answer.statusCode)) error.statusCode = answer.statusCode;
-	else if (typeof answer.error === 'string' && /^ClientError\b/.test(answer.error)) error.statusCode = 400;
+	else if (/^ClientError\b/.test(text)) error.statusCode = 400;
 	return error;
 }
 
@@ -8802,7 +8802,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								receiveShardingBootstrap(data, authorization)
 									.then(
 										(response) => answerOperation(data, { ...response, requestId: data.requestId }),
-										(error) => answerOperation(data, operationErrorAnswer(data.requestId, error))
+										(error) => answerOperationError(data, error)
 									)
 									.catch((error) => logger.warn?.('Could not answer private sharding bootstrap request', error));
 								break;
@@ -8818,30 +8818,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								isAuthorizedNode && data?.operation === 'drop_table'
 									? (remoteNodeName ?? authorization.name ?? authorization.username)
 									: undefined;
-							server
-								.operation(data, { user: authorization, replicatedFrom }, !isAuthorizedNode)
-								.then(
-									async (response) => {
-										try {
-											logger.debug?.('Requested request from finished', remoteNodeName, response);
-											// Drain streaming responses (e.g. get_analytics) into a concrete value so this
-											// single replication message can be encoded — see materializeOperationResponse.
-											response = await materializeOperationResponse(response);
-											response.requestId = data.requestId;
-											answerOperation(data, response);
-										} catch (error) {
-											logger.debug?.('Failed encoding operation response for', remoteNodeName, error);
-											answerOperation(data, operationErrorAnswer(data?.requestId, error));
-										}
-									},
-									(error) => {
-										logger.debug?.('Failed requested operation from', remoteNodeName, error);
-										answerOperation(data, operationErrorAnswer(data?.requestId, error));
+							server.operation(data, { user: authorization, replicatedFrom }, !isAuthorizedNode).then(
+								async (response) => {
+									try {
+										logger.debug?.('Requested request from finished', remoteNodeName, response);
+										// Drain streaming responses (e.g. get_analytics) into a concrete value so this
+										// single replication message can be encoded — see materializeOperationResponse.
+										response = await materializeOperationResponse(response);
+										response.requestId = data.requestId;
+										answerOperation(data, response);
+									} catch (error) {
+										logger.debug?.('Failed encoding operation response for', remoteNodeName, error);
+										answerOperationError(data, error);
 									}
-								)
-								.catch((error) => logger.warn?.('Could not answer operation request from', remoteNodeName, error));
+								},
+								(error) => {
+									logger.debug?.('Failed requested operation from', remoteNodeName, error);
+									answerOperationError(data, error);
+								}
+							);
 						} catch (error) {
-							answerOperation(data, operationErrorAnswer(data?.requestId, error));
+							answerOperationError(data, error);
 						}
 						break;
 					case OPERATION_RESPONSE: {
@@ -12826,6 +12823,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return;
 		}
 		ws.send(encode([OPERATION_RESPONSE, answer]));
+	}
+	// Two of its callers are detached promise reactions, where a throw would be an unhandled rejection.
+	function answerOperationError(request, error) {
+		try {
+			answerOperation(request, operationErrorAnswer(request?.requestId, error));
+		} catch (sendError) {
+			logger.warn?.('Could not answer a failed operation request from', remoteNodeName, sendError);
+		}
 	}
 	// Track the blobs being sent, so we can wait for them to finish before sending the next blob.
 	// The same blobs can't be sent concurrently of the packets will get mixed up. The receiving

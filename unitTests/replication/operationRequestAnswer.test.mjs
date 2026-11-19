@@ -337,6 +337,24 @@ describe("an operation error's status across the connection", function () {
 			}
 		});
 
+		it('contains an error answer that cannot be sent: the request ends at its own deadline', async () => {
+			server.operation = () => Promise.reject(new ClientError('the removal was finalized', 409));
+			answererSocket.send = () => {
+				throw new Error('socket write failed');
+			};
+			const unhandled = [];
+			const noteUnhandled = (reason) => unhandled.push(reason);
+			process.on('unhandledRejection', noteUnhandled);
+			try {
+				const error = await rejectionOf(requester.sendOperation({ operation: 'remove_node_fence' }, 200));
+				expect(error.message).to.match(/did not answer within 200ms/);
+			} finally {
+				process.off('unhandledRejection', noteUnhandled);
+			}
+			expect(unhandled).to.deep.equal([]);
+			expect(answererSocket.closes).to.deep.equal([]);
+		});
+
 		it('answers an error whose status throws on read as text, and answers the next operation', async () => {
 			server.operation = () =>
 				Promise.reject(
@@ -413,7 +431,7 @@ describe("an operation error's status across the connection", function () {
 				['ClientError: refused'],
 			]) {
 				const error = await rejectionFor({ error: malformed });
-				expect(error).to.be.an('error');
+				expect(error.message).to.equal('The peer answered with an error that is not text');
 				expect(error, JSON.stringify(malformed)).to.not.have.property('statusCode');
 			}
 			expect(socket.closes).to.deep.equal([]);

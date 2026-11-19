@@ -88,11 +88,11 @@ async function waitForProcessGone(pid) {
 	);
 }
 
-const removeA = (coordinator, target) =>
+const removeA = (coordinator, target, signal) =>
 	postOperation(
 		coordinator,
 		{ operation: 'remove_node', hostname: target.hostname, timeout: 120_000, authorization: coordinator.admin },
-		{ signal: AbortSignal.timeout(150_000) }
+		{ signal: AbortSignal.any([AbortSignal.timeout(150_000), ...(signal ? [signal] : [])]) }
 	);
 
 suite('power loss on a node that is being removed', { timeout: 900_000 }, (ctx) => {
@@ -206,8 +206,8 @@ suite('power loss on a node that is being removed', { timeout: 900_000 }, (ctx) 
 		await writeFile(join(reportHoldDir, 'release'), '');
 		let removal;
 		await waitForCondition(
-			async () => {
-				removal = await removeA(nodeB, nodeA);
+			async (signal) => {
+				removal = await removeA(nodeB, nodeA, signal);
 				if (removal.status === 200) return true;
 				assert.match(JSON.stringify(removal.body), RECOVERING, `an unexpected refusal: ${JSON.stringify(removal)}`);
 				return false;
