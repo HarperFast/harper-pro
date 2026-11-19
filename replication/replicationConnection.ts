@@ -23,7 +23,6 @@ import {
 	admitsShardedCopy,
 	publishShardingCertificate,
 	shardingCursorAdmission,
-	peerHasShardingCertificate,
 	recordShardingWait,
 } from './shardingRecovery.ts';
 import { HAS_RESIDENCY_SLOT, FULL_WRITE_HEAD } from '../core/resources/RecordEncoder.ts';
@@ -7997,7 +7996,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		try {
 			const { auditStore: dbAuditStore, dbisDB } = getDatabaseStores();
 			const store = auditStore ?? dbAuditStore;
-			if (!dbisDB) return false;
+			if (!dbisDB?.put) return false;
 			const peerId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
 			const rootStore = store?.rootStore ?? (dbisDB as any)?.rootStore;
@@ -10602,18 +10601,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								};
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
-								// captured with the floors, so emission compares against what capture saw and reads no catalog
-								let relayAgreement: string | undefined;
 								const originCertifies = (name: string): number => {
-									const status = getReplicationSharedStatus(auditStore, databaseName, name);
-									const level = status[PEER_CERTIFIES_FLOORS_POSITION];
-									if (!(level >= 1)) return 0;
-									// core keeps a stored `relayable` until the floor rises, so a link sharding has since restricted
-									// is checked here
-									return relayAgreement === undefined ||
-										peerHasShardingCertificate(status, getResidencyConfiguration().shard, relayAgreement)
-										? level
-										: 0;
+									const level = getReplicationSharedStatus(auditStore, databaseName, name)[
+										PEER_CERTIFIES_FLOORS_POSITION
+									];
+									return level >= 1 ? level : 0;
 								};
 								const captureOriginFloors = (): Map<string, OriginCertificate> | undefined => {
 									let floors: Map<string, OriginCertificate> | undefined;
@@ -10639,7 +10631,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											}
 											const { dbisDB } = names.length > 0 ? getDatabaseStores() : ({} as any);
 											if (dbisDB) {
-												relayAgreement = shardingSourceAgreement(databaseName);
 												const seqRows = collectSeqRows(
 													dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([0xff])] })
 												);

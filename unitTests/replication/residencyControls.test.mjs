@@ -54,12 +54,7 @@ import {
 	settleCopyBounds,
 } from '#src/replication/replicationConnection';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
-import { getHDBNodeTable, getReplicationSharedStatus } from '#src/replication/knownNodes';
-import {
-	CONNECTION_STATE_POSITION,
-	CONNECTION_STATE_CONNECTED,
-	PEER_CERTIFIES_FLOORS_POSITION,
-} from '#src/replication/sharedStatusSlots';
+import { getHDBNodeTable } from '#src/replication/knownNodes';
 import { residencyTopologyErrors, registerResidencySender, residencyStatus } from '#src/replication/residencyTopology';
 import { FrameWriter } from '#src/replication/frameWriter';
 import { advanceShardingHistory } from '#src/replication/shardingBootstrapState';
@@ -68,7 +63,6 @@ import {
 	shardingSourceAgreement,
 	shardingCertificate,
 	certifyShardingCopy,
-	publishShardingCertificate,
 } from '#src/replication/shardingRecovery';
 import { hasActiveBlobSends } from '#src/replication/blobSendDrain';
 import { poisonedPairs } from '#src/replication/recordLockPoison';
@@ -3071,7 +3065,7 @@ describe('Declarative tables keep control and event traffic independent of place
 						[peer, [peer]],
 					]
 				);
-				// what this pass reserves: an abandoned reservation outlives the hole's release, so it must not carry it
+				// a reservation can outlive the pass that wrote it, so it never carries a hole row
 				const reserved = [];
 				const boundStore = Records.auditStore.rootStore.dbisDb;
 				const putSync = boundStore.putSync;
@@ -3306,49 +3300,6 @@ describe('Declarative tables keep control and event traffic independent of place
 			assert.deepEqual(socket.closes, []);
 			assert.equal(peerNode().relayable, false, 'a restricted route relays nothing');
 			assert.notEqual(peerNode().fullCoverage, true);
-		}));
-
-	it('relays a stored floor only from an origin whose link sharding does not restrict (harper-pro#1214)', () =>
-		atCheckpointLevel(async () => {
-			const priorNodes = server.nodes;
-			server.nodes = [{ name: 'slot-control-peer', replicates: true }];
-			try {
-				const { Records, socket, database } = await connect(false, 'relay_gate', false, checkpointCapabilities());
-				const version = Date.now();
-				const floor = version + 1;
-				const origins = { 'relay-gate-allowed': false, 'relay-gate-restricted': true };
-				for (const [origin, restricted] of Object.entries(origins)) {
-					const originId = getIdOfRemoteNode(origin, Records.auditStore);
-					const context = { source: {}, sourceApply: true, timestamp: version };
-					await transaction(context, async () => {
-						const row = await Records.getResource(origin, context);
-						return row._writeInvalidate(origin, { id: origin, region: 1 }, { nodeId: originId, version });
-					});
-					await Records.dbisDB.put([SEQ, originId], {
-						seqId: floor,
-						nodes: [{ id: originId, closedFloor: floor, relayable: true }],
-					});
-					const status = getReplicationSharedStatus(Records.auditStore, database, origin);
-					status[PEER_CERTIFIES_FLOORS_POSITION] = 1;
-					status[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
-					publishShardingCertificate(
-						status,
-						restricted ? 1 : 0,
-						restricted ? undefined : shardingSourceAgreement(database)
-					);
-				}
-				socket.emit(
-					'message',
-					encode([129, [{ name: server.hostname, startTime: version, tables: [], replicateByDefault: true }], []])
-				);
-				const relayed = (origin) =>
-					socket.sent.some((frame) => frame[0] === 143 && frame[2] && Object.hasOwn(frame[2], origin));
-				await until(() => relayed('relay-gate-allowed') || socket.closes.length);
-				assert.deepEqual(socket.closes, []);
-				assert.equal(relayed('relay-gate-restricted'), false);
-			} finally {
-				server.nodes = priorNodes;
-			}
 		}));
 
 	async function waitForOwnReservation(Records, peerId) {
