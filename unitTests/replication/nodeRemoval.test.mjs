@@ -208,6 +208,41 @@ describe('drainNode', () => {
 		assert.equal(refused.calls.length, 1);
 	});
 
+	// what the operation connection rejects with: the peer's rendered error, and the status the peer sent
+	const peerError = (text, statusCode) => Object.assign(new Error(text), { statusCode });
+
+	it("refuses at once on a peer's ClientError, with that peer's status", async () => {
+		const refused = transport(() => {
+			throw peerError('ClientError: leaving is the only owner of shard 1 of database data', 409);
+		});
+		await assert.rejects(
+			drainNode('leaving', {}, 60_000, refused, async () => ({})),
+			(error) => {
+				assert.equal(error.statusCode, 409);
+				assert.match(error.message, /only owner of shard 1/);
+				return true;
+			}
+		);
+		assert.equal(refused.calls.length, 1);
+	});
+
+	it('keeps trying a peer whose error is not a ClientError, whatever its status', async () => {
+		const answers = [
+			peerError('HdbError: not permitted', 403),
+			peerError(`FenceLockTimeout: Timed out waiting for another ${FENCE_OPERATION} on this node to finish`, 503),
+		];
+		let fences = 0;
+		const send = transport((node, operation) => {
+			if (operation.operation !== FENCE_OPERATION) return { databases: { data: holds } };
+			if (operation.finalize) return { ...fence(), state: 'removing' };
+			if (fences++ < answers.length) throw answers[fences - 1];
+			return fence();
+		});
+		const result = await drainNode('leaving', {}, 20_000, send, async (peer) => ({ name: peer }));
+		assert.equal(result.state, 'removing');
+		assert.equal(fences, answers.length + 1);
+	});
+
 	it('waits only for peers that receive the database from the node, and counts those that hold its writes', async () => {
 		const send = transport((node, operation) => {
 			if (operation.operation === FENCE_OPERATION)
@@ -339,7 +374,7 @@ describe('drainNode', () => {
 		let fences = 0;
 		const send = transport((node, operation) => {
 			if (operation.operation === FENCE_OPERATION) {
-				if (operation.finalize && fences === 1) throw new Error('ClientError: fence changed');
+				if (operation.finalize && fences === 1) throw peerError('ClientError: fence changed', 409);
 				if (!operation.finalize) fences++;
 				return operation.finalize ? { ...fence(), state: 'removing' } : fence();
 			}

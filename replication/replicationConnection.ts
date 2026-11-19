@@ -5736,6 +5736,37 @@ function configuredPeerIdentity(
 	return canonical;
 }
 
+const isErrorStatus = (status: unknown): status is number =>
+	Number.isInteger(status) && (status as number) >= 400 && (status as number) <= 599;
+
+/** The answer to an OPERATION_REQUEST that failed: the rendered error, and its HTTP status when it has one. */
+function operationErrorAnswer(requestId: unknown, error: unknown) {
+	const answer: { requestId: unknown; error: string; statusCode?: number } = {
+		requestId,
+		error: errorToString(error),
+	};
+	try {
+		const statusCode = (error as { statusCode?: unknown })?.statusCode;
+		if (isErrorStatus(statusCode)) answer.statusCode = statusCode;
+	} catch {
+		// a getter that throws must not cost the requester its answer
+	}
+	return answer;
+}
+
+/**
+ * The rejection for an error answer. The operations API reports `statusCode` as the HTTP status, so only an error
+ * status is taken from a peer. A peer from before answers carried one names a refusal by its class alone, and 400
+ * is that class's default.
+ */
+function operationAnswerError(answer: { error: unknown; statusCode?: unknown }) {
+	const text = typeof answer.error === 'string' ? answer.error : errorToString(answer.error);
+	const error: Error & { statusCode?: number } = new Error(text);
+	if (isErrorStatus(answer.statusCode)) error.statusCode = answer.statusCode;
+	else if (/^ClientError\b/.test(text)) error.statusCode = 400;
+	return error;
+}
+
 /**
  * This handles both incoming and outgoing WS allowing either one to issue a subscription and get replication and/or handle subscription requests
  */
@@ -8770,7 +8801,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								receiveShardingBootstrap(data, authorization)
 									.then(
 										(response) => answerOperation(data, { ...response, requestId: data.requestId }),
-										(error) => answerOperation(data, { requestId: data.requestId, error: errorToString(error) })
+										(error) => answerOperation(data, operationErrorAnswer(data.requestId, error))
 									)
 									.catch((error) => logger.warn?.('Could not answer private sharding bootstrap request', error));
 								break;
@@ -8797,23 +8828,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										answerOperation(data, response);
 									} catch (error) {
 										logger.debug?.('Failed encoding operation response for', remoteNodeName, error);
-										answerOperation(data, { requestId: data?.requestId, error: errorToString(error) });
+										answerOperation(data, operationErrorAnswer(data?.requestId, error));
 									}
 								},
 								(error) => {
 									logger.debug?.('Failed requested operation from', remoteNodeName, error);
-									answerOperation(data, { requestId: data?.requestId, error: errorToString(error) });
+									answerOperation(data, operationErrorAnswer(data?.requestId, error));
 								}
 							);
 						} catch (error) {
-							answerOperation(data, { requestId: data?.requestId, error: errorToString(error) });
+							answerOperation(data, operationErrorAnswer(data?.requestId, error));
 						}
 						break;
 					case OPERATION_RESPONSE: {
 						const pending = awaitingResponse.get(data.requestId);
 						logger.debug?.('Received completed operation request', remoteNodeName, data);
 						if (!pending) break;
-						if (data.error) pending.reject(new Error(data.error));
+						if (data.error) pending.reject(operationAnswerError(data));
 						else pending.resolve(data);
 						awaitingResponse.delete(data.requestId);
 						break;

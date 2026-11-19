@@ -140,6 +140,8 @@ The wait has a limit (`timeout`, five minutes by default). When it runs out, the
 
 In the last five cases the node accepts local writes again, even when an earlier `remove_node` that timed out left it fenced, unless that removal was finalized.
 
+A refusal returns `409` when the cluster has to change before the removal can proceed (a shard's only owner, writes the node's peers have yet to return, a database no peer receives) and `400` otherwise. The status is the same whichever node receives the `remove_node` request.
+
 A node that restarts that way while fenced lifts its own fence at startup, unless its removal was finalized. A returned write is applied as one of the node's own, which a fence would refuse, and the node then sends it to the peers that never received it. Run `remove_node` again: it is refused until every peer has returned the node's writes, which usually takes seconds but waits for a peer that is down. In a database with both sharded and ordinary tables a peer on another shard is never asked, so a node's removal there needs `force` from its first such start onward.
 
 `force: true` removes the node without fencing or waiting. Writes that only that node held are lost. Use it for a node that is permanently down.

@@ -603,8 +603,13 @@ function unsupportedOperation(error: unknown): boolean {
 	).test(message);
 }
 
+/** A peer's answer names its error's class in its text: a `ClientError` is its refusal, whatever status it carries. */
+function refusedByPeer(error: any): boolean {
+	return /^ClientError\b/.test(String(error?.message ?? ''));
+}
+
 function isRefusal(error: any): boolean {
-	return (error?.statusCode >= 400 && error.statusCode < 500) || /^ClientError\b/.test(String(error?.message ?? ''));
+	return (error?.statusCode >= 400 && error.statusCode < 500) || refusedByPeer(error);
 }
 
 const errorText = (error: unknown) => String((error as Error)?.message ?? error);
@@ -659,7 +664,7 @@ export async function drainNode(
 					`${name} runs a version that cannot drain its writes before removal; upgrade it, or use force: true to remove it without draining`,
 					400
 				);
-			if (local || isRefusal(error)) throw error;
+			if (local || refusedByPeer(error)) throw error;
 			// a live node that cannot be reached may still hold writes no peer has: keep trying until the budget ends
 			unreachable = `${name} could not be reached to fence it (${errorText(error)})`;
 			await pause();
