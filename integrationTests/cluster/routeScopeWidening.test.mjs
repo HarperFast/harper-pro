@@ -164,7 +164,6 @@ suite(
 	{ timeout: SUITE_TIMEOUT_MS },
 	(ctx) => {
 		before(async () => {
-			// every node that started is kept for teardown, even when another failed to
 			const started = await Promise.allSettled([
 				startNewNode(ctx.name),
 				startNewNode(ctx.name),
