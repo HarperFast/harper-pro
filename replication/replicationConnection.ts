@@ -309,6 +309,7 @@ import {
 	routeScope,
 	sameScope,
 	scopeWidens,
+	withRouteScopeLock,
 	writeRouteScope,
 	type RouteScope,
 } from './routeScope.ts';
@@ -3620,13 +3621,15 @@ function withoutRefusedCertifications(
 	let retry = marks;
 	for (const [originId, entry] of marks) {
 		const [, certifiedFrom, partialHistory, , gen] = entry.mark;
-		if (typeof certifiedFrom !== 'number' || partialHistory !== undefined || entry.clearCertifiedFirst) continue;
+		if (typeof certifiedFrom !== 'number' || partialHistory === true) continue;
+		// a clear coalesced with the certification lands first, so the row's partial mark does not refuse it
+		const coalesced = partialHistory === false || entry.clearCertifiedFirst;
 		const node = peerNodes.find((n: any) => n?.id === originId);
 		if (
 			!node ||
 			(node.fullCoverage !== false &&
 				(gen === undefined || node.originGeneration === gen) &&
-				node.partialHistory !== true &&
+				(coalesced || node.partialHistory !== true) &&
 				node.floorRevoked !== true &&
 				node.hole !== true)
 		)
@@ -3634,7 +3637,7 @@ function withoutRefusedCertifications(
 		if (retry === marks) retry = new Map(marks);
 		const mark = [...entry.mark] as OriginRouteState;
 		mark[1] = undefined;
-		if (mark[3] === true || mark[5] === true) retry.set(originId, { ...entry, mark });
+		if (coalesced || mark[3] === true || mark[5] === true) retry.set(originId, { ...entry, mark });
 		else retry.delete(originId);
 	}
 	return retry;
@@ -8359,8 +8362,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return { scope: socketRequestScope, scopeRev: socketScopeRev };
 	}
 	/**
-	 * A completed pass's scope becomes the route's unless the route narrowed since the pass began. Synchronous, so no
-	 * narrowing can land between the revision check and the write. An absent record is the next request's to seed.
+	 * A completed pass's scope becomes the route's unless the route narrowed since the pass began, checked and written
+	 * under the route's scope lock. A held lock throws, and the caller retries the removal. An absent record is the next
+	 * request's to seed.
 	 */
 	function promoteRouteScope(pass: CopyPassState): void {
 		if (
@@ -8374,9 +8378,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		)
 			return;
 		const { dbisDB } = getDatabaseStores();
-		const recorded = readRouteScope(dbisDB, pass.routeId);
-		if (!recorded || recorded.rev !== pass.scopeRev || sameScope(recorded, pass.scope)) return;
-		writeRouteScope(dbisDB, pass.routeId, { ...pass.scope, rev: recorded.rev });
+		const { routeId, scope, scopeRev } = pass;
+		withRouteScopeLock(dbisDB, routeId, () => {
+			const recorded = readRouteScope(dbisDB, routeId);
+			if (!recorded || recorded.rev !== scopeRev || sameScope(recorded, scope)) return;
+			writeRouteScope(dbisDB, routeId, { ...scope, rev: recorded.rev });
+		});
 	}
 	function tryRestoreCopyPass(pass: CopyPassState | undefined, eventForImmediateTake?: any, deferFlush = false): void {
 		// the marks are shared with a replacement connection, whose own pass owns them now
@@ -8460,7 +8467,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						pendingRouteState.partialHistory(id, true, gen);
 					}
 				}
-				if (holedOrigins.has(id)) {
+				if (holedOrigins.has(id) && !provisionalHoles.has(id)) {
 					const holedGen = holedOrigins.get(id);
 					if (
 						holedGen !== undefined &&
@@ -9415,7 +9422,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							startTime: data,
 							resumed: copyWasResumed,
 							resumedWithWidening: copyResumedWithWidening,
-							fullCoverage: options.connection?.routeFullCoverage !== false,
+							fullCoverage: options.connection?.routeFullCoverage !== false && !coverageNarrowedOnSocket,
 							seqDurableAtCopyStart: false,
 							completeReceived: false,
 							finalized: false,
@@ -12153,9 +12160,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const copyFrameStartTime = copyModeStartTime;
 			const copyFrameOrder = copyModeOrderVersion;
 			const copyFrameWidened = Boolean(
-				currentCopyPass?.resumedWithWidening || options.connection?.routeFullCoverage === false
+				currentCopyPass?.resumedWithWidening ||
+				options.connection?.routeFullCoverage === false ||
+				coverageNarrowedOnSocket
 			);
-			const copyFrameFullCoverage = options.connection?.routeFullCoverage !== false;
+			const copyFrameFullCoverage = options.connection?.routeFullCoverage !== false && !coverageNarrowedOnSocket;
 			const copyFrameScope = currentCopyPass?.scope;
 			const copyFrameScopeRev = currentCopyPass?.scopeRev;
 			const copyFrameSupportsCheckpoints = messageIsCopyFrame && copyApplyActive() && supportsCheckpointFloors();
@@ -13967,11 +13976,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!routeNode || origins.includes(routeNode) || routeId === undefined) return;
 		coverageNarrowedOnSocket = true;
 		if (socketRequestScope) socketRequestScope = { ...socketRequestScope, full: false };
+		if (currentCopyPass && !currentCopyPass.finalized) currentCopyPass.fullCoverage = false;
 		try {
 			const { dbisDB } = getDatabaseStores();
-			const recorded = readRouteScope(dbisDB, routeId);
-			// a new revision even on a partial record: a copy that began before this must not promote over it
-			if (recorded) writeRouteScope(dbisDB, routeId, { ...recorded, full: false, rev: recorded.rev + 1 });
+			withRouteScopeLock(dbisDB, routeId, () => {
+				const recorded = readRouteScope(dbisDB, routeId);
+				// a new revision even on a partial record: a copy that began before this must not promote over it
+				if (recorded) writeRouteScope(dbisDB, routeId, { ...recorded, full: false, rev: recorded.rev + 1 });
+			});
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not record the route scope for', databaseName, error);
 			wsClosed = true;
@@ -13979,6 +13991,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	function sendSubscriptionRequestUpdate() {
+		if (wsClosed || connectionSuperseded()) return;
 		refreshShardingAdmission();
 		// once we have received the node name, and we know the database name that this connection is for,
 		// we can send a subscription request, if no other threads have subscribed.
@@ -14194,7 +14207,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (state.hole === true) {
 						holedOrigins.set(state.id, stateGen);
 						provisionalHoles.delete(state.id);
-					} else if (holedOrigins.has(state.id)) {
+					} else if (holedOrigins.has(state.id) && !provisionalHoles.has(state.id)) {
 						const holedGen = holedOrigins.get(state.id);
 						if (holedGen !== undefined && stateGen !== undefined && stateGen !== holedGen) {
 							holedOrigins.delete(state.id);
@@ -14300,6 +14313,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							};
 							cursorScope = undefined;
 							freshCopyRequired = true;
+							socketRequestScope = current;
 							try {
 								dbisDB
 									?.put?.([Symbol.for('copyCursor'), nodeId], copyCursor)
@@ -14312,6 +14326,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						} else if (fullCoverage && (widened || persistedPartial) && !copyCursor) {
 							forceFullCopyOnWidening = true;
 							freshCopyRequired = true;
+							socketRequestScope = current;
 							requestIsCopy = true;
 							logger.warn?.(
 								connectionId,

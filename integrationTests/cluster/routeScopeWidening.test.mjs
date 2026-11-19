@@ -164,11 +164,15 @@ suite(
 	{ timeout: SUITE_TIMEOUT_MS },
 	(ctx) => {
 		before(async () => {
-			[ctx.A, ctx.B, ctx.C] = await Promise.all([
+			// every node that started is kept for teardown, even when another failed to
+			const started = await Promise.allSettled([
 				startNewNode(ctx.name),
 				startNewNode(ctx.name),
 				startNewNode(ctx.name),
 			]);
+			[ctx.A, ctx.B, ctx.C] = started.map((result) => result.value);
+			const failed = started.find((result) => result.status === 'rejected');
+			if (failed) throw failed.reason;
 			const { A, B, C } = ctx;
 			await Promise.all([A, B, C].map((node) => deploy(node, false, false)));
 			await addNode(A, B);

@@ -204,6 +204,32 @@ describe('route-state facts keyed by generation and connection (harper-pro#1145)
 		}
 	});
 
+	it('keeps a clear coalesced with a refused certification in the retry, less the certification', () => {
+		const routeState = new PendingRouteState(() => {});
+		routeState.partialHistory(1, true, 'g1');
+		routeState.partialHistory(1, false, 'g1');
+		routeState.certifiedFrom(1, 100, 'g1');
+		routeState.hole(2, 'g2');
+		const event = { remoteNodeIds: [1] };
+		routeState.takeInto(event);
+		const row = [
+			{ id: 1, originGeneration: 'g1', fullCoverage: false },
+			{ id: 2, originGeneration: 'g2' },
+		];
+		assert.strictEqual(
+			routeState.verifyPersisted(() => row, event),
+			false
+		);
+		const retry = { remoteNodeIds: [1] };
+		routeState.takeInto(retry);
+		assert.ok(
+			retry.originRouteStates.every(([id, certifiedFrom]) => id !== 1 || certifiedFrom === undefined),
+			JSON.stringify(retry.originRouteStates)
+		);
+		assert.ok(retry.originRouteStates.some(([id, , partialHistory]) => id === 1 && partialHistory === false));
+		assert.ok(retry.originRouteStates.some(([id, , , hole]) => id === 2 && hole === true));
+	});
+
 	it('writes no certification captured before a new request when its commit runs after it', async () => {
 		const routeState = new PendingRouteState();
 		routeState.certifiedFrom(5, 200, 'g5');
