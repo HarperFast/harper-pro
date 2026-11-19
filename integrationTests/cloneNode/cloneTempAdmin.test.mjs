@@ -128,8 +128,7 @@ suite('Clone Node - temporary admin', SUITE_OPTIONS, (ctx) => {
 			[],
 			`${tokenClone.hostname} records a replication hole in system`
 		);
-		// the leader is then the joiner's only source for the deletion; the token clone keeps its address until
-		// teardown, since a joiner on that address would take its node name
+		// torn down only in after(): a joiner on its freed address would take its node name
 		await killHarper(
 			contexts.find((context) => context.harper === tokenClone),
 			{ graceMs: 30_000 }
