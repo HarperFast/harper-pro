@@ -3300,6 +3300,9 @@ describe('Declarative tables keep control and event traffic independent of place
 			socket.emit('message', encode([143, floor + 500, { [peer]: [floor, 'peer-generation', true] }]));
 			await until(() => peerNode()?.originGeneration === 'peer-generation' || socket.closes.length);
 			Plain.replicate = false;
+			// a later request that excludes the table cannot vouch for rows the first one asked for
+			connection.emit('subscriptions-updated');
+			await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
 			socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
 			socket.emit('message', structureFrame(Plain));
 			socket.emit('message', recordFrame(Plain, 'put', 'in-flight', { id: 'in-flight' }, Date.now()));

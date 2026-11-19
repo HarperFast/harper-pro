@@ -7844,10 +7844,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		{ revision: number; origins: Set<number>; lossKey: number; slot?: (string | number)[] }
 	>();
 	/**
-	 * The tables every subscription request on this socket left out for the route's own node: only a record of one of
-	 * them was never owed. A copy or frame names no request, and a table redeclared after a request is still owed by it.
+	 * Which tables every subscription request on this socket left out for the route's own node: only a record of one of
+	 * them was never owed, since a copy or frame names no request and a table redeclared after a request is still owed by
+	 * it. While every request was an explicit list, `names` is their union (everything else was left out); once one
+	 * listed exclusions, `names` is what all of them excluded. Undefined until the first request: nothing is left out.
 	 */
-	let socketRequestExcludedTables: Set<string> | undefined;
+	let socketRequestScope: { allowlist: boolean; names: Set<string> } | undefined;
+	const requestsLeftOut = (tableName: string) =>
+		socketRequestScope !== undefined && socketRequestScope.allowlist !== socketRequestScope.names.has(tableName);
 	/** Highest audit-less copyApply record version applied per origin, bounding floor-only resume. */
 	const maxCopiedVersionByOrigin = new Map<number, number>();
 	/**
@@ -11923,7 +11927,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (auditRecord.extendedType & HAS_BLOBS) discardRecordBlobs(auditRecord, tableDecoder);
 					const originId = remoteShortIdToLocalId.get(auditRecord.nodeId);
 					if (
-						!(socketRequestExcludedTables?.has(tableDecoder.name)
+						!(requestsLeftOut(tableDecoder.name)
 							? await recordUnowedDrop(originId, tableDecoder.name, dropReason)
 							: await recordReplicationHole(
 									originId,
@@ -13694,13 +13698,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 				}
 				if (node === connectedNode) {
-					const excluded = replicateByDefault
-						? new Set<string>(tableSubs)
-						: new Set(Object.keys(tables ?? {}).filter((tableName) => !tableSubs.includes(tableName)));
-					if (socketRequestExcludedTables)
-						for (const tableName of socketRequestExcludedTables)
-							if (!excluded.has(tableName)) socketRequestExcludedTables.delete(tableName);
-					socketRequestExcludedTables ??= excluded;
+					// tableSubs lists what this request excludes when it replicates by default, else all it asks for
+					const listed = new Set<string>(tableSubs);
+					if (!socketRequestScope) socketRequestScope = { allowlist: !replicateByDefault, names: listed };
+					else if (!replicateByDefault) {
+						if (socketRequestScope.allowlist) for (const name of listed) socketRequestScope.names.add(name);
+						else for (const name of listed) socketRequestScope.names.delete(name);
+					} else if (socketRequestScope.allowlist) {
+						const asked = socketRequestScope.names;
+						socketRequestScope = { allowlist: false, names: new Set([...listed].filter((name) => !asked.has(name))) };
+					} else {
+						for (const name of socketRequestScope.names) if (!listed.has(name)) socketRequestScope.names.delete(name);
+					}
 				}
 
 				const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
