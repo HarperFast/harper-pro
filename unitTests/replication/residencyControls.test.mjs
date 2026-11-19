@@ -3310,6 +3310,48 @@ describe('Declarative tables keep control and event traffic independent of place
 			assert.equal(Plain.primaryStore.getEntry('in-flight'), undefined);
 		}));
 
+	it('a request sent while the socket is closing leaves its scope unchanged (harper-pro#1213)', () =>
+		atCheckpointLevel(async () => {
+			const peer = 'slot-control-peer';
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [unownedSubscription(peer, 'non-replicating')];
+			connection.exclusionOrigins = [peer];
+			let Plain;
+			const { Records, socket } = await connect(
+				false,
+				'closing_widening',
+				true,
+				checkpointCapabilities(),
+				(database) => {
+					Plain = plainTable(database, 'non-replicating');
+				},
+				connection
+			);
+			const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+			const peerNode = () => Records.dbisDB.getSync([SEQ, peerId])?.nodes?.find((node) => node.id === peerId);
+			await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			const floor = Date.now() - 1000;
+			socket.emit('message', encode([143, floor + 500, { [peer]: [floor, 'peer-generation', true] }]));
+			await until(() => peerNode()?.originGeneration === 'peer-generation' || socket.closes.length);
+			socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+			socket.emit('message', structureFrame(Plain));
+			const version = Date.now();
+			socket.emit('message', recordFrame(Plain, 'put', 'first', { id: 'first' }, version));
+			await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId >= version || socket.closes.length);
+			// the receive filter computed above still blocks Plain; only the request scope changes
+			Plain.replicate = true;
+			socket.readyState = 2;
+			connection.emit('subscriptions-updated');
+			await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
+			socket.emit('message', recordFrame(Plain, 'put', 'second', { id: 'second' }, version + 1));
+			await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId >= version + 1 || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			assert.equal(Plain.primaryStore.getEntry('second'), undefined);
+			assert.notEqual(peerNode().hole, true, 'the widening request never reached the peer');
+		}));
+
 	it('a route sharding restricts keeps a received floor relayable but never stores level-2 coverage (harper-pro#1214)', () =>
 		atCheckpointLevel(async () => {
 			const peer = 'slot-control-peer';

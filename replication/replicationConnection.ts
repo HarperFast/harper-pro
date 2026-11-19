@@ -4186,6 +4186,8 @@ type SharedRouteSafetyState = {
 };
 const sharedRouteSafetyByDb = new WeakMap<object, Map<string, SharedRouteSafetyState>>();
 const COPY_BOUND_HEADROOM_MS = 60_000;
+// Terminal and shared by every socket: no fold mutates an empty exclusion set.
+const EVERY_TABLE_REQUESTED = { allowlist: false, names: new Set<string>() };
 /**
  * The bound a copy-applied row reserves: the copy start covers every row below it, and past the start the
  * reservation reaches ahead by at least the row's distance, so any series of explicit versions above the start
@@ -7852,11 +7854,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let socketRequestScope: { allowlist: boolean; names: Set<string> } | undefined;
 	const requestsLeftOut = (tableName: string) =>
 		socketRequestScope !== undefined && socketRequestScope.allowlist !== socketRequestScope.names.has(tableName);
-	/** Folds a request into `socketRequestScope` once it is sent: the peer serves only what it received. */
 	const foldSentRequestScope = (entries: { replicateByDefault?: boolean; tables: string[] }[]) => {
 		for (const { replicateByDefault, tables: listedTables } of entries) {
 			if (socketRequestScope && !socketRequestScope.allowlist && socketRequestScope.names.size === 0) return;
-			// `tables` lists what the entry excludes when it replicates by default, else all it asks for
+			if (replicateByDefault && listedTables.length === 0) {
+				socketRequestScope = EVERY_TABLE_REQUESTED;
+				return;
+			}
 			const listed = new Set<string>(listedTables);
 			if (!socketRequestScope) socketRequestScope = { allowlist: !replicateByDefault, names: listed };
 			else if (!replicateByDefault) {
@@ -14228,7 +14232,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					)
 				);
 				subscriptionRequestSent = true;
-				foldSentRequestScope(nodeSubscriptions);
+				// ws drops a send on a closing socket without throwing, while frames already received still arrive
+				if (ws.readyState === WebSocket.OPEN) foldSentRequestScope(nodeSubscriptions);
 				// Start a fresh request -> first application-response window on every non-empty request. This is
 				// intentionally after send(): a synchronous send failure must not leave an orphaned timer.
 				if (requestId === undefined) {
