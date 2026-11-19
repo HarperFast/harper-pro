@@ -217,11 +217,6 @@ describe('answering an OPERATION_REQUEST', function () {
 	});
 });
 
-/**
- * An error answer carries the error's HTTP status, and the requester's rejection has it, so the operations API
- * reports a refusal a peer decided with the status that peer gave it. Before, the answer was text alone and
- * such a refusal reached the client as a 500.
- */
 describe("an operation error's status across the connection", function () {
 	this.timeout(10_000);
 	const ANSWER_DEADLINE_MS = 3_000;
@@ -333,6 +328,15 @@ describe("an operation error's status across the connection", function () {
 			}
 		});
 
+		it('answers an error that renders as no text as an error', async () => {
+			for (const thrown of ['', { toString: () => '' }, { toString: () => 409 }]) {
+				server.operation = () => Promise.reject(thrown);
+				const error = await fail();
+				expect(error.message).to.equal('Error');
+				expect(error).to.not.have.property('statusCode');
+			}
+		});
+
 		it('answers an error whose status throws on read as text, and answers the next operation', async () => {
 			server.operation = () =>
 				Promise.reject(
@@ -402,10 +406,16 @@ describe("an operation error's status across the connection", function () {
 			}
 		});
 
-		it('rejects an error that is not text, and keeps the connection', async () => {
-			const error = await rejectionFor({ error: { toString: 1 } });
-			expect(error).to.be.an('error');
-			expect(error).to.not.have.property('statusCode');
+		it('rejects an error that is not text without reading a class from it, and keeps the connection', async () => {
+			for (const malformed of [
+				{ toString: 1 },
+				{ name: 'ClientError', message: 'refused' },
+				['ClientError: refused'],
+			]) {
+				const error = await rejectionFor({ error: malformed });
+				expect(error).to.be.an('error');
+				expect(error, JSON.stringify(malformed)).to.not.have.property('statusCode');
+			}
 			expect(socket.closes).to.deep.equal([]);
 		});
 	});

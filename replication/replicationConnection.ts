@@ -5739,11 +5739,12 @@ function configuredPeerIdentity(
 const isErrorStatus = (status: unknown): status is number =>
 	Number.isInteger(status) && (status as number) >= 400 && (status as number) <= 599;
 
-/** The answer to an OPERATION_REQUEST that failed: the rendered error, and its HTTP status when it has one. */
 function operationErrorAnswer(requestId: unknown, error: unknown) {
+	const text = errorToString(error);
+	// the requester reads an answer without error text as a success
 	const answer: { requestId: unknown; error: string; statusCode?: number } = {
 		requestId,
-		error: errorToString(error),
+		error: typeof text === 'string' && text ? text : 'Error',
 	};
 	try {
 		const statusCode = (error as { statusCode?: unknown })?.statusCode;
@@ -5755,15 +5756,15 @@ function operationErrorAnswer(requestId: unknown, error: unknown) {
 }
 
 /**
- * The rejection for an error answer. The operations API reports `statusCode` as the HTTP status, so only an error
- * status is taken from a peer. A peer from before answers carried one names a refusal by its class alone, and 400
- * is that class's default.
+ * The operations API reports `statusCode` as the HTTP status, so only an error status is taken from a peer. A peer
+ * from before answers carried one names a refusal by its class alone, and 400 is that class's default.
  */
 function operationAnswerError(answer: { error: unknown; statusCode?: unknown }) {
-	const text = typeof answer.error === 'string' ? answer.error : errorToString(answer.error);
-	const error: Error & { statusCode?: number } = new Error(text);
+	const error: Error & { statusCode?: number } = new Error(
+		typeof answer.error === 'string' ? answer.error : errorToString(answer.error)
+	);
 	if (isErrorStatus(answer.statusCode)) error.statusCode = answer.statusCode;
-	else if (/^ClientError\b/.test(text)) error.statusCode = 400;
+	else if (typeof answer.error === 'string' && /^ClientError\b/.test(answer.error)) error.statusCode = 400;
 	return error;
 }
 
@@ -8817,25 +8818,28 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								isAuthorizedNode && data?.operation === 'drop_table'
 									? (remoteNodeName ?? authorization.name ?? authorization.username)
 									: undefined;
-							server.operation(data, { user: authorization, replicatedFrom }, !isAuthorizedNode).then(
-								async (response) => {
-									try {
-										logger.debug?.('Requested request from finished', remoteNodeName, response);
-										// Drain streaming responses (e.g. get_analytics) into a concrete value so this
-										// single replication message can be encoded — see materializeOperationResponse.
-										response = await materializeOperationResponse(response);
-										response.requestId = data.requestId;
-										answerOperation(data, response);
-									} catch (error) {
-										logger.debug?.('Failed encoding operation response for', remoteNodeName, error);
+							server
+								.operation(data, { user: authorization, replicatedFrom }, !isAuthorizedNode)
+								.then(
+									async (response) => {
+										try {
+											logger.debug?.('Requested request from finished', remoteNodeName, response);
+											// Drain streaming responses (e.g. get_analytics) into a concrete value so this
+											// single replication message can be encoded — see materializeOperationResponse.
+											response = await materializeOperationResponse(response);
+											response.requestId = data.requestId;
+											answerOperation(data, response);
+										} catch (error) {
+											logger.debug?.('Failed encoding operation response for', remoteNodeName, error);
+											answerOperation(data, operationErrorAnswer(data?.requestId, error));
+										}
+									},
+									(error) => {
+										logger.debug?.('Failed requested operation from', remoteNodeName, error);
 										answerOperation(data, operationErrorAnswer(data?.requestId, error));
 									}
-								},
-								(error) => {
-									logger.debug?.('Failed requested operation from', remoteNodeName, error);
-									answerOperation(data, operationErrorAnswer(data?.requestId, error));
-								}
-							);
+								)
+								.catch((error) => logger.warn?.('Could not answer operation request from', remoteNodeName, error));
 						} catch (error) {
 							answerOperation(data, operationErrorAnswer(data?.requestId, error));
 						}

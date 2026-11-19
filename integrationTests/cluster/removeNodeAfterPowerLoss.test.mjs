@@ -15,7 +15,14 @@ import { cp, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/pro
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { readLog, readNodePid, sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
+import {
+	postOperation,
+	readLog,
+	readNodePid,
+	sendOperation,
+	stopNodeProcess,
+	waitForCondition,
+} from './clusterShared.mjs';
 import {
 	DB,
 	bootstrapHomeMap,
@@ -82,7 +89,11 @@ async function waitForProcessGone(pid) {
 }
 
 const removeA = (coordinator, target) =>
-	operation(coordinator, { operation: 'remove_node', hostname: target.hostname, timeout: 120_000 });
+	postOperation(
+		coordinator,
+		{ operation: 'remove_node', hostname: target.hostname, timeout: 120_000, authorization: coordinator.admin },
+		{ signal: AbortSignal.timeout(150_000) }
+	);
 
 suite('power loss on a node that is being removed', { timeout: 900_000 }, (ctx) => {
 	const contexts = [];
@@ -182,7 +193,6 @@ suite('power loss on a node that is being removed', { timeout: 900_000 }, (ctx) 
 			description: `A's recovery report to be parked in ${reportHoldDir}`,
 		});
 		const removal = await removeA(nodeB, nodeA);
-		// B relays the refusal A decided, with A's status
 		assert.equal(removal.status, 409, JSON.stringify(removal.body));
 		assert.match(JSON.stringify(removal.body), RECOVERING);
 		await putCounter(nodeA, 'after', 1);

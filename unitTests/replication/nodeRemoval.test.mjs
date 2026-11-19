@@ -208,7 +208,6 @@ describe('drainNode', () => {
 		assert.equal(refused.calls.length, 1);
 	});
 
-	// what the operation connection rejects with: the peer's rendered error, and the status the peer sent
 	const peerError = (text, statusCode) => Object.assign(new Error(text), { statusCode });
 
 	it("refuses at once on a peer's ClientError, with that peer's status", async () => {
