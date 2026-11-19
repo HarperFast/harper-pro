@@ -1,11 +1,16 @@
 // harper-pro#1451
 import { suite, test, after } from 'node:test';
 import assert from 'node:assert';
-import { cp, mkdtemp, rm } from 'node:fs/promises';
+import { cp, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, waitForCondition } from '../cluster/clusterShared.mjs';
+import {
+	startHarper,
+	killHarper,
+	teardownHarper,
+	getNextAvailableLoopbackAddress,
+} from '@harperfast/integration-testing';
+import { sendOperation, waitForCondition } from '../cluster/clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
@@ -18,7 +23,7 @@ const SUITE_OPTIONS = { timeout: 900_000, skip: isLMDB && 'cluster record locks 
 suite('Clone Node - temporary admin', SUITE_OPTIONS, (ctx) => {
 	const contexts = [];
 
-	after(() => stopAndTeardownNodes(contexts.map((context) => context.harper)));
+	after(() => Promise.all(contexts.map((context) => teardownHarper(context))));
 
 	async function startNode({ replication, env, harperBinPath, components } = {}) {
 		const parentDir = process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir();
@@ -123,14 +128,16 @@ suite('Clone Node - temporary admin', SUITE_OPTIONS, (ctx) => {
 			[],
 			`${tokenClone.hostname} records a replication hole in system`
 		);
-		// the leader is then the joiner's only source for the deletion, as in a two-node cluster
+		// the leader is then the joiner's only source for the deletion; the token clone keeps its address until
+		// teardown, since a joiner on that address would take its node name
 		await killHarper(
 			contexts.find((context) => context.harper === tokenClone),
 			{ graceMs: 30_000 }
 		);
-		// torn down only in after(): teardown frees the address, and a joiner on it would take the token clone's node
-		// name. Its pid file goes now, since by after() that pid could belong to another process.
-		await rm(join(tokenClone.dataRootDir, 'hdb.pid'), { force: true });
+		assert.ok(
+			tokenClone.process.exitCode !== null || tokenClone.process.signalCode !== null,
+			`${tokenClone.hostname} did not exit`
+		);
 
 		const copyJoiner = await startClone(leader, {
 			HDB_LEADER_USERNAME: leader.admin.username,
