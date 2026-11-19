@@ -13719,6 +13719,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
+
 				const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 				auditStore?.ensureLogExists?.(node.name);
 				const sequenceEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
