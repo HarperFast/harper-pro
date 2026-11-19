@@ -21,7 +21,7 @@ import {
 	fenceExternal,
 	getRecordLockHomesTable,
 	inheritedFrom,
-	ownRow,
+	planActivate,
 	planStage,
 	rowKeyOf,
 	setHomesDrainCandidates,
@@ -29,7 +29,7 @@ import {
 	stageGeneration,
 	validateExplicit,
 } from '#src/replication/recordLockHomes';
-import { planSurvey } from '#src/replication/recordLockApply';
+import { applyHomes, planSurvey } from '#src/replication/recordLockApply';
 import {
 	cachedActiveGeneration,
 	createDisabledRecordLockTransport,
@@ -38,6 +38,7 @@ import {
 	releaseRecordLockTransport,
 } from '#src/replication/recordLockTransport';
 
+const ownRow = (database) => getRecordLockHomesTable().primaryStore.get(database);
 const defaultRow = (state) => ({ database: DEFAULT_HOMES_KEY, highestActedOn: 3, fenced: [], ...state });
 const ring = (generation, homes, key = DEFAULT_HOMES_KEY) => ({
 	generation,
@@ -160,6 +161,76 @@ describe('planSurvey over databases that inherit the default', () => {
 		const plan = planSurvey('data', ['a', 'b'], ['a', 'b'], undefined, replies);
 		assert.strictEqual(plan.action, 'refuse');
 		assert.match(plan.reason, /default home map is staged/);
+	});
+});
+
+describe('planSurvey resumes only a generation every node can take', () => {
+	it('opens the next generation when a node holds the floor as a marker', () => {
+		const staged = { ...ring(1, ['a', 'b'], 'x'), quiesce: ['a', 'b'] };
+		const replies = new Map([
+			['a', { node: 'a', staged, highestActedOn: 1, supportsFenced: true }],
+			['b', { node: 'b', highestActedOn: 1, supportsFenced: true }],
+		]);
+		const plan = planSurvey('x', ['a', 'b'], ['a', 'b'], undefined, replies);
+		assert.strictEqual(plan.action, 'proceed');
+		assert.strictEqual(plan.generation, 2);
+		const resumable = new Map([
+			['a', { node: 'a', staged, highestActedOn: 1, supportsFenced: true }],
+			['b', { node: 'b', highestActedOn: 0, supportsFenced: true }],
+		]);
+		assert.strictEqual(planSurvey('x', ['a', 'b'], ['a', 'b'], undefined, resumable).generation, 1);
+	});
+});
+
+describe('a default apply carries every database with a map of its own', function () {
+	this.timeout(20_000);
+
+	it("includes the initiating node's own rows when it is not in quiesce", async () => {
+		const rows = new Map([
+			['a', undefined],
+			['b', undefined],
+		]);
+		const hops = [];
+		const peers = {
+			self: () => 'c',
+			async send(node, operation) {
+				hops.push({ node, action: operation.action, explicit: operation.explicit });
+				if (operation.action === 'survey')
+					return { node, highestActedOn: 0, supportsFenced: true, explicit: node === 'c' ? ['x'] : [] };
+				const row = rows.get(node);
+				if (operation.action === 'stage') {
+					const plan = planStage(
+						row,
+						DEFAULT_HOMES_KEY,
+						operation.generation,
+						operation.homes,
+						operation.digest,
+						0,
+						operation.quiesce,
+						operation.explicit
+					);
+					rows.set(node, plan.row);
+					return {
+						staged: plan.row.staged,
+						quiesced: { complete: true, surrendered: 0, recalled: 0, outstanding: [] },
+						explicit: [],
+					};
+				}
+				const plan = planActivate(row, DEFAULT_HOMES_KEY, operation.generation, operation.digest, 0, 0);
+				rows.set(node, plan.row);
+				return { active: plan.row.active };
+			},
+		};
+		const report = await applyHomes({ default: true, homes: ['a', 'b'] }, peers);
+		assert.strictEqual(report.outcome, 'activated');
+		assert.deepStrictEqual(report.initiator.survey.active, undefined);
+		for (const action of ['stage', 'activate'])
+			for (const node of ['a', 'b'])
+				assert.deepStrictEqual(
+					hops.find((hop) => hop.node === node && hop.action === action).explicit,
+					['x'],
+					`${action} on ${node}`
+				);
 	});
 });
 

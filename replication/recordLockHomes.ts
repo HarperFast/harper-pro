@@ -175,7 +175,6 @@ export function digestFor(key: string, generation: number, homes: string[]): str
 	return key === DEFAULT_HOMES_KEY ? digestOf(generation, homes, DEFAULT_DIGEST_SCOPE) : digestOf(generation, homes);
 }
 
-/** The row an operation addresses: `database`, or the default with `default: true`, never both. */
 export function rowKeyOf(request: any): string {
 	const isDefault = request?.default === true;
 	if (request?.default !== undefined && !isDefault) throw new ClientError('default must be true when given', 400);
@@ -233,7 +232,6 @@ export function inheritedFrom(database: string, defaultRow: RecordLockHomesRow):
 	return row;
 }
 
-/** A database's own row, else the default row it inherits; the default key reads its own row. */
 async function resolveEffectiveRow(
 	key: string,
 	read: (key: string) => Promise<RecordLockHomesRow | undefined> | RecordLockHomesRow | undefined
@@ -503,7 +501,6 @@ async function defaultStageScope(staged: RecordLockGenerationState): Promise<{ d
 	return { drain: candidates && canonicalizeHomes(candidates.filter((database) => !own.has(database))), explicit };
 }
 
-/** Every database with a row of its own on this node (none inherit the default here). */
 export function ownRowDatabases(): string[] {
 	const homes = CLUSTER_RECORD_LOCKS_ENABLED
 		? getRecordLockHomesTable()
@@ -777,16 +774,6 @@ export async function existingRow(key: string): Promise<RecordLockHomesRow | und
 		? getRecordLockHomesTable()
 		: (getDatabases() as any).system?.hdb_record_lock_homes;
 	return homes ? resolveEffectiveRow(key, (rowKey) => homes.primaryStore.get(rowKey)) : undefined;
-}
-
-/** The default row's state as a thread caches it for every database without a row of its own. */
-export async function currentDefaultRow(): Promise<RecordLockHomesRow | undefined> {
-	return readRow(DEFAULT_HOMES_KEY);
-}
-
-/** This node's own row for a database, ignoring the default; `undefined` when it inherits. */
-export async function ownRow(database: string): Promise<RecordLockHomesRow | undefined> {
-	return readRow(database);
 }
 
 /**

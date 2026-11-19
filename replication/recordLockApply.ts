@@ -256,7 +256,16 @@ export function planSurvey(
 		for (const state of [reply.active, reply.staged])
 			if (state?.generation === floor && sameSet(state.homes, homes)) resumable = true;
 	}
-	const resumeTarget = resumable ? floor : floor + 1;
+	// A node holding the floor with neither ring (a default activation's marker) cannot take that
+	// generation again, so resuming there would refuse every retry.
+	const bareFloor = [...rows.values()].some(
+		(reply) =>
+			!reply.inherited &&
+			floorOf(reply) === floor &&
+			reply.active?.generation !== floor &&
+			reply.staged?.generation !== floor
+	);
+	const resumeTarget = resumable && !bareFloor ? floor : floor + 1;
 	const generation = requestedGeneration ?? resumeTarget;
 	const digest = digestFor(database, generation, homes);
 	// Anchor: an `active` ring holding the fenced node that a strict majority of its members report, or a
@@ -294,7 +303,7 @@ export function planSurvey(
 		return {
 			action: 'refuse',
 			status: 409,
-			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; ${manualRecovery(database, homes, quiesce, fenced, rows, [generation, resumeTarget], floor)}`,
+			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; ${manualRecovery(database, homes, quiesce, fenced, rows, [generation, resumeTarget], floor, observer)}`,
 		};
 	const stages = planStages(database, homes, quiesce, rows, generation, digest);
 	if ('rejected' in stages)
@@ -346,10 +355,13 @@ function manualRecovery(
 	fenced: string[],
 	rows: Map<string, SurveyReply>,
 	preferred: number[],
-	floor: number
+	floor: number,
+	observer?: { node: string; reply: SurveyReply | { error: string } }
 ): string {
 	const target: Record<string, unknown> = database === DEFAULT_HOMES_KEY ? { default: true } : { database };
-	const explicit = canonicalizeHomes([...rows.values()].flatMap((reply) => reply.explicit ?? []));
+	const explicit = canonicalizeHomes(
+		[...rows.values(), observer?.reply].flatMap((reply) => (reply && !('error' in reply) ? (reply.explicit ?? []) : []))
+	);
 	for (const generation of new Set([...preferred, floor + 1])) {
 		if (!Number.isSafeInteger(generation)) continue;
 		const stages = planStages(database, homes, quiesce, rows, generation, digestFor(database, generation, homes));
@@ -554,14 +566,15 @@ async function runApply(
 				: plan.reason;
 		throw new ApplyRefusedError(report, plan.status);
 	}
-	// Every database some node holds a row of its own for is marked on each node before the default
-	// activates there, so none of them can inherit it. Bounded before anything is staged.
+	// Marked on every node before the default activates there; bounded before anything is staged.
 	const explicit = new Set<string>();
+	const tooManyExplicit = () =>
+		`${explicit.size} databases have home maps of their own, more than the ${MAX_EXPLICIT_DATABASES} a default transition carries`;
 	if (isDefault) {
-		for (const reply of replies.values())
-			if (!('error' in reply)) for (const name of reply.explicit ?? []) explicit.add(name);
+		for (const reply of [...replies.values(), observer?.reply])
+			if (reply && !('error' in reply)) for (const name of reply.explicit ?? []) explicit.add(name);
 		if (explicit.size > MAX_EXPLICIT_DATABASES) {
-			report.reason = `${explicit.size} databases have home maps of their own, more than the ${MAX_EXPLICIT_DATABASES} a default transition carries`;
+			report.reason = tooManyExplicit();
 			throw new ApplyRefusedError(report, 409);
 		}
 	}
@@ -606,6 +619,11 @@ async function runApply(
 		report.reason = 'staging did not complete on every node; nothing was activated. Re-run this call';
 		throw new ApplyRefusedError(report, 503);
 	}
+	if (explicit.size > MAX_EXPLICIT_DATABASES) {
+		report.outcome = 'incomplete';
+		report.reason = `${tooManyExplicit()}; nothing was activated`;
+		throw new ApplyRefusedError(report, 409);
+	}
 	if (FAIL_BEFORE_ACTIVATE) {
 		report.outcome = 'incomplete';
 		report.reason = 'injected failure between stage and activate (HARPER_TEST_RECORD_LOCK_APPLY_FAIL_BEFORE_ACTIVATE)';
@@ -640,7 +658,8 @@ async function runApply(
 				digest,
 			};
 			if (isDefault) activate.explicit = [...explicit].sort();
-			await hop(node, activate, timeouts.hopMs);
+			// A default activation also writes markers and refreshes every database on every thread.
+			await hop(node, activate, isDefault ? timeouts.stageMs : timeouts.hopMs);
 			entry.activate = { action: entry.stage?.action === 'already-active' ? 'noop' : 'activated' };
 		} catch (error) {
 			failed = true;

@@ -520,8 +520,8 @@ export function setRecordLockHomesRowReader(reader: typeof readHomesRow): typeof
 	readHomesRow = reader;
 	return previous;
 }
-export function refreshRecordLockHomesCache(database: string, freshBudget = false): Promise<void> {
-	return refreshCache(database, freshBudget);
+export async function refreshRecordLockHomesCache(database: string, freshBudget = false): Promise<void> {
+	await refreshCache(database, freshBudget);
 }
 export function cachedActiveGeneration(database: string): number | undefined {
 	return activeCache.get(database)?.generation;
@@ -542,7 +542,8 @@ export function homeMapSourceOf(database: string): 'default' | 'database' | unde
 	return homeMapSources.get(database);
 }
 
-async function refreshCache(database: string, freshBudget = false): Promise<void> {
+/** Resolves whether it re-announced this database's digest. */
+async function refreshCache(database: string, freshBudget = false): Promise<boolean> {
 	let state = refreshState.get(database);
 	if (!state)
 		refreshState.set(
@@ -562,9 +563,10 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 	if (freshBudget) state.backoff.reset();
 	const current = () => refreshState.get(database)?.token === token;
 	const before = activeCache.get(database);
+	let announced = false;
 	try {
 		const row = await readHomesRow(database);
-		if (!current()) return;
+		if (!current()) return false;
 		activeCache.set(database, row?.active);
 		if (row) homeMapSources.set(database, row.inherited ? 'default' : 'database');
 		else homeMapSources.delete(database);
@@ -576,10 +578,11 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		if (state.backoff.attempts > 0 || before?.digest !== row?.active?.digest) {
 			pushHomesDigestToPeers(database);
 			reconcileAllPeerHomesAgreement(database);
+			announced = true;
 		}
 		state.backoff.reset();
 	} catch (error) {
-		if (!current()) return;
+		if (!current()) return false;
 		// A storage error must not leave a stale (possibly superseded) generation cached; undefined is
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
@@ -599,6 +602,7 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		if (CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF && ownedDatabases.has(database))
 			restartRecall.schedule(database);
 	}
+	return announced;
 }
 
 /** Leaf bound: main waiting on ONE worker (or a worker waiting on main's own local refresh alone). */
@@ -628,12 +632,19 @@ const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
  */
 async function applyHomesChanged(database: string): Promise<void> {
 	if (database === DEFAULT_HOMES_KEY) {
-		// Every registered database re-reads its own row first, so one with a map of its own keeps it;
-		// `refreshCache` re-announces each one whose digest changed.
-		await Promise.all([...transports.keys()].map((registered) => refreshCache(registered, true)));
+		// Each registered database reads its own row first, so one with a map of its own keeps it.
+		await Promise.all(
+			[...transports.keys()].map(async (registered) => {
+				if (!(await refreshCache(registered, true)) && homeMapSources.get(registered) === 'default')
+					announceHomesDigest(registered);
+			})
+		);
 		return;
 	}
-	await refreshCache(database, true);
+	if (!(await refreshCache(database, true))) announceHomesDigest(database);
+}
+
+function announceHomesDigest(database: string): void {
 	pushHomesDigestToPeers(database);
 	reconcileAllPeerHomesAgreement(database);
 }
