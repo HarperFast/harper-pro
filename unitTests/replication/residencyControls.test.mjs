@@ -3006,20 +3006,54 @@ describe('Declarative tables keep control and event traffic independent of place
 				}
 			}));
 
-	// an owed drop is a record the pass lost; an unowed one, a local-only record a correct sender would have skipped
-	for (const drops of [false, 'owed', 'unowed'])
+	const structureFrame = (Table) =>
+		encode([
+			132,
+			{
+				structures: Table.primaryStore.encoder.structures,
+				typedStructs: Table.primaryStore.encoder.typedStructs,
+				attributes: Table.attributes,
+				schemaDefined: true,
+			},
+			Table.tableId,
+			Table.tableName,
+		]);
+	// the three records a route never owes: a correct sender skips each and advances the cursor (harper-pro#1213)
+	const unownedDrops = ['local-only', 'non-replicating', 'route-excluded'];
+	const unownedSubscription = (peer, drop) => ({
+		name: peer,
+		replicateByDefault: true,
+		...(drop === 'route-excluded'
+			? { routeReplicates: { receivesFrom: [{ source: peer, excludeTables: ['Plain'] }] } }
+			: {}),
+	});
+	const plainTable = (database, drop) =>
+		table({
+			database,
+			table: 'Plain',
+			audit: true,
+			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'body' }],
+			...(drop === 'non-replicating' ? { replicate: false } : {}),
+		});
+
+	// owed: a record the pass lost; unowed: a local-only record; filtered: a table this node does not replicate, which
+	// voids no checkpoint but leaves that table undelivered
+	for (const drops of [false, 'owed', 'unowed', 'filtered'])
 		it(`releases the hole rows that stood only after a complete copy that drops nothing it owed (drops=${drops})`, () =>
 			atCheckpointLevel(async () => {
 				const peer = 'slot-control-peer';
 				const connection = new EventEmitter();
 				connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
 				connection.exclusionOrigins = [peer];
+				let Local;
 				const { Records, socket, database } = await connect(
 					false,
 					`copy_hole_release_${drops}`,
 					true,
 					checkpointCapabilities(),
-					undefined,
+					(database) => {
+						Local = plainTable(database, 'non-replicating');
+					},
 					connection
 				);
 				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
@@ -3068,7 +3102,10 @@ describe('Declarative tables keep control and event traffic independent of place
 					])
 				);
 				socket.emit('message', encode([148, anchor, 1]));
-				if (drops)
+				if (drops === 'filtered') {
+					socket.emit('message', structureFrame(Local));
+					socket.emit('message', recordFrame(Local, 'put', 'dropped', { id: 'dropped' }, anchor - 1));
+				} else if (drops)
 					socket.emit(
 						'message',
 						recordFrame(
@@ -3096,7 +3133,8 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.ok(reserved.length > 0, 'the pass reserved its copy start');
 				for (const row of reserved)
 					assert.ok(!Object.values(row).includes(HOLE_COPY_BOUND), 'a reservation never carries a hole');
-				if (drops === 'owed') assert.equal(holes().length, 2, 'a pass that drops a record it owed fills no hole');
+				if (drops === 'owed' || drops === 'filtered')
+					assert.equal(holes().length, 2, 'a pass that drops a record it owed, or skips a table, fills no hole');
 				else {
 					assert.deepEqual(holes(), [], 'a complete pass that dropped nothing fills every hole that stood');
 					assert.deepEqual(copyHoleStatus(Records.dbisDB, Records.auditStore), []);
@@ -3106,45 +3144,16 @@ describe('Declarative tables keep control and event traffic independent of place
 					assert.ok(bounds.get(departed) >= anchor, 'otherwise the copy start');
 					assert.ok(bounds.get(departed) < HOLE_COPY_BOUND);
 				}
-				if (drops === 'unowed') {
+				if (drops === 'unowed' || drops === 'filtered') {
 					assert.notEqual(
 						Records.dbisDB.getSync([SEQ, peerId])?.nodes?.find((node) => node.id === peerId)?.hole,
 						true,
 						'completing the copy re-asserts no route hole for it'
 					);
-					assert.ok(poisonedPairs(database).includes(`${peer}:${Records.tableName}`), 'record locks still refuse it');
+					const table = drops === 'filtered' ? Local.tableName : Records.tableName;
+					assert.ok(poisonedPairs(database).includes(`${peer}:${table}`), 'record locks still refuse it');
 				}
 			}));
-
-	const structureFrame = (Table) =>
-		encode([
-			132,
-			{
-				structures: Table.primaryStore.encoder.structures,
-				typedStructs: Table.primaryStore.encoder.typedStructs,
-				attributes: Table.attributes,
-				schemaDefined: true,
-			},
-			Table.tableId,
-			Table.tableName,
-		]);
-	// the three records a route never owes: a correct sender skips each and advances the cursor (harper-pro#1213)
-	const unownedDrops = ['local-only', 'non-replicating', 'route-excluded'];
-	const unownedSubscription = (peer, drop) => ({
-		name: peer,
-		replicateByDefault: true,
-		...(drop === 'route-excluded'
-			? { routeReplicates: { receivesFrom: [{ source: peer, excludeTables: ['Plain'] }] } }
-			: {}),
-	});
-	const plainTable = (database, drop) =>
-		table({
-			database,
-			table: 'Plain',
-			audit: true,
-			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'body' }],
-			...(drop === 'non-replicating' ? { replicate: false } : {}),
-		});
 
 	for (const drop of unownedDrops)
 		it(`a projection that drops a record its route never owed writes no hole and completes (${drop})`, () =>
@@ -3272,7 +3281,6 @@ describe('Declarative tables keep control and event traffic independent of place
 			const peer = 'slot-control-peer';
 			const connection = new EventEmitter();
 			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
-			// the main thread's full-coverage set names the peer; sharding restricts the route anyway
 			connection.exclusionOrigins = [peer];
 			const { Records, socket } = await connect(
 				false,
@@ -3294,29 +3302,23 @@ describe('Declarative tables keep control and event traffic independent of place
 			assert.notEqual(peerNode().fullCoverage, true);
 		}));
 
-	for (const restricted of [false, true])
-		it(`relays a stored floor only while sharding does not restrict the origin's link (restricted=${restricted})`, () =>
-			atCheckpointLevel(async () => {
-				const priorNodes = server.nodes;
-				server.nodes = [{ name: 'slot-control-peer', replicates: true }];
-				try {
-					const { Records, socket, database } = await connect(
-						false,
-						`relay_gate_${restricted}`,
-						false,
-						checkpointCapabilities()
-					);
-					const origin = 'relay-gate-origin';
+	it('relays a stored floor only from an origin whose link sharding does not restrict (harper-pro#1214)', () =>
+		atCheckpointLevel(async () => {
+			const priorNodes = server.nodes;
+			server.nodes = [{ name: 'slot-control-peer', replicates: true }];
+			try {
+				const { Records, socket, database } = await connect(false, 'relay_gate', false, checkpointCapabilities());
+				const version = Date.now();
+				const floor = version + 1;
+				const origins = { 'relay-gate-allowed': false, 'relay-gate-restricted': true };
+				for (const [origin, restricted] of Object.entries(origins)) {
 					const originId = getIdOfRemoteNode(origin, Records.auditStore);
-					// a write from the origin gives this node a log of it to relay
-					const version = Date.now();
 					const context = { source: {}, sourceApply: true, timestamp: version };
 					await transaction(context, async () => {
-						const row = await Records.getResource('relayed', context);
-						return row._writeInvalidate('relayed', { id: 'relayed', region: 1 }, { nodeId: originId, version });
+						const row = await Records.getResource(origin, context);
+						return row._writeInvalidate(origin, { id: origin, region: 1 }, { nodeId: originId, version });
 					});
-					// the origin's direct row, stored relayable while its link carried every table
-					const floor = version + 1;
+					// stored relayable while the link carried every table
 					await Records.dbisDB.put([SEQ, originId], {
 						seqId: floor,
 						nodes: [{ id: originId, closedFloor: floor, relayable: true }],
@@ -3329,20 +3331,20 @@ describe('Declarative tables keep control and event traffic independent of place
 						restricted ? 1 : 0,
 						restricted ? undefined : shardingSourceAgreement(database)
 					);
-					socket.emit(
-						'message',
-						encode([129, [{ name: server.hostname, startTime: version, tables: [], replicateByDefault: true }], []])
-					);
-					const relayed = () =>
-						socket.sent.some((frame) => frame[0] === 143 && frame[2] && Object.hasOwn(frame[2], origin));
-					if (restricted) await new Promise((resolve) => setTimeout(resolve, 500));
-					else await until(() => relayed() || socket.closes.length);
-					assert.deepEqual(socket.closes, []);
-					assert.equal(relayed(), !restricted);
-				} finally {
-					server.nodes = priorNodes;
 				}
-			}));
+				socket.emit(
+					'message',
+					encode([129, [{ name: server.hostname, startTime: version, tables: [], replicateByDefault: true }], []])
+				);
+				const relayed = (origin) =>
+					socket.sent.some((frame) => frame[0] === 143 && frame[2] && Object.hasOwn(frame[2], origin));
+				await until(() => relayed('relay-gate-allowed') || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(relayed('relay-gate-restricted'), false);
+			} finally {
+				server.nodes = priorNodes;
+			}
+		}));
 
 	async function waitForOwnReservation(Records, peerId) {
 		const reservations = () =>
@@ -3375,14 +3377,12 @@ describe('Declarative tables keep control and event traffic independent of place
 			const rootStore = Records.auditStore.rootStore;
 			await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
 			assert.deepEqual(socket.closes, []);
-			// another peer's copy is in progress, reserving far past anything this pass copies
 			const anchor = Date.now() + 100;
 			const foreign = anchor + 600_000;
 			await persistMergedCopyBounds(Records.dbisDB, new Map([[peerId, foreign]]), other, rootStore, 'other-pass');
 			socket.emit('message', encode([148, anchor, 1]));
 			const [{ value: reserved }] = await waitForOwnReservation(Records, peerId);
 			assert.equal(reserved[peerId], anchor, 'a pass reserves its own copy start, not the other pass’s bound');
-			// this pass is abandoned; the other one settles, dropping its reservation for the versions it copied
 			socket.close();
 			await settleCopyBounds(Records.dbisDB, new Map(), other, rootStore, 'other-pass');
 			assert.equal(readCopyBounds(Records.dbisDB).get(peerId), anchor, 'nothing outlives the other pass’s settle');
