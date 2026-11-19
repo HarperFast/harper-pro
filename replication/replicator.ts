@@ -839,7 +839,10 @@ export function subscribeToNode(request: any) {
 		// The main-thread-computed multi-hop exclusion set (subscriptionManager.computeExclusionOrigins).
 		// The session reads it when building SUBSCRIPTION_REQUEST's excluded list; only overwrite when the
 		// request carries one, so a re-subscribe from a path without the set keeps the last known value.
-		if (request.exclusionOrigins) connection.exclusionOrigins = request.exclusionOrigins;
+		if (request.exclusionOrigins) {
+			connection.exclusionOrigins = request.exclusionOrigins;
+			connection.exclusionOriginsFailedOpen = false;
+		}
 		connection.subscribe(
 			request.nodes.filter((node) => {
 				return shouldReplicateFromNode(node, request.database);
@@ -924,6 +927,7 @@ export function updateExclusionOrigins({
 		const connection = dbConnections.get(database);
 		if (!connection) continue;
 		connection.exclusionOrigins = origins;
+		connection.exclusionOriginsFailedOpen = failedOpen === true;
 		connection.emit('exclusion-origins-updated', origins, failedOpen === true);
 	}
 }

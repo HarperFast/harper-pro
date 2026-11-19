@@ -3546,14 +3546,43 @@ type PendingRouteRevocationEntry = {
 	revocation: [id: number, generation?: string];
 	version: number;
 };
+type CertifiedSinceClear = { clearVersion: number; start: number; generation?: string };
+/** What a settle set and what it replaced: a failed commit rolls it back only while it is still what the map holds. */
+type SettledChange<T> = { previous: T | undefined; set: T | undefined };
 type SettledRouteStateVersions = {
-	marks: Map<number, number | undefined>;
-	clears: Map<number, number | undefined>;
-	/** The partialHistory version a settle set, and the one it replaced: rolled back only while it is still the newest. */
-	partials: Map<number, { previous: number | undefined; set: number }>;
-	revocations: Map<number, number | undefined>;
-	certifiedSinceClear: Map<number, { clearVersion: number; start: number; generation?: string } | undefined>;
+	marks: Map<number, SettledChange<number>>;
+	clears: Map<number, SettledChange<number>>;
+	partials: Map<number, SettledChange<number>>;
+	revocations: Map<number, SettledChange<number>>;
+	certifiedSinceClear: Map<number, SettledChange<CertifiedSinceClear>>;
 };
+function setSettled<T>(
+	map: Map<number, T>,
+	changes: Map<number, SettledChange<T>>,
+	originId: number,
+	value: T | undefined
+): void {
+	const change = changes.get(originId);
+	if (change) change.set = value;
+	else changes.set(originId, { previous: map.get(originId), set: value });
+	if (value === undefined) map.delete(originId);
+	else map.set(originId, value);
+}
+function raiseSettled(
+	map: Map<number, number>,
+	changes: Map<number, SettledChange<number>>,
+	originId: number,
+	version: number
+): void {
+	if (version > (map.get(originId) ?? 0)) setSettled(map, changes, originId, version);
+}
+function rollBackSettled<T>(map: Map<number, T>, changes: Map<number, SettledChange<T>>): void {
+	for (const [originId, { previous, set }] of changes) {
+		if (map.get(originId) !== set) continue;
+		if (previous === undefined) map.delete(originId);
+		else map.set(originId, previous);
+	}
+}
 type UnverifiedRouteStateBatch = {
 	event: any;
 	marks: Map<number, PendingRouteMarkEntry> | undefined;
@@ -3562,7 +3591,10 @@ type UnverifiedRouteStateBatch = {
 	epoch: number;
 };
 /** The generation core matches a route mark against: a level-1 certificate moves it to `lastGeneration`. */
-const markGeneration = (node: any): string | undefined => node?.originGeneration ?? node?.lastGeneration;
+function markGeneration(node: any): string | undefined {
+	if (typeof node?.originGeneration === 'string') return node.originGeneration;
+	return typeof node?.lastGeneration === 'string' ? node.lastGeneration : undefined;
+}
 /** A mark to restore without the `partialHistory` and clear a later settled value replaced; undefined if nothing is left. */
 function supersededPartialDropped(
 	entry: PendingRouteMarkEntry,
@@ -3602,7 +3634,7 @@ export class PendingRouteState {
 	private settledMarkVersion = new Map<number, number>();
 	private settledClearVersion = new Map<number, number>();
 	private settledRevokeVersion = new Map<number, number>();
-	private settledCertifiedSinceClear = new Map<number, { clearVersion: number; start: number; generation?: string }>();
+	private settledCertifiedSinceClear = new Map<number, CertifiedSinceClear>();
 	/** Version of the newest settled mark that set `partialHistory`: an older batch's value is no longer the row's. */
 	private settledPartialVersion = new Map<number, number>();
 	/**
@@ -3791,62 +3823,46 @@ export class PendingRouteState {
 		marks: Map<number, PendingRouteMarkEntry> | undefined,
 		revocations: Map<number, PendingRouteRevocationEntry> | undefined
 	): SettledRouteStateVersions {
-		const prevMarks = new Map<number, number | undefined>();
-		const prevClears = new Map<number, number | undefined>();
-		const prevPartials = new Map<number, { previous: number | undefined; set: number }>();
-		const prevRevocations = new Map<number, number | undefined>();
-		const prevCertifiedSinceClear = new Map<
-			number,
-			{ clearVersion: number; start: number; generation?: string } | undefined
-		>();
+		const settled: SettledRouteStateVersions = {
+			marks: new Map(),
+			clears: new Map(),
+			partials: new Map(),
+			revocations: new Map(),
+			certifiedSinceClear: new Map(),
+		};
 		for (const [originId, sent] of marks ?? []) {
-			prevMarks.set(originId, this.settledMarkVersion.get(originId));
-			prevCertifiedSinceClear.set(originId, this.settledCertifiedSinceClear.get(originId));
-			if (sent.version > (this.settledMarkVersion.get(originId) ?? 0)) {
-				this.settledMarkVersion.set(originId, sent.version);
-			}
+			raiseSettled(this.settledMarkVersion, settled.marks, originId, sent.version);
 			if (sent.mark[2] !== undefined || sent.clearCertifiedFirst) {
-				const previous = this.settledPartialVersion.get(originId);
-				if (sent.version > (previous ?? 0)) {
-					this.settledPartialVersion.set(originId, sent.version);
-					prevPartials.set(originId, { previous, set: sent.version });
-				}
+				raiseSettled(this.settledPartialVersion, settled.partials, originId, sent.version);
 			}
 			if (sent.mark[2] === true || sent.clearCertifiedFirst) {
-				prevClears.set(originId, this.settledClearVersion.get(originId));
 				const clearVer = sent.clearVersion || sent.version;
-				if (clearVer > (this.settledClearVersion.get(originId) ?? 0)) {
-					this.settledClearVersion.set(originId, clearVer);
-				}
-				if (sent.mark[2] !== true && typeof sent.mark[1] === 'number') {
-					this.settledCertifiedSinceClear.set(originId, {
-						clearVersion: clearVer,
-						start: sent.mark[1],
-						generation: sent.mark[4],
-					});
-				} else {
-					this.settledCertifiedSinceClear.delete(originId);
-				}
+				raiseSettled(this.settledClearVersion, settled.clears, originId, clearVer);
+				setSettled(
+					this.settledCertifiedSinceClear,
+					settled.certifiedSinceClear,
+					originId,
+					sent.mark[2] !== true && typeof sent.mark[1] === 'number'
+						? { clearVersion: clearVer, start: sent.mark[1], generation: sent.mark[4] }
+						: undefined
+				);
 			} else if (typeof sent.mark[1] === 'number') {
 				const existing = this.settledCertifiedSinceClear.get(originId);
 				const clearVer = this.settledClearVersion.get(originId) ?? 0;
-				if (
+				setSettled(
+					this.settledCertifiedSinceClear,
+					settled.certifiedSinceClear,
+					originId,
 					existing &&
-					existing.clearVersion === clearVer &&
-					(existing.generation === sent.mark[4] || existing.generation === undefined || sent.mark[4] === undefined)
-				) {
-					this.settledCertifiedSinceClear.set(originId, {
-						clearVersion: clearVer,
-						start: Math.min(existing.start, sent.mark[1]),
-						generation: sent.mark[4] ?? existing.generation,
-					});
-				} else {
-					this.settledCertifiedSinceClear.set(originId, {
-						clearVersion: clearVer,
-						start: sent.mark[1],
-						generation: sent.mark[4],
-					});
-				}
+						existing.clearVersion === clearVer &&
+						(existing.generation === sent.mark[4] || existing.generation === undefined || sent.mark[4] === undefined)
+						? {
+								clearVersion: clearVer,
+								start: Math.min(existing.start, sent.mark[1]),
+								generation: sent.mark[4] ?? existing.generation,
+							}
+						: { clearVersion: clearVer, start: sent.mark[1], generation: sent.mark[4] }
+				);
 			}
 			const current = this.marks?.get(originId);
 			if (!current) continue;
@@ -3865,10 +3881,7 @@ export class PendingRouteState {
 			}
 		}
 		for (const [originId, sent] of revocations ?? []) {
-			prevRevocations.set(originId, this.settledRevokeVersion.get(originId));
-			if (sent.version > (this.settledRevokeVersion.get(originId) ?? 0)) {
-				this.settledRevokeVersion.set(originId, sent.version);
-			}
+			raiseSettled(this.settledRevokeVersion, settled.revocations, originId, sent.version);
 			const current = this.revocations?.get(originId);
 			if (
 				current &&
@@ -3878,13 +3891,7 @@ export class PendingRouteState {
 				this.revocations!.delete(originId);
 			}
 		}
-		return {
-			marks: prevMarks,
-			clears: prevClears,
-			partials: prevPartials,
-			revocations: prevRevocations,
-			certifiedSinceClear: prevCertifiedSinceClear,
-		};
+		return settled;
 	}
 	private restore(
 		marks: Map<number, PendingRouteMarkEntry> | undefined,
@@ -3894,27 +3901,11 @@ export class PendingRouteState {
 	): void {
 		if (epoch !== this.ownerEpoch) marks = safetyMarksOf(marks);
 		if (settled) {
-			for (const [originId, { previous, set }] of settled.partials) {
-				if (this.settledPartialVersion.get(originId) !== set) continue;
-				if (previous === undefined) this.settledPartialVersion.delete(originId);
-				else this.settledPartialVersion.set(originId, previous);
-			}
-			for (const [originId, prev] of settled.marks) {
-				if (prev === undefined) this.settledMarkVersion.delete(originId);
-				else this.settledMarkVersion.set(originId, prev);
-			}
-			for (const [originId, prev] of settled.clears) {
-				if (prev === undefined) this.settledClearVersion.delete(originId);
-				else this.settledClearVersion.set(originId, prev);
-			}
-			for (const [originId, prev] of settled.revocations) {
-				if (prev === undefined) this.settledRevokeVersion.delete(originId);
-				else this.settledRevokeVersion.set(originId, prev);
-			}
-			for (const [originId, prev] of settled.certifiedSinceClear) {
-				if (prev === undefined) this.settledCertifiedSinceClear.delete(originId);
-				else this.settledCertifiedSinceClear.set(originId, prev);
-			}
+			rollBackSettled(this.settledPartialVersion, settled.partials);
+			rollBackSettled(this.settledMarkVersion, settled.marks);
+			rollBackSettled(this.settledClearVersion, settled.clears);
+			rollBackSettled(this.settledRevokeVersion, settled.revocations);
+			rollBackSettled(this.settledCertifiedSinceClear, settled.certifiedSinceClear);
 		}
 		for (const [originId, restored] of marks ?? []) {
 			const sent = supersededPartialDropped(restored, this.settledPartialVersion.get(originId));
@@ -4052,6 +4043,8 @@ export class PendingRouteState {
 					!entry.clearCertifiedFirst &&
 					partialHistory === undefined &&
 					typeof certifiedFrom === 'number' &&
+					(gen === undefined || node.originGeneration === gen) &&
+					node.fullCoverage !== false &&
 					node.partialHistory !== true &&
 					node.floorRevoked !== true &&
 					node.hole !== true &&
@@ -4336,6 +4329,7 @@ type SharedRouteSafetyState = {
 	pendingRouteState: PendingRouteState;
 	partialMarked: Map<number, string | undefined>;
 	holedOrigins: Map<number, string | undefined>;
+	provisionalHoles: Map<number, number>;
 	revokedOrigins: Map<number, string | undefined>;
 	ownerConnectionId?: string;
 };
@@ -5259,6 +5253,8 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	// computeExclusionOrigins), carried on subscribe-to-node and refreshed by
 	// update-exclusion-origins; the session reads it when building SUBSCRIPTION_REQUEST.
 	exclusionOrigins?: string[];
+	/** Set while `exclusionOrigins` is the empty fallback of a recompute that failed. */
+	exclusionOriginsFailedOpen?: boolean;
 	/** Whether the last subscription request on this route carried every table. */
 	routeFullCoverage?: boolean;
 	latency = 0;
@@ -6178,28 +6174,34 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			pendingRouteState.fullCoverage(routeId, node.originGeneration);
 		}
 	}
-	function attachCopyCursorRemoval(event: any, nodeId: number | undefined, afterSeqWrite = false): void {
+	function attachCopyCursorRemoval(
+		event: any,
+		nodeId: number | undefined,
+		afterSeqWrite = false,
+		armedPass = currentCopyPass
+	): void {
 		if (nodeId === undefined) return;
 		const prevOnCommit = event.onCommit;
 		event.onCommit = async (...args: unknown[]) => {
 			if (prevOnCommit) await prevOnCommit(...args);
 			if (connectionSuperseded()) return;
+			// a pass that started since the removal was armed owns the cursor, and an unfinished one still fills it
+			if (armedPass !== currentCopyPass || (armedPass && !armedPass.finalized)) return;
 			// the barrier reads route state back after core wrote it; a pass that kept none has nothing to read
-			if (!afterSeqWrite && (currentCopyPass?.marksRoute !== false || pendingRouteState.hasUnverifiedBatches())) {
+			if (!afterSeqWrite && (armedPass?.marksRoute !== false || pendingRouteState.hasUnverifiedBatches())) {
 				if (!frameOpen && tableSubscriptionToReplicator?.send && !tableSubscriptionToReplicator?.then) {
 					const barrierEvent: any = {
 						type: 'end_txn',
 						remoteNodeIds: [],
 						txnStream,
 					};
-					attachCopyCursorRemoval(barrierEvent, nodeId, true);
+					attachCopyCursorRemoval(barrierEvent, nodeId, true, armedPass);
 					if (tableSubscriptionToReplicator.send(barrierEvent) === false) afterRefusedSend(nodeId);
 				} else {
 					deferCopyCursorRemoval(nodeId);
 				}
 				return;
 			}
-			const finishedPass = currentCopyPass;
 			if (!verifySettledRouteState()) {
 				scheduleRouteStateFlushRetry();
 			}
@@ -6213,7 +6215,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!connectionSuperseded() && isCopyPassRouteRestoredDurable()) {
 				if (persisted) {
 					try {
-						await removeFinishedCopyCursor(nodeId, finishedPass);
+						await removeFinishedCopyCursor(nodeId, armedPass);
 					} catch (error) {
 						logger.warn?.(connectionId, 'could not remove copy cursor for', databaseName, error);
 						deferCopyCursorRemoval(nodeId);
@@ -7372,10 +7374,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// the generation the record was dropped under, read before the write below can let a rotation land
 			const routeId = projectionCopy ? undefined : routeRowId();
 			const nodesAtLoss = routeId !== undefined ? readDbisCursorSync(dbisDB, 'seq', routeId)?.nodes : undefined;
-			const generationAtLoss = (lostId: number): string | undefined => {
-				const generation = markGeneration(nodesAtLoss?.find?.((state: any) => state?.id === lostId));
-				return typeof generation === 'string' ? generation : undefined;
-			};
+			const generationAtLoss = (lostId: number): string | undefined =>
+				markGeneration(nodesAtLoss?.find?.((state: any) => state?.id === lostId));
 			// in memory before any await, so an update committing meanwhile takes no floor for it (dropHoledFloors)
 			if (!projectionCopy)
 				for (const lostId of lost) {
@@ -7730,7 +7730,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	async function removeFinishedCopyCursor(nodeId: number, pass: CopyPassState | undefined) {
 		const dbisDB = getDatabaseStores().dbisDB;
-		// a pass started since owns the cursor now
 		if (!dbisDB?.remove || pass !== currentCopyPass) return;
 		// the route's record must hold what the pass filled before the cursor that would refill it goes
 		if (pass) promoteRouteScope(pass);
@@ -7844,8 +7843,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let partialMarked = new Map<number, string | undefined>();
 	/** Origins with a durable replication hole on this route (`originId -> generation`), preserved across copy-pass restoration. */
 	let holedOrigins = new Map<number, string | undefined>();
-	/** Holes marked in memory by `recordReplicationHole` calls still writing (`originId -> calls`); a durable mark removes the entry. */
-	const provisionalHoles = new Map<number, number>();
+	/**
+	 * Holes marked in memory by `recordReplicationHole` calls still writing (`originId -> calls`), shared with the route's
+	 * other sockets: a durable mark removes the entry, so a superseded call never retires a hole confirmed meanwhile.
+	 */
+	let provisionalHoles = new Map<number, number>();
 	/** Origins revoked on this route (`originId -> generation`), re-asserted if a settled write fails to persist. */
 	let revokedOrigins = new Map<number, string | undefined>();
 	/** Origins optimistically marked certifiedFrom by the latest subscription request before knowing if the peer copies. */
@@ -7876,6 +7878,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					pendingRouteState,
 					partialMarked,
 					holedOrigins,
+					provisionalHoles,
 					revokedOrigins,
 					ownerConnectionId: connectionId,
 				};
@@ -7888,9 +7891,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				for (const [k, v] of partialMarked) shared.partialMarked.set(k, v);
 				for (const [k, v] of holedOrigins) shared.holedOrigins.set(k, v);
 				for (const [k, v] of revokedOrigins) shared.revokedOrigins.set(k, v);
+				for (const [k, v] of provisionalHoles)
+					shared.provisionalHoles.set(k, (shared.provisionalHoles.get(k) ?? 0) + v);
 				pendingRouteState = shared.pendingRouteState;
 				partialMarked = shared.partialMarked;
 				holedOrigins = shared.holedOrigins;
+				provisionalHoles = shared.provisionalHoles;
 				revokedOrigins = shared.revokedOrigins;
 			}
 			pendingRouteState.setOnSettled((event) => scheduleRouteStateVerification(event));
@@ -8044,7 +8050,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let socketScopeRev: number | undefined;
 	/** Set once the route lost coverage after this socket's request; it certifies no full coverage again. */
 	let coverageNarrowedOnSocket = false;
-	/** The scope and record revision of the interrupted copy this socket's request asked to resume. */
 	let resumedCopyScope: { scope: RouteScope; rev: number } | undefined;
 	let requestIsCopy = false;
 	const holesByPass = new Map<
@@ -13913,6 +13918,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// config (harper-pro#498).
 			if (options.connection) {
 				options.connection.on('exclusion-origins-updated', (origins: string[], failedOpen?: boolean) => {
+					if (wsClosed || connectionSuperseded()) return;
 					refreshShardingAdmission();
 					if (restrictedOrigins) return;
 					recordLiveCoverage(origins, failedOpen === true);
@@ -14093,7 +14099,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				optimisticCertifiedOrigins.clear();
 				for (const state of allNodes) {
-					const stateGen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
+					const stateGen = markGeneration(state);
 					if (stateGen === undefined && pendingRouteState.hasPendingRevocation(state.id)) {
 						state.closedFloor = undefined;
 						state.relayable = false;
@@ -14150,6 +14156,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					certifiesCheckpointFloors()
 				) {
 					const fullCoverage = !restrictedOrigins && (options.connection.exclusionOrigins ?? []).includes(node.name);
+					const coverageUnknown = options.connection.exclusionOriginsFailedOpen === true;
 					const previous = options.connection.routeFullCoverage;
 					options.connection.routeFullCoverage = fullCoverage;
 					const ownState = allNodes.find((state) => state.id === nodeId);
@@ -14157,12 +14164,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					let recorded: RouteScope;
 					let recordedRev: number;
 					try {
-						({ recorded, rev: recordedRev } = recordRequestScope(
-							dbisDB,
-							nodeId,
-							current,
-							previous !== false && ownState?.fullCoverage !== false
-						));
+						({ recorded, rev: recordedRev } = recordRequestScope(dbisDB, nodeId, current, {
+							legacyFull: previous !== false && ownState?.fullCoverage !== false,
+							previousOnSocket: socketRequestScope,
+							coverageUnknown,
+						}));
 					} catch (error) {
 						routeScopeFailure = error;
 						return undefined;
@@ -14192,6 +14198,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					const persistedPartial = ownState?.partialHistory === true;
 					const narrowedFromFullCoverage =
 						!fullCoverage &&
+						!coverageUnknown &&
 						(previous === true ||
 							allNodes.some((state) => state.fullCoverage === true || typeof state.certifiedFrom === 'number'));
 					if (
@@ -14201,7 +14208,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						narrowedFromFullCoverage
 					) {
 						for (const state of allNodes) {
-							const gen = typeof state.originGeneration === 'string' ? state.originGeneration : undefined;
+							const gen = markGeneration(state);
 							pendingRouteState.partialHistory(state.id, true, gen);
 							partialMarked.set(state.id, gen);
 						}
@@ -14508,8 +14515,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return;
 		}
 		// the sender resumes from whichever cursor it is sent last, so a copy the route needs whole carries none
-		if (freshCopyRequired)
+		if (freshCopyRequired) {
 			for (const subscription of nodeSubscriptions ?? []) if (subscription) subscription.copyResume = undefined;
+			copyWasResumed = false;
+			copyResumedWithWidening = false;
+			resumedCopyScope = undefined;
+		}
 		if (
 			!subscriptionRequestSent &&
 			!requestIsCopy &&

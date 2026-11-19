@@ -78,25 +78,28 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 	it('records a narrowing before the request and judges widening against the scope recorded before it', () => {
 		const dbisDB = scopeStore({ ...excluding('t'), rev: 0 });
 		// the replicate flip: t is in scope now, and the record keeps the older, narrower scope
-		const widened = recordRequestScope(dbisDB, 7, excluding(), true);
+		const widened = recordRequestScope(dbisDB, 7, excluding(), { legacyFull: true });
 		assert.deepStrictEqual(widened, { recorded: excluding('t'), rev: 0 });
 		assert.ok(scopeWidens(widened.recorded, excluding()));
 		assert.strictEqual(dbisDB.writes.length, 0, 'a widening is written only when a copy completes');
 
-		const narrowed = recordRequestScope(dbisDB, 7, excluding('t', 'u'), true);
+		const narrowed = recordRequestScope(dbisDB, 7, excluding('t', 'u'), { legacyFull: true });
 		assert.deepStrictEqual(narrowed, { recorded: excluding('t'), rev: 1 });
 		assert.deepStrictEqual(dbisDB.writes, [{ ...excluding('t', 'u'), rev: 1 }]);
-		assert.strictEqual(recordRequestScope(dbisDB, 7, excluding('t', 'u'), true).rev, 1);
+		assert.strictEqual(recordRequestScope(dbisDB, 7, excluding('t', 'u'), { legacyFull: true }).rev, 1);
 		assert.strictEqual(dbisDB.writes.length, 1, 'an unchanged scope writes nothing');
 	});
 
 	it('seeds an absent record from the request and an older build’s evidence of partial coverage', () => {
 		const fresh = scopeStore();
-		assert.deepStrictEqual(recordRequestScope(fresh, 7, excluding('t'), true), { recorded: excluding('t'), rev: 0 });
+		assert.deepStrictEqual(recordRequestScope(fresh, 7, excluding('t'), { legacyFull: true }), {
+			recorded: excluding('t'),
+			rev: 0,
+		});
 		assert.deepStrictEqual(fresh.writes, [{ ...excluding('t'), rev: 0 }]);
 
 		const partialBefore = scopeStore();
-		const { recorded } = recordRequestScope(partialBefore, 7, excluding(), false);
+		const { recorded } = recordRequestScope(partialBefore, 7, excluding(), { legacyFull: false });
 		assert.ok(scopeWidens(recorded, excluding()), 'a #1092-era row with fullCoverage: false still widens');
 		assert.deepStrictEqual(partialBefore.writes, [{ ...routeScope(false, true, []), rev: 0 }]);
 	});
@@ -104,13 +107,55 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 	it('keeps only coverage on a route that is not full, which never certifies', () => {
 		const dbisDB = scopeStore({ ...excluding('t'), rev: 2 });
 		const partial = routeScope(false, true, []);
-		assert.deepStrictEqual(recordRequestScope(dbisDB, 7, partial, true).rev, 3, 'losing coverage is a narrowing');
+		assert.deepStrictEqual(
+			recordRequestScope(dbisDB, 7, partial, { legacyFull: true }).rev,
+			3,
+			'losing coverage is a narrowing'
+		);
 		assert.deepStrictEqual(dbisDB.writes.at(-1), { ...partial, rev: 3 });
 		// a table entering scope on a partial route is tracked without a copy, and is not a narrowing
 		const wider = routeScope(false, true, []);
 		const tables = routeScope(false, true, ['u']);
-		recordRequestScope(dbisDB, 7, tables, true);
-		assert.deepStrictEqual(recordRequestScope(dbisDB, 7, wider, true), { recorded: tables, rev: 3 });
+		recordRequestScope(dbisDB, 7, tables, { legacyFull: true });
+		assert.deepStrictEqual(recordRequestScope(dbisDB, 7, wider, { legacyFull: true }), { recorded: tables, rev: 3 });
+	});
+
+	it('revises the record when a request narrows what an earlier request on the same socket covered', () => {
+		// a widening request leaves the record and its revision, and the copy it starts carries that revision
+		const tables = scopeStore({ ...excluding('t'), rev: 1 });
+		assert.strictEqual(recordRequestScope(tables, 7, excluding(), { legacyFull: true }).rev, 1);
+		const renarrowed = recordRequestScope(tables, 7, excluding('t'), {
+			legacyFull: true,
+			previousOnSocket: excluding(),
+		});
+		assert.strictEqual(renarrowed.rev, 2, 'the copy must not promote over the narrowing');
+		assert.deepStrictEqual(tables.writes, [{ ...excluding('t'), rev: 2 }]);
+
+		const coverage = scopeStore({ ...routeScope(false, true, []), rev: 1 });
+		recordRequestScope(coverage, 7, excluding(), { legacyFull: true });
+		assert.strictEqual(
+			recordRequestScope(coverage, 7, routeScope(false, true, []), { legacyFull: true, previousOnSocket: excluding() })
+				.rev,
+			2
+		);
+		const unchanged = scopeStore({ ...excluding('t'), rev: 1 });
+		assert.strictEqual(
+			recordRequestScope(unchanged, 7, excluding('t'), { legacyFull: true, previousOnSocket: excluding('t') }).rev,
+			1
+		);
+	});
+
+	it('records no coverage narrowing from a recompute that failed open', () => {
+		const dbisDB = scopeStore({ ...excluding('t'), rev: 1 });
+		const fallback = routeScope(false, true, ['t']);
+		assert.deepStrictEqual(recordRequestScope(dbisDB, 7, fallback, { legacyFull: true, coverageUnknown: true }), {
+			recorded: excluding('t'),
+			rev: 1,
+		});
+		assert.strictEqual(dbisDB.writes.length, 0);
+		// the table list it carries is still known, and still narrows
+		recordRequestScope(dbisDB, 7, routeScope(false, true, ['t', 'u']), { legacyFull: true, coverageUnknown: true });
+		assert.deepStrictEqual(dbisDB.writes, [{ ...excluding('t', 'u'), rev: 2 }]);
 	});
 
 	it('reads a row that is not a scope as the narrowest one, and propagates a store that cannot be read', () => {
@@ -127,7 +172,7 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 				throw new Error('closed');
 			},
 		};
-		assert.throws(() => recordRequestScope(unreadable, 7, excluding(), true), /closed/);
+		assert.throws(() => recordRequestScope(unreadable, 7, excluding(), { legacyFull: true }), /closed/);
 	});
 
 	it('reads the scope a copy cursor fills, and none from a cursor written before scopes were recorded', () => {

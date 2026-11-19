@@ -128,15 +128,52 @@ describe('route-state facts keyed by generation and connection (harper-pro#1145)
 	});
 
 	it('does not retry a certification on a row that cannot hold one', () => {
+		for (const node of [
+			{ id: 4, originGeneration: 'g4', floorRevoked: true },
+			// a partial-coverage certificate cleared it
+			{ id: 4, originGeneration: 'g4', fullCoverage: false },
+			// a level-1 certificate moved the generation and cleared it
+			{ id: 4, lastGeneration: 'g4' },
+		]) {
+			const routeState = new PendingRouteState(() => {});
+			routeState.certifiedFrom(4, 100, 'g4');
+			const event = { remoteNodeIds: [1] };
+			routeState.takeInto(event);
+			assert.strictEqual(
+				routeState.verifyPersisted(() => [node], event),
+				true,
+				JSON.stringify(node)
+			);
+			assert.strictEqual(routeState.hasPending(), false);
+		}
+	});
+
+	it('rolls back a failed batch’s settles only where no later settle replaced them', () => {
 		const routeState = new PendingRouteState(() => {});
-		routeState.certifiedFrom(4, 100, 'g4');
-		const event = { remoteNodeIds: [1] };
-		routeState.takeInto(event);
+		routeState.partialHistory(1, true, 'g1');
+		routeState.hole(2, 'g2');
+		const first = { remoteNodeIds: [1] };
+		routeState.takeInto(first);
+		routeState.certifiedFrom(1, 100, 'g1');
+		const certified = { remoteNodeIds: [1] };
+		routeState.takeInto(certified);
+		routeState.partialHistory(1, true, 'g1');
+		routeState.partialHistory(1, false, 'g1');
+		routeState.takeInto({ remoteNodeIds: [1] });
+		const row = [
+			{ id: 1, originGeneration: 'g1', partialHistory: false },
+			{ id: 2, originGeneration: 'g2' },
+		];
 		assert.strictEqual(
-			routeState.verifyPersisted(() => [{ id: 4, originGeneration: 'g4', floorRevoked: true }], event),
-			true
+			routeState.verifyPersisted(() => row, first),
+			false,
+			'the hole did not land'
 		);
-		assert.strictEqual(routeState.hasPending(), false);
+		assert.strictEqual(
+			routeState.verifyPersisted(() => row, certified),
+			true,
+			'the clear that settled after the certification still voids it'
+		);
 	});
 
 	it('writes no certification captured before a new request when its commit runs after it', async () => {
