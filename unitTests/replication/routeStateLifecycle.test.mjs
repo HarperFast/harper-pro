@@ -104,6 +104,52 @@ describe('route-state facts keyed by generation and connection (harper-pro#1145)
 		assert.deepStrictEqual(again.originRouteStates, [[5, 200, undefined, undefined, 'g5']]);
 	});
 
+	it('restores a failed batch without a partialHistory a later settle replaced', () => {
+		const routeState = new PendingRouteState(() => {});
+		routeState.partialHistory(1, true, 'g1');
+		routeState.hole(2, 'g2');
+		const first = { remoteNodeIds: [1] };
+		routeState.takeInto(first);
+		routeState.partialHistory(1, false, 'g1');
+		routeState.takeInto({ remoteNodeIds: [1] });
+		const row = [
+			{ id: 1, originGeneration: 'g1', partialHistory: false },
+			{ id: 2, originGeneration: 'g2' },
+		];
+		assert.strictEqual(
+			routeState.verifyPersisted(() => row, first),
+			false,
+			'the hole did not land'
+		);
+		assert.strictEqual(routeState.hasPendingPartialHistory(1), false);
+		const retry = { remoteNodeIds: [1] };
+		routeState.takeInto(retry);
+		assert.deepStrictEqual(retry.originRouteStates, [[2, undefined, undefined, true, 'g2']]);
+	});
+
+	it('does not retry a certification on a row that cannot hold one', () => {
+		const routeState = new PendingRouteState(() => {});
+		routeState.certifiedFrom(4, 100, 'g4');
+		const event = { remoteNodeIds: [1] };
+		routeState.takeInto(event);
+		assert.strictEqual(
+			routeState.verifyPersisted(() => [{ id: 4, originGeneration: 'g4', floorRevoked: true }], event),
+			true
+		);
+		assert.strictEqual(routeState.hasPending(), false);
+	});
+
+	it('writes no certification captured before a new request when its commit runs after it', async () => {
+		const routeState = new PendingRouteState();
+		routeState.certifiedFrom(5, 200, 'g5');
+		routeState.hole(6, 'g6');
+		const event = { remoteNodeIds: [1] };
+		routeState.attachTo(event);
+		routeState.retainOnlySafetyMarks();
+		await event.onCommit();
+		assert.deepStrictEqual(event.originRouteStates, [[6, undefined, undefined, true, 'g6']]);
+	});
+
 	it('restores a failed commit’s floors except one revoked or re-generated since the take', () => {
 		const revoked = new PendingOriginFloors();
 		revoked.note([[2, T, true, 'g2', true]]);

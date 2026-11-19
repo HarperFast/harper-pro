@@ -3564,6 +3564,18 @@ type UnverifiedRouteStateBatch = {
 };
 /** The generation core matches a route mark against: a level-1 certificate moves it to `lastGeneration`. */
 const markGeneration = (node: any): string | undefined => node?.originGeneration ?? node?.lastGeneration;
+/** A mark to restore without the `partialHistory` and clear a later settled value replaced; undefined if nothing is left. */
+function supersededPartialDropped(
+	entry: PendingRouteMarkEntry,
+	newerVersion: number | undefined
+): PendingRouteMarkEntry | undefined {
+	if (!(newerVersion! > entry.version) || (entry.mark[2] === undefined && !entry.clearCertifiedFirst)) return entry;
+	const mark = [...entry.mark] as OriginRouteState;
+	mark[2] = undefined;
+	if (entry.clearCertifiedFirst) mark[1] = undefined;
+	if (typeof mark[1] !== 'number' && mark[3] !== true && mark[5] !== true) return undefined;
+	return { ...entry, mark, clearCertifiedFirst: false };
+}
 /** The safety part of marks captured under an earlier epoch: partial history, clears and holes, no certification. */
 function safetyMarksOf(
 	marks: Map<number, PendingRouteMarkEntry> | undefined
@@ -3905,7 +3917,9 @@ export class PendingRouteState {
 				else this.settledCertifiedSinceClear.set(originId, prev);
 			}
 		}
-		for (const [originId, sent] of marks ?? []) {
+		for (const [originId, restored] of marks ?? []) {
+			const sent = supersededPartialDropped(restored, this.settledPartialVersion.get(originId));
+			if (!sent) continue;
 			const current = this.marks?.get(originId);
 			// a clear that settled after this mark voided its certifiedFrom
 			const certifiedVoided = (this.settledClearVersion.get(originId) ?? 0) > sent.version;
@@ -4028,7 +4042,8 @@ export class PendingRouteState {
 					batchPersisted = false;
 					break;
 				}
-				// a later settled partialHistory value is the row's now, and its own batch checks it
+				// a later settled partialHistory is the row's now and its own batch checks it; an older clear re-asserted
+				// over it could void a certification earned after it
 				if ((this.settledPartialVersion.get(originId) ?? 0) > entry.version) continue;
 				if (partialHistory !== undefined && node.partialHistory !== partialHistory) {
 					batchPersisted = false;
@@ -4039,7 +4054,10 @@ export class PendingRouteState {
 					partialHistory === undefined &&
 					typeof certifiedFrom === 'number' &&
 					node.partialHistory !== true &&
+					node.floorRevoked !== true &&
+					node.hole !== true &&
 					(this.settledClearVersion.get(originId) ?? 0) <= entry.version &&
+					(this.settledRevokeVersion.get(originId) ?? 0) <= entry.version &&
 					!(node.certifiedFrom <= certifiedFrom)
 				) {
 					batchPersisted = false;
@@ -4105,6 +4123,7 @@ export class PendingRouteState {
 		event.onCommit = async (...args: unknown[]) => {
 			if (onCommit) await onCommit(...args);
 			activeMarks = this.filterUnsettledMarks(sent[0]);
+			if (epoch !== this.ownerEpoch) activeMarks = safetyMarksOf(activeMarks);
 			activeRevocations = this.filterUnsettledRevocations(sent[1]);
 			if (!this.takenEvents.has(event)) {
 				this.writeEventFields(event, activeMarks, activeRevocations);
@@ -4189,7 +4208,8 @@ export class PendingOriginFloors {
 		const batch = new Map(this.pending);
 		this.pending.clear();
 		const takenAt = this.clock;
-		const generationsAtTake = new Map([...batch.keys()].map((originId) => [originId, this.generations.get(originId)]));
+		const generationsAtTake = new Map<number, string | undefined>();
+		for (const originId of batch.keys()) generationsAtTake.set(originId, this.generations.get(originId));
 		event.originFloors = [...batch.values()];
 		const prevOnFailure = event.onFailure;
 		event.onFailure = (error: unknown, position: number, afterCommit?: boolean) => {
@@ -6189,6 +6209,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				}
 				return;
 			}
+			const finishedPass = currentCopyPass;
 			if (!verifySettledRouteState()) {
 				scheduleRouteStateFlushRetry();
 			}
@@ -6202,7 +6223,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!connectionSuperseded() && isCopyPassRouteRestoredDurable()) {
 				if (persisted) {
 					try {
-						await removeFinishedCopyCursor(nodeId);
+						await removeFinishedCopyCursor(nodeId, finishedPass);
 					} catch (error) {
 						logger.warn?.(connectionId, 'could not remove copy cursor for', databaseName, error);
 						deferCopyCursorRemoval(nodeId);
@@ -6444,11 +6465,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						deferCopyCursorRemoval(copyNodeId);
 					}
 				} else {
+					const finishedPass = currentCopyPass;
 					void settlePassCopyBounds()
 						.then((ok) => {
 							if (connectionSuperseded()) return;
 							if (ok && isCopyPassRouteRestoredDurable()) {
-								return removeFinishedCopyCursor(copyNodeId);
+								return removeFinishedCopyCursor(copyNodeId, finishedPass);
 							}
 							deferCopyCursorRemoval(copyNodeId);
 						})
@@ -7351,7 +7373,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (calls > 1) provisionalHoles.set(lostId, calls - 1);
 				else {
 					provisionalHoles.delete(lostId);
-					holedOrigins.delete(lostId);
+					// a generation means a durable hole, possibly a replacement socket's, not this call's assumption
+					if (holedOrigins.get(lostId) === undefined) holedOrigins.delete(lostId);
 				}
 			}
 		};
@@ -7721,11 +7744,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			);
 		else credit();
 	}
-	async function removeFinishedCopyCursor(nodeId: number) {
+	async function removeFinishedCopyCursor(nodeId: number, pass: CopyPassState | undefined) {
 		const dbisDB = getDatabaseStores().dbisDB;
-		if (!dbisDB?.remove) return;
+		// a pass started since owns the cursor now
+		if (!dbisDB?.remove || pass !== currentCopyPass) return;
 		// the route's record must hold what the pass filled before the cursor that would refill it goes
-		if (currentCopyPass) promoteRouteScope(currentCopyPass);
+		if (pass) promoteRouteScope(pass);
 		await dbisDB.remove([Symbol.for('copyCursor'), nodeId]);
 		noteCopyStall((tracker) => tracker.noteDurableProgress());
 	}
@@ -8032,6 +8056,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let copyResumedWithWidening = false;
 	/** Every request scope sent on this socket, intersected: a copy started on it fills no more than the narrowest. */
 	let socketRequestScope: RouteScope | undefined;
+	/** The route-scope revision this socket's latest request left: a pass starting on it began under that one. */
+	let socketScopeRev: number | undefined;
 	/** Set once the route lost coverage after this socket's request; it certifies no full coverage again. */
 	let coverageNarrowedOnSocket = false;
 	/** The scope and record revision of the interrupted copy this socket's request asked to resume. */
@@ -8262,7 +8288,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	let currentCopyPass: CopyPassState | undefined;
-	/** What a pass starting now fills: the narrowest scope this socket requested, under the revision it began at. */
+	/** What a pass starting now fills: the narrowest scope this socket requested, under the revision its request left. */
 	function copyPassScope(routeId: number | undefined): { scope: RouteScope; scopeRev: number } | undefined {
 		if (copyWasResumed) {
 			// a cursor from before scopes were recorded never widens the record
@@ -8272,20 +8298,25 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				scopeRev: resumedCopyScope.rev,
 			};
 		}
-		if (!socketRequestScope || routeId === undefined) return undefined;
-		try {
-			const scopeRev = readRouteScope(getDatabaseStores().dbisDB, routeId)?.rev;
-			return scopeRev === undefined ? undefined : { scope: socketRequestScope, scopeRev };
-		} catch {
-			return undefined;
-		}
+		// the revision the request left, not one read now: a narrowing since must stop promotion
+		if (!socketRequestScope || socketScopeRev === undefined || routeId === undefined) return undefined;
+		return { scope: socketRequestScope, scopeRev: socketScopeRev };
 	}
 	/**
 	 * A completed pass's scope becomes the route's unless the route narrowed since the pass began. Synchronous, so no
 	 * narrowing can land between the revision check and the write.
 	 */
 	function promoteRouteScope(pass: CopyPassState): void {
-		if (!pass.marksRoute || !pass.scope || pass.scopeRev === undefined || pass.routeId === undefined) return;
+		if (
+			!pass.marksRoute ||
+			!pass.restored ||
+			pass.fullCoverage === false ||
+			pass.resumedWithWidening ||
+			!pass.scope ||
+			pass.scopeRev === undefined ||
+			pass.routeId === undefined
+		)
+			return;
 		const { dbisDB } = getDatabaseStores();
 		const recorded = readRouteScope(dbisDB, pass.routeId);
 		if (recorded?.rev !== pass.scopeRev || sameScope(recorded, pass.scope)) return;
@@ -8347,11 +8378,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				const state = rawState ? { ...rawState } : undefined;
 				// a fact recorded before the origin had a generation belongs to the first one that carries it, so a later rotation
 				// drops it rather than stamping it onto the new generation
-				if (typeof state?.originGeneration === 'string') {
+				const carriedGeneration = markGeneration(state);
+				if (typeof carriedGeneration === 'string') {
 					if (state.partialHistory === true && partialMarked.has(id) && partialMarked.get(id) === undefined)
-						partialMarked.set(id, state.originGeneration);
+						partialMarked.set(id, carriedGeneration);
 					if (state.hole === true && holedOrigins.has(id) && holedOrigins.get(id) === undefined)
-						holedOrigins.set(id, state.originGeneration);
+						holedOrigins.set(id, carriedGeneration);
 				}
 				if (partialMarked.has(id)) {
 					const partialGen = partialMarked.get(id);
@@ -13878,10 +13910,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const routeId = routeRowId();
 		if (!routeNode || origins.includes(routeNode) || routeId === undefined) return;
 		coverageNarrowedOnSocket = true;
+		if (socketRequestScope) socketRequestScope = { ...socketRequestScope, full: false };
 		try {
 			const { dbisDB } = getDatabaseStores();
 			const recorded = readRouteScope(dbisDB, routeId);
-			if (recorded?.full) writeRouteScope(dbisDB, routeId, { ...recorded, full: false, rev: recorded.rev + 1 });
+			// a new revision even on a partial record: a copy that began before this must not promote over it
+			if (recorded) writeRouteScope(dbisDB, routeId, { ...recorded, full: false, rev: recorded.rev + 1 });
 		} catch (error) {
 			logger.warn?.(connectionId, 'could not record the route scope for', databaseName, error);
 			wsClosed = true;
@@ -13906,6 +13940,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					refreshShardingAdmission();
 					if (restrictedOrigins) return;
 					recordLiveCoverage(origins, failedOpen === true);
+					if (wsClosed) return;
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
 							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
@@ -13965,6 +14000,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		copyResumedWithWidening = false;
 		resumedCopyScope = undefined;
 		let routeScopeFailure: unknown;
+		let freshCopyRequired = false;
 		let directFloorOnlyNodeId: number | undefined;
 		let directFloorOnlyStart: number | undefined;
 		let directFloorOnlyGeneration: string | undefined;
@@ -14156,6 +14192,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						return undefined;
 					}
 					socketRequestScope = socketRequestScope ? intersectScope(socketRequestScope, current) : current;
+					socketScopeRev = recordedRev;
 					cursorScope = cursorRouteScope(copyCursor);
 					// what an interrupted copy is filling; a cursor from before scopes were recorded fills the request's tables
 					const copyScope =
@@ -14174,9 +14211,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						fullCoverage &&
 						(copyScope
 							? scopeWidens(copyScope, current) ||
-								(typeof copyCursor?.scopeRev === 'number' &&
-									copyCursor.scopeRev !== recordedRev &&
-									scopeWidens(recorded, current))
+								((!cursorScope || copyCursor?.scopeRev !== recordedRev) && scopeWidens(recorded, current))
 							: scopeWidens(recorded, current));
 					const persistedPartial = ownState?.partialHistory === true;
 					const narrowedFromFullCoverage =
@@ -14208,6 +14243,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								scopeRev: undefined,
 							};
 							cursorScope = undefined;
+							freshCopyRequired = true;
 							try {
 								dbisDB
 									?.put?.([Symbol.for('copyCursor'), nodeId], copyCursor)
@@ -14219,6 +14255,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 						} else if (fullCoverage && (widened || persistedPartial) && !copyCursor) {
 							forceFullCopyOnWidening = true;
+							freshCopyRequired = true;
 							requestIsCopy = true;
 							logger.warn?.(
 								connectionId,
@@ -14494,6 +14531,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			close(1011, 'Could not record the route scope; reconnecting');
 			return;
 		}
+		// the sender resumes from whichever cursor it is sent last, so a copy the route needs whole carries none
+		if (freshCopyRequired)
+			for (const subscription of nodeSubscriptions ?? []) if (subscription) subscription.copyResume = undefined;
 		if (
 			!subscriptionRequestSent &&
 			!requestIsCopy &&
