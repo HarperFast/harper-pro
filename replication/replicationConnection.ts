@@ -4146,7 +4146,7 @@ type CopyPassState = {
 	routeId?: number;
 	/** The hole rows that stood when this pass began: the only ones its completion may fill. */
 	holes?: CopyHole[];
-	/** The pass began on a route proven to carry every table, with a request that left none out: only then may it fill. */
+	/** A full, non-resumed copy on a socket whose every request asked for every table with coverage proven: only it may fill. */
 	deliversEveryTable?: boolean;
 };
 
@@ -7863,8 +7863,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let passHoles = 0;
 	/** Records this pass dropped because its route filters their table: no hole, but those tables were not delivered. */
 	let passFilteredRecords = 0;
-	/** The latest subscription request for the route's own node asked for every table this node holds. */
-	let requestedEveryTable = false;
+	/**
+	 * Every subscription request on this socket asked the route's node for every table, with full coverage proven on
+	 * this socket. A copy cannot say which request it answers, nor does the route's coverage flag outlive a reconnect.
+	 */
+	let socketRequestsCoverEveryTable = true;
 	/** Highest audit-less copyApply record version applied per origin, bounding floor-only resume. */
 	const maxCopiedVersionByOrigin = new Map<number, number>();
 	/**
@@ -8021,15 +8024,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const store = auditStore ?? dbAuditStore;
 			const peerId =
 				copyFromNodeId ?? (remoteNodeName && store ? getIdOfRemoteNode(remoteNodeName, store) : undefined) ?? 0;
-			// only a pass known to deliver every table can vouch for what an earlier pass dropped: not a resumed one, one
-			// that skipped a table, one whose route coverage is unproven, or a projection (its route certifies no coverage)
+			// a projection's route certifies no coverage, and a resumed pass did not re-send what an earlier pass dropped
 			const filled =
-				passHoles === 0 &&
-				passFilteredRecords === 0 &&
-				passState !== undefined &&
-				!passState.resumed &&
-				!projectionCopy &&
-				passState.deliversEveryTable === true
+				passHoles === 0 && passFilteredRecords === 0 && passState?.deliversEveryTable === true
 					? (passState.holes ?? [])
 					: [];
 			const rootStore = store?.rootStore ?? (dbisDB as any)?.rootStore;
@@ -9107,7 +9104,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							resumed: copyWasResumed,
 							resumedWithWidening: copyResumedWithWidening,
 							fullCoverage: options.connection?.routeFullCoverage !== false,
-							deliversEveryTable: requestedEveryTable && options.connection?.routeFullCoverage === true,
+							deliversEveryTable: !projectionCopy && !copyWasResumed && socketRequestsCoverEveryTable,
 							seqDurableAtCopyStart: false,
 							completeReceived: false,
 							restored: false,
@@ -9127,7 +9124,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 						if (currentCopyPass.deliversEveryTable && copyApplyActive() && supportsCheckpointFloors()) {
 							try {
-								// any complete pass refills an ordinary table, whichever peer's pass dropped the record
+								// such a pass refills an ordinary table, whichever peer's pass dropped the record
 								currentCopyPass.holes = readCopyHoles(getDatabaseStores().dbisDB);
 							} catch {
 								// none to fill: a hole this pass cannot read stays
@@ -13705,7 +13702,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!error.message.includes('Can not re')) throw error;
 		}
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
-		requestedEveryTable = false;
 		receivingDataFromNodeIds = [];
 		requestedNodeNames = [];
 		lastSentBareFloorCursors.clear();
@@ -13756,7 +13752,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
-				if (node === connectedNode) requestedEveryTable = replicateByDefault !== false && tableSubs.length === 0;
+				const requestsEveryTable = replicateByDefault !== false && tableSubs.length === 0;
 
 				const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 				auditStore?.ensureLogExists?.(node.name);
@@ -13877,6 +13873,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 				}
 				let forceFullCopyOnWidening = false;
+				let coverageProven = false;
 				if (
 					nodeId !== undefined &&
 					connectedNode === node &&
@@ -13887,6 +13884,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					const fullCoverage = !restrictedOrigins && (options.connection.exclusionOrigins ?? []).includes(node.name);
 					const previous = options.connection.routeFullCoverage;
 					options.connection.routeFullCoverage = fullCoverage;
+					coverageProven = fullCoverage;
 					const ownState = allNodes.find((state) => state.id === nodeId);
 					const copyFromPartialCoverage =
 						copyCursor?.fullCoverage === true
@@ -13941,6 +13939,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 				}
+				if (node === connectedNode) socketRequestsCoverEveryTable &&= requestsEveryTable && coverageProven;
 				// A floor the peer certified is a proven start, used only while the peer still certifies: a
 				// downgraded peer may write below a floor it saved.
 				if (!forceFullCopyOnWidening && hasPersistedResumeCursor && connectedNode === node && certifiesOriginFloors()) {

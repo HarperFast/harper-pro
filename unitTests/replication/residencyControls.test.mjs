@@ -3163,6 +3163,79 @@ describe('Declarative tables keep control and event traffic independent of place
 				}
 			}));
 
+	for (const why of ['earlier-partial-request', 'reused-connection'])
+		it(`a copy fills no hole unless every request on its socket proved it asked for every table (${why})`, () =>
+			atCheckpointLevel(async () => {
+				const peer = 'slot-control-peer';
+				const connection = new EventEmitter();
+				connection.exclusionOrigins = [peer];
+				connection.nodeSubscriptions = [
+					why === 'earlier-partial-request'
+						? {
+								name: peer,
+								replicateByDefault: true,
+								routeReplicates: { receivesFrom: [{ source: peer, excludeTables: ['Other'] }] },
+							}
+						: { name: peer, replicateByDefault: true },
+				];
+				const { Records, socket, database } = await connect(
+					false,
+					`hole_fill_latch_${why.replaceAll('-', '_')}`,
+					true,
+					checkpointCapabilities(),
+					(database) => {
+						table({ database, table: 'Other', audit: true, attributes: [{ name: 'id', isPrimaryKey: true }] });
+					},
+					connection
+				);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				const departed = getIdOfRemoteNode('departed-peer', Records.auditStore);
+				await persistCopyHole(Records.dbisDB, departed, Records.auditStore.rootStore, 'earlier-pass', 1, [departed], 1);
+				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				let copySocket = socket;
+				if (why === 'earlier-partial-request') {
+					// the full request goes out before the sender answers the partial one
+					connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+					connection.emit('subscriptions-updated');
+					await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
+				} else {
+					assert.equal(connection.routeFullCoverage, true, 'premise: the level-2 socket proved full coverage');
+					socket.close();
+					copySocket = new Socket();
+					sockets.push(copySocket);
+					connection.socket = copySocket;
+					replicateOverWS(copySocket, { connection }, { name: peer, replicates: true });
+					copySocket.emit(
+						'message',
+						encode([
+							140,
+							peer,
+							database,
+							[],
+							buildLocalCapabilities(90_000, true, true),
+							{ shardsDigest: getResidencyConfiguration().digest },
+						])
+					);
+					await until(() => copySocket.sent.some((frame) => frame[0] === 129) || copySocket.closes.length);
+				}
+				assert.deepEqual(copySocket.closes, []);
+				const anchor = Date.now() + 100;
+				copySocket.emit('message', encode([148, anchor, 1]));
+				const copyCursorKey = [Symbol.for('copyCursor'), peerId];
+				await Records.dbisDB.put(copyCursorKey, {
+					copyStartTime: anchor,
+					currentTable: Records.tableName,
+					afterKey: 'x',
+				});
+				copySocket.emit('message', encode([143, anchor + 1]));
+				await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId === anchor + 1 || copySocket.closes.length);
+				copySocket.emit('message', encode([149]));
+				await until(() => Records.dbisDB.getSync(copyCursorKey) === undefined || copySocket.closes.length);
+				assert.deepEqual(copySocket.closes, []);
+				assert.equal(readCopyHoles(Records.dbisDB).length, 1, 'the hole that stood stays');
+			}));
+
 	for (const drop of unownedDrops)
 		it(`a projection that skips a record its route never owed writes no hole, and fills none (${drop})`, () =>
 			atCheckpointLevel(async () => {
