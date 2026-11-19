@@ -145,19 +145,6 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 		);
 	});
 
-	it('records no coverage narrowing from a recompute that failed open', () => {
-		const dbisDB = scopeStore({ ...excluding('t'), rev: 1 });
-		const fallback = routeScope(false, true, ['t']);
-		assert.deepStrictEqual(recordRequestScope(dbisDB, 7, fallback, { legacyFull: true, coverageUnknown: true }), {
-			recorded: excluding('t'),
-			rev: 1,
-		});
-		assert.strictEqual(dbisDB.writes.length, 0);
-		// the table list it carries is still known, and still narrows
-		recordRequestScope(dbisDB, 7, routeScope(false, true, ['t', 'u']), { legacyFull: true, coverageUnknown: true });
-		assert.deepStrictEqual(dbisDB.writes, [{ ...excluding('t', 'u'), rev: 2 }]);
-	});
-
 	it('reads a row that is not a scope as the narrowest one, and propagates a store that cannot be read', () => {
 		assert.deepStrictEqual(readRouteScope(scopeStore({ full: 'yes' }), 7), {
 			full: false,

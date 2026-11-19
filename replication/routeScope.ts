@@ -98,13 +98,11 @@ export function writeRouteScope(dbisDB: any, routeId: number, scope: RecordedRou
 	});
 }
 
-export interface RequestScopeContext {
+interface RequestScopeContext {
 	/** An older build's evidence of partial coverage, for seeding an absent record. */
 	legacyFull: boolean;
 	/** What earlier requests on this socket covered: a copy one of them started must not promote past a narrowing. */
 	previousOnSocket?: RouteScope;
-	/** The coverage recompute failed open, so `current.full` is a fallback, not a narrowing. */
-	coverageUnknown?: boolean;
 }
 
 /**
@@ -115,12 +113,11 @@ export interface RequestScopeContext {
 export function recordRequestScope(
 	dbisDB: any,
 	routeId: number,
-	requested: RouteScope,
-	{ legacyFull, previousOnSocket, coverageUnknown }: RequestScopeContext
+	current: RouteScope,
+	{ legacyFull, previousOnSocket }: RequestScopeContext
 ): { recorded: RouteScope; rev: number } {
 	const stored = readRouteScope(dbisDB, routeId);
-	const recorded = stored ?? { ...requested, full: requested.full && legacyFull, rev: 0 };
-	const current = coverageUnknown ? { ...requested, full: recorded.full } : requested;
+	const recorded = stored ?? { ...current, full: current.full && legacyFull, rev: 0 };
 	const bump = previousOnSocket !== undefined && scopeWidens(current, previousOnSocket) ? 1 : 0;
 	let next: RecordedRouteScope;
 	if (!current.full) next = { ...current, rev: recorded.full ? recorded.rev + 1 : recorded.rev + bump };

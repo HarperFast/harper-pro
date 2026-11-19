@@ -3607,6 +3607,37 @@ function supersededPartialDropped(
 	if (typeof mark[1] !== 'number' && mark[3] !== true && mark[5] !== true) return undefined;
 	return { ...entry, mark, clearCertifiedFirst: false };
 }
+/**
+ * A failed batch's marks to retry, less each certification the row can no longer take: its coverage or generation moved
+ * since, or it holds a fact that voids one.
+ */
+function withoutRefusedCertifications(
+	marks: Map<number, PendingRouteMarkEntry> | undefined,
+	peerNodes: any[] | undefined
+): Map<number, PendingRouteMarkEntry> | undefined {
+	if (!marks || !Array.isArray(peerNodes)) return marks;
+	let retry = marks;
+	for (const [originId, entry] of marks) {
+		const [, certifiedFrom, partialHistory, , gen] = entry.mark;
+		if (typeof certifiedFrom !== 'number' || partialHistory !== undefined || entry.clearCertifiedFirst) continue;
+		const node = peerNodes.find((n: any) => n?.id === originId);
+		if (
+			!node ||
+			(node.fullCoverage !== false &&
+				(gen === undefined || node.originGeneration === gen) &&
+				node.partialHistory !== true &&
+				node.floorRevoked !== true &&
+				node.hole !== true)
+		)
+			continue;
+		if (retry === marks) retry = new Map(marks);
+		const mark = [...entry.mark] as OriginRouteState;
+		mark[1] = undefined;
+		if (mark[3] === true || mark[5] === true) retry.set(originId, { ...entry, mark });
+		else retry.delete(originId);
+	}
+	return retry;
+}
 /** The safety part of marks captured under an earlier epoch: partial history, clears and holes, no certification. */
 function safetyMarksOf(
 	marks: Map<number, PendingRouteMarkEntry> | undefined
@@ -3911,7 +3942,6 @@ export class PendingRouteState {
 			const sent = supersededPartialDropped(restored, this.settledPartialVersion.get(originId));
 			if (!sent) continue;
 			const current = this.marks?.get(originId);
-			// a clear that settled after this mark voided its certifiedFrom
 			const certifiedVoided = (this.settledClearVersion.get(originId) ?? 0) > sent.version;
 			if (!current) {
 				const mark = [...sent.mark] as OriginRouteState;
@@ -4100,7 +4130,12 @@ export class PendingRouteState {
 				}
 			}
 			if (!batchPersisted) {
-				this.restore(batch.marks, batch.revocations, batch.settled, batch.epoch);
+				this.restore(
+					withoutRefusedCertifications(batch.marks, peerNodes),
+					batch.revocations,
+					batch.settled,
+					batch.epoch
+				);
 				allPersisted = false;
 			}
 		}
@@ -4337,7 +4372,7 @@ type SharedRouteSafetyState = {
 	pendingRouteState: PendingRouteState;
 	partialMarked: Map<number, string | undefined>;
 	holedOrigins: Map<number, string | undefined>;
-	provisionalHoles: Map<number, number>;
+	provisionalHoles: Map<number, Set<symbol>>;
 	revokedOrigins: Map<number, string | undefined>;
 	ownerConnectionId?: string;
 };
@@ -5261,8 +5296,6 @@ export class NodeReplicationConnection extends EventEmitter implements PrivatePa
 	// computeExclusionOrigins), carried on subscribe-to-node and refreshed by
 	// update-exclusion-origins; the session reads it when building SUBSCRIPTION_REQUEST.
 	exclusionOrigins?: string[];
-	/** Set while `exclusionOrigins` is the empty fallback of a recompute that failed. */
-	exclusionOriginsFailedOpen?: boolean;
 	/** Whether the last subscription request on this route carried every table. */
 	routeFullCoverage?: boolean;
 	latency = 0;
@@ -6172,7 +6205,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	/** A copy run with full coverage makes the route whole again: the mark rides this route's next update. */
 	function restoreRouteFullCoverage(): void {
-		if (!currentCopyPass?.marksRoute || currentCopyPass.resumedWithWidening || currentCopyPass.fullCoverage === false)
+		if (
+			!currentCopyPass?.marksRoute ||
+			!currentCopyPass.finalized ||
+			currentCopyPass.resumedWithWidening ||
+			currentCopyPass.fullCoverage === false
+		)
 			return;
 		const routeId = currentCopyPass.routeId;
 		const node = readDbisCursorSync(getDatabaseStores().dbisDB, 'seq', routeId)?.nodes?.find(
@@ -6181,6 +6219,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (node?.fullCoverage === false && typeof node.originGeneration === 'string') {
 			pendingRouteState.fullCoverage(routeId, node.originGeneration);
 		}
+	}
+	/** A pass that started since a removal was armed owns the cursor, and an unfinished one still fills it. */
+	function copyPassOwnsCursor(pass: CopyPassState | undefined): boolean {
+		if (connectionSuperseded() || pass !== currentCopyPass) return false;
+		return !pass || (pass.finalized && copyWatermark.currentPass === pass.passId);
 	}
 	function attachCopyCursorRemoval(
 		event: any,
@@ -6192,9 +6235,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const prevOnCommit = event.onCommit;
 		event.onCommit = async (...args: unknown[]) => {
 			if (prevOnCommit) await prevOnCommit(...args);
-			if (connectionSuperseded()) return;
-			// a pass that started since the removal was armed owns the cursor, and an unfinished one still fills it
-			if (armedPass !== currentCopyPass || (armedPass && !armedPass.finalized)) return;
+			if (!copyPassOwnsCursor(armedPass)) return;
 			// the barrier reads route state back after core wrote it; a pass that kept none has nothing to read
 			if (!afterSeqWrite && (armedPass?.marksRoute !== false || pendingRouteState.hasUnverifiedBatches())) {
 				if (!frameOpen && tableSubscriptionToReplicator?.send && !tableSubscriptionToReplicator?.then) {
@@ -6220,24 +6261,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				return;
 			}
 			const persisted = await settlePassCopyBounds();
-			if (!connectionSuperseded() && isCopyPassRouteRestoredDurable()) {
-				if (persisted) {
-					try {
-						await removeFinishedCopyCursor(nodeId, armedPass);
-					} catch (error) {
-						logger.warn?.(connectionId, 'could not remove copy cursor for', databaseName, error);
-						deferCopyCursorRemoval(nodeId);
-					}
-				} else {
-					deferCopyCursorRemoval(nodeId);
+			if (!copyPassOwnsCursor(armedPass)) return;
+			if (persisted && isCopyPassRouteRestoredDurable()) {
+				try {
+					await removeFinishedCopyCursor(nodeId, armedPass);
+				} catch (error) {
+					logger.warn?.(connectionId, 'could not remove copy cursor for', databaseName, error);
+					if (copyPassOwnsCursor(armedPass)) deferCopyCursorRemoval(nodeId);
 				}
-			} else if (!connectionSuperseded()) {
+			} else {
 				deferCopyCursorRemoval(nodeId);
 			}
 		};
 		const prevOnFailure = event.onFailure;
 		event.onFailure = (error: unknown, position: number, afterCommit?: boolean) => {
-			if (!connectionSuperseded()) {
+			if (copyPassOwnsCursor(armedPass)) {
 				deferCopyCursorRemoval(nodeId);
 			}
 			return prevOnFailure ? prevOnFailure(error, position, afterCommit) : false;
@@ -6468,7 +6506,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					const finishedPass = currentCopyPass;
 					void settlePassCopyBounds()
 						.then((ok) => {
-							if (connectionSuperseded()) return;
+							if (!copyPassOwnsCursor(finishedPass)) return;
 							if (ok && isCopyPassRouteRestoredDurable()) {
 								return removeFinishedCopyCursor(copyNodeId, finishedPass);
 							}
@@ -6476,7 +6514,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						})
 						.catch((error) => {
 							logger.warn?.(connectionId, 'could not remove copy cursor for', databaseName, error);
-							if (!connectionSuperseded()) deferCopyCursorRemoval(copyNodeId);
+							if (copyPassOwnsCursor(finishedPass)) deferCopyCursorRemoval(copyNodeId);
 						});
 				}
 			}
@@ -7357,18 +7395,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const origin = getNodeNameForId(auditStore, originId, true);
 		const pass = copyPassToken;
 		const premarked: number[] = [];
+		const holeToken = Symbol('provisional hole');
 		// a held frame is replayed, so the hole this call assumed is not one unless another call still holds it or it
 		// became durable meanwhile
 		const retireProvisionalHoles = () => {
 			for (const lostId of premarked) {
-				const calls = provisionalHoles.get(lostId);
-				if (calls === undefined) continue;
-				if (calls > 1) provisionalHoles.set(lostId, calls - 1);
-				else {
-					provisionalHoles.delete(lostId);
-					// a generation means a durable hole, possibly a replacement socket's, not this call's assumption
-					if (holedOrigins.get(lostId) === undefined) holedOrigins.delete(lostId);
-				}
+				const holders = provisionalHoles.get(lostId);
+				if (!holders?.delete(holeToken) || holders.size > 0) continue;
+				provisionalHoles.delete(lostId);
+				if (holedOrigins.get(lostId) === undefined) holedOrigins.delete(lostId);
 			}
 		};
 		try {
@@ -7387,10 +7422,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// in memory before any await, so an update committing meanwhile takes no floor for it (dropHoledFloors)
 			if (!projectionCopy)
 				for (const lostId of lost) {
-					const calls = holedOrigins.has(lostId) ? provisionalHoles.get(lostId) : 0;
-					if (calls === undefined) continue;
+					const holders = provisionalHoles.get(lostId);
+					if (holedOrigins.has(lostId) && !holders) continue;
 					holedOrigins.set(lostId, undefined);
-					provisionalHoles.set(lostId, calls + 1);
+					if (holders) holders.add(holeToken);
+					else provisionalHoles.set(lostId, new Set([holeToken]));
 					premarked.push(lostId);
 				}
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
@@ -7738,11 +7774,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	async function removeFinishedCopyCursor(nodeId: number, pass: CopyPassState | undefined) {
 		const dbisDB = getDatabaseStores().dbisDB;
-		if (!dbisDB?.remove || pass !== currentCopyPass) return;
+		if (!dbisDB?.remove || !copyPassOwnsCursor(pass)) return;
 		// the route's record must hold what the pass filled before the cursor that would refill it goes
 		if (pass) promoteRouteScope(pass);
 		await dbisDB.remove([Symbol.for('copyCursor'), nodeId]);
-		noteCopyStall((tracker) => tracker.noteDurableProgress());
+		if (copyPassOwnsCursor(pass)) noteCopyStall((tracker) => tracker.noteDurableProgress());
 	}
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
 	// committed AND its blob (and all earlier blobs) have finished saving; the persisted replication
@@ -7852,10 +7888,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	/** Origins with a durable replication hole on this route (`originId -> generation`), preserved across copy-pass restoration. */
 	let holedOrigins = new Map<number, string | undefined>();
 	/**
-	 * Holes marked in memory by `recordReplicationHole` calls still writing (`originId -> calls`), shared with the route's
-	 * other sockets: a durable mark removes the entry, so a superseded call never retires a hole confirmed meanwhile.
+	 * Holes marked in memory by `recordReplicationHole` calls still writing (`originId -> each call's token`), shared
+	 * with the route's other sockets: a durable mark removes the entry, and a call retires only its own token, so a
+	 * superseded call never retires a hole confirmed or assumed by another call.
 	 */
-	let provisionalHoles = new Map<number, number>();
+	let provisionalHoles = new Map<number, Set<symbol>>();
 	/** Origins revoked on this route (`originId -> generation`), re-asserted if a settled write fails to persist. */
 	let revokedOrigins = new Map<number, string | undefined>();
 	/** Origins optimistically marked certifiedFrom by the latest subscription request before knowing if the peer copies. */
@@ -7899,8 +7936,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				for (const [k, v] of partialMarked) shared.partialMarked.set(k, v);
 				for (const [k, v] of holedOrigins) shared.holedOrigins.set(k, v);
 				for (const [k, v] of revokedOrigins) shared.revokedOrigins.set(k, v);
-				for (const [k, v] of provisionalHoles)
-					shared.provisionalHoles.set(k, (shared.provisionalHoles.get(k) ?? 0) + v);
+				for (const [k, v] of provisionalHoles) {
+					const holders = shared.provisionalHoles.get(k);
+					if (holders) for (const token of v) holders.add(token);
+					else shared.provisionalHoles.set(k, v);
+				}
 				pendingRouteState = shared.pendingRouteState;
 				partialMarked = shared.partialMarked;
 				holedOrigins = shared.holedOrigins;
@@ -14167,7 +14207,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					certifiesCheckpointFloors()
 				) {
 					const fullCoverage = !restrictedOrigins && (options.connection.exclusionOrigins ?? []).includes(node.name);
-					const coverageUnknown = options.connection.exclusionOriginsFailedOpen === true;
 					const previous = options.connection.routeFullCoverage;
 					options.connection.routeFullCoverage = fullCoverage;
 					const ownState = allNodes.find((state) => state.id === nodeId);
@@ -14178,7 +14217,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						({ recorded, rev: recordedRev } = recordRequestScope(dbisDB, nodeId, current, {
 							legacyFull: previous !== false && ownState?.fullCoverage !== false,
 							previousOnSocket: socketRequestScope,
-							coverageUnknown,
 						}));
 					} catch (error) {
 						routeScopeFailure = error;
@@ -14210,7 +14248,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					const persistedPartial = ownState?.partialHistory === true;
 					const narrowedFromFullCoverage =
 						!fullCoverage &&
-						!coverageUnknown &&
 						(previous === true ||
 							allNodes.some((state) => state.fullCoverage === true || typeof state.certifiedFrom === 'number'));
 					if (
