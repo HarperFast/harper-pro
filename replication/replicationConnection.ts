@@ -3916,6 +3916,14 @@ export class PendingRouteState {
 			if (!current) {
 				const mark = [...sent.mark] as OriginRouteState;
 				if (certifiedVoided && mark[2] !== true && !sent.clearCertifiedFirst) mark[1] = undefined;
+				if (
+					typeof mark[1] !== 'number' &&
+					mark[2] === undefined &&
+					mark[3] !== true &&
+					mark[5] !== true &&
+					!sent.clearCertifiedFirst
+				)
+					continue;
 				(this.marks ??= new Map()).set(originId, {
 					mark,
 					clearCertifiedFirst: sent.clearCertifiedFirst,
