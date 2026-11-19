@@ -657,6 +657,12 @@ async function stageRow(
 			membership.thisNodeName()
 		);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
+		// Every database with a row of its own is carried by every later default transition.
+		if (plan.action === 'write' && existing?.inherited && ownRowDatabases().length >= MAX_EXPLICIT_DATABASES)
+			throw new ClientError(
+				`${MAX_EXPLICIT_DATABASES} databases already have home maps of their own here, the most a default home map carries`,
+				409
+			);
 		const fenced = withFences(
 			plan.action === 'write' ? plan.row.fenced : (existing?.fenced ?? []),
 			fence,
@@ -665,20 +671,20 @@ async function stageRow(
 		);
 		if (plan.action === 'noop') {
 			if (fenced) await write({ ...existing!, fenced });
-			const scope = isDefault ? await defaultStageScope(plan.staged) : undefined;
 			// Idempotent retry, not a genuine transition — but the PRIOR call may have durably written
 			// this exact state and then failed to confirm every thread applied it (a relay timeout, a
 			// dead worker). Re-notifying is harmless when nothing changed and is the only way a retry
 			// ever reconciles that gap (a real pre-push review finding: a noop that skips notification
 			// leaves every unconfirmed thread stuck on the retracted generation with no bound).
 			await notifyChanged(key);
-			return { staged: plan.staged, scope };
+			return { staged: plan.staged, scope: isDefault ? await defaultStageScope(plan.staged) : undefined };
 		}
 		await write(fenced ? { ...plan.row, fenced } : plan.row);
-		const scope = isDefault ? await defaultStageScope(plan.row.staged!) : undefined;
 		logger.info?.(`Record lock home map for ${describeKey(key)}: staged generation ${generation}, retracted active`);
 		await notifyChanged(key);
-		return { staged: plan.row.staged!, scope };
+		// Only once every thread acked the retraction: a database registered before then could still have
+		// been granted under the old default, and has an owner entry by the time its grant could exist.
+		return { staged: plan.row.staged!, scope: isDefault ? await defaultStageScope(plan.row.staged!) : undefined };
 	});
 }
 

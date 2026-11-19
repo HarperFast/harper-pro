@@ -560,8 +560,9 @@ true }` or the per-node operations with `default: true`). On a node, a database 
   serving it from its own row never agree, even on equal `(generation, homes)`.
 - **One fenced transition moves every inheriting database.** Staging the default retracts all of them in
   one durable write. The stage then drains each one on its owner (`drainInheriting`), and the node
-  proves only if every database's drain proves. The drain set is fixed under the default row lock at
-  the stage write (`defaultStageScope`): every database main has an owner entry for, or released one
+  proves only if every database's drain proves. The drain set is fixed under the default row lock once
+  every thread acked the retraction (`defaultStageScope` after `notifyChanged`; a database registered
+  earlier has an owner entry by the time a grant under the old default could exist): every database main has an owner entry for, or released one
   for within `DELEGATION_DRAIN_MS` (`ownedOrRecentlyReleased`), plus, after the node's first
   incarnation, every database this thread's catalog replicates (`replicatedDatabaseNames`), minus those
   with own rows. It is empty only when the node had no default ring before (`staged.fresh`) and is in
@@ -578,7 +579,9 @@ true }` or the per-node operations with `default: true`). On a node, a database 
 - **Own rows never coexist with an agreed inherited ring.** Inherited X is agreed only if every member of
   the live default ring inherits X. A per-database apply on an inheriting database plans against the
   effective row, so `planSurvey`'s unlisted check and the local `planStage` force `quiesce` to cover the
-  default ring, and its generation is above the default's. A default activation writes a marker
+  default ring, and its generation is above the default's. A first own row is refused while this node
+  already has `MAX_EXPLICIT_DATABASES` own rows, so a stage never meets an exclusion list it must refuse
+  after retracting. A default activation writes a marker
   (`markerRows`) for every database any surveyed or staged node reported an own row for (the activate
   hop's `explicit`, required on a default activation, which the apply unions from every survey and
   stage reply's own rows and `staged.explicit`). The promotion records that list as `active.explicit`,

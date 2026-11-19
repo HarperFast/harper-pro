@@ -423,6 +423,31 @@ function manualRecovery(
 	return `apply without fenced once it is reachable; no generation above ${floor} is left to re-home them by hand`;
 }
 
+/** The planner spreads every list in a reply, so a peer's malformed one must fail its own hop. */
+function isSurveyReply(reply: any): boolean {
+	const isState = (state: any) =>
+		state === undefined ||
+		(typeof state === 'object' &&
+			state !== null &&
+			Number.isSafeInteger(state.generation) &&
+			typeof state.digest === 'string' &&
+			Array.isArray(state.homes) &&
+			isNameList(state.homes) &&
+			isNameList(state.quiesce) &&
+			isNameList(state.explicit));
+	return (
+		typeof reply === 'object' &&
+		reply !== null &&
+		isState(reply.active) &&
+		isState(reply.staged) &&
+		(reply.highestActedOn === undefined || Number.isSafeInteger(reply.highestActedOn)) &&
+		(reply.fenced === undefined ||
+			(Array.isArray(reply.fenced) &&
+				reply.fenced.every((entry: any) => typeof entry === 'object' && entry !== null))) &&
+		isNameList(reply.explicit)
+	);
+}
+
 function isNameList(value: unknown): boolean {
 	return (
 		value === undefined ||
@@ -609,7 +634,7 @@ async function runApply(
 	const survey = async (node: string): Promise<SurveyReply | { error: string }> => {
 		try {
 			const reply = await hop(node, { operation: TRANSITION_OPERATION, ...target, action: 'survey' }, timeouts.hopMs);
-			return reply && typeof reply === 'object' && isNameList(reply.explicit) && isNameList(reply.staged?.explicit)
+			return isSurveyReply(reply)
 				? reply
 				: { error: `malformed survey reply: ${JSON.stringify(reply)?.slice(0, 200)}` };
 		} catch (error) {

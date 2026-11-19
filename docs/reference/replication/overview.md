@@ -521,7 +521,7 @@ It takes the same `quiesce`, `generation`, `drained` and `fenced` fields and ret
 - A map of a database's own takes precedence over the default, permanently. Apply one to a database that is not replicated by every node in the default, for example a sharded database or one some nodes leave out of `replication.databases`: under the default it answers `503`, because every node in a map must replicate the database. Its `quiesce` must include the default's nodes.
 - Every node in `quiesce` must run v5.5.0 or later; a node on an earlier version refuses the call before anything changes. Before downgrading a node below v5.5.0, apply a map of its own to each database that uses the default, since an earlier version does not read the default and those databases would refuse locks.
 - At most 10,000 databases in a cluster can have maps of their own while a default exists, counting databases since dropped. Each one is recorded on every node, and a default change is refused once the count is above that.
-- `cluster_status` reports `homeMapSource: "default"` or `"database"` for each database under `recordLocks`.
+- `cluster_status` reports `homeMapSource: "default"` or `"database"` for each database under `recordLocks`: where its map comes from, not whether it can lock. A database some default node does not replicate reports `"default"` and still answers `503`.
 
 ### Confirming Locked Writes
 

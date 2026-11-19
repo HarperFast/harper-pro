@@ -699,25 +699,30 @@ describe('the default row, on a real table', function () {
 
 	it('a row written beside a held lock commits only while that lock holds its lease', async () => {
 		const homes = getRecordLockHomesTable();
-		for (const lapse of [false, true]) {
+		for (const lapse of ['none', 'before the held write', 'after every write is saved']) {
 			const parentKey = `lease-parent-${lapse}`;
 			const childKey = `lease-child-${lapse}`;
 			const context = {};
 			const locked = await homes.lock(parentKey, { scope: 'node', hold: true, lease: 300, timeout: 5_000 }, context);
 			const commit = transaction(context, async () => {
 				await homes.put(childKey, { database: childKey, highestActedOn: 1, fenced: [] }, context);
-				if (lapse) await delay(500);
+				if (lapse === 'before the held write') await delay(500);
 				await locked._writeUpdate(parentKey, { database: parentKey, highestActedOn: 1, fenced: [] }, true, {
 					localOnly: true,
 				});
 				await locked.save();
+				if (lapse === 'after every write is saved') await delay(500);
 			});
-			if (lapse) await assert.rejects(commit, /lease expired/);
-			else await commit;
+			if (lapse === 'none') await commit;
+			else await assert.rejects(commit, /lease expired/, lapse);
 			try {
 				await locked.unlock();
 			} catch {}
-			assert.strictEqual(homes.primaryStore.get(childKey)?.highestActedOn, lapse ? undefined : 1, `lapse: ${lapse}`);
+			assert.strictEqual(
+				homes.primaryStore.get(childKey)?.highestActedOn,
+				lapse === 'none' ? 1 : undefined,
+				`lapse: ${lapse}`
+			);
 			await homes.delete(childKey);
 			await homes.delete(parentKey);
 		}
