@@ -7852,7 +7852,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let socketRequestScope: { allowlist: boolean; names: Set<string> } | undefined;
 	const requestsLeftOut = (tableName: string) =>
 		socketRequestScope !== undefined && socketRequestScope.allowlist !== socketRequestScope.names.has(tableName);
-	/** Folds a request into `socketRequestScope`, only once it was sent: an unsent one must not widen what was left out. */
+	/** Folds a request into `socketRequestScope` once it is sent: the peer serves only what it received. */
 	const foldSentRequestScope = (entries: { replicateByDefault?: boolean; tables: string[] }[]) => {
 		for (const { replicateByDefault, tables: listedTables } of entries) {
 			if (socketRequestScope && !socketRequestScope.allowlist && socketRequestScope.names.size === 0) return;

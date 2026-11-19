@@ -3197,7 +3197,7 @@ describe('Declarative tables keep control and event traffic independent of place
 						[],
 						'no hole row of its own'
 					);
-					assert.notEqual(readCopyBounds(Records.dbisDB).get(peerId), HOLE_COPY_BOUND, 'the origin stays admissible');
+					assert.notEqual(readCopyBounds(Records.dbisDB).get(peerId), HOLE_COPY_BOUND, 'no hole bound for the origin');
 					assert.deepEqual(
 						(residencyStatus()[database].checkpointHoles ?? []).filter((hole) => hole.source === peer),
 						[]
@@ -3209,7 +3209,7 @@ describe('Declarative tables keep control and event traffic independent of place
 					assert.equal(
 						readCopyHoles(Records.dbisDB).length,
 						1,
-						"a projection's table scope is unknown here, so the hole that stood stays"
+						'no copy releases a hole row, so the one that stood stays'
 					);
 					assert.ok(poisonedPairs(database).includes(`${peer}:Plain`), 'record locks still refuse the pair');
 				} finally {
@@ -3300,7 +3300,6 @@ describe('Declarative tables keep control and event traffic independent of place
 			socket.emit('message', encode([143, floor + 500, { [peer]: [floor, 'peer-generation', true] }]));
 			await until(() => peerNode()?.originGeneration === 'peer-generation' || socket.closes.length);
 			Plain.replicate = false;
-			// a later request that excludes the table cannot vouch for rows the first one asked for
 			connection.emit('subscriptions-updated');
 			await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
 			socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
@@ -3334,7 +3333,7 @@ describe('Declarative tables keep control and event traffic independent of place
 			await until(() => peerNode()?.closedFloor === floor || socket.closes.length);
 			assert.deepEqual(socket.closes, []);
 			assert.equal(peerNode().relayable, true);
-			assert.notEqual(peerNode().fullCoverage, true, 'what it relays carries no generation');
+			assert.notEqual(peerNode().fullCoverage, true, 'the restricted route stores no level-2 coverage');
 		}));
 
 	async function waitForOwnReservation(Records, peerId) {
