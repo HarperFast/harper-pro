@@ -3,7 +3,7 @@
 // applies A's writes, because the default skips the system database and replication apply.
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -20,12 +20,13 @@ import {
 	waitForRing,
 } from './recordLockShared.mjs';
 import { readNodePid, sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
+import { pauseLink, resumeLink } from './nodeDrainShared.mjs';
 
 // long, so a wait that ends well before it was ended by the peers being gone
 const CONFIRMATION_TIMEOUT_MS = 120_000;
 // recordLockShared's pingTimeout: how long a sender with no receipt still counts as connected
 const PING_TIMEOUT_MS = 3_000;
-// holds A's frames to B while the file `pause-<B's address>` exists in A's pause dir; pings are not held
+// pings are not held, so a paused link stays connected
 const PAUSE_INJECTOR = join(import.meta.dirname, 'replicationSendPauseInjector.mjs');
 const HOLD_MS = 3_000;
 
@@ -62,10 +63,16 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 		const writing = call(a, 'GatedLockedWrite/', { id, n, lease: 60_000, timeout: 10_000, afterSave }).finally(() => {
 			settled = true;
 		});
-		await waitForCondition(
-			async (signal) => ((await call(a, 'GateControl/', { id }, signal)).body?.waiting ? true : undefined),
-			{ timeoutMs: 30_000, description: `the gated write of ${id} to hold its cluster lock` }
-		);
+		writing.catch(() => {});
+		try {
+			await waitForCondition(
+				async (signal) => ((await call(a, 'GateControl/', { id }, signal)).body?.waiting ? true : undefined),
+				{ timeoutMs: 30_000, description: `the gated write of ${id} to hold its cluster lock` }
+			);
+		} catch (error) {
+			await call(a, 'GateControl/', { id, open: true }).catch(() => {});
+			throw error;
+		}
 		return { writing, settled: () => settled };
 	}
 
@@ -109,7 +116,7 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 	test('a locked commit logged after a later-keyed write B already acknowledged waits until B applies it (harper-pro#1391)', async () => {
 		const id = 'locked-out-of-order';
 		const gated = await holdGatedWrite(id, 3, true);
-		const pauseFile = join(aPauseDir, `pause-${b.hostname}`);
+		const pauseFrom = { pauseDir: aPauseDir };
 		try {
 			// the operations API runs on the main thread, so this commits while the gated transaction is open
 			await sendOperation(a, {
@@ -121,9 +128,9 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 			});
 			assert.equal((await counter(b, 'logged-first'))?.n, 1, 'B applied the later-keyed write');
 			// B sends its key acknowledgment 2 ms after the marker acknowledgment the upsert returned on; let it land, so a
-			// waiter seeded from B's key maximum would be seeded as confirmed
+			// waiter seeded from B's key maximum would be seeded as confirmed (confirmationWaiter.test.mjs pins the seed rule)
 			await delay(200);
-			await writeFile(pauseFile, '');
+			await pauseLink(pauseFrom, b);
 			assert.equal((await call(a, 'GateControl/', { id, open: true })).body.waiting, true);
 			await waitForCondition(
 				async (signal) => ((await counterLog(a, signal)).some((entry) => entry.id === id) ? true : undefined),
@@ -133,7 +140,7 @@ suite('replication confirmation defaults', { timeout: 300_000 }, (ctx) => {
 			assert.equal(gated.settled(), false, 'confirmed while its frame was held back from B');
 			assert.equal(await counter(b, id), undefined, 'B has not received the held frame');
 		} finally {
-			await rm(pauseFile, { force: true });
+			await resumeLink(pauseFrom, b);
 			await call(a, 'GateControl/', { id, open: true }).catch(() => {});
 			await gated.writing.catch(() => {});
 		}

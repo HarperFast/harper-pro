@@ -110,7 +110,7 @@ export class GatedLockedWrite extends Resource {
 	}
 }
 
-/** POST { id, open? }: whether GatedLockedWrite holds this id's lock; `open: true` lets it write. */
+/** POST { id, open? }: whether GatedLockedWrite holds this id's lock; `open: true` lets it continue. */
 export class GateControl extends Resource {
 	async post(data) {
 		const open = gates.get(data.id);
