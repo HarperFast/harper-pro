@@ -182,6 +182,7 @@ describe('route scope (harper-pro#1142, #1212)', () => {
 		// a repair request reports it, so no saved cursor resumes on the revision the repair writes
 		const repair = recordRequestScope(scopeStore({ full: 'yes' }), 7, excluding(), { legacyFull: true });
 		assert.strictEqual(repair.repaired, true);
+		assert.ok(repair.rev > 1_000_000_000_000, 'no cursor or pass from before the repair holds its revision');
 		assert.ok(scopeWidens(repair.recorded, excluding()));
 		const unreadable = {
 			getSync() {
