@@ -537,6 +537,11 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				).map(({ id }) => id);
 			const until = (probe, description) =>
 				waitForCondition(probe, { timeoutMs: CONVERGE_TIMEOUT_MS, pollMs: 500, description });
+			async function stopCleanly(nodeCtx) {
+				const outgoing = nodeCtx.harper.process;
+				await killHarper(nodeCtx, { graceMs: SHUTDOWN_GRACE_MS });
+				equal(outgoing.exitCode, 0, `${nodeCtx.harper.hostname} did not stop cleanly`);
+			}
 
 			after(async () => {
 				await stopAndTeardownNodes(nodes.map((nodeCtx) => nodeCtx.harper));
@@ -574,11 +579,11 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				);
 				equal(info.version, previousVersion, `the returning node should be running ${previousVersion}`);
 
-				await killHarper(returning, { graceMs: SHUTDOWN_GRACE_MS });
+				await stopCleanly(returning);
 				await write(source, { operation: 'delete', ids: ['gone'] });
 				// sorts last, so the copy has passed 'gone' once this arrives
 				await write(source, { operation: 'insert', records: [{ id: 'zz-sentinel', category: 'sentinel' }] });
-				await killHarper(source, { graceMs: SHUTDOWN_GRACE_MS });
+				await stopCleanly(source);
 				const mark = await logMark(source.harper);
 				// a returning node with a saved cursor is forced into the copy; one without asks for it
 				await startNode(source, CURRENT_BIN, { HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: DATABASE });
