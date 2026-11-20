@@ -28,6 +28,20 @@ function lockedIncrementIn(node, id, signal) {
 	return call(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 }, signal);
 }
 
+/** Retries only the 503 a lock answers while its map settles; any other answer fails at once. */
+function waitForLockedIncrementIn(node, id) {
+	let last;
+	return waitForCondition(
+		async (signal) => {
+			last = await lockedIncrementIn(node, id, signal);
+			if (last.status === 503) return undefined;
+			assert.equal(last.status, 200, JSON.stringify(last.body));
+			return last;
+		},
+		{ timeoutMs: 30_000, description: () => `${FRESH} to be lockable on ${node.hostname}: ${JSON.stringify(last)}` }
+	);
+}
+
 async function itemCount(node, id, signal) {
 	const rows = await sendOperation(
 		node,
@@ -161,6 +175,18 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(body.outcome, 'activated', JSON.stringify(body));
 		assert.equal(body.generation, 2, 'above the default generation it inherited');
 		for (const node of nodes.slice(0, 2)) assert.equal((await recordLocksOf(node, FRESH)).homeMapSource, 'database');
+		// A generation change rebuilds the transport and schedules a restart recall, so the first lock under it may
+		// answer a retryable 503; the default change in the next test then has to leave a lockable map lockable.
+		const id = 'own-map-' + Date.now();
+		await sendOperation(nodes[0], {
+			operation: 'insert',
+			database: FRESH,
+			table: ITEM,
+			records: [{ id, n: 0 }],
+			authorization: nodes[0].admin,
+		});
+		await waitForItem(nodes, id, 0);
+		for (const node of nodes.slice(0, 2)) await waitForLockedIncrementIn(node, id);
 	});
 
 	test('a default that names the third node lets it lock every inheriting database, and not one with its own map', async () => {
@@ -188,16 +214,8 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		await waitForItem(nodes, fresh, 0);
 		assert.equal((await lockedIncrementIn(nodes[2], fresh)).status, 503, 'the joiner holds a marker, not the default');
 		assert.equal((await recordLocksOf(nodes[2], FRESH)).homeMapSource, 'database');
-		// The first lock under FRESH's own map, after the default activation refreshed it on every thread and
-		// re-announced its digest to peers, so it polls like every other lockability check after a map change.
-		let last;
-		await waitForCondition(
-			async (signal) => {
-				last = await lockedIncrementIn(nodes[0], fresh, signal);
-				return last.status === 200 ? last : undefined;
-			},
-			{ timeoutMs: 30_000, description: () => `its own map to still serve on its members: ${JSON.stringify(last)}` }
-		);
+		const own = await lockedIncrementIn(nodes[0], fresh);
+		assert.equal(own.status, 200, `its own map still serves on its members: ${JSON.stringify(own.body)}`);
 	});
 
 	test('a shrink moves the inheriting database only after a lock held on the leaver commits', async () => {
