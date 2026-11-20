@@ -6,15 +6,10 @@ import { table } from '#src/core/resources/databases';
 import { transaction } from '#src/core/resources/transaction';
 import { getIdOfRemoteNode } from '#src/core/resources/nodeIdMapping';
 import { getThisNodeName } from '#src/core/server/nodeName';
-import { ACTION_32_BIT, createAuditEntry, Decoder, readAuditEntry } from '#src/core/resources/auditStore';
+import { Decoder, readAuditEntry } from '#src/core/resources/auditStore';
 import { FULL_WRITE_HEAD } from '#src/core/resources/Table';
 import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
-import {
-	boundaryOutranksHead,
-	databaseSubscriptions,
-	encodeCopyRecordValue,
-	replicateOverWS,
-} from '#src/replication/replicationConnection';
+import { boundaryOutranksHead, databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
 import { setReplicator } from '#src/replication/replicator';
 
 const SUBSCRIPTION_REQUEST = 129;
@@ -204,28 +199,7 @@ describe('delete tombstones in a base copy', function () {
 		return records;
 	}
 
-	function nilPutEncoding(key, nodeId) {
-		const stored = [...Records.primaryStore.getRange({ versions: true, snapshot: false })].find(
-			(entry) => entry.key === key
-		);
-		return Buffer.from(
-			createAuditEntry({
-				version: stored.version,
-				tableId: Records.tableId,
-				recordId: key,
-				previousVersion: null,
-				nodeId,
-				type: 'put',
-				encodedRecord: encodeCopyRecordValue(Records.primaryStore, stored.value, () => {}),
-				extendedType: stored.metadataFlags & ~0xff & ~FULL_WRITE_HEAD & ~(ACTION_32_BIT << 24),
-				residencyId: stored.residencyId,
-				previousResidencyId: null,
-				expiresAt: stored.expiresAt,
-			})
-		);
-	}
-
-	it('sends a tombstone as a bodyless delete at its version to a peer advertising tombstoneCopy', async () => {
+	it('sends a tombstone as a bodyless delete at its version', async () => {
 		await connect(buildLocalCapabilities(90_000, false, true));
 		const records = await copiedRecords();
 		const deleted = records.get('deleted')?.entry;
@@ -313,54 +287,26 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(logged('replayed-after-copy'), 0);
 	});
 
-	for (const peer of ['a pre-key capability bag', 'unlearned capabilities']) {
-		it(`sends a tombstone exactly as before the gate to a peer with ${peer}`, async () => {
-			let bag;
-			if (peer === 'a pre-key capability bag') {
-				bag = { ...buildLocalCapabilities(90_000, false, true) };
-				delete bag.tombstoneCopy;
-			}
+	// an older receiver core applies the copied delete as an ordinary replicated delete, which still removes the row
+	for (const [peer, bag] of [
+		['an LMDB capability bag', buildLocalCapabilities(90_000, false, false)],
+		['unlearned capabilities', undefined],
+	]) {
+		it(`sends a tombstone as a delete to a peer with ${peer}`, async () => {
 			await connect(bag);
 			const records = await copiedRecords(!bag);
-			const deleted = records.get('deleted');
-			assert.equal(deleted?.entry.type, 'put');
-			assert.deepEqual(deleted.bytes, nilPutEncoding('deleted', deleted.entry.nodeId));
-			const covered = records.get('published-over-delete');
-			assert.equal(covered?.entry.type, 'put');
-			assert.deepEqual(covered.bytes, nilPutEncoding('published-over-delete', covered.entry.nodeId));
-			const native = records.get('native-covered');
-			assert.equal(native?.entry.type, 'put');
-			assert.deepEqual(native.bytes, nilPutEncoding('native-covered', native.entry.nodeId));
+			const deleted = records.get('deleted')?.entry;
+			assert.equal(deleted?.type, 'delete');
+			assert.equal(deleted.version, Records.primaryStore.getEntry('deleted').version);
+			assert.equal(records.get('published')?.entry.type, 'put', 'a publish-only head is not a delete');
+			const covered = records.get('published-over-delete')?.entry;
+			assert.equal(covered?.type, 'delete');
+			assert.equal(covered.version, boundaryVersion);
+			const native = records.get('native-covered')?.entry;
+			assert.equal(native?.type, 'delete');
+			assert.equal(native.version, nativeDeleteVersion);
 		});
 	}
-
-	it('sends a tombstone as a delete to a peer whose bag is not learned but whose request declares tombstoneCopy', async () => {
-		await connect();
-		const records = await copiedRecords(true, { tombstoneCopy: 1 });
-		const deleted = records.get('deleted')?.entry;
-		assert.equal(deleted?.type, 'delete');
-		assert.equal(deleted.version, Records.primaryStore.getEntry('deleted').version);
-		assert.equal(records.get('published')?.entry.type, 'put', 'a publish-only head is not a delete');
-		assert.equal(records.get('published-over-delete')?.entry.type, 'delete');
-	});
-
-	for (const tombstoneCopy of [0, '1', true, null]) {
-		it(`ignores a request declaring tombstoneCopy: ${JSON.stringify(tombstoneCopy)}`, async () => {
-			await connect();
-			const records = await copiedRecords(true, { tombstoneCopy });
-			const deleted = records.get('deleted');
-			assert.equal(deleted?.entry.type, 'put');
-			assert.deepEqual(deleted.bytes, nilPutEncoding('deleted', deleted.entry.nodeId));
-		});
-	}
-
-	it('follows a learned bag without tombstoneCopy over a request declaring it', async () => {
-		const bag = { ...buildLocalCapabilities(90_000, false, true) };
-		delete bag.tombstoneCopy;
-		await connect(bag);
-		const records = await copiedRecords(false, { tombstoneCopy: 1 });
-		assert.equal(records.get('deleted')?.entry.type, 'put');
-	});
 
 	it('orders a retained boundary against a head by version, then origin name', () => {
 		const [low, high] = ['copy-tombstone-tie-a', 'copy-tombstone-tie-z'].map((name) =>
