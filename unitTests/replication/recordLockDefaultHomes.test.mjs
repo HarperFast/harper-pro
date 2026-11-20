@@ -29,6 +29,7 @@ import {
 import { applyHomes, planSurvey } from '#src/replication/recordLockApply';
 import { dropNoCoordinatorEntry } from '#src/replication/recordLockRpc';
 import { transaction } from '#src/core/resources/transaction';
+import { LOCAL_ONLY } from '#src/core/resources/auditStore';
 import { getThisNodeName } from '#src/core/server/nodeName';
 import {
 	cachedActiveGeneration,
@@ -711,6 +712,20 @@ describe('the default row, on a real table', function () {
 		const own = await ownRow('fence-only');
 		assert.strictEqual(own.staged.generation, 2);
 		assert.deepStrictEqual(own.fenced, fences);
+	});
+
+	it('a first own row and the placeholder default row it commits beside are both LOCAL_ONLY', async () => {
+		const homes = getRecordLockHomesTable();
+		const saved = homes.primaryStore.getEntry(DEFAULT_HOMES_KEY)?.value;
+		await homes.delete(DEFAULT_HOMES_KEY);
+		try {
+			await stageGeneration({ database: 'local-only', generation: 1, homes: [self], quiesce: [self], ...operator });
+			for (const key of ['local-only', DEFAULT_HOMES_KEY])
+				assert.ok(homes.primaryStore.getEntry(key).metadataFlags & LOCAL_ONLY, `${key} is LOCAL_ONLY`);
+			assert.strictEqual(homes.primaryStore.get(DEFAULT_HOMES_KEY).active, undefined, 'a ring-less placeholder');
+		} finally {
+			if (saved) await homes.put(DEFAULT_HOMES_KEY, saved);
+		}
 	});
 
 	it('a row written beside a held lock commits only while that lock holds its lease', async () => {

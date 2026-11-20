@@ -301,7 +301,13 @@ async function writeRows(
 	if (!alongside?.length) return writeRow(locked, row);
 	const homes = getRecordLockHomesTable();
 	await transaction(context, async () => {
-		for (const other of alongside) await homes.put(other.database, other, context);
+		// Marked LOCAL_ONLY as `writeRow` marks its row; a plain `put` would leave the flag off.
+		for (const other of alongside)
+			await (
+				await homes.getResource(other.database, context)
+			)._writeUpdate(other.database, other, true, {
+				localOnly: true,
+			});
 		await writeRow(locked, row);
 	});
 }
