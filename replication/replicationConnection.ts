@@ -10915,7 +10915,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const legacyCopy = await probeLegacyCopy();
 												if (legacyCopy) copyResume = undefined;
 												if (closed || wsClosed) return;
-												logger.info?.('Replicating all tables to', remoteNodeName);
+												logger.info?.('Replicating all tables to', remoteNodeName, 'for database', databaseName);
 												// Anchored in this node's own `local` log only. It does NOT depend on the tail being single-log:
 												// `excluded` is always an array here, so the range below is normally the multi-log aggregate, and
 												// that aggregate applies `exactStart` only to the logs named in `startByLog`. Gated on the store
