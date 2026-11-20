@@ -34,7 +34,7 @@ suite('Native sharding bootstrap', { timeout: 600_000 }, (ctx) => {
 				},
 				replication: {
 					failover: true,
-					threads: Number(process.env.HARPER_TEST_SHARDING_POOL || 0),
+					threads: process.env.HARPER_TEST_SHARDING_POOL ? Number(process.env.HARPER_TEST_SHARDING_POOL) : undefined,
 					securePort: context.harper.hostname + ':9933',
 					databases: '*',
 					shard: i % 2,
@@ -217,6 +217,8 @@ export class BootstrapLocal extends Resource {
   const origin = Table.auditStore.loadLogs().indexOf(Table.auditStore.logByName.get(target.get('origin')));
   const cursors = Array.from(Table.dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([255])] }));
   return { path: Table.primaryStore.rootStore.path,
+   directSeqId: Table.dbisDB.getSync([Symbol.for('seq'), origin])?.seqId,
+   copyPending: !!(Table.dbisDB.getSync([Symbol.for('copyCursor'), origin]) || Table.dbisDB.getSync([Symbol.for('shardingOwnedCopyPending'), origin])),
    recoveryBound: Table.dbisDB.getSync([Symbol.for('sharding-origin-recovery-bound'), 'data']),
    localAudit: Array.from(Table.auditStore.getRange({ log: 0, start: 1, includeLogName: true }), entry => ({ table: entry.tableId, type: entry.type, id: entry.recordId, origin: entry.nodeId, log: entry.logName, slot: entry.residencySlot, key: entry.txnLogKey })),
    bootstrap: Array.from(Table.dbisDB.getRange({ start: Symbol.for('sharding-bootstrap-history'), end: [Symbol.for('sharding-bootstrap-history'), Buffer.from([255])] }), entry => entry.value),
@@ -327,32 +329,56 @@ export class BootstrapLocal extends Resource {
 			assert.equal(response.status, 200);
 			return response.json();
 		};
+		async function establishResumeCursor(from, to, id, body, above = 0) {
+			const sender = contexts[from].harper;
+			await sendOperation(
+				sender,
+				{ operation: 'insert', database: 'data', table: 'Rows', records: [{ id, region: 'asia', body }] },
+				{ signal: AbortSignal.timeout(10_000) }
+			);
+			const source = await local(from, AbortSignal.timeout(10_000));
+			const appendKey = source.localAudit.find((entry) => entry.id === id && entry.type === 'put')?.key;
+			assert.ok(appendKey > above, `node ${from} appended ${id} above ${above}`);
+			let state;
+			await waitForCondition(
+				async (signal) => {
+					state = await local(to, signal, sender.hostname);
+					return (
+						!state.copyPending &&
+						state.directSeqId >= appendKey &&
+						state.rows.some((row) => row.id === id && row.body === body && row.version > above && !(row.flags & 5))
+					);
+				},
+				{
+					timeoutMs: 30_000,
+					description: () =>
+						`node ${to} to resume from node ${from} at ${appendKey} for ${id} ` +
+						`(direct cursor ${state?.directSeqId}, copy pending ${state?.copyPending}, ` +
+						`row ${JSON.stringify(state?.rows.find((row) => row.id === id))})`,
+				}
+			);
+		}
+		// A copy from node 2 can return node 0's newer write and fence node 0 while it holds the reservation.
+		await establishResumeCursor(2, 0, 'resume-baseline2', 'reverse-stream-ready');
 		const held = await control();
 		assert.ok(held.threadId > 0, 'a real request worker owns the reservation');
 		try {
-			await sendOperation(
-				node,
-				{
-					operation: 'insert',
-					database: 'data',
-					table: 'Rows',
-					records: [{ id: 'resume-cursor1', region: 'asia', body: 'committed-above-reservation' }],
-				},
-				{ signal: AbortSignal.timeout(10_000) }
-			);
-			await waitForCondition(
-				async (signal) =>
-					(await local(2, signal)).rows.some((row) => row.id === 'resume-cursor1' && row.version > held.key),
-				{ timeoutMs: 30_000, description: 'peer holds a committed cursor above the older reservation' }
-			);
+			await establishResumeCursor(0, 2, 'resume-cursor1', 'committed-above-reservation', held.key);
+			const logPath = join(node.logDir ?? join(node.dataRootDir, 'test-logs'), 'hdb.log');
+			const logStart = (await readFile(logPath, 'utf8')).length;
+			const readReconnectLog = async (signal) =>
+				(await readFile(logPath, { encoding: 'utf8', signal })).slice(logStart);
 			await stopNodeProcess(contexts[2].harper);
 			// a level-2 route resumes just below its certified floor, which the held reservation keeps below itself, so
 			// it needs no wait; at level 1 the peer resumes at its cursor above the reservation, the start this admits
 			await start(contexts[2], 2, { HARPER_TEST_FORCE_ORIGIN_FLOORS_LEVEL_1: '1' });
 			await waitForCondition(
-				async () => {
-					const log = await readFile(join(node.logDir ?? join(node.dataRootDir, 'test-logs'), 'hdb.log'), 'utf8');
-					return log.includes('Waiting for older local transactions before resuming sharding subscription');
+				async (signal) => {
+					const log = await readReconnectLog(signal);
+					const waits = log.matchAll(
+						/Waiting for older local transactions before resuming sharding subscription at [\d.]+ for ([\w.-]+)/g
+					);
+					return Array.from(waits).some(([, peer]) => peer === contexts[2].harper.hostname);
 				},
 				{ timeoutMs: 30_000, description: 'the real reconnect reaches closed-prefix link admission' }
 			);
@@ -371,6 +397,11 @@ export class BootstrapLocal extends Resource {
 					records: [{ id: 'resume-independent1', region: 'asia', body: 'writer-remains-live' }],
 				},
 				{ signal: AbortSignal.timeout(10_000) }
+			);
+			const reconnectLog = await readReconnectLog(AbortSignal.timeout(10_000));
+			assert.ok(
+				!reconnectLog.includes(`copy of database data from wss://${contexts[2].harper.hostname}:`),
+				'node 0 resumes the data subscription from node 2 without requesting a reverse copy'
 			);
 		} finally {
 			await control(true);
