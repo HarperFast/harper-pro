@@ -8229,6 +8229,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * Anything ambiguous (older version, different node, no existing record, missing blob, decode/read
 	 * failure) returns false and the record flows to the apply loop untouched — exactly as today.
 	 *
+	 * A `message` entry is never skipped: core applies every message with no tie check, so a skip could only
+	 * drop a delivery. A 4.x origin also stamps each publish with the topic record's existing version, so all
+	 * its messages to a topic tie with the stored record (harper-pro#1394).
+	 *
 	 * @param tableDecoder per-table decoder (exposes getEntry against the live primaryStore)
 	 * @param id           record primary key
 	 * @param incomingVersion incoming record version (scalar timestamp)
@@ -8242,6 +8246,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	async function isSkippableLeadingDuplicate(
 		tableDecoder: any,
 		id: any,
+		type: string,
 		incomingVersion: number,
 		incomingTxnLogKey: number,
 		sourceNodeId: number | undefined,
@@ -8258,6 +8263,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			leadingDupCursorByNode.delete(sourceNodeId);
 			return false;
 		}
+		if (type === 'message') return false;
 		// Within the leading-duplicate window. Read the existing record to confirm a TRUE identity tie.
 		return isDurableIdentityTie(readLocalEntry(tableDecoder, id), incomingVersion, sourceNodeId, hasBlobs);
 	}
@@ -12288,6 +12294,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						(await isSkippableLeadingDuplicate(
 							tableDecoder,
 							event.id,
+							auditRecord.type,
 							auditRecord.version,
 							frameTxnLogKey,
 							event.nodeId,
