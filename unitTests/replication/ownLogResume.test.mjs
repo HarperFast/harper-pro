@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
 	ownLogAppendAnchor,
+	ownLogFilterStart,
 	ownLogPastAnchorRange,
 	OWN_LOG_SLICE_ENTRIES,
 	endsOwnLogSlice,
@@ -49,6 +50,15 @@ describe('ownLogAppendAnchor', () => {
 		for (const resumeAfter of [undefined, 0, NaN, String(T)])
 			assert.strictEqual(ownLogAppendAnchor({ startTime: T, resumeAfter }, true), undefined, String(resumeAfter));
 		assert.strictEqual(ownLogAppendAnchor(undefined, true), undefined);
+	});
+});
+
+describe('ownLogFilterStart', () => {
+	it('filters nothing by key, except what an add_node start_time cutoff excludes', () => {
+		assert.strictEqual(ownLogFilterStart({ startTime: T, resumeAfter: T - 5 }), 0);
+		assert.strictEqual(ownLogFilterStart({ startTime: T, resumeAfter: T - 5, startCutoff: T - 100 }), T - 100);
+		for (const startCutoff of [undefined, 0, NaN, String(T)])
+			assert.strictEqual(ownLogFilterStart({ startCutoff }), 0, String(startCutoff));
 	});
 });
 

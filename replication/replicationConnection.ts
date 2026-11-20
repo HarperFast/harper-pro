@@ -3410,6 +3410,11 @@ export function ownLogAppendAnchor(ownSubscription: any, resumesPastEntries: boo
 	return isValidFrameTxnLogKey(ownSubscription.resumeAfter) ? ownSubscription.resumeAfter : undefined;
 }
 
+/** The key filter on an append-order own-log read: none, but an `add_node` start_time cutoff still holds. */
+export function ownLogFilterStart(ownSubscription: any): number {
+	return isValidFrameTxnLogKey(ownSubscription?.startCutoff) ? ownSubscription.startCutoff : 0;
+}
+
 export function ownLogPastAnchorRange(anchor: number) {
 	return { log: 'local', start: anchor, exactStart: true, resumeAfterExactStart: true, snapshot: false };
 }
@@ -9734,6 +9739,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let ownLogFromStart = false;
 						let ownLogRange: any;
 						let ownLogRangeFailed = false;
+						let ownLogMaxKeySent = 0;
 						// an own-log range stopped at a corrupt frame, reported and recovered like the main range
 						let ownLogCorruptRange: any;
 						const ownLogSlice = { drained: true };
@@ -10789,7 +10795,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// A commit landed after the stop while reconnects were in their floor: still owed once it ends.
 								let sendLogRecoveryPending = false;
 								let sendLogRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
-								let reportedMidLogBreakRange: unknown;
+								const reportedMidLogBreakRanges = new WeakSet<object>();
 								// A `return` from inside the loop (close, rejection) still runs this finally, so a timer
 								// armed in the exiting pass can never outlive it to wake a later, superseding loop that
 								// reused the connection-wide `wakeSender`.
@@ -11476,7 +11482,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												ownLogAnchor = undefined;
 												const ownId = getThisNodeId(auditStore);
 												const own = subscribedNodeIds[ownId];
-												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
+												if (typeof own === 'object')
+													subscribedNodeIds[ownId] = { ...own, startTime: ownLogFilterStart(ownSubscription) };
 												if (excludedNodes && !excludedNodes.includes('local')) excludedNodes.push('local');
 											}
 											if (ownLogRange && !excludedNodes) auditLogIterable = ownLogRange;
@@ -11516,6 +11523,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const status = getSharedStatus();
 												if (key > status[SENDING_TIME_POSITION]) status[SENDING_TIME_POSITION] = key;
 												if (key > currentSequenceId) currentSequenceId = key;
+												if (key > ownLogMaxKeySent) ownLogMaxKeySent = key;
 												await sendAuditRecord(next.value, key);
 												if (closed || wsClosed) return;
 												if (endsOwnLogSlice(count, next.value)) break;
@@ -11556,9 +11564,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										if (ownLogSliced && ownLogRange) {
 											// a cut slice left entries of this log unsent, so this pass proves nothing: send the rest now
 											if (!ownLogSlice.drained) continue;
-											if (isValidFloor(ownFloorAtPassStart)) {
-												// every own key below the floor is delivered, so the other logs' range carries this log from here
-												const start = cursorBelowFloor(ownFloorAtPassStart);
+											// Every own key below the floor is delivered, so the other logs' range carries this log from just below
+											// it. Only once the floor passes every key already sent: that range then resends none of them, however
+											// long a held transaction keeps the floor low.
+											if (isValidFloor(ownFloorAtPassStart) && ownFloorAtPassStart > ownLogMaxKeySent) {
+												const start = Math.max(
+													cursorBelowFloor(ownFloorAtPassStart),
+													ownLogFilterStart(ownSubscription)
+												);
 												ownLogRange[Symbol.iterator]().return?.();
 												ownLogRange = undefined;
 												const ownId = getThisNodeId(auditStore);
@@ -11651,18 +11664,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// peer's durable and per-origin cursors position the next range, which a sender-side reseed
 										// cannot do safely (harper-pro#876). The stopped range stays in place until then, so the
 										// certification check below still sees its failure.
-										const stoppedRange = range?.corruptFrameStop?.breaks > 0 ? range : ownLogCorruptRange;
-										if (stoppedRange && auditStore.reusableIterable) {
-											if (stoppedRange.corruptFrameStop.midLogBreak) {
+										const stoppedRanges = [...new Set([range, ownLogCorruptRange])].filter(
+											(stopped: any) => stopped?.corruptFrameStop?.breaks > 0
+										);
+										// a torn tail recovers by reconnecting, even while another log is held at a mid-log break
+										const tornTailStopped = stoppedRanges.some((stopped: any) => !stopped.corruptFrameStop.midLogBreak);
+										if (stoppedRanges.length > 0 && auditStore.reusableIterable) {
+											for (const stopped of stoppedRanges) {
+												if (!stopped.corruptFrameStop.midLogBreak || reportedMidLogBreakRanges.has(stopped)) continue;
+												reportedMidLogBreakRanges.add(stopped);
+												logger.error?.(
+													connectionId,
+													`Replication send to ${remoteNodeName} (db: "${databaseName}") stopped at a mid-log corrupt transaction-log frame; entries behind it are not sent on this connection. Repair the transaction log or re-clone this node.`
+												);
+											}
+											if (!tornTailStopped) {
 												// Core's fail-stop: no fresh range can cross a mid-log break, so reconnecting would only churn.
 												sendLogRecoveryPending = false;
-												if (reportedMidLogBreakRange !== stoppedRange) {
-													reportedMidLogBreakRange = stoppedRange;
-													logger.error?.(
-														connectionId,
-														`Replication send to ${remoteNodeName} (db: "${databaseName}") stopped at a mid-log corrupt transaction-log frame; entries behind it are not sent on this connection. Repair the transaction log or re-clone this node.`
-													);
-												}
 											} else if (sendLogStopGeneration === undefined) {
 												sendLogStopGeneration = nextTransaction;
 											} else if (
@@ -14304,7 +14322,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					...(ownLogResumeAfter !== undefined &&
 						startTime > 1 &&
 						!copyResume &&
-						!shardingProjection && { resumeAfter: ownLogResumeAfter }),
+						!shardingProjection && {
+							resumeAfter: ownLogResumeAfter,
+							...(startCutoff !== undefined && { startCutoff }),
+						}),
 				};
 			});
 		if (
