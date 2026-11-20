@@ -2186,7 +2186,7 @@ describe('Declarative tables keep control and event traffic independent of place
 		}
 	});
 
-	it('sends index invalidations to a known peer without a shard', async () => {
+	it('sends index invalidations, with the writer, to a known peer without a shard', async () => {
 		const { Records, socket, database } = await connect(false, 'unsharded');
 		socket.emit(
 			'message',
@@ -2208,10 +2208,16 @@ describe('Declarative tables keep control and event traffic independent of place
 		try {
 			socket.emit('message', encode([129, [{ name, startTime: 0, tables: [], replicateByDefault: true }], []]));
 			await until(() => socket.sent.some((frame) => frame[0] === 149) || socket.closes.length);
-			await Records.put('unsharded-reader', { id: 'unsharded-reader', region: 0, body: 'complete' });
+			await Records.put(
+				'unsharded-reader',
+				{ id: 'unsharded-reader', region: 0, body: 'complete' },
+				{ user: { username: 'invalidation-writer' } }
+			);
 			await until(() => socket.closes.length || entries(socket).some((entry) => entry.recordId === 'unsharded-reader'));
 			assert.deepEqual(socket.closes, []);
-			assert.equal(entries(socket).find((entry) => entry.recordId === 'unsharded-reader')?.type, 'invalidate');
+			const invalidation = entries(socket).find((entry) => entry.recordId === 'unsharded-reader');
+			assert.equal(invalidation?.type, 'invalidate');
+			assert.equal(invalidation.user, 'invalidation-writer');
 		} finally {
 			if (previous) await Nodes.primaryStore.put(name, previous);
 			else await Nodes.primaryStore.remove(name);
