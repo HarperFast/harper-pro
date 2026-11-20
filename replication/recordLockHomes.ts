@@ -25,6 +25,7 @@
 import { createHash } from 'node:crypto';
 import Joi from 'joi';
 import { getDatabases, table } from '../core/resources/databases.ts';
+import { transaction } from '../core/resources/transaction.ts';
 import {
 	DELEGATION_LEASE_MS,
 	LOCK_LEASE_SKEW_MS,
@@ -45,6 +46,10 @@ const configuredMinDrainMs = Number(process.env.HARPER_TEST_RECORD_LOCK_MIN_DRAI
 export const MIN_DRAIN_BACKSTOP_MS =
 	Number.isFinite(configuredMinDrainMs) && configuredMinDrainMs >= 0 ? configuredMinDrainMs : 2_000;
 const MAX_NODE_NAME_LENGTH = 256;
+/** `/` cannot appear in a database name (`schemaRegex`), so this key never collides with a database's row. */
+export const DEFAULT_HOMES_KEY = '/default';
+export const MAX_EXPLICIT_DATABASES = 10_000;
+const DEFAULT_DIGEST_SCOPE = 'default';
 
 export interface RecordLockGenerationState {
 	generation: number;
@@ -57,6 +62,10 @@ export interface RecordLockGenerationState {
 	 * only place a staged row still names the ring it stopped serving (harper-pro#862).
 	 */
 	quiesce?: string[];
+	/** Staged default only: databases some node reported a row of their own for, marked here at activation. */
+	explicit?: string[];
+	/** Staged default only: this node had no default row before, so no database here ever inherited a map. */
+	fresh?: true;
 }
 
 export interface RecordLockHomesRow {
@@ -67,6 +76,8 @@ export interface RecordLockHomesRow {
 	fenced: FenceEntry[];
 	/** The clone attempt in flight when the row was created; never written afterwards. */
 	cloneAttempt?: string;
+	/** Never stored: this database has no row here, so these fields are the default row's (`resolveEffectiveRow`). */
+	inherited?: true;
 }
 
 export interface FenceEntry {
@@ -136,9 +147,15 @@ export function canonicalizeHomes(homes: string[]): string[] {
  * same homes, a real pre-push review finding: `validateGenerationInput` accepts any positive
  * safe integer, not just a uint32).
  */
-export function digestOf(generation: number, homes: string[]): string {
+export function digestOf(generation: number, homes: string[], scope?: string): string {
 	const hash = createHash('sha256');
 	const u32 = Buffer.alloc(4);
+	if (scope !== undefined) {
+		const scopeBytes = Buffer.from(scope, 'utf8');
+		u32.writeUInt32BE(scopeBytes.length);
+		hash.update(u32);
+		hash.update(scopeBytes);
+	}
 	const generationBytes = Buffer.from(String(generation), 'utf8');
 	u32.writeUInt32BE(generationBytes.length);
 	hash.update(u32);
@@ -154,6 +171,41 @@ export function digestOf(generation: number, homes: string[]): string {
 	return hash.digest('hex');
 }
 
+/** The default's digests are scoped, so a database inheriting it never agrees with one served from its own row. */
+export function digestFor(key: string, generation: number, homes: string[]): string {
+	return key === DEFAULT_HOMES_KEY ? digestOf(generation, homes, DEFAULT_DIGEST_SCOPE) : digestOf(generation, homes);
+}
+
+export function rowKeyOf(request: any): string {
+	const isDefault = request?.default === true;
+	if (request?.default !== undefined && !isDefault) throw new ClientError('default must be true when given', 400);
+	if (isDefault === (request?.database !== undefined))
+		throw new ClientError('name exactly one of database or default: true', 400);
+	if (isDefault) return DEFAULT_HOMES_KEY;
+	if (typeof request.database !== 'string' || request.database.length === 0)
+		throw new ClientError('database must be a non-empty string', 400);
+	if (request.database === DEFAULT_HOMES_KEY)
+		throw new ClientError(`${DEFAULT_HOMES_KEY} is reserved for the default home map; use default: true`, 400);
+	return request.database;
+}
+
+export function describeKey(key: string): string {
+	return key === DEFAULT_HOMES_KEY ? 'the default home map' : key;
+}
+
+export function validateExplicit(explicit: unknown): string[] {
+	if (explicit === undefined) return [];
+	if (!Array.isArray(explicit) || explicit.length > MAX_EXPLICIT_DATABASES)
+		throw new ClientError(`explicit must be an array of at most ${MAX_EXPLICIT_DATABASES} database names`, 400);
+	for (const database of explicit) {
+		// No length bound beyond a row key's own: a database with a row of its own must be listable.
+		if (typeof database !== 'string' || database.length === 0)
+			throw new ClientError('every explicit entry must be a non-empty database name', 400);
+		if (database === DEFAULT_HOMES_KEY) throw new ClientError(`explicit must not name ${DEFAULT_HOMES_KEY}`, 400);
+	}
+	return canonicalizeHomes(explicit);
+}
+
 export function validateGenerationInput(generation: unknown, homes: unknown): asserts homes is string[] {
 	if (!(typeof generation === 'number' && Number.isSafeInteger(generation) && generation > 0))
 		throw new ClientError('generation must be a positive integer', 400);
@@ -167,6 +219,43 @@ export function validateGenerationInput(generation: unknown, homes: unknown): as
 
 async function readRow(database: string): Promise<RecordLockHomesRow | undefined> {
 	return getRecordLockHomesTable().primaryStore.get(database);
+}
+
+export function inheritedFrom(database: string, defaultRow: RecordLockHomesRow): RecordLockHomesRow {
+	const row: RecordLockHomesRow = {
+		database,
+		active: defaultRow.active,
+		staged: defaultRow.staged,
+		highestActedOn: defaultRow.highestActedOn ?? 0,
+		fenced: [],
+		inherited: true,
+	};
+	if (defaultRow.cloneAttempt !== undefined) row.cloneAttempt = defaultRow.cloneAttempt;
+	return row;
+}
+
+/** A row with a ring or a floor (a marker) takes its database out of the default; an audit-only fence row has neither. */
+function detaches(row: RecordLockHomesRow | undefined): boolean {
+	return !!row && (row.active !== undefined || row.staged !== undefined || (row.highestActedOn ?? 0) > 0);
+}
+
+/** A default row with no ring (only fences, or the placeholder a first own row commits beside) is no default. */
+function hasRing(row: RecordLockHomesRow | undefined): boolean {
+	return !!row && (row.active !== undefined || row.staged !== undefined);
+}
+
+async function resolveEffectiveRow(
+	key: string,
+	read: (key: string) => Promise<RecordLockHomesRow | undefined> | RecordLockHomesRow | undefined
+): Promise<RecordLockHomesRow | undefined> {
+	const own = await read(key);
+	if (key === DEFAULT_HOMES_KEY || detaches(own)) return own;
+	const defaultRow = await read(DEFAULT_HOMES_KEY);
+	if (!hasRing(defaultRow)) return own;
+	// A marker commits with the promotion that depends on it, and rows are never deleted, so reading the
+	// own row again after the default sees any marker that promotion carried.
+	const again = await read(key);
+	return detaches(again) ? again : inheritedFrom(key, defaultRow!);
 }
 
 /**
@@ -198,12 +287,39 @@ async function writeRow(locked: any, row: RecordLockHomesRow): Promise<void> {
 	await locked.save?.();
 }
 
+/**
+ * `alongside` rows commit in the same transaction as `row`'s write through the held lock, so core's
+ * pre-submit fence refuses all of them if that lock's lease lapsed (an off-key write through the locked
+ * resource itself would be dropped, not fenced).
+ */
+async function writeRows(
+	locked: any,
+	context: object,
+	row: RecordLockHomesRow,
+	alongside: RecordLockHomesRow[] | undefined
+): Promise<void> {
+	if (!alongside?.length) return writeRow(locked, row);
+	const homes = getRecordLockHomesTable();
+	await transaction(context, async () => {
+		// Marked LOCAL_ONLY as `writeRow` marks its row; a plain `put` would leave the flag off.
+		for (const other of alongside)
+			await (
+				await homes.getResource(other.database, context)
+			)._writeUpdate(other.database, other, true, {
+				localOnly: true,
+			});
+		await writeRow(locked, row);
+	});
+}
+
 /** How long a home-map transition may hold the row lock, and how long it waits to take it. The read,
  * the decision and the write are sub-millisecond; what sizes the lease is the `notifyChanged` fan-out
  * that runs inside the lock (see `withRow`), bounded by `HOMES_CHANGED_RELAY_TIMEOUT_MS` — seconds, an
  * order below this. The commit fence in `writeRow` catches a stall that outran the lease anyway, rather
- * than letting a stale plan land. */
+ * than letting a stale plan land. The default row's fan-out refreshes every database on every thread
+ * (`DEFAULT_CHANGED_RELAY_TIMEOUT_MS`), so its lease is longer. */
 const ROW_LOCK_LEASE_MS = 30_000;
+const DEFAULT_ROW_LOCK_LEASE_MS = 60_000;
 const ROW_LOCK_TIMEOUT_MS = 30_000;
 
 /**
@@ -226,21 +342,28 @@ const ROW_LOCK_TIMEOUT_MS = 30_000;
  * re-entrantly and defeating the exclusion.
  */
 const rowQueues = new Map<string, Promise<unknown>>();
-function withRow<T>(
-	database: string,
-	plan: (existing: RecordLockHomesRow | undefined, write: (row: RecordLockHomesRow) => Promise<void>) => Promise<T>
-): Promise<T> {
+type RowWrite = (row: RecordLockHomesRow, alongside?: RecordLockHomesRow[]) => Promise<void>;
+type RowPlan<T> = (existing: RecordLockHomesRow | undefined, write: RowWrite) => Promise<T>;
+
+function withRow<T>(database: string, plan: RowPlan<T>): Promise<T> {
 	const prior = rowQueues.get(database) ?? Promise.resolve();
 	const run = prior.then(async () => {
-		const locked: any = await getRecordLockHomesTable().lock(database, {
-			scope: 'node',
-			hold: true,
-			lease: ROW_LOCK_LEASE_MS,
-			timeout: ROW_LOCK_TIMEOUT_MS,
-		});
+		const context = {};
+		const locked: any = await getRecordLockHomesTable().lock(
+			database,
+			{
+				scope: 'node',
+				hold: true,
+				lease: database === DEFAULT_HOMES_KEY ? DEFAULT_ROW_LOCK_LEASE_MS : ROW_LOCK_LEASE_MS,
+				timeout: ROW_LOCK_TIMEOUT_MS,
+			},
+			context
+		);
 		try {
 			const existing = await readRow(database);
-			return await plan(existing, (row) => writeRow(locked, withCreationAttempt(existing, row)));
+			return await plan(existing, (row, alongside) =>
+				writeRows(locked, context, withCreationAttempt(existing, row), alongside)
+			);
 		} finally {
 			// Never let an unlock failure replace the real outcome: if the write failed 409 because the row
 			// lease was lost to a storage stall, `unlock()` on the expired handle throws too, and the
@@ -261,6 +384,28 @@ function withRow<T>(
 	return run;
 }
 
+/**
+ * `withRow` over the effective row. A database whose row does not detach it is planned under the default
+ * row's lock against the default it inherits. Every writer that gives a database a detaching row holds
+ * that lock (this path, and markers in the default's promotion), so the database's row cannot appear
+ * under it, and the new row commits beside a write of the default row (a ring-less placeholder when
+ * there is none) whose lease fences both. Rows are never deleted, so a database that has a detaching
+ * row needs only its own lock (default → database is the only nesting order).
+ */
+async function withEffectiveRow<T>(key: string, plan: RowPlan<T>): Promise<T> {
+	if (key === DEFAULT_HOMES_KEY || detaches(await readRow(key))) return withRow(key, plan);
+	return withRow(DEFAULT_HOMES_KEY, async (defaultRow, writeDefault) => {
+		const own = await readRow(key);
+		if (detaches(own)) return withRow(key, plan);
+		const existing = hasRing(defaultRow) ? { ...inheritedFrom(key, defaultRow!), fenced: own?.fenced ?? [] } : own;
+		return plan(existing, (row) =>
+			writeDefault(defaultRow ?? { database: DEFAULT_HOMES_KEY, highestActedOn: 0, fenced: [] }, [
+				withCreationAttempt(existing, row),
+			])
+		);
+	});
+}
+
 export function operatorPrincipal(request: any): string {
 	// `hdb_user` is the authenticated principal the operation dispatcher attached; never a request
 	// body field, which a caller could set to forge attribution on the `fenced[]` list.
@@ -271,10 +416,12 @@ export function operatorPrincipal(request: any): string {
 }
 
 const stageSchema = Joi.object({
-	database: Joi.string().required(),
+	database: Joi.string(),
+	default: Joi.boolean(),
 	generation: Joi.number().required(),
 	homes: Joi.array().required(),
 	quiesce: Joi.array().required(),
+	explicit: Joi.array(),
 });
 
 /**
@@ -300,14 +447,29 @@ export function planStage(
 	homes: string[],
 	digest: string,
 	now: number = Date.now(),
-	quiesce?: string[]
+	quiesce?: string[],
+	explicit?: string[],
+	self?: string
 ): StagePlan {
 	const floor = Math.max(
 		existing?.active?.generation ?? 0,
 		existing?.staged?.generation ?? 0,
 		existing?.highestActedOn ?? 0
 	);
-	if (existing?.staged?.generation === generation) {
+	// Between this node's default stage and activation, its drain set and the databases it reported as
+	// having rows of their own must not change, so no inheriting database takes a row of its own here. A
+	// node the staged default leaves out never activates it, and plans against its remembered rings.
+	if (
+		existing?.inherited &&
+		existing.staged &&
+		!existing.active &&
+		(self === undefined || existing.staged.homes.includes(self))
+	)
+		return {
+			action: 'reject',
+			reason: `the default home map is staged at generation ${existing.staged.generation} on this node; complete that transition (record_lock_apply_homes with default: true) before giving ${database} a home map of its own`,
+		};
+	if (!existing?.inherited && existing?.staged?.generation === generation) {
 		if (existing.staged.digest !== digest)
 			return { action: 'reject', reason: `generation ${generation} is already staged with a different home set` };
 		// A matching re-stage may be the first call that names the participant set (a row staged before
@@ -318,15 +480,17 @@ export function planStage(
 		// omitted from the first call go unnamed by every later survey while it still grants under the
 		// old generation. `stagedAt` is kept — nothing about when this node stopped granting has changed.
 		const widened = quiesce && canonicalizeHomes([...(existing.staged.quiesce ?? []), ...quiesce]);
-		if (widened && widened.length !== (existing.staged.quiesce?.length ?? 0))
-			return {
-				action: 'write',
-				row: {
-					...existing,
-					staged: { ...existing.staged, quiesce: widened },
-					highestActedOn: Math.max(floor, generation),
-				},
-			};
+		const widenedExplicit = explicit?.length && canonicalizeHomes([...(existing.staged.explicit ?? []), ...explicit]);
+		if (widenedExplicit && widenedExplicit.length > MAX_EXPLICIT_DATABASES)
+			return { action: 'reject', reason: `more than ${MAX_EXPLICIT_DATABASES} databases have home maps of their own` };
+		const quiesceGrew = widened && widened.length !== (existing.staged.quiesce?.length ?? 0);
+		const explicitGrew = widenedExplicit && widenedExplicit.length !== (existing.staged.explicit?.length ?? 0);
+		if (quiesceGrew || explicitGrew) {
+			const staged = { ...existing.staged };
+			if (quiesceGrew) staged.quiesce = widened;
+			if (explicitGrew) staged.explicit = widenedExplicit;
+			return { action: 'write', row: { ...existing, staged, highestActedOn: Math.max(floor, generation) } };
+		}
 		return { action: 'noop', staged: existing.staged };
 	}
 	if (generation <= floor) return { action: 'reject', reason: `generation ${generation} is not greater than ${floor}` };
@@ -345,6 +509,9 @@ export function planStage(
 		};
 	const staged: RecordLockGenerationState = { generation, homes, digest, stagedAt: now };
 	if (quiesce) staged.quiesce = quiesce;
+	if (explicit?.length) staged.explicit = explicit;
+	if (database === DEFAULT_HOMES_KEY && !hasRing(existing) && !((existing?.highestActedOn ?? 0) > 0))
+		staged.fresh = true;
 	return {
 		action: 'write',
 		row: {
@@ -374,13 +541,83 @@ async function drainForStage(database: string): Promise<QuiesceResult | { error:
 export async function stageGeneration(
 	request: any,
 	fence?: StageFence
-): Promise<{ staged: RecordLockGenerationState; quiesced: QuiesceResult | { error: string } }> {
-	const staged = await stageRow(request, fence);
+): Promise<{ staged: RecordLockGenerationState; quiesced: QuiesceResult | { error: string }; explicit?: string[] }> {
+	const key = rowKeyOf(request);
+	const { staged, scope } = await stageRow(request, key, fence);
 	// Deliberately OUTSIDE `withRow`: the drain waits on live critical sections, and holding the
 	// database's transition queue for that would block every other stage, fence and activate on this
 	// node behind it. The row write already retracted `active`, so nothing new can be granted while
 	// this runs, and a concurrent transition is free to proceed.
-	return { ...staged, quiesced: await drainForStage(request.database) };
+	if (!scope) return { staged, quiesced: await drainForStage(key) };
+	return { staged, quiesced: await drainInheriting(scope.drain, fence?.nodes ?? []), explicit: scope.explicit };
+}
+
+/**
+ * Taken under the default row's lock, right after its stage wrote: every candidate database with no row
+ * of its own inherited the default until that write. While the default stays staged no database can
+ * take a row of its own here (`planStage`), so a retry fixes the same set.
+ */
+async function defaultStageScope(staged: RecordLockGenerationState): Promise<{ drain?: string[]; explicit: string[] }> {
+	const explicit = ownRowDatabases();
+	// No default row before this transition and no earlier process of this node: nothing here ever
+	// inherited a map, so nothing can hold authority under one. The same first-incarnation fact core's
+	// cold-start waiver rests on; a handoff clears it.
+	if (staged.fresh && drainCandidates.neverGranted()) return { drain: [], explicit };
+	const own = new Set(explicit);
+	const candidates = await drainCandidates.candidates();
+	return { drain: candidates && canonicalizeHomes(candidates.filter((database) => !own.has(database))), explicit };
+}
+
+export function ownRowDatabases(): string[] {
+	const homes = CLUSTER_RECORD_LOCKS_ENABLED
+		? getRecordLockHomesTable()
+		: (getDatabases() as any).system?.hdb_record_lock_homes;
+	const databases: string[] = [];
+	if (homes)
+		for (const { key, value } of homes.primaryStore.getRange({}))
+			if (typeof key === 'string' && key !== DEFAULT_HOMES_KEY && detaches(value)) databases.push(key);
+	return canonicalizeHomes(databases);
+}
+
+/**
+ * One drain per inheriting database, each on its owner, under one shared budget. Proven only if every
+ * database's own drain proves: a database that does not adds an outstanding entry no fence can excuse.
+ */
+export async function drainInheriting(
+	databases: string[] | undefined,
+	fenced: readonly string[] = [],
+	drain: (database: string, budgetMs: number) => Promise<QuiesceResult | { error: string }> = drainReader
+): Promise<QuiesceResult | { error: string }> {
+	if (!databases)
+		return {
+			error:
+				'this node could not list the databases that could hold record-lock authority (main did not answer, or nothing is wired)',
+		};
+	const settled = await Promise.allSettled(databases.map((database) => drain(database, STAGE_DRAIN_BUDGET_MS)));
+	const aggregate: QuiesceResult = { complete: true, surrendered: 0, recalled: 0, outstanding: [] };
+	settled.forEach((outcome, index) => {
+		const database = databases[index];
+		const result: any =
+			outcome.status === 'fulfilled'
+				? outcome.value
+				: { error: (outcome.reason as Error)?.message ?? String(outcome.reason) };
+		const proven = provesQuiescence(result, fenced);
+		if (result && typeof result === 'object' && Array.isArray(result.outstanding)) {
+			aggregate.surrendered += Number(result.surrendered) || 0;
+			aggregate.recalled += Number(result.recalled) || 0;
+			for (const entry of result.outstanding)
+				aggregate.outstanding.push({ ...entry, table: `${database}.${entry?.table}` });
+		}
+		if (proven && result.complete === true) return;
+		aggregate.complete = false;
+		if (!proven)
+			aggregate.outstanding.push({
+				table: `${database}.*`,
+				key: undefined,
+				reason: `the drain of ${database} did not prove quiescence${result?.error ? `: ${result.error}` : ''}`,
+			});
+	});
+	return aggregate;
 }
 
 export function withFences(
@@ -400,20 +637,43 @@ export function withFences(
 	return added.length > 0 ? [...fenced, ...added] : undefined;
 }
 
-async function stageRow(request: any, fence?: StageFence): Promise<{ staged: RecordLockGenerationState }> {
+async function stageRow(
+	request: any,
+	key: string,
+	fence?: StageFence
+): Promise<{ staged: RecordLockGenerationState; scope?: { drain?: string[]; explicit: string[] } }> {
 	const validation = validateBySchema(request, stageSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
-	const { database } = request;
+	const isDefault = key === DEFAULT_HOMES_KEY;
+	if (!isDefault && request.explicit !== undefined)
+		throw new ClientError('explicit applies only to the default home map', 400);
 	validateGenerationInput(request.generation, request.homes);
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
-	const digest = digestOf(generation, homes);
+	const digest = digestFor(key, generation, homes);
 	validateGenerationInput(generation, request.quiesce);
 	const quiesce = canonicalizeHomes([...request.quiesce, ...homes]);
-	return withRow(database, async (existing, write) => {
-		const plan = planStage(existing, database, generation, homes, digest, Date.now(), quiesce);
+	const explicit = isDefault ? validateExplicit(request.explicit) : undefined;
+	return withEffectiveRow(key, async (existing, write) => {
+		const plan = planStage(
+			existing,
+			key,
+			generation,
+			homes,
+			digest,
+			Date.now(),
+			quiesce,
+			explicit,
+			membership.thisNodeName()
+		);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
+		// Every database with a row of its own is carried by every later default transition.
+		if (plan.action === 'write' && existing?.inherited && ownRowDatabases().length >= MAX_EXPLICIT_DATABASES)
+			throw new ClientError(
+				`${MAX_EXPLICIT_DATABASES} databases already have home maps of their own here, the most a default home map carries`,
+				409
+			);
 		const fenced = withFences(
 			plan.action === 'write' ? plan.row.fenced : (existing?.fenced ?? []),
 			fence,
@@ -427,18 +687,21 @@ async function stageRow(request: any, fence?: StageFence): Promise<{ staged: Rec
 			// dead worker). Re-notifying is harmless when nothing changed and is the only way a retry
 			// ever reconciles that gap (a real pre-push review finding: a noop that skips notification
 			// leaves every unconfirmed thread stuck on the retracted generation with no bound).
-			await notifyChanged(database);
-			return { staged: plan.staged };
+			await notifyChanged(key);
+			return { staged: plan.staged, scope: isDefault ? await defaultStageScope(plan.staged) : undefined };
 		}
 		await write(fenced ? { ...plan.row, fenced } : plan.row);
-		logger.info?.(`Record lock home map for ${database}: staged generation ${generation}, retracted active`);
-		await notifyChanged(database);
-		return { staged: plan.row.staged! };
+		logger.info?.(`Record lock home map for ${describeKey(key)}: staged generation ${generation}, retracted active`);
+		await notifyChanged(key);
+		// Only once every thread acked the retraction: a database registered before then could still have
+		// been granted under the old default, and has an owner entry by the time its grant could exist.
+		return { staged: plan.row.staged!, scope: isDefault ? await defaultStageScope(plan.row.staged!) : undefined };
 	});
 }
 
 const fenceSchema = Joi.object({
-	database: Joi.string().required(),
+	database: Joi.string(),
+	default: Joi.boolean(),
 	node: Joi.string().required(),
 });
 
@@ -451,11 +714,18 @@ export async function fenceExternal(request: any): Promise<{ fenced: true }> {
 	const validation = validateBySchema(request, fenceSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
+	const key = rowKeyOf(request);
 	const operator = operatorPrincipal(request);
-	const { database, node } = request;
-	return withRow(database, async (existing, write) => {
+	const { node } = request;
+	return withEffectiveRow(key, async (existing, write) => {
+		// A first row here would detach the database from the default it follows, with no map of its own.
+		if (existing?.inherited)
+			throw new ClientError(
+				`${key} has no home map of its own on this node and follows the default home map; record the fence with default: true`,
+				409
+			);
 		await write({
-			database,
+			database: key,
 			active: existing?.active,
 			staged: existing?.staged,
 			highestActedOn: existing?.highestActedOn ?? 0,
@@ -466,9 +736,11 @@ export async function fenceExternal(request: any): Promise<{ fenced: true }> {
 }
 
 const activateSchema = Joi.object({
-	database: Joi.string().required(),
+	database: Joi.string(),
+	default: Joi.boolean(),
 	generation: Joi.number().required(),
 	homes: Joi.array().required(),
+	explicit: Joi.array(),
 });
 
 /**
@@ -522,41 +794,113 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 	const validation = validateBySchema(request, activateSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
-	const { database } = request;
+	const key = rowKeyOf(request);
+	if (key !== DEFAULT_HOMES_KEY && request.explicit !== undefined)
+		throw new ClientError('explicit applies only to the default home map', 400);
+	if (key === DEFAULT_HOMES_KEY && request.explicit === undefined)
+		throw new ClientError(
+			"a default activation must list explicit: every database the survey found with a map of its own (the apply's stage step lists them)",
+			400
+		);
 	validateGenerationInput(request.generation, request.homes);
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
-	const digest = digestOf(generation, homes);
-	return withRow(database, async (existing, write) => {
-		const plan = planActivate(existing, database, generation, digest);
+	const digest = digestFor(key, generation, homes);
+	const explicit = key === DEFAULT_HOMES_KEY ? validateExplicit(request.explicit) : [];
+	return withRow(key, async (existing, write) => {
+		const plan = planActivate(existing, key, generation, digest);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
 		if (plan.action === 'noop') {
 			// See the matching comment in `stageGeneration`: a retry must still reconcile threads the
 			// prior call's durable write outran.
-			await notifyChanged(database);
+			await notifyChanged(key);
+			if (key === DEFAULT_HOMES_KEY) {
+				// Every home of a generation promotes the same exclusions, so a retry must name at least them.
+				const requested = new Set(explicit);
+				const unlisted = (plan.active.explicit ?? []).filter((database) => !requested.has(database));
+				if (unlisted.length > 0)
+					throw new ClientError(
+						`this node activated generation ${generation} also excluding ${listed(unlisted)}, which this activation does not list; re-run this call`,
+						409
+					);
+				const unmarked: string[] = [];
+				for (const database of explicit) if (!detaches(await readRow(database))) unmarked.push(database);
+				if (unmarked.length > 0)
+					throw new ClientError(
+						`generation ${generation} is active here without a mark for ${listed(unmarked)}; re-run with generation ${generation + 1}`,
+						409
+					);
+			}
 			return { active: plan.active };
 		}
-		await write(plan.row);
-		logger.info?.(`Record lock home map for ${database}: activated generation ${generation}`);
-		await notifyChanged(database);
+		let markers: RecordLockHomesRow[] | undefined;
+		if (key === DEFAULT_HOMES_KEY) {
+			const requested = new Set(explicit);
+			const unlisted = (existing!.staged!.explicit ?? []).filter((database) => !requested.has(database));
+			if (unlisted.length > 0)
+				throw new ClientError(
+					`this node's staged default also excludes ${listed(unlisted)}, which this activation does not list; re-run this call`,
+					409
+				);
+			markers = await markerRows(existing!, explicit);
+			const { explicit: _staged, ...active } = plan.row.active!;
+			plan.row.active = explicit.length > 0 ? { ...active, explicit } : active;
+		}
+		await write(plan.row, markers);
+		logger.info?.(`Record lock home map for ${describeKey(key)}: activated generation ${generation}`);
+		await notifyChanged(key);
 		return { active: plan.row.active! };
 	});
 }
 
-/** Current durable row, for `homeMap()` cache population and status reporting. Not the hot path. */
-export async function currentRow(database: string): Promise<RecordLockHomesRow | undefined> {
-	return readRow(database);
+function listed(names: string[]): string {
+	return `${names.slice(0, 5).join(', ')}${names.length > 5 ? ` and ${names.length - 5} more` : ''}`;
 }
 
 /**
- * This node's row without creating the table: with the feature off, only a table already on disk can
+ * A marker (no map, the default's floor) for every database some node reported a row of its own for and
+ * this node has no detaching row for, committed in the promotion's own transaction so this node never
+ * inherits it. Only a staged default is promoted, so none of these databases holds inherited authority
+ * here; an already-active default writes none, since that would retract a live map without a drain.
+ */
+async function markerRows(defaultRow: RecordLockHomesRow, explicit: string[]): Promise<RecordLockHomesRow[]> {
+	const databases = canonicalizeHomes(explicit);
+	if (databases.length > MAX_EXPLICIT_DATABASES)
+		throw new ClientError(`more than ${MAX_EXPLICIT_DATABASES} databases have home maps of their own`, 409);
+	const floor = Math.max(
+		defaultRow.active?.generation ?? 0,
+		defaultRow.staged?.generation ?? 0,
+		defaultRow.highestActedOn ?? 0
+	);
+	const markers: RecordLockHomesRow[] = [];
+	for (const database of databases) {
+		const own = await readRow(database);
+		if (detaches(own)) continue;
+		markers.push(
+			withCreationAttempt(inheritedFrom(database, defaultRow), {
+				database,
+				highestActedOn: floor,
+				fenced: own?.fenced ?? [],
+			})
+		);
+	}
+	return markers;
+}
+
+/** This node's effective row for `key`, for `homeMap()` cache population and status. Not the hot path. */
+export async function currentRow(key: string): Promise<RecordLockHomesRow | undefined> {
+	return resolveEffectiveRow(key, readRow);
+}
+
+/**
+ * The effective row without creating the table: with the feature off, only a table already on disk can
  * hold one, and the catalog load opens those on every thread.
  */
-export async function existingRow(database: string): Promise<RecordLockHomesRow | undefined> {
+export async function existingRow(key: string): Promise<RecordLockHomesRow | undefined> {
 	const homes = CLUSTER_RECORD_LOCKS_ENABLED
 		? getRecordLockHomesTable()
 		: (getDatabases() as any).system?.hdb_record_lock_homes;
-	return homes ? homes.primaryStore.get(database) : undefined;
+	return homes ? resolveEffectiveRow(key, (rowKey) => homes.primaryStore.get(rowKey)) : undefined;
 }
 
 /**
@@ -589,6 +933,8 @@ interface MembershipReaders {
 	thisNodeName(): string | undefined;
 	/** Peers this node's `hdb_nodes` view says replicate `database` — never this node itself. */
 	replicatingPeers(database: string): string[];
+	/** Every node this node's `hdb_nodes` view names, other than itself. */
+	knownNodes?(): string[];
 }
 let membership: MembershipReaders = {
 	thisNodeName: () => undefined,
@@ -596,6 +942,9 @@ let membership: MembershipReaders = {
 };
 export function setHomesMembershipReaders(readers: MembershipReaders): void {
 	membership = readers;
+}
+export function knownNodeNames(): string[] {
+	return membership.knownNodes?.() ?? [];
 }
 
 /**
@@ -633,6 +982,21 @@ export function provesQuiescence(
 }
 export function setHomesDrainReader(reader: typeof drainReader): void {
 	drainReader = reader;
+}
+/**
+ * Installed by `recordLockTransport.ts`: `candidates` is every database on this node that could hold
+ * record-lock authority, own row or not, and `undefined` (nothing installed) makes a default stage's drain
+ * unproven; `neverGranted` is whether no earlier process of this node issued anything (its first
+ * incarnation, with no coordinating-worker handoff since).
+ */
+interface DrainCandidates {
+	candidates(): Promise<string[] | undefined>;
+	neverGranted(): boolean;
+}
+const NO_DRAIN_CANDIDATES: DrainCandidates = { candidates: async () => undefined, neverGranted: () => false };
+let drainCandidates: DrainCandidates = NO_DRAIN_CANDIDATES;
+export function setHomesDrainCandidates(readers: DrainCandidates = NO_DRAIN_CANDIDATES): void {
+	drainCandidates = readers;
 }
 
 export interface HomesProposal {
@@ -698,27 +1062,34 @@ export function planProposal(
 	return { generation, homes, digest: digestOf(generation, homes), quiesce, warnings };
 }
 
-export async function proposeHomes(request: any): Promise<
-	HomesProposal & {
-		database: string;
-		source: 'hdb_nodes';
-		current: { active?: RecordLockGenerationState; staged?: RecordLockGenerationState; fenced?: FenceEntry[] };
-	}
-> {
+interface HomesProposalCurrent {
+	active?: RecordLockGenerationState;
+	staged?: RecordLockGenerationState;
+	fenced?: FenceEntry[];
+	/** The database has no row of its own here; `active`/`staged` are the default's. */
+	inherited?: true;
+}
+
+export async function proposeHomes(
+	request: any
+): Promise<HomesProposal & { database: string; source: 'hdb_nodes'; current: HomesProposalCurrent }> {
 	const validation = validateBySchema(request, proposeSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
 	const { database } = request;
+	if (database === DEFAULT_HOMES_KEY)
+		throw new ClientError(`${DEFAULT_HOMES_KEY} is reserved for the default home map`, 400);
 	const self = membership.thisNodeName();
 	if (!self) throw new ClientError('this node has no resolved node name', 503);
 	const peers = membership.replicatingPeers(database);
 	const existing = await existingRow(database);
-	return {
-		database,
-		...planProposal(self, peers, existing, database),
-		source: 'hdb_nodes',
-		current: { active: existing?.active, staged: existing?.staged, fenced: existing?.fenced },
+	const current: HomesProposalCurrent = {
+		active: existing?.active,
+		staged: existing?.staged,
+		fenced: existing?.fenced,
 	};
+	if (existing?.inherited) current.inherited = true;
+	return { database, ...planProposal(self, peers, existing, database), source: 'hdb_nodes', current };
 }
 
 const proposeSchema = Joi.object({

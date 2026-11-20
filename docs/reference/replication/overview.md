@@ -502,6 +502,27 @@ Cluster record locks need the RocksDB storage engine. On LMDB `lock()` is not av
 
 What counts is the engine each database is opened on, not `storage.engine`. That setting only picks the engine for databases created from then on, so a node upgraded in place from v4 keeps its existing `.mdb` databases on LMDB. If any database the node replicates is opened on LMDB, including `system`, which `replication.databases: '*'` (the default) replicates, the node starts with cluster record locks off even with `recordLocks: true`. It logs an error naming those databases, peers see it as not taking part, and a cluster `lock()` answers `503` saying that replicated databases are on LMDB. Migrate them with `storage.migrateOnStart` and restart. `describe_all` and `describe_table` report each table's `engine` (`rocksdb` or `lmdb`), so a tool can check a node before turning locks on.
 
+### Default Home Map
+
+<VersionBadge version="v5.5.0" /> Instead of one map per database, you can apply one default home map for the cluster. Every database that has no map of its own on a node then uses it, including databases created later, so a database a component creates is lockable as soon as it exists on the nodes:
+
+```json
+{
+	"operation": "record_lock_apply_homes",
+	"default": true,
+	"homes": ["node-1", "node-2", "node-3"]
+}
+```
+
+It takes the same `quiesce`, `generation`, `drained` and `fenced` fields and returns the same outcomes as a per-database map, and a membership change is applied the same way: list the new nodes in `homes` and the old and new nodes in `quiesce`. Applying a new default moves every database that uses it in one call; until it activates, those databases refuse locks on the nodes being changed.
+
+- `quiesce` must name the node taking the call and every node it knows (its `hdb_nodes`); a node outside `homes` goes in `quiesce` only. A node that is down goes in `fenced` while the current default names it in `homes`, as for a per-database map; one the default no longer names (an earlier shrink left it out) is removed with `remove_node` before the next default change. The call is refused with `409`, before anything changes, while a node is left out, because that node could hold a map of its own for a database the default would otherwise also serve.
+
+- A map of a database's own takes precedence over the default, permanently. Apply one to a database that is not replicated by every node in the default, for example a sharded database or one some nodes leave out of `replication.databases`: under the default it answers `503`, because every node in a map must replicate the database. Its `quiesce` must include the default's nodes.
+- Every node in `quiesce` must run v5.5.0 or later; a node on an earlier version refuses the call before anything changes. Before downgrading a node below v5.5.0, apply a map of its own to each database that uses the default, since an earlier version does not read the default and those databases would refuse locks.
+- At most 10,000 databases in a cluster can have maps of their own while a default exists, counting databases since dropped. Each one is recorded on every node, and a default change is refused once the count is above that.
+- `cluster_status` reports `homeMapSource: "default"` or `"database"` for each database under `recordLocks`: where its map comes from, not whether it can lock. A database some default node does not replicate reports `"default"` and still answers `503`.
+
 ### Confirming Locked Writes
 
 <VersionBadge version="v5.5.0" />
@@ -521,7 +542,7 @@ replication:
 - **An explicit count that meets the minimum** (`X-Replicate-To: *;confirm=<k>` or `replicatedConfirmation`) keeps its own rules: it is [refused or timed out](./sharding.md#replication-control-via-rest-header) as without locks, and waits up to `confirmationTimeout` while its peers are down.
 - **The lock is not held longer:** it is released when the commit lands on this node, before the wait.
 - **When confirmation fails,** the error carries `replicationUnconfirmed: true` and `retryable: false` ([details](./sharding.md#confirmation-failure-after-a-local-commit)). The write is committed on this node. A transaction's lock is already released, so the next holder can have it and may already see the write. A `hold: true` lock stays held until `unlock()` or its lease either way.
-- **Limits:** confirmation means a peer acknowledged applying this node's log up to a key at or past the write's. Concurrent commits can reach the log out of key order, so a write can count as confirmed while still in flight when the peer has already acknowledged a newer write that was logged first. It is not a quorum: in a cluster of three or more, the next holder can be admitted through a peer that did not confirm. A power loss between the local commit and the acknowledgment can still lose the write, and the caller then sees no success.
+- **Limits:** confirmation means the peer applied this write, even when concurrent commits reach the log out of key order. Two cases are weaker. A peer on an earlier version that cannot report this, such as v5.4.0, acknowledges only the highest log key it has applied, so a write can count as confirmed while still in flight when a newer write logged before it has already arrived there; upgrading every peer removes this. And when a link reconnects by resuming from the highest key the peer received, because the peer has no usable delivery checkpoint from this node, a write not sent yet whose key is below that one is skipped on that link whenever it commits, and can still count as confirmed. It is not a quorum: in a cluster of three or more, the next holder can be admitted through a peer that did not confirm. A power loss between the local commit and the acknowledgment can still lose the write, and the caller then sees no success.
 - **Cost:** each locked commit waits one replication round trip.
 - The value is read at startup, so restart a node after changing it.
 
