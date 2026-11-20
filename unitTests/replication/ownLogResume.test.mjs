@@ -114,7 +114,7 @@ describe('ownLogPastAnchorRange on a RocksDB transaction log', function () {
 
 	after(() => {
 		db?.close();
-		rmSync(root, { recursive: true, force: true });
+		if (root) rmSync(root, { recursive: true, force: true });
 	});
 
 	const keysOf = (range) => Array.from(range, (record) => record.txnLogKey);
