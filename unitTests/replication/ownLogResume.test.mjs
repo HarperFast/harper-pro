@@ -7,8 +7,10 @@ import { join } from 'node:path';
 import {
 	ownLogAppendAnchor,
 	ownLogPastAnchorRange,
+	OWN_LOG_SLICE_ENTRIES,
+	endsOwnLogSlice,
+	ownLogReadFailed,
 	ownLogResumeAnchor,
-	ownLogSliceThenOthers,
 	rangeBoundaryFailure,
 } from '#src/replication/replicationConnection';
 import { RocksTransactionLogStore } from '#src/core/resources/RocksTransactionLogStore';
@@ -50,44 +52,26 @@ describe('ownLogAppendAnchor', () => {
 	});
 });
 
-describe('ownLogSliceThenOthers', () => {
-	// a live tail: refilling it after a pass hands the next pass only the new entries, and closing it is an error
-	const tail = (entries) => {
-		let index = 0;
-		const iterator = {
-			next: () => (index < entries.length ? { value: entries[index++], done: false } : { done: true }),
-			return: () => assert.fail('the own-log range must not be closed between passes'),
-		};
-		return { entries, [Symbol.iterator]: () => iterator };
-	};
-	const entry = (key, endTxn = true) => ({ key, endTxn });
-	const keys = (range) => Array.from(range, ({ key }) => key);
-
-	it('reads all of a short own log and then the other logs, reporting the own log drained', () => {
-		const slice = { drained: false };
-		assert.deepStrictEqual(keys(ownLogSliceThenOthers(tail([entry(1), entry(2)]), [entry('a')], 5, slice)), [
-			1,
-			2,
-			'a',
-		]);
-		assert.strictEqual(slice.drained, true);
+describe('endsOwnLogSlice', () => {
+	it('ends a slice past its budget, and only at the end of a transaction', () => {
+		assert.strictEqual(endsOwnLogSlice(OWN_LOG_SLICE_ENTRIES - 1, { endTxn: true }), false);
+		assert.strictEqual(endsOwnLogSlice(OWN_LOG_SLICE_ENTRIES, { endTxn: false }), false);
+		assert.strictEqual(endsOwnLogSlice(OWN_LOG_SLICE_ENTRIES, {}), false);
+		assert.strictEqual(endsOwnLogSlice(OWN_LOG_SLICE_ENTRIES, { endTxn: true }), true);
 	});
+});
 
-	it('serves the other logs after the budget while the own log keeps growing, and resumes it next pass', () => {
-		const own = tail([entry(1), entry(2), entry(3), entry(4)]);
-		const slice = { drained: true };
-		assert.deepStrictEqual(keys(ownLogSliceThenOthers(own, [entry('a')], 1, slice)), [1, 2, 'a']);
-		assert.strictEqual(slice.drained, false);
-		own.entries.push(entry(5));
-		assert.deepStrictEqual(keys(ownLogSliceThenOthers(own, [entry('b')], 10, slice)), [3, 4, 5, 'b']);
-		assert.strictEqual(slice.drained, true);
-	});
-
-	it('cuts only at the end of a transaction, since a frame carries one', () => {
-		const own = tail([entry(1, false), entry(1, false), entry(1, true), entry(2)]);
-		const slice = { drained: true };
-		assert.deepStrictEqual(keys(ownLogSliceThenOthers(own, [entry('a')], 0, slice)), [1, 1, 1, 'a']);
-		assert.strictEqual(slice.drained, false);
+describe('ownLogReadFailed', () => {
+	it('reports a missed anchor, a failed log or a corrupt-frame stop, and nothing on a clean range', () => {
+		assert.strictEqual(ownLogReadFailed({}), false);
+		assert.strictEqual(ownLogReadFailed(undefined), false);
+		assert.strictEqual(
+			ownLogReadFailed({ exactStartFailures: new Map(), failedLogs: new Set(), corruptFrameStop: { breaks: 0 } }),
+			false
+		);
+		assert.strictEqual(ownLogReadFailed({ exactStartFailures: new Map([['local', 'missing']]) }), true);
+		assert.strictEqual(ownLogReadFailed({ failedLogs: new Set(['local']) }), true);
+		assert.strictEqual(ownLogReadFailed({ corruptFrameStop: { breaks: 1 } }), true);
 	});
 });
 

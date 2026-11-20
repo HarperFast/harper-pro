@@ -3417,29 +3417,13 @@ export function ownLogPastAnchorRange(anchor: number) {
 /** Own-log entries yielded per pass before the other logs are served; a live local tail would otherwise starve them. */
 export const OWN_LOG_SLICE_ENTRIES = 1000;
 
-/**
- * About `budget` entries of `own`, cut only at a transaction boundary since a frame holds one transaction, and then
- * all of `others`. `own` is pulled, never closed, so the next pass continues it. `slice.drained` is false when the
- * cut left entries behind, and that pass then proves no delivery of this node's writes.
- */
-export function* ownLogSliceThenOthers<T extends { endTxn?: boolean }>(
-	own: Iterable<T>,
-	others: Iterable<T>,
-	budget: number,
-	slice: { drained: boolean }
-): Generator<T> {
-	slice.drained = false;
-	const iterator = own[Symbol.iterator]();
-	for (let count = 0; ; count++) {
-		const next = iterator.next();
-		if (next.done) {
-			slice.drained = true;
-			break;
-		}
-		yield next.value;
-		if (count >= budget && next.value.endTxn) break;
-	}
-	yield* others;
+export function ownLogReadFailed(range: any): boolean {
+	return range?.exactStartFailures?.size > 0 || range?.failedLogs?.size > 0 || range?.corruptFrameStop?.breaks > 0;
+}
+
+/** A slice ends only with a transaction, since a frame carries one. */
+export function endsOwnLogSlice(count: number, entry: { endTxn?: boolean }): boolean {
+	return count >= OWN_LOG_SLICE_ENTRIES && entry.endTxn === true;
 }
 
 /**
@@ -10659,6 +10643,29 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											`A transaction-log scan for ${remoteNodeName} may have skipped an entry; writes waiting for confirmation from it time out until this connection reconnects`
 										);
 								};
+								// No more of this node's log goes out here: a key-filtered read could deliver a later entry past one it
+								// skipped, and the peer would resume past both. The frame the failure cut short is dropped, not flushed.
+								// Returns true when the connection closed so the peer resumes from what it holds.
+								const failOwnLogRead = (): boolean => {
+									const range = ownLogRange;
+									logger.error?.(
+										connectionId,
+										`The append-order read of this node's log for ${remoteNodeName} on ${databaseName} failed; this node's writes are not sent on this connection, which reconnects unless the log is broken mid-file`
+									);
+									frame.position = frame.encodingStart;
+									currentTransaction.txnLogKey = 0;
+									ownLogRangeFailed = true;
+									stopMarkers();
+									ownLogRange = undefined;
+									subscribedNodeIds[getThisNodeId(auditStore)] = false;
+									range[Symbol.iterator]().return?.();
+									if (range.corruptFrameStop?.midLogBreak) return false;
+									if (!supersededOrClosed()) {
+										closed = true;
+										close(1011, "this node's log could not be read in append order; reconnecting");
+									}
+									return true;
+								};
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
 								const originCertifies = (name: string): number => {
@@ -10933,9 +10940,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (ownLogAnchor !== undefined && currentSequenceId > 0 && !refusesCopies) {
 												const failure = rangeBoundaryFailure(auditStore, ownLogPastAnchorRange(ownLogAnchor));
 												if (failure) {
-													const purgedThrough = getLogPurgeBounds(auditStore, 'local');
-													// past a purged anchor the entries the peer lacks may be gone, and only a copy restores them
-													if (!purgedThrough || purgedThrough.get('local') >= ownLogAnchor) {
+													const purgedThrough = getLogPurgeBounds(auditStore, 'local')?.get('local');
+													const trackedFrom = getLogPurgeTrackedFrom(auditStore);
+													// past an anchor that may be purged the entries the peer lacks may be gone too, and only a copy restores them
+													if (!(purgedThrough < ownLogAnchor && trackedFrom <= ownLogAnchor)) {
 														logger.warn?.(
 															`Peer ${remoteNodeName} holds no floor for this node on ${databaseName} and resumes this node's log past an entry (${ownLogAnchor}) that may be purged; forcing a bounded base-copy resync.`
 														);
@@ -11488,15 +11496,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										const ownLogSliced = ownLogRange !== undefined && ownLogRange !== auditLogIterable;
 										// read before the scan: every own key below it has settled, so a drained slice delivered them
 										const ownFloorAtPassStart = ownLogSliced ? readOriginClosedFloor(auditStore) : undefined;
-										const passRange = ownLogSliced
-											? ownLogSliceThenOthers<AuditRecord>(
-													ownLogRange,
-													auditLogIterable,
-													OWN_LOG_SLICE_ENTRIES,
-													ownLogSlice
-												)
-											: auditLogIterable;
-										for (const auditRecord of passRange) {
+										if (ownLogSliced) {
+											ownLogSlice.drained = false;
+											const own = ownLogRange[Symbol.iterator]();
+											for (let count = 0; ; count++) {
+												const next = own.next();
+												if (next.done) {
+													ownLogSlice.drained = true;
+													break;
+												}
+												const key: number = next.value.txnLogKey;
+												const status = getSharedStatus();
+												if (key > status[SENDING_TIME_POSITION]) status[SENDING_TIME_POSITION] = key;
+												if (key > currentSequenceId) currentSequenceId = key;
+												await sendAuditRecord(next.value, key);
+												if (closed || wsClosed) return;
+												if (endsOwnLogSlice(count, next.value)) break;
+											}
+											// before a record of another log can flush the frame a failure cut short
+											if (ownLogReadFailed(ownLogRange) && failOwnLogRead()) return;
+										}
+										for (const auditRecord of auditLogIterable) {
 											const key: number = auditRecord.txnLogKey;
 											if (closed || wsClosed) return;
 											logger.debug?.('sending audit record', key, auditRecord.recordId);
@@ -11519,36 +11539,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (key > auditSubscription.startTime) auditSubscription.startTime = key; // don't double send
 										}
 										if (closed || wsClosed) return;
-										const ownRange: any = ownLogRange;
 										if (
-											ownRange &&
-											(ownRange.exactStartFailures?.size > 0 ||
-												ownRange.failedLogs?.size > 0 ||
-												ownRange.corruptFrameStop?.breaks > 0)
-										) {
-											// Nothing more of this log goes out here: a key-filtered read could deliver a later entry past one
-											// it skipped, and the peer would then resume past both. It resumes from what it holds on reconnect.
-											logger.error?.(
-												connectionId,
-												`The append-order read of this node's log for ${remoteNodeName} on ${databaseName} failed; this node's writes are not sent on this connection, which reconnects unless the log is broken mid-file`
-											);
-											ownLogRangeFailed = true;
-											stopMarkers();
-											ownLogRange = undefined;
-											subscribedNodeIds[getThisNodeId(auditStore)] = false;
-											if (!ownRange.corruptFrameStop?.midLogBreak) {
-												if (supersededOrClosed()) return;
-												closed = true;
-												close(1011, "this node's log could not be read in append order; reconnecting");
-												return;
-											}
-										} else if (ownLogSliced) {
+											ownLogRange &&
+											ownLogRange === auditLogIterable &&
+											ownLogReadFailed(ownLogRange) &&
+											failOwnLogRead()
+										)
+											return;
+										if (ownLogSliced && ownLogRange) {
 											// a cut slice left entries of this log unsent, so this pass proves nothing: send the rest now
 											if (!ownLogSlice.drained) continue;
 											if (isValidFloor(ownFloorAtPassStart)) {
 												// every own key below the floor is delivered, so the other logs' range carries this log from here
 												const start = cursorBelowFloor(ownFloorAtPassStart);
-												ownRange[Symbol.iterator]().return?.();
+												ownLogRange[Symbol.iterator]().return?.();
 												ownLogRange = undefined;
 												const ownId = getThisNodeId(auditStore);
 												const own = subscribedNodeIds[ownId];
