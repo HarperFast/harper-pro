@@ -150,5 +150,33 @@ suite(
 				`a write keyed before the start_time cutoff reached the peer: ${JSON.stringify(entries.map(({ id }) => id))}`
 			);
 		});
+
+		// the cutoff set above still holds, so this late write differs from the one before only in its side of it
+		test('arrives when it reserved its key after the cutoff', async () => {
+			const held = await holdWrite(origin, 'after-cutoff', { database: DATABASE, table: 'Unsharded' });
+			try {
+				await write(origin, 'newer-again');
+				await waitForCursorAt(origin, peer, 'newer-again');
+				await killHarper(peer);
+			} finally {
+				await held.release();
+			}
+			const heldResult = await held.inFlight;
+			assert.ok(heldResult.status < 300, `the held write committed: ${JSON.stringify(heldResult)}`);
+			await startHarper(peer, nodeOptions(peer));
+			await meshed(contexts, 'the peer to reconnect', DATABASE);
+
+			const entries = await waitForLocal(peer.harper, ['after-cutoff', 'newer-again'], TABLE, 30_000);
+			const late = entries.find((entry) => entry.id === 'after-cutoff');
+			const newer = entries.find((entry) => entry.id === 'newer-again');
+			assert.ok(
+				late.version < newer.version,
+				`after-cutoff (${late.version}) reserved before newer-again (${newer.version})`
+			);
+			assert.ok(
+				!entries.some((entry) => entry.id === 'before-cutoff'),
+				'the write keyed before the cutoff arrived on a later reconnect'
+			);
+		});
 	}
 );
