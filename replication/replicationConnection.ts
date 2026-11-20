@@ -3416,7 +3416,22 @@ export function ownLogFilterStart(ownSubscription: any): number {
 }
 
 export function ownLogPastAnchorRange(anchor: number) {
-	return { log: 'local', start: anchor, exactStart: true, resumeAfterExactStart: true, snapshot: false };
+	return {
+		log: 'local',
+		start: anchor,
+		exactStart: true,
+		resumeAfterExactStart: true,
+		snapshot: false,
+		trackCorruptTransactions: true,
+	};
+}
+
+/**
+ * Whether a corrupt frame cut the transaction keyed `key` short in `range`: core records the key of the transaction
+ * whose last returned entry did not end it (`trackCorruptTransactions`).
+ */
+export function cutByCorruptFrame(range: any, key: number): boolean {
+	return range?.corruptFrameStop?.breaks > 0 && range.corruptFrameStop.truncatedVersions?.has(key) === true;
 }
 
 const NO_STOPPED_RANGES: readonly any[] = [];
@@ -9966,6 +9981,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
+						// The queued frame holds part of a transaction a corrupt frame cut short: sent, the peer would commit half
+						// a source transaction and its cursor would pass the rest, so the whole transaction is withheld.
+						const dropTransactionCutByCorruptFrame = (): boolean => {
+							const key = currentTransaction.txnLogKey;
+							if (
+								!cutByCorruptFrame(auditLogIterable, key) &&
+								!cutByCorruptFrame(ownLogRange, key) &&
+								!cutByCorruptFrame(ownLogCorruptRange, key)
+							)
+								return false;
+							logger.warn?.(
+								connectionId,
+								`Withholding transaction ${key} from ${remoteNodeName} on ${databaseName}: a corrupt transaction-log frame cut it short`
+							);
+							frame.position = frame.encodingStart;
+							return true;
+						};
 						const sendAuditRecord = (
 							auditRecord,
 							cursor,
@@ -9975,7 +10007,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (closed || wsClosed) return;
 							if (sourceReadiness.some(sourceNotReady)) throw new Error('Sharding source completeness was revoked');
 							if (auditRecord.type === 'end_txn') {
-								if (currentTransaction.txnLogKey) {
+								if (currentTransaction.txnLogKey && !dropTransactionCutByCorruptFrame()) {
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
 										logger.error?.(
 											new Error('Invalid encoding of message to'),
@@ -10262,7 +10294,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 							if (currentTransaction.txnLogKey !== txnLogKey) {
 								// send the queued transaction
-								if (currentTransaction.txnLogKey) {
+								if (currentTransaction.txnLogKey && !dropTransactionCutByCorruptFrame()) {
 									if (DEBUG_MODE)
 										logger.trace?.(connectionId, 'new txn log key, sending queued txn', currentTransaction.txnLogKey);
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
@@ -10655,8 +10687,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								};
 								// No more of this node's log goes out here: a key-filtered read could deliver a later entry past one it
 								// skipped, and the peer would resume past both. A corrupt frame is handled as on the main range, which
-								// delivers the readable prefix; any other failure closes before the pending frame is flushed, and returns
-								// true so the peer resumes from what it holds.
+								// sends every transaction before it and withholds the one it cut short; any other failure closes before
+								// the pending frame is flushed, and returns true so the peer resumes from what it holds.
 								const failOwnLogRead = (): boolean => {
 									const range = ownLogRange;
 									ownLogRangeFailed = true;
@@ -11079,6 +11111,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														log: excludedNodes ? undefined : logName,
 														excludeLogs: excludedNodes,
 														snapshot: false,
+														trackCorruptTransactions: true,
 													};
 													let anchors = relayedAnchors;
 													let relayedRange: any;
@@ -11116,6 +11149,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														startByLog: new Map([[logName, copyStartTime], ...(relayedAnchors ?? [])]),
 														excludeLogs: excludedNodes,
 														snapshot: false,
+														trackCorruptTransactions: true,
 													};
 													let anchors = relayedAnchors;
 													let unusable = boundaryFailure(boundaryRange);
@@ -11478,7 +11512,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (ownLogAnchor !== undefined && !ownLogRange && ownLogSent) {
 												ownLogRange = auditStore.getRange(
 													ownLogFromStart
-														? { log: 'local', start: 0, snapshot: false }
+														? { log: 'local', start: 0, snapshot: false, trackCorruptTransactions: true }
 														: ownLogPastAnchorRange(ownLogAnchor)
 												);
 												// the peer holds every own key up to its anchor, so a handoff below it would resend them
@@ -11505,6 +11539,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													startByLog: liveStartByLog,
 													excludeLogs: excludedNodes,
 													snapshot: false, // don't want to use a snapshot, and we want to see new entries
+													trackCorruptTransactions: true, // a transaction a corrupt frame cuts short is withheld
 												});
 											}
 										}

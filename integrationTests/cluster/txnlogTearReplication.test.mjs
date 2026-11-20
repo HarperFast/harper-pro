@@ -3,15 +3,15 @@
  *
  * A partial `ENOSPC`/`EDQUOT` append the process survives can leave one unreadable frame in a
  * source's transaction log with intact, already-acknowledged entries behind it. The policy for that
- * shape is fail-stop (harper#2087): the stream delivers everything before the break, stops there
- * rather than skipping the frame -- a frame is not a transaction boundary, so skipping it could
+ * shape is fail-stop (harper#2087): the stream delivers every transaction before the break, stops
+ * there rather than skipping the frame -- a frame is not a transaction boundary, so skipping it could
  * apply part of a source transaction -- and reports the break with the offset where framing
- * resumes. Repairing the log and restarting the source revives later transactions, but B's resume
- * cursor is already exclusive of the torn transaction, so its remainder needs a re-clone.
+ * resumes.
  *
- * The torn frame sits inside the 50-row source transaction, so B's exact prefix is part of a
- * transaction it does not receive in full. Streaming replication commits what it drained; #2087's
- * atomic discard of a truncated transaction is the crash-recovery replay arm, not exercised here.
+ * The torn frame sits inside the 50-row source transaction. The sender withholds that transaction
+ * whole rather than send the entries before the break (harper-pro#1475), so B keeps only the first
+ * batch, and its resume cursor stays before the torn transaction: repairing the log and restarting
+ * the source delivers it in full.
  *
  * The two-node harness, including how B's join avoids a base copy, is in txnlogTearShared.mjs.
  *
@@ -27,6 +27,7 @@ import { join } from 'node:path';
 import { startHarper } from '@harperfast/integration-testing';
 import { stopNodeProcess, waitForCondition } from './clusterShared.mjs';
 import {
+	BATCH_ONE,
 	CONVERGE_TIMEOUT_MS,
 	ENTRY_HEADER_SIZE,
 	FRAMES_AFTER_TEAR,
@@ -48,35 +49,39 @@ import {
 	rowIds,
 	startTearPair,
 	stopTearPair,
-	waitForRowCount,
 } from './txnlogTearShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
+
+const WITHHELD = /Withholding transaction \S+ from \S+ on data: a corrupt transaction-log frame cut it short/;
 
 suite('Mid-log txnlog tear: replication stops at the break and reports it', { timeout: 300_000 }, (ctx) => {
 	before(() => startTearPair(ctx));
 
 	after(() => stopTearPair(ctx));
 
-	test('B receives every entry before the torn frame, nothing behind it, and A reports the break', async () => {
+	test('B receives every transaction before the torn one, nothing of it or behind it, and A reports the break', async () => {
 		const { stoppedA, torn: tear } = await resumeFromTornSource(ctx, tearFrame);
-		const beforeBreak = rowIds(0, tear.index);
+		const beforeBreak = rowIds(0, BATCH_ONE);
 		console.log(
 			`tore frame ${tear.index} (${rowId(tear.index)}) @${tear.position} (len ${tear.length}) of ${tear.totalFrames}; ` +
 				`${FRAMES_AFTER_TEAR} frames follow it`
 		);
 
-		// The sender commits the drained prefix when the drain ends, after it discovered the break, so
-		// the prefix must have landed before the diagnostic is read and the negative window opens.
-		const resumedRows = await waitForRowCount(ctx.nodeB, beforeBreak.length);
-		await assertNeverCopied(ctx.nodeB, 'after B resumed past its cursor');
-		assertExactRows(resumedRows, beforeBreak, 'after B resumed past its cursor');
-
+		// B already held the first batch; A withholds the torn transaction once its drain reaches the break.
 		const diagnostic = breakDiagnostic(tear.position, tear.position + ENTRY_HEADER_SIZE + tear.length);
-		await waitForCondition(async () => diagnostic.test(await readLogs([stoppedA, ctx.nodeA])), {
-			timeoutMs: REPORT_TIMEOUT_MS,
-			description: () => `A's hdb.log to report the break as ${diagnostic}`,
-		});
+		await waitForCondition(
+			async () => {
+				const log = await readLogs([stoppedA, ctx.nodeA]);
+				return diagnostic.test(log) && WITHHELD.test(log);
+			},
+			{
+				timeoutMs: REPORT_TIMEOUT_MS,
+				description: () => `A's hdb.log to report the break as ${diagnostic} and to withhold the torn transaction`,
+			}
+		);
+		await assertNeverCopied(ctx.nodeB, 'after B resumed past its cursor');
+		assertExactRows(await readRows(ctx.nodeB), beforeBreak, 'after B resumed past its cursor');
 
 		// A write A acknowledges after the restart is behind the break too, so it must not arrive either.
 		await insertRows(ctx.nodeA, TOTAL, 1);
@@ -105,12 +110,8 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 				description: () => `${ctx.nodeB.hostname} to receive ${probeId} after the repair`,
 			}
 		);
-		assertRowsPresent(afterRepair, [...beforeBreak, probeId], 'after the log was repaired');
-		const tornTransactionRemainder = rowIds(tear.index, TOTAL - tear.index);
-		const recovered = tornTransactionRemainder.filter((id) => afterRepair.some((row) => row.id === id));
-		console.log(
-			`after repair B holds ${recovered.length}/${tornTransactionRemainder.length} rows of the torn transaction's remainder`
-		);
+		// B's cursor never passed the torn transaction, so the repaired log delivers all of it
+		assertRowsPresent(afterRepair, [...rowIds(0, TOTAL), probeId], 'after the log was repaired');
 	});
 });
 

@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+	cutByCorruptFrame,
 	ownLogAppendAnchor,
 	ownLogFilterStart,
 	ownLogPastAnchorRange,
@@ -82,6 +83,25 @@ describe('ownLogReadFailed', () => {
 		assert.strictEqual(ownLogReadFailed({ exactStartFailures: new Map([['local', 'missing']]) }), true);
 		assert.strictEqual(ownLogReadFailed({ failedLogs: new Set(['local']) }), true);
 		assert.strictEqual(ownLogReadFailed({ corruptFrameStop: { breaks: 1 } }), true);
+	});
+});
+
+describe('cutByCorruptFrame', () => {
+	it('names only a transaction a corrupt frame cut short on that range', () => {
+		const stopped = { corruptFrameStop: { breaks: 1, truncatedVersions: new Set([T]), midLogBreak: true } };
+		assert.strictEqual(cutByCorruptFrame(stopped, T), true);
+		assert.strictEqual(cutByCorruptFrame(stopped, T + 1), false, 'a complete transaction before the break');
+		assert.strictEqual(
+			cutByCorruptFrame({ corruptFrameStop: { breaks: 0, truncatedVersions: new Set([T]) } }, T),
+			false,
+			'no break on the range'
+		);
+		assert.strictEqual(cutByCorruptFrame(undefined, T), false);
+		assert.strictEqual(cutByCorruptFrame({}, T), false);
+	});
+
+	it('asks core to track cut transactions on the append-order range', () => {
+		assert.strictEqual(ownLogPastAnchorRange(T).trackCorruptTransactions, true);
 	});
 });
 
