@@ -11497,6 +11497,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// read before the scan: every own key below it has settled, so a drained slice delivered them
 										const ownFloorAtPassStart = ownLogSliced ? readOriginClosedFloor(auditStore) : undefined;
 										if (ownLogSliced) {
+											// a cut pass skipped the end-of-pass flush; a failed own read must not drop another log's transaction
+											if (frame.position - frame.encodingStart > 8)
+												sendAuditRecord({ type: 'end_txn' }, currentSequenceId);
 											ownLogSlice.drained = false;
 											const own = ownLogRange[Symbol.iterator]();
 											for (let count = 0; ; count++) {
