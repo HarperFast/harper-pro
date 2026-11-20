@@ -28,17 +28,20 @@ function lockedIncrementIn(node, id, signal) {
 	return call(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 }, signal);
 }
 
-/** Retries only the 503 a lock answers while its map settles; any other answer fails at once. */
-function waitForLockedIncrementIn(node, id) {
+/**
+ * The first lock under a new generation: the change rebuilds the transport and schedules a restart recall, so
+ * it may answer a retryable 503. Retries only that; any other answer fails at once.
+ */
+function firstLock(node, path, data) {
 	let last;
 	return waitForCondition(
 		async (signal) => {
-			last = await lockedIncrementIn(node, id, signal);
+			last = await call(node, path, data, signal);
 			if (last.status === 503) return undefined;
 			assert.equal(last.status, 200, JSON.stringify(last.body));
 			return last;
 		},
-		{ timeoutMs: 30_000, description: () => `${FRESH} to be lockable on ${node.hostname}: ${JSON.stringify(last)}` }
+		{ timeoutMs: 30_000, description: () => `${path} to be admitted on ${node.hostname}: ${JSON.stringify(last)}` }
 	);
 }
 
@@ -175,8 +178,7 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(body.outcome, 'activated', JSON.stringify(body));
 		assert.equal(body.generation, 2, 'above the default generation it inherited');
 		for (const node of nodes.slice(0, 2)) assert.equal((await recordLocksOf(node, FRESH)).homeMapSource, 'database');
-		// A generation change rebuilds the transport and schedules a restart recall, so the first lock under it may
-		// answer a retryable 503; the default change in the next test then has to leave a lockable map lockable.
+		// the default change in the next test then has to leave this lockable map lockable
 		const id = 'own-map-' + Date.now();
 		await sendOperation(nodes[0], {
 			operation: 'insert',
@@ -186,7 +188,8 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 			authorization: nodes[0].admin,
 		});
 		await waitForItem(nodes, id, 0);
-		for (const node of nodes.slice(0, 2)) await waitForLockedIncrementIn(node, id);
+		for (const node of nodes.slice(0, 2))
+			await firstLock(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
 	});
 
 	test('a default that names the third node lets it lock every inheriting database, and not one with its own map', async () => {
@@ -254,8 +257,7 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(body.nodes[names[2]].role, 'departing');
 		assert.equal(body.nodes[names[2]].stage.proven, true, JSON.stringify(body.nodes[names[2]]));
 		assert.deepEqual(body.nodes[names[2]].activate, { action: 'skipped' });
-		const next = await call(nodes[0], 'LockedIncrement/', { id });
-		assert.equal(next.status, 200, JSON.stringify(next.body));
+		const next = await firstLock(nodes[0], 'LockedIncrement/', { id });
 		assert.equal(next.body.n, 11, 'the successor saw the leaver’s committed write');
 		await waitForCounter(nodes, id, 11);
 		assert.equal(await lockStatus(nodes[2], id), 503, 'the leaver is staged and serves no lock');
@@ -285,7 +287,7 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		const id = 'own-' + Date.now();
 		await putCounter(nodes[1], id, 0);
 		await waitForCounter(nodes, id, 0);
-		assert.equal((await call(nodes[2], 'LockedIncrement/', { id })).status, 200);
+		await firstLock(nodes[2], 'LockedIncrement/', { id });
 		assert.equal(await lockStatus(nodes[0], id), 503, 'the node its map leaves out is staged');
 	});
 });
