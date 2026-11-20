@@ -1,0 +1,10 @@
+# replicates with the system database, so it can share a transaction with an hdb_nodes write
+type CopyWitness @table(database: "system") {
+	id: ID @primaryKey
+}
+
+type Tombstoned @table(audit: true) @export {
+	id: ID @primaryKey
+	name: String
+	count: Int
+}
