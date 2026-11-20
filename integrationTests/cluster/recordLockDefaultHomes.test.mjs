@@ -43,7 +43,6 @@ function firstLock(node, path, data) {
 	);
 }
 
-/** One id homed on each of `homes`, picked by the ring hash rather than sampled. */
 function idHomedOnEach(database, table, homes, prefix) {
 	const ids = new Map();
 	for (let i = 0; ids.size < homes.length; i++) {
@@ -187,18 +186,20 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(body.outcome, 'activated', JSON.stringify(body));
 		assert.equal(body.generation, 2, 'above the default generation it inherited');
 		for (const node of nodes.slice(0, 2)) assert.equal((await recordLocksOf(node, FRESH)).homeMapSource, 'database');
-		const ids = idHomedOnEach(FRESH, ITEM, names.slice(0, 2), 'own-map-' + Date.now());
-		await sendOperation(nodes[0], {
-			operation: 'insert',
-			database: FRESH,
-			table: ITEM,
-			records: ids.map((id) => ({ id, n: 0 })),
-			authorization: nodes[0].admin,
-		});
-		for (const id of ids) {
-			await waitForItem(nodes, id, 0);
-			for (const node of nodes.slice(0, 2))
+		const warmed = Date.now();
+		for (const [index, node] of nodes.slice(0, 2).entries()) {
+			const ids = idHomedOnEach(FRESH, ITEM, names.slice(0, 2), `own-map-${warmed}-${index}`);
+			await sendOperation(nodes[0], {
+				operation: 'insert',
+				database: FRESH,
+				table: ITEM,
+				records: ids.map((id) => ({ id, n: 0 })),
+				authorization: nodes[0].admin,
+			});
+			for (const id of ids) {
+				await waitForItem(nodes, id, 0);
 				await firstLock(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
+			}
 		}
 	});
 
@@ -271,10 +272,13 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(next.body.n, 11, 'the successor saw the leaver’s committed write');
 		await waitForCounter(nodes, id, 11);
 		assert.equal(await lockStatus(nodes[2], id), 503, 'the leaver is staged and serves no lock');
-		for (const homed of idHomedOnEach(DB, 'Counter', names.slice(0, 2), 'shrunk-' + Date.now())) {
-			await putCounter(nodes[0], homed, 0);
-			await waitForCounter(nodes, homed, 0);
-			for (const node of nodes.slice(0, 2)) await firstLock(node, 'LockOnce/', { id: homed });
+		const warmed = Date.now();
+		for (const [index, node] of nodes.slice(0, 2).entries()) {
+			for (const homed of idHomedOnEach(DB, 'Counter', names.slice(0, 2), `shrunk-${warmed}-${index}`)) {
+				await putCounter(nodes[0], homed, 0);
+				await waitForCounter(nodes, homed, 0);
+				await firstLock(node, 'LockOnce/', { id: homed });
+			}
 		}
 	});
 
