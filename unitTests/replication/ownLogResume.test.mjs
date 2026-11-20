@@ -1,18 +1,14 @@
-/**
- * A receiver with no valid floor for a sender resumes that sender's own log past the last entry of it the receiver
- * applied, in append order, not at its received key maximum (harper-pro#1454): the log is appended in commit
- * order, so a key filter drops a lower-keyed entry appended after that maximum.
- */
+// harper-pro#1454: with no floor, the sender's own log resumes past the receiver's anchor in append order.
 import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-	chainRanges,
 	ownLogAppendAnchor,
 	ownLogPastAnchorRange,
 	ownLogResumeAnchor,
+	ownLogSliceThenOthers,
 	rangeBoundaryFailure,
 } from '#src/replication/replicationConnection';
 import { RocksTransactionLogStore } from '#src/core/resources/RocksTransactionLogStore';
@@ -54,19 +50,44 @@ describe('ownLogAppendAnchor', () => {
 	});
 });
 
-describe('chainRanges', () => {
-	it('reads the first range and then the second, each from where it stands', () => {
-		const tail = (items) => {
-			let index = 0;
-			const iterator = { next: () => (index < items.length ? { value: items[index++], done: false } : { done: true }) };
-			return { items, [Symbol.iterator]: () => iterator };
+describe('ownLogSliceThenOthers', () => {
+	// a live tail: refilling it after a pass hands the next pass only the new entries, and closing it is an error
+	const tail = (entries) => {
+		let index = 0;
+		const iterator = {
+			next: () => (index < entries.length ? { value: entries[index++], done: false } : { done: true }),
+			return: () => assert.fail('the own-log range must not be closed between passes'),
 		};
-		const own = tail([1, 2]);
-		const others = tail(['a']);
-		assert.deepStrictEqual([...chainRanges(own, others)], [1, 2, 'a']);
-		own.items.push(3);
-		others.items.push('b');
-		assert.deepStrictEqual([...chainRanges(own, others)], [3, 'b']);
+		return { entries, [Symbol.iterator]: () => iterator };
+	};
+	const entry = (key, endTxn = true) => ({ key, endTxn });
+	const keys = (range) => Array.from(range, ({ key }) => key);
+
+	it('reads all of a short own log and then the other logs, reporting the own log drained', () => {
+		const slice = { drained: false };
+		assert.deepStrictEqual(keys(ownLogSliceThenOthers(tail([entry(1), entry(2)]), [entry('a')], 5, slice)), [
+			1,
+			2,
+			'a',
+		]);
+		assert.strictEqual(slice.drained, true);
+	});
+
+	it('serves the other logs after the budget while the own log keeps growing, and resumes it next pass', () => {
+		const own = tail([entry(1), entry(2), entry(3), entry(4)]);
+		const slice = { drained: true };
+		assert.deepStrictEqual(keys(ownLogSliceThenOthers(own, [entry('a')], 1, slice)), [1, 2, 'a']);
+		assert.strictEqual(slice.drained, false);
+		own.entries.push(entry(5));
+		assert.deepStrictEqual(keys(ownLogSliceThenOthers(own, [entry('b')], 10, slice)), [3, 4, 5, 'b']);
+		assert.strictEqual(slice.drained, true);
+	});
+
+	it('cuts only at the end of a transaction, since a frame carries one', () => {
+		const own = tail([entry(1, false), entry(1, false), entry(1, true), entry(2)]);
+		const slice = { drained: true };
+		assert.deepStrictEqual(keys(ownLogSliceThenOthers(own, [entry('a')], 0, slice)), [1, 1, 1, 'a']);
+		assert.strictEqual(slice.drained, false);
 	});
 });
 

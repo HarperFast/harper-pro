@@ -1,8 +1,5 @@
-// A write that reserved its key before another and committed after it, while the receiving peer was down, must
-// reach that peer when it reconnects holding no floor for the origin (harper-pro#1454). The peer's received position
-// is above the late key, and with no floor to resume below, only a resume of the origin's log past the last entry
-// the peer applied, in append order, re-sends it. A confirmation marker after the reconnect must not confirm a write
-// the peer does not hold either.
+// harper-pro#1454: a write that reserved its key before another and committed after it, while the peer was down,
+// must reach a peer that reconnects holding no floor for the origin, and no confirmation may count it first.
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { killHarper, startHarper } from '@harperfast/integration-testing';
@@ -56,12 +53,12 @@ suite(
 			const held = await holdWrite(origin, 'late', { database: DATABASE, table: 'Unsharded' });
 			try {
 				await write(origin, 'newer');
-				await waitForLocal(peer.harper, ['newer'], TABLE);
+				const applied = await waitForLocal(peer.harper, ['newer'], TABLE);
+				const newerKey = applied.find((entry) => entry.id === 'newer').version;
+				// a saved cursor still at 'warm' would resume below 'late', which the unfixed key rule also delivers
 				await waitForCondition(
-					async (signal) => (await originRow(peer.harper, origin.hostname, signal))?.originLogKey,
-					{
-						description: 'the peer to record the highest key it applied from the origin',
-					}
+					async (signal) => (await originRow(peer.harper, origin.hostname, signal))?.originLogKey >= newerKey,
+					{ description: "the peer to save its cursor for the origin at 'newer'" }
 				);
 				const row = await originRow(peer.harper, origin.hostname);
 				assert.equal(row.closedFloor, null, 'the peer holds no floor for the origin');
