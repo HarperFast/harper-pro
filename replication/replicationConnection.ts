@@ -9734,6 +9734,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let ownLogFromStart = false;
 						let ownLogRange: any;
 						let ownLogRangeFailed = false;
+						let ownLogTxnOpen = false;
+						// an own-log range stopped at a corrupt frame, reported and recovered like the main range
+						let ownLogCorruptRange: any;
 						const ownLogSlice = { drained: true };
 						let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
 						// `liveStartByLog` is the live incremental range's own map, so an `includeNodes` update reaches the range
@@ -10644,22 +10647,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 								};
 								// No more of this node's log goes out here: a key-filtered read could deliver a later entry past one it
-								// skipped, and the peer would resume past both. The frame the failure cut short is dropped, not flushed.
+								// skipped, and the peer would resume past both. A transaction the failure cut short is dropped, not flushed.
 								// Returns true when the connection closed so the peer resumes from what it holds.
 								const failOwnLogRead = (): boolean => {
 									const range = ownLogRange;
-									logger.error?.(
-										connectionId,
-										`The append-order read of this node's log for ${remoteNodeName} on ${databaseName} failed; this node's writes are not sent on this connection, which reconnects unless the log is broken mid-file`
-									);
-									frame.position = frame.encodingStart;
-									currentTransaction.txnLogKey = 0;
+									if (ownLogTxnOpen) {
+										frame.position = frame.encodingStart;
+										currentTransaction.txnLogKey = 0;
+									}
 									ownLogRangeFailed = true;
 									stopMarkers();
 									ownLogRange = undefined;
 									subscribedNodeIds[getThisNodeId(auditStore)] = false;
+									if (range.corruptFrameStop?.breaks > 0) {
+										ownLogCorruptRange = range;
+										return false;
+									}
+									logger.error?.(
+										connectionId,
+										`The append-order read of this node's log for ${remoteNodeName} on ${databaseName} failed; this node's writes are not sent on this connection, which reconnects`
+									);
 									range[Symbol.iterator]().return?.();
-									if (range.corruptFrameStop?.midLogBreak) return false;
 									if (!supersededOrClosed()) {
 										closed = true;
 										close(1011, "this node's log could not be read in append order; reconnecting");
@@ -11512,6 +11520,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const status = getSharedStatus();
 												if (key > status[SENDING_TIME_POSITION]) status[SENDING_TIME_POSITION] = key;
 												if (key > currentSequenceId) currentSequenceId = key;
+												ownLogTxnOpen = next.value.endTxn === false;
 												await sendAuditRecord(next.value, key);
 												if (closed || wsClosed) return;
 												if (endsOwnLogSlice(count, next.value)) break;
@@ -11647,12 +11656,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// peer's durable and per-origin cursors position the next range, which a sender-side reseed
 										// cannot do safely (harper-pro#876). The stopped range stays in place until then, so the
 										// certification check below still sees its failure.
-										if (range?.corruptFrameStop?.breaks > 0 && auditStore.reusableIterable) {
-											if (range.corruptFrameStop.midLogBreak) {
+										const stoppedRange = range?.corruptFrameStop?.breaks > 0 ? range : ownLogCorruptRange;
+										if (stoppedRange && auditStore.reusableIterable) {
+											if (stoppedRange.corruptFrameStop.midLogBreak) {
 												// Core's fail-stop: no fresh range can cross a mid-log break, so reconnecting would only churn.
 												sendLogRecoveryPending = false;
-												if (reportedMidLogBreakRange !== range) {
-													reportedMidLogBreakRange = range;
+												if (reportedMidLogBreakRange !== stoppedRange) {
+													reportedMidLogBreakRange = stoppedRange;
 													logger.error?.(
 														connectionId,
 														`Replication send to ${remoteNodeName} (db: "${databaseName}") stopped at a mid-log corrupt transaction-log frame; entries behind it are not sent on this connection. Repair the transaction log or re-clone this node.`
