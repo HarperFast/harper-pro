@@ -9977,18 +9977,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								? shardingNativeRoots(databaseName).map(({ root }) => shardingBaselineState(root, databaseName))
 								: [];
 						const sourceNotReady = (word: Int32Array) => Atomics.load(word, 0) !== 1;
-						const currentTransaction = { txnLogKey: 0 };
+						// `ended`: an entry closing the queued transaction was read, whether it was sent or filtered out
+						const currentTransaction = { txnLogKey: 0, ended: false };
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
 						// The queued frame holds part of a transaction a corrupt frame cut short: sent, the peer would commit half
-						// a source transaction and its cursor would pass the rest, so the whole transaction is withheld.
-						const dropTransactionCutByCorruptFrame = (): boolean => {
+						// a source transaction and its cursor would pass the rest, so the whole transaction is withheld. A
+						// transaction whose closing entry was read is whole, even when another log's cut one shares its key.
+						const dropTransactionCutByCorruptFrame = (stoppedRange?: any): boolean => {
 							const key = currentTransaction.txnLogKey;
 							if (
-								!cutByCorruptFrame(auditLogIterable, key) &&
-								!cutByCorruptFrame(ownLogRange, key) &&
-								!cutByCorruptFrame(ownLogCorruptRange, key)
+								currentTransaction.ended ||
+								(!cutByCorruptFrame(auditLogIterable, key) &&
+									!cutByCorruptFrame(ownLogRange, key) &&
+									!cutByCorruptFrame(ownLogCorruptRange, key) &&
+									!cutByCorruptFrame(stoppedRange, key))
 							)
 								return false;
 							logger.warn?.(
@@ -9996,6 +10000,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								`Withholding transaction ${key} from ${remoteNodeName} on ${databaseName}: a corrupt transaction-log frame cut it short`
 							);
 							frame.position = frame.encodingStart;
+							currentTransaction.txnLogKey = 0;
 							return true;
 						};
 						const sendAuditRecord = (
@@ -10006,6 +10011,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						) => {
 							if (closed || wsClosed) return;
 							if (sourceReadiness.some(sourceNotReady)) throw new Error('Sharding source completeness was revoked');
+							if (auditRecord.endTxn === true && auditRecord.txnLogKey === currentTransaction.txnLogKey)
+								currentTransaction.ended = true;
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnLogKey && !dropTransactionCutByCorruptFrame()) {
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
@@ -10303,6 +10310,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									sendQueuedData();
 								}
 								currentTransaction.txnLogKey = txnLogKey;
+								currentTransaction.ended = auditRecord.endTxn === true;
 								frame.encodingStart = frame.position;
 								frame.writeFloat64(txnLogKey);
 							}
@@ -11640,6 +11648,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												databaseName,
 												boundaryLogName
 											);
+											// before the range that holds the evidence is dropped, so the next pass cannot flush a cut transaction
+											if (currentTransaction.txnLogKey) dropTransactionCutByCorruptFrame();
 											boundaryLogName = undefined;
 											auditLogIterable = undefined;
 											stopMarkers();
@@ -11676,6 +11686,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														end: ownOriginRange.endTime,
 														exclusiveStart: true,
 														snapshot: false,
+														trackCorruptTransactions: true,
 													})
 												: [];
 											for (const auditRecord of recoveryRange) {
@@ -11694,6 +11705,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												await sendAuditRecord(auditRecord, auditRecord.txnLogKey);
 											}
 											if (closed || wsClosed) return;
+											if (currentTransaction.txnLogKey) dropTransactionCutByCorruptFrame(recoveryRange);
 											if (frame.position - frame.encodingStart > 8)
 												sendAuditRecord({ type: 'end_txn' }, currentSequenceId);
 											settleOwnOriginRange(ownOriginRange, recoveryRange);
