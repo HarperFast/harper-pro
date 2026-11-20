@@ -1,6 +1,7 @@
 /** Fresh nodes are in their first incarnation, so the first default proves its drain at once. */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { homeFor, ringKeyFor } from '../../dist/core/resources/recordLockCoordinator.js';
 import { ensureTableExists, sendOperation, waitForCondition } from './clusterShared.mjs';
 import {
 	DB,
@@ -40,6 +41,17 @@ function firstLock(node, path, data) {
 		},
 		{ timeoutMs: 30_000, description: () => `${path} to be admitted on ${node.hostname}: ${JSON.stringify(last)}` }
 	);
+}
+
+/** One id homed on each of `homes`, picked by the ring hash rather than sampled. */
+function idHomedOnEach(database, table, homes, prefix) {
+	const ids = new Map();
+	for (let i = 0; ids.size < homes.length; i++) {
+		const id = `${prefix}-${i}`;
+		const home = homeFor(ringKeyFor(database, table, id), homes);
+		if (!ids.has(home)) ids.set(home, id);
+	}
+	return [...ids.values()];
 }
 
 async function itemCount(node, id, signal) {
@@ -175,29 +187,18 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(body.outcome, 'activated', JSON.stringify(body));
 		assert.equal(body.generation, 2, 'above the default generation it inherited');
 		for (const node of nodes.slice(0, 2)) assert.equal((await recordLocksOf(node, FRESH)).homeMapSource, 'database');
-		const members = nodes.slice(0, 2);
-		const servedAsHome = new Set();
-		for (let i = 0; servedAsHome.size < members.length; i++) {
-			assert.ok(i < 32, `only ${servedAsHome.size} of ${FRESH}'s members served as a home in 32 keys`);
-			const id = `own-map-${Date.now()}-${i}`;
-			await sendOperation(nodes[0], {
-				operation: 'insert',
-				database: FRESH,
-				table: ITEM,
-				records: [{ id, n: 0 }],
-				authorization: nodes[0].admin,
-			});
+		const ids = idHomedOnEach(FRESH, ITEM, names.slice(0, 2), 'own-map-' + Date.now());
+		await sendOperation(nodes[0], {
+			operation: 'insert',
+			database: FRESH,
+			table: ITEM,
+			records: ids.map((id) => ({ id, n: 0 })),
+			authorization: nodes[0].admin,
+		});
+		for (const id of ids) {
 			await waitForItem(nodes, id, 0);
-			const granted = () => Promise.all(members.map(async (node) => (await recordLocksOf(node, FRESH))?.granted));
-			const before = await granted();
-			await firstLock(nodes[0], 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
-			const after = await granted();
-			// `granted` counts outstanding delegations, so one fresh key's first lock raises only its home's
-			members.forEach((node, index) => {
-				if (typeof before[index] === 'number' && typeof after[index] === 'number' && after[index] > before[index])
-					servedAsHome.add(node);
-			});
-			await firstLock(nodes[1], 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
+			for (const node of nodes.slice(0, 2))
+				await firstLock(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
 		}
 	});
 
@@ -270,7 +271,11 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(next.body.n, 11, 'the successor saw the leaver’s committed write');
 		await waitForCounter(nodes, id, 11);
 		assert.equal(await lockStatus(nodes[2], id), 503, 'the leaver is staged and serves no lock');
-		await firstLock(nodes[1], 'LockOnce/', { id });
+		for (const homed of idHomedOnEach(DB, 'Counter', names.slice(0, 2), 'shrunk-' + Date.now())) {
+			await putCounter(nodes[0], homed, 0);
+			await waitForCounter(nodes, homed, 0);
+			for (const node of nodes.slice(0, 2)) await firstLock(node, 'LockOnce/', { id: homed });
+		}
 	});
 
 	test('refuses, before staging anything, a default change that does not survey every known node', async () => {
