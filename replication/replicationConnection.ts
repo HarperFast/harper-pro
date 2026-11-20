@@ -1196,6 +1196,8 @@ const unknownCommandWarnThrottle = createThrottleState();
 let nextConnectionSessionOrdinal = 0;
 const TEST_OMIT_CAPABILITIES = process.env.HARPER_TEST_OMIT_REPLICATION_CAPABILITIES === '1';
 const TEST_ORIGIN_FLOOR_INTERVAL_MS = Number(process.env.HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS);
+// Test-only: certify no floor to any peer, so a receiver resumes with none (harper-pro#1454).
+const TEST_WITHHOLD_ORIGIN_FLOORS = process.env.HARPER_TEST_WITHHOLD_ORIGIN_FLOORS === '1';
 /** Authorized drop markers for a database not open on this thread yet: they cannot be recorded until it is. */
 const markersAwaitingDatabase = new Map<string, TableDropMarker[]>();
 /** Clears the held list a pass recorded, unless an overlapping pass has since merged in markers it has not. */
@@ -3388,6 +3390,39 @@ export function raiseStatusSlot(status: Float64Array, position: number, value: n
  */
 export function resumeStartWithFloor(position: number, closedFloor: unknown): number {
 	return isValidFloor(closedFloor) ? cursorBelowFloor(closedFloor) : position;
+}
+
+/**
+ * The entry of a sender's own log that a receiver with no valid floor for it asks to resume past (harper-pro#1454):
+ * the highest key it applied from that origin. Its frames arrive in the origin's append order from a proven start,
+ * so every entry appended before that one is held, whatever its key, and only the entries appended after it can be
+ * missing. Without a floor, the received position is only a key maximum, and a key filter would drop a lower-keyed
+ * entry appended after it.
+ */
+export function ownLogResumeAnchor(ownState: any): number | undefined {
+	return isValidFloor(ownState?.closedFloor) || !isValidFrameTxnLogKey(ownState?.originLogKey)
+		? undefined
+		: ownState.originLogKey;
+}
+
+/**
+ * The anchor of a subscription to this node's own log that resumes past an entry, in append order. Only a store
+ * whose log reads can resume past an exact entry honors it, and never on a copy, whose own anchor supersedes it.
+ */
+export function ownLogAppendAnchor(ownSubscription: any, resumesPastEntries: boolean): number | undefined {
+	if (!resumesPastEntries || !(ownSubscription?.startTime > 1)) return undefined;
+	return isValidFrameTxnLogKey(ownSubscription.resumeAfter) ? ownSubscription.resumeAfter : undefined;
+}
+
+/** This node's own log from the entry after `anchor` in append order, whatever the keys of the entries that follow. */
+export function ownLogPastAnchorRange(anchor: number) {
+	return { log: 'local', start: anchor, exactStart: true, resumeAfterExactStart: true, snapshot: false };
+}
+
+/** Reads `first` and then `second`: a pass over this node's own log in append order, then the other logs. */
+export function* chainRanges<T>(first: Iterable<T>, second: Iterable<T>): Generator<T> {
+	yield* first;
+	yield* second;
 }
 
 /**
@@ -9692,6 +9727,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// `missing` whenever the first entry's key differs from the cursor — which is the ordinary,
 						// healthy case for a plain resume. Only a log we actually asked to resume past can fail closed.
 						let boundaryLogName: string | undefined;
+						// The entry of this node's own log the receiver, with no floor for it, holds everything appended
+						// through (harper-pro#1454). The own log is then read by `ownLogRange`, in append order past that
+						// entry and with no key filter, beside the range over the other logs.
+						let ownLogAnchor: number | undefined;
+						let ownLogRange: any;
+						let ownLogRangeFailed = false;
 						let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
 						// `liveStartByLog` is the live incremental range's own map, so an `includeNodes` update reaches the range
 						let originFloors: Map<string, number> | undefined;
@@ -9722,6 +9763,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 							logger.debug?.(connectionId, 'returned own-origin writes to', remoteNodeName, databaseName, { failed });
 							if (subscribedNodeIds) subscribedNodeIds[getIdOfRemoteNode(recovery.name, auditStore)] = false;
+						};
+						// This node's own log past the receiver's anchor entry, in append order. An anchor the log cannot
+						// resume past (purged, or a reissued key) reads from its oldest retained entry instead: that
+						// resends more, and skips nothing.
+						const openOwnLogRange = (anchor: number) => {
+							const pastAnchor = ownLogPastAnchorRange(anchor);
+							const failure = rangeBoundaryFailure(auditStore, pastAnchor);
+							if (!failure) return auditStore.getRange(pastAnchor);
+							logger.warn?.(
+								connectionId,
+								`${remoteNodeName} holds no floor for this node on ${databaseName}, and this node's log cannot resume past the entry it names (${anchor}); resending the log from its oldest retained entry`,
+								failure instanceof Error ? failure : undefined
+							);
+							return auditStore.getRange({ log: 'local', start: 0, snapshot: false });
 						};
 						let skippedMessageSequenceUpdateTimer: ReturnType<typeof setTimeout> | undefined;
 						let copying = false;
@@ -10495,6 +10550,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									subscribedNodeIds[localId] = { startTime, endTime };
 									if (subscription !== ownOriginRange) subscribedNodeName = name;
 								}
+								ownLogAnchor = ownLogAppendAnchor(ownSubscription, auditStore.reusableIterable === true);
 								// Only a multi-log range reads unlisted origins, and only per-origin logs carry their keys.
 								if (excludedNodes && auditStore.reusableIterable === true) {
 									const nameToId = sentIdMapping(auditStore, getThisNodeName());
@@ -10608,6 +10664,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return level >= 1 ? level : 0;
 								};
 								const captureOriginFloors = (): Map<string, OriginCertificate> | undefined => {
+									if (TEST_WITHHOLD_ORIGIN_FLOORS) return undefined;
 									let floors: Map<string, OriginCertificate> | undefined;
 									try {
 										const thisNodeName = getThisNodeName();
@@ -10880,6 +10937,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (currentSequenceId > 0 || sendingProjection) subscriptionResidencySender?.replaying();
 											if (currentSequenceId === 0) {
 												copying = true;
+												ownLogAnchor = undefined;
 												const legacyCopy = await probeLegacyCopy();
 												if (legacyCopy) copyResume = undefined;
 												if (closed || wsClosed) return;
@@ -11072,18 +11130,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													});
 													if (closed || wsClosed) return;
 												}
+												// The copy holds every entry of this node's own log through an anchor that names one, so a
+												// follower with no floor yet resumes this log past it (harper-pro#1454).
+												const copyAnchors =
+													anchoredInLogOrder && boundaryLogName === logName && anchorKey !== 0
+														? new Map([...(relayedAnchors ?? []), [getThisNodeName(), copyStartTime]])
+														: relayedAnchors;
 												// Tell the follower a bulk copy is starting, its anchor, and the copy-cursor version, so it tracks
 												// a resume cursor a later leader can validate before trusting the skip or the anchor.
 												ws.send(
 													encode(
-														relayedAnchors?.size &&
-															peerCapabilitiesLearned &&
-															peerSupportsOriginCursors(peerCapabilities)
+														copyAnchors?.size && peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities)
 															? [
 																	COPY_START,
 																	copyStartTime,
 																	COPY_ORDER_VERSION,
-																	Object.fromEntries(relayedAnchors),
+																	Object.fromEntries(copyAnchors),
 																	sendingProjection ? { shardingProjection: true } : undefined,
 																]
 															: [
@@ -11362,28 +11424,44 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											boundaryLogName = undefined;
 											auditLogIterable = deadAuditIterableForTest;
 										} else if (!(auditStore.reusableIterable && auditLogIterable)) {
-											// No append-order resume here — only the copy's own pre-positioned range above does that. A
-											// reconnect resumes with the subscription's startTime at the anchor key, and
-											// `matchesSubscription` below requires that startTime to be BELOW an entry's key, so an
-											// older-keyed entry this range would correctly yield is dropped by the subscription predicate
-											// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
+											// This range starts each log at a key, and a log read from a key skips every lower-keyed entry
+											// appended after it. Only the copy's pre-positioned range above, and `ownLogRange` for a
+											// receiver with no floor, resume past an entry in append order (harper-pro#876, #1454).
 											boundaryLogName = undefined;
-											const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
-											liveStartByLog = new Map([
-												[logName, currentSequenceId || 1],
-												...[...(originFloors ?? [])].filter(([name]) => !relabeled?.has(name)),
-											]);
-											auditLogIterable = auditStore.getRange({
-												start: currentSequenceId || 1,
-												exclusiveStart: true,
-												exactStart: false,
-												log: excludedNodes ? undefined : logName,
-												startByLog: liveStartByLog,
-												excludeLogs: excludedNodes,
-												snapshot: false, // don't want to use a snapshot, and we want to see new entries
-											});
+											const ownLogSent = excludedNodes
+												? !excludedNodes.includes(getThisNodeName())
+												: logName === 'local';
+											if (ownLogAnchor !== undefined && !ownLogRange && ownLogSent) {
+												ownLogRange = openOwnLogRange(ownLogAnchor);
+												const ownId = getThisNodeId(auditStore);
+												const own = subscribedNodeIds[ownId];
+												// the range positions this log, so no entry of it is filtered by key
+												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
+											}
+											if (ownLogRange && !excludedNodes) auditLogIterable = ownLogRange;
+											else {
+												const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
+												liveStartByLog = new Map([
+													[logName, currentSequenceId || 1],
+													...[...(originFloors ?? [])].filter(([name]) => !relabeled?.has(name)),
+												]);
+												auditLogIterable = auditStore.getRange({
+													start: currentSequenceId || 1,
+													exclusiveStart: true,
+													exactStart: false,
+													log: excludedNodes ? undefined : logName,
+													startByLog: liveStartByLog,
+													// a copy: the range adds and removes logs in its own list
+													excludeLogs: ownLogRange ? [...excludedNodes, 'local'] : excludedNodes,
+													snapshot: false, // don't want to use a snapshot, and we want to see new entries
+												});
+											}
 										}
-										for (const auditRecord of auditLogIterable) {
+										const passRange =
+											ownLogRange && ownLogRange !== auditLogIterable
+												? chainRanges<AuditRecord>(ownLogRange, auditLogIterable)
+												: auditLogIterable;
+										for (const auditRecord of passRange) {
 											const key: number = auditRecord.txnLogKey;
 											if (closed || wsClosed) return;
 											logger.debug?.('sending audit record', key, auditRecord.recordId);
@@ -11406,6 +11484,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (key > auditSubscription.startTime) auditSubscription.startTime = key; // don't double send
 										}
 										if (closed || wsClosed) return;
+										const ownRange: any = ownLogRange;
+										if (
+											ownRange &&
+											(ownRange.exactStartFailures?.size > 0 ||
+												ownRange.failedLogs?.size > 0 ||
+												ownRange.corruptFrameStop?.breaks > 0)
+										) {
+											// A key-filtered read can skip a late lower-keyed entry of this log, so from here on this
+											// connection proves nothing: no marker, and no floor that could certify past such an entry.
+											logger.error?.(
+												connectionId,
+												`The append-order read of this node's log for ${remoteNodeName} failed; falling back to a timestamp resume with no confirmation markers or floors on this connection`,
+												databaseName
+											);
+											ownLogRangeFailed = true;
+											stopMarkers();
+											ownLogRange = undefined;
+											ownLogAnchor = undefined;
+											const ownId = getThisNodeId(auditStore);
+											const own = subscribedNodeIds[ownId];
+											if (typeof own === 'object')
+												subscribedNodeIds[ownId] = { ...own, startTime: ownSubscription.startTime };
+											boundaryLogName = undefined;
+											auditLogIterable = undefined;
+											continue;
+										}
 										// Backstop for the pre-COPY_START probe, which pulled a different iterable. Every failure signal
 										// counts, not just the boundary one: a local iterator that dies mid-pass leaves the reusable
 										// iterable exhausted while the follower's cursor keeps advancing. Drop the append-order range and
@@ -11554,7 +11658,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														`A transaction-log scan for ${remoteNodeName} reported a failure; origin floors are no longer certified on this connection until it reconnects`
 													);
 												floorEmissionLatchedRange = liveRange;
-											} else if (floorEmissionLatchedRange !== liveRange) certifyOriginFloors(capturedFloors);
+											} else if (floorEmissionLatchedRange !== liveRange && !ownLogRangeFailed)
+												certifyOriginFloors(capturedFloors);
 											capturedFloors = undefined;
 										}
 										let markersProven = false;
@@ -13740,6 +13845,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				let floorOnlyStart: number | undefined;
 				let floorOnlyGeneration: string | undefined;
 				let floorBoundedStart = false;
+				let ownLogResumeAfter: number | undefined;
 				if (copyCursor) requestIsCopy = true;
 				const allNodes: any[] = (sequenceEntry?.nodes ?? [])
 					.filter((state: any) => state && typeof state.id === 'number')
@@ -13902,6 +14008,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
 						floorBoundedStart = isValidFloor(ownState?.closedFloor);
 					}
+					// a revocation pending clears the floor this row holds, so only the peer's log order is proven
+					if (!floorBoundedStart && floorOnlyStart === undefined && !restrictedOrigins)
+						ownLogResumeAfter = ownLogResumeAnchor(
+							nodeId !== undefined && pendingRouteState.hasPendingRevocation(nodeId)
+								? { ...ownState, closedFloor: undefined }
+								: ownState
+						);
 				}
 				if (copyCursor) {
 					copyWasResumed = !copyCursor.restartFullCopy;
@@ -14126,6 +14239,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					refusesCopies: restrictedOrigins,
 					copyResume, // present only when resuming an interrupted bulk copy
 					...(floorOnlyStart !== undefined && startTime === floorOnlyStart && { floorGeneration: floorOnlyGeneration }),
+					// an older sender ignores it and filters its log by `startTime`
+					...(ownLogResumeAfter !== undefined &&
+						startTime > 1 &&
+						!copyResume &&
+						!shardingProjection && { resumeAfter: ownLogResumeAfter }),
 				};
 			});
 		if (
