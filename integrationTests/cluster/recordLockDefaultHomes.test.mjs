@@ -28,10 +28,7 @@ function lockedIncrementIn(node, id, signal) {
 	return call(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 }, signal);
 }
 
-/**
- * The first lock under a new generation: the change rebuilds the transport and schedules a restart recall, so
- * it may answer a retryable 503. Retries only that; any other answer fails at once.
- */
+/** A generation change rebuilds the transport and schedules a restart recall, so the first lock under it may answer 503. */
 function firstLock(node, path, data) {
 	let last;
 	return waitForCondition(
@@ -178,18 +175,28 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(body.outcome, 'activated', JSON.stringify(body));
 		assert.equal(body.generation, 2, 'above the default generation it inherited');
 		for (const node of nodes.slice(0, 2)) assert.equal((await recordLocksOf(node, FRESH)).homeMapSource, 'database');
-		// the default change in the next test then has to leave this lockable map lockable
-		const id = 'own-map-' + Date.now();
-		await sendOperation(nodes[0], {
-			operation: 'insert',
-			database: FRESH,
-			table: ITEM,
-			records: [{ id, n: 0 }],
-			authorization: nodes[0].admin,
-		});
-		await waitForItem(nodes, id, 0);
-		for (const node of nodes.slice(0, 2))
-			await firstLock(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
+		// until each member has served as a home, so the next test's one-shot lock meets a settled map
+		const members = nodes.slice(0, 2);
+		const servedAsHome = new Set();
+		for (let i = 0; servedAsHome.size < members.length; i++) {
+			assert.ok(i < 32, `only ${servedAsHome.size} of ${FRESH}'s members served as a home in 32 keys`);
+			const id = `own-map-${Date.now()}-${i}`;
+			await sendOperation(nodes[0], {
+				operation: 'insert',
+				database: FRESH,
+				table: ITEM,
+				records: [{ id, n: 0 }],
+				authorization: nodes[0].admin,
+			});
+			await waitForItem(nodes, id, 0);
+			const before = await Promise.all(members.map((node) => recordLocksOf(node, FRESH)));
+			for (const node of members)
+				await firstLock(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
+			const after = await Promise.all(members.map((node) => recordLocksOf(node, FRESH)));
+			members.forEach((node, index) => {
+				if ((after[index]?.granted ?? 0) > (before[index]?.granted ?? 0)) servedAsHome.add(node);
+			});
+		}
 	});
 
 	test('a default that names the third node lets it lock every inheriting database, and not one with its own map', async () => {
