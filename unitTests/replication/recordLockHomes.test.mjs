@@ -9,6 +9,7 @@
 import assert from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
+	DEFAULT_HOMES_KEY,
 	STAGE_DRAIN_BUDGET_MS,
 	canonicalizeHomes,
 	currentRow,
@@ -512,18 +513,17 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 });
 
 describe('withRow serializes on the row lock, not only on its per-isolate queue (harper-pro#852)', () => {
-	it('a transition waits for a node-scoped hold on its row taken outside withRow', async () => {
-		// The exclusion a stage/fence/activate needs is between HTTP WORKERS, so the old per-isolate
-		// promise queue could not supply it: two workers each read `active: g1`, and whichever wrote
-		// second discarded the other's transition while both reported success. `withRow` now takes core's
-		// node-scoped hold lock on the `hdb_record_lock_homes` row, which is process-wide.
-		//
-		// A holder that `withRow`'s own queue knows nothing about is what this asserts against, and it is
-		// the assertion an isolate-local queue cannot pass: with the queue alone the stage below runs
-		// straight through. That the lock ALSO excludes across threads is core's property, not this
-		// test's — one isolate cannot demonstrate it.
-		const database = 'row-lock-exclusion';
-		const held = await getRecordLockHomesTable().lock(database, {
+	// The exclusion a stage/fence/activate needs is between HTTP WORKERS, so the old per-isolate promise
+	// queue could not supply it: two workers each read `active: g1`, and whichever wrote second discarded
+	// the other's transition while both reported success. `withRow` takes core's node-scoped hold lock,
+	// which is process-wide: the database's own row once it has one, and the default row's while it has
+	// none (every writer that creates a database's row holds that one). A holder `withRow`'s own queue
+	// knows nothing about is what this asserts against; that the lock also excludes across threads is
+	// core's property, not this test's.
+	const database = 'row-lock-exclusion';
+
+	async function waitsFor(lockKey, generation) {
+		const held = await getRecordLockHomesTable().lock(lockKey, {
 			scope: 'node',
 			hold: true,
 			lease: 30_000,
@@ -532,7 +532,7 @@ describe('withRow serializes on the row lock, not only on its per-isolate queue 
 		let settled;
 		const stage = stageGeneration({
 			database,
-			generation: 1,
+			generation,
 			homes: ['a'],
 			quiesce: ['a'],
 			hdb_user: { username: 'op' },
@@ -541,16 +541,19 @@ describe('withRow serializes on the row lock, not only on its per-isolate queue 
 			(error) => ((settled = 'rejected'), Promise.reject(error))
 		);
 		// Never leave the row locked for the rest of the run: an unlock skipped by a failed assertion
-		// would wedge every later test that touches this database behind a 30s lease.
+		// would wedge every later test that touches this row behind a 30s lease.
 		try {
 			await delay(300);
-			assert.strictEqual(settled, undefined, `the stage did not wait for the row lock (${settled})`);
+			assert.strictEqual(settled, undefined, `the stage did not wait for the ${lockKey} row lock (${settled})`);
 		} finally {
 			await held.unlock();
 		}
 		const { staged } = await stage;
-		assert.strictEqual(staged.generation, 1, 'and it completes once the holder releases');
-	});
+		assert.strictEqual(staged.generation, generation, 'and it completes once the holder releases');
+	}
+
+	it("a database's first row waits for a hold on the default row", () => waitsFor(DEFAULT_HOMES_KEY, 1));
+	it('a database with a row waits for a hold on its own row', () => waitsFor(database, 2));
 });
 
 describe('a fenced stage records the fence with the stage (harper-pro#973)', () => {

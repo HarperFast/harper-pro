@@ -12,22 +12,29 @@ import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/h
 import * as logger from '../core/utility/logging/harper_logger.js';
 import type { QuiesceResult } from '../core/resources/recordLockCoordinator.ts';
 import {
+	DEFAULT_HOMES_KEY,
 	DELEGATION_DRAIN_MS,
+	MAX_EXPLICIT_DATABASES,
 	MIN_DRAIN_BACKSTOP_MS,
 	STAGE_DRAIN_BUDGET_MS,
 	activateGeneration,
 	canonicalizeHomes,
-	digestOf,
+	describeKey,
+	digestFor,
 	existingRow,
 	operatorPrincipal,
+	ownRowDatabases,
 	planStage,
 	provesQuiescence,
+	rowKeyOf,
 	stageGeneration,
+	validateExplicit,
 	validateGenerationInput,
 	type FenceEntry,
 	type RecordLockGenerationState,
 	type RecordLockHomesRow,
 	type StageFence,
+	knownNodeNames,
 } from './recordLockHomes.ts';
 import { principalNodeName, sendRecordLockOperation } from './recordLockRpc.ts';
 const { HTTP_STATUS_CODES } = hdbErrors;
@@ -40,8 +47,17 @@ export interface HopTimeouts {
 	hopMs: number;
 	/** A stage also runs the #856 drain on the peer. */
 	stageMs: number;
+	/**
+	 * A default stage or activate on the peer: the row-lock wait (30 s), owner listing (5 s), the
+	 * origin's own refresh (10 s), the relay to every other thread (21.5 s) and, for a stage, the drain.
+	 */
+	defaultMs?: number;
 }
-export const DEFAULT_HOP_TIMEOUTS: HopTimeouts = { hopMs: 15_000, stageMs: STAGE_DRAIN_BUDGET_MS + 15_000 };
+export const DEFAULT_HOP_TIMEOUTS: HopTimeouts = {
+	hopMs: 15_000,
+	stageMs: STAGE_DRAIN_BUDGET_MS + 15_000,
+	defaultMs: STAGE_DRAIN_BUDGET_MS + 80_000,
+};
 /** `quiesce` may name 256 nodes and each hop may open a socket. */
 export const HOP_CONCURRENCY = 16;
 
@@ -49,7 +65,8 @@ export type TransitionAction = 'survey' | 'stage' | 'activate';
 
 export interface TransitionOperation {
 	operation: typeof TRANSITION_OPERATION;
-	database: string;
+	database?: string;
+	default?: true;
 	action: TransitionAction;
 	generation?: number;
 	homes?: string[];
@@ -57,6 +74,8 @@ export interface TransitionOperation {
 	digest?: string;
 	fenced?: string[];
 	operator?: string;
+	/** Default only: databases some node reported a row of their own for. */
+	explicit?: string[];
 }
 
 export interface SurveyReply {
@@ -64,6 +83,10 @@ export interface SurveyReply {
 	active?: RecordLockGenerationState;
 	staged?: RecordLockGenerationState;
 	highestActedOn: number;
+	/** The database has no row of its own on this node; `active`/`staged` are the default's. */
+	inherited?: true;
+	/** Default only: the databases with a row of their own on this node. */
+	explicit?: string[];
 	/** This node records a stage's `fenced` list. An older node would accept the field and drop it. */
 	supportsFenced?: boolean;
 	fenced?: FenceEntry[];
@@ -71,6 +94,8 @@ export interface SurveyReply {
 export interface StageReply {
 	staged: RecordLockGenerationState;
 	quiesced: QuiesceResult | { error: string };
+	/** Default only: the databases with a row of their own on this node when it staged. */
+	explicit?: string[];
 }
 export interface ActivateReply {
 	active: RecordLockGenerationState;
@@ -80,6 +105,7 @@ export interface NodeSurvey {
 	active?: RecordLockGenerationState;
 	staged?: RecordLockGenerationState;
 	highestActedOn?: number;
+	inherited?: true;
 	error?: string;
 }
 
@@ -96,7 +122,8 @@ export interface NodeReport {
 }
 
 export interface ApplyReport {
-	database: string;
+	database?: string;
+	default?: true;
 	homes: string[];
 	quiesce: string[];
 	fenced?: string[];
@@ -159,7 +186,8 @@ export function planSurvey(
 	requestedGeneration: number | undefined,
 	replies: Map<string, SurveyReply | { error: string }>,
 	observer?: { node: string; reply: SurveyReply | { error: string } },
-	fenced: string[] = []
+	fenced: string[] = [],
+	explicit?: string[]
 ): SurveyPlan {
 	const unreachable: string[] = [];
 	const misnamed: string[] = [];
@@ -234,12 +262,21 @@ export function planSurvey(
 	for (const reply of rows.values()) floor = Math.max(floor, floorOf(reply));
 	// Resume an interrupted transition to this exact set rather than opening a new generation past it.
 	let resumable = false;
-	for (const reply of rows.values())
+	for (const reply of rows.values()) {
+		if (reply.inherited) continue;
 		for (const state of [reply.active, reply.staged])
 			if (state?.generation === floor && sameSet(state.homes, homes)) resumable = true;
-	const resumeTarget = resumable ? floor : floor + 1;
+	}
+	// A node holding the floor with neither ring (a default activation's marker), or through the default
+	// it inherits, cannot take that generation again, so resuming there would refuse every retry.
+	const bareFloor = [...rows.values()].some(
+		(reply) =>
+			floorOf(reply) === floor &&
+			(reply.inherited || (reply.active?.generation !== floor && reply.staged?.generation !== floor))
+	);
+	const resumeTarget = resumable && !bareFloor ? floor : floor + 1;
 	const generation = requestedGeneration ?? resumeTarget;
-	const digest = digestOf(generation, homes);
+	const digest = digestFor(database, generation, homes);
 	// Anchor: an `active` ring holding the fenced node that a strict majority of its members report, or a
 	// fence an earlier call of this transition recorded at its target. Why a majority, not one
 	// survivor: RECORD_LOCK_HOMES_DESIGN.md "Fenced nodes".
@@ -275,9 +312,9 @@ export function planSurvey(
 		return {
 			action: 'refuse',
 			status: 409,
-			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; ${manualRecovery(database, homes, quiesce, fenced, rows, [generation, resumeTarget], floor)}`,
+			reason: `no active ring holding ${unanchored.join(', ')} is reported by a majority of its members, so nothing is sure to refuse its old map if it came back; ${manualRecovery(database, homes, quiesce, fenced, rows, [generation, resumeTarget], floor, observer)}`,
 		};
-	const stages = planStages(database, homes, quiesce, rows, generation, digest);
+	const stages = planStages(database, homes, quiesce, rows, generation, digest, explicit);
 	if ('rejected' in stages)
 		return { action: 'refuse', status: 409, reason: `${stages.rejected} would refuse to stage: ${stages.reason}` };
 	return { action: 'proceed', generation, digest, ...stages };
@@ -291,7 +328,8 @@ function planStages(
 	quiesce: string[],
 	rows: Map<string, SurveyReply>,
 	generation: number,
-	digest: string
+	digest: string,
+	explicit?: string[]
 ): StagePlans {
 	const alreadyActive = new Set<string>();
 	const alreadyStaged = new Set<string>();
@@ -307,9 +345,18 @@ function planStages(
 			highestActedOn: reply.highestActedOn ?? 0,
 			fenced: [],
 		};
-		const plan = planStage(row, database, generation, homes, digest, Date.now(), quiesce);
+		if (reply.inherited) row.inherited = true;
+		const plan = planStage(row, database, generation, homes, digest, Date.now(), quiesce, explicit, node);
 		if (plan.action === 'reject') return { rejected: node, reason: plan.reason };
-		if (plan.action === 'noop') alreadyStaged.add(node);
+		// A re-stage that only widens what the staged generation records keeps `stagedAt`: the node stopped
+		// granting when it did, so an attested interval still covers it.
+		if (
+			plan.action === 'noop' ||
+			(reply.staged?.generation === generation &&
+				reply.staged.digest === digest &&
+				plan.row.staged?.stagedAt === reply.staged.stagedAt)
+		)
+			alreadyStaged.add(node);
 	}
 	return { alreadyActive, alreadyStaged };
 }
@@ -326,13 +373,36 @@ function manualRecovery(
 	fenced: string[],
 	rows: Map<string, SurveyReply>,
 	preferred: number[],
-	floor: number
+	floor: number,
+	observer?: { node: string; reply: SurveyReply | { error: string } }
 ): string {
+	const target: Record<string, unknown> = database === DEFAULT_HOMES_KEY ? { default: true } : { database };
+	const explicit = canonicalizeHomes(
+		[...rows.values(), observer?.reply].flatMap((reply) =>
+			reply && !('error' in reply) ? [...(reply.explicit ?? []), ...(reply.staged?.explicit ?? [])] : []
+		)
+	);
+	const isDefault = database === DEFAULT_HOMES_KEY;
 	for (const generation of new Set([...preferred, floor + 1])) {
 		if (!Number.isSafeInteger(generation)) continue;
-		const stages = planStages(database, homes, quiesce, rows, generation, digestOf(generation, homes));
+		const stages = planStages(
+			database,
+			homes,
+			quiesce,
+			rows,
+			generation,
+			digestFor(database, generation, homes),
+			isDefault ? explicit : undefined
+		);
 		if ('rejected' in stages) continue;
-		const activate = JSON.stringify({ operation: 'record_lock_activate_generation', database, generation, homes });
+		if (isDefault && unmarkedOn(stages.alreadyActive, explicit, (node) => rows.get(node)).length > 0) continue;
+		const activate = JSON.stringify({
+			operation: 'record_lock_activate_generation',
+			...target,
+			generation,
+			homes,
+			...(isDefault ? { explicit } : {}),
+		});
 		const departing = canonicalizeHomes([...rows.keys()].filter((node) => !homes.includes(node)));
 		if (
 			homes.every((node) => stages.alreadyActive.has(node)) &&
@@ -340,10 +410,72 @@ function manualRecovery(
 		)
 			return `the per-node recovery has already run: generation ${generation} is active on ${JSON.stringify(homes)}${departing.length > 0 ? ` and staged on ${JSON.stringify(departing)}` : ''}. Send ${activate} to each of ${JSON.stringify(homes)} once more: on an active node it only re-notifies the threads, so one that missed the activation picks it up`;
 		const stageOn = canonicalizeHomes([...rows.keys()].filter((node) => !stages.alreadyActive.has(node)));
-		const stage = JSON.stringify({ operation: 'record_lock_stage_generation', database, generation, homes, quiesce });
+		const stage = JSON.stringify({
+			operation: 'record_lock_stage_generation',
+			...target,
+			generation,
+			homes,
+			quiesce,
+			...(isDefault ? { explicit } : {}),
+		});
 		return `apply without fenced once it is reachable, or, if ${JSON.stringify(fenced)} will never run again from their current data, re-home without them by hand: send ${stage} to each of ${JSON.stringify(stageOn)}; after the last of those succeeds, wait ${DELEGATION_DRAIN_MS} ms, then send ${activate} to each of ${JSON.stringify(homes)}. Never activate after a failed stage; if interrupted, re-send this call for steps that match the current state`;
 	}
 	return `apply without fenced once it is reachable; no generation above ${floor} is left to re-home them by hand`;
+}
+
+/** The planner spreads every list in a reply, so a peer's malformed one must fail its own hop. */
+function isSurveyReply(reply: any): boolean {
+	const isState = (state: any) =>
+		state === undefined ||
+		(typeof state === 'object' &&
+			state !== null &&
+			Number.isSafeInteger(state.generation) &&
+			typeof state.digest === 'string' &&
+			Array.isArray(state.homes) &&
+			isNameList(state.homes) &&
+			isNameList(state.quiesce) &&
+			isNameList(state.explicit));
+	return (
+		typeof reply === 'object' &&
+		reply !== null &&
+		isState(reply.active) &&
+		isState(reply.staged) &&
+		(reply.highestActedOn === undefined || Number.isSafeInteger(reply.highestActedOn)) &&
+		(reply.fenced === undefined ||
+			(Array.isArray(reply.fenced) &&
+				reply.fenced.every(
+					(entry: any) =>
+						typeof entry === 'object' &&
+						entry !== null &&
+						typeof entry.node === 'string' &&
+						(entry.fencedWith === undefined || (Array.isArray(entry.fencedWith) && isNameList(entry.fencedWith)))
+				))) &&
+		isNameList(reply.explicit)
+	);
+}
+
+function isNameList(value: unknown): boolean {
+	return (
+		value === undefined ||
+		(Array.isArray(value) &&
+			value.length <= MAX_EXPLICIT_DATABASES &&
+			value.every((name) => typeof name === 'string' && name.length > 0))
+	);
+}
+
+/** The nodes whose survey lacks a mark for some name in `explicit`; an active default is never re-marked. */
+function unmarkedOn(
+	nodes: Iterable<string>,
+	explicit: Iterable<string>,
+	replyOf: (node: string) => SurveyReply | { error: string } | undefined
+): string[] {
+	const required = [...explicit];
+	return [...nodes].filter((node) => {
+		const reply = replyOf(node);
+		if (!reply || 'error' in reply) return false;
+		const marks = new Set(reply.explicit);
+		return required.some((name) => !marks.has(name));
+	});
 }
 
 export type ActivationPlan =
@@ -378,12 +510,15 @@ export function planActivation(nodes: Record<string, NodeReport>, drained: boole
 
 export interface TransitionPeers {
 	self(): string | undefined;
+	/** Every other node this node's `hdb_nodes` names; a default apply must survey each of them. */
+	known?(): string[];
 	/** Runs `operation` on `node`, locally for this node, and must settle within `timeoutMs`. */
 	send(node: string, operation: TransitionOperation, timeoutMs: number): Promise<any>;
 }
 
 const applySchema = Joi.object({
-	database: Joi.string().required(),
+	database: Joi.string(),
+	default: Joi.boolean(),
 	homes: Joi.array().required(),
 	quiesce: Joi.array().optional(),
 	generation: Joi.number().optional(),
@@ -410,7 +545,7 @@ async function forEachNode(nodes: string[], task: (node: string) => Promise<void
 	await Promise.all(lanes);
 }
 
-/** One apply at a time per database on this worker; the per-node planners keep a concurrent apply elsewhere safe. */
+/** One apply at a time per row key on this worker; the per-node planners keep a concurrent apply elsewhere safe. */
 const applyQueues = new Map<string, Promise<unknown>>();
 
 const FAIL_BEFORE_ACTIVATE = process.env.HARPER_TEST_RECORD_LOCK_APPLY_FAIL_BEFORE_ACTIVATE === '1';
@@ -424,7 +559,7 @@ export async function applyHomes(
 	const validation = validateBySchema(request, applySchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
-	const { database } = request;
+	const database = rowKeyOf(request);
 	validateGenerationInput(request.generation ?? 1, request.homes);
 	if (request.drained === true && request.generation === undefined)
 		throw new ClientError(
@@ -482,23 +617,42 @@ async function runApply(
 ): Promise<ApplyReport> {
 	const fenced = fence?.nodes ?? [];
 	const live = quiesce.filter((node) => !fenced.includes(node));
-	const report: ApplyReport = { database, homes, quiesce, outcome: 'refused', nodes: {} };
+	const isDefault = database === DEFAULT_HOMES_KEY;
+	const target: { database?: string; default?: true } = isDefault ? { default: true } : { database };
+	const report: ApplyReport = { ...target, homes, quiesce, outcome: 'refused', nodes: {} };
 	if (fence) report.fenced = fenced;
 	for (const node of quiesce)
 		report.nodes[node] = { role: fenced.includes(node) ? 'fenced' : homes.includes(node) ? 'home' : 'departing' };
+	if (isDefault) {
+		// A node left out could hold, or take after its survey, a map of its own for a database the default's
+		// homes would then inherit. A fenced node's own rows are mirrored on the live members of every ring
+		// it took them under, and the survey anchors the fence.
+		const self = peers.self();
+		const unlisted = [...(peers.known?.() ?? []), ...(self ? [self] : [])].filter((node) => !quiesce.includes(node));
+		if (unlisted.length > 0) {
+			report.reason = `a default home map covers every database, so every node this one knows, and this node, must be in quiesce: add ${[...new Set(unlisted)].join(', ')}`;
+			throw new ApplyRefusedError(report, 409);
+		}
+	}
+	const stageMs = isDefault ? (timeouts.defaultMs ?? timeouts.stageMs) : timeouts.stageMs;
 	const hop = (node: string, operation: TransitionOperation, ms: number) =>
 		withHopDeadline(peers.send(node, operation, ms), ms, `${node} ${operation.action}`);
 	const survey = async (node: string): Promise<SurveyReply | { error: string }> => {
 		try {
-			return await hop(node, { operation: TRANSITION_OPERATION, database, action: 'survey' }, timeouts.hopMs);
+			const reply = await hop(node, { operation: TRANSITION_OPERATION, ...target, action: 'survey' }, timeouts.hopMs);
+			return isSurveyReply(reply)
+				? reply
+				: { error: `malformed survey reply: ${JSON.stringify(reply)?.slice(0, 200)}` };
 		} catch (error) {
 			return { error: hopError(error) };
 		}
 	};
-	const surveyed = (reply: SurveyReply | { error: string }): NodeSurvey =>
-		'error' in reply
-			? { error: reply.error }
-			: { active: reply.active, staged: reply.staged, highestActedOn: reply.highestActedOn };
+	const surveyed = (reply: SurveyReply | { error: string }): NodeSurvey => {
+		if ('error' in reply) return { error: reply.error };
+		const survey: NodeSurvey = { active: reply.active, staged: reply.staged, highestActedOn: reply.highestActedOn };
+		if (reply.inherited) survey.inherited = true;
+		return survey;
+	};
 
 	const replies = new Map<string, SurveyReply | { error: string }>();
 	await forEachNode(live, async (node) => {
@@ -512,10 +666,41 @@ async function runApply(
 		observer = { node: self, reply: await survey(self) };
 		report.initiator = { node: self, survey: surveyed(observer.reply) };
 	}
-	const plan = planSurvey(database, homes, quiesce, request.generation, replies, observer, fenced);
-	if (plan.action === 'refuse') {
-		report.reason = plan.reason;
-		throw new ApplyRefusedError(report, plan.status);
+	// Includes names earlier calls staged, since each must be marked on every node the default activates on.
+	const explicit = new Set<string>();
+	const tooManyExplicit = () =>
+		`${explicit.size} databases have home maps of their own, more than the ${MAX_EXPLICIT_DATABASES} a default transition carries`;
+	if (isDefault)
+		for (const reply of [...replies.values(), observer?.reply])
+			if (reply && !('error' in reply))
+				for (const name of [...(reply.explicit ?? []), ...(reply.staged?.explicit ?? [])]) explicit.add(name);
+	const refuse = (reason: string, status: number): never => {
+		report.reason = reason;
+		throw new ApplyRefusedError(report, status);
+	};
+	if (explicit.size > MAX_EXPLICIT_DATABASES) return refuse(tooManyExplicit(), 409);
+	const planFor = (generation: number | undefined) =>
+		planSurvey(database, homes, quiesce, generation, replies, observer, fenced, isDefault ? [...explicit] : undefined);
+	const unmarked = (nodes: Iterable<string>) => unmarkedOn(nodes, explicit, (node) => replies.get(node));
+	let plan = planFor(request.generation);
+	if (plan.action === 'refuse')
+		return refuse(
+			isDefault && plan.status === 503
+				? `${plan.reason}; a node that predates the default home map refuses a default: true transition`
+				: plan.reason,
+			plan.status
+		);
+	// A home already active at the target promoted without some of these marks, and an active default is
+	// never re-marked, so finishing this generation would leave the homes split: open the next one.
+	const diverged = unmarked(plan.alreadyActive);
+	if (diverged.length > 0) {
+		if (request.generation !== undefined)
+			return refuse(
+				`${diverged.join(', ')} activated generation ${plan.generation} before every database with a map of its own was marked there; re-run with generation ${plan.generation + 1}`,
+				409
+			);
+		plan = planFor(plan.generation + 1);
+		if (plan.action === 'refuse') return refuse(plan.reason, plan.status);
 	}
 	const { generation, digest } = plan;
 	report.generation = generation;
@@ -524,13 +709,14 @@ async function runApply(
 	let failed = false;
 	const stage: TransitionOperation = {
 		operation: TRANSITION_OPERATION,
-		database,
+		...target,
 		action: 'stage',
 		generation,
 		homes,
 		quiesce,
 		digest,
 	};
+	if (isDefault) stage.explicit = validateExplicit([...explicit]);
 	if (fence) Object.assign(stage, { fenced, operator: fence.operator });
 	await forEachNode(live, async (node) => {
 		const entry = report.nodes[node];
@@ -539,13 +725,21 @@ async function runApply(
 			return;
 		}
 		try {
-			const reply: StageReply = await hop(node, stage, timeouts.stageMs);
+			const reply: StageReply = await hop(node, stage, stageMs);
+			if (
+				reply?.staged?.generation !== generation ||
+				reply.staged.digest !== digest ||
+				!isNameList(reply.explicit) ||
+				!isNameList(reply.staged.explicit)
+			)
+				throw new Error(`malformed stage reply: ${JSON.stringify(reply)?.slice(0, 200)}`);
 			entry.stage = {
 				action: plan.alreadyStaged.has(node) ? 'noop' : 'staged',
 				quiesced: reply.quiesced,
 				proven: provesQuiescence(reply.quiesced, fenced),
 			};
 			entry.survey = { ...entry.survey, staged: reply.staged };
+			for (const name of [...(reply.explicit ?? []), ...(reply.staged?.explicit ?? [])]) explicit.add(name);
 		} catch (error) {
 			failed = true;
 			entry.stage = { action: 'failed', error: hopError(error) };
@@ -555,6 +749,15 @@ async function runApply(
 		report.outcome = 'incomplete';
 		report.reason = 'staging did not complete on every node; nothing was activated. Re-run this call';
 		throw new ApplyRefusedError(report, 503);
+	}
+	const lateUnmarked = unmarked(plan.alreadyActive);
+	if (explicit.size > MAX_EXPLICIT_DATABASES || lateUnmarked.length > 0) {
+		report.outcome = 'incomplete';
+		report.reason =
+			explicit.size > MAX_EXPLICIT_DATABASES
+				? `${tooManyExplicit()}; nothing was activated`
+				: `a database took a map of its own on a node while this call staged, after ${lateUnmarked.join(', ')} activated; nothing was activated. Re-run this call`;
+		throw new ApplyRefusedError(report, 409);
 	}
 	if (FAIL_BEFORE_ACTIVATE) {
 		report.outcome = 'incomplete';
@@ -570,7 +773,7 @@ async function runApply(
 	}
 	if (activation.attested.length > 0)
 		logger.warn?.(
-			`Record lock home map for ${database}: activating generation ${generation} on the operator's attestation that the drain interval elapsed; ${activation.attested.join(', ')} could not prove quiescence`
+			`Record lock home map for ${describeKey(database)}: activating generation ${generation} on the operator's attestation that the drain interval elapsed; ${activation.attested.join(', ')} could not prove quiescence`
 		);
 	// `planActivate` refuses an activate within MIN_DRAIN_BACKSTOP_MS of that node's own stage.
 	if (Object.values(report.nodes).some((entry) => entry.stage?.action === 'staged')) await delay(MIN_DRAIN_BACKSTOP_MS);
@@ -581,11 +784,19 @@ async function runApply(
 			return;
 		}
 		try {
-			await hop(
-				node,
-				{ operation: TRANSITION_OPERATION, database, action: 'activate', generation, homes, digest },
-				timeouts.hopMs
-			);
+			const activate: TransitionOperation = {
+				operation: TRANSITION_OPERATION,
+				...target,
+				action: 'activate',
+				generation,
+				homes,
+				digest,
+			};
+			if (isDefault) activate.explicit = [...explicit].sort();
+			// A default activation also writes markers and refreshes every database on every thread.
+			const reply = await hop(node, activate, isDefault ? stageMs : timeouts.hopMs);
+			if (reply?.active?.generation !== generation || reply.active.digest !== digest)
+				throw new Error(`malformed activate reply: ${JSON.stringify(reply)?.slice(0, 200)}`);
 			entry.activate = { action: entry.stage?.action === 'already-active' ? 'noop' : 'activated' };
 		} catch (error) {
 			failed = true;
@@ -599,13 +810,14 @@ async function runApply(
 	}
 	report.outcome = 'activated';
 	logger.info?.(
-		`Record lock home map for ${database}: applied generation ${generation} on ${homes.join(', ')}${fence ? `, ${fenced.join(', ')} fenced by ${fence.operator}` : ''}`
+		`Record lock home map for ${describeKey(database)}: applied generation ${generation} on ${homes.join(', ')}${fence ? `, ${fenced.join(', ')} fenced by ${fence.operator}` : ''}`
 	);
 	return report;
 }
 
 const transitionSchema = Joi.object({
-	database: Joi.string().required(),
+	database: Joi.string(),
+	default: Joi.boolean(),
 	action: Joi.string().valid('survey', 'stage', 'activate').required(),
 	generation: Joi.number().optional(),
 	homes: Joi.array().optional(),
@@ -613,6 +825,7 @@ const transitionSchema = Joi.object({
 	digest: Joi.string().optional(),
 	fenced: Joi.array().optional(),
 	operator: Joi.string().max(MAX_OPERATOR_LENGTH).optional(),
+	explicit: Joi.array().optional(),
 });
 
 /**
@@ -627,12 +840,15 @@ export async function executeTransitionLocally(
 	const validation = validateBySchema(request, transitionSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
-	const { database, action } = request;
+	const key = rowKeyOf(request);
+	const target: { database?: string; default?: true } =
+		key === DEFAULT_HOMES_KEY ? { default: true } : { database: key };
+	const { action } = request;
 	const self = getThisNodeName();
 	if (!self) throw new ClientError('this node has no resolved node name', 503);
 	if (action === 'survey') {
-		const row = await existingRow(database);
-		return {
+		const row = await existingRow(key);
+		const reply: SurveyReply = {
 			node: self,
 			active: row?.active,
 			staged: row?.staged,
@@ -640,10 +856,13 @@ export async function executeTransitionLocally(
 			supportsFenced: true,
 			fenced: row?.fenced,
 		};
+		if (row?.inherited) reply.inherited = true;
+		if (key === DEFAULT_HOMES_KEY) reply.explicit = ownRowDatabases();
+		return reply;
 	}
 	validateGenerationInput(request.generation, request.homes);
 	const homes = canonicalizeHomes(request.homes);
-	const digest = digestOf(request.generation, homes);
+	const digest = digestFor(key, request.generation, homes);
 	if (request.digest !== digest)
 		throw new ClientError(
 			`the relayed digest does not match generation ${request.generation} over ${homes.join(', ')}`,
@@ -661,10 +880,13 @@ export async function executeTransitionLocally(
 			const operator = relayedBy && relayedBy !== self ? `${request.operator} via ${relayedBy}` : request.operator;
 			fence = { nodes, operator };
 		}
-		return stageGeneration({ database, generation: request.generation, homes, quiesce }, fence);
+		return stageGeneration(
+			{ ...target, generation: request.generation, homes, quiesce, explicit: request.explicit },
+			fence
+		);
 	}
 	if (!homes.includes(self)) throw new ClientError(`${self} is not a member of generation ${request.generation}`, 409);
-	return activateGeneration({ database, generation: request.generation, homes });
+	return activateGeneration({ ...target, generation: request.generation, homes, explicit: request.explicit });
 }
 
 export async function executeTransition(request: any) {
@@ -675,9 +897,10 @@ export async function executeTransition(request: any) {
 
 const productionPeers: TransitionPeers = {
 	self: getThisNodeName,
+	known: knownNodeNames,
 	send(node, operation, timeoutMs) {
 		if (node === getThisNodeName()) return executeTransitionLocally(operation);
-		return sendRecordLockOperation(node, operation.database, operation, timeoutMs);
+		return sendRecordLockOperation(node, operation.database ?? DEFAULT_HOMES_KEY, operation, timeoutMs);
 	},
 };
 
