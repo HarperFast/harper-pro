@@ -6,22 +6,13 @@
  * TTL-eviction races, partial transfers, or the #1287 multi-worker evict() path.
  * A fresh receiver then joins with isLeader:true, triggering a full copy from scratch.
  *
- * The regression being guarded (harper#1337):
- *   Before #405 (sender) + #429 (receiver), when the full-copy stream hit a record
- *   whose source blob file was missing, the copy cursor was permanently pinned
- *   (hasBlobGap=true held cursor at lastDurableSequenceId=0): the receiver applied only the
- *   records before the first orphan, sat at lastReceivedStatus "Receiving", and never
- *   reached COPY_COMPLETE.
- *
- * Expected outcome on fixed code:
- *   The sender reports the missing file as a permanent (404) error frame, the receiver
- *   advances past each orphan and counts it in blobReplicationFailures, and the copy
- *   completes: every record arrives and the receiver goes back to "Waiting". The orphaned
- *   blobs stay diverged until repair_blob_data backfills them.
+ * Expected: the sender reports each missing file as a permanent (404) error frame, the receiver
+ * advances past each orphan and counts it in blobReplicationFailures, and the copy completes:
+ * every record and every non-orphaned blob arrives, and the receiver goes back to "Waiting". The
+ * orphaned blobs stay diverged until repair_blob_data backfills them.
  */
 
 import { suite, test, before, after } from 'node:test';
-import { ok } from 'node:assert/strict';
 import { existsSync, readdirSync, rmSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
@@ -66,7 +57,16 @@ function blobFilesInIdOrder(dataRootDir, db = 'data') {
 }
 
 function databaseSockets(status) {
-	return (status.connections ?? []).flatMap((c) => c.database_sockets ?? []);
+	return (status?.connections ?? []).flatMap((c) => c.database_sockets ?? []);
+}
+
+// A probe error (a restarting worker, a non-200 answer) means "not yet"; waitForCondition's deadline decides.
+function orUndefined(promise) {
+	return promise.catch(() => undefined);
+}
+
+function describeBlobAsset(node, signal) {
+	return sendOperation(node, { operation: 'describe_table', database: 'data', table: 'BlobAsset' }, { signal });
 }
 
 const sharedConfig = (host) => ({
@@ -101,40 +101,38 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429 regression)', { time
 				sendOperation(node, { operation: 'deploy_component', project: 'blob-orphan-copy', payload, restart: true })
 			)
 		);
-		await waitForCondition(
-			async () =>
-				(await postOperation(ctx.nodeB, { operation: 'describe_table', database: 'data', table: 'BlobAsset' }))
-					.status === 200,
-			{ timeoutMs: 60_000, description: 'the BlobAsset table on B' }
-		);
+		await waitForCondition(async (signal) => await orUndefined(describeBlobAsset(ctx.nodeB, signal)), {
+			timeoutMs: 60_000,
+			description: 'the BlobAsset table on B',
+		});
 
 		// Seed sequentially so blob file ids follow record ids and the deleted block is contiguous in both.
 		// A seed can land on a worker that has not restarted onto the component yet; retry until it serves it.
 		for (let i = 0; i < RECORD_COUNT; i++) {
-			await waitForCondition(async () => (await fetchWithRetry(ctx.nodeA.httpURL + '/SeedBlobAsset/' + i)).ok, {
-				timeoutMs: 60_000,
-				description: `seeding record ${i}`,
-			});
+			await waitForCondition(
+				async (signal) =>
+					(await orUndefined(fetchWithRetry(ctx.nodeA.httpURL + '/SeedBlobAsset/' + i, { signal })))?.ok,
+				{ timeoutMs: 60_000, description: `seeding record ${i}` }
+			);
 		}
 
-		ctx.aRecordCount = await waitForCondition(
-			async () => {
-				const aDesc = await sendOperation(ctx.nodeA, {
-					operation: 'describe_table',
-					database: 'data',
-					table: 'BlobAsset',
-				});
-				return aDesc.record_count >= RECORD_COUNT && aDesc.record_count;
+		let aRecordCount;
+		await waitForCondition(
+			async (signal) => {
+				aRecordCount = (await orUndefined(describeBlobAsset(ctx.nodeA, signal)))?.record_count;
+				return aRecordCount === RECORD_COUNT;
 			},
-			{ timeoutMs: 30_000, description: `A to hold ${RECORD_COUNT} records` }
+			{ timeoutMs: 30_000, description: () => `A to hold ${RECORD_COUNT} records (has ${aRecordCount})` }
 		);
 
-		const blobFiles = await waitForCondition(
+		// Exactly one file per record, or the deleted block would not be the records it is meant to be.
+		let blobFiles = [];
+		await waitForCondition(
 			() => {
-				const files = blobFilesInIdOrder(ctx.nodeA.dataRootDir, 'data');
-				return files.length >= RECORD_COUNT && files;
+				blobFiles = blobFilesInIdOrder(ctx.nodeA.dataRootDir, 'data');
+				return blobFiles.length === RECORD_COUNT;
 			},
-			{ timeoutMs: 30_000, description: `A to hold ${RECORD_COUNT} blob files` }
+			{ timeoutMs: 30_000, description: () => `A to hold ${RECORD_COUNT} blob files (has ${blobFiles.length})` }
 		);
 		for (const p of blobFiles.slice(ORPHAN_START, ORPHAN_START + ORPHAN_COUNT)) {
 			rmSync(p, { force: true });
@@ -152,17 +150,21 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429 regression)', { time
 		const { nodeA, nodeB } = ctx;
 
 		// B joins A as subscriber with isLeader:true → triggers full copy. A's replication listener can
-		// still be starting, so retry through ECONNREFUSED.
+		// still be starting.
 		let addNode;
 		await waitForCondition(
-			async () => {
-				addNode = await postOperation(nodeB, {
-					operation: 'add_node',
-					hostname: nodeA.hostname,
-					rejectUnauthorized: false,
-					isLeader: true,
-					authorization: nodeA.admin,
-				});
+			async (signal) => {
+				addNode = await postOperation(
+					nodeB,
+					{
+						operation: 'add_node',
+						hostname: nodeA.hostname,
+						rejectUnauthorized: false,
+						isLeader: true,
+						authorization: nodeA.admin,
+					},
+					{ signal }
+				);
 				if (addNode.status === 200) return true;
 				if (!/ECONNREFUSED/.test(addNode.body?.error))
 					throw new Error(`add_node failed: ${JSON.stringify(addNode.body)}`);
@@ -172,27 +174,21 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429 regression)', { time
 
 		let bCount = 0;
 		await waitForCondition(
-			async () => {
-				const bDesc = await sendOperation(nodeB, {
-					operation: 'describe_table',
-					database: 'data',
-					table: 'BlobAsset',
-				}).catch(() => null);
-				bCount = bDesc?.record_count ?? bCount;
-				return bCount >= ctx.aRecordCount;
+			async (signal) => {
+				bCount = (await orUndefined(describeBlobAsset(nodeB, signal)))?.record_count ?? bCount;
+				return bCount >= RECORD_COUNT;
 			},
 			{
 				timeoutMs: 120_000,
 				pollMs: 1000,
-				description: () =>
-					`B to receive all ${ctx.aRecordCount} records (has ${bCount}); the copy cursor is pinned by the ${ORPHAN_COUNT} orphaned blob files`,
+				description: () => `B to receive all ${RECORD_COUNT} records (has ${bCount})`,
 			}
 		);
 
 		let sockets = [];
 		await waitForCondition(
-			async () => {
-				sockets = databaseSockets(await sendOperation(nodeB, { operation: 'cluster_status' }));
+			async (signal) => {
+				sockets = databaseSockets(await orUndefined(sendOperation(nodeB, { operation: 'cluster_status' }, { signal })));
 				return (
 					sockets.length > 0 &&
 					sockets.every((s) => s.lastReceivedStatus === 'Waiting' && (s.blobReplicationFailures ?? 0) >= ORPHAN_COUNT)
@@ -206,12 +202,36 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429 regression)', { time
 			}
 		);
 
-		const bLog = await readLog(nodeB);
-		ok(/bulk copy complete/.test(bLog), 'B never logged COPY_COMPLETE for the full copy');
-		const advancedPast = (bLog.match(/advancing the resume cursor past it/g) ?? []).length;
-		ok(
-			advancedPast >= ORPHAN_COUNT,
-			`B should advance past each of the ${ORPHAN_COUNT} orphans as a permanent source failure, advanced past ${advancedPast}`
+		// The blobs on either side of the gap must still arrive, not fail along with the orphans.
+		let bBlobFiles = [];
+		await waitForCondition(
+			() => {
+				bBlobFiles = blobFilesInIdOrder(nodeB.dataRootDir, 'data');
+				return bBlobFiles.length === RECORD_COUNT - ORPHAN_COUNT;
+			},
+			{
+				timeoutMs: 30_000,
+				description: () =>
+					`B to hold the ${RECORD_COUNT - ORPHAN_COUNT} non-orphaned blob files (has ${bBlobFiles.length})`,
+			}
+		);
+
+		// Records and Waiting are reached even while the cursor is held; only the advance lines prove the
+		// orphans were classified as permanent.
+		let copyCompleted = false;
+		let advancedPast = 0;
+		await waitForCondition(
+			async () => {
+				const bLog = await readLog(nodeB);
+				copyCompleted = /bulk copy complete/.test(bLog);
+				advancedPast = (bLog.match(/advancing the resume cursor past it/g) ?? []).length;
+				return copyCompleted && advancedPast >= ORPHAN_COUNT;
+			},
+			{
+				timeoutMs: 10_000,
+				description: () =>
+					`B to log COPY_COMPLETE (${copyCompleted}) and advance past each of the ${ORPHAN_COUNT} orphans as a permanent source failure (advanced past ${advancedPast})`,
+			}
 		);
 	});
 });
