@@ -492,7 +492,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 		}
 	);
 
-	// harper-pro#1449: a copy into a release without copy-applied tombstones must still remove a row it holds
+	// harper-pro#1449
 	suite(
 		`a ${previousVersion} node rejoining by base copy drops a row deleted while it was away`,
 		{ timeout: 600_000 },
@@ -562,12 +562,17 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 					},
 					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
 				);
-				// a live write that arrives proves the joining copy completed, so the next copy starts afresh
 				await write(source, { operation: 'insert', records: [{ id: 'live', category: 'live' }] });
-				await until(
-					async (signal) => (await ids(returning, signal)).includes('live'),
-					'the live write on the returning node'
+				await until(async (signal) => {
+					const held = await ids(returning, signal);
+					return ['kept', 'gone', 'live'].every((id) => held.includes(id));
+				}, 'the returning node to hold every row before it stops');
+				const info = await sendOperation(
+					returning.harper,
+					{ operation: 'registration_info' },
+					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
 				);
+				equal(info.version, previousVersion, `the returning node should be running ${previousVersion}`);
 
 				await killHarper(returning, { graceMs: SHUTDOWN_GRACE_MS });
 				await write(source, { operation: 'delete', ids: ['gone'] });
