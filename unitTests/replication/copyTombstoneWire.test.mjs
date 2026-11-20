@@ -153,12 +153,12 @@ describe('delete tombstones in a base copy', function () {
 		}
 	}
 
-	async function copiedRecords(unlearned = false, declared = {}, subscriptions = []) {
+	async function copiedRecords(unlearned = false, subscriptions = []) {
 		socket.emit(
 			'message',
 			encode([
 				SUBSCRIPTION_REQUEST,
-				[{ name: PEER, startTime: 0, tables: [], replicateByDefault: true, ...declared }, ...subscriptions],
+				[{ name: PEER, startTime: 0, tables: [], replicateByDefault: true }, ...subscriptions],
 				[],
 			])
 		);
@@ -256,7 +256,7 @@ describe('delete tombstones in a base copy', function () {
 		for (const window of windows) {
 			await connect(buildLocalCapabilities(90_000, false, true));
 			// the peer's start of 0 still makes it a copy
-			const records = await copiedRecords(false, {}, [
+			const records = await copiedRecords(false, [
 				{ name: getThisNodeName(), tables: [], replicateByDefault: true, ...window },
 			]);
 			assert.equal(records.get('published-over-delete'), undefined, 'premise: the window filters copy rows');
@@ -287,7 +287,6 @@ describe('delete tombstones in a base copy', function () {
 		assert.equal(logged('replayed-after-copy'), 0);
 	});
 
-	// an older receiver core applies the copied delete as an ordinary replicated delete, which still removes the row
 	for (const [peer, bag] of [
 		['an LMDB capability bag', buildLocalCapabilities(90_000, false, false)],
 		['unlearned capabilities', undefined],
