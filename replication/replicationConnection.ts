@@ -182,6 +182,7 @@ import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { requiresLegacyCopyVerification, verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { isDedicatedPoolWorker } from '../core/server/threads/workerPools.ts';
+import { broadcast, onMessageByType } from '../core/server/threads/manageThreads.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS, THREAD_TYPES } from '../core/utility/hdbTerms.ts';
 import { registerBlobSend, noteBlobSendProgress, endBlobSend, isDrainingBlobSends } from './blobSendDrain.ts';
@@ -1215,6 +1216,13 @@ export function heldDropMarkersFor(databaseName: string): readonly TableDropMark
 function advertisedCreatedTime(table: any): number | undefined {
 	return TEST_OMIT_CAPABILITIES ? undefined : (table.createdTime ?? catalogCreatedTime(table));
 }
+// A stamp lands in the catalog and on the stamping thread's class; every other thread's class learns it here, so a
+// sender there sees it change and resends the table's structure.
+const TABLE_STAMPED = 'replication-table-stamped';
+onMessageByType(TABLE_STAMPED, ({ databaseName, tableName, createdTime }) => {
+	const table: any = getDatabases()?.[databaseName]?.[tableName];
+	if (table && table.createdTime === undefined && Number.isFinite(createdTime)) table.createdTime = createdTime;
+});
 /** A peer's table-level expiration or eviction, in seconds: unset unless positive and a representable deadline. */
 function peerTableSeconds(value: unknown): number | undefined {
 	return typeof value === 'number' && value > 0 && !Number.isNaN(new Date(Date.now() + value * 1000).getTime())
@@ -9977,18 +9985,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								? shardingNativeRoots(databaseName).map(({ root }) => shardingBaselineState(root, databaseName))
 								: [];
 						const sourceNotReady = (word: Int32Array) => Atomics.load(word, 0) !== 1;
-						// `ended`: an entry closing the queued transaction was read, whether it was sent or filtered out
-						const currentTransaction = { txnLogKey: 0, ended: false };
+						// `open`: origins whose part of the queued transaction has had no closing entry read, sent or filtered out
+						const currentTransaction = { txnLogKey: 0, open: new Set<number>() };
+						const trackOpenTransaction = (auditRecord) => {
+							if (auditRecord.endTxn === true) currentTransaction.open.delete(auditRecord.nodeId);
+							else currentTransaction.open.add(auditRecord.nodeId);
+						};
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
 						// The queued frame holds part of a transaction a corrupt frame cut short: sent, the peer would commit half
-						// a source transaction and its cursor would pass the rest, so the whole transaction is withheld. A
-						// transaction whose closing entry was read is whole, even when another log's cut one shares its key.
+						// a source transaction and its cursor would pass the rest, so the whole frame is withheld. A frame whose
+						// every origin read its closing entry is whole, even when another log's cut transaction shares its key.
 						const dropTransactionCutByCorruptFrame = (stoppedRange?: any): boolean => {
 							const key = currentTransaction.txnLogKey;
 							if (
-								currentTransaction.ended ||
+								currentTransaction.open.size === 0 ||
 								(!cutByCorruptFrame(auditLogIterable, key) &&
 									!cutByCorruptFrame(ownLogRange, key) &&
 									!cutByCorruptFrame(ownLogCorruptRange, key) &&
@@ -10011,8 +10023,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						) => {
 							if (closed || wsClosed) return;
 							if (sourceReadiness.some(sourceNotReady)) throw new Error('Sharding source completeness was revoked');
-							if (auditRecord.endTxn === true && auditRecord.txnLogKey === currentTransaction.txnLogKey)
-								currentTransaction.ended = true;
+							if (auditRecord.txnLogKey === currentTransaction.txnLogKey) trackOpenTransaction(auditRecord);
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnLogKey && !dropTransactionCutByCorruptFrame()) {
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
@@ -10317,7 +10328,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									sendQueuedData();
 								}
 								currentTransaction.txnLogKey = txnLogKey;
-								currentTransaction.ended = auditRecord.endTxn === true;
+								currentTransaction.open.clear();
+								trackOpenTransaction(auditRecord);
 								frame.encodingStart = frame.position;
 								frame.writeFloat64(txnLogKey);
 							}
@@ -10595,7 +10607,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									subscribedNodeIds[localId] = { startTime, endTime };
 									if (subscription !== ownOriginRange) subscribedNodeName = name;
 								}
-								ownLogAnchor = ownLogAppendAnchor(ownSubscription, auditStore.reusableIterable === true);
+								// a peer that refuses copies skips the anchor probe, so a missing anchor would reconnect forever
+								ownLogAnchor = ownLogAppendAnchor(
+									ownSubscription,
+									auditStore.reusableIterable === true && !refusesCopies
+								);
 								// Only a multi-log range reads unlisted origins, and only per-origin logs carry their keys.
 								if (excludedNodes && auditStore.reusableIterable === true) {
 									const nameToId = sentIdMapping(auditStore, getThisNodeName());
@@ -14789,11 +14805,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				: undefined;
 		if (peerStamp === undefined && !rows.newer) return;
 		if (connectionSuperseded()) return;
-		if (stampTableCreatedTime(localTable, peerStamp ?? tableLifecycleTime(droppedTime)))
+		const createdTime = peerStamp ?? tableLifecycleTime(droppedTime);
+		if (stampTableCreatedTime(localTable, createdTime)) {
 			logger.warn?.(
 				connectionId,
 				`Stamped ${schemaDatabaseName}.${localTable.tableName} as a generation newer than the drop ${remoteNodeName} relays: it was created on a build that kept no stamp and holds no row older than the drop`
 			);
+			void broadcast({
+				type: TABLE_STAMPED,
+				databaseName: schemaDatabaseName,
+				tableName: localTable.tableName,
+				createdTime,
+			});
+		}
 	}
 	/** A peer's marker for a definition, while its database is not open here to record it in. */
 	function frameRetires(markers: Array<{ table: string; droppedTime: number }>, definition: any) {
