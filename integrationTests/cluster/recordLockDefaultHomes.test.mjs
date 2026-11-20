@@ -28,7 +28,7 @@ function lockedIncrementIn(node, id, signal) {
 	return call(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 }, signal);
 }
 
-/** A generation change rebuilds the transport and schedules a restart recall, so the first lock under it may answer 503. */
+/** The first lock after a generation change may answer 503 while the new map settles. */
 function firstLock(node, path, data) {
 	let last;
 	return waitForCondition(
@@ -175,7 +175,6 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(body.outcome, 'activated', JSON.stringify(body));
 		assert.equal(body.generation, 2, 'above the default generation it inherited');
 		for (const node of nodes.slice(0, 2)) assert.equal((await recordLocksOf(node, FRESH)).homeMapSource, 'database');
-		// until each member has served as a home, so the next test's one-shot lock meets a settled map
 		const members = nodes.slice(0, 2);
 		const servedAsHome = new Set();
 		for (let i = 0; servedAsHome.size < members.length; i++) {
@@ -189,13 +188,16 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 				authorization: nodes[0].admin,
 			});
 			await waitForItem(nodes, id, 0);
-			const before = await Promise.all(members.map((node) => recordLocksOf(node, FRESH)));
-			for (const node of members)
-				await firstLock(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
-			const after = await Promise.all(members.map((node) => recordLocksOf(node, FRESH)));
+			const granted = () => Promise.all(members.map(async (node) => (await recordLocksOf(node, FRESH))?.granted));
+			const before = await granted();
+			await firstLock(nodes[0], 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
+			const after = await granted();
+			// `granted` counts outstanding delegations, so one fresh key's first lock raises only its home's
 			members.forEach((node, index) => {
-				if ((after[index]?.granted ?? 0) > (before[index]?.granted ?? 0)) servedAsHome.add(node);
+				if (typeof before[index] === 'number' && typeof after[index] === 'number' && after[index] > before[index])
+					servedAsHome.add(node);
 			});
+			await firstLock(nodes[1], 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
 		}
 	});
 
@@ -268,6 +270,7 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(next.body.n, 11, 'the successor saw the leaver’s committed write');
 		await waitForCounter(nodes, id, 11);
 		assert.equal(await lockStatus(nodes[2], id), 503, 'the leaver is staged and serves no lock');
+		await firstLock(nodes[1], 'LockOnce/', { id });
 	});
 
 	test('refuses, before staging anything, a default change that does not survey every known node', async () => {
