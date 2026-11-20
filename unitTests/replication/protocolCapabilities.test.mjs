@@ -17,7 +17,6 @@ import {
 	OWN_ORIGIN_RECOVERY_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	TABLE_LIFECYCLE_CAPABILITY,
-	TOMBSTONE_COPY_CAPABILITY,
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
@@ -28,8 +27,6 @@ import {
 	peerSupportsResidencyStubCopy,
 	peerSupportsResidencySlots,
 	peerSupportsShardingRecovery,
-	peerSupportsTombstoneCopy,
-	receiverDeclaresTombstoneCopy,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -52,7 +49,6 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				originFloors: 0,
 				tableLifecycle: 0,
 				residencyStubCopy: 0,
-				tombstoneCopy: 0,
 				residencyNotResident: 0,
 				residencySlots: 0,
 				shardingRecovery: 0,
@@ -91,7 +87,6 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 			'subscriptionSetupAck',
 			'subscriptionSetupBudgetMs',
 			'tableLifecycle',
-			'tombstoneCopy',
 		]);
 	});
 
@@ -266,7 +261,6 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
-				tombstoneCopy: TOMBSTONE_COPY_CAPABILITY,
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
@@ -314,7 +308,6 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 				residencyStubCopy: RESIDENCY_STUB_COPY_CAPABILITY,
-				tombstoneCopy: TOMBSTONE_COPY_CAPABILITY,
 				residencyNotResident: RESIDENCY_NOT_RESIDENT_CAPABILITY,
 				residencySlots: RESIDENCY_SLOTS_CAPABILITY,
 				shardingRecovery: SHARDING_RECOVERY_CAPABILITY,
@@ -529,28 +522,6 @@ describe('residencyStubCopy', () => {
 	});
 });
 
-describe('tombstoneCopy', () => {
-	it('is unsupported for an absent, empty or pre-key bag', () => {
-		for (const bag of [undefined, {}, { tombstoneCopy: 0 }, { tombstoneCopy: 'no' }, { residencyStubCopy: 1 }])
-			assert.strictEqual(peerSupportsTombstoneCopy(resolvePeerCapabilities(bag)), false, JSON.stringify(bag));
-	});
-
-	it('is advertised only with per-origin logs (RocksDB) and clamped to the level this build implements', () => {
-		for (const perOriginLogs of [true, false])
-			assert.strictEqual(
-				peerSupportsTombstoneCopy(resolvePeerCapabilities(buildLocalCapabilities(1, false, perOriginLogs))),
-				perOriginLogs
-			);
-		assert.strictEqual(resolvePeerCapabilities({ tombstoneCopy: 5 }).tombstoneCopy, TOMBSTONE_COPY_CAPABILITY);
-	});
-
-	it('reports a change in tombstoneCopy alone', () => {
-		const full = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
-		const without = resolvePeerCapabilities({ ...buildLocalCapabilities(90_000, true, true), tombstoneCopy: 0 });
-		assert.strictEqual(samePeerCapabilities(full, without), false);
-	});
-});
-
 describe('residencyNotResident', () => {
 	it('defaults absent and invalid levels to unsupported', () => {
 		for (const value of [undefined, null, 0, -1, 'no', {}, { toString: 0 }])
@@ -611,32 +582,5 @@ describe('Confirmation markers capability (harper-pro#1351)', () => {
 			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ confirmationMarkers: 1 })),
 			false
 		);
-	});
-});
-
-describe('receiverDeclaresTombstoneCopy', () => {
-	it('reads a numeric level of at least the local one on any request entry', () => {
-		assert.equal(
-			receiverDeclaresTombstoneCopy([{ name: 'a' }, { name: 'b', tombstoneCopy: TOMBSTONE_COPY_CAPABILITY }]),
-			true
-		);
-		assert.equal(receiverDeclaresTombstoneCopy([{ tombstoneCopy: TOMBSTONE_COPY_CAPABILITY + 1 }]), true);
-	});
-
-	it('declares nothing for an absent, non-numeric or malformed value', () => {
-		for (const entries of [
-			undefined,
-			null,
-			{},
-			[],
-			[null],
-			[{ name: 'a' }],
-			[{ tombstoneCopy: 0 }],
-			[{ tombstoneCopy: '1' }],
-			[{ tombstoneCopy: true }],
-			[{ tombstoneCopy: NaN }],
-			[{ tombstoneCopy: Infinity }],
-		])
-			assert.equal(receiverDeclaresTombstoneCopy(entries), false, inspect(entries));
 	});
 });

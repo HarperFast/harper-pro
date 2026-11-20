@@ -344,12 +344,15 @@ suite('base-copy deletions at the edges', { timeout: 600_000, skip: isLMDB && 'c
 		if (holdDirectory) await rm(holdDirectory, { recursive: true, force: true });
 	});
 
-	test('a receiver without tombstoneCopy completes the copy as before, storing no tombstone', async () => {
+	test('a receiver advertising no capabilities still gets the delete', async () => {
 		const older = await nodes.startFresh({ HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' });
 		await nodes.join(older, A);
 		await waitFor(async (signal) => (await dataRow(older.harper, 'sentinel', signal)).present, 'the copy to finish');
 		for (const id of ['r1', 'r2']) assert.equal((await dataRow(older.harper, id)).present, true, id);
-		assert.deepEqual(await dataRow(older.harper, 'r-deleted'), { stored: false });
+		const deleted = await dataRow(older.harper, 'r-deleted');
+		assert.equal(deleted.stored, true, 'the copy kept no tombstone');
+		assert.equal(deleted.present, false);
+		assert.equal(deleted.version, (await dataRow(A.harper, 'r-deleted')).version);
 	});
 
 	test('a delete that lands during the copy is kept', async () => {
