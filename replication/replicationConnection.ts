@@ -3419,6 +3419,8 @@ export function ownLogPastAnchorRange(anchor: number) {
 	return { log: 'local', start: anchor, exactStart: true, resumeAfterExactStart: true, snapshot: false };
 }
 
+const NO_STOPPED_RANGES: readonly any[] = [];
+
 /** Own-log entries yielded per pass before the other logs are served; a live local tail would otherwise starve them. */
 export const OWN_LOG_SLICE_ENTRIES = 1000;
 
@@ -11479,6 +11481,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														? { log: 'local', start: 0, snapshot: false }
 														: ownLogPastAnchorRange(ownLogAnchor)
 												);
+												// the peer holds every own key up to its anchor, so a handoff below it would resend them
+												ownLogMaxKeySent = ownLogAnchor;
 												ownLogAnchor = undefined;
 												const ownId = getThisNodeId(auditStore);
 												const own = subscribedNodeIds[ownId];
@@ -11664,9 +11668,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// peer's durable and per-origin cursors position the next range, which a sender-side reseed
 										// cannot do safely (harper-pro#876). The stopped range stays in place until then, so the
 										// certification check below still sees its failure.
-										const stoppedRanges = [...new Set([range, ownLogCorruptRange])].filter(
-											(stopped: any) => stopped?.corruptFrameStop?.breaks > 0
-										);
+										const stoppedRanges =
+											range?.corruptFrameStop?.breaks > 0 || ownLogCorruptRange
+												? [...new Set([range, ownLogCorruptRange])].filter(
+														(stopped: any) => stopped?.corruptFrameStop?.breaks > 0
+													)
+												: NO_STOPPED_RANGES;
 										// a torn tail recovers by reconnecting, even while another log is held at a mid-log break
 										const tornTailStopped = stoppedRanges.some((stopped: any) => !stopped.corruptFrameStop.midLogBreak);
 										if (stoppedRanges.length > 0 && auditStore.reusableIterable) {
