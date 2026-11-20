@@ -9734,7 +9734,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let ownLogFromStart = false;
 						let ownLogRange: any;
 						let ownLogRangeFailed = false;
-						let ownLogTxnOpen = false;
 						// an own-log range stopped at a corrupt frame, reported and recovered like the main range
 						let ownLogCorruptRange: any;
 						const ownLogSlice = { drained: true };
@@ -10647,14 +10646,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 								};
 								// No more of this node's log goes out here: a key-filtered read could deliver a later entry past one it
-								// skipped, and the peer would resume past both. A transaction the failure cut short is dropped, not flushed.
-								// Returns true when the connection closed so the peer resumes from what it holds.
+								// skipped, and the peer would resume past both. A corrupt frame is handled as on the main range, which
+								// delivers the readable prefix; any other failure closes before the pending frame is flushed, and returns
+								// true so the peer resumes from what it holds.
 								const failOwnLogRead = (): boolean => {
 									const range = ownLogRange;
-									if (ownLogTxnOpen) {
-										frame.position = frame.encodingStart;
-										currentTransaction.txnLogKey = 0;
-									}
 									ownLogRangeFailed = true;
 									stopMarkers();
 									ownLogRange = undefined;
@@ -11520,7 +11516,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const status = getSharedStatus();
 												if (key > status[SENDING_TIME_POSITION]) status[SENDING_TIME_POSITION] = key;
 												if (key > currentSequenceId) currentSequenceId = key;
-												ownLogTxnOpen = next.value.endTxn === false;
 												await sendAuditRecord(next.value, key);
 												if (closed || wsClosed) return;
 												if (endsOwnLogSlice(count, next.value)) break;
