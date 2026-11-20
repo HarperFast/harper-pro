@@ -590,7 +590,9 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 					() => `the sentinel on the returning node; last: ${JSON.stringify(held)}`
 				);
 				ok(
-					(await readLogSince(source.harper, mark)).includes(`Replicating all tables to ${returning.harper.hostname}`),
+					(await readLogSince(source.harper, mark)).includes(
+						`Replicating all tables to ${returning.harper.hostname} for database ${DATABASE}`
+					),
 					'premise: the source sent the returning node a base copy'
 				);
 				ok(!held.includes('gone'), `the deleted row is still on the ${previousVersion} node: ${JSON.stringify(held)}`);
