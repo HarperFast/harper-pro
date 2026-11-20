@@ -1,6 +1,7 @@
 /** Fresh nodes are in their first incarnation, so the first default proves its drain at once. */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { homeFor, ringKeyFor } from '../../dist/core/resources/recordLockCoordinator.js';
 import { ensureTableExists, sendOperation, waitForCondition } from './clusterShared.mjs';
 import {
 	DB,
@@ -26,6 +27,30 @@ function applyDefault(node, fields) {
 
 function lockedIncrementIn(node, id, signal) {
 	return call(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 }, signal);
+}
+
+/** The first lock after a generation change may answer 503 while the new map settles. */
+function firstLock(node, path, data) {
+	let last;
+	return waitForCondition(
+		async (signal) => {
+			last = await call(node, path, data, signal);
+			if (last.status === 503) return undefined;
+			assert.equal(last.status, 200, JSON.stringify(last.body));
+			return last;
+		},
+		{ timeoutMs: 30_000, description: () => `${path} to be admitted on ${node.hostname}: ${JSON.stringify(last)}` }
+	);
+}
+
+function idHomedOnEach(database, table, homes, prefix) {
+	const ids = new Map();
+	for (let i = 0; ids.size < homes.length; i++) {
+		const id = `${prefix}-${i}`;
+		const home = homeFor(ringKeyFor(database, table, id), homes);
+		if (!ids.has(home)) ids.set(home, id);
+	}
+	return [...ids.values()];
 }
 
 async function itemCount(node, id, signal) {
@@ -161,6 +186,21 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(body.outcome, 'activated', JSON.stringify(body));
 		assert.equal(body.generation, 2, 'above the default generation it inherited');
 		for (const node of nodes.slice(0, 2)) assert.equal((await recordLocksOf(node, FRESH)).homeMapSource, 'database');
+		const warmed = Date.now();
+		for (const [index, node] of nodes.slice(0, 2).entries()) {
+			const ids = idHomedOnEach(FRESH, ITEM, names.slice(0, 2), `own-map-${warmed}-${index}`);
+			await sendOperation(nodes[0], {
+				operation: 'insert',
+				database: FRESH,
+				table: ITEM,
+				records: ids.map((id) => ({ id, n: 0 })),
+				authorization: nodes[0].admin,
+			});
+			for (const id of ids) {
+				await waitForItem(nodes, id, 0);
+				await firstLock(node, 'LockedIncrementIn/', { database: FRESH, table: ITEM, id, timeout: 2_000 });
+			}
+		}
 	});
 
 	test('a default that names the third node lets it lock every inheriting database, and not one with its own map', async () => {
@@ -188,7 +228,8 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		await waitForItem(nodes, fresh, 0);
 		assert.equal((await lockedIncrementIn(nodes[2], fresh)).status, 503, 'the joiner holds a marker, not the default');
 		assert.equal((await recordLocksOf(nodes[2], FRESH)).homeMapSource, 'database');
-		assert.equal((await lockedIncrementIn(nodes[0], fresh)).status, 200, 'its own map still serves on its members');
+		const own = await lockedIncrementIn(nodes[0], fresh);
+		assert.equal(own.status, 200, `its own map still serves on its members: ${JSON.stringify(own.body)}`);
 	});
 
 	test('a shrink moves the inheriting database only after a lock held on the leaver commits', async () => {
@@ -227,11 +268,18 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		assert.equal(body.nodes[names[2]].role, 'departing');
 		assert.equal(body.nodes[names[2]].stage.proven, true, JSON.stringify(body.nodes[names[2]]));
 		assert.deepEqual(body.nodes[names[2]].activate, { action: 'skipped' });
-		const next = await call(nodes[0], 'LockedIncrement/', { id });
-		assert.equal(next.status, 200, JSON.stringify(next.body));
+		const next = await firstLock(nodes[0], 'LockedIncrement/', { id });
 		assert.equal(next.body.n, 11, 'the successor saw the leaver’s committed write');
 		await waitForCounter(nodes, id, 11);
 		assert.equal(await lockStatus(nodes[2], id), 503, 'the leaver is staged and serves no lock');
+		const warmed = Date.now();
+		for (const [index, node] of nodes.slice(0, 2).entries()) {
+			for (const homed of idHomedOnEach(DB, 'Counter', names.slice(0, 2), `shrunk-${warmed}-${index}`)) {
+				await putCounter(nodes[0], homed, 0);
+				await waitForCounter(nodes, homed, 0);
+				await firstLock(node, 'LockOnce/', { id: homed });
+			}
+		}
 	});
 
 	test('refuses, before staging anything, a default change that does not survey every known node', async () => {
@@ -258,7 +306,7 @@ suite('record lock default home map on a three-node cluster', { timeout: 900_000
 		const id = 'own-' + Date.now();
 		await putCounter(nodes[1], id, 0);
 		await waitForCounter(nodes, id, 0);
-		assert.equal((await call(nodes[2], 'LockedIncrement/', { id })).status, 200);
+		await firstLock(nodes[2], 'LockedIncrement/', { id });
 		assert.equal(await lockStatus(nodes[0], id), 503, 'the node its map leaves out is staged');
 	});
 });
