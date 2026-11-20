@@ -39,11 +39,47 @@ export class ResidencyWireReferences {
 	}
 }
 
+interface WireHeader {
+	tableId: number;
+	nodeId: number;
+	type: string;
+	extendedType: number;
+	residencyId?: number;
+	previousResidencyId?: number;
+	encodedRecord: Buffer;
+}
+
+/**
+ * The input is built from explicit reads because an entry's recordId and user may be prototype accessors, where
+ * a spread does not reach them.
+ */
+export function createWireAuditEntry(record: any, header: WireHeader): Buffer {
+	return createAuditEntry({
+		version: record.version,
+		tableId: header.tableId,
+		recordId: record.recordId,
+		previousVersion: null,
+		nodeId: header.nodeId,
+		user: record.user,
+		type: header.type,
+		encodedRecord: header.encodedRecord,
+		extendedType: header.extendedType,
+		residencyId: header.residencyId,
+		previousResidencyId: header.previousResidencyId,
+		residencySlot: record.residencySlot,
+		previousResidencySlot: record.previousResidencySlot,
+		expiresAt: record.expiresAt,
+		originatingOperation: record.originatingOperation,
+		previousAdditionalAuditRefs: record.previousAdditionalAuditRefs,
+	} as any);
+}
+
 /** Reframe only the header; copy the original encoded body and its blob transfer tags unchanged. */
 export function encodeResidencyWireRecord(record: any, residencyId?: number, previousResidencyId?: number): Buffer {
-	return createAuditEntry({
-		...record,
-		previousVersion: null,
+	return createWireAuditEntry(record, {
+		tableId: record.tableId,
+		nodeId: record.nodeId,
+		type: record.type,
 		extendedType:
 			(record.extendedType &
 				~0xff &

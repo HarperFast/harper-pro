@@ -50,6 +50,7 @@ import {
 } from './residencyTopology.ts';
 import {
 	ResidencyWireReferences,
+	createWireAuditEntry,
 	encodeResidencyWireRecord,
 	resolveSlotReference,
 	isResidencyRecord,
@@ -10079,7 +10080,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 							if (hasSlot && residency.includes(remoteNodeName) && auditRecord.type === 'invalidate')
 								throw new Error(`A projection cannot fill owned sharding slots on ${remoteNodeName}`);
-							let wireRecord = auditRecord;
+							let previousResidencyId;
 							let reframe = false;
 							if (hasSlot) {
 								residencyId = slotWireReferences.reference(
@@ -10088,7 +10089,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									peerSupportsResidencySlots(peerCapabilities),
 									sendResidencyReference
 								);
-								const previousResidencyId =
+								previousResidencyId =
 									auditRecord.previousResidencySlot === undefined
 										? undefined
 										: slotWireReferences.reference(
@@ -10097,16 +10098,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												peerSupportsResidencySlots(peerCapabilities),
 												sendResidencyReference
 											);
-								wireRecord = {
-									...auditRecord,
-									residencyId,
-									previousResidencyId,
-								};
 								reframe = true;
 							} else if (
 								table.residency &&
 								(auditRecord.residencySlot !== undefined || auditRecord.previousResidencySlot !== undefined)
 							) {
+								previousResidencyId = auditRecord.previousResidencyId;
 								reframe = true;
 							}
 							let invalidationEntry;
@@ -10115,27 +10112,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (table.residency ? !hasStoredIndexes(table) : table.getResidencyById) {
 									return skipAuditRecord();
 								}
-								const recordId = auditRecord.recordId;
+								if (!hasSlot) previousResidencyId = auditRecord.previousResidencyId;
 								// send out invalidation messages
-								logger.trace?.(connectionId, 'sending invalidation', recordId, remoteNodeName, 'from', nodeId);
+								logger.trace?.(
+									connectionId,
+									'sending invalidation',
+									auditRecord.recordId,
+									remoteNodeName,
+									'from',
+									nodeId
+								);
 								let extendedType = 0;
 								if (residencyId) extendedType |= HAS_CURRENT_RESIDENCY_ID;
-								if (wireRecord.previousResidencyId) extendedType |= HAS_PREVIOUS_RESIDENCY_ID;
+								if (previousResidencyId) extendedType |= HAS_PREVIOUS_RESIDENCY_ID;
 								let partialRecord = null;
 								if (hasStoredIndexes(table)) {
 									const fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore, txnLogKey);
 									if (fullRecord) partialRecord = residencyStubOf(table, fullRecord);
 								}
-								invalidationEntry = createAuditEntry({
-									...wireRecord,
+								invalidationEntry = createWireAuditEntry(auditRecord, {
 									tableId,
-									recordId,
-									previousVersion: null,
 									nodeId,
 									type: auditRecord.type === 'put' || auditRecord.type === 'patch' ? 'invalidate' : auditRecord.type,
-									encodedRecord: encoder.encode(partialRecord), // use the store's encoder; note that this may actually result in a new structure being created
 									extendedType,
 									residencyId,
+									previousResidencyId,
+									encodedRecord: encoder.encode(partialRecord), // use the store's encoder; note that this may actually result in a new structure being created
 								});
 								// entry is encoded, send it after checks for new structure and residency
 							}
@@ -10173,7 +10175,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 
 							// Copy encoding starts blob transfers and may add encoder structures. Do it only
 							// after placement selects a complete body, before advertising those structures.
-							if (!invalidationEntry && encodeCopy) wireRecord.encoded = encodeCopy();
+							if (!invalidationEntry && encodeCopy) auditRecord.encoded = encodeCopy();
 							const typedStructs = encoder.typedStructs;
 							const structures = encoder.structures;
 							if (typedStructs?.length != tableEntry.typed_length || structures.length != tableEntry.structure_length) {
@@ -10232,8 +10234,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							} else {
 								// directly write the audit record.
 								const encoded = reframe
-									? encodeResidencyWireRecord(wireRecord, residencyId, wireRecord.previousResidencyId)
-									: wireRecord.encoded;
+									? encodeResidencyWireRecord(auditRecord, residencyId, previousResidencyId)
+									: auditRecord.encoded;
 								if (auditRecord.extendedType & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
 									decodeWithBlobCallback(

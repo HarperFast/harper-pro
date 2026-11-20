@@ -7,8 +7,46 @@ import {
 	HAS_PREVIOUS_RESIDENCY_SLOT,
 	HAS_CURRENT_RESIDENCY_ID,
 	HAS_PREVIOUS_RESIDENCY_ID,
+	HAS_EXPIRATION_EXTENDED_TYPE,
+	HAS_ORIGINATING_OPERATION,
+	HAS_ADDITIONAL_AUDIT_REFS,
 } from '#src/core/resources/auditStore';
-import { encodeResidencyWireRecord } from '#src/replication/residencyWire';
+import { createWireAuditEntry, encodeResidencyWireRecord } from '#src/replication/residencyWire';
+
+class PrivateEntry {
+	#entry;
+	constructor(entry) {
+		this.#entry = entry;
+		for (const key of [
+			'type',
+			'tableId',
+			'nodeId',
+			'version',
+			'previousVersion',
+			'extendedType',
+			'residencyId',
+			'previousResidencyId',
+			'residencySlot',
+			'previousResidencySlot',
+			'expiresAt',
+			'originatingOperation',
+			'previousAdditionalAuditRefs',
+		])
+			this[key] = entry[key];
+	}
+	get recordId() {
+		return this.#entry.recordId;
+	}
+	get user() {
+		return this.#entry.user;
+	}
+	get encoded() {
+		return this.#entry.encoded;
+	}
+	getBinaryValue() {
+		return this.#entry.getBinaryValue();
+	}
+}
 
 describe('Sharding wire headers', () => {
 	for (const residencyId of [undefined, 42]) {
@@ -63,6 +101,180 @@ describe('Sharding wire headers', () => {
 			assert.equal(wire.version, original.version);
 		});
 	}
+	describe('an entry whose accessors and methods are prototype members over #private state', () => {
+		const stored = (overrides = {}) =>
+			readAuditEntry(
+				createAuditEntry({
+					tableId: 2,
+					nodeId: 3,
+					version: Date.now(),
+					recordId: 'author-key',
+					user: 'author',
+					type: 'put',
+					extendedType: HAS_CURRENT_RESIDENCY_SLOT | HAS_PREVIOUS_RESIDENCY_SLOT,
+					residencySlot: 5,
+					previousResidencySlot: 6,
+					encodedRecord: encode({ id: 'author-key' }),
+					...overrides,
+				})
+			);
+		it('reframes to the same bytes as an entry carrying them as own properties', () => {
+			const entry = stored();
+			const expected = encodeResidencyWireRecord(entry, 0x80000000, 0x80000001);
+			const wire = encodeResidencyWireRecord(new PrivateEntry(entry), 0x80000000, 0x80000001);
+			assert.deepEqual(wire, expected);
+			const reread = readAuditEntry(wire);
+			assert.equal(reread.recordId, 'author-key');
+			assert.equal(reread.user, 'author');
+			assert.deepEqual(reread.getBinaryValue(), entry.getBinaryValue());
+		});
+		it('builds the invalidation header with its key, writer and version', () => {
+			const entry = stored();
+			const header = {
+				tableId: entry.tableId,
+				nodeId: entry.nodeId,
+				type: 'invalidate',
+				extendedType: HAS_CURRENT_RESIDENCY_ID,
+				residencyId: 42,
+				previousResidencyId: undefined,
+				encodedRecord: encode({ id: 'author-key' }),
+			};
+			const wire = createWireAuditEntry(new PrivateEntry(entry), header);
+			assert.deepEqual(wire, createWireAuditEntry(entry, header));
+			const reread = readAuditEntry(wire);
+			assert.equal(reread.type, 'invalidate');
+			assert.equal(reread.recordId, 'author-key');
+			assert.equal(reread.user, 'author');
+			assert.equal(reread.version, entry.version);
+			assert.equal(reread.residencyId, 42);
+		});
+	});
+	describe('header field parity with core', () => {
+		// A member of a decoded entry that is not listed here arrived with a core bump: decide how the wire
+		// handles it, then list it.
+		const known = [
+			'type',
+			'tableId',
+			'nodeId',
+			'version',
+			'residencyId',
+			'previousResidencyId',
+			'residencySlot',
+			'previousResidencySlot',
+			'expiresAt',
+			'originatingOperation',
+			'previousAdditionalAuditRefs',
+			'previousVersion',
+			'extendedType',
+			'logName',
+			'txnLogKey',
+			'endTxn',
+			'structureVersion',
+			'encoded',
+			'size',
+			'recordId',
+			'user',
+			'getValue',
+			'getBinaryValue',
+			'getBinaryRecordId',
+		];
+		const memberNames = (entry) => {
+			const names = new Set();
+			for (let object = entry; object && object !== Object.prototype; object = Object.getPrototypeOf(object))
+				for (const name of Object.getOwnPropertyNames(object)) if (name !== 'constructor') names.add(name);
+			return [...names];
+		};
+		const unhandled = (entry) => memberNames(entry).filter((name) => !known.includes(name));
+		const everyField = () =>
+			readAuditEntry(
+				createAuditEntry({
+					tableId: 2,
+					nodeId: 3,
+					version: 1_800_000_000_123.5,
+					recordId: 'parity-key',
+					user: 'parity-user',
+					type: 'put',
+					previousVersion: 2 ** 40,
+					extendedType:
+						HAS_CURRENT_RESIDENCY_SLOT |
+						HAS_PREVIOUS_RESIDENCY_SLOT |
+						HAS_CURRENT_RESIDENCY_ID |
+						HAS_PREVIOUS_RESIDENCY_ID |
+						HAS_EXPIRATION_EXTENDED_TYPE |
+						HAS_ORIGINATING_OPERATION |
+						HAS_ADDITIONAL_AUDIT_REFS,
+					residencyId: 9,
+					previousResidencyId: 8,
+					residencySlot: 5,
+					previousResidencySlot: 6,
+					expiresAt: 1_900_000_000_000,
+					originatingOperation: 'insert',
+					previousAdditionalAuditRefs: [{ version: 1_700_000_000_000, nodeId: 4 }],
+					encodedRecord: encode({ id: 'parity-key', body: 'parity' }),
+				})
+			);
+		it('round-trips every header field through a reframe, except those it changes on purpose', () => {
+			const entry = everyField();
+			const wire = readAuditEntry(encodeResidencyWireRecord(entry, 0x80000000, 0x80000001));
+			for (const field of ['type', 'tableId', 'nodeId', 'version', 'recordId', 'user'])
+				assert.equal(wire[field], entry[field], field);
+			assert.equal(wire.expiresAt, entry.expiresAt);
+			assert.equal(wire.originatingOperation, entry.originatingOperation);
+			assert.deepEqual(wire.previousAdditionalAuditRefs, entry.previousAdditionalAuditRefs);
+			assert.deepEqual(wire.getBinaryValue(), entry.getBinaryValue());
+			assert.equal(wire.residencyId, 0x80000000);
+			assert.equal(wire.previousResidencyId, 0x80000001);
+			assert.equal(wire.residencySlot, undefined);
+			assert.equal(wire.previousResidencySlot, undefined);
+			assert.equal(wire.previousVersion, undefined);
+			assert.equal(wire.extendedType & (HAS_CURRENT_RESIDENCY_SLOT | HAS_PREVIOUS_RESIDENCY_SLOT), 0);
+		});
+		it('round-trips every header field through an invalidation header', () => {
+			const entry = everyField();
+			const wire = readAuditEntry(
+				createWireAuditEntry(entry, {
+					tableId: entry.tableId,
+					nodeId: entry.nodeId,
+					type: 'invalidate',
+					extendedType: HAS_CURRENT_RESIDENCY_ID | HAS_PREVIOUS_RESIDENCY_ID,
+					residencyId: 9,
+					previousResidencyId: 8,
+					encodedRecord: encode({ id: 'parity-key' }),
+				})
+			);
+			for (const field of ['tableId', 'nodeId', 'version', 'recordId', 'user'])
+				assert.equal(wire[field], entry[field], field);
+			assert.equal(wire.residencyId, 9);
+			assert.equal(wire.previousResidencyId, 8);
+			assert.equal(wire.type, 'invalidate');
+		});
+		it('names every field and accessor an entry exposes, so a new one needs a wire decision', () => {
+			assert.deepEqual(
+				unhandled(everyField()),
+				[],
+				'decide whether the wire header carries these, then list them here'
+			);
+		});
+		it('reports an accessor or method added to the entry itself or to a prototype', () => {
+			const entry = everyField();
+			const descriptors = Object.getOwnPropertyDescriptors(entry);
+			const inheritedAccessor = Object.create(
+				Object.create(Object.getPrototypeOf(entry), { addedLater: { get: () => 1 } }),
+				descriptors
+			);
+			const ownAccessor = Object.create(Object.getPrototypeOf(entry), {
+				...descriptors,
+				addedLater: { get: () => 1 },
+			});
+			const inheritedMethod = Object.create(
+				Object.create(Object.getPrototypeOf(entry), { addedMethod: { value() {} } }),
+				descriptors
+			);
+			assert.deepEqual(unhandled(inheritedAccessor), ['addedLater']);
+			assert.deepEqual(unhandled(ownAccessor), ['addedLater']);
+			assert.deepEqual(unhandled(inheritedMethod), ['addedMethod']);
+		});
+	});
 	it('drops a historical node-list identity when reframing a converted key-derived record', () => {
 		const stored = readAuditEntry(
 			createAuditEntry({
