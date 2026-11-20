@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, waitForCondition, stopAndTeardownNodes } from './clusterShared.mjs';
+import { sendOperation, waitForCondition, stopAndTeardownNodes, logMark, readLogSince } from './clusterShared.mjs';
 
 const PACKAGE_ROOT = join(import.meta.dirname, '..', '..');
 const CURRENT_BIN = join(PACKAGE_ROOT, 'dist', 'bin', 'harper.js');
@@ -488,6 +488,108 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				);
 				await writeBatch(nodeA, 'join');
 				await assertConverged(`${nodeD.harper.hostname} joining on ${previousVersion}`);
+			});
+		}
+	);
+
+	// harper-pro#1449: a copy into a release without copy-applied tombstones must still remove a row it holds
+	suite(
+		`a ${previousVersion} node rejoining by base copy drops a row deleted while it was away`,
+		{ timeout: 600_000 },
+		(ctx) => {
+			const nodes = [];
+			const [source, returning] = [0, 1].map(() => ({ name: ctx.name }));
+
+			async function startNode(nodeCtx, harperBinPath, env) {
+				if (!nodeCtx.harper) {
+					const hostname = await getNextAvailableLoopbackAddress();
+					const parentDir = process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir();
+					nodeCtx.harper = { hostname, dataRootDir: await mkdtemp(join(parentDir, 'harper-integration-test-')) };
+					nodes.push(nodeCtx);
+					await cp(FIXTURE_PATH, join(nodeCtx.harper.dataRootDir, 'components', basename(FIXTURE_PATH)), {
+						recursive: true,
+						dereference: true,
+					});
+				}
+				await startHarper(nodeCtx, nodeOptions(nodeCtx.harper.hostname, harperBinPath, env));
+			}
+
+			const write = (nodeCtx, operation) =>
+				sendOperation(
+					nodeCtx.harper,
+					{ database: DATABASE, table: ITEM, ...operation },
+					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+				);
+			const ids = async (nodeCtx, signal) =>
+				(
+					await sendOperation(
+						nodeCtx.harper,
+						{
+							operation: 'search_by_value',
+							database: DATABASE,
+							table: ITEM,
+							search_attribute: 'id',
+							search_value: '*',
+							get_attributes: ['id'],
+						},
+						{ signal }
+					)
+				).map(({ id }) => id);
+			const until = (probe, description) =>
+				waitForCondition(probe, { timeoutMs: CONVERGE_TIMEOUT_MS, pollMs: 500, description });
+
+			after(async () => {
+				await stopAndTeardownNodes(nodes.map((nodeCtx) => nodeCtx.harper));
+			});
+
+			test('the copy removes the row', async () => {
+				await startNode(source, CURRENT_BIN);
+				await startNode(returning, previousBin);
+				await write(source, {
+					operation: 'insert',
+					records: [
+						{ id: 'kept', category: 'kept' },
+						{ id: 'gone', category: 'gone' },
+					],
+				});
+				await sendOperation(
+					returning.harper,
+					{
+						operation: 'add_node',
+						hostname: source.harper.hostname,
+						rejectUnauthorized: false,
+						authorization: source.harper.admin,
+					},
+					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+				);
+				// a live write that arrives proves the joining copy completed, so the next copy starts afresh
+				await write(source, { operation: 'insert', records: [{ id: 'live', category: 'live' }] });
+				await until(
+					async (signal) => (await ids(returning, signal)).includes('live'),
+					'the live write on the returning node'
+				);
+
+				await killHarper(returning, { graceMs: SHUTDOWN_GRACE_MS });
+				await write(source, { operation: 'delete', ids: ['gone'] });
+				// sorts last, so the copy has passed 'gone' once this arrives
+				await write(source, { operation: 'insert', records: [{ id: 'zz-sentinel', category: 'sentinel' }] });
+				await killHarper(source, { graceMs: SHUTDOWN_GRACE_MS });
+				const mark = await logMark(source.harper);
+				// a returning node with a saved cursor is forced into the copy; one without asks for it
+				await startNode(source, CURRENT_BIN, { HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: DATABASE });
+				await startNode(returning, previousBin);
+
+				let held;
+				await until(
+					async (signal) => (held = await ids(returning, signal)).includes('zz-sentinel'),
+					() => `the sentinel on the returning node; last: ${JSON.stringify(held)}`
+				);
+				ok(
+					(await readLogSince(source.harper, mark)).includes(`Replicating all tables to ${returning.harper.hostname}`),
+					'premise: the source sent the returning node a base copy'
+				);
+				ok(!held.includes('gone'), `the deleted row is still on the ${previousVersion} node: ${JSON.stringify(held)}`);
+				ok(held.includes('kept'));
 			});
 		}
 	);
