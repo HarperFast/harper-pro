@@ -108,18 +108,37 @@ export class LockRelease extends Resource {
 
 const gates = new Map();
 
-/** POST { id, n, lease? }: lock, wait for GateControl to open this id's gate, then write `n`. */
+// a test that fails before opening a gate must not leave the transaction staged for the rest of the suite
+function waitForGate(id) {
+	return new Promise((resolve, reject) => {
+		const open = () => {
+			clearTimeout(timer);
+			resolve();
+		};
+		const timer = setTimeout(() => {
+			if (gates.get(id) === open) gates.delete(id);
+			reject(Object.assign(new Error(`gate ${id} was never opened`), { statusCode: 504 }));
+		}, 60_000);
+		gates.set(id, open);
+	});
+}
+
+/**
+ * POST { id, n, lease?, afterSave? }: lock, wait for GateControl to open this id's gate, then write `n`. With
+ * `afterSave`, write `n` first, which reserves the commit's log key, and wait before the commit instead.
+ */
 export class GatedLockedWrite extends Resource {
 	async post(data) {
 		const record = await tables.Counter.lock(data.id, lockOptions(data));
-		await new Promise((resolve) => gates.set(data.id, resolve));
+		if (!data.afterSave) await waitForGate(data.id);
 		record.set('n', data.n);
 		await record.save();
+		if (data.afterSave) await waitForGate(data.id);
 		return { n: data.n };
 	}
 }
 
-/** POST { id, open? }: whether GatedLockedWrite holds this id's lock; `open: true` lets it write. */
+/** POST { id, open? }: whether GatedLockedWrite holds this id's lock; `open: true` lets it continue. */
 export class GateControl extends Resource {
 	async post(data) {
 		const open = gates.get(data.id);
@@ -128,6 +147,18 @@ export class GateControl extends Resource {
 			open();
 		}
 		return { waiting: Boolean(open) };
+	}
+}
+
+/** This node's own Counter entries in its local transaction log, in log (commit) order: id, log key and type. */
+export class CounterLog extends Resource {
+	async get() {
+		const entries = [];
+		for (const entry of tables.Counter.auditStore.getRange({ start: 1, log: 'local' })) {
+			if (entry.tableId === tables.Counter.tableId)
+				entries.push({ id: entry.recordId, key: entry.txnLogKey, type: entry.type });
+		}
+		return entries;
 	}
 }
 
