@@ -183,6 +183,7 @@ import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { requiresLegacyCopyVerification, verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { isDedicatedPoolWorker } from '../core/server/threads/workerPools.ts';
+import { broadcast, onMessageByType } from '../core/server/threads/manageThreads.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS, THREAD_TYPES } from '../core/utility/hdbTerms.ts';
 import { registerBlobSend, noteBlobSendProgress, endBlobSend, isDrainingBlobSends } from './blobSendDrain.ts';
@@ -1197,6 +1198,8 @@ const unknownCommandWarnThrottle = createThrottleState();
 let nextConnectionSessionOrdinal = 0;
 const TEST_OMIT_CAPABILITIES = process.env.HARPER_TEST_OMIT_REPLICATION_CAPABILITIES === '1';
 const TEST_ORIGIN_FLOOR_INTERVAL_MS = Number(process.env.HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS);
+// Test-only: certify no floor to any peer, so a receiver resumes with none (harper-pro#1454).
+const TEST_WITHHOLD_ORIGIN_FLOORS = process.env.HARPER_TEST_WITHHOLD_ORIGIN_FLOORS === '1';
 /** Authorized drop markers for a database not open on this thread yet: they cannot be recorded until it is. */
 const markersAwaitingDatabase = new Map<string, TableDropMarker[]>();
 /** Clears the held list a pass recorded, unless an overlapping pass has since merged in markers it has not. */
@@ -1214,6 +1217,13 @@ export function heldDropMarkersFor(databaseName: string): readonly TableDropMark
 function advertisedCreatedTime(table: any): number | undefined {
 	return TEST_OMIT_CAPABILITIES ? undefined : (table.createdTime ?? catalogCreatedTime(table));
 }
+// A stamp lands in the catalog and on the stamping thread's class; every other thread's class learns it here, so a
+// sender there sees it change and resends the table's structure.
+const TABLE_STAMPED = 'replication-table-stamped';
+onMessageByType(TABLE_STAMPED, ({ databaseName, tableName, createdTime }) => {
+	const table: any = getDatabases()?.[databaseName]?.[tableName];
+	if (table && table.createdTime === undefined && Number.isFinite(createdTime)) table.createdTime = createdTime;
+});
 /** A peer's table-level expiration or eviction, in seconds: unset unless positive and a representable deadline. */
 function peerTableSeconds(value: unknown): number | undefined {
 	return typeof value === 'number' && value > 0 && !Number.isNaN(new Date(Date.now() + value * 1000).getTime())
@@ -3389,6 +3399,62 @@ export function raiseStatusSlot(status: Float64Array, position: number, value: n
  */
 export function resumeStartWithFloor(position: number, closedFloor: unknown): number {
 	return isValidFloor(closedFloor) ? cursorBelowFloor(closedFloor) : position;
+}
+
+/**
+ * What a receiver with no valid floor for a sender asks it to resume its own log past (harper-pro#1454): the highest
+ * key applied from it. Those frames arrive in the sender's append order from a proven start, so everything appended
+ * before that entry is held whatever its key, while a key filter at the received maximum drops a lower-keyed entry
+ * appended after it.
+ */
+export function ownLogResumeAnchor(ownState: any): number | undefined {
+	return isValidFloor(ownState?.closedFloor) || !isValidFrameTxnLogKey(ownState?.originLogKey)
+		? undefined
+		: ownState.originLogKey;
+}
+
+/** Honored only by a store whose log reads can resume past an exact entry, and never on a copy. */
+export function ownLogAppendAnchor(ownSubscription: any, resumesPastEntries: boolean): number | undefined {
+	if (!resumesPastEntries || !(ownSubscription?.startTime > 1)) return undefined;
+	return isValidFrameTxnLogKey(ownSubscription.resumeAfter) ? ownSubscription.resumeAfter : undefined;
+}
+
+/** The key filter on an append-order own-log read: none, but an `add_node` start_time cutoff still holds. */
+export function ownLogFilterStart(ownSubscription: any): number {
+	return isValidFrameTxnLogKey(ownSubscription?.startCutoff) ? ownSubscription.startCutoff : 0;
+}
+
+export function ownLogPastAnchorRange(anchor: number) {
+	return {
+		log: 'local',
+		start: anchor,
+		exactStart: true,
+		resumeAfterExactStart: true,
+		snapshot: false,
+		trackCorruptTransactions: true,
+	};
+}
+
+/**
+ * Whether a corrupt frame cut the transaction keyed `key` short in `range`: core records the key of the transaction
+ * whose last returned entry did not end it (`trackCorruptTransactions`).
+ */
+export function cutByCorruptFrame(range: any, key: number): boolean {
+	return range?.corruptFrameStop?.breaks > 0 && range.corruptFrameStop.truncatedVersions?.has(key) === true;
+}
+
+const NO_STOPPED_RANGES: readonly any[] = [];
+
+/** Own-log entries yielded per pass before the other logs are served; a live local tail would otherwise starve them. */
+export const OWN_LOG_SLICE_ENTRIES = 1000;
+
+export function ownLogReadFailed(range: any): boolean {
+	return range?.exactStartFailures?.size > 0 || range?.failedLogs?.size > 0 || range?.corruptFrameStop?.breaks > 0;
+}
+
+/** A slice ends only with a transaction, since a frame carries one. */
+export function endsOwnLogSlice(count: number, entry: { endTxn?: boolean }): boolean {
+	return count >= OWN_LOG_SLICE_ENTRIES && entry.endTxn === true;
 }
 
 /**
@@ -9750,6 +9816,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// `missing` whenever the first entry's key differs from the cursor — which is the ordinary,
 						// healthy case for a plain resume. Only a log we actually asked to resume past can fail closed.
 						let boundaryLogName: string | undefined;
+						// Until a drained pass proves a floor, `ownLogRange` reads this node's log past the receiver's anchor
+						// in append order with no key filter, and the other logs' range excludes it (harper-pro#1454).
+						let ownLogAnchor: number | undefined;
+						let ownLogFromStart = false;
+						let ownLogRange: any;
+						let ownLogRangeFailed = false;
+						let ownLogMaxKeySent = 0;
+						// an own-log range stopped at a corrupt frame, reported and recovered like the main range
+						let ownLogCorruptRange: any;
+						const ownLogSlice = { drained: true };
 						let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
 						// `liveStartByLog` is the live incremental range's own map, so an `includeNodes` update reaches the range
 						let originFloors: Map<string, number> | undefined;
@@ -9967,10 +10043,36 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								? shardingNativeRoots(databaseName).map(({ root }) => shardingBaselineState(root, databaseName))
 								: [];
 						const sourceNotReady = (word: Int32Array) => Atomics.load(word, 0) !== 1;
-						const currentTransaction = { txnLogKey: 0 };
+						// `open`: origins whose part of the queued transaction has had no closing entry read, sent or filtered out
+						const currentTransaction = { txnLogKey: 0, open: new Set<number>() };
+						const trackOpenTransaction = (auditRecord) => {
+							if (auditRecord.endTxn === true) currentTransaction.open.delete(auditRecord.nodeId);
+							else currentTransaction.open.add(auditRecord.nodeId);
+						};
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
+						// The queued frame holds part of a transaction a corrupt frame cut short: sent, the peer would commit half
+						// a source transaction and its cursor would pass the rest, so the whole frame is withheld. A frame whose
+						// every origin read its closing entry is whole, even when another log's cut transaction shares its key.
+						const dropTransactionCutByCorruptFrame = (stoppedRange?: any): boolean => {
+							const key = currentTransaction.txnLogKey;
+							if (
+								currentTransaction.open.size === 0 ||
+								(!cutByCorruptFrame(auditLogIterable, key) &&
+									!cutByCorruptFrame(ownLogRange, key) &&
+									!cutByCorruptFrame(ownLogCorruptRange, key) &&
+									!cutByCorruptFrame(stoppedRange, key))
+							)
+								return false;
+							logger.warn?.(
+								connectionId,
+								`Withholding transaction ${key} from ${remoteNodeName} on ${databaseName}: a corrupt transaction-log frame cut it short`
+							);
+							frame.position = frame.encodingStart;
+							currentTransaction.txnLogKey = 0;
+							return true;
+						};
 						const sendAuditRecord = (
 							auditRecord,
 							cursor,
@@ -9979,8 +10081,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						) => {
 							if (closed || wsClosed) return;
 							if (sourceReadiness.some(sourceNotReady)) throw new Error('Sharding source completeness was revoked');
+							if (auditRecord.txnLogKey === currentTransaction.txnLogKey) trackOpenTransaction(auditRecord);
 							if (auditRecord.type === 'end_txn') {
-								if (currentTransaction.txnLogKey) {
+								if (currentTransaction.txnLogKey && !dropTransactionCutByCorruptFrame()) {
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
 										logger.error?.(
 											new Error('Invalid encoding of message to'),
@@ -10235,9 +10338,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!invalidationEntry && encodeCopy) auditRecord.encoded = encodeCopy();
 							const typedStructs = encoder.typedStructs;
 							const structures = encoder.structures;
-							if (typedStructs?.length != tableEntry.typed_length || structures.length != tableEntry.structure_length) {
+							// A table stamped since its structure went out (an upgraded node's unstamped generation, judged newer than
+							// a drop) is sent again: the peer refused the unstamped one and skips its records until it sees the stamp.
+							if (
+								typedStructs?.length != tableEntry.typed_length ||
+								structures.length != tableEntry.structure_length ||
+								table.createdTime !== tableEntry.createdTime
+							) {
 								tableEntry.typed_length = typedStructs?.length;
 								tableEntry.structure_length = structures.length;
+								tableEntry.createdTime = table.createdTime;
 								// the structure used for encoding records has changed, so we need to send the new structure
 								logger.debug?.(connectionId, 'send table struct', tableEntry.typed_length, tableEntry.structure_length);
 								if (!tableEntry.sentName) {
@@ -10268,7 +10378,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 							if (currentTransaction.txnLogKey !== txnLogKey) {
 								// send the queued transaction
-								if (currentTransaction.txnLogKey) {
+								if (currentTransaction.txnLogKey && !dropTransactionCutByCorruptFrame()) {
 									if (DEBUG_MODE)
 										logger.trace?.(connectionId, 'new txn log key, sending queued txn', currentTransaction.txnLogKey);
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
@@ -10277,6 +10387,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									sendQueuedData();
 								}
 								currentTransaction.txnLogKey = txnLogKey;
+								currentTransaction.open.clear();
+								trackOpenTransaction(auditRecord);
 								frame.encodingStart = frame.position;
 								frame.writeFloat64(txnLogKey);
 							}
@@ -10554,6 +10666,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									subscribedNodeIds[localId] = { startTime, endTime };
 									if (subscription !== ownOriginRange) subscribedNodeName = name;
 								}
+								// a peer that refuses copies skips the anchor probe, so a missing anchor would reconnect forever
+								ownLogAnchor = ownLogAppendAnchor(
+									ownSubscription,
+									auditStore.reusableIterable === true && !refusesCopies
+								);
 								// Only a multi-log range reads unlisted origins, and only per-origin logs carry their keys.
 								if (excludedNodes && auditStore.reusableIterable === true) {
 									const nameToId = sentIdMapping(auditStore, getThisNodeName());
@@ -10658,6 +10775,31 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											`A transaction-log scan for ${remoteNodeName} may have skipped an entry; writes waiting for confirmation from it time out until this connection reconnects`
 										);
 								};
+								// No more of this node's log goes out here: a key-filtered read could deliver a later entry past one it
+								// skipped, and the peer would resume past both. A corrupt frame is handled as on the main range, which
+								// sends every transaction before it and withholds the one it cut short; any other failure closes before
+								// the pending frame is flushed, and returns true so the peer resumes from what it holds.
+								const failOwnLogRead = (): boolean => {
+									const range = ownLogRange;
+									ownLogRangeFailed = true;
+									stopMarkers();
+									ownLogRange = undefined;
+									subscribedNodeIds[getThisNodeId(auditStore)] = false;
+									if (range.corruptFrameStop?.breaks > 0) {
+										ownLogCorruptRange = range;
+										return false;
+									}
+									logger.error?.(
+										connectionId,
+										`The append-order read of this node's log for ${remoteNodeName} on ${databaseName} failed; this node's writes are not sent on this connection, which reconnects`
+									);
+									range[Symbol.iterator]().return?.();
+									if (!supersededOrClosed()) {
+										closed = true;
+										close(1011, "this node's log could not be read in append order; reconnecting");
+									}
+									return true;
+								};
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
 								const originCertifies = (name: string): number => {
@@ -10667,6 +10809,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return level >= 1 ? level : 0;
 								};
 								const captureOriginFloors = (): Map<string, OriginCertificate> | undefined => {
+									if (TEST_WITHHOLD_ORIGIN_FLOORS) return undefined;
 									let floors: Map<string, OriginCertificate> | undefined;
 									try {
 										const thisNodeName = getThisNodeName();
@@ -10776,7 +10919,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// A commit landed after the stop while reconnects were in their floor: still owed once it ends.
 								let sendLogRecoveryPending = false;
 								let sendLogRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
-								let reportedMidLogBreakRange: unknown;
+								const reportedMidLogBreakRanges = new WeakSet<object>();
 								// A `return` from inside the loop (close, rejection) still runs this finally, so a timer
 								// armed in the exiting pass can never outlive it to wake a later, superseding loop that
 								// reused the connection-wide `wakeSender`.
@@ -10928,6 +11071,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													currentSequenceId = 0;
 												}
 											}
+											if (ownLogAnchor !== undefined && currentSequenceId > 0 && !refusesCopies) {
+												const failure = rangeBoundaryFailure(auditStore, ownLogPastAnchorRange(ownLogAnchor));
+												if (failure) {
+													const purgedThrough = getLogPurgeBounds(auditStore, 'local')?.get('local');
+													const trackedFrom = getLogPurgeTrackedFrom(auditStore);
+													// past an anchor that may be purged the entries the peer lacks may be gone too, and only a copy restores them
+													if (!(purgedThrough < ownLogAnchor && trackedFrom <= ownLogAnchor)) {
+														logger.warn?.(
+															`Peer ${remoteNodeName} holds no floor for this node on ${databaseName} and resumes this node's log past an entry (${ownLogAnchor}) that may be purged; forcing a bounded base-copy resync.`
+														);
+														currentSequenceId = 0;
+													} else {
+														logger.warn?.(
+															connectionId,
+															`${remoteNodeName} holds no floor for this node on ${databaseName}, and this node's log cannot resume past the entry it names (${ownLogAnchor}); resending the log from its oldest retained entry`,
+															failure instanceof Error ? failure : undefined
+														);
+														ownLogFromStart = true;
+													}
+												}
+											}
 											// the copy filters rows at or below the start, which holds only for a position taken from this
 											// copy; another subscription's start of 0 can have made it a copy already
 											if (otherGeneration && currentSequenceId === 0) {
@@ -10939,6 +11103,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (currentSequenceId > 0 || sendingProjection) subscriptionResidencySender?.replaying();
 											if (currentSequenceId === 0) {
 												copying = true;
+												ownLogAnchor = undefined;
 												const legacyCopy = await probeLegacyCopy();
 												if (legacyCopy) copyResume = undefined;
 												if (closed || wsClosed) return;
@@ -11036,6 +11201,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														log: excludedNodes ? undefined : logName,
 														excludeLogs: excludedNodes,
 														snapshot: false,
+														trackCorruptTransactions: true,
 													};
 													let anchors = relayedAnchors;
 													let relayedRange: any;
@@ -11073,6 +11239,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														startByLog: new Map([[logName, copyStartTime], ...(relayedAnchors ?? [])]),
 														excludeLogs: excludedNodes,
 														snapshot: false,
+														trackCorruptTransactions: true,
 													};
 													let anchors = relayedAnchors;
 													let unusable = boundaryFailure(boundaryRange);
@@ -11131,18 +11298,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													});
 													if (closed || wsClosed) return;
 												}
+												// The copy holds every entry of this node's own log through an anchor that names one, so a
+												// follower with no floor yet resumes this log past it (harper-pro#1454).
+												const copyAnchors =
+													anchoredInLogOrder && boundaryLogName === logName && anchorKey !== 0
+														? new Map([...(relayedAnchors ?? []), [getThisNodeName(), copyStartTime]])
+														: relayedAnchors;
 												// Tell the follower a bulk copy is starting, its anchor, and the copy-cursor version, so it tracks
 												// a resume cursor a later leader can validate before trusting the skip or the anchor.
 												ws.send(
 													encode(
-														relayedAnchors?.size &&
-															peerCapabilitiesLearned &&
-															peerSupportsOriginCursors(peerCapabilities)
+														copyAnchors?.size && peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities)
 															? [
 																	COPY_START,
 																	copyStartTime,
 																	COPY_ORDER_VERSION,
-																	Object.fromEntries(relayedAnchors),
+																	Object.fromEntries(copyAnchors),
 																	sendingProjection ? { shardingProjection: true } : undefined,
 																]
 															: [
@@ -11421,26 +11592,73 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											boundaryLogName = undefined;
 											auditLogIterable = deadAuditIterableForTest;
 										} else if (!(auditStore.reusableIterable && auditLogIterable)) {
-											// No append-order resume here — only the copy's own pre-positioned range above does that. A
-											// reconnect resumes with the subscription's startTime at the anchor key, and
-											// `matchesSubscription` below requires that startTime to be BELOW an entry's key, so an
-											// older-keyed entry this range would correctly yield is dropped by the subscription predicate
-											// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
+											// This range starts each log at a key, and a log read from a key skips every lower-keyed entry
+											// appended after it. Only the copy's pre-positioned range above, and `ownLogRange` for a
+											// receiver with no floor, resume past an entry in append order (harper-pro#876, #1454).
 											boundaryLogName = undefined;
-											const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
-											liveStartByLog = new Map([
-												[logName, currentSequenceId || 1],
-												...[...(originFloors ?? [])].filter(([name]) => !relabeled?.has(name)),
-											]);
-											auditLogIterable = auditStore.getRange({
-												start: currentSequenceId || 1,
-												exclusiveStart: true,
-												exactStart: false,
-												log: excludedNodes ? undefined : logName,
-												startByLog: liveStartByLog,
-												excludeLogs: excludedNodes,
-												snapshot: false, // don't want to use a snapshot, and we want to see new entries
-											});
+											const ownLogSent = excludedNodes
+												? !excludedNodes.includes(getThisNodeName())
+												: logName === 'local';
+											if (ownLogAnchor !== undefined && !ownLogRange && ownLogSent) {
+												ownLogRange = auditStore.getRange(
+													ownLogFromStart
+														? { log: 'local', start: 0, snapshot: false, trackCorruptTransactions: true }
+														: ownLogPastAnchorRange(ownLogAnchor)
+												);
+												// the peer holds every own key up to its anchor, so a handoff below it would resend them
+												ownLogMaxKeySent = ownLogAnchor;
+												ownLogAnchor = undefined;
+												const ownId = getThisNodeId(auditStore);
+												const own = subscribedNodeIds[ownId];
+												if (typeof own === 'object')
+													subscribedNodeIds[ownId] = { ...own, startTime: ownLogFilterStart(ownSubscription) };
+												if (excludedNodes && !excludedNodes.includes('local')) excludedNodes.push('local');
+											}
+											if (ownLogRange && !excludedNodes) auditLogIterable = ownLogRange;
+											else {
+												const relabeled = originFloors?.size ? namesSentUnderAnotherId(auditStore) : undefined;
+												liveStartByLog = new Map([
+													[logName, currentSequenceId || 1],
+													...[...(originFloors ?? [])].filter(([name]) => !relabeled?.has(name)),
+												]);
+												auditLogIterable = auditStore.getRange({
+													start: currentSequenceId || 1,
+													exclusiveStart: true,
+													exactStart: false,
+													log: excludedNodes ? undefined : logName,
+													startByLog: liveStartByLog,
+													excludeLogs: excludedNodes,
+													snapshot: false, // don't want to use a snapshot, and we want to see new entries
+													trackCorruptTransactions: true, // a transaction a corrupt frame cuts short is withheld
+												});
+											}
+										}
+										const ownLogSliced = ownLogRange !== undefined && ownLogRange !== auditLogIterable;
+										// read before the scan: every own key below it has settled, so a drained slice delivered them
+										const ownFloorAtPassStart = ownLogSliced ? readOriginClosedFloor(auditStore) : undefined;
+										if (ownLogSliced) {
+											// a cut pass skipped the end-of-pass flush; a failed own read must not drop another log's transaction
+											if (frame.position - frame.encodingStart > 8)
+												sendAuditRecord({ type: 'end_txn' }, currentSequenceId);
+											ownLogSlice.drained = false;
+											const own = ownLogRange[Symbol.iterator]();
+											for (let count = 0; ; count++) {
+												const next = own.next();
+												if (next.done) {
+													ownLogSlice.drained = true;
+													break;
+												}
+												const key: number = next.value.txnLogKey;
+												const status = getSharedStatus();
+												if (key > status[SENDING_TIME_POSITION]) status[SENDING_TIME_POSITION] = key;
+												if (key > currentSequenceId) currentSequenceId = key;
+												if (key > ownLogMaxKeySent) ownLogMaxKeySent = key;
+												await sendAuditRecord(next.value, key);
+												if (closed || wsClosed) return;
+												if (endsOwnLogSlice(count, next.value)) break;
+											}
+											// before a record of another log can flush the frame a failure cut short
+											if (ownLogReadFailed(ownLogRange) && failOwnLogRead()) return;
 										}
 										for (const auditRecord of auditLogIterable) {
 											const key: number = auditRecord.txnLogKey;
@@ -11465,6 +11683,35 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (key > auditSubscription.startTime) auditSubscription.startTime = key; // don't double send
 										}
 										if (closed || wsClosed) return;
+										if (
+											ownLogRange &&
+											ownLogRange === auditLogIterable &&
+											ownLogReadFailed(ownLogRange) &&
+											failOwnLogRead()
+										)
+											return;
+										if (ownLogSliced && ownLogRange) {
+											// a cut slice left entries of this log unsent, so this pass proves nothing: send the rest now
+											if (!ownLogSlice.drained) continue;
+											// Every own key below the floor is delivered, so the other logs' range carries this log from just below
+											// it. Only once the floor passes every key already sent: that range then resends none of them, however
+											// long a held transaction keeps the floor low.
+											if (isValidFloor(ownFloorAtPassStart) && ownFloorAtPassStart > ownLogMaxKeySent) {
+												const start = Math.max(
+													cursorBelowFloor(ownFloorAtPassStart),
+													ownLogFilterStart(ownSubscription)
+												);
+												ownLogRange[Symbol.iterator]().return?.();
+												ownLogRange = undefined;
+												const ownId = getThisNodeId(auditStore);
+												const own = subscribedNodeIds[ownId];
+												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: start };
+												liveStartByLog?.set('local', start);
+												const index = excludedNodes.indexOf('local');
+												if (index !== -1) excludedNodes.splice(index, 1);
+												auditLogIterable.addLog?.('local');
+											}
+										}
 										// Backstop for the pre-COPY_START probe, which pulled a different iterable. Every failure signal
 										// counts, not just the boundary one: a local iterator that dies mid-pass leaves the reusable
 										// iterable exhausted while the follower's cursor keeps advancing. Drop the append-order range and
@@ -11483,6 +11730,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												databaseName,
 												boundaryLogName
 											);
+											// before the range that holds the evidence is dropped, so the next pass cannot flush a cut transaction
+											if (currentTransaction.txnLogKey) dropTransactionCutByCorruptFrame();
 											boundaryLogName = undefined;
 											auditLogIterable = undefined;
 											stopMarkers();
@@ -11519,6 +11768,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														end: ownOriginRange.endTime,
 														exclusiveStart: true,
 														snapshot: false,
+														trackCorruptTransactions: true,
 													})
 												: [];
 											for (const auditRecord of recoveryRange) {
@@ -11537,6 +11787,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												await sendAuditRecord(auditRecord, auditRecord.txnLogKey);
 											}
 											if (closed || wsClosed) return;
+											if (currentTransaction.txnLogKey) dropTransactionCutByCorruptFrame(recoveryRange);
 											if (frame.position - frame.encodingStart > 8)
 												sendAuditRecord({ type: 'end_txn' }, currentSequenceId);
 											settleOwnOriginRange(ownOriginRange, recoveryRange);
@@ -11546,17 +11797,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// peer's durable and per-origin cursors position the next range, which a sender-side reseed
 										// cannot do safely (harper-pro#876). The stopped range stays in place until then, so the
 										// certification check below still sees its failure.
-										if (range?.corruptFrameStop?.breaks > 0 && auditStore.reusableIterable) {
-											if (range.corruptFrameStop.midLogBreak) {
+										const stoppedRanges =
+											range?.corruptFrameStop?.breaks > 0 || ownLogCorruptRange
+												? [...new Set([range, ownLogCorruptRange])].filter(
+														(stopped: any) => stopped?.corruptFrameStop?.breaks > 0
+													)
+												: NO_STOPPED_RANGES;
+										// a torn tail recovers by reconnecting, even while another log is held at a mid-log break
+										const tornTailStopped = stoppedRanges.some((stopped: any) => !stopped.corruptFrameStop.midLogBreak);
+										if (stoppedRanges.length > 0 && auditStore.reusableIterable) {
+											for (const stopped of stoppedRanges) {
+												if (!stopped.corruptFrameStop.midLogBreak || reportedMidLogBreakRanges.has(stopped)) continue;
+												reportedMidLogBreakRanges.add(stopped);
+												logger.error?.(
+													connectionId,
+													`Replication send to ${remoteNodeName} (db: "${databaseName}") stopped at a mid-log corrupt transaction-log frame; entries behind it are not sent on this connection. Repair the transaction log or re-clone this node.`
+												);
+											}
+											if (!tornTailStopped) {
 												// Core's fail-stop: no fresh range can cross a mid-log break, so reconnecting would only churn.
 												sendLogRecoveryPending = false;
-												if (reportedMidLogBreakRange !== range) {
-													reportedMidLogBreakRange = range;
-													logger.error?.(
-														connectionId,
-														`Replication send to ${remoteNodeName} (db: "${databaseName}") stopped at a mid-log corrupt transaction-log frame; entries behind it are not sent on this connection. Repair the transaction log or re-clone this node.`
-													);
-												}
 											} else if (sendLogStopGeneration === undefined) {
 												sendLogStopGeneration = nextTransaction;
 											} else if (
@@ -11613,7 +11873,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														`A transaction-log scan for ${remoteNodeName} reported a failure; origin floors are no longer certified on this connection until it reconnects`
 													);
 												floorEmissionLatchedRange = liveRange;
-											} else if (floorEmissionLatchedRange !== liveRange) certifyOriginFloors(capturedFloors);
+											} else if (floorEmissionLatchedRange !== liveRange && !ownLogRangeFailed)
+												certifyOriginFloors(capturedFloors);
 											capturedFloors = undefined;
 										}
 										let markersProven = false;
@@ -13812,6 +14073,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				let floorOnlyStart: number | undefined;
 				let floorOnlyGeneration: string | undefined;
 				let floorBoundedStart = false;
+				let ownLogResumeAfter: number | undefined;
 				if (copyCursor) requestIsCopy = true;
 				const allNodes: any[] = (sequenceEntry?.nodes ?? [])
 					.filter((state: any) => state && typeof state.id === 'number')
@@ -13974,6 +14236,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
 						floorBoundedStart = isValidFloor(ownState?.closedFloor);
 					}
+					// a revocation pending clears the floor this row holds, so only the peer's log order is proven
+					if (!floorBoundedStart && floorOnlyStart === undefined && !restrictedOrigins)
+						ownLogResumeAfter = ownLogResumeAnchor(
+							nodeId !== undefined && pendingRouteState.hasPendingRevocation(nodeId)
+								? { ...ownState, closedFloor: undefined }
+								: ownState
+						);
 				}
 				if (copyCursor) {
 					copyWasResumed = !copyCursor.restartFullCopy;
@@ -14198,6 +14467,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					refusesCopies: restrictedOrigins,
 					copyResume, // present only when resuming an interrupted bulk copy
 					...(floorOnlyStart !== undefined && startTime === floorOnlyStart && { floorGeneration: floorOnlyGeneration }),
+					// an older sender ignores it and filters its log by `startTime`
+					...(ownLogResumeAfter !== undefined &&
+						startTime > 1 &&
+						!copyResume &&
+						!shardingProjection && {
+							resumeAfter: ownLogResumeAfter,
+							...(startCutoff !== undefined && { startCutoff }),
+						}),
 				};
 			});
 		if (
@@ -14602,11 +14879,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				: undefined;
 		if (peerStamp === undefined && !rows.newer) return;
 		if (connectionSuperseded()) return;
-		if (stampTableCreatedTime(localTable, peerStamp ?? tableLifecycleTime(droppedTime)))
+		const createdTime = peerStamp ?? tableLifecycleTime(droppedTime);
+		if (stampTableCreatedTime(localTable, createdTime)) {
 			logger.warn?.(
 				connectionId,
 				`Stamped ${schemaDatabaseName}.${localTable.tableName} as a generation newer than the drop ${remoteNodeName} relays: it was created on a build that kept no stamp and holds no row older than the drop`
 			);
+			void broadcast({
+				type: TABLE_STAMPED,
+				databaseName: schemaDatabaseName,
+				tableName: localTable.tableName,
+				createdTime,
+			});
+		}
 	}
 	/** A peer's marker for a definition, while its database is not open here to record it in. */
 	function frameRetires(markers: Array<{ table: string; droppedTime: number }>, definition: any) {

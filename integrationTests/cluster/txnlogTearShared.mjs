@@ -34,7 +34,7 @@ export const DATABASE = 'data';
 export const TABLE = 'torn';
 const SEED_TABLE = 'seed';
 const SEED_ID = 'seed';
-const BATCH_ONE = 10;
+export const BATCH_ONE = 10;
 const BATCH_TWO = 50;
 export const TOTAL = BATCH_ONE + BATCH_TWO;
 

@@ -12,19 +12,21 @@
  *   hole without a close/resume, and receives every entry behind it. r40 is not dropped by B: it is
  *   gone from A's log, and nothing reports it.
  * - Overrun into the neighbour (the issue's construction): the same undecodable r39, but the reader
- *   lands mid-way through r40, so a mid-log break follows the torn entry. B drops r39 without a
- *   close/resume; A's fail-stop then holds back everything behind the break and reports it.
- * - Partial append, characterizing an open defect: r39's last bytes are missing, so its declared
- *   length takes in r40's header. That payload still decodes, and B stores r39 with the wrong value
- *   and reports nothing, while A's fail-stop holds back what follows. Pinned so a fix has to change it.
+ *   lands mid-way through r40, so a mid-log break follows the torn entry. The break cuts the source
+ *   transaction short, so A withholds it whole (harper-pro#1475): B keeps only the first batch and
+ *   never sees r39, and A's fail-stop holds back everything behind the break and reports it.
+ * - Partial append: r39's last bytes are missing, so its declared length takes in r40's header. That
+ *   payload still decodes, which used to let B store r39 with the wrong value; the break that follows
+ *   now withholds the whole transaction, so B holds neither r39 nor anything else of it.
  */
 import { suite, test, before, after } from 'node:test';
-import { notStrictEqual, ok, strictEqual } from 'node:assert';
+import { ok, strictEqual } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { sendOperation, waitForCondition } from './clusterShared.mjs';
 import {
+	BATCH_ONE,
 	CONVERGE_TIMEOUT_MS,
 	DATABASE,
 	ENTRY_HEADER_SIZE,
@@ -38,7 +40,6 @@ import {
 	breakDiagnostic,
 	insertRows,
 	locateTearTarget,
-	payloadFor,
 	readFrames,
 	readLogs,
 	readRows,
@@ -90,62 +91,50 @@ suite(
 );
 
 suite(
-	'Readable txnlog tear into the next frame: B drops the torn entry, then A stops at the break',
+	'Readable txnlog tear into the next frame: A withholds the torn transaction and stops at the break',
 	{ timeout: 300_000 },
 	(ctx) => {
 		before(() => startTearPair(ctx));
 		after(() => stopTearPair(ctx));
 
-		test('B holds the rows before the torn entry and logs the drop without a close/resume; A stops at the break', async () => {
+		test('B holds only the transactions before the torn one and never sees the torn entry; A withholds it and stops at the break', async () => {
 			const { stoppedA, stoppedB, torn } = await resumeFromTornSource(ctx, overrunIntoNeighbour);
 			const tornId = rowId(torn.index);
-			await waitForRowCount(ctx.nodeB, torn.index);
 			await waitForBreakReport(ctx, stoppedA, torn);
-			await waitForLog([stoppedB, ctx.nodeB], [decodeDrop(tornId), hole(ctx.nodeA)], 'B');
 
 			const rows = await readRowsAfterQuarantine(ctx);
 			await assertNeverCopied(ctx.nodeB, QUARANTINED);
-			assertExactRows(rows, rowIds(0, torn.index), QUARANTINED);
-			strictEqual(countCloses(await readLogs([stoppedB, ctx.nodeB])), 0, CLOSED_ON_TORN_ENTRY);
+			assertExactRows(rows, rowIds(0, BATCH_ONE), QUARANTINED);
+			const logB = await readLogs([stoppedB, ctx.nodeB]);
+			ok(!decodeDrop(tornId).test(logB), `B received the withheld ${tornId}`);
+			ok(!hole(ctx.nodeA).test(logB), 'B recorded a replication hole');
+			strictEqual(countCloses(logB), 0, CLOSED_ON_TORN_ENTRY);
 			await recordStatus(ctx, rows);
 		});
 	}
 );
 
 suite(
-	'Readable txnlog tear from a partial append (characterizes an open defect): B silently applies the torn entry',
+	'Readable txnlog tear from a partial append: A withholds the torn transaction, so B never applies the torn entry',
 	{ timeout: 300_000 },
 	(ctx) => {
 		before(() => startTearPair(ctx));
 		after(() => stopTearPair(ctx));
 
-		test('B stores the torn entry with the wrong payload and reports nothing; A stops at the break', async () => {
+		test('B holds only the transactions before the torn one and never applies the torn entry; A stops at the break', async () => {
 			const { stoppedA, stoppedB, torn } = await resumeFromTornSource(ctx, partialAppend);
 			const tornId = rowId(torn.index);
-			await waitForRowCount(ctx.nodeB, torn.index + 1);
 			await waitForBreakReport(ctx, stoppedA, torn);
 
 			const rows = await readRowsAfterQuarantine(ctx);
 			await assertNeverCopied(ctx.nodeB, QUARANTINED);
-			const tornRow = rows.find((row) => row.id === tornId);
-			ok(tornRow, `B does not hold ${tornId}`);
-			assertExactRows(
-				rows.filter((row) => row !== tornRow),
-				rowIds(0, torn.index),
-				QUARANTINED
-			);
-			const written = payloadFor(tornId);
-			notStrictEqual(tornRow.payload, written, `B holds ${tornId} intact, so the torn entry was not applied as read`);
-			ok(
-				tornRow.payload.startsWith(written.slice(0, -ENTRY_HEADER_SIZE)),
-				`B's ${tornId} does not keep the bytes the partial append wrote: ${JSON.stringify(tornRow.payload)}`
-			);
+			ok(!rows.some((row) => row.id === tornId), `B applied the torn ${tornId}`);
+			assertExactRows(rows, rowIds(0, BATCH_ONE), QUARANTINED);
 
 			const logB = await readLogs([stoppedB, ctx.nodeB]);
-			ok(!decodeDrop(tornId).test(logB), `B reported ${tornId} as undecodable`);
+			ok(!decodeDrop(tornId).test(logB), `B received the withheld ${tornId}`);
 			ok(!hole(ctx.nodeA).test(logB), 'B recorded a replication hole');
 			strictEqual(countCloses(logB), 0, CLOSED_ON_TORN_ENTRY);
-			console.log(`B stored ${tornId} as ${JSON.stringify(tornRow.payload)}`);
 			await recordStatus(ctx, rows);
 		});
 	}
