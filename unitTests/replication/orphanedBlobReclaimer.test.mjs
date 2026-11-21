@@ -1,7 +1,4 @@
-/**
- * createOrphanedBlobReclaimer releases a fully received blob stream no record claimed once
- * ORPHANED_BLOB_RECORD_FRAMES record frames settle after its final chunk (harper-pro#659).
- */
+/** createOrphanedBlobReclaimer (harper-pro#659); the ordering argument is replication/DESIGN.md item 40. */
 import { expect } from 'chai';
 import { createOrphanedBlobReclaimer, ORPHANED_BLOB_RECORD_FRAMES } from '#src/replication/replicationConnection';
 

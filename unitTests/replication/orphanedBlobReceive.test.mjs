@@ -1,8 +1,4 @@
-/**
- * A fully received blob that no record claims is released once two record frames have settled after it
- * (harper-pro#659), rather than held for `blobTimeout` (900s). Drives the real inbound handlers of
- * `replicateOverWS` over a fake socket against a real audited table.
- */
+/** Drives replicateOverWS over a fake socket: an unclaimed blob is released after two settled record frames (#659). */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { decode, encode } from 'msgpackr';

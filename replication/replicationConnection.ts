@@ -1767,7 +1767,6 @@ export function createOrphanedBlobReclaimer(maxTombstones: number = ORPHANED_BLO
 		forget(streamKey: string): void {
 			awaitingRecord.delete(streamKey);
 		},
-		/** Returns how many streams it removed from `blobsInFlight` and handed to `onReclaim`. */
 		recordFrameProcessed<S extends ReclaimableBlobStream>(
 			blobsInFlight: Map<string, S>,
 			onReclaim: (streamKey: string, stream: S) => void,
@@ -1795,7 +1794,6 @@ export function createOrphanedBlobReclaimer(maxTombstones: number = ORPHANED_BLO
 			}
 			return count;
 		},
-		/** Consumes the tombstone. */
 		takeReclaimed(streamKey: string): boolean {
 			return reclaimed.delete(streamKey);
 		},
@@ -9507,10 +9505,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									blobsInFlight.delete(streamKey);
 									orphanedBlobs.forget(streamKey);
 									unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
-								} else stream.end(blobBody);
+								} else {
+									stream.end(blobBody);
+									if (!stream.connectedToBlob && !stream.destroyed)
+										orphanedBlobs.completedUnconnected(streamKey, stream);
+								}
 								if (stream.connectedToBlob) blobsInFlight.delete(streamKey);
-								else if (stream.writableEnded && !stream.destroyed)
-									orphanedBlobs.completedUnconnected(streamKey, stream);
 							} else if (stream.destroyed || stream.writableEnded) {
 								// The stream was already torn down before this mid-blob chunk arrived —
 								// typically because saveBlob's pipeline failed (e.g. ENOENT on
