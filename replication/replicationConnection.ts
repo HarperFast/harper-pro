@@ -1743,6 +1743,99 @@ export function isReplicationConnectionClosedError(error: unknown): boolean {
 	);
 }
 
+/**
+ * How many record-carrying frames must finish processing after a blob's final chunk before a stream no
+ * record has attached to is treated as orphaned. One suffices by construction (see
+ * {@link createOrphanedBlobReclaimer}); the second is margin.
+ */
+export const ORPHANED_BLOB_RECORD_FRAMES = 2;
+/** Cap on remembered reclaimed transfers, so a reclaim-heavy connection cannot grow the tombstones without bound. */
+export const ORPHANED_BLOB_TOMBSTONE_MAX = 10_000;
+
+type ReclaimableBlobStream = { connectedToBlob?: boolean };
+
+/**
+ * Receive-side bound for blob bytes that no record will ever consume (harper-pro#659).
+ *
+ * A blob whose chunks outrun its record is buffered in memory, never back-pressured: pausing the socket
+ * would block the very record that attaches the consumer. A fully received stream whose record never
+ * comes (a skipped duplicate, a record a skip path drops without discarding its blobs) used to sit in
+ * `blobsInFlight` until the `blobsTimer` sweep, `blobTimeout` (900s) later, so a base copy retained
+ * `receive rate × blobTimeout` bytes and OOM-killed the node.
+ *
+ * Whether that record can still arrive follows from wire order rather than a clock. The sender starts a
+ * blob (`sendBlobs`) while encoding its record into the frame it is assembling, and that frame is the
+ * next record frame it flushes; the socket delivers frames in order and `messageProcessing` handles them
+ * one at a time. So once a record-carrying frame that arrived after the blob's final chunk has been fully
+ * processed, the record either attached the stream or is not coming. Reclaiming after
+ * {@link ORPHANED_BLOB_RECORD_FRAMES} such frames bounds the buffered bytes to the blobs of about one
+ * frame, whatever the receive rate.
+ *
+ * Reclaimed transfers keep a tombstone. Should a record still arrive for one, `receiveBlobs` fails that
+ * save with a plain (transient) error, which holds the resume cursor at the gap and lets the reconnect
+ * re-stream the blob: a broken ordering assumption costs a reconnect, never data.
+ */
+export function createOrphanedBlobReclaimer(maxTombstones: number = ORPHANED_BLOB_TOMBSTONE_MAX) {
+	let recordFramesProcessed = 0;
+	// insertion order is completion order, so the due entries are always at the front
+	const awaitingRecord = new Map<string, { stream: ReclaimableBlobStream; frames: number }>();
+	const reclaimed = new Map<string, number>();
+	return {
+		/** The stream received its final chunk while no record had attached to it. */
+		completedUnconnected(streamKey: string, stream: ReclaimableBlobStream): void {
+			awaitingRecord.delete(streamKey);
+			awaitingRecord.set(streamKey, { stream, frames: recordFramesProcessed });
+		},
+		/** A record attached to the transfer. */
+		attached(streamKey: string): void {
+			awaitingRecord.delete(streamKey);
+		},
+		/**
+		 * A record-carrying frame finished processing. Removes each stream that has waited
+		 * {@link ORPHANED_BLOB_RECORD_FRAMES} frames and is still unattached and still the map's entry, hands
+		 * it to `onReclaim` (which releases it), and returns how many it reclaimed.
+		 */
+		recordFrameProcessed<S extends ReclaimableBlobStream>(
+			blobsInFlight: Map<string, S>,
+			onReclaim: (streamKey: string, stream: S) => void,
+			now: number = Date.now()
+		): number {
+			recordFramesProcessed++;
+			let count = 0;
+			for (const [streamKey, entry] of awaitingRecord) {
+				if (recordFramesProcessed - entry.frames < ORPHANED_BLOB_RECORD_FRAMES) break;
+				awaitingRecord.delete(streamKey);
+				const stream = blobsInFlight.get(streamKey);
+				if (stream !== entry.stream || stream.connectedToBlob) continue;
+				blobsInFlight.delete(streamKey);
+				reclaimed.delete(streamKey);
+				reclaimed.set(streamKey, now);
+				if (reclaimed.size > maxTombstones) reclaimed.delete(reclaimed.keys().next().value);
+				onReclaim(streamKey, stream);
+				count++;
+			}
+			return count;
+		},
+		/** Whether this transfer was reclaimed as orphaned; consumes its tombstone. */
+		takeReclaimed(streamKey: string): boolean {
+			return reclaimed.delete(streamKey);
+		},
+		/** Forget tombstones reclaimed at or before `cutoff`. */
+		expireReclaimed(cutoff: number): void {
+			for (const [streamKey, reclaimedAt] of reclaimed) {
+				if (reclaimedAt > cutoff) break;
+				reclaimed.delete(streamKey);
+			}
+		},
+		get awaitingRecordCount(): number {
+			return awaitingRecord.size;
+		},
+		get reclaimedCount(): number {
+			return reclaimed.size;
+		},
+	};
+}
+
 /** Keeps separate copy transfers of a reused file id from sharing receive state. */
 export function getBlobTransferKey(fileId: unknown, transferId: number | undefined): string {
 	return transferId === undefined ? `file:${fileId}` : `transfer:${transferId}`;
@@ -6847,6 +6940,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Retired by the blob's own final chunk, by a record that does apply the same transfer, or by
 	// the connection closing.
 	const skippedBlobIds = new Map<any, number>();
+	// Releases fully received blob streams whose record is no longer coming (harper-pro#659); fed by the
+	// chunk handler, stepped as each record-carrying frame settles.
+	const orphanedBlobs = createOrphanedBlobReclaimer();
+	let frameCarriedRecords = false;
+	const orphanedBlobWarnThrottle = createThrottleState();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
 	const blobSentCallbacks: Array<(v?: any) => void> = [];
@@ -8385,6 +8483,24 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return (tableDecoder.refused = isDroppedPeerGeneration(databaseName, tableDecoder.name, tableDecoder.createdTime));
 	}
 
+	// A record frame settled: release completed blob streams whose record should have arrived by now (#659).
+	function reclaimOrphanedBlobs() {
+		let bytes = 0;
+		const reclaimed = orphanedBlobs.recordFrameProcessed(blobsInFlight, (streamKey, stream) => {
+			bytes += (stream.readableLength ?? 0) + (stream.writableLength ?? 0);
+			logger.debug?.(connectionId, 'Reclaiming orphaned blob stream', streamKey, 'from', remoteNodeName);
+			unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
+			stream.destroy(new Error(`Blob ${stream.fileId} from ${remoteNodeName} was never claimed by a record`));
+		});
+		if (reclaimed > 0)
+			warnThrottled(orphanedBlobWarnThrottle, 'Released received blobs no replicated record claimed', {
+				database: databaseName,
+				node: remoteNodeName,
+				streams: reclaimed,
+				bytes,
+			});
+	}
+
 	// Blobs are announced ahead of their record, so a skipped record's are already buffered; without this they
 	// would sit until the blobsTimer sweep a blobTimeout later (900s default).
 	function discardRecordBlobs(auditRecord: AuditRecord, tableDecoder: { decoder: any }) {
@@ -8426,6 +8542,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// pause-stall watchdog reads a draining queue as a dead leg (#466).
 					consumerProgress++;
 					if (receiveQueue.settle(queuedBytes)) removePauseReason();
+					if (frameCarriedRecords) {
+						frameCarriedRecords = false;
+						reclaimOrphanedBlobs();
+					}
 				} catch (error) {
 					// Nothing handles the tail of `messageProcessing`, so a throw here would surface as an
 					// unhandled rejection with the pause refcount half-updated.
@@ -9411,6 +9531,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
 								} else stream.end(blobBody);
 								if (stream.connectedToBlob) blobsInFlight.delete(streamKey);
+								else if (stream.writableEnded && !stream.destroyed)
+									orphanedBlobs.completedUnconnected(streamKey, stream);
 							} else if (stream.destroyed || stream.writableEnded) {
 								// The stream was already torn down before this mid-blob chunk arrived —
 								// typically because saveBlob's pipeline failed (e.g. ENOENT on
@@ -9442,8 +9564,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// stranding it forever (the same wedge class as the destroyed/ended guard above,
 									// but for a not-yet-connected stream — the base-copy receive deadlock). Let the
 									// chunk buffer instead; saveBlob attaches and drains it once the record arrives.
-									// Exposure is bounded by the sender's in-flight blob cap
-									// (MAX_OUTSTANDING_BLOBS_BEING_SENT) and the blobsTimer reclaims a truly orphaned stream.
+									// The sender's in-flight cap does NOT bound this (a blob leaves it once sent, not
+									// once attached); what does is that its record arrives within the next record frame,
+									// so createOrphanedBlobReclaimer releases a completed stream whose record never came
+									// (harper-pro#659), and the blobsTimer sweep one that never completes.
 								} else {
 									addPauseReason();
 									const release = () => {
@@ -11880,6 +12004,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					break;
 				}
 				const start = decoder.position;
+				frameCarriedRecords = true;
 				const auditRecord = readAuditEntry(body, start, start + eventLength);
 				if (!isValidRecordVersion(auditRecord.version)) {
 					recordAction(true, DECODE_HOLD_METRIC, databaseName + '.record-version');
@@ -13255,9 +13380,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		skippedBlobIds.delete(streamKey);
 		let stream = blobsInFlight.get(streamKey);
 		logger.debug?.('Received transaction with blob', blobId, 'has stream', !!stream, 'ended', !!stream?.writableEnded);
+		let reclaimedBeforeRecord = false;
 		if (stream) {
+			orphanedBlobs.attached(streamKey);
 			if (stream.writableEnded) blobsInFlight.delete(streamKey);
 		} else {
+			reclaimedBeforeRecord = orphanedBlobs.takeReclaimed(streamKey);
 			stream = createBlobReceiveStream(blobTimeout);
 			stream.fileId = blobId;
 			blobsInFlight.set(streamKey, stream);
@@ -13325,6 +13453,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			);
 		}
 		stream.blob = localBlob; // record the blob so we can reuse it if another request uses the same blob
+		if (reclaimedBeforeRecord && !stream.destroyed) {
+			// Its bytes were released as orphaned and will not be sent again on this connection. A plain error
+			// is transient to the save's .catch: it holds the resume cursor and the reconnect re-streams the blob.
+			logger.warn?.(
+				connectionId,
+				`Record ${id} arrived for blob ${blobId} after its bytes were released as unclaimed; re-requesting it on reconnect`
+			);
+			stream.destroy(new Error(`Blob ${blobId} from ${remoteNodeName} was released before its record arrived`));
+		}
 		if (finished && !stream.writableEnded && !stream.destroyed) {
 			// The close handler may have swept blobsInFlight before this already-queued record handler
 			// creates and attaches its stream. Without this post-attach ownership check, the orphaned
@@ -14645,6 +14782,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			for (const [streamKey, skippedAt] of skippedBlobIds) {
 				if (skippedAt + blobTimeout <= now) skippedBlobIds.delete(streamKey);
 			}
+			orphanedBlobs.expireReclaimed(now - blobTimeout);
 			// Sweep more often than the idle threshold: with the interval coupled to blobTimeout (900s
 			// default), an orphaned stream could hold its buffered chunks for up to 2x blobTimeout.
 		},
