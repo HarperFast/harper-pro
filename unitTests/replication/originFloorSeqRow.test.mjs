@@ -332,7 +332,7 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 		subscription.end();
 	});
 
-	it('refuses an origin a copy dropped a record of, and once a later complete pass fills it admits only starts after that pass', async function () {
+	it('refuses an origin a copy dropped a record of, through any later pass, until the node is rebuilt', async function () {
 		this.timeout(30_000);
 		const T = table({
 			table: 'CopyHoleAdmission',
@@ -347,9 +347,8 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 		const listener = (event) => listener.values.push(event?.value?.value);
 		listener.values = [];
 		const subscription = await T.subscribe({ omitCurrent: true, reportProgress: true, listener });
-		let releaseSource, sendRecertification;
+		let releaseSource;
 		const held = new Promise((resolve) => (releaseSource = resolve));
-		const recertification = new Promise((resolve) => (sendRecertification = resolve));
 		const txnStream = {};
 		const routeUpdate = (floor, routeStates) => {
 			const event = {
@@ -375,7 +374,6 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 					subscribeOnThisThread: () => true,
 					async *subscribe() {
 						yield routeUpdate(floor, [[origin, floor - 1000, undefined, undefined, 'origin-generation']]);
-						yield await recertification;
 						await held;
 					},
 				},
@@ -399,45 +397,20 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 				'no route certifies an origin missing a record'
 			);
 
-			// a later pass from Q copies everything again and drops nothing: it fills the hole, but its snapshot carries
-			// no audit entry for the dropped record, so a checkpoint from before it still cannot be resumed
-			const copyStart = Date.now();
-			await settleCopyBounds(T.dbisDB, new Map(), copier, rootStore, 'later-pass', readCopyHoles(T.dbisDB), copyStart);
-			assert.deepEqual(readCopyHoles(T.dbisDB), []);
+			await settleCopyBounds(T.dbisDB, new Map(), copier, rootStore, 'later-pass');
+			assert.equal(readCopyHoles(T.dbisDB).length, 1);
 			await assert.rejects(
 				T.subscribe({ resume: token, omitCurrent: true }),
 				(error) => error.statusCode === 410,
-				'a checkpoint from before the filled hole stays refused'
+				'a checkpoint from before stays refused'
 			);
-
-			// the route certifies again from after the pass, as its next fresh socket does: the void start cleared first
-			await T.put('b', { value: 'b' });
-			await waitFor(() => listener.values.includes('b'), 'a later live write');
-			await new Promise((resolve) => setTimeout(resolve, 2));
-			const laterFloor = certify(T);
-			assert.ok(laterFloor > copyStart + 1);
-			sendRecertification(
-				routeUpdate(laterFloor, [
-					[origin, undefined, true, undefined, 'origin-generation'],
-					[origin, copyStart + 1, false, undefined, 'origin-generation'],
-				])
-			);
-			let laterToken;
-			await waitFor(
-				() => (laterToken = subscription.checkpoint())?.members === members && laterToken.time >= laterFloor,
-				'a checkpoint after the recertification'
-			);
-			const readmitted = await T.subscribe({ resume: laterToken, omitCurrent: true, listener: () => {} });
-			assert.strictEqual(await readmitted.resumeVerified, true, 'a start after the filled hole is admitted');
-			readmitted.end();
 		} finally {
 			releaseSource();
-			sendRecertification(undefined);
 			subscription.end();
 		}
 	});
 
-	it('never releases a loss a pass recorded after another pass captured its hole', async () => {
+	it('a revision replaces the one before it and keeps every origin the pass lost', async () => {
 		const T = table({
 			table: 'CopyHoleRevisions',
 			database: 'copy_hole_revisions',
@@ -448,18 +421,15 @@ describe("one writer per [seq, peer] row: another route's copy never rewrites it
 		const [x, y] = ['origin-x', 'origin-y'].map((name) => getIdOfRemoteNode(name, T.auditStore));
 		const rootStore = T.primaryStore.rootStore;
 		await persistCopyHole(T.dbisDB, copier, rootStore, 'pass-a', 1, [x], 100);
-		// a clean pass begins, and captures what stands
-		const captured = readCopyHoles(T.dbisDB);
-		// pass A then drops a record of another origin: a new revision, which releases the one captured
-		const [first] = captured;
+		const [first] = readCopyHoles(T.dbisDB);
 		await persistCopyHole(T.dbisDB, copier, rootStore, 'pass-a', 2, [x, y], 200, first.slot);
-		await settleCopyBounds(T.dbisDB, new Map(), copier, rootStore, 'pass-b', captured, 150);
-		const standing = readCopyHoles(T.dbisDB);
+		await settleCopyBounds(T.dbisDB, new Map(), copier, rootStore, 'pass-b');
 		assert.deepEqual(
-			standing.map(({ origins, lossKey }) => [origins.sort(), lossKey]),
-			[[[x, y].sort(), 200]],
-			'the later loss stays'
+			readCopyHoles(T.dbisDB).map(({ origins, lossKey }) => [origins.sort(), lossKey]),
+			[[[x, y].sort(), 200]]
 		);
-		assert.strictEqual(readCopyBounds(T.dbisDB).get(y), HOLE_COPY_BOUND);
+		const bounds = readCopyBounds(T.dbisDB);
+		assert.strictEqual(bounds.get(x), HOLE_COPY_BOUND);
+		assert.strictEqual(bounds.get(y), HOLE_COPY_BOUND);
 	});
 });

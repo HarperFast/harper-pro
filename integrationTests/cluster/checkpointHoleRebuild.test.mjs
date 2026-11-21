@@ -9,7 +9,7 @@
  * B's projection from A drops `hole-1`, a record of an ordinary table, so B records a hole: it warns and lists the hole
  * in `cluster_status`. Replacing B the way the warning says (drain, `remove_node`, then `add_node` an empty node D under
  * a new name) leaves no hole: D's own projection carries `hole-1`. A multi-shard database admits no checkpoint across
- * shards yet, so admission after a fill is covered by `unitTests/replication/originFloorSeqRow.test.mjs` instead.
+ * shards yet, so admission refusing while a hole stands is covered by `unitTests/replication/originFloorSeqRow.test.mjs`.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal, match } from 'node:assert/strict';
