@@ -3324,6 +3324,52 @@ describe('Declarative tables keep control and event traffic independent of place
 			assert.notEqual(peerNode().hole, true);
 		}));
 
+	// A level-1 link keeps its socket across a scope change, so there the request fold decides what is owed.
+	for (const [change, declared] of [
+		['a table a later request leaves out stays owed', 'replicating'],
+		['a table a later request asks for becomes owed', 'non-replicating'],
+	])
+		it(`on a level-1 link ${change} (harper-pro#1213)`, () =>
+			atCheckpointLevel(async () => {
+				const peer = 'slot-control-peer';
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+				connection.exclusionOrigins = [peer];
+				let reconnects = 0;
+				connection.forceReconnect = () => reconnects++;
+				let Plain;
+				const { Records, socket } = await connect(
+					false,
+					'level1_fold_' + declared.replace('-', '_'),
+					true,
+					undefined,
+					(database) => {
+						Plain = plainTable(database, declared);
+					},
+					connection
+				);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				const peerNode = () => Records.dbisDB.getSync([SEQ, peerId])?.nodes?.find((node) => node.id === peerId);
+				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+				socket.emit('message', structureFrame(Plain));
+				const version = Date.now();
+				if (declared === 'non-replicating') {
+					socket.emit('message', recordFrame(Plain, 'put', 'unowed', { id: 'unowed' }, version));
+					await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId >= version || socket.closes.length);
+					assert.notEqual(peerNode()?.hole, true, 'the only request so far left the table out');
+				}
+				Plain.replicate = declared === 'non-replicating';
+				connection.emit('subscriptions-updated');
+				await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
+				socket.emit('message', recordFrame(Plain, 'put', 'in-flight', { id: 'in-flight' }, version + 1));
+				await until(() => peerNode()?.hole === true || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(reconnects, 0);
+				assert.equal(Plain.primaryStore.getEntry('in-flight'), undefined);
+			}));
+
 	it('a request sent while the socket is closing leaves its scope unchanged (harper-pro#1213)', () =>
 		atCheckpointLevel(async () => {
 			const peer = 'slot-control-peer';
