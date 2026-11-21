@@ -10,6 +10,7 @@ import { replicateOverWS } from '#src/replication/replicationConnection';
 // Registers server.operation, which the receive path dispatches through.
 import '#src/core/server/serverHelpers/serverUtilities';
 import { server } from '#src/core/server/Server';
+import { ClientError, ServerError } from '#src/core/utility/errors/hdbError';
 
 const OPERATION_REQUEST = 136;
 const OPERATION_RESPONSE = 137;
@@ -211,6 +212,228 @@ describe('answering an OPERATION_REQUEST', function () {
 			expect(answer.error).to.match(/unreadable result/);
 			server.operation = () => Promise.resolve({ recalled: true });
 			expect(await answerTo(12)).to.deep.equal({ recalled: true, requestId: 12 });
+			expect(socket.closes).to.deep.equal([]);
+		});
+	});
+});
+
+describe("an operation error's status across the connection", function () {
+	this.timeout(10_000);
+	const ANSWER_DEADLINE_MS = 3_000;
+	let realOperation;
+
+	beforeEach(() => {
+		realOperation = server.operation;
+	});
+
+	afterEach(() => {
+		server.operation = realOperation;
+	});
+
+	const rejectionOf = (answered) =>
+		answered.then(
+			(result) => expect.fail(`expected a rejection, got ${JSON.stringify(result)}`),
+			(error) => error
+		);
+
+	describe('between two sessions', () => {
+		class PairedSocket extends FakeSocket {
+			peer;
+			send(data) {
+				super.send(data);
+				setImmediate(() => this.peer.readyState === OPEN && this.peer.emit('message', data));
+			}
+		}
+		let requesterSocket, answererSocket, requester;
+
+		beforeEach(() => {
+			requesterSocket = new PairedSocket();
+			answererSocket = new PairedSocket();
+			requesterSocket.peer = answererSocket;
+			answererSocket.peer = requesterSocket;
+			requester = replicateOverWS(requesterSocket, {}, { name: 'peer-b', replicates: true });
+			replicateOverWS(answererSocket, {}, { name: 'peer-a', replicates: true });
+		});
+
+		afterEach(() => {
+			requesterSocket?.close(1000);
+			answererSocket?.close(1000);
+		});
+
+		const fail = () => rejectionOf(requester.sendOperation({ operation: 'remove_node_fence' }, ANSWER_DEADLINE_MS));
+		const lastAnswer = () => answererSocket.sent.at(-1)[1];
+
+		for (const [label, thrown, statusCode, text] of [
+			[
+				'a 409 refusal',
+				() => new ClientError('the removal was finalized', 409),
+				409,
+				'ClientError: the removal was finalized',
+			],
+			[
+				'a refusal with the default status',
+				() => new ClientError('node is required'),
+				400,
+				'ClientError: node is required',
+			],
+			[
+				'a server error',
+				() => new ServerError('another fence change is running', 503),
+				503,
+				'ServerError: another fence change is running',
+			],
+		]) {
+			it(`rejects ${label} with its status and its rendered text`, async () => {
+				server.operation = () => Promise.reject(thrown());
+				const error = await fail();
+				expect(error.statusCode).to.equal(statusCode);
+				expect(error.message).to.equal(text);
+			});
+		}
+
+		it('rejects an error that has no status without one', async () => {
+			server.operation = () => Promise.reject(new Error('boom'));
+			const error = await fail();
+			expect(error.message).to.equal('Error: boom');
+			expect(error).to.not.have.property('statusCode');
+			expect(lastAnswer()).to.not.have.property('statusCode');
+		});
+
+		it('keeps the status of an operation that throws before it returns a promise', async () => {
+			server.operation = () => {
+				throw new ClientError('not while a removal is running', 409);
+			};
+			expect((await fail()).statusCode).to.equal(409);
+		});
+
+		it('keeps the status of an error raised while the result is read for sending', async () => {
+			server.operation = () =>
+				Promise.resolve(
+					(async function* () {
+						yield { id: 1 };
+						throw new ClientError('the rows are gone', 409);
+					})()
+				);
+			const error = await fail();
+			expect(error.statusCode).to.equal(409);
+			expect(error.message).to.equal('ClientError: the rows are gone');
+		});
+
+		it('sends only an integer error status', async () => {
+			for (const statusCode of [200, 204, 399, 600, 409.5, '409', Number.NaN, null]) {
+				server.operation = () => Promise.reject(Object.assign(new Error('odd'), { statusCode }));
+				const error = await fail();
+				expect(error, `statusCode ${String(statusCode)}`).to.not.have.property('statusCode');
+				expect(lastAnswer(), `statusCode ${String(statusCode)}`).to.not.have.property('statusCode');
+			}
+		});
+
+		it('answers an error that renders as no text as an error', async () => {
+			for (const thrown of ['', { toString: () => '' }, { toString: () => 409 }]) {
+				server.operation = () => Promise.reject(thrown);
+				const error = await fail();
+				expect(error.message).to.equal('Error');
+				expect(error).to.not.have.property('statusCode');
+			}
+		});
+
+		it('contains an error answer that cannot be sent: the request ends at its own deadline', async () => {
+			server.operation = () => Promise.reject(new ClientError('the removal was finalized', 409));
+			answererSocket.send = () => {
+				throw new Error('socket write failed');
+			};
+			const unhandled = [];
+			const noteUnhandled = (reason) => unhandled.push(reason);
+			process.on('unhandledRejection', noteUnhandled);
+			try {
+				const error = await rejectionOf(requester.sendOperation({ operation: 'remove_node_fence' }, 200));
+				expect(error.message).to.match(/did not answer within 200ms/);
+			} finally {
+				process.off('unhandledRejection', noteUnhandled);
+			}
+			expect(unhandled).to.deep.equal([]);
+			expect(answererSocket.closes).to.deep.equal([]);
+		});
+
+		it('answers an error whose status throws on read as text, and answers the next operation', async () => {
+			server.operation = () =>
+				Promise.reject(
+					Object.defineProperty(new Error('boom'), 'statusCode', {
+						get() {
+							throw new Error('unreadable status');
+						},
+					})
+				);
+			const error = await fail();
+			expect(error.message).to.equal('Error: boom');
+			expect(error).to.not.have.property('statusCode');
+			server.operation = () => Promise.resolve({ fenced: true });
+			const answer = await requester.sendOperation({ operation: 'remove_node_fence' }, ANSWER_DEADLINE_MS);
+			expect(answer.fenced).to.equal(true);
+			expect(requesterSocket.closes).to.deep.equal([]);
+			expect(answererSocket.closes).to.deep.equal([]);
+		});
+	});
+
+	describe('for an answer as received', () => {
+		let socket, session;
+
+		beforeEach(() => {
+			socket = new FakeSocket();
+			session = replicateOverWS(socket, {}, { name: 'peer-a', replicates: true });
+		});
+
+		afterEach(() => {
+			socket?.close(1000);
+		});
+
+		async function rejectionFor(answer) {
+			const before = socket.sent.length;
+			const answered = rejectionOf(session.sendOperation({ operation: 'remove_node_fence' }, ANSWER_DEADLINE_MS));
+			expect(socket.sent).to.have.length(before + 1);
+			const [command, request] = socket.sent[before];
+			expect(command).to.equal(OPERATION_REQUEST);
+			socket.emit('message', encode([OPERATION_RESPONSE, { ...answer, requestId: request.requestId }]));
+			return answered;
+		}
+
+		it('reads a ClientError from a peer that sends no status as a 400', async () => {
+			const error = await rejectionFor({ error: 'ClientError: the removal was finalized' });
+			expect(error.statusCode).to.equal(400);
+			expect(error.message).to.equal('ClientError: the removal was finalized');
+		});
+
+		it('gives no status to any other error from a peer that sends none', async () => {
+			for (const text of ['ServerError: busy', 'Error: boom', 'ClientErrors: not the class', 'a ClientError: inside'])
+				expect(await rejectionFor({ error: text }), text).to.not.have.property('statusCode');
+		});
+
+		it("takes the peer's status whatever the error's class", async () => {
+			expect((await rejectionFor({ error: 'ClientError: finalized', statusCode: 409 })).statusCode).to.equal(409);
+			expect((await rejectionFor({ error: 'HdbError: not permitted', statusCode: 403 })).statusCode).to.equal(403);
+			expect((await rejectionFor({ error: 'FenceLockTimeout: busy', statusCode: 503 })).statusCode).to.equal(503);
+		});
+
+		it('falls back the same way when the status is not an integer error status', async () => {
+			for (const statusCode of [0, 200, 204, 302, 600, 409.5, '409', true, { valueOf: 409 }]) {
+				const label = `statusCode ${JSON.stringify(statusCode)}`;
+				expect((await rejectionFor({ error: 'ClientError: refused', statusCode })).statusCode, label).to.equal(400);
+				expect(await rejectionFor({ error: 'ServerError: busy', statusCode }), label).to.not.have.property(
+					'statusCode'
+				);
+			}
+		});
+
+		it('rejects an error that is not text without reading a class from it, and keeps the connection', async () => {
+			for (const malformed of [
+				{ toString: 1 },
+				{ name: 'ClientError', message: 'refused' },
+				['ClientError: refused'],
+			]) {
+				const error = await rejectionFor({ error: malformed });
+				expect(error.message).to.equal('The peer answered with an error that is not text');
+				expect(error, JSON.stringify(malformed)).to.not.have.property('statusCode');
+			}
 			expect(socket.closes).to.deep.equal([]);
 		});
 	});

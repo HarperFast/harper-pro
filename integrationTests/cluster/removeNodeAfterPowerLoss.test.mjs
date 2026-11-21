@@ -15,7 +15,14 @@ import { cp, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/pro
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { readLog, readNodePid, sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
+import {
+	postOperation,
+	readLog,
+	readNodePid,
+	sendOperation,
+	stopNodeProcess,
+	waitForCondition,
+} from './clusterShared.mjs';
 import {
 	DB,
 	bootstrapHomeMap,
@@ -81,8 +88,12 @@ async function waitForProcessGone(pid) {
 	);
 }
 
-const removeA = (coordinator, target) =>
-	operation(coordinator, { operation: 'remove_node', hostname: target.hostname, timeout: 120_000 });
+const removeA = (coordinator, target, signal) =>
+	postOperation(
+		coordinator,
+		{ operation: 'remove_node', hostname: target.hostname, timeout: 120_000, authorization: coordinator.admin },
+		{ signal: AbortSignal.any([AbortSignal.timeout(150_000), ...(signal ? [signal] : [])]) }
+	);
 
 suite('power loss on a node that is being removed', { timeout: 900_000 }, (ctx) => {
 	const contexts = [];
@@ -182,8 +193,7 @@ suite('power loss on a node that is being removed', { timeout: 900_000 }, (ctx) 
 			description: `A's recovery report to be parked in ${reportHoldDir}`,
 		});
 		const removal = await removeA(nodeB, nodeA);
-		// a refusal relayed from the node being removed keeps its text, not its status
-		assert.notEqual(removal.status, 200, JSON.stringify(removal.body));
+		assert.equal(removal.status, 409, JSON.stringify(removal.body));
 		assert.match(JSON.stringify(removal.body), RECOVERING);
 		await putCounter(nodeA, 'after', 1);
 		await waitForCounter([nodeA, nodeB, nodeC], 'after', 1);
@@ -196,8 +206,8 @@ suite('power loss on a node that is being removed', { timeout: 900_000 }, (ctx) 
 		await writeFile(join(reportHoldDir, 'release'), '');
 		let removal;
 		await waitForCondition(
-			async () => {
-				removal = await removeA(nodeB, nodeA);
+			async (signal) => {
+				removal = await removeA(nodeB, nodeA, signal);
 				if (removal.status === 200) return true;
 				assert.match(JSON.stringify(removal.body), RECOVERING, `an unexpected refusal: ${JSON.stringify(removal)}`);
 				return false;
