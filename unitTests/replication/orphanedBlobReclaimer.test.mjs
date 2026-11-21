@@ -1,9 +1,6 @@
 /**
- * Receive-side bound for blob bytes no record claims (harper-pro#659). A fully received blob stream whose
- * record never arrives used to sit in `blobsInFlight` until the blobsTimer sweep, `blobTimeout` (900s)
- * later, so a base copy retained `receive rate × blobTimeout` bytes and OOM-killed the node.
- * `createOrphanedBlobReclaimer` releases such a stream once ORPHANED_BLOB_RECORD_FRAMES record frames have
- * settled after its final chunk, and tombstones it so a late record fails fast instead of waiting.
+ * createOrphanedBlobReclaimer releases a fully received blob stream no record claimed once
+ * ORPHANED_BLOB_RECORD_FRAMES record frames settle after its final chunk (harper-pro#659).
  */
 import { expect } from 'chai';
 import { createOrphanedBlobReclaimer, ORPHANED_BLOB_RECORD_FRAMES } from '#src/replication/replicationConnection';
@@ -71,7 +68,7 @@ describe('createOrphanedBlobReclaimer (harper-pro#659)', () => {
 		]);
 		reclaimer.completedUnconnected('transfer:a', viaAttach);
 		reclaimer.completedUnconnected('transfer:b', viaFlag);
-		reclaimer.attached('transfer:a');
+		reclaimer.forget('transfer:a');
 		viaFlag.connectedToBlob = true;
 
 		expect(settleFrames(reclaimer, blobsInFlight, 3)).to.deep.equal([]);
@@ -109,7 +106,7 @@ describe('createOrphanedBlobReclaimer (harper-pro#659)', () => {
 	it('caps the tombstones, dropping the oldest first', () => {
 		const reclaimer = createOrphanedBlobReclaimer(2);
 		const blobsInFlight = new Map();
-		for (const key of ['t1', 't2', 't3']) {
+		for (const key of ['transfer:1', 'transfer:2', 'transfer:3']) {
 			const stream = makeStream();
 			blobsInFlight.set(key, stream);
 			reclaimer.completedUnconnected(key, stream);
@@ -117,16 +114,16 @@ describe('createOrphanedBlobReclaimer (harper-pro#659)', () => {
 		settleFrames(reclaimer, blobsInFlight, 2);
 
 		expect(reclaimer.reclaimedCount).to.equal(2);
-		expect(reclaimer.takeReclaimed('t1')).to.equal(false);
-		expect(reclaimer.takeReclaimed('t3')).to.equal(true);
+		expect(reclaimer.takeReclaimed('transfer:1')).to.equal(false);
+		expect(reclaimer.takeReclaimed('transfer:3')).to.equal(true);
 	});
 
 	it('expires tombstones reclaimed at or before the cutoff', () => {
 		const reclaimer = createOrphanedBlobReclaimer();
 		const blobsInFlight = new Map();
 		for (const [key, at] of [
-			['early', 1_000],
-			['late', 5_000],
+			['transfer:early', 1_000],
+			['transfer:late', 5_000],
 		]) {
 			const stream = makeStream();
 			blobsInFlight.set(key, stream);
@@ -136,8 +133,8 @@ describe('createOrphanedBlobReclaimer (harper-pro#659)', () => {
 		}
 		reclaimer.expireReclaimed(1_000);
 
-		expect(reclaimer.takeReclaimed('early')).to.equal(false);
-		expect(reclaimer.takeReclaimed('late')).to.equal(true);
+		expect(reclaimer.takeReclaimed('transfer:early')).to.equal(false);
+		expect(reclaimer.takeReclaimed('transfer:late')).to.equal(true);
 	});
 
 	it('re-completing a transfer restarts its wait', () => {
@@ -152,5 +149,27 @@ describe('createOrphanedBlobReclaimer (harper-pro#659)', () => {
 
 		expect(settleFrames(reclaimer, blobsInFlight, 1)).to.deep.equal([]);
 		expect(settleFrames(reclaimer, blobsInFlight, 1)).to.deep.equal([['transfer:r', second]]);
+	});
+
+	it('tombstones only copy transfers: a file key is reused by later sends of the same file', () => {
+		const reclaimer = createOrphanedBlobReclaimer();
+		const stream = makeStream();
+		const blobsInFlight = new Map([['file:reused', stream]]);
+		reclaimer.completedUnconnected('file:reused', stream);
+
+		expect(settleFrames(reclaimer, blobsInFlight, 2)).to.have.length(1);
+		expect(reclaimer.takeReclaimed('file:reused')).to.equal(false);
+	});
+
+	it('counts no frames while nothing waits, and forgets a stream removed elsewhere', () => {
+		const reclaimer = createOrphanedBlobReclaimer();
+		const stream = makeStream();
+		const blobsInFlight = new Map([['transfer:discarded', stream]]);
+		reclaimer.completedUnconnected('transfer:discarded', stream);
+		blobsInFlight.delete('transfer:discarded');
+		reclaimer.forget('transfer:discarded');
+
+		expect(reclaimer.awaitingRecordCount).to.equal(0);
+		expect(reclaimer.recordFrameProcessed(blobsInFlight, () => expect.fail('nothing to reclaim'))).to.equal(0);
 	});
 });
