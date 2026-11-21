@@ -521,6 +521,32 @@ describe('receiving operation replies', () => {
 		}
 	});
 
+	it('preserves forwarded refusal status and legacy ClientError fallback on error replies', async () => {
+		const socket = new FakeSocket();
+		try {
+			const session = replicateOverWS(socket, {}, undefined, 'operation-replies');
+			const replyError = async (answer) => {
+				const before = socket.sent.length;
+				const rejected = session.sendOperation({ operation: 'remove_node_fence' }, 1_000).then(
+					(result) => expect.fail(`expected a rejection, got ${JSON.stringify(result)}`),
+					(error) => error
+				);
+				const [, { requestId }] = socket.sent[before];
+				socket.emit('message', encode([OPERATION_RESPONSE, { ...answer, requestId }]));
+				return rejected;
+			};
+			const conflict = await replyError({ error: 'ClientError: the removal was finalized', statusCode: 409 });
+			expect(conflict.statusCode).to.equal(409);
+			expect(conflict.message).to.equal('ClientError: the removal was finalized');
+			const legacy = await replyError({ error: 'ClientError: node is required' });
+			expect(legacy.statusCode).to.equal(400);
+			expect(legacy.message).to.equal('ClientError: node is required');
+			expect(socket.closes).to.deep.equal([]);
+		} finally {
+			socket.close(1000);
+		}
+	});
+
 	for (const [label, frame] of [
 		['operation request', encode([OPERATION_REQUEST, { operation: 'user_info', requestId: 1 }])],
 		['binary frame', Buffer.alloc(1)],
