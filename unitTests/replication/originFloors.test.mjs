@@ -12,7 +12,7 @@ import {
 	mergePersistedCopyBounds,
 	parseOriginCertificates,
 	persistMergedCopyBounds,
-	readCommittedCopyBounds,
+	scanCopyBounds,
 	resolveOriginFloors,
 	settleCopyBounds,
 	restoreCompletedCopyPass,
@@ -685,7 +685,9 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			resumedWithWidening: false,
 			seqDurableAtCopyStart: true,
 			completeReceived: true,
+			finalized: true,
 			restored: false,
+			marksRoute: true,
 			originGenerations: new Map([
 				[1, 'g1'],
 				[2, 'g2'],
@@ -718,7 +720,9 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			resumedWithWidening: false,
 			seqDurableAtCopyStart: true,
 			completeReceived: true,
+			finalized: true,
 			restored: false,
+			marksRoute: true,
 			originGenerations: new Map([
 				[1, 'g1'],
 				[2, 'g2'],
@@ -748,7 +752,9 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			fullCoverage: false,
 			seqDurableAtCopyStart: true,
 			completeReceived: true,
+			finalized: true,
 			restored: false,
+			marksRoute: true,
 			originGenerations: new Map([[1, 'g1']]),
 		};
 		assert.strictEqual(restoreCompletedCopyPass(partialPass, 5, partialRouteMarked, partialRouteState), true);
@@ -856,14 +862,14 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 3, 'reserved', 0]), { 1: T + 500 });
 		// another pass's reservation, which its settle drops, never counts as committed for this one
 		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 980]]), 1, rootStore, T + 7);
-		assert.strictEqual(readCommittedCopyBounds(dbisDB, 1, 0).get(2), T + 900);
-		assert.strictEqual(readCommittedCopyBounds(dbisDB, 3, 0).get(2), undefined);
+		assert.strictEqual(scanCopyBounds(dbisDB, 1, 0).committed.get(2), T + 900);
+		assert.strictEqual(scanCopyBounds(dbisDB, 3, 0).committed.get(2), undefined);
 		// a completed pass replaces only its own reservation with the exact versions it copied, in one commit
 		assert.strictEqual(await settleCopyBounds(dbisDB, new Map([[2, T + 640]]), 1, rootStore), true);
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1]), { 2: T + 640 });
 		assert.strictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', 0]), undefined);
 		assert.deepStrictEqual(dbisDB.getSync([Symbol.for('copyBound'), 1, 'reserved', T + 7]), { 2: T + 980 });
-		assert.strictEqual(readCommittedCopyBounds(dbisDB, 3, 0).get(2), T + 640);
+		assert.strictEqual(scanCopyBounds(dbisDB, 3, 0).committed.get(2), T + 640);
 		// a later attempt on the same anchor settles only its own row; the earlier attempt's, which may cover rows it
 		// applied past its saved cursor, stays
 		await persistMergedCopyBounds(dbisDB, new Map([[2, T + 990]]), 1, rootStore, `${T + 7}:retry`);
@@ -1020,11 +1026,13 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 		assert.strictEqual(routeState.hasPendingPartialHistory(1), true);
 		assert.strictEqual(routeState.hasPendingRevocation(3), true);
 
+		// the certification is retried with them: it was earned on this request, which no new one has replaced
 		const retryEvent = { remoteNodeIds: [1] };
 		routeState.takeInto(retryEvent);
 		assert.deepStrictEqual(retryEvent.originRouteStates, [
 			[1, undefined, true, undefined, 'g1'],
 			[2, undefined, undefined, true, 'g2'],
+			[4, 100, undefined, undefined, 'g4'],
 		]);
 		assert.deepStrictEqual(retryEvent.originFloorRevocations, [[3, 'g3']]);
 
@@ -1032,6 +1040,7 @@ describe('level-2 certificates (harper-pro#922 items 3–4)', () => {
 			{ id: 1, originGeneration: 'g1', partialHistory: true },
 			{ id: 2, originGeneration: 'g2', hole: true },
 			{ id: 3, originGeneration: 'g3', floorRevoked: true },
+			{ id: 4, originGeneration: 'g4', certifiedFrom: 100 },
 		];
 		assert.strictEqual(
 			routeState.verifyPersisted(() => persistedNodes, retryEvent),

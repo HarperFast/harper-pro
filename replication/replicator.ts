@@ -911,12 +911,20 @@ export function releaseSharedStatusOnUnsubscribe(connection) {
 // Apply a recomputed exclusion-origin set (an update-exclusion-origins message from the main thread's
 // subscriptionManager broadcast) to every live subscription connection for the database. Each session
 // diffs against the list it last sent, so a set that changes nothing sends nothing.
-export function updateExclusionOrigins({ database, origins }: { database: string; origins: string[] }) {
+export function updateExclusionOrigins({
+	database,
+	origins,
+	failedOpen,
+}: {
+	database: string;
+	origins: string[];
+	failedOpen?: boolean;
+}) {
 	for (const dbConnections of connections.values()) {
 		const connection = dbConnections.get(database);
 		if (!connection) continue;
 		connection.exclusionOrigins = origins;
-		connection.emit('exclusion-origins-updated', origins);
+		connection.emit('exclusion-origins-updated', origins, failedOpen === true);
 	}
 }
 
