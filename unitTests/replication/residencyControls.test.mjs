@@ -3281,12 +3281,14 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.deepEqual(socket.closes, []);
 			}));
 
-	it('a record of a table redeclared non-replicating after the request asked for it is still a hole (harper-pro#1213)', () =>
+	it('a table redeclared non-replicating after the request asked for it retires the socket before any record of it is dropped (harper-pro#1213)', () =>
 		atCheckpointLevel(async () => {
 			const peer = 'slot-control-peer';
 			const connection = new EventEmitter();
 			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
 			connection.exclusionOrigins = [peer];
+			let reconnects = 0;
+			connection.forceReconnect = () => reconnects++;
 			let Plain;
 			const { Records, socket } = await connect(
 				false,
@@ -3307,13 +3309,19 @@ describe('Declarative tables keep control and event traffic independent of place
 			await until(() => peerNode()?.originGeneration === 'peer-generation' || socket.closes.length);
 			Plain.replicate = false;
 			connection.emit('subscriptions-updated');
-			await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
+			// a level-2 socket carries one scope, so the narrowed request waits for the next socket
+			await until(() => reconnects > 0 || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			assert.equal(socket.sent.filter((frame) => frame[0] === 129).length, 1);
+			assert.deepEqual(Records.dbisDB.getSync([Symbol.for('routeScope'), peerId])?.tables, ['Plain']);
+			const version = Date.now();
 			socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
 			socket.emit('message', structureFrame(Plain));
-			socket.emit('message', recordFrame(Plain, 'put', 'in-flight', { id: 'in-flight' }, Date.now()));
-			await until(() => peerNode()?.hole === true || socket.closes.length);
-			assert.deepEqual(socket.closes, []);
+			socket.emit('message', recordFrame(Plain, 'put', 'in-flight', { id: 'in-flight' }, version));
+			await new Promise((resolve) => setTimeout(resolve, 100));
 			assert.equal(Plain.primaryStore.getEntry('in-flight'), undefined);
+			assert.ok(!(Records.dbisDB.getSync([SEQ, peerId])?.seqId >= version), 'the cursor stays before the owed record');
+			assert.notEqual(peerNode().hole, true);
 		}));
 
 	it('a request sent while the socket is closing leaves its scope unchanged (harper-pro#1213)', () =>
@@ -3349,7 +3357,8 @@ describe('Declarative tables keep control and event traffic independent of place
 			Plain.replicate = true;
 			socket.readyState = 2;
 			connection.emit('subscriptions-updated');
-			await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(socket.sent.filter((frame) => frame[0] === 129).length, 1, 'a closing socket builds no request');
 			socket.emit('message', recordFrame(Plain, 'put', 'second', { id: 'second' }, version + 1));
 			await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId >= version + 1 || socket.closes.length);
 			assert.deepEqual(socket.closes, []);
