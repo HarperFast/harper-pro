@@ -8099,7 +8099,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let copyWasResumed = false;
 	let copyResumedWithWidening = false;
 	/** The one scope this socket's requests asked for; a request asking another reconnects. */
-	let socketRequestScope: RouteScope | undefined;
+	let socketRouteScope: RouteScope | undefined;
 	/** The route-scope revision this socket's latest request left: a pass starting on it began under that one. */
 	let socketScopeRev: number | undefined;
 	let socketScopeRouteId: number | undefined;
@@ -8339,13 +8339,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// a cursor from before scopes were recorded never widens the record
 			if (!resumedCopyScope) return undefined;
 			return {
-				scope: socketRequestScope ? intersectScope(resumedCopyScope.scope, socketRequestScope) : resumedCopyScope.scope,
+				scope: socketRouteScope ? intersectScope(resumedCopyScope.scope, socketRouteScope) : resumedCopyScope.scope,
 				scopeRev: resumedCopyScope.rev,
 			};
 		}
 		// the revision the request left, not one read now: a narrowing since must stop promotion
-		if (!socketRequestScope || socketScopeRev === undefined) return undefined;
-		return { scope: socketRequestScope, scopeRev: socketScopeRev };
+		if (!socketRouteScope || socketScopeRev === undefined) return undefined;
+		return { scope: socketRouteScope, scopeRev: socketScopeRev };
 	}
 	/** A held scope lock throws, and the caller retries the removal. An absent record is the next request's to seed. */
 	function promoteRouteScope(pass: CopyPassState): void {
@@ -13951,7 +13951,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		coverageNarrowedOnSocket = true;
 		// a coverage restoration or certification queued under the wider coverage must not land after it
 		pendingRouteState.retainOnlySafetyMarks();
-		if (socketRequestScope) socketRequestScope = { ...socketRequestScope, full: false };
+		if (socketRouteScope) socketRouteScope = { ...socketRouteScope, full: false };
 		if (currentCopyPass && !currentCopyPass.finalized) currentCopyPass.fullCoverage = false;
 		try {
 			const { dbisDB } = getDatabaseStores();
@@ -14243,9 +14243,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					if (certifiesCheckpointFloors()) {
 						// a copy is attributable only to its socket's one request: COPY_START names none
-						if (socketRequestScope && (!sameScope(socketRequestScope, current) || socketScopeRev !== recordedRev))
+						if (socketRouteScope && (!sameScope(socketRouteScope, current) || socketScopeRev !== recordedRev))
 							scopeChangedOnSocket = true;
-						socketRequestScope = current;
+						socketRouteScope = current;
 						socketScopeRev = recordedRev;
 						socketScopeRouteId = nodeId;
 						cursorScope = cursorRouteScope(copyCursor);
