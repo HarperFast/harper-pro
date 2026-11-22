@@ -78,10 +78,13 @@ const sharedConfig = (host) => ({
 	replication: { securePort: host + ':9933' },
 });
 
-/** Resolves once `path` answers 200 on `node` (a transient fetch failure or non-200 keeps polling). */
 function waitForHttp200(node, path, description, timeoutMs = 60_000) {
 	return waitForCondition(
-		async (signal) => (await fetch(node.httpURL + path, { signal }).catch(() => null))?.status === 200,
+		async (signal) => {
+			const response = await fetch(node.httpURL + path, { signal }).catch(() => null);
+			await response?.body?.cancel();
+			return response?.status === 200;
+		},
 		{ timeoutMs, description }
 	);
 }
@@ -118,14 +121,16 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 		const payload = await targz(fixtureCopy);
 		rmSync(fixtureCopy, { recursive: true, force: true });
 		for (const node of [ctx.nodeA, ctx.nodeB]) {
-			await sendOperation(node, {
+			const deployed = await sendOperation(node, {
 				operation: 'deploy_component',
 				project: 'qa177-blob-ttl-copy',
 				payload,
 				restart: true,
 			});
+			if (node === ctx.nodeA) ctx.aDeploymentId = deployed.deployment_id;
 			await waitForHttp200(node, '/BlobAsset/', `${node.hostname} to serve the blob fixture`);
 		}
+		ok(ctx.aDeploymentId, 'deploy_component on A returned no deployment_id');
 
 		// Seed RECORD_COUNT authoritative blob records on A via the fixture's seed endpoint.
 		for (let i = 0; i < RECORD_COUNT; i++) {
@@ -136,8 +141,6 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 		ctx.aRecordCount = aDesc.record_count ?? 0;
 		ok(ctx.aRecordCount >= RECORD_COUNT, `A should have at least ${RECORD_COUNT} records, got ${ctx.aRecordCount}`);
 
-		// Orphan ORPHAN_COUNT data blob files and every system blob file (the deployment
-		// payload) by deleting them directly from disk.
 		const dataBlobs = walkBlobFiles(ctx.nodeA.dataRootDir, 'data');
 		ok(
 			dataBlobs.length >= ORPHAN_COUNT,
@@ -145,7 +148,6 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 		);
 		const systemBlobs = walkBlobFiles(ctx.nodeA.dataRootDir, 'system');
 		ok(systemBlobs.length >= 1, 'Need the deployment payload blob file to orphan, found none');
-		ctx.orphanCount = ORPHAN_COUNT + systemBlobs.length;
 		for (const p of [...dataBlobs.slice(0, ORPHAN_COUNT), ...systemBlobs]) {
 			rmSync(p, { force: true });
 		}
@@ -171,7 +173,6 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 			authorization: nodeA.admin,
 		});
 
-		// WEDGE = copy cursor permanently pinned; the wait times out with B under-count.
 		let bCount = 0;
 		await waitForCondition(
 			async (signal) => {
@@ -180,7 +181,7 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 					{ operation: 'describe_table', database: 'data', table: 'BlobAsset' },
 					{ signal }
 				).catch(() => ({ body: {} }));
-				bCount = body.record_count ?? bCount;
+				bCount = body?.record_count ?? bCount;
 				return bCount >= ctx.aRecordCount;
 			},
 			{
@@ -191,11 +192,9 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 			}
 		);
 
-		// A record written after the copy reaches B only once B has left copy mode.
 		await fetchWithRetry(nodeA.httpURL + '/SeedBlobAsset/' + (RECORD_COUNT + 1000), { retries: 10 });
 		await waitForHttp200(nodeB, '/BlobAsset/' + (RECORD_COUNT + 1000), 'a post-copy record to replicate to B');
 
-		// The harper#1472 symptom: a replicated deploy whose peer waits on its hdb_deployment row.
 		await waitForOperationPath(nodeA, nodeB.hostname);
 		const probe = mkdtempSync(join(tmpdir(), 'post-copy-probe-'));
 		writeFileSync(join(probe, 'config.yaml'), "rest: true\ngraphqlSchema:\n  files: '*.graphql'\n");
@@ -214,11 +213,19 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 		ok(peer && !peer.error, `B did not report a successful deploy: ${JSON.stringify(body)}`);
 		await waitForHttp200(nodeB, '/PostCopyProbe/', 'the post-copy component to serve on B');
 
-		// The copy met every orphan and skipped it as unrecoverable at the source.
-		const skips = (await readLog(nodeB)).split('\n').filter((line) => line.includes('is unrecoverable at source'));
+		// Restarts and reconnects can log the same skip twice, so count distinct records.
+		const skippedRecords = new Set();
+		for (const line of (await readLog(nodeB)).split('\n')) {
+			const match = / for record (\S+) is unrecoverable at source /.exec(line);
+			if (match) skippedRecords.add(match[1]);
+		}
 		ok(
-			skips.length >= ctx.orphanCount,
-			`expected B to skip ${ctx.orphanCount} source-missing blobs, saw ${skips.length}:\n${skips.join('\n')}`
+			skippedRecords.has(ctx.aDeploymentId),
+			`B never skipped A's orphaned deployment payload (${ctx.aDeploymentId}); skipped: ${[...skippedRecords]}`
+		);
+		ok(
+			skippedRecords.size >= ORPHAN_COUNT + 1,
+			`expected B to skip ${ORPHAN_COUNT} orphaned data records plus the payload, skipped: ${[...skippedRecords]}`
 		);
 	});
 });
