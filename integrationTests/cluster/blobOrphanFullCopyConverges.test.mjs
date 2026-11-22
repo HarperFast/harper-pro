@@ -3,24 +3,20 @@
  *
  * Scenario: an authoritative blob table (no sourcedFrom) has records whose blob files
  * are deleted from disk on the leader — simulating orphaned blob references arising via
- * TTL-eviction races, partial transfers, or the #1287 multi-worker evict() path. The
- * leader's system.hdb_deployment payload blob (from an earlier deploy) is deleted too.
- * A fresh receiver then joins with isLeader:true, triggering a full copy from scratch.
+ * TTL-eviction races, partial transfers, or the #1287 multi-worker evict() path — and so
+ * is the leader's hdb_deployment payload blob. A fresh receiver then joins with
+ * isLeader:true, triggering a full copy from scratch.
  *
  * The regression being guarded:
  *   Before #405 (sender) + #429 (receiver), when the full-copy stream hit a record
  *   whose source blob file was missing, the copy cursor was permanently pinned
  *   (hasBlobGap=true held cursor at lastDurableSequenceId=0), and the receiver never
  *   advanced past the orphaned record — the copy hard-wedged. Non-orphaned records
- *   never arrived. harper#1472 reported the deploy_component form of it: a peer that
- *   full-copied past a missing payload blob never received a later deployment row, so
- *   awaitDeploymentRow timed out.
+ *   never arrived, nor did a later deploy_component's deployment row (harper#1472).
  *
- * Expected outcome on fixed code:
- *   The sender catches ENOENT and sends an error frame (finished:true, error:…).
- *   The receiver classifies it as unrecoverable at the source, advances past the orphan,
- *   finishes the copy and goes live: every record arrives, a record written after the
- *   copy replicates, and a later replicated deploy_component succeeds on the receiver.
+ * Invariant: the receiver advances past each source-missing blob as unrecoverable at the
+ * source and stays live. Copy finalization has no external signal and is not asserted
+ * here; copyFinalizeWedgeRecovery.test.mjs covers it.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -82,7 +78,7 @@ function waitForHttp200(node, path, description, timeoutMs = 60_000) {
 	return waitForCondition(
 		async (signal) => {
 			const response = await fetch(node.httpURL + path, { signal }).catch(() => null);
-			await response?.body?.cancel();
+			await response?.body?.cancel().catch(() => {});
 			return response?.status === 200;
 		},
 		{ timeoutMs, description }
