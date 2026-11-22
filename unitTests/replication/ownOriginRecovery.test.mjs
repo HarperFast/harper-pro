@@ -275,18 +275,25 @@ describe('a returned own message', () => {
 		}
 	});
 
-	it('keeps what it read and proves nothing more when the log cannot be read cleanly', () => {
+	it('vouches only for a whole transaction: a read that stops at a torn frame or failed log vouches for nothing', () => {
 		const entry = { txnLogKey: 5, type: 'message', tableId: 3, recordId: 'read', version: 5 };
+		const store = (entries, status) => ({ getRange: () => Object.assign(entries, status) });
+		const torn = { corruptFrameStop: { breaks: 1 } };
+		const held = (auditStore) => isHeldOwnMessage(ownMessagesLoggedAt(auditStore, 5), 3, 'read', 5);
+		assert.strictEqual(held(store([entry])), true, 'an intact last transaction');
+		assert.strictEqual(held(store([entry, { ...entry, txnLogKey: 6 }], torn)), true, 'a later key was reached');
+		assert.strictEqual(held(store([{ ...entry, endTxn: true }], torn)), true, 'its end was read before the torn frame');
+		assert.strictEqual(ownMessagesLoggedAt(store([entry], torn), 5).size, 0, 'stopped by a torn frame');
+		assert.strictEqual(ownMessagesLoggedAt(store([entry], { failedLogs: new Set(['local']) }), 5).size, 0);
+	});
+
+	it('vouches for nothing when the log cannot be read', () => {
 		const throwing = {
 			getRange() {
 				throw new Error('log unavailable');
 			},
 		};
 		assert.strictEqual(ownMessagesLoggedAt(throwing, 5).size, 0);
-		const stoppedEarly = { getRange: () => Object.assign([entry], { failedLogs: new Set(['local']) }) };
-		const partial = ownMessagesLoggedAt(stoppedEarly, 5);
-		assert.strictEqual(isHeldOwnMessage(partial, 3, 'read', 5), true);
-		assert.strictEqual(isHeldOwnMessage(partial, 3, 'unread', 5), false);
 	});
 });
 

@@ -1,7 +1,7 @@
 /**
  * A checkpoint-grade route resumes below the origin's certified floor (replication/DESIGN.md note 33), so the origin
  * re-sends messages the receiver already applied. A clean-session subscriber on a restarted B can miss what B
- * applied before it resubscribed, so B's own log is the oracle that holds in every case.
+ * applied before it resubscribed, so B's log of A, against A's own log, is the oracle that holds in every case.
  */
 import { suite, test, before, after } from 'node:test';
 import { deepEqual, ok } from 'node:assert/strict';
@@ -12,6 +12,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import mqtt from 'mqtt';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import {
+	replicationPoolActive,
 	restartHttpWorkers,
 	restartNode,
 	sendOperation,
@@ -163,9 +164,13 @@ async function deliversOnce(ctx, topic, interrupt) {
 		deepEqual(duplicates(onA), [], 'message numbers the subscriber on A received more than once');
 		deepEqual(missingFrom(onB, backUpN, publisher.n), [], `numbers from ${backUpN} B never delivered`);
 		const logged = await postToFixture(B, 'LoggedMessages', { peer: A.hostname, topic });
-		ok(
-			Object.keys(logged).length >= publisher.n - backUpN,
-			`B logged ${Object.keys(logged).length} of A's messages, fewer than the ${publisher.n - backUpN} sent after it was back`
+		const published = await postToFixture(A, 'LoggedMessages', { own: true, topic });
+		const byVersion = (versions) => Object.keys(versions).sort((a, b) => a - b);
+		deepEqual(byVersion(logged), byVersion(published), "the message versions B logged from A, against A's own log");
+		deepEqual(
+			Object.entries(published).filter(([, count]) => count > 1),
+			[],
+			'message versions A logged more than once'
 		);
 		deepEqual(
 			Object.entries(logged).filter(([, count]) => count > 1),
@@ -242,12 +247,18 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 		ok(certifiedFrom > 0, 'B resumed from A floor-only');
 	});
 
-	test("the receiving node's HTTP workers restart", () =>
-		deliversOnce(ctx, 'worker-restart', async (onB) => {
-			const since = Date.now();
-			await restartHttpWorkers(ctx.B);
-			return nextNAfter(onB.subscriptions, since, 'the subscriber on B to resubscribe');
-		}));
+	test(
+		"the receiving node's HTTP workers restart",
+		{
+			skip: replicationPoolActive() && 'replication runs on the pool, which an http_workers restart leaves running',
+		},
+		() =>
+			deliversOnce(ctx, 'worker-restart', async (onB) => {
+				const since = Date.now();
+				await restartHttpWorkers(ctx.B);
+				return nextNAfter(onB.subscriptions, since, 'the subscriber on B to resubscribe');
+			})
+	);
 
 	test('the receiving node restarts', () =>
 		deliversOnce(ctx, 'node-restart', async (onB) => {

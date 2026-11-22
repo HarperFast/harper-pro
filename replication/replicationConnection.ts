@@ -4488,24 +4488,31 @@ const ownMessageIdentity = (tableId: number, id: any, version: number) =>
 	`${tableId}:${version}:${toBufferKey(id).toString('latin1')}`;
 
 /**
- * The messages this node's own log holds at `txnLogKey`. A log that cannot be read cleanly proves nothing more
- * than what was read, so the rest are applied.
+ * The messages this node's own log holds at `txnLogKey`. Only a whole transaction vouches: replayLogs may not
+ * restore a torn one's readable prefix, so a read that stops before the transaction's end proves nothing and the
+ * returned messages are applied.
  */
 export function ownMessagesLoggedAt(auditStore: any, txnLogKey: number): Set<string> {
 	const logged = new Set<string>();
 	try {
 		const range: any = auditStore.getRange({ start: txnLogKey, exactStart: true, log: 'local' });
+		let whole = false;
 		for (const entry of range) {
-			if (entry.txnLogKey !== txnLogKey) break;
+			if (entry.txnLogKey !== txnLogKey) {
+				whole = true;
+				break;
+			}
 			if (entry.type === 'message') logged.add(ownMessageIdentity(entry.tableId, entry.recordId, entry.version));
+			if (entry.endTxn) whole = true;
 		}
-		if (range.failedLogs?.size > 0 || range.corruptFrameStop?.breaks > 0)
-			throw new Error('the own log could not be read cleanly');
+		if (!whole && (range.failedLogs?.size > 0 || range.corruptFrameStop?.breaks > 0))
+			throw new Error('the own log could not be read through the transaction');
 	} catch (error) {
 		logger.warn?.(
 			`Own-origin recovery: could not read the own log at ${txnLogKey}; a returned message it holds is published again`,
 			error
 		);
+		logged.clear();
 	}
 	return logged;
 }
