@@ -283,7 +283,7 @@ describe('a returned own message', () => {
 		const held = (auditStore, recordId = 'read') =>
 			isHeldOwnMessage(ownMessagesLoggedAt(auditStore, 5), 3, recordId, 5);
 		assert.strictEqual(held(store([ended])), true, 'an intact last transaction');
-		assert.strictEqual(held(store([entry, { ...entry, txnLogKey: 6 }], torn)), true, 'a later key was reached');
+		assert.strictEqual(held(store([entry, { ...entry, txnLogKey: 6 }])), false, 'a later key without its end');
 		assert.strictEqual(held(store([ended], torn)), true, 'its end was read before the torn frame');
 		assert.strictEqual(ownMessagesLoggedAt(store([entry], torn), 5).size, 0, 'stopped by a torn frame');
 		assert.strictEqual(ownMessagesLoggedAt(store([entry], { failedLogs: new Set(['local']) }), 5).size, 0);

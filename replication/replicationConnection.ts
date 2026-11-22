@@ -4489,32 +4489,28 @@ const ownMessageIdentity = (tableId: number, id: any, version: number) =>
 
 /**
  * The messages this node's own log holds at `txnLogKey`. Only a whole transaction vouches: replayLogs may not
- * restore a torn one's readable prefix, so a transaction's messages count only once its `endTxn` entry or a later
- * key is read, and one the read stops inside (a torn frame, a failed log, the log's end) is applied.
+ * restore a torn one's readable prefix, so a transaction's messages count only once its `endTxn` entry is read,
+ * and one the read stops inside (a torn frame, a failed log, a later key, the log's end) is applied.
  */
 export function ownMessagesLoggedAt(auditStore: any, txnLogKey: number): Set<string> {
 	const logged = new Set<string>();
 	// several transactions can share a key, so each one's messages wait for its own end
 	let unfinished: string[] = [];
-	let laterKey = false;
 	try {
-		for (const entry of auditStore.getRange({ start: txnLogKey, exactStart: true, log: 'local' })) {
-			if (entry.txnLogKey !== txnLogKey) {
-				laterKey = true;
-				break;
-			}
+		const range: any = auditStore.getRange({ start: txnLogKey, exactStart: true, log: 'local' });
+		for (const entry of range) {
+			if (entry.txnLogKey !== txnLogKey) break;
 			if (entry.type === 'message') unfinished.push(ownMessageIdentity(entry.tableId, entry.recordId, entry.version));
 			if (entry.endTxn) {
 				for (const identity of unfinished) logged.add(identity);
 				unfinished = [];
 			}
 		}
-		// a later key ends the last transaction at this one
-		if (laterKey) for (const identity of unfinished) logged.add(identity);
-		else if (unfinished.length > 0) throw new Error('the own log stopped inside a transaction');
+		if (unfinished.length > 0 || range.failedLogs?.size > 0 || range.corruptFrameStop?.breaks > 0)
+			throw new Error('the own log could not be read through every transaction');
 	} catch (error) {
 		logger.warn?.(
-			`Own-origin recovery: could not read the own log at ${txnLogKey}; a returned message it holds is published again`,
+			`Own-origin recovery: could not read the own log at ${txnLogKey}; a returned message it holds may be published again`,
 			error
 		);
 	}
