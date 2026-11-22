@@ -166,6 +166,10 @@ async function deliversOnce(ctx, topic, interrupt) {
 		const logged = await postToFixture(B, 'LoggedMessages', { peer: A.hostname, topic });
 		const published = await postToFixture(A, 'LoggedMessages', { own: true, topic });
 		const byVersion = (versions) => Object.keys(versions).sort((a, b) => a - b);
+		ok(
+			Object.keys(published).length >= publisher.n - backUpN,
+			`A logged ${Object.keys(published).length} of its messages, fewer than the ${publisher.n - backUpN} sent after B was back`
+		);
 		deepEqual(byVersion(logged), byVersion(published), "the message versions B logged from A, against A's own log");
 		deepEqual(
 			Object.entries(published).filter(([, count]) => count > 1),
