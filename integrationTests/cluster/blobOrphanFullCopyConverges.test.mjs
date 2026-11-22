@@ -1,9 +1,10 @@
 /**
- * Blob orphan × full-copy convergence (regression guard for #403/#405/#429)
+ * Blob orphan × full-copy convergence (regression guard for #403/#405/#429 and HarperFast/harper#1472)
  *
  * Scenario: an authoritative blob table (no sourcedFrom) has records whose blob files
  * are deleted from disk on the leader — simulating orphaned blob references arising via
- * TTL-eviction races, partial transfers, or the #1287 multi-worker evict() path.
+ * TTL-eviction races, partial transfers, or the #1287 multi-worker evict() path. The
+ * leader's system.hdb_deployment payload blob (from an earlier deploy) is deleted too.
  * A fresh receiver then joins with isLeader:true, triggering a full copy from scratch.
  *
  * The regression being guarded:
@@ -11,23 +12,32 @@
  *   whose source blob file was missing, the copy cursor was permanently pinned
  *   (hasBlobGap=true held cursor at lastDurableSequenceId=0), and the receiver never
  *   advanced past the orphaned record — the copy hard-wedged. Non-orphaned records
- *   never arrived.
+ *   never arrived. harper#1472 reported the deploy_component form of it: a peer that
+ *   full-copied past a missing payload blob never received a later deployment row, so
+ *   awaitDeploymentRow timed out.
  *
  * Expected outcome on fixed code:
  *   The sender catches ENOENT and sends an error frame (finished:true, error:…).
- *   The receiver handles it, advances past the orphan, and the copy continues.
- *   Non-orphaned records replicate successfully; the receiver record count reaches the
- *   leader's count. The orphaned blobs remain as a gap (re-requestable on reconnect),
- *   but the copy itself does NOT wedge.
+ *   The receiver classifies it as unrecoverable at the source, advances past the orphan,
+ *   finishes the copy and goes live: every record arrives, a record written after the
+ *   copy replicates, and a later replicated deploy_component succeeds on the receiver.
  */
 
 import { suite, test, before, after } from 'node:test';
-import { ok } from 'node:assert/strict';
-import { setTimeout as delay } from 'node:timers/promises';
-import { existsSync, readdirSync, rmSync } from 'node:fs';
+import { ok, equal } from 'node:assert/strict';
+import { existsSync, readdirSync, rmSync, mkdtempSync, writeFileSync, cpSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
-import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
+import {
+	sendOperation,
+	postOperation,
+	fetchWithRetry,
+	readLog,
+	waitForCondition,
+	waitForOperationPath,
+} from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -38,7 +48,6 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	'harper.js'
 );
 
-const STRESS = process.env.HARPER_RUN_STRESS_TESTS === '1';
 const FIXTURE_PATH = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'fixture-blob-orphan-full-copy-converges'
@@ -48,7 +57,7 @@ const RECORD_COUNT = 20;
 const ORPHAN_COUNT = 3;
 
 /** Walk the blob store under {dataRootDir}/blobs/{db}/. */
-function walkBlobFiles(dataRootDir, db = 'data') {
+function walkBlobFiles(dataRootDir, db) {
 	const root = join(dataRootDir, 'blobs', db);
 	if (!existsSync(root)) return [];
 	const files = [];
@@ -66,13 +75,18 @@ function walkBlobFiles(dataRootDir, db = 'data') {
 const sharedConfig = (host) => ({
 	analytics: { aggregatePeriod: -1 },
 	logging: { colors: false, console: true, level: 'debug' },
-	replication: {
-		securePort: host + ':9933',
-		databases: ['data'],
-	},
+	replication: { securePort: host + ':9933' },
 });
 
-suite('Blob orphan × full-copy convergence (#403/#405/#429 regression)', { skip: !STRESS, timeout: 300000 }, (ctx) => {
+/** Resolves once `path` answers 200 on `node` (a transient fetch failure or non-200 keeps polling). */
+function waitForHttp200(node, path, description, timeoutMs = 60_000) {
+	return waitForCondition(
+		async (signal) => (await fetch(node.httpURL + path, { signal }).catch(() => null))?.status === 200,
+		{ timeoutMs, description }
+	);
+}
+
+suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { timeout: 300000 }, (ctx) => {
 	before(async () => {
 		// Node A = leader with pre-existing data + orphaned blob files.
 		// Node B = fresh receiver that joins (full copy from scratch).
@@ -96,45 +110,45 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429 regression)', { skip
 		ctx.nodeB = nodeB.harper;
 
 		// Deploy the authoritative blob fixture to both nodes (B needs the schema to
-		// serve its REST endpoint for record-count checks during the copy).
-		const payload = await targz(FIXTURE_PATH);
-		await sendOperation(ctx.nodeA, {
-			operation: 'deploy_component',
-			project: 'qa177-blob-ttl-copy',
-			payload,
-			restart: true,
-		});
-		await delay(20000);
-		await sendOperation(ctx.nodeB, {
-			operation: 'deploy_component',
-			project: 'qa177-blob-ttl-copy',
-			payload,
-			restart: true,
-		});
-		await delay(20000);
+		// serve its REST endpoint for record-count checks during the copy). The padding is
+		// incompressible so the hdb_deployment payload_blob is file-backed, not stored inline.
+		const fixtureCopy = mkdtempSync(join(tmpdir(), 'blob-orphan-fixture-'));
+		cpSync(FIXTURE_PATH, fixtureCopy, { recursive: true });
+		writeFileSync(join(fixtureCopy, 'padding.bin'), randomBytes(64 * 1024));
+		const payload = await targz(fixtureCopy);
+		rmSync(fixtureCopy, { recursive: true, force: true });
+		for (const node of [ctx.nodeA, ctx.nodeB]) {
+			await sendOperation(node, {
+				operation: 'deploy_component',
+				project: 'qa177-blob-ttl-copy',
+				payload,
+				restart: true,
+			});
+			await waitForHttp200(node, '/BlobAsset/', `${node.hostname} to serve the blob fixture`);
+		}
 
 		// Seed RECORD_COUNT authoritative blob records on A via the fixture's seed endpoint.
 		for (let i = 0; i < RECORD_COUNT; i++) {
 			await fetchWithRetry(ctx.nodeA.httpURL + '/SeedBlobAsset/' + i, { retries: 10 });
 		}
-		await delay(3000);
 
 		const aDesc = await sendOperation(ctx.nodeA, { operation: 'describe_table', database: 'data', table: 'BlobAsset' });
 		ctx.aRecordCount = aDesc.record_count ?? 0;
 		ok(ctx.aRecordCount >= RECORD_COUNT, `A should have at least ${RECORD_COUNT} records, got ${ctx.aRecordCount}`);
 
-		// Orphan ORPHAN_COUNT blob files by deleting them directly from disk —
-		// simulates the TTL-eviction-race / partial-transfer orphan scenario.
-		const blobFiles = walkBlobFiles(ctx.nodeA.dataRootDir, 'data');
+		// Orphan ORPHAN_COUNT data blob files and every system blob file (the deployment
+		// payload) by deleting them directly from disk.
+		const dataBlobs = walkBlobFiles(ctx.nodeA.dataRootDir, 'data');
 		ok(
-			blobFiles.length >= ORPHAN_COUNT,
-			`Need at least ${ORPHAN_COUNT} blob files to orphan, found ${blobFiles.length}`
+			dataBlobs.length >= ORPHAN_COUNT,
+			`Need at least ${ORPHAN_COUNT} blob files to orphan, found ${dataBlobs.length}`
 		);
-		ctx.orphanedPaths = blobFiles.slice(0, ORPHAN_COUNT);
-		for (const p of ctx.orphanedPaths) {
+		const systemBlobs = walkBlobFiles(ctx.nodeA.dataRootDir, 'system');
+		ok(systemBlobs.length >= 1, 'Need the deployment payload blob file to orphan, found none');
+		ctx.orphanCount = ORPHAN_COUNT + systemBlobs.length;
+		for (const p of [...dataBlobs.slice(0, ORPHAN_COUNT), ...systemBlobs]) {
 			rmSync(p, { force: true });
 		}
-		ctx.blobFilesAfterOrphan = walkBlobFiles(ctx.nodeA.dataRootDir, 'data').length;
 	});
 
 	after(async () => {
@@ -148,7 +162,7 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429 regression)', { skip
 		const { nodeA, nodeB } = ctx;
 
 		// B joins A as subscriber with isLeader:true → triggers full copy.
-		// The copy stream will hit ORPHAN_COUNT records with missing blob files.
+		// The copy stream will hit the orphaned records with missing blob files.
 		await sendOperation(nodeB, {
 			operation: 'add_node',
 			hostname: nodeA.hostname,
@@ -157,27 +171,54 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429 regression)', { skip
 			authorization: nodeA.admin,
 		});
 
-		// Poll B's record count. CONVERGE = reaches A's count within 120s.
-		// WEDGE = copy cursor permanently pinned; timeout fires with B under-count.
-		const deadline = Date.now() + 120_000;
+		// WEDGE = copy cursor permanently pinned; the wait times out with B under-count.
 		let bCount = 0;
-		while (Date.now() < deadline) {
-			try {
-				const bDesc = await sendOperation(nodeB, { operation: 'describe_table', database: 'data', table: 'BlobAsset' });
-				bCount = bDesc.record_count ?? 0;
-			} catch {
-				// transient during replication setup
+		await waitForCondition(
+			async (signal) => {
+				const { body } = await postOperation(
+					nodeB,
+					{ operation: 'describe_table', database: 'data', table: 'BlobAsset' },
+					{ signal }
+				).catch(() => ({ body: {} }));
+				bCount = body.record_count ?? bCount;
+				return bCount >= ctx.aRecordCount;
+			},
+			{
+				timeoutMs: 120_000,
+				pollMs: 1000,
+				description: () =>
+					`B to receive all ${ctx.aRecordCount} records (has ${bCount}); the copy cursor appears pinned by the orphaned blob files`,
 			}
-			if (bCount >= ctx.aRecordCount) break;
-			await delay(1000);
-		}
+		);
 
-		// PRIMARY: copy must complete — non-orphaned records must have arrived.
+		// A record written after the copy reaches B only once B has left copy mode.
+		await fetchWithRetry(nodeA.httpURL + '/SeedBlobAsset/' + (RECORD_COUNT + 1000), { retries: 10 });
+		await waitForHttp200(nodeB, '/BlobAsset/' + (RECORD_COUNT + 1000), 'a post-copy record to replicate to B');
+
+		// The harper#1472 symptom: a replicated deploy whose peer waits on its hdb_deployment row.
+		await waitForOperationPath(nodeA, nodeB.hostname);
+		const probe = mkdtempSync(join(tmpdir(), 'post-copy-probe-'));
+		writeFileSync(join(probe, 'config.yaml'), "rest: true\ngraphqlSchema:\n  files: '*.graphql'\n");
+		writeFileSync(join(probe, 'schema.graphql'), 'type PostCopyProbe @table @export { id: ID @primaryKey }\n');
+		const probePayload = await targz(probe);
+		rmSync(probe, { recursive: true, force: true });
+		const { status, body } = await postOperation(nodeA, {
+			operation: 'deploy_component',
+			project: 'post-copy-probe',
+			payload: probePayload,
+			replicated: true,
+			restart: true,
+		});
+		equal(status, 200, JSON.stringify(body));
+		const peer = body.replicated?.find((result) => result.node === nodeB.hostname);
+		ok(peer && !peer.error, `B did not report a successful deploy: ${JSON.stringify(body)}`);
+		await waitForHttp200(nodeB, '/PostCopyProbe/', 'the post-copy component to serve on B');
+
+		// The copy met every orphan and skipped it as unrecoverable at the source.
+		const skips = (await readLog(nodeB)).split('\n').filter((line) => line.includes('is unrecoverable at source'));
 		ok(
-			bCount >= ctx.aRecordCount,
-			`WEDGE detected: B only has ${bCount}/${ctx.aRecordCount} records after 120s full copy. ` +
-				`Copy cursor appears permanently pinned by the ${ORPHAN_COUNT} orphaned blob file(s). ` +
-				`This is the #403/#429 regression — #405/#429 fixes did NOT prevent the wedge.`
+			skips.length >= ctx.orphanCount,
+			`expected B to skip ${ctx.orphanCount} source-missing blobs, saw ${skips.length}:\n${skips.join('\n')}`
 		);
 	});
 });
