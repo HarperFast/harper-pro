@@ -14814,12 +14814,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				connectionId,
 				`Stamped ${schemaDatabaseName}.${localTable.tableName} as a generation newer than the drop ${remoteNodeName} relays: it was created on a build that kept no stamp and holds no row older than the drop`
 			);
-			void broadcast({
+			broadcast({
 				type: TABLE_STAMPED,
 				databaseName: schemaDatabaseName,
 				tableName: localTable.tableName,
 				createdTime,
-			});
+			}).catch((error) =>
+				// an unhandled rejection would surface far from here; the stamp on this thread stands either way
+				logger.warn?.(connectionId, 'could not tell the other threads about the table stamp', error)
+			);
 		}
 	}
 	/** A peer's marker for a definition, while its database is not open here to record it in. */
