@@ -180,3 +180,45 @@ suite(
 		});
 	}
 );
+
+suite(
+	'a late older-keyed write on a route with no floor, when the origin forces a base copy',
+	{ timeout: 600_000, skip: isLMDB && 'RocksDB append-order resume' },
+	(ctx) => {
+		let contexts;
+		let origin, peer;
+
+		before(async () => {
+			contexts = await startNoFloorCluster(ctx);
+			[origin, peer] = contexts;
+		});
+
+		after(() => contexts && stopAndTeardownNodes(contexts.map((context) => context.harper)));
+
+		test('reaches the peer through the copy, below the start the peer asked for', async () => {
+			await write(origin, 'warm');
+			await waitForLocal(peer.harper, ['warm'], TABLE);
+			const held = await holdWrite(origin, 'late-copied', { database: DATABASE, table: 'Unsharded' });
+			try {
+				await write(origin, 'newer');
+				await waitForCursorAt(origin, peer, 'newer');
+				await killHarper(peer);
+			} finally {
+				await held.release();
+			}
+			const heldResult = await held.inFlight;
+			assert.ok(heldResult.status < 300, `the held write committed: ${JSON.stringify(heldResult)}`);
+			// the restarted origin answers the peer's resume with a retention copy instead of a replay
+			await killHarper(origin);
+			origin.env = { ...origin.env, HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: DATABASE };
+			await startHarper(origin, nodeOptions(origin));
+			await startHarper(peer, nodeOptions(peer));
+			await meshed(contexts, 'the peer to reconnect', DATABASE);
+
+			const entries = await waitForLocal(peer.harper, ['late-copied', 'newer'], TABLE, 60_000);
+			const late = entries.find((entry) => entry.id === 'late-copied');
+			const newer = entries.find((entry) => entry.id === 'newer');
+			assert.ok(late.version < newer.version, `late-copied (${late.version}) reserved before newer (${newer.version})`);
+		});
+	}
+);

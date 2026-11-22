@@ -3418,7 +3418,7 @@ export function ownLogAppendAnchor(ownSubscription: any, resumesPastEntries: boo
 	return isValidFrameTxnLogKey(ownSubscription.resumeAfter) ? ownSubscription.resumeAfter : undefined;
 }
 
-/** The key filter on an append-order own-log read: none, but an `add_node` start_time cutoff still holds. */
+/** The key filter on this node's rows in an append-order read or a forced copy: none but an `add_node` start_time cutoff. */
 export function ownLogFilterStart(ownSubscription: any): number {
 	return isValidFrameTxnLogKey(ownSubscription?.startCutoff) ? ownSubscription.startCutoff : 0;
 }
@@ -11033,12 +11033,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													}
 												}
 											}
-											// the copy filters rows at or below the start, which holds only for a position taken from this
-											// copy; another subscription's start of 0 can have made it a copy already
-											if (otherGeneration && currentSequenceId === 0) {
+											// The copy filters this node's rows at or below the start, which holds only for a position taken
+											// from this copy. A start the receiver asked for is a key maximum or a floor, and a row keyed below
+											// it can have been appended after the receiver's last apply, so on a copy this pass forced (another
+											// generation, a purged anchor, retention, or another subscription's start of 0) only an
+											// `add_node` start_time cutoff still filters them (harper-pro#1454).
+											if (currentSequenceId === 0) {
 												const ownId = getThisNodeId(auditStore);
 												const own = subscribedNodeIds[ownId];
-												if (typeof own === 'object') subscribedNodeIds[ownId] = { ...own, startTime: 0 };
+												if (typeof own === 'object' && own.startTime > 0)
+													subscribedNodeIds[ownId] = { ...own, startTime: ownLogFilterStart(ownSubscription) };
 											}
 											// a projection goes only to a receiver that asked for it, so it is accepted too
 											if (currentSequenceId > 0 || sendingProjection) subscriptionResidencySender?.replaying();
@@ -14399,10 +14403,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					...(ownLogResumeAfter !== undefined &&
 						startTime > 1 &&
 						!copyResume &&
-						!shardingProjection && {
-							resumeAfter: ownLogResumeAfter,
-							...(startCutoff !== undefined && { startCutoff }),
-						}),
+						!shardingProjection && { resumeAfter: ownLogResumeAfter }),
+					// carried on its own, so a copy the sender forces still honors it
+					...(startCutoff !== undefined && { startCutoff }),
 				};
 			});
 		if (
