@@ -69,7 +69,6 @@ export const ACKED_CONFIRMATION_MARKER_POSITION = allocate();
 export const CONFIRMATION_MARKERS_UNKNOWN = 0;
 export const CONFIRMATION_MARKERS_UNSUPPORTED = 1;
 export const CONFIRMATION_MARKERS_SUPPORTED = 2;
-// An Int32 count bumped after each write that changes RECORD_LOCK_HOMES_DIGEST_POSITION (recordLockTransport.ts).
 export const RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION = allocate();
 
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
@@ -84,6 +83,28 @@ export function assertAllocationFits(allocated: number, capacity: number): void 
 	}
 }
 assertAllocationFits(ALLOCATED_SLOTS, REPLICATION_SHARED_STATUS_SLOTS);
+
+/** The home-map digest record's change count: an Int32 in its slot's first word that only ever increases. */
+export function noteHomesDigestChange(status: Float64Array): void {
+	const words = new Int32Array(status.buffer, status.byteOffset, status.length * 2);
+	Atomics.add(words, RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2, 1);
+}
+
+/**
+ * Zeroes every slot but the digest change count, which moves on instead: threads cache the digest against
+ * that count (`peerHomesDigestReader`), so a count set back could match a cache taken before the reset.
+ * Answers whether anything was cleared.
+ */
+export function resetReplicationSharedStatus(status: Float64Array): boolean {
+	let cleared = false;
+	for (let position = 0; position < status.length; position++) {
+		if (position === RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION || status[position] === 0) continue;
+		status[position] = 0;
+		cleared = true;
+	}
+	if (cleared) noteHomesDigestChange(status);
+	return cleared;
+}
 
 export const CONNECTION_STATE_CONNECTED = 2;
 

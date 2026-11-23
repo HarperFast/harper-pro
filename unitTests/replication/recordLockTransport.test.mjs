@@ -68,6 +68,7 @@ import {
 } from '#src/replication/recordLockRpc';
 import { RECORD_LOCKS_CAPABILITY } from '#src/replication/protocolCapabilities';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
+import { resetReplicationSharedStatus } from '#src/replication/sharedStatusSlots';
 import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
 import { setActiveWorkerPools } from '#src/core/server/threads/workerPools';
 import { getClusterLockTransport, LockCoordinator } from '#src/core/resources/recordLockCoordinator';
@@ -199,13 +200,28 @@ describe('peer home-map digest record in the shared status buffer', () => {
 		}
 	});
 
-	it('counts each write that changes the record, and not a re-send', () => {
+	it('counts every publication, a re-send too, so a write cut off before its count is repaired', () => {
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		const read = peerHomesDigestReader(status);
 		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
-		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
-		assert.strictEqual(digestChanges(status), 1);
-		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2)));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
+		// A writer stopped between its exchange and its count.
+		new BigInt64Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_POSITION] = homesDigestPrefix(digestFor(2));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2))), false);
 		assert.strictEqual(digestChanges(status), 2);
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
+	});
+
+	it('reads the next digest after a reset, whatever it cached before it', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		const read = peerHomesDigestReader(status);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(resetReplicationSharedStatus(status), true);
+		// Not read in between: homeMap() stops at the capability check while the peer is gone.
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2)));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
 	});
 
 	it('re-reads the record only once the change count has moved', () => {

@@ -19,6 +19,7 @@ import {
 	CONFIRMATION_STATUS_POSITION,
 	PEER_CONFIRMATION_MARKERS_POSITION,
 	REPLICATION_SHARED_STATUS_SLOTS,
+	resetReplicationSharedStatus,
 } from './sharedStatusSlots.ts';
 import { createBackoff } from './backoff.ts';
 import { countSendingTo } from './residencyTopology.ts';
@@ -123,11 +124,11 @@ export function getReplicationSharedStatus(
 	);
 }
 // A node removed and re-added inside one process resolves the SAME buffer (harper-pro#431), so without
-// this the new membership inherits the old one's state, liveness, close code and fire counts. Zeroes the
-// whole buffer: every field in it describes the membership that just left.
+// this the new membership inherits the old one's state, liveness, close code and fire counts. Every field
+// in it describes the membership that just left.
 export function clearReplicationSharedStatus(auditStore: any, databaseName: string, node_name: string): boolean {
 	if (!auditStore || !databaseName || !node_name) return false;
-	getReplicationSharedStatus(auditStore, databaseName, node_name).fill(0);
+	resetReplicationSharedStatus(getReplicationSharedStatus(auditStore, databaseName, node_name));
 	return true;
 }
 // If the async iterator for hdb_nodes throws or completes, the watcher used to die silently

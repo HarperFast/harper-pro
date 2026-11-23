@@ -166,18 +166,23 @@ side effect triggered. Receipt stores the digest's first 64 bits in the per-(dat
 status buffer (slot 32) with one 64-bit atomic write, so the record is always one whole value; a
 malformed frame stores nothing. Agreement is that value equal to the reading thread's own digest,
 decided when `homeMap()` reads it (`peerHomesDigestReader`: a change count in slot 51, bumped after
-each changing write, gates a 64-bit atomic re-read, so the lock path allocates nothing and never pairs
-halves of two writes): a stored verdict is
+every write and moved on, never zeroed, by `resetReplicationSharedStatus`, gates a 64-bit atomic
+re-read, so the lock path allocates only once per frame received and never pairs halves of two
+writes): a stored verdict is
 relative to the writing thread's cache and to whichever of the peer's sockets that thread holds, so
 one thread's stale view overwrites another's correct one. 64 bits give a 2⁻⁶⁴ chance that two
 different maps agree; the digests are of operator-applied maps exchanged between authenticated,
 capability-gated peers, so nothing chooses a colliding map but an administrator already trusted
 with both. Sockets of one peer land on different threads and frames carry no order, so an older
 frame can be recorded after a newer one, and the map stays withheld (fail-closed, a retryable 503)
-until the next frame: a backlogged socket's own re-announce or (c), at most one ping interval. Frames
-queued on a socket that closes are dropped, and a reconnect re-sends at handshake. A peer on a build
-before this one re-announces only on outbound sessions and never on a ping, so during a rolling
-upgrade its stale record lasts until it reconnects or changes generation again.
+until the next frame: a backlogged socket's own re-announce or (c), at most one ping interval for a
+peer that dials this node. A peer that only accepts this node's connection, like a dropped frame,
+waits for its next announcement or a reconnect. Frames queued on a socket that closes are dropped,
+and a reconnect re-sends at handshake. A peer on a build before this one re-announces only on
+outbound sessions and never on a ping, so during a rolling upgrade its stale record lasts until it
+reconnects or changes generation again. Waking the owner's restart round on a changed record
+(`record-lock-homes-agreed`) is best effort: if the receiving thread does not know the owner, or the
+message fails, the round waits out its own backoff.
 
 ### 7. `homeIncarnation` per coordination incarnation, gated centrally
 
