@@ -11,7 +11,7 @@
 
 import { expect } from 'chai';
 import { clearReplicationSharedStatus, REPLICATION_SHARED_STATUS_SLOTS } from '#src/replication/knownNodes';
-import { RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION } from '#src/replication/sharedStatusSlots';
+import { HOMES_DIGEST_CHANGE, RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION } from '#src/replication/sharedStatusSlots';
 import {
 	CONNECTION_STATE_POSITION,
 	LAST_LIVENESS_TIME_POSITION,
@@ -65,7 +65,7 @@ describe('clearReplicationSharedStatus', () => {
 		expect(
 			after.every((slot, position) => slot === 0 || position === RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION)
 		).to.equal(true);
-		expect(changes()).to.equal(before + 1);
+		expect(changes()).to.equal(before + HOMES_DIGEST_CHANGE);
 	});
 
 	it('leaves the re-added membership reading not-connected with no inherited error or counters', () => {

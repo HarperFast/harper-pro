@@ -68,7 +68,11 @@ import {
 } from '#src/replication/recordLockRpc';
 import { RECORD_LOCKS_CAPABILITY } from '#src/replication/protocolCapabilities';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
-import { resetReplicationSharedStatus } from '#src/replication/sharedStatusSlots';
+import {
+	HOMES_DIGEST_CHANGE,
+	HOMES_DIGEST_WRITER,
+	resetReplicationSharedStatus,
+} from '#src/replication/sharedStatusSlots';
 import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
 import { setActiveWorkerPools } from '#src/core/server/threads/workerPools';
 import { getClusterLockTransport, LockCoordinator } from '#src/core/resources/recordLockCoordinator';
@@ -172,8 +176,8 @@ describe('peer lock capability in the shared status buffer', () => {
 
 const digestFor = (label) => createHash('sha256').update(String(label)).digest('hex');
 const recordHolds = (status, digest) => peerHomesDigestReader(status)() === homesDigestPrefix(digest);
-const digestChanges = (status) =>
-	new Int32Array(status.buffer, status.byteOffset, status.length * 2)[RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2];
+const CHANGE_WORD = RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2;
+const digestChangeWord = (status) => new Int32Array(status.buffer)[CHANGE_WORD];
 
 describe('peer home-map digest record in the shared status buffer', () => {
 	it('starts as none heard, and answers whether each publication changed it', () => {
@@ -200,16 +204,26 @@ describe('peer home-map digest record in the shared status buffer', () => {
 		}
 	});
 
-	it('counts every publication, a re-send too, so a write cut off before its count is repaired', () => {
+	it('moves the count for a write that changes the record, and leaves it for a re-send', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(digestChangeWord(status), HOMES_DIGEST_CHANGE);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(digestChangeWord(status), HOMES_DIGEST_CHANGE);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2)));
+		assert.strictEqual(digestChangeWord(status), 2 * HOMES_DIGEST_CHANGE);
+	});
+
+	it('trusts no cached value while a writer is in flight, so a write cut off mid-way is still read', () => {
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 		const read = peerHomesDigestReader(status);
 		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
 		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
-		// A writer stopped between its exchange and its count.
-		new BigInt64Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_POSITION] = homesDigestPrefix(digestFor(2));
+		// A writer that counted itself in and exchanged, but never finished.
+		new Int32Array(status.buffer)[CHANGE_WORD] += HOMES_DIGEST_WRITER;
 		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
-		assert.strictEqual(publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2))), false);
-		assert.strictEqual(digestChanges(status), 2);
+		new BigInt64Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_POSITION] = homesDigestPrefix(digestFor(2));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
 		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
 	});
 
@@ -239,7 +253,7 @@ describe('peer home-map digest record in the shared status buffer', () => {
 		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
 		new BigInt64Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_POSITION] = homesDigestPrefix(digestFor(2));
 		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)), 'no count change, no re-read');
-		new Int32Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2]++;
+		new Int32Array(status.buffer)[CHANGE_WORD] += HOMES_DIGEST_CHANGE;
 		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
 	});
 

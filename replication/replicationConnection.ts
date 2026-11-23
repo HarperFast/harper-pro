@@ -12680,7 +12680,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	ws.on('ping', resetPingTimer);
 	// The accepting side runs no keepalive of its own, so the dialer's ping is its re-send bound.
-	if (!shouldRunKeepalive(options))
+	if (CLUSTER_RECORD_LOCKS_ENABLED && !shouldRunKeepalive(options))
 		ws.on('ping', () => {
 			try {
 				sendRecordLockHomesDigestFrame();

@@ -165,10 +165,11 @@ digest just changed, and (c) on each keepalive ping, sent by the dialing side an
 side effect triggered. Receipt stores the digest's first 64 bits in the per-(database, peer) shared
 status buffer (slot 32) with one 64-bit atomic write, so the record is always one whole value; a
 malformed frame stores nothing. Agreement is that value equal to the reading thread's own digest,
-decided when `homeMap()` reads it (`peerHomesDigestReader`: a change count in slot 51, bumped after
-every write and moved on, never zeroed, by `resetReplicationSharedStatus`, gates a 64-bit atomic
-re-read, so a reader allocates one BigInt per frame from that peer and never pairs halves of two
-writes): a stored verdict is
+decided when `homeMap()` reads it (`peerHomesDigestReader`): slot 51 holds the writers in flight and
+a change count, moved by every changing write and by `resetReplicationSharedStatus`, never set back.
+A reader re-reads the record with one 64-bit atomic load unless no writer is in flight and the count
+is unchanged, so it never pairs halves of two writes, never trusts its cache after a write's exchange,
+and allocates a BigInt only when the record changes. A stored verdict is
 relative to the writing thread's cache and to whichever of the peer's sockets that thread holds, so
 one thread's stale view overwrites another's correct one. 64 bits give a 2⁻⁶⁴ chance that two
 different maps agree; the digests are of operator-applied maps exchanged between authenticated,

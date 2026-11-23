@@ -84,21 +84,21 @@ export function assertAllocationFits(allocated: number, capacity: number): void 
 }
 assertAllocationFits(ALLOCATED_SLOTS, REPLICATION_SHARED_STATUS_SLOTS);
 
-/** Readers cache the digest against this count, so it only ever increases. */
-export function noteHomesDigestChange(status: Float64Array): void {
-	const words = new Int32Array(status.buffer, status.byteOffset, status.length * 2);
-	Atomics.add(words, RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2, 1);
+// The digest record's change word, one Int32: writers in flight in the low byte, a change count above it.
+export const HOMES_DIGEST_WRITER = 1;
+export const HOMES_DIGEST_CHANGE = 1 << 8;
+export const HOMES_DIGEST_WRITERS = HOMES_DIGEST_CHANGE - 1;
+
+export function homesDigestChangeWords(status: Float64Array): Int32Array {
+	return new Int32Array(status.buffer, status.byteOffset, status.length * 2);
 }
 
 /**
- * Zeroes every slot but the digest change count, which moves on instead: threads cache the digest against
- * that count (`peerHomesDigestReader`), so a count set back could match a cache taken before the reset.
- * Answers whether anything was cleared.
+ * Zeroes every slot but the digest change word, whose count moves on instead: threads cache the digest
+ * against it (`peerHomesDigestReader`), so a count set back could match a cache taken before the reset.
  */
 export function resetReplicationSharedStatus(status: Float64Array): boolean {
-	// Through the 64-bit view: a digest prefix can read as -0 through the Float64 one.
-	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
-	let cleared = Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, 0n) !== 0n;
+	let cleared = false;
 	for (let position = 0; position < status.length; position++) {
 		if (
 			position === RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION ||
@@ -109,7 +109,11 @@ export function resetReplicationSharedStatus(status: Float64Array): boolean {
 		status[position] = 0;
 		cleared = true;
 	}
-	if (cleared) noteHomesDigestChange(status);
+	// Last, after the capability slot, and through the 64-bit view: a prefix can read as -0 as a Float64.
+	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
+	if (Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, 0n) !== 0n) cleared = true;
+	if (cleared)
+		Atomics.add(homesDigestChangeWords(status), RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2, HOMES_DIGEST_CHANGE);
 	return cleared;
 }
 

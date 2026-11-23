@@ -68,7 +68,10 @@ import {
 	RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION,
 	RECORD_LOCK_HOMES_DIGEST_POSITION,
 	RECORD_LOCK_LEVEL_POSITION,
-	noteHomesDigestChange,
+	HOMES_DIGEST_CHANGE,
+	HOMES_DIGEST_WRITER,
+	HOMES_DIGEST_WRITERS,
+	homesDigestChangeWords,
 } from './sharedStatusSlots.ts';
 import { isReplicationWorker } from './replicationWorkers.ts';
 import { ClientError, LockUnavailableError } from '../core/utility/errors/hdbError.ts';
@@ -159,32 +162,35 @@ export function homesDigestPrefix(digest: unknown): bigint | undefined {
 const HOMES_DIGEST_CHANGES_WORD = RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2;
 
 /**
- * One 64-bit atomic write, since sockets of one peer on several threads may publish at once, then a bump of
- * the change count that `peerHomesDigestReader` keys its re-read on. The count moves on every frame,
- * changed or not, so a writer stopped between the two steps is repaired by the peer's next frame.
+ * One 64-bit atomic write, since sockets of one peer on several threads may publish at once, bracketed in
+ * the change word: counted in flight before it, then out of flight with the count moved if it changed the
+ * record.
  */
 export function publishPeerHomesDigest(status: Float64Array, prefix: bigint): boolean {
 	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
+	const words = homesDigestChangeWords(status);
+	Atomics.add(words, HOMES_DIGEST_CHANGES_WORD, HOMES_DIGEST_WRITER);
 	const changed = Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, prefix) !== prefix;
-	noteHomesDigestChange(status);
+	Atomics.add(words, HOMES_DIGEST_CHANGES_WORD, (changed ? HOMES_DIGEST_CHANGE : 0) - HOMES_DIGEST_WRITER);
 	return changed;
 }
 
 /**
- * One thread's reader of a peer's digest record. A BigInt load allocates, so it re-loads the record only
- * when the change count moved. Each write bumps the count after it and a reset moves it on, so a load made
- * after reading a count returns a value at least as new as the write that count reflects.
+ * One thread's reader of a peer's digest record. A BigInt load allocates, so it keeps the last value and
+ * trusts it only while no writer is in flight and the count has not moved; a read that starts after a
+ * write's exchange always re-loads. A writer that never finishes (a terminated worker) leaves its peer's
+ * readers re-loading on every call.
  */
 export function peerHomesDigestReader(status: Float64Array): () => bigint {
 	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
-	const words = new Int32Array(status.buffer, status.byteOffset, status.length * 2);
+	const words = homesDigestChangeWords(status);
 	let seen: number | undefined;
 	let prefix = NO_PEER_HOMES_DIGEST;
 	return () => {
 		const changes = Atomics.load(words, HOMES_DIGEST_CHANGES_WORD);
 		if (changes !== seen) {
 			prefix = Atomics.load(record, RECORD_LOCK_HOMES_DIGEST_POSITION);
-			seen = changes;
+			seen = changes & HOMES_DIGEST_WRITERS ? undefined : changes;
 		}
 		return prefix;
 	};
@@ -816,11 +822,7 @@ function pushHomesDigestToPeers(database: string): void {
 
 const HOMES_AGREED_MESSAGE = 'record-lock-homes-agreed';
 
-/**
- * A frame dropped here (malformed, or the database not open on this thread yet) leaves the record as it
- * was until the next frame: the peer's keepalive re-send if it holds an outbound socket to this node,
- * otherwise its next announcement or reconnect handshake.
- */
+/** A frame dropped here (malformed, or the database not open on this thread yet) waits for the next ping. */
 export function recordPeerHomesDigest(database: string, peer: string, digest: unknown): void {
 	const prefix = homesDigestPrefix(digest);
 	if (prefix === undefined) return;
