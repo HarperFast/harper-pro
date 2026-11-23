@@ -12,17 +12,17 @@
  *   whose source blob file was missing, the copy cursor was permanently pinned
  *   (hasBlobGap=true held cursor at lastDurableSequenceId=0), and the receiver never
  *   advanced past the orphaned record — the copy hard-wedged. Non-orphaned records
- *   never arrived, nor did a later deploy_component's deployment row (harper#1472).
+ *   never arrived.
  *
  * Invariant: the receiver advances past each source-missing blob as unrecoverable at the
- * source and stays live. Copy finalization has no external signal and is not asserted
- * here; copyFinalizeWedgeRecovery.test.mjs covers it.
+ * source, finalizes the copy (its copy-finalization watchdog never fires) and stays live.
  */
 
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
 import { existsSync, readdirSync, rmSync, mkdtempSync, writeFileSync, cpSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
@@ -51,6 +51,7 @@ const FIXTURE_PATH = join(
 
 const RECORD_COUNT = 20;
 const ORPHAN_COUNT = 3;
+const COPY_FINALIZE_TIMEOUT_MS = 5000;
 
 /** Walk the blob store under {dataRootDir}/blobs/{db}/. */
 function walkBlobFiles(dataRootDir, db) {
@@ -102,7 +103,7 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 			}),
 			startHarper(nodeB, {
 				config: sharedConfig(hostnameB),
-				env: { HARPER_NO_FLUSH_ON_EXIT: true },
+				env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_COPY_FINALIZE_TIMEOUT_MS: String(COPY_FINALIZE_TIMEOUT_MS) },
 			}),
 		]);
 		ctx.nodeA = nodeA.harper;
@@ -190,6 +191,15 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 
 		await fetchWithRetry(nodeA.httpURL + '/SeedBlobAsset/' + (RECORD_COUNT + 1000), { retries: 10 });
 		await waitForHttp200(nodeB, '/BlobAsset/' + (RECORD_COUNT + 1000), 'a post-copy record to replicate to B');
+
+		// Live rows flow while a copy is still unfinalized, so give the finalization watchdog two windows to
+		// fire. This must precede the restarting deploy below, which would clear an unfinalized copy.
+		ok((await readLog(nodeB)).includes('bulk copy complete'), 'B never received COPY_COMPLETE');
+		await delay(COPY_FINALIZE_TIMEOUT_MS * 2);
+		const watchdogFires = (await readLog(nodeB))
+			.split('\n')
+			.filter((line) => line.includes('Copy-finalization watchdog'));
+		equal(watchdogFires.length, 0, `B's copy did not finalize:\n${watchdogFires.join('\n')}`);
 
 		await waitForOperationPath(nodeA, nodeB.hostname);
 		const probe = mkdtempSync(join(tmpdir(), 'post-copy-probe-'));
