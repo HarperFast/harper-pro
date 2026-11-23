@@ -98,6 +98,10 @@ export function homesDigestChangeWords(status: Float64Array): Int32Array {
  * against it (`peerHomesDigestReader`), so a count set back could match a cache taken before the reset.
  */
 export function resetReplicationSharedStatus(status: Float64Array): boolean {
+	const words = homesDigestChangeWords(status);
+	const changeWord = RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2;
+	// In flight like a writer, so no reader trusts a cached digest while the reset runs.
+	Atomics.add(words, changeWord, HOMES_DIGEST_WRITER);
 	let cleared = false;
 	for (let position = 0; position < status.length; position++) {
 		if (
@@ -112,8 +116,7 @@ export function resetReplicationSharedStatus(status: Float64Array): boolean {
 	// Last, after the capability slot, and through the 64-bit view: a prefix can read as -0 as a Float64.
 	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
 	if (Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, 0n) !== 0n) cleared = true;
-	if (cleared)
-		Atomics.add(homesDigestChangeWords(status), RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2, HOMES_DIGEST_CHANGE);
+	Atomics.add(words, changeWord, (cleared ? HOMES_DIGEST_CHANGE : 0) - HOMES_DIGEST_WRITER);
 	return cleared;
 }
 
