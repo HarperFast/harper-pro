@@ -84,7 +84,7 @@ export function assertAllocationFits(allocated: number, capacity: number): void 
 }
 assertAllocationFits(ALLOCATED_SLOTS, REPLICATION_SHARED_STATUS_SLOTS);
 
-/** The home-map digest record's change count: an Int32 in its slot's first word that only ever increases. */
+/** Readers cache the digest against this count, so it only ever increases. */
 export function noteHomesDigestChange(status: Float64Array): void {
 	const words = new Int32Array(status.buffer, status.byteOffset, status.length * 2);
 	Atomics.add(words, RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2, 1);
@@ -96,9 +96,16 @@ export function noteHomesDigestChange(status: Float64Array): void {
  * Answers whether anything was cleared.
  */
 export function resetReplicationSharedStatus(status: Float64Array): boolean {
-	let cleared = false;
+	// Through the 64-bit view: a digest prefix can read as -0 through the Float64 one.
+	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
+	let cleared = Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, 0n) !== 0n;
 	for (let position = 0; position < status.length; position++) {
-		if (position === RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION || status[position] === 0) continue;
+		if (
+			position === RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION ||
+			position === RECORD_LOCK_HOMES_DIGEST_POSITION ||
+			status[position] === 0
+		)
+			continue;
 		status[position] = 0;
 		cleared = true;
 	}

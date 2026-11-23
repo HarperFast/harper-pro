@@ -150,7 +150,6 @@ export function readPeerLockCapability(status: Float64Array): number {
 	return value === LOCK_CAPABILITY_SUPPORTED || value === LOCK_CAPABILITY_UNSUPPORTED ? value : LOCK_CAPABILITY_UNKNOWN;
 }
 
-/** The form the peer-digest record holds; undefined for anything but a `digestOf` digest. */
 export function homesDigestPrefix(digest: unknown): bigint | undefined {
 	if (typeof digest !== 'string' || !HOMES_DIGEST_PATTERN.test(digest)) return undefined;
 	const prefix = BigInt.asIntN(64, BigInt('0x' + digest.slice(0, 16)));

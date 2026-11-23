@@ -213,6 +213,14 @@ describe('peer home-map digest record in the shared status buffer', () => {
 		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
 	});
 
+	it('clears a digest whose 64 bits read as -0 through the Float64 view', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		publishPeerHomesDigest(status, homesDigestPrefix('8' + '0'.repeat(63)));
+		assert.ok(Object.is(status[RECORD_LOCK_HOMES_DIGEST_POSITION], -0));
+		resetReplicationSharedStatus(status);
+		assert.strictEqual(peerHomesDigestReader(status)(), 0n);
+	});
+
 	it('reads the next digest after a reset, whatever it cached before it', () => {
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 		const read = peerHomesDigestReader(status);
