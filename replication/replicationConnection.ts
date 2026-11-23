@@ -4488,13 +4488,12 @@ const ownMessageIdentity = (tableId: number, id: any, version: number) =>
 	`${tableId}:${version}:${toBufferKey(id).toString('latin1')}`;
 
 /**
- * The messages this node's own log holds at `txnLogKey`. Only a whole transaction vouches: replayLogs may not
- * restore a torn one's readable prefix, so a transaction's messages count only once its `endTxn` entry is read,
- * and one the read stops inside (a torn frame, a failed log, a later key, the log's end) is applied.
+ * The messages this node's own log holds at `txnLogKey`, from transactions read through their `endTxn` only:
+ * replayLogs may not restore a torn transaction's readable prefix.
  */
 export function ownMessagesLoggedAt(auditStore: any, txnLogKey: number): Set<string> {
 	const logged = new Set<string>();
-	// several transactions can share a key, so each one's messages wait for its own end
+	// several transactions can share a key
 	let unfinished: string[] = [];
 	try {
 		const range: any = auditStore.getRange({ start: txnLogKey, exactStart: true, log: 'local' });
