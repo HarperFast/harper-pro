@@ -2441,10 +2441,6 @@ export function isLocalOnlyEntry(entry: { metadataFlags?: number } | undefined |
 	return ((entry?.metadataFlags ?? 0) & LOCAL_ONLY) !== 0;
 }
 
-/**
- * `options.localOnly`: true keeps the row on this node, false makes it an ordinary replicated row,
- * and omitted keeps whichever the stored row already is.
- */
 export async function ensureNode(name: string, node, options?: { localOnly?: boolean }) {
 	const table = getHDBNodeTable();
 	name = name ?? urlToNodeName(node.url);
@@ -2485,7 +2481,7 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 	// `isLeader` had replicated onto it, after which its own changes stopped reaching the cluster.
 	const localOnly =
 		name !== getThisNodeName() &&
-		(options?.localOnly ??
+		(options?.localOnly ||
 			(existing != null &&
 				node.isLeader !== false &&
 				isLocalOnlyEntry(await table.primaryStore.getEntry(name, { async: true }))));

@@ -67,21 +67,6 @@ function ownRowPrivateUrls(privateUrls: unknown): unknown {
  * @param req
  */
 export async function setNode(req: any) {
-	// An operator's isLeader peer is a bridge source (e.g. a v4 node in a v4->v5 migration), whose row
-	// must not reach the rest of the mesh (harper-pro #246). undefined inherits what the row already is.
-	return applySetNode(req, req.isLeader === true ? true : undefined);
-}
-
-/**
- * cloneNode's add_node. A clone's leader is an ordinary member of the cluster being joined, so its
- * row must replicate: a node later cloned from this one learns the leader only from that row
- * (harper-pro #1487). Only a bridge peer's row stays on this node.
- */
-export async function setCloneLeaderNode(req: any, leaderIsBridgePeer: boolean) {
-	return applySetNode(req, leaderIsBridgePeer);
-}
-
-async function applySetNode(req: any, peerRowLocalOnly: boolean | undefined) {
 	if (!req.hostname) req.hostname = req.node_name || req.name;
 	if (req.verify_tls !== undefined) req.rejectUnauthorized = req.verify_tls;
 	let { url, hostname } = req;
@@ -251,9 +236,17 @@ async function applySetNode(req: any, peerRowLocalOnly: boolean | undefined) {
 		getHDBNodeTable().primaryStore.getSync(targetNodeResponse?.nodeName ?? nodeRecord.name ?? urlToNodeName(url))
 	);
 	if (peerPrivateUrls !== undefined) nodeRecord.private_urls = peerPrivateUrls;
-	// isLeader means "this peer is my bootstrap source", so it is stored on this node's row for the peer
-	// and never sent in targetAddNodeObj: the peer would record this node as its own leader.
+	// isLeader is LOCAL-ONLY: it means "this peer is my leader; request a full-table copy from it".
+	// It must NOT be forwarded to the peer via targetAddNodeObj — doing so would cause the peer
+	// to treat this node as its leader and attempt to full-copy in the wrong direction.
 	if (req.isLeader !== undefined) nodeRecord.isLeader = req.isLeader;
+	// An isLeader bridge peer (e.g. a v4 source in a v4->v5 migration) must stay invisible to the
+	// rest of the mesh: its hdb_nodes row carries replicates.sends, so if it replicated to v5 leaves
+	// they would each open a direct (and unauthorized) subscription to it. Persist the row with the
+	// LOCAL_ONLY metadata bit so it lives in the normal hdb_nodes table (driving this node's own
+	// watcher/subscription/full-copy and surviving restart) but is never sent to any peer (harper-pro #246).
+	const writeNodeLocalOnly = req.isLeader === true;
+
 	if (nodeRecord.replicates) {
 		const thisNode: any = {
 			url: thisUrl,
@@ -278,9 +271,7 @@ async function applySetNode(req: any, peerRowLocalOnly: boolean | undefined) {
 	await ensureNode(
 		targetNodeResponse ? targetNodeResponse.nodeName : (nodeRecord.name ?? urlToNodeName(url)),
 		nodeRecord,
-		// A local-only row lives in hdb_nodes (driving this node's own subscription and surviving restart)
-		// but is never sent to a peer, who would otherwise open an unauthorized subscription to it.
-		peerRowLocalOnly === undefined ? undefined : { localOnly: peerRowLocalOnly }
+		writeNodeLocalOnly ? { localOnly: true } : undefined
 	);
 	let message: string;
 	if (req.operation === 'update_node') {

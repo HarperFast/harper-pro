@@ -4,8 +4,9 @@
  *     A (leader)  <-- clone --  B  <-- clone --  C
  *
  * B's hdb_nodes row for A is the only way C can learn A: nothing joins after C, so A never rewrites
- * its own row. When B kept that row local-only, C never received it, refused A's connections ("no
- * hdb_nodes entry"), and reached A only through B, so stopping B split the cluster.
+ * its own row. While B kept that row local-only after its clone completed, C never received it,
+ * refused A's connections ("no hdb_nodes entry"), and reached A only through B, so stopping B split
+ * the cluster.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert/strict';
@@ -144,8 +145,8 @@ suite('Clone Node - a clone of a clone learns the first leader (harper-pro#1487)
 		await waitForAvailable(second);
 
 		ok(
-			!/keeping its node record on this node/.test(await readLog(follower)),
-			'premise: B recorded A, a v5 leader, as an ordinary cluster member'
+			/Published this node's record of leader/.test(await readLog(follower)),
+			'premise: B published its record of A when its clone completed'
 		);
 
 		await waitForPeerRow(second, leader);

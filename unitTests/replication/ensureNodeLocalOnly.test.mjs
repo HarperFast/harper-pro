@@ -38,13 +38,12 @@ describe('ensureNode local-only rows (harper-pro #246, #1487)', function () {
 		}
 	});
 
-	it('clears the bit on an explicit localOnly: false and on an isLeader: false demotion', async () => {
+	it('clears the bit on an isLeader: false demotion, which is how a finished clone publishes its leader', async () => {
 		await ensureNode(PEER, { url: URL, replicates: true, isLeader: true }, { localOnly: true });
-		await ensureNode(PEER, { url: URL, replicates: true, isLeader: true }, { localOnly: false });
-		assert.equal(await storedLocalOnly(), false, 're-cloning from a mesh-member leader heals an old row');
-
-		await ensureNode(PEER, { url: URL, replicates: true, isLeader: true }, { localOnly: true });
-		await ensureNode(PEER, { url: URL, replicates: true, isLeader: false });
+		await ensureNode(PEER, { isLeader: false });
 		assert.equal(await storedLocalOnly(), false);
+		const row = getHDBNodeTable().primaryStore.getSync(PEER);
+		assert.equal(row.isLeader, false);
+		assert.equal(row.url, URL, 'the rest of the row is kept');
 	});
 });

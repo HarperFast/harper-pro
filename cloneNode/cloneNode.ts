@@ -393,6 +393,8 @@ export async function cloneNode(): Promise<void> {
 		return;
 	}
 
+	await publishLeaderNode();
+
 	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
 	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
 	// node with no users during setNode(), which prevents replication from being established.
@@ -441,6 +443,32 @@ export async function cloneNode(): Promise<void> {
 	else clearCloneAttempt();
 
 	log(`Clone from leader node ${leaderURL} complete`);
+}
+
+/**
+ * setNode keeps this node's row for its leader on this node, because `isLeader` also marks a bridge
+ * peer the cluster must not learn (harper-pro #246). A leader running 5 or later is a member of the
+ * cluster, and a node later cloned from this one learns it only from this row (harper-pro #1487), so
+ * the row is released once this node no longer bootstraps from it. Only the flag is written: the rest
+ * of the row is this node's view of the leader. An unreadable version leaves the row as it is.
+ */
+async function publishLeaderNode(): Promise<void> {
+	try {
+		const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
+		if (!(leaderMajorVersion >= 5)) return;
+		const { getHDBNodeTable } = await import('../replication/knownNodes.ts');
+		const { ensureNode } = await import('../replication/subscriptionManager.ts');
+		for (const node of getHDBNodeTable().search([])) {
+			if (node?.url !== leaderReplicationURL || node.isLeader !== true) continue;
+			await ensureNode(node.name, { isLeader: false });
+			log(`Published this node's record of leader ${node.name} to the cluster`);
+		}
+	} catch (err) {
+		log(
+			`Could not publish this node's record of its leader; a node cloned from this one may not learn it: ${err}`,
+			'error'
+		);
+	}
 }
 
 /**
@@ -562,16 +590,12 @@ async function establishReplicationSetup(syncStartedAt: number, priorMarker?: Sy
 	await restartWorkers();
 
 	// Dynamically importing setNode because it was causing early usage of rootpath var install before it was initialized.
-	const { setCloneLeaderNode } = await import('../replication/setNode.js');
+	const { setNode } = await import('../replication/setNode.js');
 
 	// Set node will set up replication between this node and the leader,
 	// which will trigger the sync of data including some system tables like users and roles.
 	log('Sending set node request to leader to establish replication and trigger data sync');
-	// Only a legacy leader is a bridge peer to keep off the mesh; any other leader's row must replicate so
-	// a node cloned from this one learns it. A leader of unknown version is treated as a mesh member.
-	const leaderIsBridgePeer = await leaderIsLegacy();
-	if (leaderIsBridgePeer) log(`Leader ${leaderURL} runs a version before 5; keeping its node record on this node`);
-	const setNodeResponse = await setCloneLeaderNode(setNodeRequest, leaderIsBridgePeer);
+	const setNodeResponse = await setNode(setNodeRequest);
 	log(`Response from set node: ${setNodeResponse}`);
 }
 
@@ -806,7 +830,9 @@ async function monitorSync(
 	if (!systemSocketRequired) {
 		log(`'${SYSTEM_SCHEMA_NAME}' is not in this node's replication.databases; not requiring its socket`, 'debug');
 	} else {
-		systemSocketRequired = !(await leaderIsLegacy());
+		// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
+		const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
+		systemSocketRequired = !(leaderMajorVersion >= 1 && leaderMajorVersion < 5);
 	}
 
 	const outcome = await monitorSyncLoop({
@@ -934,14 +960,12 @@ async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string
 
 	const shardedReplicates = await leaderShardedReplicates();
 	const { getHDBNodeTable } = await import('../replication/knownNodes.ts');
-	// isLeader replicates with the row, so other nodes' leaders carry it too: the URL names ours.
 	let leaderNode: any;
 	for (const node of getHDBNodeTable().search([])) {
-		if (node?.url === leaderReplicationURL) {
+		if (node?.isLeader || node?.url === leaderReplicationURL) {
 			leaderNode = node;
 			break;
 		}
-		if (node?.isLeader) leaderNode ??= node;
 	}
 	const allDb: Record<string, any> = await leaderRequest({ operation: 'describe_all' });
 	for (const db in allDb) {
@@ -1185,16 +1209,10 @@ function deriveLeaderReplicationURL(leaderConfig: Record<string, any> | undefine
 	return `${scheme}://${hostname}:${port}`;
 }
 
-/** True only for a leader whose version was read and is below 5; an unreadable version is not legacy. */
-async function leaderIsLegacy(): Promise<boolean> {
-	// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
-	const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
-	return leaderMajorVersion >= 1 && leaderMajorVersion < 5;
-}
-
 /** v4 leaders have no shard maps; a leader of unknown version is asked, and a failure stops the clone. */
 async function leaderClusterStatus(): Promise<any> {
-	if (await leaderIsLegacy()) return undefined;
+	const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
+	if (leaderMajorVersion >= 1 && leaderMajorVersion < 5) return undefined;
 	return leaderRequest({ operation: 'cluster_status' });
 }
 
