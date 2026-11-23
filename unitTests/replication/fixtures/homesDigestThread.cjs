@@ -50,6 +50,17 @@ function homesDigestThread(database, homes) {
 		homeMapGeneration() {
 			return lockTransport.homeMap(database)?.generation;
 		},
+		publishAlternating(peer, digests, milliseconds) {
+			const status = getReplicationSharedStatus(Item.auditStore, database, peer);
+			const prefixes = digests.map(transport.homesDigestPrefix);
+			let writes = 0;
+			for (const end = Date.now() + milliseconds; Date.now() < end; writes++)
+				transport.publishPeerHomesDigest(status, prefixes[writes % prefixes.length]);
+			return writes;
+		},
+		peerDigestReader(peer) {
+			return transport.peerHomesDigestReader(getReplicationSharedStatus(Item.auditStore, database, peer));
+		},
 		dispose() {
 			transport.setRecordLockHomesRowReader(previousReader);
 			transport.forgetRecordLockHomesCache(database);

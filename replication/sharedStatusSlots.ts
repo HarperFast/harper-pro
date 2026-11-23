@@ -69,6 +69,8 @@ export const ACKED_CONFIRMATION_MARKER_POSITION = allocate();
 export const CONFIRMATION_MARKERS_UNKNOWN = 0;
 export const CONFIRMATION_MARKERS_UNSUPPORTED = 1;
 export const CONFIRMATION_MARKERS_SUPPORTED = 2;
+// An Int32 count bumped after each write that changes RECORD_LOCK_HOMES_DIGEST_POSITION (recordLockTransport.ts).
+export const RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION = allocate();
 
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
 export const ALLOCATED_SLOTS = cursor;

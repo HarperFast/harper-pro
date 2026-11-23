@@ -65,6 +65,7 @@ import * as logger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, getReplicationSharedStatus, shouldReplicateFromNode } from './knownNodes.ts';
 import {
 	RECORD_LOCKS_CAPABILITY_POSITION,
+	RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION,
 	RECORD_LOCK_HOMES_DIGEST_POSITION,
 	RECORD_LOCK_LEVEL_POSITION,
 } from './sharedStatusSlots.ts';
@@ -124,7 +125,12 @@ import { replicatedDatabaseNames } from './replicator.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import './recordLockApply.ts';
 
-export { RECORD_LOCKS_CAPABILITY_POSITION, RECORD_LOCK_HOMES_DIGEST_POSITION, RECORD_LOCK_LEVEL_POSITION };
+export {
+	RECORD_LOCKS_CAPABILITY_POSITION,
+	RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION,
+	RECORD_LOCK_HOMES_DIGEST_POSITION,
+	RECORD_LOCK_LEVEL_POSITION,
+};
 export const LOCK_CAPABILITY_UNKNOWN = 0;
 export const LOCK_CAPABILITY_UNSUPPORTED = 1;
 export const LOCK_CAPABILITY_SUPPORTED = 2;
@@ -153,32 +159,38 @@ export function homesDigestPrefix(digest: unknown): bigint | undefined {
 	return prefix === NO_PEER_HOMES_DIGEST ? 1n : prefix;
 }
 
-/** One 64-bit atomic write: sockets of one peer on several threads may publish at once. */
+const HOMES_DIGEST_CHANGES_WORD = RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2;
+
+/**
+ * One 64-bit atomic write, since sockets of one peer on several threads may publish at once, then a bump of
+ * the change count, after the write, that `peerHomesDigestReader` keys its re-read on.
+ */
 export function publishPeerHomesDigest(status: Float64Array, prefix: bigint): boolean {
 	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
 	if (Atomics.load(record, RECORD_LOCK_HOMES_DIGEST_POSITION) === prefix) return false;
-	return Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, prefix) !== prefix;
-}
-
-/** `prefix` as the two Int32 halves it occupies in the record, in this platform's byte order. */
-export function homesDigestWords(prefix: bigint): Int32Array {
-	const words = new Int32Array(2);
-	new BigInt64Array(words.buffer)[0] = prefix;
-	return words;
-}
-
-export function peerHomesDigestWords(status: Float64Array): Int32Array {
-	return new Int32Array(status.buffer, status.byteOffset, status.length * 2);
+	if (Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, prefix) === prefix) return false;
+	Atomics.add(new Int32Array(status.buffer, status.byteOffset, status.length * 2), HOMES_DIGEST_CHANGES_WORD, 1);
+	return true;
 }
 
 /**
- * Plain Int32 loads, which allocate nothing on the lock path (a BigInt load does). Each is tear-free, but
- * a pair can straddle a concurrent 64-bit write; reading the low half again after the high half rejects a
- * pair taken across one.
+ * One thread's reader of a peer's digest record. A BigInt load allocates, so it re-loads the record only
+ * when the change count moved. Every changing write bumps the count after it, so a load made after
+ * reading a count returns a value at least as new as the write that count reflects.
  */
-export function peerHomesDigestIs(words: Int32Array, low: number, high: number): boolean {
-	const at = RECORD_LOCK_HOMES_DIGEST_POSITION * 2;
-	return words[at] === low && words[at + 1] === high && words[at] === low;
+export function peerHomesDigestReader(status: Float64Array): () => bigint {
+	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
+	const words = new Int32Array(status.buffer, status.byteOffset, status.length * 2);
+	let seen: number | undefined;
+	let prefix = NO_PEER_HOMES_DIGEST;
+	return () => {
+		const changes = Atomics.load(words, HOMES_DIGEST_CHANGES_WORD);
+		if (changes !== seen) {
+			prefix = Atomics.load(record, RECORD_LOCK_HOMES_DIGEST_POSITION);
+			seen = changes;
+		}
+		return prefix;
+	};
 }
 
 /** The peer's exact advertised `recordLocks` level, so a refusal can name it. 0 while unknown. */
@@ -358,7 +370,7 @@ export function createRecordLockTransport(
 	cacheFor: () => RecordLockGenerationState | undefined,
 	mapConfirmedAbsent: () => boolean = () => false
 ): ClusterLockTransport {
-	const statusViews = new Map<string, { status: Float64Array; words: Int32Array }>();
+	const statusViews = new Map<string, { status: Float64Array; peerDigest: () => bigint }>();
 	let statusViewsStore: any;
 	const statusFor = (auditStore: any, peer: string) => {
 		if (statusViewsStore !== auditStore) {
@@ -368,14 +380,12 @@ export function createRecordLockTransport(
 		let views = statusViews.get(peer);
 		if (!views) {
 			const status = getReplicationSharedStatus(auditStore, database, peer);
-			statusViews.set(peer, (views = { status, words: peerHomesDigestWords(status) }));
+			statusViews.set(peer, (views = { status, peerDigest: peerHomesDigestReader(status) }));
 		}
 		return views;
 	};
 	let ownDigestFor: RecordLockGenerationState | undefined;
-	let ownDigestLow = 0;
-	let ownDigestHigh = 0;
-	let ownDigestKnown = false;
+	let ownDigest: bigint | undefined;
 	// Read once, at transport construction, matching when core reads it (`LockCoordinator`'s
 	// constructor, once per coordinator build): a fresh node that has never incarnated before has
 	// provably granted nothing, so core's construction-anchored restart quarantine
@@ -415,14 +425,12 @@ export function createRecordLockTransport(
 			const auditStore = deps.auditStore(database);
 			if (active !== ownDigestFor) {
 				ownDigestFor = active;
-				const prefix = homesDigestPrefix(active.digest);
-				ownDigestKnown = prefix !== undefined;
-				if (prefix !== undefined) [ownDigestLow, ownDigestHigh] = homesDigestWords(prefix);
+				ownDigest = homesDigestPrefix(active.digest);
 			}
 			for (const peer of active.homes) {
 				if (peer === self) continue;
-				if (!auditStore || !ownDigestKnown) return undefined;
-				const { status, words } = statusFor(auditStore, peer);
+				if (!auditStore || ownDigest === undefined) return undefined;
+				const { status, peerDigest } = statusFor(auditStore, peer);
 				// Digest agreement (the operator-stated topology matches) and wire-protocol capability
 				// (the peer can actually speak this level's delegation/recall/lockRelease shape) are
 				// independent: a coincidentally-matching digest from a peer at the wrong protocol level
@@ -431,7 +439,7 @@ export function createRecordLockTransport(
 				// unsafe to treat as agreeing as one that actively disagrees (§4.1: "a digest check is
 				// not a freshness check").
 				if (readPeerLockCapability(status) !== LOCK_CAPABILITY_SUPPORTED) return undefined;
-				if (!peerHomesDigestIs(words, ownDigestLow, ownDigestHigh)) return undefined;
+				if (peerDigest() !== ownDigest) return undefined;
 			}
 			return { generation: active.generation, homes: active.homes, homeIncarnation };
 		},
@@ -785,7 +793,7 @@ const homesDigestAnnouncers = new Map<string, Set<() => void>>();
 
 /**
  * Inbound sessions register too: the peer's thread holding its outbound socket to this node hears
- * nothing else after the handshake. Returns the removal.
+ * nothing else after the handshake.
  */
 export function registerHomesDigestAnnouncer(database: string, announce: () => void): () => void {
 	let announcers = homesDigestAnnouncers.get(database);

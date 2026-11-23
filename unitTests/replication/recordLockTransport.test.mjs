@@ -13,6 +13,7 @@ import {
 	LOCK_CAPABILITY_SUPPORTED,
 	LOCK_CAPABILITY_UNKNOWN,
 	LOCK_CAPABILITY_UNSUPPORTED,
+	RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION,
 	RECORD_LOCK_HOMES_DIGEST_POSITION,
 	RECORD_LOCKS_CAPABILITY_POSITION,
 	RECORD_LOCKS_DISABLED_MESSAGE,
@@ -34,9 +35,7 @@ import {
 	currentHomeIncarnation,
 	ownsRecordLockCoordination,
 	homesDigestPrefix,
-	homesDigestWords,
-	peerHomesDigestIs,
-	peerHomesDigestWords,
+	peerHomesDigestReader,
 	publishPeerHomesDigest,
 	readPeerLockCapability,
 	recordLockOwnerFor,
@@ -171,13 +170,14 @@ describe('peer lock capability in the shared status buffer', () => {
 });
 
 const digestFor = (label) => createHash('sha256').update(String(label)).digest('hex');
-const recordHolds = (status, digest) =>
-	peerHomesDigestIs(peerHomesDigestWords(status), ...homesDigestWords(homesDigestPrefix(digest)));
+const recordHolds = (status, digest) => peerHomesDigestReader(status)() === homesDigestPrefix(digest);
+const digestChanges = (status) =>
+	new Int32Array(status.buffer, status.byteOffset, status.length * 2)[RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2];
 
 describe('peer home-map digest record in the shared status buffer', () => {
 	it('starts as none heard, and answers whether each publication changed it', () => {
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
-		assert.ok(peerHomesDigestIs(peerHomesDigestWords(status), 0, 0), 'none heard');
+		assert.strictEqual(peerHomesDigestReader(status)(), 0n, 'none heard');
 		assert.ok(!recordHolds(status, digestFor(1)));
 		assert.strictEqual(publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1))), true);
 		assert.ok(recordHolds(status, digestFor(1)));
@@ -191,7 +191,7 @@ describe('peer home-map digest record in the shared status buffer', () => {
 		assert.ok(!recordHolds(status, digestFor(1)));
 	});
 
-	it('reads back the halves of a prefix with the high bit set in either half', () => {
+	it('reads back a prefix with the high bit set in either half', () => {
 		for (const digest of ['f'.repeat(64), '80000000' + '7'.repeat(56), '7fffffff' + '8'.repeat(56)]) {
 			const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 			publishPeerHomesDigest(status, homesDigestPrefix(digest));
@@ -199,30 +199,24 @@ describe('peer home-map digest record in the shared status buffer', () => {
 		}
 	});
 
-	it('rejects a pair read across a concurrent write, even when each half matched its own', () => {
-		const [low, high] = homesDigestWords(homesDigestPrefix(digestFor('own')));
-		const at = RECORD_LOCK_HOMES_DIGEST_POSITION * 2;
-		let lowReads = 0;
-		// (low, x) is replaced by (y, high) between the first read of the low half and the read of the high half.
-		const words = {
-			get [at]() {
-				return lowReads++ === 0 ? low : low ^ 1;
-			},
-			[at + 1]: high,
-		};
-		assert.strictEqual(peerHomesDigestIs(words, low, high), false);
+	it('counts each write that changes the record, and not a re-send', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(digestChanges(status), 1);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2)));
+		assert.strictEqual(digestChanges(status), 2);
 	});
 
-	it('fails closed on a read that pairs halves of two different digests', () => {
+	it('re-reads the record only once the change count has moved', () => {
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
-		const [lowA] = homesDigestWords(homesDigestPrefix(digestFor('a')));
-		const [, highB] = homesDigestWords(homesDigestPrefix(digestFor('b')));
-		const words = peerHomesDigestWords(status);
-		const at = RECORD_LOCK_HOMES_DIGEST_POSITION * 2;
-		words[at] = lowA;
-		words[at + 1] = highB;
-		assert.ok(!recordHolds(status, digestFor('a')));
-		assert.ok(!recordHolds(status, digestFor('b')));
+		const read = peerHomesDigestReader(status);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
+		new BigInt64Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_POSITION] = homesDigestPrefix(digestFor(2));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)), 'no count change, no re-read');
+		new Int32Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2]++;
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
 	});
 
 	it('keeps the first 64 bits of a digest, with the high bit, and never the none value', () => {
@@ -239,13 +233,13 @@ describe('peer home-map digest record in the shared status buffer', () => {
 			assert.strictEqual(homesDigestPrefix(value), undefined, String(value));
 	});
 
-	it('is one 8-byte slot right after the capability flag, read and written whole', () => {
+	it('writes only its record, right after the capability flag, and its change count', () => {
 		assert.strictEqual(RECORD_LOCK_HOMES_DIGEST_POSITION, RECORD_LOCKS_CAPABILITY_POSITION + 1);
-		assert.ok(RECORD_LOCK_HOMES_DIGEST_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
+		assert.ok(RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(3)));
 		const touched = [...status.keys()].filter((position) => status[position] !== 0);
-		assert.deepStrictEqual(touched, [RECORD_LOCK_HOMES_DIGEST_POSITION]);
+		assert.deepStrictEqual(touched, [RECORD_LOCK_HOMES_DIGEST_POSITION, RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION]);
 	});
 
 	it('records the exact advertised level in the last slot, reading garbage as 0', () => {

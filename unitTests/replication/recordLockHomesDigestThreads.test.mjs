@@ -10,6 +10,7 @@ import { Worker } from 'node:worker_threads';
 const require = createRequire(import.meta.url);
 const FIXTURE = require.resolve('./fixtures/homesDigestThread.cjs');
 const { homesDigestThread } = require(FIXTURE);
+const { homesDigestPrefix } = require('../../dist/replication/recordLockTransport.js');
 
 const DATABASE = 'homes_digest_threads';
 const HOMES = ['self', 'peer-a'];
@@ -108,5 +109,22 @@ describe('peer home-map digest agreement across threads of one node', function (
 		await sibling.call('receive', 'peer-a', digest('generation 5'));
 		assert.strictEqual(here.homeMapGeneration(), undefined);
 		assert.strictEqual(await sibling.call('homeMapGeneration'), undefined);
+	});
+
+	it('never reads a digest the peer did not publish while another thread writes the record', async () => {
+		// Each published digest shares one 32-bit half with `own`; a read pairing halves of two writes equals it.
+		const own = homesDigestPrefix('aaaaaaaabbbbbbbb' + '0'.repeat(48));
+		const published = ['aaaaaaaacccccccc' + '0'.repeat(48), 'ddddddddbbbbbbbb' + '0'.repeat(48)];
+		const read = here.peerDigestReader('peer-b');
+		const writing = sibling.call('publishAlternating', 'peer-b', published, 400);
+		const seen = new Map();
+		for (const end = Date.now() + 600; Date.now() < end;) {
+			const prefix = read();
+			seen.set(prefix, (seen.get(prefix) ?? 0) + 1);
+		}
+		assert.ok((await writing) > 1000);
+		assert.strictEqual(seen.get(own), undefined);
+		for (const digest of published)
+			assert.ok(seen.get(homesDigestPrefix(digest)) > 0, 'the writer ran during the reads');
 	});
 });
