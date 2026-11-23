@@ -569,7 +569,9 @@ async function establishReplicationSetup(syncStartedAt: number, priorMarker?: Sy
 	log('Sending set node request to leader to establish replication and trigger data sync');
 	// Only a legacy leader is a bridge peer to keep off the mesh; any other leader's row must replicate so
 	// a node cloned from this one learns it. A leader of unknown version is treated as a mesh member.
-	const setNodeResponse = await setCloneLeaderNode(setNodeRequest, await leaderIsLegacy());
+	const leaderIsBridgePeer = await leaderIsLegacy();
+	if (leaderIsBridgePeer) log(`Leader ${leaderURL} runs a version before 5; keeping its node record on this node`);
+	const setNodeResponse = await setCloneLeaderNode(setNodeRequest, leaderIsBridgePeer);
 	log(`Response from set node: ${setNodeResponse}`);
 }
 

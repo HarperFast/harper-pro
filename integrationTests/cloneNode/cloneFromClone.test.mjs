@@ -11,7 +11,13 @@ import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert/strict';
 import { join } from 'node:path';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, stopAndTeardownNodes, stopNodeProcess, waitForCondition } from '../cluster/clusterShared.mjs';
+import {
+	readLog,
+	sendOperation,
+	stopAndTeardownNodes,
+	stopNodeProcess,
+	waitForCondition,
+} from '../cluster/clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -136,6 +142,11 @@ suite('Clone Node - a clone of a clone learns the first leader (harper-pro#1487)
 
 		const second = (ctx.second = await startClone(ctx, follower));
 		await waitForAvailable(second);
+
+		ok(
+			!/keeping its node record on this node/.test(await readLog(follower)),
+			'premise: B recorded A, a v5 leader, as an ordinary cluster member'
+		);
 
 		await waitForPeerRow(second, leader);
 		await waitForPeerRow(leader, second);
