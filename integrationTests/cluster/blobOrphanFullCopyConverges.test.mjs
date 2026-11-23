@@ -185,20 +185,25 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 
 		// Live rows flow while a copy is still unfinalized, so wait out the watchdog for system and data. This
 		// must precede the restarting deploy below, which would clear an unfinalized copy.
-		const copyCompletes = async () => ((await readLog(nodeB)).match(/bulk copy complete from/g) ?? []).length;
-		await waitForCondition(async () => (await copyCompletes()) >= 2, {
+		const copyLog = async () => {
+			const lines = (await readLog(nodeB)).split('\n');
+			return {
+				completes: lines.filter((line) => line.includes('bulk copy complete from')).length,
+				watchdogFires: lines.filter((line) => line.includes('Copy-finalization watchdog')),
+			};
+		};
+		await waitForCondition(async () => (await copyLog()).completes >= 2, {
 			timeoutMs: 30_000,
 			description: 'B to receive COPY_COMPLETE for the system and data databases',
 		});
 		// The log line does not name its database and a re-run copy logs it again, so restart the wait
 		// whenever another COPY_COMPLETE lands during it.
-		for (let seen = 0, count = await copyCompletes(); count > seen; count = await copyCompletes()) {
-			seen = count;
+		let { completes, watchdogFires } = await copyLog();
+		for (let seen = 0, rounds = 0; completes > seen && !watchdogFires.length && rounds < 3; rounds++) {
+			seen = completes;
 			await delay(COPY_FINALIZE_FIRE_BOUND_MS + 2000);
+			({ completes, watchdogFires } = await copyLog());
 		}
-		const watchdogFires = (await readLog(nodeB))
-			.split('\n')
-			.filter((line) => line.includes('Copy-finalization watchdog'));
 		equal(watchdogFires.length, 0, `B's copy did not finalize:\n${watchdogFires.join('\n')}`);
 
 		await waitForOperationPath(nodeA, nodeB.hostname);
