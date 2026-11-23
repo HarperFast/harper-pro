@@ -14652,6 +14652,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	).unref();
 
 	let nextId = 1;
+	// A request is refused before its waiter is registered once the socket is ending: a retired instance has
+	// already rejected its waiters, and ws drops a send on a closing socket without an error while 'close'
+	// (which rejects them) can be the closing handshake's timeout away.
+	function socketEnding() {
+		return wsClosed || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED;
+	}
 	function sendOperation(operation, timeoutMs?: number): Promise<any> {
 		const requestId = nextId++;
 		return new Promise((resolve, reject) => {
@@ -14674,7 +14680,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				},
 			});
 			try {
-				if (wsClosed) throw new Error('Connection closed before operation request');
+				if (socketEnding()) throw new Error('Connection closed before operation request');
 				ws.send(encode([OPERATION_REQUEST, { ...operation, requestId }]));
 			} catch (error) {
 				awaitingResponse.delete(requestId);
@@ -14697,8 +14703,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// send a request for a specific record
 			const requestId = nextId++;
 			return new Promise((resolve, reject) => {
-				// a retired instance has already rejected its pending requests; ws drops a send on a closing socket
-				if (wsClosed) return reject(new Error('Replication connection closed before the record request was sent'));
+				if (socketEnding())
+					return reject(new Error('Replication connection closed before the record request was sent'));
 				let tableId = request.table.tableId;
 				if (request.blobRepairOnly) {
 					// Repair shares the subscription stream's decoder namespace: use the peer's id, not ours.
