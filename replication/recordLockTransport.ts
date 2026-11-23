@@ -179,7 +179,11 @@ const STUCK_WRITER_READS = 10_000;
  * write's exchange always re-loads. A writer that never finishes (a terminated worker) leaves its peer's
  * readers re-loading on every call.
  */
-export function peerHomesDigestReader(status: Float64Array, peer = ''): () => bigint {
+export function peerHomesDigestReader(
+	status: Float64Array,
+	peer = '',
+	warn: (message: string) => void = (message) => logger.warn?.(message)
+): () => bigint {
 	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
 	const words = homesDigestChangeWords(status);
 	let seen: number | undefined;
@@ -198,7 +202,7 @@ export function peerHomesDigestReader(status: Float64Array, peer = ''): () => bi
 					inFlightReads = 0;
 				} else if (++inFlightReads === STUCK_WRITER_READS && !warned) {
 					warned = true;
-					logger.warn?.(
+					warn(
 						`The record lock home map digest record for ${peer} has had a writer in flight for ${STUCK_WRITER_READS} reads; a worker likely exited mid-write, so this thread re-reads it on every lock until restart`
 					);
 				}
@@ -849,12 +853,15 @@ export function recordPeerHomesDigest(database: string, peer: string, digest: un
 
 /**
  * A changed peer digest may be what makes `homeMap()` answerable on the owner, which judges that against
- * its own cache: run the restart round now rather than at its next backoff, which after a few mapless
+ * its own cache (a generation change there schedules the round anyway): run the restart round now rather than at its next backoff, which after a few mapless
  * attempts can be most of a lock's timeout away.
  */
 function scheduleRestartRecallOnOwner(database: string): void {
 	if (!CLUSTER_RECORD_LOCKS_ENABLED || RESTART_RECALL_OFF) return;
-	if (ownedDatabases.has(database)) return restartRecall.schedule(database);
+	if (ownedDatabases.has(database)) {
+		if (transports.get(database)?.homeMap(database)) restartRecall.schedule(database);
+		return;
+	}
 	const owner = ownerThreadByDatabase.get(database);
 	if (owner === undefined) return;
 	try {

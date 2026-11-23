@@ -8,8 +8,7 @@
  */
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
-import { createRequire } from 'node:module';
-import sinon from 'sinon';
+
 import { notifyThreadExit, setMainIsWorker, workers } from '#js/core/server/threads/manageThreads';
 import {
 	LOCK_CAPABILITY_SUPPORTED,
@@ -177,7 +176,6 @@ describe('peer lock capability in the shared status buffer', () => {
 });
 
 const digestFor = (label) => createHash('sha256').update(String(label)).digest('hex');
-const logger = createRequire(import.meta.url)('#js/core/utility/logging/harper_logger');
 const recordHolds = (status, digest) => peerHomesDigestReader(status)() === homesDigestPrefix(digest);
 const CHANGE_WORD = RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2;
 const digestChangeWord = (status) => new Int32Array(status.buffer)[CHANGE_WORD];
@@ -231,25 +229,21 @@ describe('peer home-map digest record in the shared status buffer', () => {
 	});
 
 	it('warns once for a writer that stays in flight, and not for in-flight reads broken by a clean one', () => {
-		const warn = sinon.stub(logger, 'warn');
-		try {
-			const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
-			const read = peerHomesDigestReader(status, 'peer-x');
-			const words = new Int32Array(status.buffer);
-			for (let i = 0; i < 30_000; i++) {
-				words[CHANGE_WORD] += HOMES_DIGEST_WRITER;
-				read();
-				words[CHANGE_WORD] -= HOMES_DIGEST_WRITER;
-				read();
-			}
-			assert.strictEqual(warn.callCount, 0);
+		const warnings = [];
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		const read = peerHomesDigestReader(status, 'peer-x', (message) => warnings.push(message));
+		const words = new Int32Array(status.buffer);
+		for (let i = 0; i < 30_000; i++) {
 			words[CHANGE_WORD] += HOMES_DIGEST_WRITER;
-			for (let i = 0; i < 30_000; i++) read();
-			assert.strictEqual(warn.callCount, 1);
-			assert.match(warn.firstCall.args[0], /peer-x/);
-		} finally {
-			warn.restore();
+			read();
+			words[CHANGE_WORD] -= HOMES_DIGEST_WRITER;
+			read();
 		}
+		assert.strictEqual(warnings.length, 0);
+		words[CHANGE_WORD] += HOMES_DIGEST_WRITER;
+		for (let i = 0; i < 30_000; i++) read();
+		assert.strictEqual(warnings.length, 1);
+		assert.match(warnings[0], /peer-x/);
 	});
 
 	it('leaves an already empty buffer, its change word included, untouched', () => {
