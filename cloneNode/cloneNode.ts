@@ -773,6 +773,7 @@ async function monitorSync(
 		// Best-effort Available: also clears an Unavailable persisted by a prior failed attempt
 		// (hdb_status is not replicated and survives restarts).
 		log('Skipping sync monitor (skip-sync-monitor); marking node Available without verifying sync');
+		await publishLeaderNode();
 		try {
 			await setStatus({ id: 'availability', status: 'Available' });
 		} catch (err) {
