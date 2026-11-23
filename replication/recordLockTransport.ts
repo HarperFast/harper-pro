@@ -153,10 +153,7 @@ export function homesDigestPrefix(digest: unknown): bigint | undefined {
 	return prefix === NO_PEER_HOMES_DIGEST ? 1n : prefix;
 }
 
-/**
- * One 64-bit atomic write, so the record always holds one whole digest prefix even with sockets of the
- * same peer on several threads. Answers whether it changed.
- */
+/** One 64-bit atomic write: sockets of one peer on several threads may publish at once. */
 export function publishPeerHomesDigest(status: Float64Array, prefix: bigint): boolean {
 	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
 	if (Atomics.load(record, RECORD_LOCK_HOMES_DIGEST_POSITION) === prefix) return false;
@@ -175,13 +172,13 @@ export function peerHomesDigestWords(status: Float64Array): Int32Array {
 }
 
 /**
- * Read as two plain Int32 loads, which allocate nothing on the lock path (a BigInt load allocates). Each
- * load is tear-free; one that straddles a concurrent write pairs halves of two digests, which matches
- * neither unless they share that half, so it fails closed for that call.
+ * Plain Int32 loads, which allocate nothing on the lock path (a BigInt load does). Each is tear-free, but
+ * a pair can straddle a concurrent 64-bit write; reading the low half again after the high half rejects a
+ * pair taken across one.
  */
 export function peerHomesDigestIs(words: Int32Array, low: number, high: number): boolean {
 	const at = RECORD_LOCK_HOMES_DIGEST_POSITION * 2;
-	return words[at] === low && words[at + 1] === high;
+	return words[at] === low && words[at + 1] === high && words[at] === low;
 }
 
 /** The peer's exact advertised `recordLocks` level, so a refusal can name it. 0 while unknown. */
@@ -815,8 +812,9 @@ function pushHomesDigestToPeers(database: string): void {
 const HOMES_AGREED_MESSAGE = 'record-lock-homes-agreed';
 
 /**
- * A frame lost here (malformed, or the database not open on this thread yet) is repaired by the peer's
- * next keepalive re-send.
+ * A frame dropped here (malformed, or the database not open on this thread yet) leaves the record as it
+ * was until the next frame: the peer's keepalive re-send if it holds an outbound socket to this node,
+ * otherwise its next announcement or reconnect handshake.
  */
 export function recordPeerHomesDigest(database: string, peer: string, digest: unknown): void {
 	const prefix = homesDigestPrefix(digest);

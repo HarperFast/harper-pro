@@ -199,6 +199,20 @@ describe('peer home-map digest record in the shared status buffer', () => {
 		}
 	});
 
+	it('rejects a pair read across a concurrent write, even when each half matched its own', () => {
+		const [low, high] = homesDigestWords(homesDigestPrefix(digestFor('own')));
+		const at = RECORD_LOCK_HOMES_DIGEST_POSITION * 2;
+		let lowReads = 0;
+		// (low, x) is replaced by (y, high) between the first read of the low half and the read of the high half.
+		const words = {
+			get [at]() {
+				return lowReads++ === 0 ? low : low ^ 1;
+			},
+			[at + 1]: high,
+		};
+		assert.strictEqual(peerHomesDigestIs(words, low, high), false);
+	});
+
 	it('fails closed on a read that pairs halves of two different digests', () => {
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 		const [lowA] = homesDigestWords(homesDigestPrefix(digestFor('a')));

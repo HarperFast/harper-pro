@@ -13,7 +13,10 @@ const { getReplicationSharedStatus } = require(path.join(dist, 'replication/know
 function homesDigestThread(database, homes) {
 	const Item = table({ database, table: 'Item', attributes: [{ name: 'id', type: 'ID', isPrimaryKey: true }] });
 	let active;
-	const previousReader = transport.setRecordLockHomesRowReader(async () => (active ? { active } : undefined));
+	const previousReader = transport.setRecordLockHomesRowReader((key) =>
+		key === database ? Promise.resolve(active ? { active } : undefined) : previousReader(key)
+	);
+	let cached;
 	const lockTransport = transport.createRecordLockTransport(
 		database,
 		{
@@ -27,13 +30,13 @@ function homesDigestThread(database, homes) {
 		},
 		() => {
 			const generation = transport.cachedActiveGeneration(database);
-			return generation === undefined
-				? undefined
-				: { generation, homes, digest: transport.currentHomesDigest(database) };
+			if (generation === undefined) return undefined;
+			if (cached?.generation !== generation)
+				cached = { generation, homes, digest: transport.currentHomesDigest(database) };
+			return cached;
 		}
 	);
 	return {
-		/** What this thread does on the homes-changed broadcast. */
 		async activate(generation, digest) {
 			active = { generation, homes, digest };
 			await transport.refreshRecordLockHomesCache(database, true);

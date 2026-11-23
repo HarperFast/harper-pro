@@ -43,7 +43,6 @@ export const FIRE_MECHANISMS = [
 export const FIRE_COUNTER_BASE_POSITION = allocate(FIRE_MECHANISMS.length * 2);
 
 export const RECORD_LOCKS_CAPABILITY_POSITION = allocate();
-// The peer's last advertised home-map digest prefix: written as one BigInt64 with `Atomics`, read as two Int32 halves.
 export const RECORD_LOCK_HOMES_DIGEST_POSITION = allocate();
 export const RECORD_LOCK_LEVEL_POSITION = allocate();
 // 1 while the peer's current socket advertises `originFloors`: a relay forwards that peer's floor only then.

@@ -8976,8 +8976,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					case RECORD_LOCK_HOMES_DIGEST:
 						// `data` (`message[1]`) is the digest; `message[2]` names the database — the same slot
 						// NODE_NAME uses for it — since one socket carries every database's traffic and the
-						// digest is per-database (harper-pro#825). Recorded per (database, peer) in shared memory,
-						// not on this connection: the peer's other socket is often on another thread.
+						// digest is per-database (harper-pro#825).
 						if (typeof data === 'string' && typeof remoteNodeName === 'string' && message[2] === databaseName)
 							recordPeerHomesDigest(databaseName, remoteNodeName, data);
 						break;
@@ -14477,8 +14476,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * resolved at handshake — harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6): the active
 	 * generation digest travels on its own, from whatever this node's transport cache currently holds.
 	 * No-op with the feature off or before this node has an active generation — the peer's fail-closed
-	 * default already covers "no digest received." Sent at handshake, again whenever this node's digest
-	 * changes (every live session, inbound included, registers to be told), and on each keepalive ping.
+	 * default already covers "no digest received."
 	 */
 	function sendRecordLockHomesDigestFrame() {
 		if (!CLUSTER_RECORD_LOCKS_ENABLED || wsClosed) return;

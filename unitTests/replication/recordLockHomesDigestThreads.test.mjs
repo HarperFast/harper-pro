@@ -103,6 +103,7 @@ describe('peer home-map digest agreement across threads of one node', function (
 		await here.activate(4, digest('generation 4'));
 		await sibling.call('activate', 4, digest('generation 4'));
 		here.receive('peer-a', digest('generation 4'));
+		assert.strictEqual(here.homeMapGeneration(), 4);
 		assert.strictEqual(await sibling.call('homeMapGeneration'), 4);
 		await sibling.call('receive', 'peer-a', digest('generation 5'));
 		assert.strictEqual(here.homeMapGeneration(), undefined);
