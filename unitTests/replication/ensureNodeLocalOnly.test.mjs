@@ -1,4 +1,5 @@
 import assert from 'node:assert';
+import { getThisNodeName } from '#src/core/server/nodeName';
 import { getHDBNodeTable } from '#src/replication/knownNodes';
 import { ensureNode, isLocalOnlyEntry } from '#src/replication/subscriptionManager';
 
@@ -20,15 +21,21 @@ describe('ensureNode local-only rows (harper-pro #246, #1487)', function () {
 	});
 
 	it('does not hide a row that only carries a replicated isLeader', async () => {
-		// How a clone leader's row looks on every other node: isLeader set, never written local-only.
 		await getHDBNodeTable().put(PEER, { name: PEER, url: URL, replicates: true, isLeader: true });
 		await ensureNode(PEER, { url: URL, replicates: true });
 		assert.equal(await storedLocalOnly(), false);
 	});
 
-	it('writes an ordinary row for a clone leader that is a mesh member', async () => {
-		await ensureNode(PEER, { url: URL, replicates: true, isLeader: true }, { localOnly: false });
-		assert.equal(await storedLocalOnly(), false);
+	it("never keeps this node's own row local-only", async () => {
+		const self = getThisNodeName();
+		const prior = getHDBNodeTable().primaryStore.getSync(self);
+		try {
+			await ensureNode(self, { url: URL, replicates: true, isLeader: true }, { localOnly: true });
+			assert.equal(isLocalOnlyEntry(await getHDBNodeTable().primaryStore.getEntry(self, { async: true })), false);
+		} finally {
+			if (prior) await getHDBNodeTable().put(self, prior);
+			else await getHDBNodeTable().delete(self);
+		}
 	});
 
 	it('clears the bit on an explicit localOnly: false and on an isLeader: false demotion', async () => {

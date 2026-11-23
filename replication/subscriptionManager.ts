@@ -2481,11 +2481,14 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 	// would otherwise send it to the mesh (harper-pro #246). The stored bit decides, not `isLeader`: that
 	// field replicates, so on another node it marks a row that was never local-only (harper-pro #1487).
 	// `isLeader: false` is an explicit demotion and clears it.
+	// A node's own row is never a bridge peer's: an earlier release could make it local-only once
+	// `isLeader` had replicated onto it, after which its own changes stopped reaching the cluster.
 	const localOnly =
-		options?.localOnly ??
-		(existing != null &&
-			node.isLeader !== false &&
-			isLocalOnlyEntry(await table.primaryStore.getEntry(name, { async: true })));
+		name !== getThisNodeName() &&
+		(options?.localOnly ??
+			(existing != null &&
+				node.isLeader !== false &&
+				isLocalOnlyEntry(await table.primaryStore.getEntry(name, { async: true }))));
 
 	// Use an explicit, isolated context for this write instead of relying on ambient fallback
 	// (contextStorage.getStore()). This is internal node-registry bookkeeping, not a user-authored
