@@ -474,6 +474,7 @@ jobs:
           integrationTests/cluster/replicationWorkerPool.test.mjs
           integrationTests/cluster/fullyConnectedReplication.test.mjs
           integrationTests/cluster/recordLockCluster.test.mjs
+          integrationTests/cluster/recordLockDefaultHomes.test.mjs
           integrationTests/cluster/cacheReplicationSource.test.mjs
           integrationTests/cluster/isolatedApplicationReplication.test.mjs
           integrationTests/cluster/staticSharding.test.mjs

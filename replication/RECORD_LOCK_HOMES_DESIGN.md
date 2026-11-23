@@ -134,8 +134,8 @@ staged?.generation ?? 0, highestActedOn)`, and refuses a `quiesce` that omits a 
 Per thread, cache this node's active generation per database, updated **only** when this node's
 own `active` row changes locally (on `stage` clearing it, or `activate` setting it) — never read
 from storage, hashed or sorted inside `homeMap()` itself. Each call checks every peer named in
-`homes` against shared-status slots 31 (capability) and 32 (digest agreement), failing closed when
-either is unknown, and returns a new object. With `replication.recordLocks` off, no table watcher
+`homes` against shared-status slots 31 (capability) and 32 (the digest that peer last advertised,
+compared with this thread's own), failing closed when either is unknown, and returns a new object. With `replication.recordLocks` off, no table watcher
 or cache exists at all.
 
 ### 4. Digest mismatch fails the whole map closed, not a shrunk ring
@@ -159,12 +159,16 @@ non-collision.
 
 Reusing `NODE_NAME` as a live refresh is unproven — its handler has side effects
 (`sendSubscriptionRequestUpdate()`). So the digest travels on its own minimal message,
-`RECORD_LOCK_HOMES_DIGEST` (`[150, digest, database]`), sent (a) at handshake per database and
-(b) standalone, on every live outbound connection for a database whose local `active` digest just
-changed (on `activate`) — with no other handshake side effect triggered. Receipt writes only a
-tri-state match/mismatch/unknown result into the per-(database, peer) shared status buffer
-(slot 32, beside slot 31's capability support flag) — the full digest itself travels on the wire,
-compared byte-exact on the socket thread, never truncated into shared memory.
+`RECORD_LOCK_HOMES_DIGEST` (`[150, digest, database]`), sent (a) at handshake per database,
+(b) standalone on every live session of a database, inbound and outbound, whose local `active`
+digest just changed, and (c) on each keepalive ping of an outbound session — with no other handshake
+side effect triggered. Receipt stores the digest's first 64 bits in the per-(database, peer) shared
+status buffer (slot 32), one `Atomics` value, so it cannot tear; a malformed frame stores nothing.
+Agreement is that value equal to the reading thread's own digest, decided when `homeMap()` reads it:
+a stored verdict is relative to the writing thread's cache and to whichever of the peer's sockets
+that thread holds, so one thread's stale view overwrites another's correct one. Sockets of one peer
+land on different threads, so an older frame can be recorded after a newer one; (c) bounds that to
+one ping interval.
 
 ### 7. `homeIncarnation` per coordination incarnation, gated centrally
 
@@ -438,15 +442,15 @@ fencedWith)` so retries of the same call do not grow it. A noop re-stage that ad
 Why each kind of authority the fenced node `C` held under `g` cannot admit after the survivors
 activate `g+1`:
 
-| `C`'s authority under `g`                         | Why it cannot admit                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| delegations `C` holds, granted by a survivor home | `C` is stopped: the operator's attestation, and the only fact the recall discount relies on. Core's home expires an older grant its stage drain reported outstanding to a node outside the new ring (the recall to `C`) on its first grant under `g+1` (`#retireOlderGrants`), so the key is served at once rather than after the lease                                                                                                        |
-| delegations `C` granted to survivors              | the survivor's own drain surrenders them, which is part of its proof                                                                                                                                                                                                                                                                                                                                                                           |
-| a grant reply from `C` still in flight            | a staged survivor has no home map, so core's post-reply check (`reply.token[0] !== homeMap()?.generation`) hands it back; after activation the token's generation is `g`                                                                                                                                                                                                                                                                       |
-| a delegation request from `C` still in flight     | refused for no map while staged, and for generation or `unknown-node` after activation                                                                                                                                                                                                                                                                                                                                                         |
-| `C` restarts with its old `active` row            | the per-peer digest agreement (slot 32) is process memory, so a restarted `C` starts with no agreement. The survey of this transition (this call's, or the earlier call whose recorded fence a retry passes on) required a majority of `C`'s ring to report it active, so `C`'s row holds that ring and its live members now announce `g+1`; §4 withholds `C`'s whole map. It cannot lock until a later generation that includes it is applied |
+| `C`'s authority under `g`                         | Why it cannot admit                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| delegations `C` holds, granted by a survivor home | `C` is stopped: the operator's attestation, and the only fact the recall discount relies on. Core's home expires an older grant its stage drain reported outstanding to a node outside the new ring (the recall to `C`) on its first grant under `g+1` (`#retireOlderGrants`), so the key is served at once rather than after the lease                                                                                             |
+| delegations `C` granted to survivors              | the survivor's own drain surrenders them, which is part of its proof                                                                                                                                                                                                                                                                                                                                                                |
+| a grant reply from `C` still in flight            | a staged survivor has no home map, so core's post-reply check (`reply.token[0] !== homeMap()?.generation`) hands it back; after activation the token's generation is `g`                                                                                                                                                                                                                                                            |
+| a delegation request from `C` still in flight     | refused for no map while staged, and for generation or `unknown-node` after activation                                                                                                                                                                                                                                                                                                                                              |
+| `C` restarts with its old `active` row            | the per-peer digest record (slot 32) is process memory, so a restarted `C` starts with none. The survey of this transition (this call's, or the earlier call whose recorded fence a retry passes on) required a majority of `C`'s ring to report it active, so `C`'s row holds that ring and its live members now announce `g+1`; §4 withholds `C`'s whole map. It cannot lock until a later generation that includes it is applied |
 
-A `C` that is actually alive and partitioned keeps its retained digest agreement and self-homes its own
+A `C` that is actually alive and partitioned keeps its retained peer digest records and self-homes its own
 keys under `g` whether or not the call waits, so the attestation was already load-bearing on the wait
 path; the immediate path adds reliance only for the delegations `C` held. Writes `C` committed and never
 replicated are lost or arrive late on either path.
