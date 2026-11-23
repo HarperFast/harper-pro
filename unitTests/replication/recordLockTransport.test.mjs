@@ -13,7 +13,6 @@ import {
 	LOCK_CAPABILITY_SUPPORTED,
 	LOCK_CAPABILITY_UNKNOWN,
 	LOCK_CAPABILITY_UNSUPPORTED,
-	NO_PEER_HOMES_DIGEST,
 	RECORD_LOCK_HOMES_DIGEST_POSITION,
 	RECORD_LOCKS_CAPABILITY_POSITION,
 	RECORD_LOCKS_DISABLED_MESSAGE,
@@ -35,9 +34,10 @@ import {
 	currentHomeIncarnation,
 	ownsRecordLockCoordination,
 	homesDigestPrefix,
-	peerHomesDigestView,
+	homesDigestWords,
+	peerHomesDigestIs,
+	peerHomesDigestWords,
 	publishPeerHomesDigest,
-	readPeerHomesDigest,
 	readPeerLockCapability,
 	recordLockOwnerFor,
 	recordLockOwnerThreadIds,
@@ -170,20 +170,45 @@ describe('peer lock capability in the shared status buffer', () => {
 	});
 });
 
-/** A `digestOf`-shaped digest (64 lowercase hex), distinct per label. */
 const digestFor = (label) => createHash('sha256').update(String(label)).digest('hex');
+const recordHolds = (status, digest) =>
+	peerHomesDigestIs(peerHomesDigestWords(status), ...homesDigestWords(homesDigestPrefix(digest)));
 
 describe('peer home-map digest record in the shared status buffer', () => {
 	it('starts as none heard, and answers whether each publication changed it', () => {
-		const view = peerHomesDigestView(new Float64Array(REPLICATION_SHARED_STATUS_SLOTS));
-		assert.strictEqual(readPeerHomesDigest(view), NO_PEER_HOMES_DIGEST);
-		const first = homesDigestPrefix(digestFor(1));
-		assert.strictEqual(publishPeerHomesDigest(view, first), true);
-		assert.strictEqual(readPeerHomesDigest(view), first);
-		assert.strictEqual(publishPeerHomesDigest(view, first), false, 'a re-send of the same digest changes nothing');
-		const second = homesDigestPrefix(digestFor(2));
-		assert.strictEqual(publishPeerHomesDigest(view, second), true);
-		assert.strictEqual(readPeerHomesDigest(view), second);
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		assert.ok(peerHomesDigestIs(peerHomesDigestWords(status), 0, 0), 'none heard');
+		assert.ok(!recordHolds(status, digestFor(1)));
+		assert.strictEqual(publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1))), true);
+		assert.ok(recordHolds(status, digestFor(1)));
+		assert.strictEqual(
+			publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1))),
+			false,
+			'a re-send of the same digest changes nothing'
+		);
+		assert.strictEqual(publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2))), true);
+		assert.ok(recordHolds(status, digestFor(2)));
+		assert.ok(!recordHolds(status, digestFor(1)));
+	});
+
+	it('reads back the halves of a prefix with the high bit set in either half', () => {
+		for (const digest of ['f'.repeat(64), '80000000' + '7'.repeat(56), '7fffffff' + '8'.repeat(56)]) {
+			const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+			publishPeerHomesDigest(status, homesDigestPrefix(digest));
+			assert.ok(recordHolds(status, digest), digest);
+		}
+	});
+
+	it('fails closed on a read that pairs halves of two different digests', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		const [lowA] = homesDigestWords(homesDigestPrefix(digestFor('a')));
+		const [, highB] = homesDigestWords(homesDigestPrefix(digestFor('b')));
+		const words = peerHomesDigestWords(status);
+		const at = RECORD_LOCK_HOMES_DIGEST_POSITION * 2;
+		words[at] = lowA;
+		words[at + 1] = highB;
+		assert.ok(!recordHolds(status, digestFor('a')));
+		assert.ok(!recordHolds(status, digestFor('b')));
 	});
 
 	it('keeps the first 64 bits of a digest, with the high bit, and never the none value', () => {
@@ -204,7 +229,7 @@ describe('peer home-map digest record in the shared status buffer', () => {
 		assert.strictEqual(RECORD_LOCK_HOMES_DIGEST_POSITION, RECORD_LOCKS_CAPABILITY_POSITION + 1);
 		assert.ok(RECORD_LOCK_HOMES_DIGEST_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
-		publishPeerHomesDigest(peerHomesDigestView(status), homesDigestPrefix(digestFor(3)));
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(3)));
 		const touched = [...status.keys()].filter((position) => status[position] !== 0);
 		assert.deepStrictEqual(touched, [RECORD_LOCK_HOMES_DIGEST_POSITION]);
 	});
@@ -254,10 +279,7 @@ describe('createRecordLockTransport().homeMap', () => {
 				// A peer agreeing on the home map is assumed to also speak the right protocol level
 				// unless the test says otherwise — these are independent checks (see homeMap's comment).
 				recordPeerLockCapability(status, capabilities?.[peer] ?? matches);
-				publishPeerHomesDigest(
-					peerHomesDigestView(status),
-					homesDigestPrefix(matches ? DEFAULT_ACTIVE.digest : digestFor('other'))
-				);
+				publishPeerHomesDigest(status, homesDigestPrefix(matches ? DEFAULT_ACTIVE.digest : digestFor('other')));
 			}
 		}
 		const cached = 'active' in options ? options.active : DEFAULT_ACTIVE;
@@ -405,7 +427,7 @@ describe('createRecordLockTransport().homeMap', () => {
 		let cachedOnB = generation(1);
 		const threadA = createRecordLockTransport('data', deps, () => cachedOnA);
 		const threadB = createRecordLockTransport('data', deps, () => cachedOnB);
-		publishPeerHomesDigest(peerHomesDigestView(status), homesDigestPrefix(digestFor(2)));
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2)));
 		assert.strictEqual(threadA.homeMap('data')?.generation, 2);
 		assert.strictEqual(threadB.homeMap('data'), undefined, 'a cache still on the old generation does not agree');
 		cachedOnB = generation(2);
@@ -414,7 +436,7 @@ describe('createRecordLockTransport().homeMap', () => {
 			2,
 			'agrees once its own cache catches up, with no new frame'
 		);
-		publishPeerHomesDigest(peerHomesDigestView(status), homesDigestPrefix(digestFor(3)));
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(3)));
 		assert.strictEqual(threadA.homeMap('data'), undefined, 'the peer moved on');
 		assert.strictEqual(threadB.homeMap('data'), undefined);
 		cachedOnA = generation(3);
@@ -1583,14 +1605,14 @@ describe('recordPeerHomesDigest', () => {
 			table: 'Item',
 			attributes: [{ name: 'id', type: 'ID', isPrimaryKey: true }],
 		});
-		const view = peerHomesDigestView(getReplicationSharedStatus(Item.auditStore, 'digest_receipt', 'peer-r'));
+		const status = getReplicationSharedStatus(Item.auditStore, 'digest_receipt', 'peer-r');
 		recordPeerHomesDigest('digest_receipt', 'peer-r', digestFor(1));
-		assert.strictEqual(readPeerHomesDigest(view), homesDigestPrefix(digestFor(1)));
+		assert.ok(recordHolds(status, digestFor(1)));
 		for (const malformed of ['not a digest', 'A'.repeat(64), 42, undefined])
 			recordPeerHomesDigest('digest_receipt', 'peer-r', malformed);
-		assert.strictEqual(readPeerHomesDigest(view), homesDigestPrefix(digestFor(1)), 'a malformed frame erases nothing');
+		assert.ok(recordHolds(status, digestFor(1)), 'a malformed frame erases nothing');
 		recordPeerHomesDigest('digest_receipt', 'peer-r', digestFor(2));
-		assert.strictEqual(readPeerHomesDigest(view), homesDigestPrefix(digestFor(2)), 'the newest frame wins');
+		assert.ok(recordHolds(status, digestFor(2)), 'the newest frame wins');
 		recordPeerHomesDigest('digest_receipt_absent', 'peer-r', digestFor(3));
 	});
 });

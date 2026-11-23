@@ -153,7 +153,7 @@ Length-prefixed, not delimiter-joined, so `['A','B']` and `['A\0B']` cannot coll
 canonicalized (sorted, deduped) list; the generation is hashed as its decimal string, so
 generations past 2³² stay distinct. The exact encoding is `digestOf`'s docstring and the bounds are
 `validateGenerationInput` (both `recordLockHomes.ts`); `recordLockHomes.test.mjs` pins the
-non-collision.
+non-collision. Agreement compares only the first 64 bits (§6).
 
 ### 6. Wire: a dedicated digest message, not a `NODE_NAME` resend
 
@@ -163,12 +163,19 @@ Reusing `NODE_NAME` as a live refresh is unproven — its handler has side effec
 (b) standalone on every live session of a database, inbound and outbound, whose local `active`
 digest just changed, and (c) on each keepalive ping of an outbound session — with no other handshake
 side effect triggered. Receipt stores the digest's first 64 bits in the per-(database, peer) shared
-status buffer (slot 32), one `Atomics` value, so it cannot tear; a malformed frame stores nothing.
-Agreement is that value equal to the reading thread's own digest, decided when `homeMap()` reads it:
-a stored verdict is relative to the writing thread's cache and to whichever of the peer's sockets
-that thread holds, so one thread's stale view overwrites another's correct one. Sockets of one peer
-land on different threads, so an older frame can be recorded after a newer one; (c) bounds that to
-one ping interval.
+status buffer (slot 32) with one 64-bit atomic write, so the record is always one whole value; a
+malformed frame stores nothing. Agreement is that value equal to the reading thread's own digest,
+decided when `homeMap()` reads it (two plain Int32 reads, `peerHomesDigestIs`): a stored verdict is
+relative to the writing thread's cache and to whichever of the peer's sockets that thread holds, so
+one thread's stale view overwrites another's correct one. 64 bits give a 2⁻⁶⁴ chance that two
+different maps agree; the digests are of operator-applied maps exchanged between authenticated,
+capability-gated peers, so nothing chooses a colliding map but an administrator already trusted
+with both. Sockets of one peer land on different threads and frames carry no order, so an older
+frame can be recorded after a newer one, and the map stays withheld (fail-closed, a retryable 503)
+until the next frame: a backlogged socket's own re-announce or (c), at most one ping interval. Frames
+queued on a socket that closes are dropped, and a reconnect re-sends at handshake. A peer on a build
+before this one re-announces only on outbound sessions and never on a ping, so during a rolling
+upgrade its stale record lasts until it reconnects or changes generation again.
 
 ### 7. `homeIncarnation` per coordination incarnation, gated centrally
 

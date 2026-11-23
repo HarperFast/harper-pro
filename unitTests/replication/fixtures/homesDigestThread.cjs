@@ -13,7 +13,7 @@ const { getReplicationSharedStatus } = require(path.join(dist, 'replication/know
 function homesDigestThread(database, homes) {
 	const Item = table({ database, table: 'Item', attributes: [{ name: 'id', type: 'ID', isPrimaryKey: true }] });
 	let active;
-	transport.setRecordLockHomesRowReader(async () => (active ? { active } : undefined));
+	const previousReader = transport.setRecordLockHomesRowReader(async () => (active ? { active } : undefined));
 	const lockTransport = transport.createRecordLockTransport(
 		database,
 		{
@@ -33,7 +33,7 @@ function homesDigestThread(database, homes) {
 		}
 	);
 	return {
-		/** This thread's refresh after the node's own row changed (the homes-changed broadcast). */
+		/** What this thread does on the homes-changed broadcast. */
 		async activate(generation, digest) {
 			active = { generation, homes, digest };
 			await transport.refreshRecordLockHomesCache(database, true);
@@ -41,12 +41,15 @@ function homesDigestThread(database, homes) {
 		peerSupportsLocks(peer) {
 			transport.recordPeerLockCapability(getReplicationSharedStatus(Item.auditStore, database, peer), true);
 		},
-		/** A `RECORD_LOCK_HOMES_DIGEST` frame from `peer` on a socket this thread holds. */
 		receive(peer, digest) {
 			transport.recordPeerHomesDigest(database, peer, digest);
 		},
 		homeMapGeneration() {
 			return lockTransport.homeMap(database)?.generation;
+		},
+		dispose() {
+			transport.setRecordLockHomesRowReader(previousReader);
+			transport.forgetRecordLockHomesCache(database);
 		},
 	};
 }

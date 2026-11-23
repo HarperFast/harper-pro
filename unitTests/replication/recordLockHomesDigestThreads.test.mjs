@@ -1,8 +1,6 @@
 /**
- * A peer's sockets to this node land on different threads, and the peer re-announces a changed digest on
- * only some of them. The thread that heard only the handshake digest must not undo the agreement another
- * thread's socket established: the replication-pool failure of `recordLockDefaultHomes.test.mjs` (a 403
- * "not a member" barrier refusal and a 503 "no agreed record lock home map" after a generation change).
+ * A peer's sockets to this node land on different threads, and a thread may hear only the handshake
+ * digest on its socket. Agreement must not depend on which thread last heard from the peer.
  */
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
@@ -75,7 +73,10 @@ describe('peer home-map digest agreement across threads of one node', function (
 		await sibling.ready;
 	});
 
-	after(() => sibling?.terminate());
+	after(async () => {
+		await sibling?.terminate();
+		here?.dispose();
+	});
 
 	it('holds after a generation change the sibling thread heard only from its own cache', async () => {
 		here.peerSupportsLocks('peer-a');
@@ -98,7 +99,12 @@ describe('peer home-map digest agreement across threads of one node', function (
 	});
 
 	it('withholds the map on every thread once the peer advertises another digest', async () => {
-		await sibling.call('receive', 'peer-a', digest('generation 3'));
+		here.peerSupportsLocks('peer-a');
+		await here.activate(4, digest('generation 4'));
+		await sibling.call('activate', 4, digest('generation 4'));
+		here.receive('peer-a', digest('generation 4'));
+		assert.strictEqual(await sibling.call('homeMapGeneration'), 4);
+		await sibling.call('receive', 'peer-a', digest('generation 5'));
 		assert.strictEqual(here.homeMapGeneration(), undefined);
 		assert.strictEqual(await sibling.call('homeMapGeneration'), undefined);
 	});

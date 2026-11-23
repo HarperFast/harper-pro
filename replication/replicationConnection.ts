@@ -6894,8 +6894,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (pausedStatus && options.connection?.nodeSubscriptions !== undefined)
 					pausedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
 			}
-			// Re-sent each interval so a peer whose record went stale (an older frame drained after a newer
-			// one from a socket that then closed, or a frame it could not record yet) converges within one.
+			// Bounds a peer's stale record of our digest to one interval: its sockets to us can be on different
+			// threads, so an older frame can be recorded after a newer one.
 			try {
 				sendRecordLockHomesDigestFrame();
 			} catch (error) {
@@ -8976,9 +8976,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					case RECORD_LOCK_HOMES_DIGEST:
 						// `data` (`message[1]`) is the digest; `message[2]` names the database — the same slot
 						// NODE_NAME uses for it — since one socket carries every database's traffic and the
-						// digest is per-database (harper-pro#825). Recorded in the (database, peer) shared status
-						// buffer rather than on this connection object: the mesh keeps a separate connection per
-						// direction, often on different threads, and every thread reads the one record.
+						// digest is per-database (harper-pro#825). Recorded per (database, peer) in shared memory,
+						// not on this connection: the peer's other socket is often on another thread.
 						if (typeof data === 'string' && typeof remoteNodeName === 'string' && message[2] === databaseName)
 							recordPeerHomesDigest(databaseName, remoteNodeName, data);
 						break;
@@ -14482,11 +14481,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * changes (every live session, inbound included, registers to be told), and on each keepalive ping.
 	 */
 	function sendRecordLockHomesDigestFrame() {
-		if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
+		if (!CLUSTER_RECORD_LOCKS_ENABLED || wsClosed) return;
 		// Sender-side gating discipline (DESIGN.md, "Sender-side gating discipline"): do not emit a
 		// frame the peer has not advertised support for.
 		if (!(peerCapabilitiesLearned && peerSupportsRecordLocks(peerCapabilities))) return;
-		if (!unregisterHomesDigestAnnouncer && !wsClosed && typeof databaseName === 'string')
+		if (!unregisterHomesDigestAnnouncer && typeof databaseName === 'string')
 			unregisterHomesDigestAnnouncer = registerHomesDigestAnnouncer(databaseName, sendRecordLockHomesDigestFrame);
 		const digest = currentHomesDigest(databaseName);
 		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
