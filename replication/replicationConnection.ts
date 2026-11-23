@@ -5064,10 +5064,7 @@ const MAX_RETRY_TIME = 30_000;
 const COPY_STALL_ATTEMPTS = 5;
 const COPY_FLUSH_RETRY_INITIAL_MS = 250;
 const COPY_FLUSH_RETRY_MAX_MS = 30_000;
-/**
- * A request refused because its session was ending: it never reached the peer, so a caller can try another
- * node even while the connection still reports connected (the socket is closing but 'close' has not arrived).
- */
+/** A request refused by an ending session: it never reached the peer, so another node can be tried. */
 export class RequestNotSentError extends Error {}
 /**
  * This represents a persistent connection to a node for replication, which handles

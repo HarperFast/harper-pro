@@ -605,10 +605,7 @@ export function setReplicator(dbName: string, table: any, options: any) {
 }
 const connections = new Map<string, Map<string, NodeReplicationConnection>>();
 
-/**
- * Whether a failed remote read moves on to the next resident node. A connection that is still connected answered
- * with a non-network error, unless the request was refused unsent because its socket was already closing.
- */
+// A socket can be closing while its connection still reports connected
 export function retrievalFailsOver(connection: NodeReplicationConnection, error: unknown): boolean {
 	return !connection.isConnected || error instanceof RequestNotSentError;
 }

@@ -1,8 +1,4 @@
-/**
- * A request through a session whose socket is ending is refused before its response waiter is registered
- * (harper-pro#1083): retirement rejects the waiters it finds once, and ws drops a send on a closing socket
- * without an error.
- */
+// Requests on a replication session whose socket is ending (harper-pro#1083)
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { decode, encode } from 'msgpackr';
@@ -55,9 +51,7 @@ describe('requests on an ending replication session (harper-pro#1083)', function
 		peer.on('message', (data) => {
 			try {
 				received.push(decode(data));
-			} catch {
-				// frames encoded with the session's structures are not the ones under test
-			}
+			} catch {}
 		});
 		if (client.readyState !== WebSocket.OPEN) await once(client, 'open');
 		session = replicateOverWS(client, {}, { name: 'peer-a', replicates: true });
