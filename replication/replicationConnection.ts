@@ -5065,6 +5065,11 @@ const COPY_STALL_ATTEMPTS = 5;
 const COPY_FLUSH_RETRY_INITIAL_MS = 250;
 const COPY_FLUSH_RETRY_MAX_MS = 30_000;
 /**
+ * A request refused because its session was ending: it never reached the peer, so a caller can try another
+ * node even while the connection still reports connected (the socket is closing but 'close' has not arrived).
+ */
+export class RequestNotSentError extends Error {}
+/**
  * This represents a persistent connection to a node for replication, which handles
  * sockets that may be disconnected and reconnected
  */
@@ -14652,15 +14657,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	).unref();
 
 	let nextId = 1;
-	// A request is refused before its waiter is registered once the socket is ending: a retired instance has
-	// already rejected its waiters, and ws drops a send on a closing socket without an error while 'close'
-	// (which rejects them) can be the closing handshake's timeout away.
+	// A retired instance has already rejected its waiters, and ws drops a send on a closing socket without an
+	// error while 'close' (which rejects them) can be the closing handshake's timeout away.
 	function socketEnding() {
-		return wsClosed || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED;
+		return wsClosed || ws.readyState >= WebSocket.CLOSING;
 	}
 	function sendOperation(operation, timeoutMs?: number): Promise<any> {
 		const requestId = nextId++;
 		return new Promise((resolve, reject) => {
+			if (socketEnding()) return reject(new RequestNotSentError('Connection closed before operation request'));
 			// Retire the entry ourselves: a peer that never answers must not pin it (and the caller) for
 			// the life of the socket.
 			const timer = timeoutMs
@@ -14680,7 +14685,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				},
 			});
 			try {
-				if (socketEnding()) throw new Error('Connection closed before operation request');
 				ws.send(encode([OPERATION_REQUEST, { ...operation, requestId }]));
 			} catch (error) {
 				awaitingResponse.delete(requestId);
@@ -14704,7 +14708,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const requestId = nextId++;
 			return new Promise((resolve, reject) => {
 				if (socketEnding())
-					return reject(new Error('Replication connection closed before the record request was sent'));
+					return reject(new RequestNotSentError('Replication connection closed before the record request was sent'));
 				let tableId = request.table.tableId;
 				if (request.blobRepairOnly) {
 					// Repair shares the subscription stream's decoder namespace: use the peer's id, not ours.

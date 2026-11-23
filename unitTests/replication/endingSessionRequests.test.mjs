@@ -1,18 +1,21 @@
 /**
- * A request made through a session whose socket is ending must be refused before its response waiter is
- * registered (harper-pro#1083). Retirement rejects the waiters it finds once, and ws drops a send on a closing
- * socket without an error, so a waiter registered after either would wait for an answer that cannot come.
- * These drive a real `replicateOverWS` session over the locked `ws` client against a local server.
+ * A request through a session whose socket is ending is refused before its response waiter is registered
+ * (harper-pro#1083): retirement rejects the waiters it finds once, and ws drops a send on a closing socket
+ * without an error.
  */
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { decode, encode } from 'msgpackr';
 import { WebSocket, WebSocketServer } from 'ws';
-import { NodeReplicationConnection, replicateOverWS } from '#src/replication/replicationConnection';
+import {
+	NodeReplicationConnection,
+	RequestNotSentError,
+	replicateOverWS,
+} from '#src/replication/replicationConnection';
+import { retrievalFailsOver } from '#src/replication/replicator';
 
 const GET_RECORD = 133;
 const GET_RECORD_RESPONSE = 134;
-const OPERATION_REQUEST = 136;
 const BOUND = 1000;
 const REQUEST = { id: 'k', table: { tableId: 1, tableName: 'SomeTable' } };
 
@@ -33,9 +36,14 @@ async function waitFor(predicate, what) {
 	}
 }
 
+async function settled(state, what) {
+	await waitFor(() => state.outcome !== 'pending', what);
+	return state.outcome;
+}
+
 describe('requests on an ending replication session (harper-pro#1083)', function () {
 	this.timeout(10_000);
-	let server, peer, client, session, received;
+	let server, peer, client, session, sent, received;
 
 	beforeEach(async () => {
 		server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
@@ -48,11 +56,17 @@ describe('requests on an ending replication session (harper-pro#1083)', function
 			try {
 				received.push(decode(data));
 			} catch {
-				// frames that need the session's structures are not the ones under test
+				// frames encoded with the session's structures are not the ones under test
 			}
 		});
 		if (client.readyState !== WebSocket.OPEN) await once(client, 'open');
 		session = replicateOverWS(client, {}, { name: 'peer-a', replicates: true });
+		sent = [];
+		const send = client.send;
+		client.send = function (data, ...rest) {
+			sent.push(decode(data));
+			return send.call(this, data, ...rest);
+		};
 	});
 
 	afterEach(async () => {
@@ -62,20 +76,20 @@ describe('requests on an ending replication session (harper-pro#1083)', function
 		await new Promise((resolve) => server.close(resolve));
 	});
 
-	const sentRequests = (command) => received.filter((frame) => Array.isArray(frame) && frame[0] === command);
+	const sentCommands = () => sent.filter((frame) => Array.isArray(frame)).map((frame) => frame[0]);
+	const receivedRequests = () => received.filter((frame) => Array.isArray(frame) && frame[0] === GET_RECORD);
 
 	for (const blobRepairOnly of [false, true]) {
 		it(`rejects a${blobRepairOnly ? ' blob repair' : ''} read queued on the connection when the session retires before it runs`, async () => {
 			const connection = new NodeReplicationConnection('ws://127.0.0.1:1', null, 'data', 'peer-a');
 			connection.session = Promise.resolve(session);
 			const read = settlement(connection.getRecord({ ...REQUEST, entry: {}, blobRepairOnly }));
-			// the read's continuation is queued behind the resolved session; retire it first, as forceReconnect does
 			session.retire('superseded by forceReconnect');
 			assert.equal(client.readyState, WebSocket.OPEN, 'retirement alone leaves the socket open');
-			await waitFor(() => read.outcome !== 'pending', 'the queued read settles');
-			assert.match(read.outcome.message, /closed before the record request was sent/);
-			await new Promise((resolve) => setTimeout(resolve, 20));
-			assert.deepEqual(sentRequests(GET_RECORD), [], 'no request went out on the retired session');
+			const error = await settled(read, 'the queued read settles');
+			assert.ok(error instanceof RequestNotSentError, `unexpected ${error}`);
+			assert.match(error.message, /closed before the record request was sent/);
+			assert.deepEqual(sentCommands(), [], 'nothing was sent on the retired session');
 		});
 	}
 
@@ -88,32 +102,45 @@ describe('requests on an ending replication session (harper-pro#1083)', function
 		});
 
 		it('rejects a record request at once instead of after the close completes', async () => {
-			const read = settlement(session.getRecord(REQUEST));
-			await waitFor(() => read.outcome !== 'pending', 'the read settles');
-			assert.match(read.outcome.message, /closed before the record request was sent/);
+			const error = await settled(settlement(session.getRecord(REQUEST)), 'the read settles');
+			assert.ok(error instanceof RequestNotSentError, `unexpected ${error}`);
 			assert.equal(client.readyState, WebSocket.CLOSING, "settled before the socket's 'close'");
+			assert.deepEqual(sentCommands(), []);
 		});
 
 		it('rejects an operation request at once instead of after the close completes', async () => {
-			const operation = settlement(session.sendOperation({ operation: 'cluster_status' }));
-			await waitFor(() => operation.outcome !== 'pending', 'the operation settles');
-			assert.match(operation.outcome.message, /Connection closed before operation request/);
+			const operation = settlement(session.sendOperation({ operation: 'cluster_status' }, 60_000));
+			const error = await settled(operation, 'the operation settles');
+			assert.ok(error instanceof RequestNotSentError, `unexpected ${error}`);
+			assert.match(error.message, /Connection closed before operation request/);
 			assert.equal(client.readyState, WebSocket.CLOSING, "settled before the socket's 'close'");
-			assert.deepEqual(sentRequests(OPERATION_REQUEST), []);
+			assert.deepEqual(sentCommands(), []);
+		});
+
+		it('lets a remote read fail over while the connection still reports connected', async () => {
+			const connection = new NodeReplicationConnection('ws://127.0.0.1:1', null, 'data', 'peer-a');
+			connection.session = Promise.resolve(session);
+			connection.isConnected = true;
+			const error = await settled(settlement(connection.getRecord(REQUEST)), 'the read settles');
+			assert.ok(error instanceof RequestNotSentError, `unexpected ${error}`);
+			assert.equal(retrievalFailsOver(connection, error), true);
+			assert.equal(retrievalFailsOver(connection, new Error('the peer refused the read')), false);
+			connection.isConnected = false;
+			assert.equal(retrievalFailsOver(connection, new Error('Connection closed')), true);
 		});
 	});
 
 	it('answers a read on an open session, and retirement rejects one still in flight', async () => {
 		const answered = settlement(session.getRecord(REQUEST));
-		await waitFor(() => sentRequests(GET_RECORD).length === 1, 'the first request reaches the peer');
-		peer.send(encode([GET_RECORD_RESPONSE, sentRequests(GET_RECORD)[0][1], null]));
-		await waitFor(() => answered.outcome !== 'pending', 'the answered read settles');
-		assert.deepEqual(answered.outcome, { value: undefined });
+		await waitFor(() => receivedRequests().length === 1, 'the first request reaches the peer');
+		peer.send(encode([GET_RECORD_RESPONSE, receivedRequests()[0][1], null]));
+		assert.deepEqual(await settled(answered, 'the answered read settles'), { value: undefined });
 
 		const inFlight = settlement(session.getRecord(REQUEST));
-		await waitFor(() => sentRequests(GET_RECORD).length === 2, 'the second request reaches the peer');
+		await waitFor(() => receivedRequests().length === 2, 'the second request reaches the peer');
 		session.retire('superseded by forceReconnect');
-		await waitFor(() => inFlight.outcome !== 'pending', 'the in-flight read settles');
-		assert.match(inFlight.outcome.message, /Connection closed/);
+		const error = await settled(inFlight, 'the in-flight read settles');
+		assert.match(error.message, /Connection closed/);
+		assert.ok(!(error instanceof RequestNotSentError), 'a sent request is not marked unsent');
 	});
 });
