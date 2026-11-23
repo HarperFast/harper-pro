@@ -5773,6 +5773,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const sessionOrdinal = ++nextConnectionSessionOrdinal;
 	logger.debug?.(connectionId, 'Initializing replication connection', authorization);
 	let databaseName = options.database;
+	// Above every call made during setup: `setDatabase` and an already-open socket's first keepalive read them.
+	let wsClosed = false;
+	let unregisterHomesDigestAnnouncer: (() => void) | undefined;
 	const dbSubscriptions = options.databaseSubscriptions || databaseSubscriptions;
 	let auditStore: any;
 	let replicationSharedStatus: Float64Array;
@@ -7533,8 +7536,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Without serialization, awaiting inside the handler would let concurrent message handlers
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
-	let wsClosed = false;
-	let unregisterHomesDigestAnnouncer: (() => void) | undefined;
 	const stopShardingRecoveryWatch = onShardingRecoveryChange((database) => {
 		if (database !== databaseName || wsClosed || !residencyIdentityBound) return;
 		wsClosed = true;
