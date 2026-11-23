@@ -14496,7 +14496,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!unregisterHomesDigestAnnouncer && typeof databaseName === 'string')
 			unregisterHomesDigestAnnouncer = registerHomesDigestAnnouncer(databaseName, sendRecordLockHomesDigestFrame);
 		const digest = currentHomesDigest(databaseName);
-		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
+		if (digest && ws.readyState === WebSocket.OPEN) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
 	}
 	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
 		const database = getDatabases()?.[databaseName];

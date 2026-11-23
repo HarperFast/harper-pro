@@ -14,7 +14,7 @@ function homesDigestThread(database, homes) {
 	const Item = table({ database, table: 'Item', attributes: [{ name: 'id', type: 'ID', isPrimaryKey: true }] });
 	let active;
 	const previousReader = transport.setRecordLockHomesRowReader((key) =>
-		key === database ? Promise.resolve(active ? { active } : undefined) : previousReader(key)
+		Promise.resolve(key === database && active ? { active } : undefined)
 	);
 	let cached;
 	const lockTransport = transport.createRecordLockTransport(

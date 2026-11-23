@@ -116,7 +116,7 @@ export function resetReplicationSharedStatus(status: Float64Array): boolean {
 		status[position] = 0;
 		cleared = true;
 	}
-	// Last, after the capability slot.
+	// After the capability slot, so homeMap() refuses during the reset, and a publish before this exchange is cleared.
 	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
 	if (Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, 0n) !== 0n) cleared = true;
 	Atomics.add(words, changeWord, (cleared ? HOMES_DIGEST_CHANGE : 0) - HOMES_DIGEST_WRITER);

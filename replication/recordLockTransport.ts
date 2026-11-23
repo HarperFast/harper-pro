@@ -186,18 +186,26 @@ export function peerHomesDigestReader(status: Float64Array, peer = ''): () => bi
 	let prefix = NO_PEER_HOMES_DIGEST;
 	let inFlight: number | undefined;
 	let inFlightReads = 0;
+	let warned = false;
 	return () => {
 		const changes = Atomics.load(words, HOMES_DIGEST_CHANGES_WORD);
 		if (changes !== seen) {
 			prefix = Atomics.load(record, RECORD_LOCK_HOMES_DIGEST_POSITION);
 			if (changes & HOMES_DIGEST_WRITERS) {
 				seen = undefined;
-				if (changes !== inFlight) [inFlight, inFlightReads] = [changes, 0];
-				else if (++inFlightReads === STUCK_WRITER_READS)
+				if (changes !== inFlight) {
+					inFlight = changes;
+					inFlightReads = 0;
+				} else if (++inFlightReads === STUCK_WRITER_READS && !warned) {
+					warned = true;
 					logger.warn?.(
 						`The record lock home map digest record for ${peer} has had a writer in flight for ${STUCK_WRITER_READS} reads; a worker likely exited mid-write, so this thread re-reads it on every lock until restart`
 					);
-			} else seen = changes;
+				}
+			} else {
+				seen = changes;
+				inFlight = undefined;
+			}
 		}
 		return prefix;
 	};

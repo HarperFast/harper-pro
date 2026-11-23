@@ -169,7 +169,7 @@ decided when `homeMap()` reads it (`peerHomesDigestReader`): slot 51 holds the w
 a change count, moved by every changing write and by `resetReplicationSharedStatus`, never set back.
 A reader re-reads the record with one 64-bit atomic load unless no writer is in flight and the count
 is unchanged, so it never pairs halves of two writes, never trusts its cache after a write's exchange,
-and allocates a BigInt only when the record changes or a writer is in flight. The replaced design
+and allocates a BigInt only on its first read, when the record changes, or while a writer is in flight. The replaced design
 stored a verdict, which was relative to the writing thread's cache and to whichever of the peer's
 sockets that thread held, so one thread's stale view overwrote another's correct one. 64 bits give a 2⁻⁶⁴ chance that two
 different maps agree; the digests are of operator-applied maps exchanged between authenticated,
