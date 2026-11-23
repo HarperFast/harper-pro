@@ -1,4 +1,3 @@
-// Requests on a replication session whose socket is ending (harper-pro#1083)
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { decode, encode } from 'msgpackr';
