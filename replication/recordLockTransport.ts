@@ -161,11 +161,7 @@ export function homesDigestPrefix(digest: unknown): bigint | undefined {
 
 const HOMES_DIGEST_CHANGES_WORD = RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2;
 
-/**
- * One 64-bit atomic write, since sockets of one peer on several threads may publish at once, bracketed in
- * the change word: counted in flight before it, then out of flight with the count moved if it changed the
- * record.
- */
+/** Sockets of one peer on several threads may publish at once. */
 export function publishPeerHomesDigest(status: Float64Array, prefix: bigint): boolean {
 	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
 	const words = homesDigestChangeWords(status);
@@ -175,22 +171,33 @@ export function publishPeerHomesDigest(status: Float64Array, prefix: bigint): bo
 	return changed;
 }
 
+const STUCK_WRITER_READS = 10_000;
+
 /**
  * One thread's reader of a peer's digest record. A BigInt load allocates, so it keeps the last value and
  * trusts it only while no writer is in flight and the count has not moved; a read that starts after a
  * write's exchange always re-loads. A writer that never finishes (a terminated worker) leaves its peer's
  * readers re-loading on every call.
  */
-export function peerHomesDigestReader(status: Float64Array): () => bigint {
+export function peerHomesDigestReader(status: Float64Array, peer = ''): () => bigint {
 	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
 	const words = homesDigestChangeWords(status);
 	let seen: number | undefined;
 	let prefix = NO_PEER_HOMES_DIGEST;
+	let inFlight: number | undefined;
+	let inFlightReads = 0;
 	return () => {
 		const changes = Atomics.load(words, HOMES_DIGEST_CHANGES_WORD);
 		if (changes !== seen) {
 			prefix = Atomics.load(record, RECORD_LOCK_HOMES_DIGEST_POSITION);
-			seen = changes & HOMES_DIGEST_WRITERS ? undefined : changes;
+			if (changes & HOMES_DIGEST_WRITERS) {
+				seen = undefined;
+				if (changes !== inFlight) [inFlight, inFlightReads] = [changes, 0];
+				else if (++inFlightReads === STUCK_WRITER_READS)
+					logger.warn?.(
+						`The record lock home map digest record for ${peer} has had a writer in flight for ${STUCK_WRITER_READS} reads; a worker likely exited mid-write, so this thread re-reads it on every lock until restart`
+					);
+			} else seen = changes;
 		}
 		return prefix;
 	};
@@ -383,7 +390,7 @@ export function createRecordLockTransport(
 		let views = statusViews.get(peer);
 		if (!views) {
 			const status = getReplicationSharedStatus(auditStore, database, peer);
-			statusViews.set(peer, (views = { status, peerDigest: peerHomesDigestReader(status) }));
+			statusViews.set(peer, (views = { status, peerDigest: peerHomesDigestReader(status, peer) }));
 		}
 		return views;
 	};
