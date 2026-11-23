@@ -1,21 +1,11 @@
 /**
- * Blob orphan × full-copy convergence (regression guard for #403/#405/#429 and HarperFast/harper#1472)
+ * Blob orphan × full-copy convergence (#403/#405/#429, HarperFast/harper#1472).
  *
- * Scenario: an authoritative blob table (no sourcedFrom) has records whose blob files
- * are deleted from disk on the leader — simulating orphaned blob references arising via
- * TTL-eviction races, partial transfers, or the #1287 multi-worker evict() path — and so
- * is the leader's hdb_deployment payload blob. A fresh receiver then joins with
- * isLeader:true, triggering a full copy from scratch.
+ * A fresh receiver full-copies (add_node isLeader:true) from a leader whose blob files are gone: some
+ * data-table blobs and the hdb_deployment payload of an earlier deploy.
  *
- * The regression being guarded:
- *   Before #405 (sender) + #429 (receiver), when the full-copy stream hit a record
- *   whose source blob file was missing, the copy cursor was permanently pinned
- *   (hasBlobGap=true held cursor at lastDurableSequenceId=0), and the receiver never
- *   advanced past the orphaned record — the copy hard-wedged. Non-orphaned records
- *   never arrived.
- *
- * Invariant: the receiver advances past each source-missing blob as unrecoverable at the
- * source, finalizes the copy (its copy-finalization watchdog never fires) and stays live.
+ * Invariant: the receiver advances past each source-missing blob as unrecoverable at the source,
+ * finalizes the copy (its copy-finalization watchdog never fires) and stays live.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -51,7 +41,10 @@ const FIXTURE_PATH = join(
 
 const RECORD_COUNT = 20;
 const ORPHAN_COUNT = 3;
-const COPY_FINALIZE_TIMEOUT_MS = 5000;
+const COPY_FINALIZE_TIMEOUT_MS = 3000;
+// A stalled finalization fires within the 4x progress ceiling plus one escalated (2x) threshold detected at
+// up to 2x — 8x in all — after COPY_COMPLETE (COPY_FINALIZE_DEADLINE_MULTIPLE, createCopyFinalizeWatchdog).
+const COPY_FINALIZE_FIRE_BOUND_MS = 8 * COPY_FINALIZE_TIMEOUT_MS;
 
 /** Walk the blob store under {dataRootDir}/blobs/{db}/. */
 function walkBlobFiles(dataRootDir, db) {
@@ -160,8 +153,6 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 	test('full copy with orphaned blobs converges (does not wedge)', async () => {
 		const { nodeA, nodeB } = ctx;
 
-		// B joins A as subscriber with isLeader:true → triggers full copy.
-		// The copy stream will hit the orphaned records with missing blob files.
 		await sendOperation(nodeB, {
 			operation: 'add_node',
 			hostname: nodeA.hostname,
@@ -192,10 +183,13 @@ suite('Blob orphan × full-copy convergence (#403/#405/#429, harper#1472)', { ti
 		await fetchWithRetry(nodeA.httpURL + '/SeedBlobAsset/' + (RECORD_COUNT + 1000), { retries: 10 });
 		await waitForHttp200(nodeB, '/BlobAsset/' + (RECORD_COUNT + 1000), 'a post-copy record to replicate to B');
 
-		// Live rows flow while a copy is still unfinalized, so give the finalization watchdog two windows to
-		// fire. This must precede the restarting deploy below, which would clear an unfinalized copy.
-		ok((await readLog(nodeB)).includes('bulk copy complete'), 'B never received COPY_COMPLETE');
-		await delay(COPY_FINALIZE_TIMEOUT_MS * 2);
+		// Live rows flow while a copy is still unfinalized, so wait out the watchdog for system and data. This
+		// must precede the restarting deploy below, which would clear an unfinalized copy.
+		await waitForCondition(async () => ((await readLog(nodeB)).match(/bulk copy complete from/g) ?? []).length >= 2, {
+			timeoutMs: 30_000,
+			description: 'B to receive COPY_COMPLETE for the system and data databases',
+		});
+		await delay(COPY_FINALIZE_FIRE_BOUND_MS + 2000);
 		const watchdogFires = (await readLog(nodeB))
 			.split('\n')
 			.filter((line) => line.includes('Copy-finalization watchdog'));
