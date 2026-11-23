@@ -161,7 +161,7 @@ Reusing `NODE_NAME` as a live refresh is unproven — its handler has side effec
 (`sendSubscriptionRequestUpdate()`). So the digest travels on its own minimal message,
 `RECORD_LOCK_HOMES_DIGEST` (`[150, digest, database]`), sent (a) at handshake per database,
 (b) standalone on every live session of a database, inbound and outbound, whose local `active`
-digest just changed, and (c) on each keepalive ping of an outbound session — with no other handshake
+digest just changed, and (c) on each keepalive ping, sent by the dialing side and answered by the accepting side — with no other handshake
 side effect triggered. Receipt stores the digest's first 64 bits in the per-(database, peer) shared
 status buffer (slot 32) with one 64-bit atomic write, so the record is always one whole value; a
 malformed frame stores nothing. Agreement is that value equal to the reading thread's own digest,
@@ -177,10 +177,10 @@ with both. Sockets of one peer land on different threads and frames carry no ord
 frame can be recorded after a newer one. If this node already holds the newer map, the map stays
 withheld (fail-closed, a retryable 503); if this node is still behind on the older one, it agrees
 again, as it did before the newer frame arrived, which the apply fencing (§4.1: a digest is not a
-freshness check) already has to make safe. Either lasts until the next frame: a backlogged socket's own re-announce or (c), at most one ping interval for a
-peer that dials this node. A peer that only accepts this node's connection, like a dropped frame,
-waits for its next announcement or a reconnect. Frames queued on a socket that closes are dropped,
-and a reconnect re-sends at handshake. A peer on a build before this one re-announces only on
+freshness check) already has to make safe. Either lasts until the next frame: a backlogged socket's
+own re-announce or (c), at most one ping interval in either direction of any link, which also
+repairs a dropped frame. Frames queued on a socket that closes are dropped, and a reconnect re-sends
+at handshake. A peer on a build before this one re-announces only on
 outbound sessions and never on a ping, so during a rolling upgrade its stale record lasts until it
 reconnects or changes generation again. Waking the owner's restart round on a changed record
 (`record-lock-homes-agreed`) is best effort: if the receiving thread does not know the owner, or the

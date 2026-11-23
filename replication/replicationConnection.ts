@@ -12679,6 +12679,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	ws.on('ping', resetPingTimer);
+	// The accepting side runs no keepalive of its own, so the dialer's ping is its re-send bound.
+	if (!shouldRunKeepalive(options))
+		ws.on('ping', () => {
+			try {
+				sendRecordLockHomesDigestFrame();
+			} catch (error) {
+				logger.debug?.(connectionId, 'could not re-send the record lock home map digest', error);
+			}
+		});
 	ws.on('pong', resetPingTimer);
 	ws.on('pong', () => {
 		if (options.connection) {
