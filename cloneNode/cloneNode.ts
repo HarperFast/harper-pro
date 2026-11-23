@@ -562,12 +562,14 @@ async function establishReplicationSetup(syncStartedAt: number, priorMarker?: Sy
 	await restartWorkers();
 
 	// Dynamically importing setNode because it was causing early usage of rootpath var install before it was initialized.
-	const { setNode } = await import('../replication/setNode.js');
+	const { setCloneLeaderNode } = await import('../replication/setNode.js');
 
 	// Set node will set up replication between this node and the leader,
 	// which will trigger the sync of data including some system tables like users and roles.
 	log('Sending set node request to leader to establish replication and trigger data sync');
-	const setNodeResponse = await setNode(setNodeRequest);
+	// Only a legacy leader is a bridge peer to keep off the mesh; any other leader's row must replicate so
+	// a node cloned from this one learns it. A leader of unknown version is treated as a mesh member.
+	const setNodeResponse = await setCloneLeaderNode(setNodeRequest, await leaderIsLegacy());
 	log(`Response from set node: ${setNodeResponse}`);
 }
 
@@ -802,9 +804,7 @@ async function monitorSync(
 	if (!systemSocketRequired) {
 		log(`'${SYSTEM_SCHEMA_NAME}' is not in this node's replication.databases; not requiring its socket`, 'debug');
 	} else {
-		// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
-		const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
-		systemSocketRequired = !(leaderMajorVersion >= 1 && leaderMajorVersion < 5);
+		systemSocketRequired = !(await leaderIsLegacy());
 	}
 
 	const outcome = await monitorSyncLoop({
@@ -932,12 +932,14 @@ async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string
 
 	const shardedReplicates = await leaderShardedReplicates();
 	const { getHDBNodeTable } = await import('../replication/knownNodes.ts');
+	// isLeader replicates with the row, so other nodes' leaders carry it too: the URL names ours.
 	let leaderNode: any;
 	for (const node of getHDBNodeTable().search([])) {
-		if (node?.isLeader || node?.url === leaderReplicationURL) {
+		if (node?.url === leaderReplicationURL) {
 			leaderNode = node;
 			break;
 		}
+		if (node?.isLeader) leaderNode ??= node;
 	}
 	const allDb: Record<string, any> = await leaderRequest({ operation: 'describe_all' });
 	for (const db in allDb) {
@@ -1181,10 +1183,16 @@ function deriveLeaderReplicationURL(leaderConfig: Record<string, any> | undefine
 	return `${scheme}://${hostname}:${port}`;
 }
 
+/** True only for a leader whose version was read and is below 5; an unreadable version is not legacy. */
+async function leaderIsLegacy(): Promise<boolean> {
+	// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
+	const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
+	return leaderMajorVersion >= 1 && leaderMajorVersion < 5;
+}
+
 /** v4 leaders have no shard maps; a leader of unknown version is asked, and a failure stops the clone. */
 async function leaderClusterStatus(): Promise<any> {
-	const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
-	if (leaderMajorVersion >= 1 && leaderMajorVersion < 5) return undefined;
+	if (await leaderIsLegacy()) return undefined;
 	return leaderRequest({ operation: 'cluster_status' });
 }
 

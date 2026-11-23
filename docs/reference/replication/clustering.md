@@ -29,7 +29,7 @@ Adds a new Harper instance to the cluster. If `subscriptions` are provided, it c
 - `revoked_certificates` _(optional)_ — array of revoked certificate serial numbers that will not be accepted for any connections
 - `shard` _(optional)_ — shard number for this node. Only needed when using sharding
 - `start_time` _(optional)_ — ISO 8601 UTC datetime. If set, only data after this time is downloaded during initial synchronization instead of the entire database
-- `isLeader` _(optional)_ — identify the added node as a bootstrap source for this node. This does not grant primary ownership or write authority, or prevent full-copy requests to other peers for which this node has no resume cursor. Subsequent replication still follows the configured routes
+- `isLeader` _(optional)_ — identify the added node as a bootstrap source for this node. This does not grant primary ownership or write authority, or prevent full-copy requests to other peers for which this node has no resume cursor. Subsequent replication still follows the configured routes. This node keeps its record of a node added this way to itself: the record is not replicated to the rest of the cluster, so the bootstrap source can be a node outside it, such as the source of a migration. Send `isLeader: false` to make it an ordinary, replicated record. A node started as a clone records its leader as an ordinary cluster member instead, unless the leader runs a version before 5
 - `subscriptions` _(optional)_ — explicit table-level replication relationships. This is optional (and discouraged). Each subscription is an object with:
   - `database` — database name
   - `table` — table name
