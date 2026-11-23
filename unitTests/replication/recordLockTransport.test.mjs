@@ -483,7 +483,6 @@ describe('createRecordLockTransport().homeMap', () => {
 	});
 
 	it('compares the peer record with each reader’s own digest when read, so a lagging cache agrees once it catches up', () => {
-		// Two threads of one node: one shared status buffer, a cache each. The record is written once.
 		const auditStore = fakeAuditStore();
 		const status = getReplicationSharedStatus(auditStore, 'data', 'peer-a');
 		recordPeerLockCapability(status, true);

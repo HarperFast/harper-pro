@@ -159,34 +159,35 @@ non-collision. Agreement compares only the first 64 bits (§6).
 
 Reusing `NODE_NAME` as a live refresh is unproven — its handler has side effects
 (`sendSubscriptionRequestUpdate()`). So the digest travels on its own minimal message,
-`RECORD_LOCK_HOMES_DIGEST` (`[150, digest, database]`), sent (a) at handshake per database,
-(b) standalone on every live session of a database, inbound and outbound, whose local `active`
-digest just changed, and (c) on each keepalive ping, sent by the dialing side and answered by the accepting side — with no other handshake
-side effect triggered. Receipt stores the digest's first 64 bits in the per-(database, peer) shared
-status buffer (slot 32) with one 64-bit atomic write, so the record is always one whole value; a
-malformed frame stores nothing. Agreement is that value equal to the reading thread's own digest,
-decided when `homeMap()` reads it (`peerHomesDigestReader`): slot 51 holds the writers in flight and
-a change count, moved by every changing write and by `resetReplicationSharedStatus`, never set back.
-A reader re-reads the record with one 64-bit atomic load unless no writer is in flight and the count
-is unchanged, so it never pairs halves of two writes, never trusts its cache after a write's exchange,
-and allocates a BigInt only on its first read, when the record changes, or while a writer is in flight. The replaced design
-stored a verdict, which was relative to the writing thread's cache and to whichever of the peer's
-sockets that thread held, so one thread's stale view overwrote another's correct one. 64 bits give a 2⁻⁶⁴ chance that two
-different maps agree; the digests are of operator-applied maps exchanged between authenticated,
-capability-gated peers, so nothing chooses a colliding map but an administrator already trusted
-with both. Sockets of one peer land on different threads and frames carry no order, so an older
-frame can be recorded after a newer one. If this node already holds the newer map, the map stays
-withheld (fail-closed, a retryable 503); if this node is still behind on the older one, it agrees
-again, as it did before the newer frame arrived, which the apply fencing (§4.1: a digest is not a
-freshness check) already has to make safe. Either lasts until the next frame: a backlogged socket's
-own re-announce or (c), at most one ping interval in either direction of any link, which also
-repairs a dropped frame. Frames queued on a socket that closes are dropped, and a reconnect re-sends
-at handshake. A peer on a build before this one re-announces only on outbound sessions and never on
-a ping, so during a rolling upgrade its stale record lasts until it reconnects or changes generation
-again, and a frame from it dropped on receipt (the database not yet open on that thread) lasts until
-it reconnects. Waking the owner's restart round on a changed record (`record-lock-homes-agreed`) is
-best effort: if the receiving thread does not know the owner, or the message fails, the round waits
-out its own backoff.
+`RECORD_LOCK_HOMES_DIGEST` (`[150, digest, database]`), sent (a) at handshake per database, (b)
+standalone on every live session of a database, inbound and outbound, whose local `active` digest
+just changed, and (c) on each keepalive ping, sent by the dialing side and answered by the accepting
+side — with no other handshake side effect triggered. Receipt stores the digest's first 64 bits in
+the per-(database, peer) shared status buffer (slot 32) with one 64-bit atomic write, so the record
+is always one whole value; a malformed frame stores nothing. Agreement is that value equal to the
+reading thread's own digest, decided when `homeMap()` reads it (`peerHomesDigestReader`): slot 51
+holds the writers in flight and a change count, moved by every changing write and by
+`resetReplicationSharedStatus`, never set back. A reader re-reads the record with one 64-bit atomic
+load unless no writer is in flight and the count is unchanged, so it never pairs halves of two
+writes, never trusts its cache after a write's exchange, and allocates a BigInt only on its first
+read, after a change or a reset, or while a writer is in flight. The replaced design stored a
+verdict, which was relative to the writing thread's cache and to whichever of the peer's sockets
+that thread held, so one thread's stale view overwrote another's correct one. 64 bits give a 2⁻⁶⁴
+chance that two different maps agree; the digests are of operator-applied maps exchanged between
+authenticated, capability-gated peers, so nothing chooses a colliding map but an administrator
+already trusted with both. Sockets of one peer land on different threads and frames carry no order,
+so an older frame can be recorded after a newer one. If this node already holds the newer map, the
+map stays withheld (fail-closed, a retryable 503); if this node is still behind on the older one, it
+agrees again, as it did before the newer frame arrived, which the apply fencing (§4.1: a digest is
+not a freshness check) already has to make safe. Either lasts until the next frame: a backlogged
+socket's own re-announce or (c), at most one ping interval in either direction of any link, which
+also repairs a dropped frame. Frames queued on a socket that closes are dropped, and a reconnect
+re-sends at handshake. A peer on a build before this one re-announces only on outbound sessions and
+never on a ping, so during a rolling upgrade its stale record lasts until it reconnects or changes
+generation again, and a frame from it dropped on receipt (the database not yet open on that thread)
+lasts until it reconnects. Waking the owner's restart round on a changed record
+(`record-lock-homes-agreed`) is best effort: if the receiving thread does not know the owner, or the
+message fails, the round waits out its own backoff.
 
 ### 7. `homeIncarnation` per coordination incarnation, gated centrally
 

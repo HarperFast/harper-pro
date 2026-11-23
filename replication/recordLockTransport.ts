@@ -188,7 +188,6 @@ export function peerHomesDigestReader(
 	const words = homesDigestChangeWords(status);
 	let seen: number | undefined;
 	let prefix = NO_PEER_HOMES_DIGEST;
-	let inFlight: number | undefined;
 	let inFlightReads = 0;
 	let warned = false;
 	return () => {
@@ -197,10 +196,7 @@ export function peerHomesDigestReader(
 			prefix = Atomics.load(record, RECORD_LOCK_HOMES_DIGEST_POSITION);
 			if (changes & HOMES_DIGEST_WRITERS) {
 				seen = undefined;
-				if (changes !== inFlight) {
-					inFlight = changes;
-					inFlightReads = 0;
-				} else if (++inFlightReads === STUCK_WRITER_READS && !warned) {
+				if (++inFlightReads === STUCK_WRITER_READS && !warned) {
 					warned = true;
 					warn(
 						`The record lock home map digest record for ${peer} has had a writer in flight for ${STUCK_WRITER_READS} reads; a worker likely exited mid-write, so this thread re-reads it on every lock until restart`
@@ -208,7 +204,7 @@ export function peerHomesDigestReader(
 				}
 			} else {
 				seen = changes;
-				inFlight = undefined;
+				inFlightReads = 0;
 			}
 		}
 		return prefix;
@@ -852,14 +848,14 @@ export function recordPeerHomesDigest(database: string, peer: string, digest: un
 }
 
 /**
- * A changed peer digest may be what makes `homeMap()` answerable on the owner, which judges that against
- * its own cache (a generation change there schedules the round anyway): run the restart round now rather than at its next backoff, which after a few mapless
+ * A changed peer digest may be what makes `homeMap()` answerable on the owner, judged against the owner's
+ * own cache; a generation change there schedules the round anyway. Run the restart round now rather than at its next backoff, which after a few mapless
  * attempts can be most of a lock's timeout away.
  */
 function scheduleRestartRecallOnOwner(database: string): void {
 	if (!CLUSTER_RECORD_LOCKS_ENABLED || RESTART_RECALL_OFF) return;
 	if (ownedDatabases.has(database)) {
-		if (transports.get(database)?.homeMap(database)) restartRecall.schedule(database);
+		if (ownHomeMap(database)) restartRecall.schedule(database);
 		return;
 	}
 	const owner = ownerThreadByDatabase.get(database);
@@ -880,6 +876,14 @@ onMessageByType(HOMES_AGREED_MESSAGE, (message) => {
 
 const ownedDatabases = new Set<string>();
 const transports = new Map<string, ClusterLockTransport>();
+
+function ownHomeMap(database: string): LockHomeMap | undefined {
+	try {
+		return transports.get(database)?.homeMap(database);
+	} catch {
+		return undefined;
+	}
+}
 const transportBuilders = new Map<string, () => ClusterLockTransport>();
 /**
  * The thread that coordinates each database, as this thread last learned it from main (harper-pro#852).
@@ -1113,13 +1117,7 @@ const restartRecall = createRestartRecall({
 	homeIncarnation: currentHomeIncarnation,
 	isFirstIncarnation,
 	ownsDatabase: ownsRecordLockCoordination,
-	homeMap(database) {
-		try {
-			return transports.get(database)?.homeMap(database);
-		} catch {
-			return undefined;
-		}
-	},
+	homeMap: ownHomeMap,
 	send: sendRecordLockOperation,
 	recallLocally: recallDelegationsFromHome,
 	delegateEpoch: delegateEpochOf,

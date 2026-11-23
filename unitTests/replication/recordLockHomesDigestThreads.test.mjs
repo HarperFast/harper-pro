@@ -83,7 +83,6 @@ describe('peer home-map digest agreement across threads of one node', function (
 		here.peerSupportsLocks('peer-a');
 		await here.activate(1, digest('generation 1'));
 		await sibling.call('activate', 1, digest('generation 1'));
-		// Each thread's socket to the peer carried its handshake digest.
 		here.receive('peer-a', digest('generation 1'));
 		await sibling.call('receive', 'peer-a', digest('generation 1'));
 		assert.strictEqual(here.homeMapGeneration(), 1);
@@ -116,11 +115,14 @@ describe('peer home-map digest agreement across threads of one node', function (
 		const own = homesDigestPrefix('aaaaaaaabbbbbbbb' + '0'.repeat(48));
 		const published = ['aaaaaaaacccccccc' + '0'.repeat(48), 'ddddddddbbbbbbbb' + '0'.repeat(48)];
 		const read = here.peerDigestReader('peer-b');
-		const writing = sibling.call('publishAlternating', 'peer-b', published, 400);
+		const writing = sibling.call('publishAlternating', 'peer-b', published, 2000);
 		const seen = new Map();
-		for (const end = Date.now() + 600; Date.now() < end;) {
-			const prefix = read();
-			seen.set(prefix, (seen.get(prefix) ?? 0) + 1);
+		const seenEach = () => published.every((digest) => (seen.get(homesDigestPrefix(digest)) ?? 0) >= 1000);
+		for (const end = Date.now() + 10_000; Date.now() < end && !seenEach();) {
+			for (let i = 0; i < 1000; i++) {
+				const prefix = read();
+				seen.set(prefix, (seen.get(prefix) ?? 0) + 1);
+			}
 		}
 		assert.ok((await writing) > 1000);
 		assert.strictEqual(seen.get(own), undefined);
