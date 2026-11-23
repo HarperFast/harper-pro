@@ -167,12 +167,6 @@ suite('Clone from legacy v4 leader', { timeout: 240000 }, (ctx) => {
 			/instead of copying node_modules \(leader v?4\.[\d.]+ cannot stream it\)/.test(await readLog(cloneCtx.harper)),
 			'A clone of a v4 leader must not ask it for node_modules, which would carry the whole v4 install'
 		);
-		// harper-pro#246, #1487: a v5 leader's node record is published when the clone completes; a v4
-		// leader is a bridge peer and must stay off the v5 mesh.
-		ok(
-			!/Published this node's record of leader/.test(await readLog(cloneCtx.harper)),
-			'A clone of a v4 leader must keep its record of that leader to itself'
-		);
 		const cloneComponents = await sendOperation(cloneCtx.harper, { operation: 'get_components' });
 		ok(
 			cloneComponents.entries?.some((entry) => entry.name === FILESYSTEM_ONLY_APP),
@@ -256,6 +250,15 @@ suite('Clone from legacy v4 leader', { timeout: 240000 }, (ctx) => {
 		const legacy = ctx.nodes[0];
 		const clone = ctx.nodes[1];
 		if (!clone) return;
+
+		// harper-pro#246: a v4 leader is a bridge peer, so the finished clone must not publish its record.
+		let cloneLog = await readLog(clone);
+		for (let i = 0; i < 60 && !/Clone from leader node .* complete/.test(cloneLog); i++) {
+			await delay(500);
+			cloneLog = await readLog(clone);
+		}
+		ok(/Clone from leader node .* complete/.test(cloneLog), 'premise: the clone ran to completion');
+		ok(!/Published this node's record of leader/.test(cloneLog), 'A v4 leader must stay off the v5 mesh');
 
 		// After the clone is complete, audit-log forwarding should pick up new
 		// writes on the v4 source and ship them to the v5 clone. This is the

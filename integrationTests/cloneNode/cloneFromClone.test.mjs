@@ -1,12 +1,6 @@
 /**
- * harper-pro#1487: a node cloned from a clone must learn that clone's own leader.
- *
- *     A (leader)  <-- clone --  B  <-- clone --  C
- *
- * B's hdb_nodes row for A is the only way C can learn A: nothing joins after C, so A never rewrites
- * its own row. While B kept that row local-only after its clone completed, C never received it,
- * refused A's connections ("no hdb_nodes entry"), and reached A only through B, so stopping B split
- * the cluster.
+ * harper-pro#1487. A (leader) <- B (clone of A) <- C (clone of B), with no later join to make A rewrite
+ * its own row: C can learn A only from B's row for A.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert/strict';
@@ -153,7 +147,6 @@ suite('Clone Node - a clone of a clone learns the first leader (harper-pro#1487)
 		await waitForPeerRow(leader, second);
 		await Promise.all([waitForConnected(second, leader), waitForConnected(leader, second)]);
 
-		// With B stopped, only a direct A <-> C link can carry these.
 		await stopNodeProcess(follower);
 		await insert(leader, 'from-leader');
 		await insert(second, 'from-second');

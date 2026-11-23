@@ -2441,6 +2441,7 @@ export function isLocalOnlyEntry(entry: { metadataFlags?: number } | undefined |
 	return ((entry?.metadataFlags ?? 0) & LOCAL_ONLY) !== 0;
 }
 
+/** `options.localOnly`: true keeps the row on this node, false releases it, omitted keeps what the stored row is. */
 export async function ensureNode(name: string, node, options?: { localOnly?: boolean }) {
 	const table = getHDBNodeTable();
 	name = name ?? urlToNodeName(node.url);
@@ -2476,15 +2477,14 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 	// the stored row is: a plain patch of a bridge peer's row (an `update_node` that omits `isLeader`)
 	// would otherwise send it to the mesh (harper-pro #246). The stored bit decides, not `isLeader`: that
 	// field replicates, so on another node it marks a row that was never local-only (harper-pro #1487).
-	// `isLeader: false` is an explicit demotion and clears it.
-	// A node's own row is never a bridge peer's: an earlier release could make it local-only once
-	// `isLeader` had replicated onto it, after which its own changes stopped reaching the cluster.
+	// `isLeader: false` is an explicit demotion. A node's own row never inherits it: an earlier release
+	// set it there once `isLeader` had replicated onto the row, and its own changes stopped replicating.
 	const localOnly =
-		name !== getThisNodeName() &&
-		(options?.localOnly ||
-			(existing != null &&
-				node.isLeader !== false &&
-				isLocalOnlyEntry(await table.primaryStore.getEntry(name, { async: true }))));
+		options?.localOnly ??
+		(name !== getThisNodeName() &&
+			existing != null &&
+			node.isLeader !== false &&
+			isLocalOnlyEntry(await table.primaryStore.getEntry(name, { async: true })));
 
 	// Use an explicit, isolated context for this write instead of relying on ambient fallback
 	// (contextStorage.getStore()). This is internal node-registry bookkeeping, not a user-authored

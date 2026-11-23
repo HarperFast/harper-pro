@@ -26,24 +26,34 @@ describe('ensureNode local-only rows (harper-pro #246, #1487)', function () {
 		assert.equal(await storedLocalOnly(), false);
 	});
 
-	it("never keeps this node's own row local-only", async () => {
+	it("does not inherit local-only on this node's own row, but honors an explicit request", async () => {
 		const self = getThisNodeName();
-		const prior = getHDBNodeTable().primaryStore.getSync(self);
+		const table = getHDBNodeTable();
+		const prior = table.primaryStore.getSync(self);
+		const selfLocalOnly = async () => isLocalOnlyEntry(await table.primaryStore.getEntry(self, { async: true }));
 		try {
-			await ensureNode(self, { url: URL, replicates: true, isLeader: true }, { localOnly: true });
-			assert.equal(isLocalOnlyEntry(await getHDBNodeTable().primaryStore.getEntry(self, { async: true })), false);
+			await ensureNode(self, { recordLockIncarnation: 1 }, { localOnly: true });
+			assert.equal(await selfLocalOnly(), true);
+			await ensureNode(self, { url: URL, replicates: true });
+			assert.equal(await selfLocalOnly(), false);
 		} finally {
-			if (prior) await getHDBNodeTable().put(self, prior);
-			else await getHDBNodeTable().delete(self);
+			if (prior) await table.put(self, prior);
+			else await table.delete(self);
 		}
 	});
 
-	it('clears the bit on an isLeader: false demotion, which is how a finished clone publishes its leader', async () => {
+	it('releases a row on localOnly: false without changing it, which is how a finished clone publishes its leader', async () => {
+		await ensureNode(PEER, { url: URL, replicates: true, isLeader: true }, { localOnly: true });
+		await ensureNode(PEER, {}, { localOnly: false });
+		assert.equal(await storedLocalOnly(), false);
+		const row = getHDBNodeTable().primaryStore.getSync(PEER);
+		assert.equal(row.isLeader, true);
+		assert.equal(row.url, URL);
+	});
+
+	it('clears the bit on an isLeader: false demotion', async () => {
 		await ensureNode(PEER, { url: URL, replicates: true, isLeader: true }, { localOnly: true });
 		await ensureNode(PEER, { isLeader: false });
 		assert.equal(await storedLocalOnly(), false);
-		const row = getHDBNodeTable().primaryStore.getSync(PEER);
-		assert.equal(row.isLeader, false);
-		assert.equal(row.url, URL, 'the rest of the row is kept');
 	});
 });
