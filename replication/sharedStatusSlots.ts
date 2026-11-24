@@ -43,7 +43,7 @@ export const FIRE_MECHANISMS = [
 export const FIRE_COUNTER_BASE_POSITION = allocate(FIRE_MECHANISMS.length * 2);
 
 export const RECORD_LOCKS_CAPABILITY_POSITION = allocate();
-export const RECORD_LOCK_HOMES_AGREEMENT_POSITION = allocate();
+export const RECORD_LOCK_HOMES_DIGEST_POSITION = allocate();
 export const RECORD_LOCK_LEVEL_POSITION = allocate();
 // 1 while the peer's current socket advertises `originFloors`: a relay forwards that peer's floor only then.
 export const PEER_CERTIFIES_FLOORS_POSITION = allocate();
@@ -69,6 +69,7 @@ export const ACKED_CONFIRMATION_MARKER_POSITION = allocate();
 export const CONFIRMATION_MARKERS_UNKNOWN = 0;
 export const CONFIRMATION_MARKERS_UNSUPPORTED = 1;
 export const CONFIRMATION_MARKERS_SUPPORTED = 2;
+export const RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION = allocate();
 
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
 export const ALLOCATED_SLOTS = cursor;
@@ -82,6 +83,45 @@ export function assertAllocationFits(allocated: number, capacity: number): void 
 	}
 }
 assertAllocationFits(ALLOCATED_SLOTS, REPLICATION_SHARED_STATUS_SLOTS);
+
+// The digest record's change word, one Int32: writers in flight in the low byte, a change count above it.
+export const HOMES_DIGEST_WRITER = 1;
+export const HOMES_DIGEST_CHANGE = 1 << 8;
+export const HOMES_DIGEST_WRITERS = HOMES_DIGEST_CHANGE - 1;
+
+export function homesDigestChangeWords(status: Float64Array): Int32Array {
+	return new Int32Array(status.buffer, status.byteOffset, status.length * 2);
+}
+
+/**
+ * Zeroes every slot but the digest change word, whose count moves on instead: threads cache the digest
+ * against it (`peerHomesDigestReader`), so a count set back could match a cache taken before the reset.
+ */
+export function resetReplicationSharedStatus(status: Float64Array): boolean {
+	// Object.is: a digest prefix can read as -0 through the Float64 view.
+	if (status.every((slot, position) => position === RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION || Object.is(slot, 0)))
+		return false;
+	const words = homesDigestChangeWords(status);
+	const changeWord = RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2;
+	// In flight like a writer, so no reader trusts a cached digest while the reset runs.
+	Atomics.add(words, changeWord, HOMES_DIGEST_WRITER);
+	let cleared = false;
+	for (let position = 0; position < status.length; position++) {
+		if (
+			position === RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION ||
+			position === RECORD_LOCK_HOMES_DIGEST_POSITION ||
+			status[position] === 0
+		)
+			continue;
+		status[position] = 0;
+		cleared = true;
+	}
+	// After the capability slot, so homeMap() refuses during the reset, and a publish before this exchange is cleared.
+	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
+	if (Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, 0n) !== 0n) cleared = true;
+	Atomics.add(words, changeWord, (cleared ? HOMES_DIGEST_CHANGE : 0) - HOMES_DIGEST_WRITER);
+	return cleared;
+}
 
 export const CONNECTION_STATE_CONNECTED = 2;
 

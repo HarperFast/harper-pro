@@ -46,6 +46,7 @@ import {
 	selfNodeReplicates,
 	ownWriteRecipientNames,
 } from './knownNodes.ts';
+import { resetReplicationSharedStatus } from './sharedStatusSlots.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 import { ownPrivateUrls, samePrivateUrls } from './privatePaths.ts';
 import {
@@ -1972,8 +1973,7 @@ export async function startOnMainThread(options) {
 					// would falsely read as removed.
 					const key = `${databaseName}/${nodeName}`;
 					if (nodeMap.size > 0 && !nodeMap.has(nodeName)) {
-						if (status.some((slot) => slot !== 0)) {
-							status.fill(0);
+						if (resetReplicationSharedStatus(status)) {
 							// Reported once while the condition holds, not on every tick: a live writer that kept
 							// re-populating a buffer this keeps zeroing would otherwise log every 5s forever. The
 							// key is dropped again below when the peer is a member, so a genuine recurrence is

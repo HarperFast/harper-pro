@@ -175,6 +175,7 @@ import {
 	recordPeerHomesDigest,
 	currentHomesDigest,
 	recordLockBarrierApplied,
+	registerHomesDigestAnnouncer,
 } from './recordLockTransport.ts';
 import { ANY_TABLE, markReclonedIfLockHistory, poison as poisonRecordLockPair } from './recordLockPoison.ts';
 import { recoveryRangeFor, settleOwnOriginReport } from './ownOriginRecovery.ts';
@@ -5772,6 +5773,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	const sessionOrdinal = ++nextConnectionSessionOrdinal;
 	logger.debug?.(connectionId, 'Initializing replication connection', authorization);
 	let databaseName = options.database;
+	// Above every call made during setup: `setDatabase` and an already-open socket's first keepalive read them.
+	let wsClosed = false;
+	let unregisterHomesDigestAnnouncer: (() => void) | undefined;
 	const dbSubscriptions = options.databaseSubscriptions || databaseSubscriptions;
 	let auditStore: any;
 	let replicationSharedStatus: Float64Array;
@@ -6893,6 +6897,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (pausedStatus && options.connection?.nodeSubscriptions !== undefined)
 					pausedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
 			}
+			// Bounds a peer's stale record of our digest to one interval: its sockets to us can be on different
+			// threads, so an older frame can be recorded after a newer one.
+			try {
+				sendRecordLockHomesDigestFrame();
+			} catch (error) {
+				logger.debug?.(connectionId, 'could not re-send the record lock home map digest', error);
+			}
 			// Always send the keep-alive ping. ws.pause() only stops reads, not writes, and the accepted
 			// peer relies on our pings to keep its own receive timer alive even when it has no data to send
 			// us. Record byte counts AFTER the ping so the ping's own bytes aren't later mistaken for peer
@@ -7525,7 +7536,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Without serialization, awaiting inside the handler would let concurrent message handlers
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
-	let wsClosed = false;
 	const stopShardingRecoveryWatch = onShardingRecoveryChange((database) => {
 		if (database !== databaseName || wsClosed || !residencyIdentityBound) return;
 		wsClosed = true;
@@ -8967,9 +8977,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					case RECORD_LOCK_HOMES_DIGEST:
 						// `data` (`message[1]`) is the digest; `message[2]` names the database — the same slot
 						// NODE_NAME uses for it — since one socket carries every database's traffic and the
-						// digest is per-database (harper-pro#825). Recorded centrally, keyed by (database,
-						// peer) rather than on this connection object: the mesh keeps a separate connection
-						// per direction, and our own digest can become known later, on either one.
+						// digest is per-database (harper-pro#825).
 						if (typeof data === 'string' && typeof remoteNodeName === 'string' && message[2] === databaseName)
 							recordPeerHomesDigest(databaseName, remoteNodeName, data);
 						break;
@@ -12671,6 +12679,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	ws.on('ping', resetPingTimer);
+	// The accepting side runs no keepalive of its own, so the dialer's ping is its re-send bound.
+	if (CLUSTER_RECORD_LOCKS_ENABLED && !shouldRunKeepalive(options))
+		ws.on('ping', () => {
+			try {
+				sendRecordLockHomesDigestFrame();
+			} catch (error) {
+				logger.debug?.(connectionId, 'could not re-send the record lock home map digest', error);
+			}
+		});
 	ws.on('pong', resetPingTimer);
 	ws.on('pong', () => {
 		if (options.connection) {
@@ -12762,6 +12779,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		instanceRetired = true;
 		wsClosed = true;
 		stopShardingConfigurationWatch();
+		unregisterHomesDigestAnnouncer?.();
 		if (residencySender && code === 1011 && reasonBuffer?.toString() === OWNED_SLOTS_COPY_REFUSAL) {
 			try {
 				if (residencySender.refused())
@@ -14468,17 +14486,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * resolved at handshake — harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6): the active
 	 * generation digest travels on its own, from whatever this node's transport cache currently holds.
 	 * No-op with the feature off or before this node has an active generation — the peer's fail-closed
-	 * default already covers "no digest received." Agreement itself is reconciled centrally in
-	 * `recordLockTransport.ts`, not here — this connection may not be the one that last heard from the
-	 * peer (the mesh keeps a separate connection per direction).
+	 * default already covers "no digest received."
 	 */
 	function sendRecordLockHomesDigestFrame() {
-		if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
+		if (!CLUSTER_RECORD_LOCKS_ENABLED || wsClosed) return;
 		// Sender-side gating discipline (DESIGN.md, "Sender-side gating discipline"): do not emit a
 		// frame the peer has not advertised support for.
 		if (!(peerCapabilitiesLearned && peerSupportsRecordLocks(peerCapabilities))) return;
+		if (!unregisterHomesDigestAnnouncer && typeof databaseName === 'string')
+			unregisterHomesDigestAnnouncer = registerHomesDigestAnnouncer(databaseName, sendRecordLockHomesDigestFrame);
 		const digest = currentHomesDigest(databaseName);
-		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
+		if (digest && ws.readyState === WebSocket.OPEN) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
 	}
 	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
 		const database = getDatabases()?.[databaseName];
@@ -14737,13 +14755,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		 * @param operation
 		 */
 		sendOperation,
-		// A standalone re-announce for this live socket (harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6):
-		// activation does not otherwise reach an already-connected peer, since the capability bag is only
-		// sent at handshake. No-op while this node has no active generation yet — the peer's own fail-closed
-		// default (`homeMap()` unavailable, or `HOMES_AGREEMENT_UNKNOWN`) already covers that case.
-		sendRecordLockHomesDigest() {
-			sendRecordLockHomesDigestFrame();
-		},
 	};
 
 	function checkExcessMessageSize(messageSize) {

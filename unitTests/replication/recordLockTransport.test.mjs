@@ -7,15 +7,15 @@
  * review).
  */
 import assert from 'node:assert';
+import { createHash } from 'node:crypto';
+
 import { notifyThreadExit, setMainIsWorker, workers } from '#js/core/server/threads/manageThreads';
 import {
-	HOMES_AGREEMENT_MATCH,
-	HOMES_AGREEMENT_MISMATCH,
-	HOMES_AGREEMENT_UNKNOWN,
 	LOCK_CAPABILITY_SUPPORTED,
 	LOCK_CAPABILITY_UNKNOWN,
 	LOCK_CAPABILITY_UNSUPPORTED,
-	RECORD_LOCK_HOMES_AGREEMENT_POSITION,
+	RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION,
+	RECORD_LOCK_HOMES_DIGEST_POSITION,
 	RECORD_LOCKS_CAPABILITY_POSITION,
 	RECORD_LOCKS_DISABLED_MESSAGE,
 	RECORD_LOCK_LEVEL_POSITION,
@@ -35,12 +35,15 @@ import {
 	isFirstIncarnation,
 	currentHomeIncarnation,
 	ownsRecordLockCoordination,
-	readPeerHomesAgreement,
+	homesDigestPrefix,
+	peerHomesDigestReader,
+	publishPeerHomesDigest,
 	readPeerLockCapability,
 	recordLockOwnerFor,
 	recordLockOwnerThreadIds,
-	recordPeerHomesAgreement,
+	recordPeerHomesDigest,
 	recordPeerLockCapability,
+	registerHomesDigestAnnouncer,
 	releaseRecordLockOwner,
 	cachedActiveGeneration,
 	homeMapConfirmedAbsent,
@@ -66,10 +69,16 @@ import {
 } from '#src/replication/recordLockRpc';
 import { RECORD_LOCKS_CAPABILITY } from '#src/replication/protocolCapabilities';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
+import {
+	HOMES_DIGEST_CHANGE,
+	HOMES_DIGEST_WRITER,
+	resetReplicationSharedStatus,
+} from '#src/replication/sharedStatusSlots';
 import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
 import { setActiveWorkerPools } from '#src/core/server/threads/workerPools';
 import { getClusterLockTransport, LockCoordinator } from '#src/core/resources/recordLockCoordinator';
 import { server } from '#src/core/server/Server';
+import { table } from '#src/core/resources/databases';
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
@@ -166,23 +175,141 @@ describe('peer lock capability in the shared status buffer', () => {
 	});
 });
 
-describe('peer home-map digest agreement in the shared status buffer', () => {
-	it('records match/mismatch and reads never-learned as unknown', () => {
+const digestFor = (label) => createHash('sha256').update(String(label)).digest('hex');
+const recordHolds = (status, digest) => peerHomesDigestReader(status)() === homesDigestPrefix(digest);
+const CHANGE_WORD = RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2;
+const digestChangeWord = (status) => new Int32Array(status.buffer)[CHANGE_WORD];
+
+describe('peer home-map digest record in the shared status buffer', () => {
+	it('starts as none heard, and answers whether each publication changed it', () => {
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
-		assert.strictEqual(readPeerHomesAgreement(status), HOMES_AGREEMENT_UNKNOWN);
-		recordPeerHomesAgreement(status, true);
-		assert.strictEqual(readPeerHomesAgreement(status), HOMES_AGREEMENT_MATCH);
-		recordPeerHomesAgreement(status, false);
-		assert.strictEqual(readPeerHomesAgreement(status), HOMES_AGREEMENT_MISMATCH);
+		assert.strictEqual(peerHomesDigestReader(status)(), 0n, 'none heard');
+		assert.ok(!recordHolds(status, digestFor(1)));
+		assert.strictEqual(publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1))), true);
+		assert.ok(recordHolds(status, digestFor(1)));
+		assert.strictEqual(
+			publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1))),
+			false,
+			'a re-send of the same digest changes nothing'
+		);
+		assert.strictEqual(publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2))), true);
+		assert.ok(recordHolds(status, digestFor(2)));
+		assert.ok(!recordHolds(status, digestFor(1)));
 	});
 
-	it('uses the slot right after the capability-level flag, still inside headroom', () => {
-		assert.strictEqual(RECORD_LOCK_HOMES_AGREEMENT_POSITION, RECORD_LOCKS_CAPABILITY_POSITION + 1);
-		assert.ok(RECORD_LOCK_HOMES_AGREEMENT_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
+	it('reads back a prefix with the high bit set in either half', () => {
+		for (const digest of ['f'.repeat(64), '80000000' + '7'.repeat(56), '7fffffff' + '8'.repeat(56)]) {
+			const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+			publishPeerHomesDigest(status, homesDigestPrefix(digest));
+			assert.ok(recordHolds(status, digest), digest);
+		}
+	});
+
+	it('moves the count for a write that changes the record, and leaves it for a re-send', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(digestChangeWord(status), HOMES_DIGEST_CHANGE);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(digestChangeWord(status), HOMES_DIGEST_CHANGE);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2)));
+		assert.strictEqual(digestChangeWord(status), 2 * HOMES_DIGEST_CHANGE);
+	});
+
+	it('trusts no cached value while a writer is in flight, so a write cut off mid-way is still read', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		const read = peerHomesDigestReader(status);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
+		// A writer that counted itself in and exchanged, but never finished.
+		new Int32Array(status.buffer)[CHANGE_WORD] += HOMES_DIGEST_WRITER;
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
+		new BigInt64Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_POSITION] = homesDigestPrefix(digestFor(2));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
+	});
+
+	it('warns once for a writer that stays in flight, and not for in-flight reads broken by a clean one', () => {
+		const warnings = [];
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		const read = peerHomesDigestReader(status, 'peer-x', (message) => warnings.push(message));
+		const words = new Int32Array(status.buffer);
+		for (let i = 0; i < 30_000; i++) {
+			words[CHANGE_WORD] += HOMES_DIGEST_WRITER;
+			read();
+			words[CHANGE_WORD] -= HOMES_DIGEST_WRITER;
+			read();
+		}
+		assert.strictEqual(warnings.length, 0);
+		words[CHANGE_WORD] += HOMES_DIGEST_WRITER;
+		for (let i = 0; i < 30_000; i++) read();
+		assert.strictEqual(warnings.length, 1);
+		assert.match(warnings[0], /peer-x/);
+	});
+
+	it('leaves an already empty buffer, its change word included, untouched', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(resetReplicationSharedStatus(status), true);
+		const word = digestChangeWord(status);
+		assert.strictEqual(resetReplicationSharedStatus(status), false);
+		assert.strictEqual(digestChangeWord(status), word);
+	});
+
+	it('clears a digest whose 64 bits read as -0 through the Float64 view', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		publishPeerHomesDigest(status, homesDigestPrefix('8' + '0'.repeat(63)));
+		assert.ok(Object.is(status[RECORD_LOCK_HOMES_DIGEST_POSITION], -0));
+		resetReplicationSharedStatus(status);
+		assert.strictEqual(peerHomesDigestReader(status)(), 0n);
+	});
+
+	it('reads the next digest after a reset, whatever it cached before it', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		const read = peerHomesDigestReader(status);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(resetReplicationSharedStatus(status), true);
+		// Not read in between: homeMap() stops at the capability check while the peer is gone.
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2)));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
+	});
+
+	it('re-reads the record only once the change count has moved', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		const read = peerHomesDigestReader(status);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(1)));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)));
+		new BigInt64Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_POSITION] = homesDigestPrefix(digestFor(2));
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(1)), 'no count change, no re-read');
+		new Int32Array(status.buffer)[CHANGE_WORD] += HOMES_DIGEST_CHANGE;
+		assert.strictEqual(read(), homesDigestPrefix(digestFor(2)));
+	});
+
+	it('keeps the first 64 bits of a digest, with the high bit, and never the none value', () => {
+		assert.strictEqual(homesDigestPrefix('f'.repeat(64)), -1n);
+		assert.strictEqual(homesDigestPrefix('8000000000000001' + '0'.repeat(48)), -(2n ** 63n) + 1n);
+		assert.strictEqual(homesDigestPrefix('0'.repeat(16) + 'a'.repeat(48)), 1n);
+		const digest = digestFor('real');
+		assert.strictEqual(homesDigestPrefix(digest), BigInt.asIntN(64, BigInt('0x' + digest.slice(0, 16))));
+		assert.notStrictEqual(homesDigestPrefix(digestFor(1)), homesDigestPrefix(digestFor(2)));
+	});
+
+	it('is undefined for anything but a lowercase 64-hex digest', () => {
+		for (const value of [undefined, null, 7, '', 'd1', 'A'.repeat(64), 'g'.repeat(64), 'a'.repeat(63), 'a'.repeat(65)])
+			assert.strictEqual(homesDigestPrefix(value), undefined, String(value));
+	});
+
+	it('writes only its record, right after the capability flag, and its change count', () => {
+		assert.strictEqual(RECORD_LOCK_HOMES_DIGEST_POSITION, RECORD_LOCKS_CAPABILITY_POSITION + 1);
+		assert.ok(RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(3)));
+		const touched = [...status.keys()].filter((position) => status[position] !== 0);
+		assert.deepStrictEqual(touched, [RECORD_LOCK_HOMES_DIGEST_POSITION, RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION]);
 	});
 
 	it('records the exact advertised level in the last slot, reading garbage as 0', () => {
-		assert.strictEqual(RECORD_LOCK_LEVEL_POSITION, RECORD_LOCK_HOMES_AGREEMENT_POSITION + 1);
+		assert.strictEqual(RECORD_LOCK_LEVEL_POSITION, RECORD_LOCK_HOMES_DIGEST_POSITION + 1);
 		assert.ok(RECORD_LOCK_LEVEL_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 		assert.strictEqual(readPeerLockLevel(status), 0);
@@ -196,6 +323,7 @@ describe('peer home-map digest agreement in the shared status buffer', () => {
 });
 
 describe('createRecordLockTransport().homeMap', () => {
+	const DEFAULT_ACTIVE = { generation: 1, homes: ['self', 'peer-a'], digest: digestFor(1) };
 	function transportFor(options = {}) {
 		const {
 			homeIncarnation = 3,
@@ -225,10 +353,10 @@ describe('createRecordLockTransport().homeMap', () => {
 				// A peer agreeing on the home map is assumed to also speak the right protocol level
 				// unless the test says otherwise — these are independent checks (see homeMap's comment).
 				recordPeerLockCapability(status, capabilities?.[peer] ?? matches);
-				recordPeerHomesAgreement(status, matches);
+				publishPeerHomesDigest(status, homesDigestPrefix(matches ? DEFAULT_ACTIVE.digest : digestFor('other')));
 			}
 		}
-		const cached = 'active' in options ? options.active : { generation: 1, homes: ['self', 'peer-a'] };
+		const cached = 'active' in options ? options.active : DEFAULT_ACTIVE;
 		const confirmedAbsent = 'confirmedAbsent' in options ? options.confirmedAbsent : cached === undefined;
 		return {
 			transport: createRecordLockTransport(
@@ -351,6 +479,48 @@ describe('createRecordLockTransport().homeMap', () => {
 		// A coincidentally-matching digest string from a peer speaking a different wire shape is not
 		// enough; capability level and home-map agreement are checked independently.
 		const { transport } = transportFor({ agreements: { 'peer-a': true }, capabilities: { 'peer-a': false } });
+		assert.strictEqual(transport.homeMap('data'), undefined);
+	});
+
+	it('compares the peer record with each reader’s own digest when read, so a lagging cache agrees once it catches up', () => {
+		const auditStore = fakeAuditStore();
+		const status = getReplicationSharedStatus(auditStore, 'data', 'peer-a');
+		recordPeerLockCapability(status, true);
+		const deps = {
+			thisNodeName: () => 'self',
+			auditStore: () => auditStore,
+			ownsDatabase: () => true,
+			homeIncarnation: () => 3,
+			send: async () => ({}),
+			isFirstIncarnation: () => false,
+			monotonicNow: () => 0,
+		};
+		const generation = (n) => ({ generation: n, homes: ['self', 'peer-a'], digest: digestFor(n) });
+		let cachedOnA = generation(2);
+		let cachedOnB = generation(1);
+		const threadA = createRecordLockTransport('data', deps, () => cachedOnA);
+		const threadB = createRecordLockTransport('data', deps, () => cachedOnB);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(2)));
+		assert.strictEqual(threadA.homeMap('data')?.generation, 2);
+		assert.strictEqual(threadB.homeMap('data'), undefined, 'a cache still on the old generation does not agree');
+		cachedOnB = generation(2);
+		assert.strictEqual(
+			threadB.homeMap('data')?.generation,
+			2,
+			'agrees once its own cache catches up, with no new frame'
+		);
+		publishPeerHomesDigest(status, homesDigestPrefix(digestFor(3)));
+		assert.strictEqual(threadA.homeMap('data'), undefined, 'the peer moved on');
+		assert.strictEqual(threadB.homeMap('data'), undefined);
+		cachedOnA = generation(3);
+		assert.strictEqual(threadA.homeMap('data')?.generation, 3);
+	});
+
+	it('is undefined while its own cached digest is not a digest', () => {
+		const { transport } = transportFor({
+			active: { generation: 1, homes: ['self', 'peer-a'], digest: 'd1' },
+			agreements: { 'peer-a': true },
+		});
 		assert.strictEqual(transport.homeMap('data'), undefined);
 	});
 
@@ -1325,6 +1495,30 @@ describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
 	beforeEach(() => (previous = setRecordLockHomesRowReader(previous ?? (() => Promise.reject(new Error('unset'))))));
 	afterEach(() => setRecordLockHomesRowReader(previous));
 
+	it('re-announces a changed digest on every registered session of the database, past one that throws', async () => {
+		const calls = [];
+		const removeThrowing = registerHomesDigestAnnouncer('refresh-announce', () => {
+			calls.push('throwing');
+			throw new Error('socket closing');
+		});
+		const removeLive = registerHomesDigestAnnouncer('refresh-announce', () => calls.push('live'));
+		const removeOther = registerHomesDigestAnnouncer('refresh-announce-other', () => calls.push('other'));
+		setRecordLockHomesRowReader(async () => generation(1));
+		await refreshRecordLockHomesCache('refresh-announce');
+		assert.deepStrictEqual(calls.sort(), ['live', 'throwing'], 'only that database, each session once');
+		calls.length = 0;
+		await refreshRecordLockHomesCache('refresh-announce');
+		assert.deepStrictEqual(calls, [], 'an unchanged digest is not re-announced');
+		removeThrowing();
+		removeThrowing();
+		setRecordLockHomesRowReader(async () => generation(2));
+		await refreshRecordLockHomesCache('refresh-announce');
+		assert.deepStrictEqual(calls, ['live'], 'a retired session is not told');
+		removeLive();
+		removeOther();
+		forgetRecordLockHomesCache('refresh-announce');
+	});
+
 	it('retries a failed read on a backoff until one succeeds, then stops', async () => {
 		let reads = 0;
 		setRecordLockHomesRowReader(async () => {
@@ -1474,5 +1668,24 @@ describe('the per-database coordination epoch (record-locks.md §4.5)', () => {
 		setRecordLockOwnership('epoch-a', true);
 		assert.strictEqual(delegateEpochOf('epoch-a'), 501);
 		assert.ok(coordinationStartedMonoOf('epoch-a') > started);
+	});
+});
+
+describe('recordPeerHomesDigest', () => {
+	it('publishes a well-formed digest into the (database, peer) record and ignores anything else', () => {
+		const Item = table({
+			database: 'digest_receipt',
+			table: 'Item',
+			attributes: [{ name: 'id', type: 'ID', isPrimaryKey: true }],
+		});
+		const status = getReplicationSharedStatus(Item.auditStore, 'digest_receipt', 'peer-r');
+		recordPeerHomesDigest('digest_receipt', 'peer-r', digestFor(1));
+		assert.ok(recordHolds(status, digestFor(1)));
+		for (const malformed of ['not a digest', 'A'.repeat(64), 42, undefined])
+			recordPeerHomesDigest('digest_receipt', 'peer-r', malformed);
+		assert.ok(recordHolds(status, digestFor(1)), 'a malformed frame erases nothing');
+		recordPeerHomesDigest('digest_receipt', 'peer-r', digestFor(2));
+		assert.ok(recordHolds(status, digestFor(2)), 'the newest frame wins');
+		recordPeerHomesDigest('digest_receipt_absent', 'peer-r', digestFor(3));
 	});
 });

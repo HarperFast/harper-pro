@@ -26,8 +26,10 @@
  *   owner has exited: a live owner still holds delegations and grants.
  *
  * A peer's advertised home-map digest (`RECORD_LOCK_HOMES_DIGEST`, `replicationConnection.ts`) is
- * kept in the per-(database, peer) shared status buffer so the owner can read it for a peer whose
- * socket lives on another thread.
+ * kept, as its 64-bit prefix, in the per-(database, peer) shared status buffer, written by whichever
+ * thread's socket received it. Every thread compares it with its own cached digest when it reads:
+ * a stored match/mismatch verdict was relative to the writer's cache and to the frames that one
+ * thread happened to hear.
  *
  * With `replication.recordLocks` off (the default) every replicated database gets a transport that
  * fails closed instead, so a cluster-scoped `lock()` reports the missing enablement rather than
@@ -63,8 +65,13 @@ import * as logger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, getReplicationSharedStatus, shouldReplicateFromNode } from './knownNodes.ts';
 import {
 	RECORD_LOCKS_CAPABILITY_POSITION,
-	RECORD_LOCK_HOMES_AGREEMENT_POSITION,
+	RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION,
+	RECORD_LOCK_HOMES_DIGEST_POSITION,
 	RECORD_LOCK_LEVEL_POSITION,
+	HOMES_DIGEST_CHANGE,
+	HOMES_DIGEST_WRITER,
+	HOMES_DIGEST_WRITERS,
+	homesDigestChangeWords,
 } from './sharedStatusSlots.ts';
 import { isReplicationWorker } from './replicationWorkers.ts';
 import { ClientError, LockUnavailableError } from '../core/utility/errors/hdbError.ts';
@@ -118,18 +125,23 @@ import {
 	unregisterReplicatedApplyFailureListener,
 	type ReplicatedApplyFailureListener,
 } from '../core/resources/replicatedApplyFailure.ts';
-import { getRepairConnectionsForDB, replicatedDatabaseNames } from './replicator.ts';
+import { replicatedDatabaseNames } from './replicator.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import './recordLockApply.ts';
 
-export { RECORD_LOCKS_CAPABILITY_POSITION, RECORD_LOCK_HOMES_AGREEMENT_POSITION, RECORD_LOCK_LEVEL_POSITION };
+export {
+	RECORD_LOCKS_CAPABILITY_POSITION,
+	RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION,
+	RECORD_LOCK_HOMES_DIGEST_POSITION,
+	RECORD_LOCK_LEVEL_POSITION,
+};
 export const LOCK_CAPABILITY_UNKNOWN = 0;
 export const LOCK_CAPABILITY_UNSUPPORTED = 1;
 export const LOCK_CAPABILITY_SUPPORTED = 2;
 
-export const HOMES_AGREEMENT_UNKNOWN = 0;
-export const HOMES_AGREEMENT_MISMATCH = 1;
-export const HOMES_AGREEMENT_MATCH = 2;
+/** The peer-digest record before any digest was heard; `homesDigestPrefix` never returns it. */
+const NO_PEER_HOMES_DIGEST = 0n;
+const HOMES_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 
 /** Record what a peer's own `NODE_NAME` bag said, on whichever thread its socket landed. */
 export function recordPeerLockCapability(status: Float64Array, supported: boolean): void {
@@ -141,17 +153,62 @@ export function readPeerLockCapability(status: Float64Array): number {
 	return value === LOCK_CAPABILITY_SUPPORTED || value === LOCK_CAPABILITY_UNSUPPORTED ? value : LOCK_CAPABILITY_UNKNOWN;
 }
 
-/**
- * Byte-exact comparison happens on the socket thread that receives the peer's digest
- * (`replicationConnection.ts`); only the tri-state result lands here, never the digest itself.
- */
-export function recordPeerHomesAgreement(status: Float64Array, matches: boolean): void {
-	status[RECORD_LOCK_HOMES_AGREEMENT_POSITION] = matches ? HOMES_AGREEMENT_MATCH : HOMES_AGREEMENT_MISMATCH;
+export function homesDigestPrefix(digest: unknown): bigint | undefined {
+	if (typeof digest !== 'string' || !HOMES_DIGEST_PATTERN.test(digest)) return undefined;
+	const prefix = BigInt.asIntN(64, BigInt('0x' + digest.slice(0, 16)));
+	return prefix === NO_PEER_HOMES_DIGEST ? 1n : prefix;
 }
 
-export function readPeerHomesAgreement(status: Float64Array): number {
-	const value = status[RECORD_LOCK_HOMES_AGREEMENT_POSITION];
-	return value === HOMES_AGREEMENT_MATCH || value === HOMES_AGREEMENT_MISMATCH ? value : HOMES_AGREEMENT_UNKNOWN;
+const HOMES_DIGEST_CHANGES_WORD = RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2;
+
+/** Sockets of one peer on several threads may publish at once. */
+export function publishPeerHomesDigest(status: Float64Array, prefix: bigint): boolean {
+	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
+	const words = homesDigestChangeWords(status);
+	Atomics.add(words, HOMES_DIGEST_CHANGES_WORD, HOMES_DIGEST_WRITER);
+	const changed = Atomics.exchange(record, RECORD_LOCK_HOMES_DIGEST_POSITION, prefix) !== prefix;
+	Atomics.add(words, HOMES_DIGEST_CHANGES_WORD, (changed ? HOMES_DIGEST_CHANGE : 0) - HOMES_DIGEST_WRITER);
+	return changed;
+}
+
+const STUCK_WRITER_READS = 10_000;
+
+/**
+ * One thread's reader of a peer's digest record. A BigInt load allocates, so it keeps the last value and
+ * trusts it only while no writer is in flight and the count has not moved; a read that starts after a
+ * write's exchange always re-loads. A writer that never finishes (a terminated worker) leaves its peer's
+ * readers re-loading on every call.
+ */
+export function peerHomesDigestReader(
+	status: Float64Array,
+	peer = '',
+	warn: (message: string) => void = (message) => logger.warn?.(message)
+): () => bigint {
+	const record = new BigInt64Array(status.buffer, status.byteOffset, status.length);
+	const words = homesDigestChangeWords(status);
+	let seen: number | undefined;
+	let prefix = NO_PEER_HOMES_DIGEST;
+	let inFlightReads = 0;
+	let warned = false;
+	return () => {
+		const changes = Atomics.load(words, HOMES_DIGEST_CHANGES_WORD);
+		if (changes !== seen) {
+			prefix = Atomics.load(record, RECORD_LOCK_HOMES_DIGEST_POSITION);
+			if (changes & HOMES_DIGEST_WRITERS) {
+				seen = undefined;
+				if (++inFlightReads === STUCK_WRITER_READS && !warned) {
+					warned = true;
+					warn(
+						`The record lock home map digest record for ${peer} has had a writer in flight for ${STUCK_WRITER_READS} reads; a worker likely exited mid-write, so this thread re-reads it on every lock until restart`
+					);
+				}
+			} else {
+				seen = changes;
+				inFlightReads = 0;
+			}
+		}
+		return prefix;
+	};
 }
 
 /** The peer's exact advertised `recordLocks` level, so a refusal can name it. 0 while unknown. */
@@ -331,17 +388,22 @@ export function createRecordLockTransport(
 	cacheFor: () => RecordLockGenerationState | undefined,
 	mapConfirmedAbsent: () => boolean = () => false
 ): ClusterLockTransport {
-	const statusViews = new Map<string, Float64Array>();
+	const statusViews = new Map<string, { status: Float64Array; peerDigest: () => bigint }>();
 	let statusViewsStore: any;
-	const statusFor = (auditStore: any, peer: string): Float64Array => {
+	const statusFor = (auditStore: any, peer: string) => {
 		if (statusViewsStore !== auditStore) {
 			statusViews.clear();
 			statusViewsStore = auditStore;
 		}
-		let status = statusViews.get(peer);
-		if (!status) statusViews.set(peer, (status = getReplicationSharedStatus(auditStore, database, peer)));
-		return status;
+		let views = statusViews.get(peer);
+		if (!views) {
+			const status = getReplicationSharedStatus(auditStore, database, peer);
+			statusViews.set(peer, (views = { status, peerDigest: peerHomesDigestReader(status, peer) }));
+		}
+		return views;
 	};
+	let ownDigestFor: RecordLockGenerationState | undefined;
+	let ownDigest: bigint | undefined;
 	// Read once, at transport construction, matching when core reads it (`LockCoordinator`'s
 	// constructor, once per coordinator build): a fresh node that has never incarnated before has
 	// provably granted nothing, so core's construction-anchored restart quarantine
@@ -379,10 +441,14 @@ export function createRecordLockTransport(
 			if (!(homeIncarnation > 0)) return undefined;
 			const self = deps.thisNodeName();
 			const auditStore = deps.auditStore(database);
+			if (active !== ownDigestFor) {
+				ownDigestFor = active;
+				ownDigest = homesDigestPrefix(active.digest);
+			}
 			for (const peer of active.homes) {
 				if (peer === self) continue;
-				if (!auditStore) return undefined;
-				const status = statusFor(auditStore, peer);
+				if (!auditStore || ownDigest === undefined) return undefined;
+				const { status, peerDigest } = statusFor(auditStore, peer);
 				// Digest agreement (the operator-stated topology matches) and wire-protocol capability
 				// (the peer can actually speak this level's delegation/recall/lockRelease shape) are
 				// independent: a coincidentally-matching digest from a peer at the wrong protocol level
@@ -391,7 +457,7 @@ export function createRecordLockTransport(
 				// unsafe to treat as agreeing as one that actively disagrees (§4.1: "a digest check is
 				// not a freshness check").
 				if (readPeerLockCapability(status) !== LOCK_CAPABILITY_SUPPORTED) return undefined;
-				if (readPeerHomesAgreement(status) !== HOMES_AGREEMENT_MATCH) return undefined;
+				if (peerDigest() !== ownDigest) return undefined;
 			}
 			return { generation: active.generation, homes: active.homes, homeIncarnation };
 		},
@@ -581,12 +647,11 @@ async function readIntoCache(database: string, freshBudget: boolean): Promise<Re
 		if (row?.inherited) homeMapSources.set(database, 'default');
 		else if (row?.active || row?.staged || (row?.highestActedOn ?? 0) > 0) homeMapSources.set(database, 'database');
 		else homeMapSources.delete(database);
-		// A peer digest recorded while the row was unreadable, or a handshake that found the cache empty (a
-		// database created at runtime), left peers without our current digest. The backoff resets only once
-		// this is done, so a failure here re-arms the whole cycle.
+		// A handshake while the row was unreadable, or one that found the cache empty (a database created at
+		// runtime), left peers without our current digest. The backoff resets only once this is done, so a
+		// failure here re-arms the whole cycle.
 		if (state.backoff.attempts > 0 || before?.digest !== row?.active?.digest) {
 			pushHomesDigestToPeers(database);
-			reconcileAllPeerHomesAgreement(database);
 			outcome = 'announced';
 		}
 		state.backoff.reset();
@@ -597,7 +662,6 @@ async function readIntoCache(database: string, freshBudget: boolean): Promise<Re
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
 		homeMapSources.delete(database);
-		reconcileAllPeerHomesAgreement(database);
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
 		state.timer = setTimeout(() => {
 			if (current())
@@ -652,7 +716,7 @@ async function applyHomesChanged(database: string): Promise<void> {
 				const inheritedBefore = homeMapSources.get(registered) === 'default';
 				const outcome = await refreshCache(registered, true);
 				if (outcome === 'unchanged' && (inheritedBefore || homeMapSources.get(registered) === 'default'))
-					announceHomesDigest(registered);
+					pushHomesDigestToPeers(registered);
 				if (outcome === 'failed') failed.push(registered);
 			})
 		);
@@ -663,12 +727,7 @@ async function applyHomesChanged(database: string): Promise<void> {
 		return;
 	}
 	const outcome = await refreshCache(database, true);
-	if (outcome === 'unchanged' || outcome === 'failed') announceHomesDigest(database);
-}
-
-function announceHomesDigest(database: string): void {
-	pushHomesDigestToPeers(database);
-	reconcileAllPeerHomesAgreement(database);
+	if (outcome === 'unchanged' || outcome === 'failed') pushHomesDigestToPeers(database);
 }
 
 /**
@@ -748,65 +807,83 @@ onRecordLockHomesChanged(async (database) => {
 	}
 });
 
-/** Re-announces this node's new digest on every live outbound connection for the database — an
- * already-connected peer otherwise never sees an activation (§6: the digest is sent at handshake
- * only, not pushed automatically). Best-effort: a peer this reaches later (reconnect, or its own
- * digest receipt) still converges via the ordinary handshake path. */
+const homesDigestAnnouncers = new Map<string, Set<() => void>>();
+
+/**
+ * Inbound sessions register too: the peer's thread holding its outbound socket to this node hears
+ * nothing else after the handshake.
+ */
+export function registerHomesDigestAnnouncer(database: string, announce: () => void): () => void {
+	let announcers = homesDigestAnnouncers.get(database);
+	if (!announcers) homesDigestAnnouncers.set(database, (announcers = new Set()));
+	announcers.add(announce);
+	return () => {
+		const current = homesDigestAnnouncers.get(database);
+		if (current?.delete(announce) && current.size === 0) homesDigestAnnouncers.delete(database);
+	};
+}
+
 function pushHomesDigestToPeers(database: string): void {
-	for (const connection of getRepairConnectionsForDB(database)) {
+	const announcers = homesDigestAnnouncers.get(database);
+	if (!announcers) return;
+	for (const announce of announcers) {
 		try {
-			connection.liveSession?.sendRecordLockHomesDigest?.();
+			announce();
 		} catch (error) {
-			logger.debug?.(`Could not re-announce the record lock home map digest to ${connection.nodeName}`, error);
+			logger.debug?.(`Could not re-announce the record lock home map digest for ${database}`, error);
 		}
 	}
 }
 
-// ---- peer home-map digest agreement: reconciled centrally, independent of which connection object
-// (inbound or outbound — the mesh keeps separate ones per direction, each with its own local state)
-// last received a peer's digest or last carried our own send. Keyed by database, not by connection,
-// which is what makes "our own digest changed" able to re-evaluate every peer it has ever heard from,
-// not just the one connection object that happens to fire next. --------------------------------------
+const HOMES_AGREED_MESSAGE = 'record-lock-homes-agreed';
 
-const lastPeerDigest = new Map<string, Map<string, string>>(); // database -> peer -> digest
-
-/** Called from `replicationConnection.ts` on receiving a peer's `RECORD_LOCK_HOMES_DIGEST` frame,
- * regardless of which connection (inbound or outbound) received it. */
-export function recordPeerHomesDigest(database: string, peer: string, digest: string): void {
-	let perDatabase = lastPeerDigest.get(database);
-	if (!perDatabase) lastPeerDigest.set(database, (perDatabase = new Map()));
-	perDatabase.set(peer, digest);
-	reconcilePeerHomesAgreement(database, peer);
-}
-
-function reconcilePeerHomesAgreement(database: string, peer: string): void {
-	const theirs = lastPeerDigest.get(database)?.get(peer);
-	if (theirs === undefined) return; // nothing heard from this peer yet; leave the buffer's UNKNOWN default
+/** A frame dropped here (malformed, or the database not open on this thread yet) waits for the next ping. */
+export function recordPeerHomesDigest(database: string, peer: string, digest: unknown): void {
+	const prefix = homesDigestPrefix(digest);
+	if (prefix === undefined) return;
 	const auditStore = auditStoreFor(database);
 	if (!auditStore) return;
-	const ours = currentHomesDigest(database);
-	const matches = ours !== undefined && ours === theirs;
-	recordPeerHomesAgreement(getReplicationSharedStatus(auditStore, database, peer), matches);
-	// Agreement arriving is what makes `homeMap()` answerable: run the restart round now rather than
-	// at its next backoff, which after a few mapless attempts can be most of a lock's timeout away.
-	if (matches && CLUSTER_RECORD_LOCKS_ENABLED && !RESTART_RECALL_OFF && ownedDatabases.has(database))
-		restartRecall.schedule(database);
+	if (publishPeerHomesDigest(getReplicationSharedStatus(auditStore, database, peer), prefix))
+		scheduleRestartRecallOnOwner(database);
 }
 
-/** Our own digest just changed (a fresh activation): every peer we have EVER heard a digest from for
- * this database needs its agreement re-derived against the new value — a peer's own digest frame
- * arriving before ours was ready is exactly the common case (they can activate before us), and
- * without this it would stay wrongly recorded as a mismatch forever, since nothing else re-checks it. */
-function reconcileAllPeerHomesAgreement(database: string): void {
-	const perDatabase = lastPeerDigest.get(database);
-	if (!perDatabase) return;
-	for (const peer of perDatabase.keys()) reconcilePeerHomesAgreement(database, peer);
+/**
+ * A changed peer digest may be what makes `homeMap()` answerable on the owner, judged against the owner's
+ * own cache; a generation change there schedules the round anyway. Run the restart round now rather than at its next backoff, which after a few mapless
+ * attempts can be most of a lock's timeout away.
+ */
+function scheduleRestartRecallOnOwner(database: string): void {
+	if (!CLUSTER_RECORD_LOCKS_ENABLED || RESTART_RECALL_OFF) return;
+	if (ownedDatabases.has(database)) {
+		if (ownHomeMap(database)) restartRecall.schedule(database);
+		return;
+	}
+	const owner = ownerThreadByDatabase.get(database);
+	if (owner === undefined) return;
+	try {
+		sendToThread(owner, { type: HOMES_AGREED_MESSAGE, database });
+	} catch (error) {
+		logger.debug?.(`Could not tell the record lock owner of ${database} that its home map agreed`, error);
+	}
 }
+
+onMessageByType(HOMES_AGREED_MESSAGE, (message) => {
+	if (typeof message?.database === 'string' && ownedDatabases.has(message.database))
+		scheduleRestartRecallOnOwner(message.database);
+});
 
 // ---- worker side: the databases this thread coordinates, and the registered transports ----------
 
 const ownedDatabases = new Set<string>();
 const transports = new Map<string, ClusterLockTransport>();
+
+function ownHomeMap(database: string): LockHomeMap | undefined {
+	try {
+		return transports.get(database)?.homeMap(database);
+	} catch {
+		return undefined;
+	}
+}
 const transportBuilders = new Map<string, () => ClusterLockTransport>();
 /**
  * The thread that coordinates each database, as this thread last learned it from main (harper-pro#852).
@@ -1040,13 +1117,7 @@ const restartRecall = createRestartRecall({
 	homeIncarnation: currentHomeIncarnation,
 	isFirstIncarnation,
 	ownsDatabase: ownsRecordLockCoordination,
-	homeMap(database) {
-		try {
-			return transports.get(database)?.homeMap(database);
-		} catch {
-			return undefined;
-		}
-	},
+	homeMap: ownHomeMap,
 	send: sendRecordLockOperation,
 	recallLocally: recallDelegationsFromHome,
 	delegateEpoch: delegateEpochOf,

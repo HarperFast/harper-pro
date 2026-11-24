@@ -5,11 +5,13 @@
  * close code and fire counters, and reads healthy before it has connected once.
  *
  * The reset covers the whole buffer, not just the truth slots, because every field in it — progress
- * watermarks, blob-failure counts, recovery-fire counts — describes the membership that just left.
+ * watermarks, blob-failure counts, recovery-fire counts — describes the membership that just left. The one
+ * exception is the record-lock digest change count, which must only increase.
  */
 
 import { expect } from 'chai';
 import { clearReplicationSharedStatus, REPLICATION_SHARED_STATUS_SLOTS } from '#src/replication/knownNodes';
+import { HOMES_DIGEST_CHANGE, RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION } from '#src/replication/sharedStatusSlots';
 import {
 	CONNECTION_STATE_POSITION,
 	LAST_LIVENESS_TIME_POSITION,
@@ -51,12 +53,19 @@ function seed(auditStore, database, nodeName) {
 }
 
 describe('clearReplicationSharedStatus', () => {
-	it('zeroes the whole buffer, so a same-process re-add starts from nothing', () => {
+	it('zeroes every slot but the digest change count, which moves on, so a same-process re-add starts from nothing', () => {
 		const auditStore = makeAuditStore();
-		seed(auditStore, 'data', 'peer').fill(7);
+		const status = seed(auditStore, 'data', 'peer');
+		status.fill(7);
+		const changes = () => new Int32Array(status.buffer)[RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION * 2];
+		const before = changes();
 
 		expect(clearReplicationSharedStatus(auditStore, 'data', 'peer')).to.equal(true);
-		expect(Array.from(statusFor(auditStore, 'data', 'peer')).every((slot) => slot === 0)).to.equal(true);
+		const after = Array.from(statusFor(auditStore, 'data', 'peer'));
+		expect(
+			after.every((slot, position) => slot === 0 || position === RECORD_LOCK_HOMES_DIGEST_CHANGES_POSITION)
+		).to.equal(true);
+		expect(changes()).to.equal(before + HOMES_DIGEST_CHANGE);
 	});
 
 	it('leaves the re-added membership reading not-connected with no inherited error or counters', () => {
