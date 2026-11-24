@@ -12,7 +12,7 @@
  * has no install, the file fails rather than skipping.
  */
 import { suite, test, before, after } from 'node:test';
-import { equal, ok } from 'node:assert/strict';
+import { deepEqual, equal, ok } from 'node:assert/strict';
 import { cp, mkdtemp, readdir, readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -47,6 +47,19 @@ const SHUTDOWN_GRACE_MS = 30_000;
 
 function readVersion(packageRoot) {
 	return JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')).version;
+}
+
+async function assertRunning(nodeCtx, harperBinPath, version) {
+	ok(
+		nodeCtx.harper.process.spawnargs.includes(harperBinPath),
+		`${nodeCtx.harper.hostname} should have been launched from ${harperBinPath}`
+	);
+	const info = await sendOperation(
+		nodeCtx.harper,
+		{ operation: 'registration_info' },
+		{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+	);
+	equal(info.version, version, `${nodeCtx.harper.hostname} should be running ${version}`);
 }
 
 function blobText(seed, bytes) {
@@ -119,19 +132,6 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 			const expected = { [ITEM]: new Map(), [TYPED]: new Map() };
 			const categories = new Set();
 			let batchCount = 0;
-
-			async function assertRunning(nodeCtx, harperBinPath, version) {
-				ok(
-					nodeCtx.harper.process.spawnargs.includes(harperBinPath),
-					`${nodeCtx.harper.hostname} should have been launched from ${harperBinPath}`
-				);
-				const info = await sendOperation(
-					nodeCtx.harper,
-					{ operation: 'registration_info' },
-					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
-				);
-				equal(info.version, version, `${nodeCtx.harper.hostname} should be running ${version}`);
-			}
 
 			// setupHarperWithFixture picks the hostname itself, but replication.securePort needs it first
 			async function startFresh(nodeCtx) {
@@ -492,20 +492,17 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 		}
 	);
 
-	// harper-pro#1449
+	// harper-pro#1449 and #1433
 	suite(
-		`a ${previousVersion} node rejoining by base copy drops a row deleted while it was away`,
-		{ timeout: 600_000 },
-		(ctx) => {
-			const nodes = [];
-			const [source, returning] = [0, 1].map(() => ({ name: ctx.name }));
-
+		`a populated ${previousVersion} node rejoining by base copy drops a row deleted while it was away`,
+		{ concurrency: false },
+		() => {
+			const caseOptions = { timeout: 600_000 };
 			async function startNode(nodeCtx, harperBinPath, env) {
 				if (!nodeCtx.harper) {
 					const hostname = await getNextAvailableLoopbackAddress();
 					const parentDir = process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir();
 					nodeCtx.harper = { hostname, dataRootDir: await mkdtemp(join(parentDir, 'harper-integration-test-')) };
-					nodes.push(nodeCtx);
 					await cp(FIXTURE_PATH, join(nodeCtx.harper.dataRootDir, 'components', basename(FIXTURE_PATH)), {
 						recursive: true,
 						dereference: true,
@@ -520,7 +517,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 					{ database: DATABASE, table: ITEM, ...operation },
 					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
 				);
-			const ids = async (nodeCtx, signal) =>
+			const ids = async (nodeCtx, signal, attribute = 'id', value = '*') =>
 				(
 					await sendOperation(
 						nodeCtx.harper,
@@ -528,8 +525,8 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 							operation: 'search_by_value',
 							database: DATABASE,
 							table: ITEM,
-							search_attribute: 'id',
-							search_value: '*',
+							search_attribute: attribute,
+							search_value: value,
 							get_attributes: ['id'],
 						},
 						{ signal }
@@ -543,11 +540,10 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				equal(outgoing.exitCode, 0, `${nodeCtx.harper.hostname} did not stop cleanly`);
 			}
 
-			after(async () => {
-				await stopAndTeardownNodes(nodes.map((nodeCtx) => nodeCtx.harper));
-			});
-
-			test('the copy removes the row', async () => {
+			async function rejoinByCopy(t, rejoinBin, rejoinVersion) {
+				const source = { name: t.name };
+				const returning = { name: t.name };
+				t.after(() => stopAndTeardownNodes([source.harper, returning.harper]));
 				await startNode(source, CURRENT_BIN);
 				await startNode(returning, previousBin);
 				await write(source, {
@@ -572,12 +568,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 					const held = await ids(returning, signal);
 					return ['kept', 'gone', 'live'].every((id) => held.includes(id));
 				}, 'the returning node to hold every row before it stops');
-				const info = await sendOperation(
-					returning.harper,
-					{ operation: 'registration_info' },
-					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
-				);
-				equal(info.version, previousVersion, `the returning node should be running ${previousVersion}`);
+				await assertRunning(returning, previousBin, previousVersion);
 
 				await stopCleanly(returning);
 				await write(source, { operation: 'delete', ids: ['gone'] });
@@ -587,22 +578,46 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				const mark = await logMark(source.harper);
 				// a returning node with a saved cursor is forced into the copy; one without asks for it
 				await startNode(source, CURRENT_BIN, { HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: DATABASE });
-				await startNode(returning, previousBin);
+				await startNode(returning, rejoinBin);
+				await assertRunning(returning, rejoinBin, rejoinVersion);
 
 				let held;
 				await until(
 					async (signal) => (held = await ids(returning, signal)).includes('zz-sentinel'),
 					() => `the sentinel on the returning node; last: ${JSON.stringify(held)}`
 				);
-				ok(
-					(await readLogSince(source.harper, mark)).includes(
-						`Replicating all tables to ${returning.harper.hostname} for database ${DATABASE}`
-					),
-					'premise: the source sent the returning node a base copy'
+				const sentDataCopy = (await readLogSince(source.harper, mark)).includes(
+					`Replicating all tables to ${returning.harper.hostname} for database ${DATABASE}`
 				);
-				ok(!held.includes('gone'), `the deleted row is still on the ${previousVersion} node: ${JSON.stringify(held)}`);
+				ok(
+					!held.includes('gone'),
+					`the deleted row is still on the ${rejoinVersion} node: ${JSON.stringify(held)}; source logged the data copy: ${sentDataCopy}`
+				);
+				ok(sentDataCopy, 'premise: the source sent the returning node a base copy for data');
 				ok(held.includes('kept'));
-			});
+				return { source, returning };
+			}
+
+			test('the copy removes the row on the previous release', caseOptions, (t) =>
+				rejoinByCopy(t, previousBin, previousVersion)
+			);
+
+			test(
+				'the forward upgrade removes the row and keeps it absent after a clean restart with no peer',
+				caseOptions,
+				async (t) => {
+					const { source, returning } = await rejoinByCopy(t, CURRENT_BIN, CURRENT_VERSION);
+					const indexedGone = () => ids(returning, AbortSignal.timeout(REQUEST_TIMEOUT_MS), 'category', 'gone');
+					deepEqual(await indexedGone(), [], 'the category index still returns the deleted row after the copy');
+					// Keep the source offline so another copy cannot repair the row before the cold read.
+					await stopCleanly(source);
+					await stopCleanly(returning);
+					await startNode(returning, CURRENT_BIN);
+					const held = await ids(returning, AbortSignal.timeout(REQUEST_TIMEOUT_MS));
+					deepEqual(held.sort(), ['kept', 'live', 'zz-sentinel']);
+					deepEqual(await indexedGone(), [], 'the category index still returns the deleted row after the restart');
+				}
+			);
 		}
 	);
 }
