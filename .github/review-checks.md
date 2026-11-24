@@ -12,7 +12,7 @@ resources/APIs and pull from Harper core internals.
   oxlint with `--deny-warnings`. Advice in layers that
   references ESLint doesn't apply.
 - **Documentation scope.** Harper docs at
-  https://docs.harperdb.io are authoritative for Harper
+  https://docs.harper.fast are authoritative for Harper
   mechanics. Pro-side docs should describe Pro-only
   surface, not re-explain core behavior.
 - **Storage.** Same substrate as Harper core — RocksDB

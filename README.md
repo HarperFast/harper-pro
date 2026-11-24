@@ -24,10 +24,10 @@ Harper is a Node.js unified development platform that fuses database, cache, app
 
 ## Getting Started
 
-1. [Install Harper Pro](https://docs.harperdb.io/docs/getting-started/installation)
-2. [Create Your First App](https://docs.harperdb.io/docs/getting-started/quickstart)
+1. [Install Harper Pro](https://docs.harper.fast/learn/getting-started/install-and-connect-harper)
+2. [Create Your First App](https://docs.harper.fast/learn)
 
-For full documentation, visit [docs.harperdb.io](https://docs.harperdb.io/).
+For full documentation, visit [docs.harper.fast](https://docs.harper.fast/).
 
 ## Open Source Core
 

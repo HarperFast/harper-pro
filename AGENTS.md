@@ -131,7 +131,7 @@ When a feature spans both, prefer landing as much as possible in `core/` and glu
 
 - **Linter**: `oxlint --deny-warnings`, same as core.
 - **Storage substrate**: same as core — RocksDB primary, LMDB available via `HARPER_STORAGE_ENGINE=lmdb`.
-- **Documentation scope**: https://docs.harperdb.io is authoritative for Harper mechanics. Pro docs describe Pro-only surface, not core behavior.
+- **Documentation scope**: https://docs.harper.fast is authoritative for Harper mechanics. Pro docs describe Pro-only surface, not core behavior.
 - **Submodule pointer**: when changing core, commit there first, then bump the submodule pointer in Pro in a separate commit. Don't combine core changes with submodule bumps — they need to be reviewable separately.
 - **Patch releases**: a PR's milestone selects its earliest stable release line and newer minor lines of the same major; the **`patch`** label does not select backports. See `CONTRIBUTING.md` for the patch-release workflow.
 
