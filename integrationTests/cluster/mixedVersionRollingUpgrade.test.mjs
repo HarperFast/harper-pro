@@ -27,6 +27,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = CURRENT_BIN;
 const CURRENT_VERSION = readVersion(PACKAGE_ROOT);
 const FIXTURE_PATH = join(import.meta.dirname, 'fixture-mixed-version');
 const PREVIOUS_INSTALLS = (process.env.HARPER_PRO_PREVIOUS_VERSION_PATHS ?? '').split(delimiter).filter(Boolean);
+const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
 
 const DATABASE = 'data';
 const ITEM = 'MixedVersionItem';
@@ -495,7 +496,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 	// harper-pro#1449 and #1433
 	suite(
 		`a populated ${previousVersion} node rejoining by base copy drops a row deleted while it was away`,
-		{ concurrency: false },
+		{ concurrency: false, skip: isLMDB && 'an LMDB copy source does not flag deletes (harper-pro#1333)' },
 		() => {
 			const caseOptions = { timeout: 600_000 };
 			async function startNode(nodeCtx, harperBinPath, env) {
