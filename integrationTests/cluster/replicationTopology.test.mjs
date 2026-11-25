@@ -201,9 +201,10 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 			{ operation: 'search_by_id', table: 'test', get_attributes: ['id', 'name'], ids: ['1'] },
 			options
 		);
-	// A leaf's `replicatedConfirmation: 1` is satisfied by the hub alone, so a sibling leaf applies the
+	// A leaf's `replicatedConfirmation: 1` is satisfied by the hub alone, so the other leaves apply the
 	// relayed write at no bounded time after the write returns.
 	const RELAY_BUDGET_MS = 10_000;
+	const siblingLeaves = (writer) => ctx.nodes.map((_, i) => i).filter((i) => i !== 0 && i !== writer);
 	const waitForRelayedRecordOne = async (i, holds, expectation, deadline) => {
 		let lastRead;
 		await waitForCondition(
@@ -212,7 +213,7 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 				return holds(lastRead);
 			},
 			{
-				timeoutMs: Math.max(1, deadline - Date.now()),
+				timeoutMs: Math.max(1, Math.round(deadline - performance.now())),
 				pollMs: 100,
 				description: () =>
 					`node ${i} ${ctx.nodes[i].hostname} to ${expectation} (last read: ${JSON.stringify(lastRead)})`,
@@ -227,19 +228,23 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 			records: [{ id: '1', name: 'test2' }],
 			replicatedConfirmation: 1,
 		});
+		const relayDeadline = performance.now() + RELAY_BUDGET_MS;
 		for (const i of [1, 0]) {
 			const response = await readRecordOne(i);
 			equal(response.length, 1);
 			equal(response[0].name, 'test2', `node ${i} did not hold the update when it returned`);
 		}
-		const relayDeadline = Date.now() + RELAY_BUDGET_MS;
-		for (let i = 2; i < NODE_COUNT; i++) {
-			const response = await waitForRelayedRecordOne(
-				i,
-				(rows) => rows.length === 1 && rows[0].name === 'test2',
-				'hold the relayed update',
-				relayDeadline
-			);
+		const relayed = await Promise.all(
+			siblingLeaves(1).map((i) =>
+				waitForRelayedRecordOne(
+					i,
+					(rows) => rows.length === 1 && rows[0].name === 'test2',
+					'hold the relayed update',
+					relayDeadline
+				)
+			)
+		);
+		for (const response of relayed) {
 			equal(response.length, 1);
 			equal(response[0].name, 'test2');
 		}
@@ -251,15 +256,15 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 			ids: ['1'],
 			replicatedConfirmation: 1,
 		});
-		let response = await readRecordOne(0);
+		const relayDeadline = performance.now() + RELAY_BUDGET_MS;
+		const response = await readRecordOne(0);
 		equal(response.length, 0);
-		response = await waitForRelayedRecordOne(
-			1,
-			(rows) => rows.length === 0,
-			'drop the relayed delete',
-			Date.now() + RELAY_BUDGET_MS
+		const relayed = await Promise.all(
+			siblingLeaves(2).map((i) =>
+				waitForRelayedRecordOne(i, (rows) => rows.length === 0, 'drop the relayed delete', relayDeadline)
+			)
 		);
-		equal(response.length, 0);
+		for (const rows of relayed) equal(rows.length, 0);
 	});
 	test('take down the central node, do writes and verify catchup afterwards', async () => {
 		await killHarper({ harper: ctx.nodes[0] });
