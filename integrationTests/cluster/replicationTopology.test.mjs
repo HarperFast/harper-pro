@@ -195,6 +195,31 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 		equal(response.length, 1);
 		equal(response[0].name, 'test');
 	});
+	const readRecordOne = (i, options) =>
+		sendOperation(
+			ctx.nodes[i],
+			{ operation: 'search_by_id', table: 'test', get_attributes: ['id', 'name'], ids: ['1'] },
+			options
+		);
+	// A leaf's `replicatedConfirmation: 1` is satisfied by the hub alone, so a sibling leaf applies the
+	// relayed write at no bounded time after the write returns.
+	const RELAY_BUDGET_MS = 10_000;
+	const waitForRelayedRecordOne = async (i, holds, expectation, deadline) => {
+		let lastRead;
+		await waitForCondition(
+			async (signal) => {
+				lastRead = await readRecordOne(i, { signal });
+				return holds(lastRead);
+			},
+			{
+				timeoutMs: Math.max(1, deadline - Date.now()),
+				pollMs: 100,
+				description: () =>
+					`node ${i} ${ctx.nodes[i].hostname} to ${expectation} (last read: ${JSON.stringify(lastRead)})`,
+			}
+		);
+		return lastRead;
+	};
 	test('replicate update from node 2', async () => {
 		await sendOperation(ctx.nodes[1], {
 			operation: 'update',
@@ -202,15 +227,19 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 			records: [{ id: '1', name: 'test2' }],
 			replicatedConfirmation: 1,
 		});
-		// we don't really have anyway of know when the message transitively replicated to the next node, so just wait
-		await delay(200);
-		for (let i = 0; i < NODE_COUNT; i++) {
-			let response = await sendOperation(ctx.nodes[i], {
-				operation: 'search_by_id',
-				table: 'test',
-				get_attributes: ['id', 'name'],
-				ids: ['1'],
-			});
+		for (const i of [1, 0]) {
+			const response = await readRecordOne(i);
+			equal(response.length, 1);
+			equal(response[0].name, 'test2', `node ${i} did not hold the update when it returned`);
+		}
+		const relayDeadline = Date.now() + RELAY_BUDGET_MS;
+		for (let i = 2; i < NODE_COUNT; i++) {
+			const response = await waitForRelayedRecordOne(
+				i,
+				(rows) => rows.length === 1 && rows[0].name === 'test2',
+				'hold the relayed update',
+				relayDeadline
+			);
 			equal(response.length, 1);
 			equal(response[0].name, 'test2');
 		}
@@ -222,21 +251,14 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 			ids: ['1'],
 			replicatedConfirmation: 1,
 		});
-		let response = await sendOperation(ctx.nodes[0], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
+		let response = await readRecordOne(0);
 		equal(response.length, 0);
-		// we don't really have anyway of know when the message transitively replicated to the next node, so just wait
-		await delay(200);
-		response = await sendOperation(ctx.nodes[1], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
+		response = await waitForRelayedRecordOne(
+			1,
+			(rows) => rows.length === 0,
+			'drop the relayed delete',
+			Date.now() + RELAY_BUDGET_MS
+		);
 		equal(response.length, 0);
 	});
 	test('take down the central node, do writes and verify catchup afterwards', async () => {
