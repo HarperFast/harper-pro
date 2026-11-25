@@ -205,6 +205,13 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 	// relayed write at no bounded time after the write returns.
 	const RELAY_BUDGET_MS = 10_000;
 	const siblingLeaves = (writer) => ctx.nodes.map((_, i) => i).filter((i) => i !== 0 && i !== writer);
+	const remainingRelayBudget = (deadline, i) => {
+		const remaining = Math.round(deadline - performance.now());
+		if (remaining <= 0) throw new Error(`relay budget of ${RELAY_BUDGET_MS}ms ran out before node ${i} was read`);
+		return remaining;
+	};
+	const readRecordOneWithin = (i, deadline) =>
+		readRecordOne(i, { signal: AbortSignal.timeout(remainingRelayBudget(deadline, i)) });
 	const waitForRelayedRecordOne = async (i, holds, expectation, deadline) => {
 		let lastRead;
 		await waitForCondition(
@@ -213,7 +220,7 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 				return holds(lastRead);
 			},
 			{
-				timeoutMs: Math.max(1, Math.round(deadline - performance.now())),
+				timeoutMs: remainingRelayBudget(deadline, i),
 				pollMs: 100,
 				description: () =>
 					`node ${i} ${ctx.nodes[i].hostname} to ${expectation} (last read: ${JSON.stringify(lastRead)})`,
@@ -230,7 +237,7 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 		});
 		const relayDeadline = performance.now() + RELAY_BUDGET_MS;
 		for (const i of [1, 0]) {
-			const response = await readRecordOne(i);
+			const response = await readRecordOneWithin(i, relayDeadline);
 			equal(response.length, 1);
 			equal(response[0].name, 'test2', `node ${i} did not hold the update when it returned`);
 		}
@@ -257,8 +264,10 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 			replicatedConfirmation: 1,
 		});
 		const relayDeadline = performance.now() + RELAY_BUDGET_MS;
-		const response = await readRecordOne(0);
-		equal(response.length, 0);
+		for (const i of [2, 0]) {
+			const response = await readRecordOneWithin(i, relayDeadline);
+			equal(response.length, 0, `node ${i} still held the record when the delete returned`);
+		}
 		const relayed = await Promise.all(
 			siblingLeaves(2).map((i) =>
 				waitForRelayedRecordOne(i, (rows) => rows.length === 0, 'drop the relayed delete', relayDeadline)
