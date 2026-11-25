@@ -29,9 +29,9 @@ export class LoggedMessages extends Resource {
 		const Message = databases.data.Message;
 		const counts = {};
 		Message.auditStore.loadLogs();
-		// getRange would create a log it does not find
-		if (!Message.auditStore.logByName.has(data.peer)) return counts;
-		for (const entry of Message.auditStore.getRange({ start: 1, log: data.peer })) {
+		// getRange would create a peer log it does not find
+		if (!data.own && !Message.auditStore.logByName.has(data.peer)) return counts;
+		for (const entry of Message.auditStore.getRange({ start: 1, log: data.own ? 'local' : data.peer })) {
 			if (entry.type !== 'message' || entry.tableId !== Message.tableId || entry.recordId !== data.topic) continue;
 			counts[entry.version] = (counts[entry.version] ?? 0) + 1;
 		}

@@ -1,7 +1,7 @@
 /**
  * A checkpoint-grade route resumes below the origin's certified floor (replication/DESIGN.md note 33), so the origin
  * re-sends messages the receiver already applied. A clean-session subscriber on a restarted B can miss what B
- * applied before it resubscribed, so B's own log is the oracle that holds in every case.
+ * applied before it resubscribed, so B's log of A, against A's own log, is the oracle that holds in every case.
  */
 import { suite, test, before, after } from 'node:test';
 import { deepEqual, ok } from 'node:assert/strict';
@@ -12,6 +12,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import mqtt from 'mqtt';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import {
+	replicationPoolActive,
 	restartHttpWorkers,
 	restartNode,
 	sendOperation,
@@ -123,6 +124,11 @@ async function clusterConnected(nodes, signal) {
 	);
 }
 
+async function replicationThreadIds(node) {
+	const { threads } = await sendOperation(node, { operation: 'system_information', attributes: ['threads'] });
+	return threads.filter((thread) => thread.name === 'replication').map((thread) => thread.threadId);
+}
+
 async function deliversOnce(ctx, topic, interrupt) {
 	const { A, B } = ctx;
 	const publisher = startPublisher(A, topic);
@@ -163,9 +169,17 @@ async function deliversOnce(ctx, topic, interrupt) {
 		deepEqual(duplicates(onA), [], 'message numbers the subscriber on A received more than once');
 		deepEqual(missingFrom(onB, backUpN, publisher.n), [], `numbers from ${backUpN} B never delivered`);
 		const logged = await postToFixture(B, 'LoggedMessages', { peer: A.hostname, topic });
+		const published = await postToFixture(A, 'LoggedMessages', { own: true, topic });
+		const byVersion = (versions) => Object.keys(versions).sort((a, b) => a - b);
 		ok(
-			Object.keys(logged).length >= publisher.n - backUpN,
-			`B logged ${Object.keys(logged).length} of A's messages, fewer than the ${publisher.n - backUpN} sent after it was back`
+			Object.keys(published).length >= publisher.n - backUpN,
+			`A logged ${Object.keys(published).length} of its messages, fewer than the ${publisher.n - backUpN} sent after B was back`
+		);
+		deepEqual(byVersion(logged), byVersion(published), "the message versions B logged from A, against A's own log");
+		deepEqual(
+			Object.entries(published).filter(([, count]) => count > 1),
+			[],
+			'message versions A logged more than once'
 		);
 		deepEqual(
 			Object.entries(logged).filter(([, count]) => count > 1),
@@ -245,7 +259,16 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 	test("the receiving node's HTTP workers restart", () =>
 		deliversOnce(ctx, 'worker-restart', async (onB) => {
 			const since = Date.now();
+			const poolBefore = await replicationThreadIds(ctx.B);
+			if (replicationPoolActive()) ok(poolBefore.length > 0, "B's replication pool workers, found by thread name");
 			await restartHttpWorkers(ctx.B);
+			const poolAfter = await replicationThreadIds(ctx.B);
+			deepEqual(poolAfter.length, poolBefore.length, "B's replication pool workers once the restart completed");
+			deepEqual(
+				poolAfter.filter((id) => poolBefore.includes(id)),
+				[],
+				"B's replication pool workers the http_workers restart left running, so B's link to A never resumed"
+			);
 			return nextNAfter(onB.subscriptions, since, 'the subscriber on B to resubscribe');
 		}));
 
