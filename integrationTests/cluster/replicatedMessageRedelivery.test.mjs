@@ -12,7 +12,6 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import mqtt from 'mqtt';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import {
-	replicationPoolActive,
 	restartHttpWorkers,
 	restartNode,
 	sendOperation,
@@ -251,18 +250,13 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 		ok(certifiedFrom > 0, 'B resumed from A floor-only');
 	});
 
-	test(
-		"the receiving node's HTTP workers restart",
-		{
-			skip: replicationPoolActive() && 'replication runs on the pool, which an http_workers restart leaves running',
-		},
-		() =>
-			deliversOnce(ctx, 'worker-restart', async (onB) => {
-				const since = Date.now();
-				await restartHttpWorkers(ctx.B);
-				return nextNAfter(onB.subscriptions, since, 'the subscriber on B to resubscribe');
-			})
-	);
+	// an operator's http_workers restart replaces the replication pool's workers too
+	test("the receiving node's HTTP workers restart", () =>
+		deliversOnce(ctx, 'worker-restart', async (onB) => {
+			const since = Date.now();
+			await restartHttpWorkers(ctx.B);
+			return nextNAfter(onB.subscriptions, since, 'the subscriber on B to resubscribe');
+		}));
 
 	test('the receiving node restarts', () =>
 		deliversOnce(ctx, 'node-restart', async (onB) => {
