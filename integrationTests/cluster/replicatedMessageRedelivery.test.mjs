@@ -123,6 +123,11 @@ async function clusterConnected(nodes, signal) {
 	);
 }
 
+async function replicationThreadIds(node) {
+	const { threads } = await sendOperation(node, { operation: 'system_information', attributes: ['threads'] });
+	return threads.filter((thread) => thread.name === 'replication').map((thread) => thread.threadId);
+}
+
 async function deliversOnce(ctx, topic, interrupt) {
 	const { A, B } = ctx;
 	const publisher = startPublisher(A, topic);
@@ -250,11 +255,17 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 		ok(certifiedFrom > 0, 'B resumed from A floor-only');
 	});
 
-	// an operator's http_workers restart replaces the replication pool's workers too
 	test("the receiving node's HTTP workers restart", () =>
 		deliversOnce(ctx, 'worker-restart', async (onB) => {
 			const since = Date.now();
+			const poolBefore = await replicationThreadIds(ctx.B);
 			await restartHttpWorkers(ctx.B);
+			const poolAfter = await replicationThreadIds(ctx.B);
+			deepEqual(
+				poolAfter.filter((id) => poolBefore.includes(id)),
+				[],
+				"B's replication pool workers the http_workers restart left running, so B's link to A never resumed"
+			);
 			return nextNAfter(onB.subscriptions, since, 'the subscriber on B to resubscribe');
 		}));
 
