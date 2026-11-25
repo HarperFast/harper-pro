@@ -12,6 +12,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import mqtt from 'mqtt';
 import { startHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import {
+	replicationPoolActive,
 	restartHttpWorkers,
 	restartNode,
 	sendOperation,
@@ -259,8 +260,10 @@ suite('Replicated MQTT messages reach live subscribers once across resumes', { t
 		deliversOnce(ctx, 'worker-restart', async (onB) => {
 			const since = Date.now();
 			const poolBefore = await replicationThreadIds(ctx.B);
+			if (replicationPoolActive()) ok(poolBefore.length > 0, "B's replication pool workers, found by thread name");
 			await restartHttpWorkers(ctx.B);
 			const poolAfter = await replicationThreadIds(ctx.B);
+			deepEqual(poolAfter.length, poolBefore.length, "B's replication pool workers once the restart completed");
 			deepEqual(
 				poolAfter.filter((id) => poolBefore.includes(id)),
 				[],
