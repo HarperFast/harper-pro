@@ -9,6 +9,7 @@ import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
 import { replicateOperation, sendOperationToNode } from '#src/replication/replicator';
 import { server } from '#src/core/server/Server';
+import { ServerError } from '#src/core/utility/errors/hdbError';
 
 const require = createRequire(import.meta.url);
 const replicationConnection = require('#src/replication/replicationConnection');
@@ -236,15 +237,20 @@ describe('replicateOperation', function () {
 		expect(replicated[0]).to.not.have.property('statusCode');
 	});
 
-	// The session rejects an error answer with the peer's status (`operationAnswerError`).
-	const peerAnswer = (text, statusCode) => Object.assign(new Error(text), { statusCode });
+	it('reports no status for a local failure that carries one', async () => {
+		replicationConnection.createWebSocket.rejects(new ServerError('Certificates are not available yet', 503));
+		const { replicated } = await replicateOperation({ operation: 'set_configuration', logging_level: 'warn' });
+		expect(replicated[0]).to.include({ status: 'failed', node: 'peer-a' });
+		expect(replicated[0]).to.not.have.property('statusCode');
+	});
 
-	for (const [label, statusCode] of [
-		['a permission refusal', 403],
-		['a validation refusal', 400],
+	for (const [label, answer, statusCode] of [
+		['a permission refusal', { error: 'ClientError: refused by the peer', statusCode: 403 }, 403],
+		['a validation refusal', { error: 'ClientError: refused by the peer', statusCode: 400 }, 400],
+		['a refusal from a peer that sends no status', { error: 'ClientError: refused by the peer' }, 400],
 	]) {
-		it(`reports the status of ${label} the peer answered with`, async () => {
-			session.sendOperation.rejects(peerAnswer('ClientError: refused by the peer', statusCode));
+		it(`reports the status of ${label}`, async () => {
+			session.sendOperation.rejects(replicationConnection.operationAnswerError(answer));
 			const response = replicateOperation({ operation: 'set_configuration', logging_level: 'warn' });
 			await openAll();
 			const { replicated } = await response;
@@ -257,10 +263,10 @@ describe('replicateOperation', function () {
 		});
 	}
 
-	it('reports only an integer error status', async () => {
+	it("reports only an integer error status from the peer's answer", async () => {
 		for (const statusCode of [200, 399, 600, 409.5, '409', Number.NaN, null]) {
 			sockets.length = 0;
-			session.sendOperation.rejects(peerAnswer('odd', statusCode));
+			session.sendOperation.rejects(replicationConnection.operationAnswerError({ error: 'Error: odd', statusCode }));
 			const response = replicateOperation({ operation: 'set_configuration', logging_level: 'warn' });
 			await openAll();
 			const { replicated } = await response;

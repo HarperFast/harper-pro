@@ -31,7 +31,7 @@ import { IterableEventQueue } from '../core/resources/IterableEventQueue.ts';
 import {
 	NodeReplicationConnection,
 	createWebSocket,
-	isErrorStatus,
+	peerAnswerStatus,
 	replicateOverWS,
 	createPendingDatabaseSubscription,
 	databaseSubscriptions,
@@ -1063,8 +1063,8 @@ export async function replicateOperation(req, options?: { onPeerResult?: (result
 						reason: reason?.toString?.() ?? String(reason),
 						node: node.name,
 					};
-					// Only a peer's error answer carries a status; a peer that was not reached or did not answer has none.
-					if (isErrorStatus(reason?.statusCode)) failed.statusCode = reason.statusCode;
+					const statusCode = peerAnswerStatus(reason);
+					if (statusCode !== undefined) failed.statusCode = statusCode;
 					return failed;
 				})
 				.then((result) => {
