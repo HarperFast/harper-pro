@@ -3410,6 +3410,38 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.equal(recordedFull(), false, 'only the next socket’s request records the wider coverage');
 			}));
 
+	it('a scope record that could not be written leaves the connection’s coverage as last recorded', () =>
+		atCheckpointLevel(async () => {
+			const peer = 'slot-control-peer';
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+			connection.exclusionOrigins = [];
+			const { Records, socket } = await connect(
+				false,
+				'scope_write_refused',
+				true,
+				checkpointCapabilities(),
+				undefined,
+				connection
+			);
+			const scopeKey = [Symbol.for('routeScope'), getIdOfRemoteNode(peer, Records.auditStore)];
+			await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			assert.equal(connection.routeFullCoverage, false);
+			assert.ok(Records.dbisDB.tryLock(scopeKey), 'another writer holds the record');
+			try {
+				connection.exclusionOrigins = [peer];
+				connection.emit('subscriptions-updated');
+				await until(() => socket.closes.length);
+			} finally {
+				Records.dbisDB.unlock(scopeKey);
+			}
+			assert.equal(socket.closes[0].code, 1011);
+			assert.equal(socket.sent.filter((frame) => frame[0] === 129).length, 1);
+			// the next socket's request reads this as the coverage before it, which decides whether it copies
+			assert.equal(connection.routeFullCoverage, false);
+		}));
+
 	for (const [route, level2, shardedFailover] of [
 		['a level-2 route that never narrowed', true, false],
 		['a level-1 route', false, false],
@@ -3428,16 +3460,17 @@ describe('Declarative tables keep control and event traffic independent of place
 				connection.exclusionOrigins = neverNarrowed ? [peer] : [];
 				let reconnects = 0;
 				connection.forceReconnect = () => reconnects++;
-				if (shardedFailover) env.setProperty('replication_failover', true);
 				try {
+					if (shardedFailover) {
+						env.setProperty('replication_failover', true);
+						await Nodes.primaryStore.put(peer, { name: peer, shard: 0, replicates: true });
+					}
 					const { Records, socket } = await connect(
 						false,
 						`live_widened_kept_${level2}_${shardedFailover}`,
 						!shardedFailover,
 						level2 ? checkpointCapabilities() : undefined,
-						async () => {
-							if (shardedFailover) await Nodes.primaryStore.put(peer, { name: peer, shard: 0, replicates: true });
-						},
+						undefined,
 						connection,
 						undefined,
 						false,
@@ -3455,6 +3488,12 @@ describe('Declarative tables keep control and event traffic independent of place
 					}
 					assert.equal(reconnects, 0);
 					assert.deepEqual(socket.closes, []);
+					if (shardedFailover) {
+						// the same admitted route reconnects once the set no longer follows its connection
+						env.setProperty('replication_failover', false);
+						connection.emit('exclusion-origins-updated', [peer]);
+						assert.equal(reconnects, 1);
+					}
 				} finally {
 					env.setProperty('replication_failover', priorFailover);
 					if (shardedFailover) {

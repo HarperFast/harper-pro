@@ -14271,7 +14271,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (nodeId !== undefined && connectedNode === node && options.connection && supportsCheckpointFloors()) {
 					const fullCoverage = !restrictedOrigins && (options.connection.exclusionOrigins ?? []).includes(node.name);
 					const previous = options.connection.routeFullCoverage;
-					options.connection.routeFullCoverage = fullCoverage;
 					const ownState = allNodes.find((state) => state.id === nodeId);
 					const current = routeScope(fullCoverage, replicateByDefault, tableSubs);
 					let recorded: RouteScope;
@@ -14289,6 +14288,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						routeScopeFailure = error;
 						return undefined;
 					}
+					// after the record, so the next socket still reads what the last recorded request covered
+					options.connection.routeFullCoverage = fullCoverage;
 					if (certifiesCheckpointFloors()) {
 						// a copy is attributable only to its socket's one request: COPY_START names none
 						if (socketRouteScope && (!sameScope(socketRouteScope, current) || socketScopeRev !== recordedRev))
