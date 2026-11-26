@@ -229,7 +229,12 @@ import { WebSocket } from 'ws';
 import { threadId, workerData } from 'node:worker_threads';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 const { forComponent, errorToString } = harperLogger;
-import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptionManager.ts';
+import {
+	disconnectedFromNode,
+	connectedToNode,
+	ensureNode,
+	exclusionFollowsConnection,
+} from './subscriptionManager.ts';
 import { materializeOperationResponse } from './materializeOperationResponse.ts';
 import { deferSubscribeUntilSessionForTest, subscribeDeferralAllowedForTest } from './subscribeDeferralForTest.ts';
 import {
@@ -14017,6 +14022,25 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (restrictedOrigins) return;
 					recordLiveCoverage(origins, failedOpen === true);
 					if (wsClosed) return;
+					// Only a request records and asks for full coverage, and a socket carries one request scope. Where a
+					// disconnect itself removes the route node from the set, a reconnect could not keep it full.
+					const routeNode = options.connection.nodeSubscriptions?.[0]?.name;
+					if (
+						socketRouteScope?.full === false &&
+						routeNode &&
+						origins?.includes(routeNode) &&
+						!exclusionFollowsConnection(databaseName)
+					) {
+						logger.info?.(
+							connectionId,
+							'Route coverage for',
+							databaseName,
+							'widened to full on an open connection; reconnecting so a new request asks for it'
+						);
+						wsClosed = true;
+						options.connection.forceReconnect();
+						return;
+					}
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
 							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)

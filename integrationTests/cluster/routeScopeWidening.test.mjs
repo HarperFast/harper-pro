@@ -14,6 +14,12 @@
  * 2. #1212. `Flipped` starts `replicate: false` on every node and A writes rows into it. The component is redeployed
  *    with `replicate: true` on A, then B, then C, each followed by a restart. A table entering scope changes no route's
  *    coverage, so only the route's table scope says it widened: B and then C must copy A's Flipped rows.
+ * 3. A live narrowing and widening. `update_node` makes B's row advertise that it sends `data` without `Skipped`, then
+ *    all of it again, while C's socket to B stays open. An exclusion update builds no request, so C must reconnect to
+ *    record the route full and certify it again.
+ * 4. The same widening with rows missed. The narrowed rows are in place when B restarts, so C's next socket opens
+ *    narrowed and B's sender leaves `Skipped` out of it. A writes Skipped rows. The live widening must bring them and
+ *    later Skipped rows to C: only a new request makes B's sender read its exclusions again.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert/strict';
@@ -68,6 +74,38 @@ const narrowedRoute = (peer) => ({
 		receivesFrom: [{ database: 'system' }, { database: 'data', excludeTables: ['Skipped'] }],
 	},
 });
+
+const routeEntries = (excludeTables) => [
+	{ database: 'system' },
+	{ database: 'data', ...(excludeTables && { excludeTables }) },
+];
+/** Rewrites `peer`'s row from `node`: what `peer` sends and receives. `peer` writes the mirror image as `node`'s row. */
+const updateRoute = (node, peer, sendsTo, receivesFrom) =>
+	sendOperation(node, {
+		operation: 'update_node',
+		hostname: peer.hostname,
+		rejectUnauthorized: false,
+		authorization: peer.admin,
+		sendsTo,
+		receivesFrom,
+	});
+const RECONNECTED_TO_WIDEN = 'Route coverage for data widened to full on an open connection';
+
+async function waitForRoute(node, peer, description, matches) {
+	let state;
+	await waitForCondition(
+		async () =>
+			matches(
+				(state = await routeState(node, peer)),
+				state.nodes.find((entry) => entry.id === state.peerId)
+			),
+		{
+			timeoutMs: CONVERGE_TIMEOUT_MS,
+			description: `${node.hostname}'s route to ${peer.hostname} to ${description}`,
+		}
+	);
+	return state;
+}
 
 const upsert = (node, table, ids) =>
 	sendOperation(node, { operation: 'upsert', database: 'data', table, records: ids.map((id) => ({ id })) });
@@ -237,6 +275,67 @@ suite(
 				(await logSince(C, mark)).includes(`Route table scope widened for ${B.hostname} on database data`),
 				'C requested the copy because the table scope widened'
 			);
+		});
+
+		test('a route narrowed and widened while its socket stays open certifies again', async () => {
+			const { A, B, C } = ctx;
+			await waitForRoute(
+				C,
+				B,
+				'be recorded full',
+				(state, direct) => state.scope?.full === true && direct?.fullCoverage === true
+			);
+			await updateRoute(C, B, routeEntries(['Skipped']), routeEntries());
+			await waitForRoute(
+				C,
+				B,
+				'be recorded narrowed',
+				(state, direct) => state.scope?.full === false && direct?.fullCoverage === false
+			);
+
+			const mark = await logMark(C);
+			await updateRoute(C, B, routeEntries(), routeEntries());
+			await waitForRoute(
+				C,
+				B,
+				'be recorded full again',
+				(state, direct) => state.scope?.full === true && direct?.fullCoverage === true && direct.partialHistory !== true
+			);
+			ok((await logSince(C, mark)).includes(RECONNECTED_TO_WIDEN), 'C reconnected to ask for the wider coverage');
+			await upsert(A, 'Progress', ['after-live-widening']);
+			await waitForRows(C, 'Progress', ['after-live-widening']);
+			// only a socket's first request certifies its start, and the one that widened asked for a copy
+			await stopNodeProcess(B);
+			await startNode(B);
+			await waitForRoute(C, B, 'resume from a certified floor', (state, direct) => direct?.certifiedFrom > 0);
+		});
+
+		test('rows a narrowed route left out arrive when it widens on an open socket', async () => {
+			const { A, B, C } = ctx;
+			// both directions, so B's row for C also names the exclusion B's sender reads
+			await updateRoute(C, B, routeEntries(['Skipped']), routeEntries(['Skipped']));
+			await waitForRoute(C, B, 'be recorded narrowed', (state) => state.scope?.full === false);
+			// C keeps the subscription it had, so only B's sender leaves Skipped out of the socket C opens next
+			await stopNodeProcess(B);
+			await startNode(B);
+			await upsert(A, 'Progress', ['after-b-restart']);
+			await waitForRows(C, 'Progress', ['after-b-restart']);
+
+			const missed = Array.from({ length: 20 }, (_, index) => `missed-${index}`);
+			await upsert(A, 'Skipped', missed);
+			await waitForRows(B, 'Skipped', missed);
+			await upsert(A, 'Progress', ['after-missed']);
+			await waitForRows(C, 'Progress', ['after-missed']);
+			ok(!(await holds(C, 'Skipped', [missed[0]])), 'premise: the narrowed route did not deliver Skipped rows');
+
+			const mark = await logMark(C);
+			await updateRoute(C, B, routeEntries(), routeEntries());
+			await waitForRows(C, 'Skipped', missed);
+			const later = Array.from({ length: 5 }, (_, index) => `after-widening-${index}`);
+			await upsert(A, 'Skipped', later);
+			await waitForRows(C, 'Skipped', later);
+			ok((await logSince(C, mark)).includes(RECONNECTED_TO_WIDEN), 'C reconnected to ask for the wider coverage');
+			await waitForRoute(C, B, 'be recorded full again', (state) => state.scope?.full === true);
 		});
 	}
 );

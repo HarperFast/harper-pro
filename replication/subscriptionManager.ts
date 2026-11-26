@@ -982,6 +982,11 @@ export function getConfiguredRoutes(): Route[] {
 	return routes;
 }
 
+/** Whether an origin leaves `databaseName`'s exclusion set while its own connection is down, so a reconnect narrows it. */
+export function exclusionFollowsConnection(databaseName: string): boolean {
+	return !!shardingLayout(databaseName) && !!env.get(CONFIG_PARAMS.REPLICATION_FAILOVER);
+}
+
 /**
  * The origins whose logs a relay peer may be told to omit for `databaseName`: this node receives them
  * directly, with full table coverage, so relayed copies are pure duplicates. Owned HERE because only the
@@ -1004,7 +1009,7 @@ export function getConfiguredRoutes(): Route[] {
 export function computeExclusionOrigins(databaseName: string): string[] {
 	const thisNodeName = getThisNodeName();
 	const origins: string[] = [];
-	const shardedFailover = shardingLayout(databaseName) && env.get(CONFIG_PARAMS.REPLICATION_FAILOVER);
+	const shardedFailover = exclusionFollowsConnection(databaseName);
 	if (!thisNodeName) return origins;
 	for (const node of getHDBNodeTable().search([])) {
 		if (!node.name || node.name === thisNodeName) continue;
