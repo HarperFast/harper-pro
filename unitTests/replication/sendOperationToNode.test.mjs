@@ -203,6 +203,7 @@ describe('replicateOperation', function () {
 		expect(replicated).to.have.length(1);
 		expect(replicated[0]).to.include({ status: 'failed', node: 'peer-a' });
 		expect(replicated[0].reason).to.match(/did not answer within 20ms/);
+		expect(replicated[0]).to.not.have.property('statusCode');
 		expect(onPeerResult.calledOnceWith(replicated[0])).to.equal(true);
 		expect(replicationConnection.createWebSocket.firstCall.args[1].timeoutMs).to.equal(20);
 		expect(logger.warn.calledOnce).to.equal(true);
@@ -221,8 +222,50 @@ describe('replicateOperation', function () {
 		const { replicated } = await response;
 		expect(replicated[0]).to.include({ status: 'failed', node: 'peer-a' });
 		expect(replicated[0].reason).to.match(/closed \(1006\) before deploy_component was answered/);
+		expect(replicated[0]).to.not.have.property('statusCode');
 		expect(logger.warn.calledOnce).to.equal(true);
 		expect(logger.warn.firstCall.args.join(' ')).to.include('peer-a');
+	});
+
+	it('reports no status for a peer it could not reach', async () => {
+		replicationConnection.createWebSocket.rejects(
+			Object.assign(new Error('connect ECONNREFUSED 10.0.0.2:9933'), { code: 'ECONNREFUSED' })
+		);
+		const { replicated } = await replicateOperation({ operation: 'set_configuration', logging_level: 'warn' });
+		expect(replicated[0]).to.include({ status: 'failed', node: 'peer-a' });
+		expect(replicated[0]).to.not.have.property('statusCode');
+	});
+
+	// The session rejects an error answer with the peer's status (`operationAnswerError`).
+	const peerAnswer = (text, statusCode) => Object.assign(new Error(text), { statusCode });
+
+	for (const [label, statusCode] of [
+		['a permission refusal', 403],
+		['a validation refusal', 400],
+	]) {
+		it(`reports the status of ${label} the peer answered with`, async () => {
+			session.sendOperation.rejects(peerAnswer('ClientError: refused by the peer', statusCode));
+			const response = replicateOperation({ operation: 'set_configuration', logging_level: 'warn' });
+			await openAll();
+			const { replicated } = await response;
+			expect(replicated[0]).to.deep.equal({
+				status: 'failed',
+				reason: 'Error: ClientError: refused by the peer',
+				node: 'peer-a',
+				statusCode,
+			});
+		});
+	}
+
+	it('reports only an integer error status', async () => {
+		for (const statusCode of [200, 399, 600, 409.5, '409', Number.NaN, null]) {
+			sockets.length = 0;
+			session.sendOperation.rejects(peerAnswer('odd', statusCode));
+			const response = replicateOperation({ operation: 'set_configuration', logging_level: 'warn' });
+			await openAll();
+			const { replicated } = await response;
+			expect(replicated[0], `statusCode ${String(statusCode)}`).to.not.have.property('statusCode');
+		}
 	});
 
 	it('sends no deadline when the caller gives none, and logs nothing for an answer', async () => {

@@ -5734,7 +5734,7 @@ function configuredPeerIdentity(
 	return canonical;
 }
 
-const isErrorStatus = (status: unknown): status is number =>
+export const isErrorStatus = (status: unknown): status is number =>
 	Number.isInteger(status) && (status as number) >= 400 && (status as number) <= 599;
 
 function operationErrorAnswer(requestId: unknown, error: unknown) {
