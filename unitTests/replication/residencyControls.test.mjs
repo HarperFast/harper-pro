@@ -3281,12 +3281,14 @@ describe('Declarative tables keep control and event traffic independent of place
 				assert.deepEqual(socket.closes, []);
 			}));
 
-	it('a record of a table redeclared non-replicating after the request asked for it is still a hole (harper-pro#1213)', () =>
+	it('a table redeclared non-replicating after the request asked for it retires the socket before any record of it is dropped (harper-pro#1213)', () =>
 		atCheckpointLevel(async () => {
 			const peer = 'slot-control-peer';
 			const connection = new EventEmitter();
 			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
 			connection.exclusionOrigins = [peer];
+			let reconnects = 0;
+			connection.forceReconnect = () => reconnects++;
 			let Plain;
 			const { Records, socket } = await connect(
 				false,
@@ -3307,14 +3309,199 @@ describe('Declarative tables keep control and event traffic independent of place
 			await until(() => peerNode()?.originGeneration === 'peer-generation' || socket.closes.length);
 			Plain.replicate = false;
 			connection.emit('subscriptions-updated');
-			await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
+			// a level-2 socket carries one scope, so the narrowed request waits for the next socket
+			await until(() => reconnects > 0 || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			assert.equal(socket.sent.filter((frame) => frame[0] === 129).length, 1);
+			assert.deepEqual(Records.dbisDB.getSync([Symbol.for('routeScope'), peerId])?.tables, ['Plain']);
+			const version = Date.now();
 			socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
 			socket.emit('message', structureFrame(Plain));
-			socket.emit('message', recordFrame(Plain, 'put', 'in-flight', { id: 'in-flight' }, Date.now()));
-			await until(() => peerNode()?.hole === true || socket.closes.length);
-			assert.deepEqual(socket.closes, []);
+			socket.emit('message', recordFrame(Plain, 'put', 'in-flight', { id: 'in-flight' }, version));
+			await new Promise((resolve) => setTimeout(resolve, 100));
 			assert.equal(Plain.primaryStore.getEntry('in-flight'), undefined);
+			assert.ok(!(Records.dbisDB.getSync([SEQ, peerId])?.seqId >= version), 'the cursor stays before the owed record');
+			assert.notEqual(peerNode().hole, true);
 		}));
+
+	// A level-1 link keeps its socket across a scope change, so there the request fold decides what is owed.
+	for (const [change, declared] of [
+		['a table a later request leaves out stays owed', 'replicating'],
+		['a table a later request asks for becomes owed', 'non-replicating'],
+	])
+		it(`on a level-1 link ${change} (harper-pro#1213)`, () =>
+			atCheckpointLevel(async () => {
+				const peer = 'slot-control-peer';
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+				connection.exclusionOrigins = [peer];
+				let reconnects = 0;
+				connection.forceReconnect = () => reconnects++;
+				let Plain;
+				const { Records, socket } = await connect(
+					false,
+					'level1_fold_' + declared.replace('-', '_'),
+					true,
+					undefined,
+					(database) => {
+						Plain = plainTable(database, declared);
+					},
+					connection
+				);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				const peerNode = () => Records.dbisDB.getSync([SEQ, peerId])?.nodes?.find((node) => node.id === peerId);
+				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				socket.emit('message', encode([141, { [peer]: 0 }, [peer]]));
+				socket.emit('message', structureFrame(Plain));
+				const version = Date.now();
+				if (declared === 'non-replicating') {
+					socket.emit('message', recordFrame(Plain, 'put', 'unowed', { id: 'unowed' }, version));
+					await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId >= version || socket.closes.length);
+					assert.notEqual(peerNode()?.hole, true, 'the only request so far left the table out');
+				}
+				Plain.replicate = declared === 'non-replicating';
+				connection.emit('subscriptions-updated');
+				await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
+				socket.emit('message', recordFrame(Plain, 'put', 'in-flight', { id: 'in-flight' }, version + 1));
+				await until(() => peerNode()?.hole === true || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(reconnects, 0);
+				assert.equal(Plain.primaryStore.getEntry('in-flight'), undefined);
+			}));
+
+	// An exclusion update builds no request, so a route that regains full coverage needs a socket of its own to ask for it.
+	for (const opened of ['full', 'narrowed'])
+		it(`a level-2 route opened ${opened} that regains full coverage on an open socket reconnects once`, () =>
+			atCheckpointLevel(async () => {
+				const peer = 'slot-control-peer';
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+				connection.exclusionOrigins = opened === 'full' ? [peer] : [];
+				let reconnects = 0;
+				connection.forceReconnect = () => reconnects++;
+				const { Records, socket } = await connect(
+					false,
+					'live_widened_' + opened,
+					true,
+					checkpointCapabilities(),
+					undefined,
+					connection
+				);
+				const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+				const recordedFull = () => Records.dbisDB.getSync([Symbol.for('routeScope'), peerId])?.full;
+				const update = (origins) => {
+					connection.exclusionOrigins = origins;
+					connection.emit('exclusion-origins-updated', origins);
+				};
+				await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+				assert.deepEqual(socket.closes, []);
+				assert.equal(recordedFull(), opened === 'full');
+				update([]);
+				update([]);
+				assert.equal(recordedFull(), false);
+				assert.equal(reconnects, 0, 'a narrowing keeps its socket');
+				update([peer]);
+				assert.equal(reconnects, 1);
+				update([peer]);
+				assert.equal(reconnects, 1, 'the retired socket asks for no second reconnect');
+				assert.deepEqual(socket.closes, []);
+				assert.equal(socket.sent.filter((frame) => frame[0] === 129).length, 1);
+				assert.equal(recordedFull(), false, 'only the next socket’s request records the wider coverage');
+			}));
+
+	it('a scope record that could not be written leaves the connection’s coverage as last recorded', () =>
+		atCheckpointLevel(async () => {
+			const peer = 'slot-control-peer';
+			const connection = new EventEmitter();
+			connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+			connection.exclusionOrigins = [];
+			const { Records, socket } = await connect(
+				false,
+				'scope_write_refused',
+				true,
+				checkpointCapabilities(),
+				undefined,
+				connection
+			);
+			const scopeKey = [Symbol.for('routeScope'), getIdOfRemoteNode(peer, Records.auditStore)];
+			await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+			assert.deepEqual(socket.closes, []);
+			assert.equal(connection.routeFullCoverage, false);
+			assert.ok(Records.dbisDB.tryLock(scopeKey), 'another writer holds the record');
+			try {
+				connection.exclusionOrigins = [peer];
+				connection.emit('subscriptions-updated');
+				await until(() => socket.closes.length);
+			} finally {
+				Records.dbisDB.unlock(scopeKey);
+			}
+			assert.equal(socket.closes[0].code, 1011);
+			assert.equal(socket.sent.filter((frame) => frame[0] === 129).length, 1);
+			// the next socket's request reads this as the coverage before it, which decides whether it copies
+			assert.equal(connection.routeFullCoverage, false);
+		}));
+
+	for (const [route, level2, shardedFailover] of [
+		['a level-2 route that never narrowed', true, false],
+		['a level-1 route', false, false],
+		// there a disconnect itself takes the route node out of the set, so a reconnect would narrow it again
+		['a level-2 route of a sharded database with failover', true, true],
+	])
+		it(`${route} keeps its socket when the exclusion set names its node again`, () =>
+			atCheckpointLevel(async () => {
+				const peer = 'slot-control-peer';
+				const Nodes = getHDBNodeTable();
+				const previous = Nodes.primaryStore.getSync(peer);
+				const priorFailover = env.get('replication_failover');
+				const neverNarrowed = level2 && !shardedFailover;
+				const connection = new EventEmitter();
+				connection.nodeSubscriptions = [{ name: peer, replicateByDefault: true }];
+				connection.exclusionOrigins = neverNarrowed ? [peer] : [];
+				let reconnects = 0;
+				connection.forceReconnect = () => reconnects++;
+				try {
+					if (shardedFailover) {
+						env.setProperty('replication_failover', true);
+						await Nodes.primaryStore.put(peer, { name: peer, shard: 0, replicates: true });
+					}
+					const { Records, socket } = await connect(
+						false,
+						`live_widened_kept_${level2}_${shardedFailover}`,
+						!shardedFailover,
+						level2 ? checkpointCapabilities() : undefined,
+						undefined,
+						connection,
+						undefined,
+						false,
+						(database) => (shardedFailover ? { shard: 0, shardingCertificate: shardingSourceAgreement(database) } : {})
+					);
+					const peerId = getIdOfRemoteNode(peer, Records.auditStore);
+					await until(() => socket.sent.some((frame) => frame[0] === 129) || socket.closes.length);
+					assert.deepEqual(socket.closes, []);
+					assert.equal(Records.dbisDB.getSync([Symbol.for('routeScope'), peerId])?.full, neverNarrowed);
+					// a recompute that failed open names no narrowing
+					if (neverNarrowed) connection.emit('exclusion-origins-updated', [], true);
+					for (let repeat = 0; repeat < 3; repeat++) {
+						connection.exclusionOrigins = [peer];
+						connection.emit('exclusion-origins-updated', [peer]);
+					}
+					assert.equal(reconnects, 0);
+					assert.deepEqual(socket.closes, []);
+					if (shardedFailover) {
+						// the same admitted route reconnects once the set no longer follows its connection
+						env.setProperty('replication_failover', false);
+						connection.emit('exclusion-origins-updated', [peer]);
+						assert.equal(reconnects, 1);
+					}
+				} finally {
+					env.setProperty('replication_failover', priorFailover);
+					if (shardedFailover) {
+						if (previous) await Nodes.primaryStore.put(peer, previous);
+						else await Nodes.primaryStore.remove(peer);
+					}
+				}
+			}));
 
 	it('a request sent while the socket is closing leaves its scope unchanged (harper-pro#1213)', () =>
 		atCheckpointLevel(async () => {
@@ -3349,7 +3536,8 @@ describe('Declarative tables keep control and event traffic independent of place
 			Plain.replicate = true;
 			socket.readyState = 2;
 			connection.emit('subscriptions-updated');
-			await until(() => socket.sent.filter((frame) => frame[0] === 129).length === 2 || socket.closes.length);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(socket.sent.filter((frame) => frame[0] === 129).length, 1, 'a closing socket builds no request');
 			socket.emit('message', recordFrame(Plain, 'put', 'second', { id: 'second' }, version + 1));
 			await until(() => Records.dbisDB.getSync([SEQ, peerId])?.seqId >= version + 1 || socket.closes.length);
 			assert.deepEqual(socket.closes, []);

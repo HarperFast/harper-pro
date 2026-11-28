@@ -1,0 +1,12 @@
+# routeScopeWidening.test.mjs redeploys this with `replicate: true` to widen every route's table scope.
+type Flipped @table(database: "data", replicate: false) @export {
+	id: ID @primaryKey
+}
+
+type Skipped @table(database: "data") @export {
+	id: ID @primaryKey
+}
+
+type Progress @table(database: "data") @export {
+	id: ID @primaryKey
+}

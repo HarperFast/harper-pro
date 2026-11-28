@@ -982,6 +982,11 @@ export function getConfiguredRoutes(): Route[] {
 	return routes;
 }
 
+/** Whether an origin leaves `databaseName`'s exclusion set while its own connection is down, so a reconnect narrows it. */
+export function exclusionFollowsConnection(databaseName: string): boolean {
+	return !!shardingLayout(databaseName) && !!env.get(CONFIG_PARAMS.REPLICATION_FAILOVER);
+}
+
 /**
  * The origins whose logs a relay peer may be told to omit for `databaseName`: this node receives them
  * directly, with full table coverage, so relayed copies are pure duplicates. Owned HERE because only the
@@ -1004,7 +1009,7 @@ export function getConfiguredRoutes(): Route[] {
 export function computeExclusionOrigins(databaseName: string): string[] {
 	const thisNodeName = getThisNodeName();
 	const origins: string[] = [];
-	const shardedFailover = shardingLayout(databaseName) && env.get(CONFIG_PARAMS.REPLICATION_FAILOVER);
+	const shardedFailover = exclusionFollowsConnection(databaseName);
 	if (!thisNodeName) return origins;
 	for (const node of getHDBNodeTable().search([])) {
 		if (!node.name || node.name === thisNodeName) continue;
@@ -1086,6 +1091,7 @@ function scheduleExclusionOriginsBroadcast() {
 		exclusionBroadcastScheduled = false;
 		try {
 			const originsByDatabase = new Map<string, string[]>();
+			const failedOpen = new Set<string>();
 			// One message per (worker, database): application is database-wide on the worker, so
 			// entries for different peer URLs on the same worker would repeat identical work.
 			const notifiedByTarget = new Map<any, Set<string>>();
@@ -1101,6 +1107,8 @@ function scheduleExclusionOriginsBroadcast() {
 						try {
 							origins = computeExclusionOrigins(databaseName);
 						} catch (error) {
+							// a receiver must not read the fallback as a route losing coverage
+							failedOpen.add(databaseName);
 							// Fail OPEN per database: pushing the empty set turns exclusions off (relay
 							// duplicates) until a later broadcast recomputes. Keeping the last-sent set
 							// instead could pin an exclusion for an origin that lost direct coverage,
@@ -1110,7 +1118,12 @@ function scheduleExclusionOriginsBroadcast() {
 						}
 						originsByDatabase.set(databaseName, origins);
 					}
-					const message = { type: 'update-exclusion-origins', database: databaseName, origins };
+					const message = {
+						type: 'update-exclusion-origins',
+						database: databaseName,
+						origins,
+						...(failedOpen.has(databaseName) && { failedOpen: true }),
+					};
 					if (entry.worker) entry.worker.postMessage(message);
 					else updateExclusionOrigins(message);
 				}
