@@ -14,7 +14,9 @@ import { ClientError, ServerError } from '#src/core/utility/errors/hdbError';
 
 const OPERATION_REQUEST = 136;
 const OPERATION_RESPONSE = 137;
+const DISCONNECT = 142;
 const OPEN = 1;
+const CLOSING = 2;
 const CLOSED = 3;
 
 class FakeSocket extends EventEmitter {
@@ -37,6 +39,16 @@ class FakeSocket extends EventEmitter {
 	ping() {}
 	pause() {}
 	resume() {}
+}
+
+class DelayedCloseSocket extends FakeSocket {
+	close(code) {
+		this.closes.push(code);
+		this.readyState = CLOSING;
+	}
+	finishClose() {
+		super.close(1000);
+	}
 }
 
 async function settled(socket) {
@@ -91,8 +103,8 @@ describe('answering an OPERATION_REQUEST', function () {
 		beforeEach(() => {
 			realOperation = server.operation;
 			received = [];
-			server.operation = (data, context) => {
-				received.push({ data, context });
+			server.operation = (data, context, authorize) => {
+				received.push({ data, context, authorize });
 				return Promise.resolve({});
 			};
 		});
@@ -121,6 +133,41 @@ describe('answering an OPERATION_REQUEST', function () {
 			operationSocket.close(1000);
 			expect(received).to.have.length(1);
 			expect(received[0].context.replicatedFrom).to.equal('peer-b');
+		});
+
+		for (const [label, principal, authorize] of [
+			['node identity', { name: 'peer-c' }, false],
+			['directional grant', { replicates: { sendsTo: [{ database: 'data' }] } }, false],
+			['super_user', { role: { permission: { super_user: true } } }, true],
+		]) {
+			it(`admits a ${label} principal`, async () => {
+				const admitted = new FakeSocket();
+				try {
+					replicateOverWS(admitted, {}, Promise.resolve(principal));
+					admitted.emit('message', encode([OPERATION_REQUEST, { operation: 'user_info', requestId: 1 }]));
+					await settled(admitted);
+					expect(admitted.closes).to.deep.equal([]);
+					expect(received).to.have.length(1);
+					expect(received[0].authorize).to.equal(authorize);
+				} finally {
+					admitted.close(1000);
+				}
+			});
+		}
+
+		it('stops queued messages before the socket emits close', async () => {
+			const denied = new DelayedCloseSocket();
+			try {
+				replicateOverWS(denied, {}, Promise.resolve({ username: 'reader', role: { permission: {} } }));
+				for (const requestId of [1, 2])
+					denied.emit('message', encode([OPERATION_REQUEST, { operation: 'user_info', requestId }]));
+				await new Promise(setImmediate);
+				expect(denied.closes).to.deep.equal([1008]);
+				expect(received).to.deep.equal([]);
+				expect(denied.sent).to.deep.equal([]);
+			} finally {
+				denied.finishClose();
+			}
 		});
 
 		it('is left unset on every other operation', async () => {
@@ -437,4 +484,84 @@ describe("an operation error's status across the connection", function () {
 			expect(socket.closes).to.deep.equal([]);
 		});
 	});
+});
+
+describe('receiving operation replies', () => {
+	it('settles a disconnected operation as closed before accepting later replies', async () => {
+		const socket = new DelayedCloseSocket();
+		try {
+			const session = replicateOverWS(socket, {}, undefined, 'operation-replies');
+			const result = session.sendOperation({ operation: 'user_info' }, 1_000).then(
+				() => 'fulfilled',
+				(error) => error.message
+			);
+			const [, { requestId }] = socket.sent[0];
+			socket.emit('message', encode([DISCONNECT]));
+			socket.emit('message', encode([OPERATION_RESPONSE, { requestId }]));
+			await new Promise(setImmediate);
+			expect(socket.readyState).to.equal(CLOSING);
+			socket.finishClose();
+			expect(await result).to.match(/^Connection closed/);
+		} finally {
+			if (socket.readyState !== CLOSED) socket.finishClose();
+		}
+	});
+
+	it('correlates the reply to the outgoing request', async () => {
+		const socket = new FakeSocket();
+		try {
+			const session = replicateOverWS(socket, {}, undefined, 'operation-replies');
+			const result = session.sendOperation({ operation: 'user_info' }, 1_000);
+			const [, { requestId }] = socket.sent[0];
+			const answer = { requestId, username: 'peer-user' };
+			socket.emit('message', encode([OPERATION_RESPONSE, answer]));
+			expect(await result).to.deep.equal(answer);
+		} finally {
+			socket.close(1000);
+		}
+	});
+
+	it('preserves forwarded refusal status and legacy ClientError fallback on error replies', async () => {
+		const socket = new FakeSocket();
+		try {
+			const session = replicateOverWS(socket, {}, undefined, 'operation-replies');
+			const replyError = async (answer) => {
+				const before = socket.sent.length;
+				const rejected = session.sendOperation({ operation: 'remove_node_fence' }, 1_000).then(
+					(result) => expect.fail(`expected a rejection, got ${JSON.stringify(result)}`),
+					(error) => error
+				);
+				const [, { requestId }] = socket.sent[before];
+				socket.emit('message', encode([OPERATION_RESPONSE, { ...answer, requestId }]));
+				return rejected;
+			};
+			const conflict = await replyError({ error: 'ClientError: the removal was finalized', statusCode: 409 });
+			expect(conflict.statusCode).to.equal(409);
+			expect(conflict.message).to.equal('ClientError: the removal was finalized');
+			const legacy = await replyError({ error: 'ClientError: node is required' });
+			expect(legacy.statusCode).to.equal(400);
+			expect(legacy.message).to.equal('ClientError: node is required');
+			expect(socket.closes).to.deep.equal([]);
+		} finally {
+			socket.close(1000);
+		}
+	});
+
+	for (const [label, frame] of [
+		['operation request', encode([OPERATION_REQUEST, { operation: 'user_info', requestId: 1 }])],
+		['binary frame', Buffer.alloc(1)],
+	]) {
+		it(`closes the reply-only session on a ${label}`, async () => {
+			const socket = new FakeSocket();
+			try {
+				replicateOverWS(socket, {}, undefined, 'operation-replies');
+				socket.emit('message', frame);
+				await settled(socket);
+				expect(socket.closes).to.deep.equal([1008]);
+				expect(socket.sent).to.deep.equal([]);
+			} finally {
+				socket.close(1000);
+			}
+		});
+	}
 });

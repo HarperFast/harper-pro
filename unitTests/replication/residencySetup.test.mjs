@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 const { Transaction: NativeTransaction } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
+const { forComponent } = createRequire(import.meta.url)('#src/core/utility/logging/harper_logger');
 import * as env from '#src/core/utility/environment/environmentManager';
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
@@ -250,7 +251,6 @@ describe('sharding setup authority', function () {
 		}
 	});
 	for (const [name, authorization, options] of [
-		['credential', { username: 'reader', role: { permission: {} } }, {}],
 		['false_grant', { name: 'slot-setup-peer', replicates: false }, {}],
 		['receive_only_grant', { name: 'slot-setup-peer', replicates: { receives: true } }, {}],
 		['receive_from_grant', { name: 'slot-setup-peer', replicates: { receivesFrom: ['*'] } }, {}],
@@ -571,14 +571,21 @@ describe('sharding setup authority', function () {
 			server.nodes = priorNodes;
 		}
 	});
-	it('ignores shard-list claims from a credential without replication authority', async () => {
-		const database = 'slot_setup_untrusted_digest';
+	it('requires a replication principal before setup for a configured database', async () => {
+		const database = 'slot_setup_principal';
+		const socket = new Socket();
+		sockets.push(socket);
+		const finishClose = socket.close.bind(socket);
+		socket.close = (code, reason) => {
+			socket.closes.push({ code, reason });
+			socket.readyState = 2;
+		};
 		const priorNodes = server.nodes;
 		server.nodes = [{ name: 'slot-setup-peer' }];
 		try {
 			await connect(database, { name: 'slot-setup-peer', replicates: true });
 			assert.deepEqual(residencyTopologyErrors(database), []);
-			const socket = await connect(database, { username: 'reader', role: { permission: {} } });
+			replicateOverWS(socket, { database }, Promise.resolve({ username: 'reader', role: { permission: {} } }));
 			socket.emit(
 				'message',
 				encode([
@@ -587,14 +594,83 @@ describe('sharding setup authority', function () {
 					database,
 					[],
 					buildLocalCapabilities(90_000, false, true),
-					{ shardsDigest: 'forged' },
+					{ shardsDigest: 'invalid' },
 				])
 			);
-			await processed(socket, true);
+			await turns();
+			assert.deepEqual(socket.closes, [{ code: 1008, reason: 'Unauthorized replication principal' }]);
+			assert.deepEqual(socket.sent, []);
 			assert.deepEqual(residencyTopologyErrors(database), []);
 		} finally {
+			finishClose(1000);
 			server.nodes = priorNodes;
 		}
+	});
+	it('reports configured database setup failures after authorization resolves', async () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		replicateOverWS(socket, { database: 'system' }, Promise.resolve({ name: server.hostname }));
+		await turns();
+		assert.deepStrictEqual(socket.closes, [{ code: 1008, reason: 'Replication database setup failed' }]);
+		assert.deepStrictEqual(socket.sent, []);
+	});
+	it('closes a failed database setup when warning logging throws', async () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		const logger = forComponent('replication').conditional;
+		const originalWarn = logger.warn;
+		let setupWarning;
+		logger.warn = (...args) => {
+			if (args[1] !== 'Error setting database') return originalWarn?.(...args);
+			setupWarning = args[2];
+			throw new Error('Fixture warning sink failed');
+		};
+		try {
+			replicateOverWS(socket, { database: 'system' }, Promise.resolve({ name: server.hostname }));
+			await turns();
+			assert.match(setupWarning?.message, /Should not connect to self/);
+			assert.deepStrictEqual(socket.closes, [{ code: 1008, reason: 'Replication database setup failed' }]);
+		} finally {
+			logger.warn = originalWarn;
+		}
+	});
+	it('reports a rejected authorization promise as unauthorized', async () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		replicateOverWS(socket, {}, Promise.reject(new Error('Fixture authorization failure')));
+		await turns();
+		assert.deepStrictEqual(socket.closes, [{ code: 1008, reason: 'Unauthorized' }]);
+	});
+	it('stops sending requests when the database handshake fails before transport close', async () => {
+		const socket = new Socket();
+		sockets.push(socket);
+		const finishClose = socket.close.bind(socket);
+		const failure = new Error('Fixture database handshake send failed');
+		const send = socket.send.bind(socket);
+		socket.send = (data) => {
+			if (decode(data)[0] === 140) throw failure;
+			send(data);
+		};
+		socket.close = (code, reason) => {
+			socket.closes.push({ code, reason });
+			socket.readyState = 2;
+		};
+		let rejection;
+		try {
+			const session = replicateOverWS(socket, {}, { name: 'slot-setup-peer', replicates: true });
+			socket.emit('message', encode([140, 'slot-setup-peer', 'slot_setup_failed_handshake', [], {}]));
+			await turns();
+			assert.deepStrictEqual(socket.closes, [{ code: 1008, reason: failure.message }]);
+			assert.deepStrictEqual(socket.sent, [[142]]);
+			rejection = assert.rejects(
+				session.sendOperation({ operation: 'user_info' }),
+				/Connection closed before operation request/
+			);
+		} finally {
+			socket.close = finishClose;
+			finishClose(1000);
+		}
+		await rejection;
 	});
 	for (const [name, authorization, options] of [
 		['false_grant', { name: 'slot-setup-peer', replicates: false }, {}],

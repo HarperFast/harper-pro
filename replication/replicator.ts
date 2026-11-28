@@ -764,7 +764,7 @@ export async function sendOperationToNode(node, operation, options?) {
 					socket.close();
 					return;
 				}
-				const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), {});
+				const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), undefined, 'operation-replies');
 				const send = () => {
 					// operation may carry a secret (registry token / ssh key / password); redact before
 					// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
