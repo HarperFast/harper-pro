@@ -12,14 +12,14 @@
  * has no install, the file fails rather than skipping.
  */
 import { suite, test, before, after } from 'node:test';
-import { equal, ok } from 'node:assert/strict';
+import { deepEqual, equal, ok } from 'node:assert/strict';
 import { cp, mkdtemp, readdir, readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, waitForCondition, stopAndTeardownNodes } from './clusterShared.mjs';
+import { sendOperation, waitForCondition, stopAndTeardownNodes, logMark, readLogSince } from './clusterShared.mjs';
 
 const PACKAGE_ROOT = join(import.meta.dirname, '..', '..');
 const CURRENT_BIN = join(PACKAGE_ROOT, 'dist', 'bin', 'harper.js');
@@ -27,6 +27,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = CURRENT_BIN;
 const CURRENT_VERSION = readVersion(PACKAGE_ROOT);
 const FIXTURE_PATH = join(import.meta.dirname, 'fixture-mixed-version');
 const PREVIOUS_INSTALLS = (process.env.HARPER_PRO_PREVIOUS_VERSION_PATHS ?? '').split(delimiter).filter(Boolean);
+const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
 
 const DATABASE = 'data';
 const ITEM = 'MixedVersionItem';
@@ -47,6 +48,19 @@ const SHUTDOWN_GRACE_MS = 30_000;
 
 function readVersion(packageRoot) {
 	return JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')).version;
+}
+
+async function assertRunning(nodeCtx, harperBinPath, version) {
+	ok(
+		nodeCtx.harper.process.spawnargs.includes(harperBinPath),
+		`${nodeCtx.harper.hostname} should have been launched from ${harperBinPath}`
+	);
+	const info = await sendOperation(
+		nodeCtx.harper,
+		{ operation: 'registration_info' },
+		{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+	);
+	equal(info.version, version, `${nodeCtx.harper.hostname} should be running ${version}`);
 }
 
 function blobText(seed, bytes) {
@@ -119,19 +133,6 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 			const expected = { [ITEM]: new Map(), [TYPED]: new Map() };
 			const categories = new Set();
 			let batchCount = 0;
-
-			async function assertRunning(nodeCtx, harperBinPath, version) {
-				ok(
-					nodeCtx.harper.process.spawnargs.includes(harperBinPath),
-					`${nodeCtx.harper.hostname} should have been launched from ${harperBinPath}`
-				);
-				const info = await sendOperation(
-					nodeCtx.harper,
-					{ operation: 'registration_info' },
-					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
-				);
-				equal(info.version, version, `${nodeCtx.harper.hostname} should be running ${version}`);
-			}
 
 			// setupHarperWithFixture picks the hostname itself, but replication.securePort needs it first
 			async function startFresh(nodeCtx) {
@@ -489,6 +490,135 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				await writeBatch(nodeA, 'join');
 				await assertConverged(`${nodeD.harper.hostname} joining on ${previousVersion}`);
 			});
+		}
+	);
+
+	// harper-pro#1449 and #1433
+	suite(
+		`a populated ${previousVersion} node rejoining by base copy drops a row deleted while it was away`,
+		{ concurrency: false, skip: isLMDB && 'an LMDB copy source does not flag deletes (harper-pro#1333)' },
+		() => {
+			const caseOptions = { timeout: 600_000 };
+			async function startNode(nodeCtx, harperBinPath, env) {
+				if (!nodeCtx.harper) {
+					const hostname = await getNextAvailableLoopbackAddress();
+					const parentDir = process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir();
+					nodeCtx.harper = { hostname, dataRootDir: await mkdtemp(join(parentDir, 'harper-integration-test-')) };
+					await cp(FIXTURE_PATH, join(nodeCtx.harper.dataRootDir, 'components', basename(FIXTURE_PATH)), {
+						recursive: true,
+						dereference: true,
+					});
+				}
+				await startHarper(nodeCtx, nodeOptions(nodeCtx.harper.hostname, harperBinPath, env));
+			}
+
+			const write = (nodeCtx, operation) =>
+				sendOperation(
+					nodeCtx.harper,
+					{ database: DATABASE, table: ITEM, ...operation },
+					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+				);
+			const ids = async (nodeCtx, signal, attribute = 'id', value = '*') =>
+				(
+					await sendOperation(
+						nodeCtx.harper,
+						{
+							operation: 'search_by_value',
+							database: DATABASE,
+							table: ITEM,
+							search_attribute: attribute,
+							search_value: value,
+							get_attributes: ['id'],
+						},
+						{ signal }
+					)
+				).map(({ id }) => id);
+			const until = (probe, description) =>
+				waitForCondition(probe, { timeoutMs: CONVERGE_TIMEOUT_MS, pollMs: 500, description });
+			async function stopCleanly(nodeCtx) {
+				const outgoing = nodeCtx.harper.process;
+				await killHarper(nodeCtx, { graceMs: SHUTDOWN_GRACE_MS });
+				equal(outgoing.exitCode, 0, `${nodeCtx.harper.hostname} did not stop cleanly`);
+			}
+
+			async function rejoinByCopy(t, rejoinBin, rejoinVersion) {
+				const source = { name: t.name };
+				const returning = { name: t.name };
+				t.after(() => stopAndTeardownNodes([source.harper, returning.harper]));
+				await startNode(source, CURRENT_BIN);
+				await startNode(returning, previousBin);
+				await write(source, {
+					operation: 'insert',
+					records: [
+						{ id: 'kept', category: 'kept' },
+						{ id: 'gone', category: 'gone' },
+					],
+				});
+				await sendOperation(
+					returning.harper,
+					{
+						operation: 'add_node',
+						hostname: source.harper.hostname,
+						rejectUnauthorized: false,
+						authorization: source.harper.admin,
+					},
+					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+				);
+				await write(source, { operation: 'insert', records: [{ id: 'live', category: 'live' }] });
+				await until(async (signal) => {
+					const held = await ids(returning, signal);
+					return ['kept', 'gone', 'live'].every((id) => held.includes(id));
+				}, 'the returning node to hold every row before it stops');
+				await assertRunning(returning, previousBin, previousVersion);
+
+				await stopCleanly(returning);
+				await write(source, { operation: 'delete', ids: ['gone'] });
+				// sorts last, so the copy has passed 'gone' once this arrives
+				await write(source, { operation: 'insert', records: [{ id: 'zz-sentinel', category: 'sentinel' }] });
+				await stopCleanly(source);
+				const mark = await logMark(source.harper);
+				// a returning node with a saved cursor is forced into the copy; one without asks for it
+				await startNode(source, CURRENT_BIN, { HARPER_TEST_FORCE_RETENTION_COPY_DATABASES: DATABASE });
+				await startNode(returning, rejoinBin);
+				await assertRunning(returning, rejoinBin, rejoinVersion);
+
+				let held;
+				await until(
+					async (signal) => (held = await ids(returning, signal)).includes('zz-sentinel'),
+					() => `the sentinel on the returning node; last: ${JSON.stringify(held)}`
+				);
+				const sentDataCopy = (await readLogSince(source.harper, mark)).includes(
+					`Replicating all tables to ${returning.harper.hostname} for database ${DATABASE}`
+				);
+				ok(
+					!held.includes('gone'),
+					`the deleted row is still on the ${rejoinVersion} node: ${JSON.stringify(held)}; source logged the data copy: ${sentDataCopy}`
+				);
+				ok(sentDataCopy, 'premise: the source sent the returning node a base copy for data');
+				ok(held.includes('kept'));
+				return { source, returning };
+			}
+
+			test('the copy removes the row on the previous release', caseOptions, (t) =>
+				rejoinByCopy(t, previousBin, previousVersion)
+			);
+
+			test(
+				'the forward upgrade removes the row and keeps it absent after a clean restart with no peer',
+				caseOptions,
+				async (t) => {
+					const { source, returning } = await rejoinByCopy(t, CURRENT_BIN, CURRENT_VERSION);
+					const indexedGone = () => ids(returning, AbortSignal.timeout(REQUEST_TIMEOUT_MS), 'category', 'gone');
+					deepEqual(await indexedGone(), [], 'the category index still returns the deleted row after the copy');
+					// Keep the source offline so another copy cannot repair the row before the cold read.
+					await stopCleanly(source);
+					await stopCleanly(returning);
+					await startNode(returning, CURRENT_BIN);
+					const held = await ids(returning, AbortSignal.timeout(REQUEST_TIMEOUT_MS));
+					deepEqual(held.sort(), ['kept', 'live', 'zz-sentinel']);
+					deepEqual(await indexedGone(), [], 'the category index still returns the deleted row after the restart');
+				}
+			);
 		}
 	);
 }
