@@ -31,6 +31,7 @@ import { IterableEventQueue } from '../core/resources/IterableEventQueue.ts';
 import {
 	NodeReplicationConnection,
 	createWebSocket,
+	peerAnswerStatus,
 	replicateOverWS,
 	createPendingDatabaseSubscription,
 	databaseSubscriptions,
@@ -1057,11 +1058,14 @@ export async function replicateOperation(req, options?: { onPeerResult?: (result
 				.catch((reason) => {
 					// Only the operation's name: its body can carry secrets the redaction lists do not know yet.
 					logger.warn(`Replicating ${req.operation} to ${node.name} failed:`, reason?.message ?? String(reason));
-					return {
+					const failed: { status: 'failed'; reason: string; node: string; statusCode?: number } = {
 						status: 'failed',
 						reason: reason?.toString?.() ?? String(reason),
 						node: node.name,
 					};
+					const statusCode = peerAnswerStatus(reason);
+					if (statusCode !== undefined) failed.statusCode = statusCode;
+					return failed;
 				})
 				.then((result) => {
 					if (onPeerResult) {

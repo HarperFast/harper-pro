@@ -5737,6 +5737,16 @@ function configuredPeerIdentity(
 const isErrorStatus = (status: unknown): status is number =>
 	Number.isInteger(status) && (status as number) >= 400 && (status as number) <= 599;
 
+const peerAnswerStatuses = new WeakMap<Error, number>();
+
+/**
+ * The status of a peer's error answer, for an error `operationAnswerError` built. Any other error, including a local
+ * failure that carries a `statusCode`, has none: it never reads as the peer's answer.
+ */
+export function peerAnswerStatus(error: unknown): number | undefined {
+	return peerAnswerStatuses.get(error as Error);
+}
+
 function operationErrorAnswer(requestId: unknown, error: unknown) {
 	const text = errorToString(error);
 	// the requester reads an answer without error text as a success
@@ -5755,12 +5765,13 @@ function operationErrorAnswer(requestId: unknown, error: unknown) {
  * The operations API reports `statusCode` as the HTTP status, so only an error status is taken from a peer. A peer
  * from before answers carried one names a refusal by its class alone, and 400 is that class's default.
  */
-function operationAnswerError(answer: { error: unknown; statusCode?: unknown }) {
+export function operationAnswerError(answer: { error: unknown; statusCode?: unknown }) {
 	// text a peer did not send must not name an error class, which callers match on
 	const text = typeof answer.error === 'string' ? answer.error : 'The peer answered with an error that is not text';
 	const error: Error & { statusCode?: number } = new Error(text);
 	if (isErrorStatus(answer.statusCode)) error.statusCode = answer.statusCode;
 	else if (/^ClientError\b/.test(text)) error.statusCode = 400;
+	if (error.statusCode !== undefined) peerAnswerStatuses.set(error, error.statusCode);
 	return error;
 }
 
