@@ -1,12 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { join } from 'node:path';
+import { cp, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
+import mqtt from 'mqtt';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { assertLegacyAuditHasNoEcho } from './legacyAuditHelpers.mjs';
 import { sendOperation, waitForCondition, readLog, stopNodeProcess } from './clusterShared.mjs';
 
 const legacyPath = process.env.HARPER_LEGACY_VERSION_PATH;
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '../../dist/bin/harper.js');
+const FIXTURE = join(import.meta.dirname, 'fixture-replicated-messages');
 
 test(
 	'a node upgraded in place from v4 on LMDB keeps replicating to its v4 peer from where the peer left off',
@@ -25,14 +30,20 @@ test(
 			});
 			return context.harper;
 		}
-		async function newContext(name) {
-			const context = { name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		async function newContext(name, hostname) {
+			const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
+			const context = { name, harper: { hostname, dataRootDir } };
 			contexts.push(context);
+			await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
 			return context;
 		}
 		t.after(async () => {
 			await Promise.all(
-				contexts.filter((context) => context.harper?.process).map((context) => teardownHarper(context))
+				contexts.map((context) =>
+					context.harper?.process
+						? teardownHarper(context)
+						: rm(context.harper.dataRootDir, { recursive: true, force: true })
+				)
 			);
 		});
 		async function waitForRecords(node, ids) {
@@ -64,8 +75,14 @@ test(
 			},
 		};
 
-		const legacyContext = await newContext('legacy-in-place-upgrade-peer');
-		const upgradedContext = await newContext('legacy-in-place-upgrade-node');
+		// A same-version tie goes to the greater node name, so the v4 peer's message takes over the record the upgraded node
+		// copied as v4 only when the peer's name sorts higher; every later message to the topic then ties with it
+		const [peerHostname, nodeHostname] = [
+			await getNextAvailableLoopbackAddress(),
+			await getNextAvailableLoopbackAddress(),
+		].sort((a, b) => (a > b ? -1 : 1));
+		const legacyContext = await newContext('legacy-in-place-upgrade-peer', peerHostname);
+		const upgradedContext = await newContext('legacy-in-place-upgrade-node', nodeHostname);
 		const legacy = await start(legacyContext, true);
 		let upgraded = await start(upgradedContext, true);
 		for (const node of [legacy, upgraded])
@@ -86,7 +103,31 @@ test(
 			records: beforeIds.map((id) => ({ id, name: 'written on v4' })),
 		});
 		await sendOperation(upgraded, { operation: 'add_role', role: 'before_upgrade', permission });
+		// a topic that already has a record: a v4 publish to it carries that record's version
+		await sendOperation(legacy, {
+			operation: 'upsert',
+			database: 'data',
+			table: 'Message',
+			records: [{ id: 'existing-topic', n: -1 }],
+		});
 		await waitForRecords(legacy, beforeIds);
+		await waitForCondition(
+			async (signal) => {
+				const rows = await sendOperation(
+					upgraded,
+					{
+						operation: 'search_by_id',
+						database: 'data',
+						table: 'Message',
+						ids: ['existing-topic'],
+						get_attributes: ['id'],
+					},
+					{ signal }
+				);
+				return rows.length === 1;
+			},
+			{ timeoutMs: 60_000, pollMs: 250, description: `the topic record on ${upgraded.hostname}` }
+		);
 		await waitForRole(legacy, 'before_upgrade');
 		// the v4 peer commits a dated cursor only for an incremental entry after its initial copy; without one it
 		// resumes from 0, which is a full copy rather than the resume this test covers
@@ -123,6 +164,60 @@ test(
 			await waitForRecords(legacy, ['after-upgrade']);
 			await waitForRole(legacy, 'after_upgrade');
 		});
+
+		await t.test(
+			'messages the v4 peer publishes to an existing topic reach a subscriber on the upgraded node',
+			async () => {
+				const clients = [];
+				const connect = (node, clientId) =>
+					new Promise((resolve, reject) => {
+						const client = mqtt.connect(`mqtt://${node.hostname}:1883`, {
+							username: node.admin.username,
+							password: node.admin.password,
+							clientId,
+							clean: true,
+							reconnectPeriod: 0,
+							connectTimeout: 8000,
+						});
+						clients.push(client);
+						client.once('connect', () => resolve(client));
+						client.on('error', reject);
+						// a connect timeout or a dropped socket before CONNACK emits only close
+						client.once('close', () => reject(new Error(`MQTT connection to ${node.hostname} closed`)));
+					});
+				const count = 20;
+				const seen = new Set();
+				const setupDeadline = new AbortController();
+				try {
+					await Promise.race([
+						(async () => {
+							const subscriber = await connect(upgraded, 'sub-upgraded');
+							const publisher = await connect(legacy, 'pub-legacy');
+							subscriber.on('message', (_topic, payload) => seen.add(JSON.parse(payload.toString()).n));
+							await subscriber.subscribeAsync('Message/existing-topic', { qos: 1 });
+							for (let n = 0; n < count; n++)
+								await publisher.publishAsync('Message/existing-topic', JSON.stringify({ n }), { qos: 1 });
+						})(),
+						sleep(30_000, undefined, { signal: setupDeadline.signal }).then(
+							() => {
+								throw new Error('Timed out after 30000ms connecting, subscribing and publishing over MQTT');
+							},
+							() => {}
+						),
+					]);
+					const expected = Array.from({ length: count }, (_, n) => n);
+					await waitForCondition(() => expected.every((n) => seen.has(n)), {
+						timeoutMs: 30_000,
+						pollMs: 250,
+						description: () =>
+							`all ${count} messages on the upgraded node, missing ${expected.filter((n) => !seen.has(n))}`,
+					});
+				} finally {
+					setupDeadline.abort();
+					for (const client of clients) client.end(true);
+				}
+			}
+		);
 
 		await t.test('the upgraded node replays from the peer position instead of forcing a copy', async () => {
 			const log = await readLog(upgraded);
