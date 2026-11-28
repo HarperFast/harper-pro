@@ -251,6 +251,15 @@ suite('Clone from legacy v4 leader', { timeout: 240000 }, (ctx) => {
 		const clone = ctx.nodes[1];
 		if (!clone) return;
 
+		// harper-pro#246: a v4 leader is a bridge peer, so the finished clone must not publish its record.
+		let cloneLog = await readLog(clone);
+		for (let i = 0; i < 60 && !/Clone from leader node .* complete/.test(cloneLog); i++) {
+			await delay(500);
+			cloneLog = await readLog(clone);
+		}
+		ok(/Clone from leader node .* complete/.test(cloneLog), 'premise: the clone ran to completion');
+		ok(!/Published this node's record of leader/.test(cloneLog), 'A v4 leader must stay off the v5 mesh');
+
 		// After the clone is complete, audit-log forwarding should pick up new
 		// writes on the v4 source and ship them to the v5 clone. This is the
 		// path the migration uses for the live delta between bootstrap and

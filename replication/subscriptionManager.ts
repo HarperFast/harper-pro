@@ -13,6 +13,7 @@ import { replicationWorkers } from './replicationWorkers.ts';
 import { isWorkerPoolActive } from '../core/server/threads/workerPools.ts';
 import { setSessionHolderReader } from './recordLockRpc.ts';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
+import { LOCAL_ONLY } from '../core/resources/auditStore.ts';
 import {
 	markOwnOriginRecoveryFailed,
 	openOwnOriginRecoveryEpoch,
@@ -2436,6 +2437,11 @@ if (parentPort) {
 	});
 }
 
+export function isLocalOnlyEntry(entry: { metadataFlags?: number } | undefined | null): boolean {
+	return ((entry?.metadataFlags ?? 0) & LOCAL_ONLY) !== 0;
+}
+
+/** `options.localOnly`: true keeps the row on this node, false releases it, omitted keeps what the stored row is. */
 export async function ensureNode(name: string, node, options?: { localOnly?: boolean }) {
 	const table = getHDBNodeTable();
 	name = name ?? urlToNodeName(node.url);
@@ -2457,9 +2463,8 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 		logger.error('Error parsing replication CA info for hdb_nodes table', err.message);
 	}
 
-	// A miss here drops the revoked_certificates merge below and defeats the sticky LOCAL_ONLY check
-	// (existing?.isLeader), reopening harper-pro#246, so the read must reflect a write from this same
-	// request sequence moments earlier.
+	// A miss here drops the revoked_certificates merge below, so the read must reflect a write from
+	// this same request sequence moments earlier.
 	const existing = await table.get(name);
 	logger.debug(`Ensuring node ${name} at ${getNodeURL(node)}, existing record:`, existing, 'new record:', node);
 	if (existing && Array.isArray(node.revoked_certificates)) {
@@ -2468,15 +2473,18 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 	}
 	if (existing) logger.info(`Updating node ${name} at ${getNodeURL(node)}`);
 
-	// LOCAL_ONLY is sticky: once a node row is a cross-cluster bridge peer (harper-pro #246) it must
-	// STAY local-only across subsequent writes, even when this particular update doesn't request it
-	// (e.g. an `update_node` or a reconnect path that omits `isLeader`). The metadata bit is per-write,
-	// not inherited, so without re-asserting it the next plain patch() would clear it and the row would
-	// replicate to the mesh again, re-opening #246. We key off the existing record's `isLeader` field
-	// (already loaded above; written together with the LOCAL_ONLY bit by setNode) rather than the
-	// metadata bit — `isLeader === true` IS the bridge-peer marker. `node.isLeader === false` is an
-	// explicit demotion, which is allowed to clear it.
-	const alreadyLocalOnly = existing?.isLeader === true && node.isLeader !== false;
+	// LOCAL_ONLY is per-write, not inherited, so a write that does not say either way re-asserts what
+	// the stored row is: a plain patch of a bridge peer's row (an `update_node` that omits `isLeader`)
+	// would otherwise send it to the mesh (harper-pro #246). The stored bit decides, not `isLeader`: that
+	// field replicates, so on another node it marks a row that was never local-only (harper-pro #1487).
+	// `isLeader: false` is an explicit demotion. A node's own row never inherits it: an earlier release
+	// set it there once `isLeader` had replicated onto the row, and its own changes stopped replicating.
+	const localOnly =
+		options?.localOnly ??
+		(name !== getThisNodeName() &&
+			existing != null &&
+			node.isLeader !== false &&
+			isLocalOnlyEntry(await table.primaryStore.getEntry(name, { async: true })));
 
 	// Use an explicit, isolated context for this write instead of relying on ambient fallback
 	// (contextStorage.getStore()). This is internal node-registry bookkeeping, not a user-authored
@@ -2500,7 +2508,7 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 	// internal static Resource API call always got its own throwaway `{}` context) as defense in
 	// depth, and fixes the attribution issue regardless of the core fix.
 	const writeContext: any = {};
-	if (options?.localOnly || alreadyLocalOnly) {
+	if (localOnly) {
 		// Persist the node row with the LOCAL_ONLY metadata bit so it never replicates to peers
 		// (e.g. a v4 bridge peer that must stay invisible to the rest of the v5 mesh — harper-pro #246).
 		// The public patch() API has no per-write option slot, so write through the resource's internal

@@ -444,6 +444,42 @@ export async function cloneNode(): Promise<void> {
 }
 
 /**
+ * setNode keeps this node's row for its leader local-only, because `isLeader` also marks a bridge peer
+ * the cluster must not learn (harper-pro #246). A leader running 5 or later is a cluster member, and a
+ * node later cloned from this one learns it only from this row (harper-pro #1487). Best effort: a row
+ * left local-only is the pre-existing gap, not a failed clone.
+ */
+async function publishLeaderNode(): Promise<void> {
+	try {
+		const version = await leaderVersion();
+		const leaderMajorVersion = Number(version?.match(/\d+/)?.[0] ?? NaN);
+		if (leaderMajorVersion < 5) return;
+		if (!(leaderMajorVersion >= 5)) {
+			log(
+				`Keeping this node's record of its leader local-only: the leader's version (${version ?? 'none'}) is unreadable`
+			);
+			return;
+		}
+		// The stored url can be replaced by the leader's own row, so the row is found by the leader's name.
+		const leaderName = (await leaderRequest({ operation: 'cluster_status' }))?.node_name;
+		const { getHDBNodeTable } = await import('../replication/knownNodes.ts');
+		const { ensureNode, isLocalOnlyEntry } = await import('../replication/subscriptionManager.ts');
+		const table = getHDBNodeTable();
+		const entry = leaderName ? await table.primaryStore.getEntry(leaderName, { async: true }) : undefined;
+		if (!entry?.value) throw new Error(`no hdb_nodes row for leader ${leaderName}`);
+		if (!isLocalOnlyEntry(entry)) return;
+		// isLeader stays on this node's copy: sent as false it would end the bootstrap of a node still cloning from the same leader
+		await ensureNode(leaderName, {}, { localOnly: false });
+		log(`Published this node's record of leader ${leaderName} to the cluster`);
+	} catch (err) {
+		log(
+			`Could not publish this node's record of its leader; a node cloned from this one may not learn it: ${err}`,
+			'error'
+		);
+	}
+}
+
+/**
  * First half of one-time clone setup, through `setNode()` accepting this node onto the leader.
  * Must never be repeated once that succeeds (component re-extract, `npm install`, and a
  * `restartWorkers` that would tear down the replication just resumed). Failures throw uncaught.
@@ -737,6 +773,7 @@ async function monitorSync(
 		// Best-effort Available: also clears an Unavailable persisted by a prior failed attempt
 		// (hdb_status is not replicated and survives restarts).
 		log('Skipping sync monitor (skip-sync-monitor); marking node Available without verifying sync');
+		await publishLeaderNode();
 		try {
 			await setStatus({ id: 'availability', status: 'Available' });
 		} catch (err) {
@@ -831,6 +868,8 @@ async function monitorSync(
 		// Only report Available — and let the caller finalize the clone — once the status
 		// write itself succeeds. A failed write must not be treated as a successful sync,
 		// otherwise the node would be marked cloned without a readiness signal.
+		// Before Available: a node may be cloned from this one as soon as it reports that.
+		await publishLeaderNode();
 		try {
 			await setStatus({ id: 'availability', status: 'Available' });
 		} catch (err) {
