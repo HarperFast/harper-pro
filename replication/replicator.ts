@@ -37,6 +37,7 @@ import {
 	tableUpdateListeners,
 	LATENCY_POSITION,
 	deriveConnectionTruth,
+	RequestNotSentError,
 } from './replicationConnection.ts';
 import {
 	admitRecordLocks,
@@ -588,8 +589,7 @@ export function setReplicator(dbName: string, table: any, options: any) {
 								if (found === false) reportedNotResident = true;
 								else reportedAbsence = true;
 							} catch (error) {
-								// if we are still connected, must be a non-network error
-								if (bestConnection.isConnected) throw error;
+								if (!retrievalFailsOver(bestConnection, error)) throw error;
 								// if we got a network error, record it and try the next node (continuing through the loop)
 								logger.warn('Error in load from node', bestNode, error);
 								if (!firstError) firstError = error;
@@ -604,6 +604,11 @@ export function setReplicator(dbName: string, table: any, options: any) {
 	);
 }
 const connections = new Map<string, Map<string, NodeReplicationConnection>>();
+
+// A socket can be closing while its connection still reports connected
+export function retrievalFailsOver(connection: NodeReplicationConnection, error: unknown): boolean {
+	return !connection.isConnected || error instanceof RequestNotSentError;
+}
 
 // A connection that was intentionally torn down — the empty-subscription delayed close marks it
 // intentionallyUnsubscribed/isFinished — must not be handed back out of the cache. connect()
